@@ -686,10 +686,154 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
         self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
                          [0])
+        # Read slots are dense w.r.t. the generation batch: the padded dummy
+        # has no MRoPE metadata, so it resolves to the reserved zero slot
+        # (max_num_tokens * pp_size) rather than being dropped, which would
+        # shift every later request onto another request's delta.
         self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
-                         [0])
+                         [0, 32])
         self.assertNotIn("multimodal_embedding",
                          multimodal_request.py_multimodal_data)
+        kv_cache_manager.shutdown()
+
+    def _setup_mrope_engine(self, max_num_tokens: int = 32):
+        """Build a DummyModelEngine that takes the MRoPE path, plus its KV cache
+        manager and attention metadata."""
+        llm_args = TorchLlmArgs(model="dummy")
+        model_engine = DummyModelEngine(llm_args, dtype=torch.half)
+        model_engine.model.model_config.pretrained_config.rope_scaling = {
+            "type": "mrope"
+        }
+
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        kv_cache_config = KvCacheConfig(max_tokens=max_num_tokens)
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=16,
+            head_dim=16,
+            tokens_per_block=1,
+            max_seq_len=max_num_tokens,
+            max_batch_size=4,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.HALF,
+        )
+        attn_metadata = AttentionMetadata(max_num_requests=4,
+                                          max_num_tokens=max_num_tokens,
+                                          kv_cache_manager=kv_cache_manager)
+        attn_metadata.is_cuda_graph = False
+
+        model_engine.max_num_tokens = max_num_tokens
+        model_engine.input_ids_cuda = torch.zeros(max_num_tokens,
+                                                  dtype=torch.int32,
+                                                  device='cuda')
+        model_engine.position_ids_cuda = torch.zeros(max_num_tokens,
+                                                     dtype=torch.int32,
+                                                     device='cuda')
+        model_engine.mrope_position_ids_cuda = torch.zeros(
+            (3, 1, max_num_tokens), dtype=torch.int32, device='cuda')
+        model_engine.previous_batch_indices_cuda = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device='cuda')
+        return model_engine, kv_cache_manager, attn_metadata
+
+    @staticmethod
+    def _make_mrope_gen_request(num_tokens: int, req_id: int, seq_slot: int,
+                                delta):
+        """Generation request carrying an MRoPE delta when `delta` is not None,
+        and no multimodal data at all otherwise (a text-only prompt)."""
+        request = _create_request(num_tokens, req_id)
+        request.py_prompt_len = num_tokens
+        request.py_batch_idx = None
+        request.py_seq_slot = seq_slot
+        request.sampling_config.beam_width = 1
+        if delta is None:
+            request.py_multimodal_data = {}
+        else:
+            request.py_multimodal_data = {
+                "mrope_config": {
+                    "mrope_position_deltas":
+                    torch.tensor([[delta]], dtype=torch.int32)
+                },
+            }
+        return request
+
+    def test_prepare_tp_inputs_mixed_text_only_keeps_mrope_deltas_dense(
+            self) -> None:
+        """A text-only request between two multimodal ones must not compact the
+        MRoPE delta read slots.
+
+        The attention kernel indexes `mrope_position_deltas` by generation batch
+        index, so a list that skips the text-only request would hand request 2's
+        delta to the text-only request and read out of bounds for request 2.
+        """
+        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
+        )
+
+        # (num_tokens, seq_slot, delta); the middle request is text-only.
+        requests = [
+            self._make_mrope_gen_request(4, 1, 0, 10),
+            self._make_mrope_gen_request(5, 2, 1, None),
+            self._make_mrope_gen_request(6, 3, 2, 20),
+        ]
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = []
+        scheduled_requests.generation_requests = requests
+
+        result, _ = model_engine._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata)
+
+        # One entry per generation request, in batch order. Slot 32 is the
+        # reserved zero slot (max_num_tokens * pp_size) standing in for the
+        # text-only request's zero delta.
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [0, 32, 2])
+        # Only the two multimodal requests seed the seq-slot delta cache.
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0, 2])
+
+        # past_seen_token_num is num_tokens - 1, offset by the request's delta;
+        # the text-only request keeps the plain scalar position on all 3 axes.
+        position_ids = result["position_ids"]
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 3))
+        expected = torch.tensor([[[13, 4, 25]]] * 3,
+                                dtype=torch.int32,
+                                device='cuda')
+        torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        kv_cache_manager.shutdown()
+
+    def test_prepare_tp_inputs_all_text_only_drops_mrope_deltas(self) -> None:
+        """A generation batch with no MRoPE metadata at all emits no delta
+        tensors, so the steady-state generation fast path stays reachable."""
+        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
+        )
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests_last_chunk = []
+        scheduled_requests.generation_requests = [
+            self._make_mrope_gen_request(4, 1, 0, None),
+            self._make_mrope_gen_request(6, 2, 1, None),
+        ]
+
+        result, _ = model_engine._prepare_tp_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata)
+
+        # An all-zero delta vector is identical to passing no deltas at all.
+        self.assertNotIn("mrope_delta_read_seq_slots", result)
+        self.assertNotIn("mrope_delta_write_seq_slots", result)
+
+        # MRoPE models keep the (3,1,N) layout even with no mrope work.
+        position_ids = result["position_ids"]
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 2))
+        expected = torch.tensor([[[3, 5]]] * 3,
+                                dtype=torch.int32,
+                                device='cuda')
+        torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
         kv_cache_manager.shutdown()
 
     def test_kv_cache_manager_with_execution_stream(self):
