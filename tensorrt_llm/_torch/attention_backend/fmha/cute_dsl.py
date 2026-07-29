@@ -233,7 +233,7 @@ class CuteDslMlaFmha(PhasedFmha):
             (16, 2): 64,
             (16, 4): 32,
             (16, 8): 16,
-            (128, 1): 8,
+            (128, 1): 64,
             (128, 2): 32,
             (128, 4): 32,
             (128, 8): 16,
@@ -263,16 +263,14 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> tuple[bool, str]:
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
+        # It is to disable mix-batch(context request + generation request) for now.
+        # TODO: Eliminate high host overhead of cutedsl mla to enable mix-batch.
         if meta.num_contexts != 0 or meta.num_generations <= 0:
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.helix_position_offsets is not None:
             return False, "CuTe DSL MLA FMHA does not support Helix parallelism."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
-        # The kernel is dense-only, so any sparse layer must fall back to a
-        # library that consumes the predicted sparse/topk indices.
-        if attn.sparse_params is not None:
-            return False, "CuTe DSL MLA FMHA does not support sparse attention."
         # Linear-chain MTP / spec-decode (seq_len_q > 1) IS supported: the
         # kernel applies the implicit causal mask (q token t attends to KV
         # [0, K - (seq_len_q - 1) + t)). Tree / dynamic-tree spec-decode carries

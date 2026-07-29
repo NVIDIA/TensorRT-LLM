@@ -3543,6 +3543,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             return False
         if K <= 0:
             return False
+
+        # The performance is not good when split_kv is not in [1, 32].
+        if split_kv < 1 or split_kv > 32:
+            return False
+
         return True
 
 
