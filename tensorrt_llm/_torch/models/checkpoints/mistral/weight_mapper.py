@@ -35,6 +35,9 @@ class MistralWeightMapper(HfWeightMapper):
             "tok_embeddings": "model.embed_tokens",
             "output": "lm_head",
             "norm": "model.norm",
+            # For text-only models: preprocess_weights adds "language_model." prefix
+            "language_model.tok_embeddings": "model.embed_tokens",
+            "language_model.output": "lm_head",
             # For Eagle3
             "language_model.eagle_linear": "model.fc",
             "language_model.layers": "layers",

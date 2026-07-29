@@ -76,15 +76,41 @@ class MapperKind(IntEnum):
 
 @dataclass
 class PhysicalPool:
+    """Affine view of a physical pool over logical layers and slots.
+
+    ``slot_bytes`` is the transferable payload for one ``(layer, slot)`` and
+    ``num_slots`` is the number of logical slots. The payload address is
+    ``base_address + layer * layer_stride_bytes + slot * slot_stride_bytes``.
+    The strides describe the physical layout independently of payload size and
+    slot count. Their defaults describe dense layer-major storage, where
+    ``slot_stride_bytes == slot_bytes`` and
+    ``layer_stride_bytes == num_slots * slot_stride_bytes``. V2 Mamba supplies
+    both explicitly for its slot-major, role-interleaved pools.
+    """
+
     base_address: int  # uint64
     slot_bytes: int
     num_slots: int
+    slot_stride_bytes: Optional[int] = None
+    layer_stride_bytes: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.slot_stride_bytes is None:
+            self.slot_stride_bytes = self.slot_bytes
+        if self.layer_stride_bytes is None:
+            self.layer_stride_bytes = self.num_slots * self.slot_stride_bytes
+        if self.slot_stride_bytes < self.slot_bytes:
+            raise ValueError("slot_stride_bytes must be greater than or equal to slot_bytes")
+        if self.layer_stride_bytes < self.slot_bytes:
+            raise ValueError("layer_stride_bytes must be greater than or equal to slot_bytes")
 
     def to_dict(self) -> dict:
         return {
             "base_address": int(self.base_address),
             "slot_bytes": int(self.slot_bytes),
             "num_slots": int(self.num_slots),
+            "slot_stride_bytes": int(self.slot_stride_bytes),
+            "layer_stride_bytes": int(self.layer_stride_bytes),
         }
 
     @staticmethod
@@ -93,6 +119,16 @@ class PhysicalPool:
             base_address=int(data["base_address"]),
             slot_bytes=int(data["slot_bytes"]),
             num_slots=int(data["num_slots"]),
+            slot_stride_bytes=(
+                int(data["slot_stride_bytes"])
+                if data.get("slot_stride_bytes") is not None
+                else None
+            ),
+            layer_stride_bytes=(
+                int(data["layer_stride_bytes"])
+                if data.get("layer_stride_bytes") is not None
+                else None
+            ),
         )
 
 
