@@ -665,7 +665,7 @@ def test_llm_partial_update_weights_qwen35_35b_bf16_tp8_cuda_graph(
     _run_qwen35_35b_tp8_multinode_update()
 
 
-@pytest.mark.part0
+@pytest.mark.part5
 @pytest.mark.gpu4
 @pytest.mark.high_cuda_memory
 @skip_pre_blackwell
@@ -674,7 +674,7 @@ def test_llm_update_weights_qwen35_35b_bf16():
     _run_qwen35_35b_bf16_update(partial=False)
 
 
-@pytest.mark.part1
+@pytest.mark.part5
 @pytest.mark.gpu4
 @pytest.mark.high_cuda_memory
 @skip_pre_blackwell
@@ -683,7 +683,7 @@ def test_llm_partial_update_weights_qwen35_35b_bf16():
     _run_qwen35_35b_bf16_update(partial=True)
 
 
-@pytest.mark.part0
+@pytest.mark.part5
 @pytest.mark.gpu4
 @pytest.mark.high_cuda_memory
 @skip_pre_blackwell
@@ -692,7 +692,7 @@ def test_llm_update_weights_qwen35_35b_fp8():
     _run_qwen35_35b_fp8_update(partial=False)
 
 
-@pytest.mark.part1
+@pytest.mark.part5
 @pytest.mark.gpu4
 @pytest.mark.high_cuda_memory
 @skip_pre_blackwell
