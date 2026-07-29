@@ -106,6 +106,8 @@ l0_b200:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/test_swiglu_2in.py
+  - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
@@ -234,6 +236,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
+  - unittest/_torch/visual_gen/test_attention_qkv_share.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example

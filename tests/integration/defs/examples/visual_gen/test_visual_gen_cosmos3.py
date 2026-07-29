@@ -76,6 +76,37 @@ COSMOS3_I2V_4STEP_LPIPS_GUIDANCE_SCALE = 1.0
 # golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json.
 COSMOS3_I2V_4STEP_LPIPS_THRESHOLD = 0.10
 
+# Statically quantized (ModelOpt FP8) Cosmos3 builds. They ship inside a dated
+# subdirectory, hence the multi-component paths.
+COSMOS3_NANO_FP8_MODEL_SUBPATH = ("Cosmos3-Nano-FP8", "cosmos3-nano-fp8-14072026")
+COSMOS3_SUPER_FP8_MODEL_SUBPATH = ("Cosmos3-Super-FP8", "cosmos3-super-fp8-14072026")
+
+# FP8 smokes run smaller/shorter than the golden gates. They prove the quantized
+# checkpoints load and produce non-collapsed output for each task; they are not a
+# quality check, and no quality claim is made anywhere for these checkpoints.
+#
+# Deliberately NOT gated against the BF16 goldens. Diffusion sampling is chaotic:
+# an FP8 rounding difference at step 0 compounds over the trajectory into a
+# different sample. Measured FP8-vs-BF16 LPIPS at 704x1280/20 steps on B200 was
+# 0.023 (I2V) / 0.086 (T2I) / 0.165 (T2V) / 0.263 (V2V) -- but nothing here
+# establishes which of the two is better, or that either is good. A
+# BF16-referenced threshold would therefore either reject acceptable FP8 output
+# or be too loose to catch anything.
+#
+# What these smokes DO catch: a checkpoint that loads but decodes to a collapsed
+# (near-flat) frame, the failure mode of a misloaded or missing FP8 scale.
+# Structured noise would pass. Real quality gating needs an accuracy harness,
+# which does not exist for these checkpoints.
+COSMOS3_FP8_SMOKE_HEIGHT = 704
+COSMOS3_FP8_SMOKE_WIDTH = 1280
+COSMOS3_FP8_SMOKE_NUM_FRAMES = 29
+COSMOS3_FP8_SMOKE_NUM_INFERENCE_STEPS = 20
+# Lower bound on per-pixel spread. This detects a *collapsed* decode -- the
+# failure mode of a misloaded or missing FP8 scale, which produces near-flat
+# output. It does NOT check image quality: structured noise would pass. Quality
+# is unbenchmarked (no accuracy harness exists for these checkpoints).
+COSMOS3_FP8_SMOKE_MIN_PIXEL_STD = 10.0
+
 
 COSMOS3_FEATURE_LPIPS_THRESHOLD = 0.05
 COSMOS3_QUANTIZATION_IGNORE = [
@@ -128,13 +159,27 @@ def _build_cosmos3_accuracy_cases():
 COSMOS3_ACCURACY_CASES = _build_cosmos3_accuracy_cases()
 
 
-def _run_cosmos3_lpips_pipeline(num_frames, video=None):
-    """Run the Cosmos3-Nano pipeline (default setting, VANILLA attn, compile-off).
+def _run_cosmos3_lpips_pipeline(
+    num_frames,
+    video=None,
+    image=None,
+    model_subpath=(COSMOS3_NANO_MODEL_SUBPATH,),
+    label="Cosmos3-Nano checkpoint",
+    height=COSMOS3_LPIPS_HEIGHT,
+    width=COSMOS3_LPIPS_WIDTH,
+    num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+):
+    """Run a Cosmos3 pipeline (default setting, VANILLA attn, compile-off).
 
     Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
     or ``None`` if generation produced no video.  ``num_frames=1`` yields the
     single-frame text-to-image path; passing ``video`` (encoded MP4 bytes,
-    decoded on the worker's NVDEC) yields the video-to-video path.
+    decoded on the worker's NVDEC) yields the video-to-video path; passing
+    ``image`` yields the image-to-video path.
+
+    ``model_subpath`` selects the checkpoint under ``LLM_MODELS_ROOT`` and is a
+    tuple of path components, so nested checkpoints (the FP8 builds ship inside
+    a dated subdirectory) address the same way as top-level ones.
     """
     # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
@@ -149,8 +194,8 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
             VisualGenArgs,
         )
 
-        model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
-        _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+        model_path = _lpips_model_path(*model_subpath)
+        _skip_if_missing(model_path, label, is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -164,14 +209,15 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
                 result = pipeline.forward(
                     prompt=COSMOS3_LPIPS_PROMPT,
                     seed=COSMOS3_LPIPS_SEED,
-                    height=COSMOS3_LPIPS_HEIGHT,
-                    width=COSMOS3_LPIPS_WIDTH,
+                    height=height,
+                    width=width,
                     num_frames=num_frames,
-                    num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+                    num_inference_steps=num_inference_steps,
                     guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
                     frame_rate=COSMOS3_LPIPS_FRAME_RATE,
                     use_guardrails=False,
                     video=video,
+                    image=image,
                 )
             if result is None or result.video is None:
                 return None
@@ -636,3 +682,129 @@ def test_cosmos3_i2v_4step_lpips_against_golden(_visual_gen_deps, request, tmp_p
         "cosmos3_i2v_4step_lpips_golden_video.mp4",
     )
     _assert_lpips_below_threshold(score, COSMOS3_I2V_4STEP_LPIPS_THRESHOLD)
+
+
+def _cosmos3_i2v_smoke_image():
+    """Build the I2V conditioning image procedurally.
+
+    Synthesized rather than checked in: the smoke only needs a well-formed image
+    with real spatial structure (a flat fill would make a degenerate-output
+    assertion meaningless), and generating it keeps the fixture deterministic
+    without adding another binary to the repo.
+    """
+    import numpy as np
+    import PIL.Image
+
+    height, width = COSMOS3_FP8_SMOKE_HEIGHT, COSMOS3_FP8_SMOKE_WIDTH
+    ys, xs = np.meshgrid(
+        np.linspace(0, 1, height, dtype=np.float32),
+        np.linspace(0, 1, width, dtype=np.float32),
+        indexing="ij",
+    )
+    # Sky-to-ground vertical ramp with a horizon band and a horizontal ripple,
+    # so the conditioned frame carries structure the model can propagate.
+    frame = np.stack(
+        [
+            0.25 + 0.5 * ys,
+            0.45 + 0.35 * ys + 0.1 * np.sin(8 * np.pi * xs),
+            0.85 - 0.55 * ys,
+        ],
+        axis=-1,
+    )
+    frame[int(height * 0.6) : int(height * 0.62), :, :] = 1.0
+    return PIL.Image.fromarray((np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8))
+
+
+def _assert_cosmos3_fp8_decode_not_collapsed(video, label, expected_frames, free_frame=None):
+    """Assert an FP8 run decoded to real content rather than a degenerate frame.
+
+    ``free_frame`` names a frame that carries no conditioning. I2V and V2V copy
+    structure from the reference into their leading frames, so a whole-video
+    standard deviation can clear the threshold on that structure alone even if
+    every generated frame collapsed. Passing an unconditioned frame index makes
+    the assertion test what the transformer actually produced.
+    """
+    assert video is not None, f"{label} produced no video"
+    assert video.dtype == torch.uint8, f"{label}: expected uint8 frames, got {video.dtype}"
+    assert video.shape[1] == expected_frames, (
+        f"{label}: expected {expected_frames} frames, got {video.shape[1]}"
+    )
+    pixel_std = video.float().std().item()
+    assert pixel_std > COSMOS3_FP8_SMOKE_MIN_PIXEL_STD, (
+        f"{label}: decode collapsed (pixel std {pixel_std:.2f} <= "
+        f"{COSMOS3_FP8_SMOKE_MIN_PIXEL_STD}); an FP8 scale misload decodes to near-flat output"
+    )
+
+    if free_frame is None:
+        return
+    assert free_frame < expected_frames, (
+        f"{label}: free frame {free_frame} is outside the {expected_frames}-frame output"
+    )
+    frame_std = video[:, free_frame].float().std().item()
+    assert frame_std > COSMOS3_FP8_SMOKE_MIN_PIXEL_STD, (
+        f"{label}: unconditioned frame {free_frame} collapsed (pixel std "
+        f"{frame_std:.2f} <= {COSMOS3_FP8_SMOKE_MIN_PIXEL_STD}) even though the "
+        f"whole-video std was {pixel_std:.2f}; the conditioned frames alone "
+        "carried the video-level check"
+    )
+
+
+def _run_cosmos3_fp8_smoke(model_subpath, label, num_frames, video=None, image=None):
+    return _run_cosmos3_lpips_pipeline(
+        num_frames,
+        video=video,
+        image=image,
+        model_subpath=model_subpath,
+        label=label,
+        height=COSMOS3_FP8_SMOKE_HEIGHT,
+        width=COSMOS3_FP8_SMOKE_WIDTH,
+        num_inference_steps=COSMOS3_FP8_SMOKE_NUM_INFERENCE_STEPS,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    "model_subpath, label",
+    [
+        (COSMOS3_NANO_FP8_MODEL_SUBPATH, "Cosmos3-Nano-FP8"),
+        (COSMOS3_SUPER_FP8_MODEL_SUBPATH, "Cosmos3-Super-FP8"),
+    ],
+    ids=["nano", "super"],
+)
+@pytest.mark.parametrize("task", ["t2v", "t2i", "i2v", "v2v"])
+def test_cosmos3_fp8_decode_is_not_collapsed(model_subpath, label, task):
+    """Every parametrized task decodes to non-collapsed output on the FP8 checkpoints.
+
+    Super is parametrized alongside Nano rather than inferred from it: it is a
+    different depth/width with roughly twice the quantized linear count, and its
+    fused shards carry the wider weight-scale spread.
+    """
+    # free_frame: a frame no conditioning reaches, so the assertion sees only
+    # what the transformer generated. V2V pins latent frames (0, 1) -> pixel
+    # frames 0-4 of its 9, leaving 8. I2V pins latent frame 0 -> pixel frame 0,
+    # so the last frame is the furthest from the conditioning.
+    if task == "t2i":
+        num_frames, video, image, free_frame = 1, None, None, None
+    elif task == "v2v":
+        num_frames, video, image, free_frame = (
+            COSMOS3_LPIPS_V2V_NUM_FRAMES,
+            _cosmos3_v2v_lpips_reference_bytes(),
+            None,
+            COSMOS3_LPIPS_V2V_NUM_FRAMES - 1,
+        )
+    elif task == "i2v":
+        num_frames, video, image, free_frame = (
+            COSMOS3_FP8_SMOKE_NUM_FRAMES,
+            None,
+            _cosmos3_i2v_smoke_image(),
+            COSMOS3_FP8_SMOKE_NUM_FRAMES - 1,
+        )
+    else:
+        num_frames, video, image, free_frame = COSMOS3_FP8_SMOKE_NUM_FRAMES, None, None, None
+
+    generated = _run_cosmos3_fp8_smoke(
+        model_subpath, f"{label} checkpoint", num_frames, video=video, image=image
+    )
+    _assert_cosmos3_fp8_decode_not_collapsed(
+        generated, f"{label} {task}", num_frames, free_frame=free_frame
+    )
