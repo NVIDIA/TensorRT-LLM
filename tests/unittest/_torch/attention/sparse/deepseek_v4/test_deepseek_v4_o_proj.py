@@ -266,56 +266,6 @@ def test_dsv4_ob_tuning_input_hook_restores_packed_scale_layout() -> None:
     assert prepared[4] is inputs[4]
 
 
-def test_dsv4_deep_gemm_ob_warmup_uses_startup_autotuner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tensorrt_llm import deep_gemm
-
-    weight = torch.empty((128, 512), device="meta", dtype=torch.float8_e4m3fn)
-    weight_scale = torch.empty((128, 1), device="meta", dtype=torch.int32)
-    tuning_calls = []
-    gemm_calls = []
-
-    def choose_one(custom_op, runners, tuning_config, inputs):
-        tuning_calls.append((custom_op, runners, tuning_config, inputs))
-
-    def deep_gemm_nt(a, b, output, **kwargs):
-        gemm_calls.append((a, b, output, kwargs))
-
-    tuner = SimpleNamespace(is_tuning_mode=True, choose_one=choose_one)
-    monkeypatch.setattr(AutoTuner, "get", lambda: tuner)
-    monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", deep_gemm_nt)
-    cute_dsl_custom_ops.warmup_dsv4_deep_gemm_ob(weight, weight_scale, torch.bfloat16, 37)
-
-    assert len(tuning_calls) == 1
-    custom_op, runners, tuning_config, inputs = tuning_calls[0]
-    assert custom_op == "trtllm::dsv4_deep_gemm_ob::startup_warmup"
-    runner = runners[0]
-    assert isinstance(runner, cute_dsl_custom_ops.Dsv4DeepGemmObWarmupRunner)
-    assert runner.get_valid_tactics([], OptimizationProfile()) == [0]
-    assert tuning_config.exclude_from_cache
-    assert tuning_config.inputs_pre_hook is cute_dsl_custom_ops._prepare_dsv4_ob_tuning_inputs
-    assert tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets(8192) == tuple(
-        range(8, 128, 8)
-    ) + tuple(range(128, 8192, 128))
-    assert inputs[0].shape == (37, 512)
-    assert inputs[1].shape == (37, 1)
-    assert inputs[1].stride() == (1, 40)
-    assert inputs[1].untyped_storage().nbytes() == 40 * 4
-    assert inputs[2] is weight
-    assert inputs[3] is weight_scale
-    assert inputs[4].shape == (37, 128)
-
-    assert runner(inputs, tactic=0) is inputs[4]
-    assert len(gemm_calls) == 1
-    assert gemm_calls[0][0][0] is inputs[0]
-    assert gemm_calls[0][0][1] is inputs[1]
-    assert gemm_calls[0][1][0] is inputs[2]
-    assert gemm_calls[0][1][1] is inputs[3]
-    assert gemm_calls[0][2] is inputs[4]
-    assert gemm_calls[0][3] == {"c": None, "disable_ue8m0_cast": False}
-
-
 def test_dsv4_model_warmup_deduplicates_deep_gemm_signatures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -343,16 +293,23 @@ def test_dsv4_model_warmup_deduplicates_deep_gemm_signatures(
     )
     calls = []
 
-    def warmup(weight, weight_scale, output_dtype, max_num_tokens):
-        calls.append((weight, weight_scale, output_dtype, max_num_tokens))
+    def warmup(input, weight, weight_scale, **kwargs):
+        calls.append((input, weight, weight_scale, kwargs))
 
-    monkeypatch.setattr(cute_dsl_custom_ops, "warmup_dsv4_deep_gemm_ob", warmup)
+    monkeypatch.setattr(torch.ops.trtllm, "fp8_swap_ab_gemm", warmup)
     DeepseekV4ForCausalLM.warmup_dsv4_fused_ob(module, 8192)
 
     assert len(calls) == 1
-    assert calls[0][0] is first.o_b_proj.weight
-    assert calls[0][1] is first.o_b_proj.weight_scale
-    assert calls[0][2:] == (torch.bfloat16, 8192)
+    dummy_input, weight, weight_scale, kwargs = calls[0]
+    assert dummy_input.shape == (8192, 512)
+    assert dummy_input.dtype == torch.bfloat16
+    assert dummy_input.device.type == "meta"
+    assert weight is first.o_b_proj.weight
+    assert weight_scale is first.o_b_proj.weight_scale
+    assert kwargs == {
+        "output_dtype": torch.bfloat16,
+        "disable_ue8m0_cast": False,
+    }
 
 
 def _check_dsv4_oa_fp8out_tensor_contract() -> None:

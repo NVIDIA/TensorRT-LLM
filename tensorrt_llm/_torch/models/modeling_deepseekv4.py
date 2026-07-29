@@ -2654,7 +2654,8 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
 
     def warmup_dsv4_fused_ob(self, max_num_tokens: int) -> None:
         """Precompile each fused DeepGEMM O_b signature during startup."""
-        from ..custom_ops import cute_dsl_custom_ops
+        if max_num_tokens <= 0:
+            return
 
         warmed_signatures = set()
         for layer in self.model.layers:
@@ -2678,11 +2679,17 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             if signature in warmed_signatures:
                 continue
             warmed_signatures.add(signature)
-            cute_dsl_custom_ops.warmup_dsv4_deep_gemm_ob(
+            dummy_input = torch.empty(
+                (max_num_tokens, weight.shape[1]),
+                dtype=attention.dtype,
+                device=weight.device,
+            )
+            torch.ops.trtllm.fp8_swap_ab_gemm(
+                dummy_input,
                 weight,
                 weight_scale,
-                attention.dtype,
-                max_num_tokens,
+                output_dtype=attention.dtype,
+                disable_ue8m0_cast=False,
             )
 
     def load_weights(self, weights: Dict):
