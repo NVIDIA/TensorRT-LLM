@@ -358,8 +358,19 @@ def get_benchmark_request_queue_size(config, concurrency):
     return queue_size
 
 
+def is_real_slurm_partition(partition):
+    """True if partition should be passed to SLURM.
+
+    Matches L0_Test.groovy: clusters such as oci-hsg use the sentinel name
+    "unspecified" to mean "do not set --partition" (use the cluster default).
+    """
+    return bool(partition) and partition != "unspecified"
+
+
 def partition_has_gpu_gres(partition):
     """Return True if the Slurm partition reports GPU GRES (e.g. 'gpu:4'), False if null/absent."""
+    if not is_real_slurm_partition(partition):
+        return False
     try:
         gres = (
             subprocess.check_output(
@@ -391,8 +402,10 @@ def generate_sbatch_params(args, hardware_config, work_dir):
     if partition_has_gpu_gres(args.partition):
         lines.append(f"#SBATCH --gpus-per-node={gpus_per_node}")
         lines.append(f"#SBATCH --gres=gpu:{gpus_per_node}")
+    # Omit --partition when unspecified (same convention as L0_Test.groovy).
+    if is_real_slurm_partition(args.partition):
+        lines.append(f"#SBATCH --partition={args.partition}")
     lines += [
-        f"#SBATCH --partition={args.partition}",
         f"#SBATCH --time={args.time}",
         f"#SBATCH --account={args.account}",
         f"#SBATCH -J {args.job_name}",
@@ -560,7 +573,12 @@ def main():
         choices=["", "e2e", "gen_only", "ctx_only"],
         help="Benchmark mode for disagg config (when --config-file is provided)",
     )
-    parser.add_argument("--partition", required=True, help="SLURM partition")
+    parser.add_argument(
+        "--partition",
+        required=True,
+        help="SLURM partition; use 'unspecified' to omit #SBATCH --partition "
+        "(cluster default; same convention as L0_Test.groovy)",
+    )
     parser.add_argument("--time", default="02:00:00", help="SLURM time limit")
     parser.add_argument("--account", required=True, help="SLURM account")
     parser.add_argument("--job-name", required=True, help="SLURM job name")

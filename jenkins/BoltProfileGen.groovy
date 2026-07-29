@@ -201,16 +201,17 @@ def submitProfileGen(pipeline)
     def bundle = "${outDir}/bolt-profile-${BOLT_REF}-${TRIPLE}.tar.gz"
 
     // Bootstrap on the frontend entirely from the phase-1 tarball (no agent->
-    // cluster file copy): stage the toolkit (scripts/bolt), the full source tree
-    // + wheel (the perf harness runs from the checkout, install_mode=wheel), and
-    // llvm-bolt once (shared, reused by the per-node instrument hook + merge).
+    // cluster file copy): extract the full source tree + wheel (the perf harness
+    // runs from the checkout, install_mode=wheel), and stage llvm-bolt once
+    // (shared, reused by the per-node instrument hook + merge). The merge job
+    // mounts scripts/bolt directly from the extracted tree (no separate copy).
     // Then fan out one perf-harness run per workload, and merge once.
     CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
         // 1) Bootstrap on the frontend as SEPARATE commands with NO timeout: the
         //    tarball download is a multi-GB cross-region transfer, and Utils.exec
         //    defaults to a 10-min timeout, so pass timeout:false on each.
         Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, "\"mkdir -p ${ws}/builds ${ws}/runs ${ws}/toolkit\""))
+            script: Utils.sshUserCmd(remote, "\"mkdir -p ${ws}/builds ${ws}/runs\""))
 
         // Download the phase-1 tarball from Artifactory to the cluster frontend.
         // curl (not wget): --speed-time/--speed-limit aborts a STALLED transfer
@@ -239,12 +240,9 @@ def submitProfileGen(pipeline)
         // build commit's TensorRT-LLM/src). The perf harness runs from this
         // checkout (jenkins/scripts/perf + tests/scripts/perf-sanity), and
         // install_mode=wheel uses the bundled TensorRT-LLM/tensorrt_llm-*.whl;
-        // scripts/bolt (the toolkit) lives under src/ too.
+        // scripts/bolt (TOOLKIT_HOST for the merge job) lives under src/ too.
         Utils.exec(pipeline, timeout: false, numRetries: 2,
             script: Utils.sshUserCmd(remote, "\"tar -xf ${ws}/builds/${BOLT_TARNAME} -C ${ws} TensorRT-LLM\""))
-        // Keep a toolkit copy for the merge job (slurm_merge.sh TOOLKIT_HOST).
-        Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, "\"cp -r ${ws}/TensorRT-LLM/src/scripts/bolt/. ${ws}/toolkit/\""))
 
         // Stage llvm-bolt ONCE here (shared ${ws}/builds/llvm), before the fan-out.
         // The per-node instrument hook (perf_instrument_hook.sh, via BOLT_LLVM_DIR)
@@ -281,7 +279,7 @@ def submitProfileGen(pipeline)
         // SLURM partition the merge job uses -- so a plain `/bot run` works with
         // nothing to set by hand. `partition.name` is the SLURM partition name
         // (getPartitionArgs builds `--partition=<name>` from it); mounts default to
-        // the workspace + models (covers hook, llvm, fdata, toolkit -- all under ws).
+        // the workspace + models (covers hook, llvm, fdata -- all under ws).
         // Overridable via param/env if a run ever needs a different partition.
         def harnessPartition = params.boltHarnessPartition ?: env.boltHarnessPartition ?: partition.name
         def harnessMounts = params.boltHarnessMounts ?: env.boltHarnessMounts ?: "${ws}:${ws},${modelsRoot}:${modelsRoot}"
@@ -361,8 +359,8 @@ def submitHarnessWorkload(pipeline, remote, String ws, String fdataRoot, String 
             "\"ls ${ws}/TensorRT-LLM/tensorrt_llm-*.whl | head -1\"")).trim()
 
     // Generate the .conf, then run the harness with the BOLT hook wired in.
-    // Single-quote EXTRA_CONTAINER_EXPORTS (its value has no single quotes) so
-    // the nested value doesn't collide with sshUserCmd's outer double quotes.
+    // Values are Groovy-interpolated; bashWrappedRemoteCmd avoids depending on
+    // the cluster login shell being bash (heredoc + multi-line script).
     def script = """
         set -e
         mkdir -p ${workDir}
@@ -388,7 +386,7 @@ CONF
         cut -d'|' -f1 ${workDir}/slurm_jobs.txt | head -1
     """.stripIndent()
     return Utils.exec(pipeline, timeout: false, returnStdout: true, numRetries: 1,
-                      script: Utils.sshUserCmd(remote, "\"${script}\"")).trim().readLines().last().trim()
+                      script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(script))).trim().readLines().last().trim()
 }
 
 def submitMerge(pipeline, remote, String ws, String fdataRoot, String outDir, String partArgs)
@@ -396,9 +394,11 @@ def submitMerge(pipeline, remote, String ws, String fdataRoot, String outDir, St
     // Match the enroot URI form used for the collect jobs (imageEnroot): pyxis
     // expects urm.nvidia.com#<path>, not urm.nvidia.com/<path>.
     def mergeImage = (LLM_DOCKER_IMAGE ?: "").replace("urm.nvidia.com/", "urm.nvidia.com#")
-    def cmd = "cd ${ws}/toolkit && " +
+    // Point TOOLKIT_HOST at the extracted tree (no separate ${ws}/toolkit copy).
+    def toolkitHost = "${ws}/TensorRT-LLM/src/scripts/bolt"
+    def cmd = "cd ${toolkitHost} && " +
         "CONTAINER_IMAGE=${mergeImage} " +
-        "WORKSPACE=${ws} TOOLKIT_HOST=${ws}/toolkit BUILDS_HOST=${ws}/builds " +
+        "WORKSPACE=${ws} TOOLKIT_HOST=${toolkitHost} BUILDS_HOST=${ws}/builds " +
         "BOLT_REF=${BOLT_REF} TRIPLE=${TRIPLE} TARBALL_NAME=${BOLT_TARNAME} " +
         "FDATA_ROOT=${fdataRoot} OUT_DIR=${outDir} BOLT_APPLY=${APPLY_PROFILES == 'true' ? '1' : '0'} " +
         "sbatch --parsable --nodes=1 ${partArgs} internal/slurm_merge.sh"
@@ -435,11 +435,9 @@ def pollSlurm(pipeline, remote, String jobId, String label)
 // netrc via `printf` (a shell builtin, so no `ps` exposure) with curl reading
 // --netrc-file (creds never on curl's argv); the netrc is removed after.
 //
-// IMPORTANT quoting constraint: Utils.sshUserCmd wraps this script in "\"...\"",
-// so the AGENT's sh pre-expands $, $(...) and consumes inner double quotes before
-// the command is sent. Therefore the script must use ONLY Groovy-interpolated
-// values (no shell vars, no $(...), no heredoc, no inner double quotes). Assumes
-// the credential is shell-safe (no $ " ` ), which holds for the URM service creds.
+// Values are Groovy-interpolated into the script before bashWrappedRemoteCmd
+// wraps it (so the credential never appears as a shell variable). Assumes the
+// credential is shell-safe (no $ " ` ), which holds for the URM service creds.
 // ---------------------------------------------------------------------------
 def promoteBundle(pipeline, remote, String bundle)
 {
@@ -459,7 +457,7 @@ def promoteBundle(pipeline, remote, String bundle)
             rm -f ${netrc}
         """.stripIndent()
         Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, "\"${promote}\""))
+            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(promote)))
     }
     pipeline.echo("Promoted. latest = ${base}/latest.tar.gz")
 }

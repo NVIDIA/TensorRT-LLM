@@ -16,8 +16,8 @@
 #
 # run_local.sh - Local / customer entry point for the TRT-LLM BOLT flow.
 #
-# Runs the entire instrument -> profile -> merge -> optimize loop on a single
-# node, with NO NVIDIA network access. The only external dependency is a public
+# Runs the instrument -> profile -> merge -> optimize loop on a single node,
+# with NO NVIDIA network access. The only external dependency is a public
 # `llvm-bolt` toolchain (see README for install) plus a TensorRT-LLM install
 # that was built with ENABLE_BOLT_COMPATIBLE=ON.
 #
@@ -25,16 +25,20 @@
 #
 #   export FDATA_OUTPUT_DIR=$PWD/bolt_fdata        # where .fdata is collected
 #   scripts/bolt/run_local.sh instrument           # swap in instrumented libs
-#   scripts/bolt/run_local.sh profile              # run the workload suite
+#   scripts/bolt/run_local.sh profile --workloads /path/to/suite.yaml
 #   scripts/bolt/run_local.sh merge                # per-PID -> per-lib + YAML
 #   scripts/bolt/run_local.sh optimize             # BOLT + install optimized
 #
 # Or all at once (instrument -> profile -> merge -> optimize):
-#   scripts/bolt/run_local.sh all
+#   scripts/bolt/run_local.sh all --workloads /path/to/suite.yaml
 #
 # To consume a profile bundle that already ships in the container (offline
 # re-BOLT without profiling), skip instrument/profile/merge and run:
 #   scripts/bolt/run_local.sh optimize --profiles /opt/trtllm/bolt
+#
+# Note: the reference workload suite + driver (scripts/bolt/workloads/) land
+# with the user-facing docs PR. Until then, `profile` / `all` require an
+# explicit --workloads suite and a matching driver command inside it.
 #
 # Commands:
 #   preflight    check llvm-bolt + that tensorrt/tensorrt_llm import (run first)
@@ -53,9 +57,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export BOLT_WORK_DIR="${BOLT_WORK_DIR:-/opt/trtllm_bolt}"
 export FDATA_OUTPUT_DIR="${FDATA_OUTPUT_DIR:-${BOLT_WORK_DIR}/fdata}"
 PROFILES_DIR=""          # for `optimize`: where to read profiles from
-WORKLOAD_SUITE="${WORKLOAD_SUITE:-${SCRIPT_DIR}/workloads/suite_v0_2.yaml}"
+WORKLOAD_SUITE="${WORKLOAD_SUITE:-}"
 
-usage() { sed -n '17,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '17,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # ---- arg parsing ----------------------------------------------------------
 CMD="${1:-}"; shift || true
@@ -74,17 +78,42 @@ done
 # shellcheck source=scripts/bolt/bolt_lib.sh
 source "${SCRIPT_DIR}/bolt_lib.sh"
 
+# Run a user-supplied workload suite. The in-tree reference suite +
+# run_workloads.sh driver are deferred to the docs PR; until then callers must
+# provide --workloads (or WORKLOAD_SUITE) pointing at a suite whose entries
+# invoke their own command (absolute path or on PATH).
+run_workload_suite() {
+    if [[ -z "${WORKLOAD_SUITE}" ]]; then
+        log_error "No workload suite configured."
+        log_error "  Pass --workloads /path/to/suite.yaml (or set WORKLOAD_SUITE)."
+        log_error "  The in-tree reference suite lands with the BOLT docs PR."
+        exit 1
+    fi
+    if [[ ! -f "${WORKLOAD_SUITE}" ]]; then
+        log_error "Workload suite not found: ${WORKLOAD_SUITE}"
+        exit 1
+    fi
+    local driver="${SCRIPT_DIR}/workloads/run_workloads.sh"
+    if [[ ! -x "${driver}" ]]; then
+        log_error "Workload driver not found: ${driver}"
+        log_error "  Restore scripts/bolt/workloads/ from the docs-PR backup, or"
+        log_error "  drive profiling outside run_local.sh and use 'merge'/'optimize'."
+        exit 1
+    fi
+    log_info "Running workload suite: $WORKLOAD_SUITE"
+    log_info "Profiles will be written to: $FDATA_OUTPUT_DIR"
+    "${driver}" "$WORKLOAD_SUITE" "${EXTRA_ARGS[@]}"
+}
+
 case "$CMD" in
     instrument)
         bolt_run_stages setup_directories backup_libraries \
                         link_fdata_output_dir instrument_libraries \
                         install_instrumented_libraries
-        log_success "Instrumented libraries installed. Now run: $0 profile"
+        log_success "Instrumented libraries installed. Now run: $0 profile --workloads <suite.yaml>"
         ;;
     profile)
-        log_info "Running workload suite: $WORKLOAD_SUITE"
-        log_info "Profiles will be written to: $FDATA_OUTPUT_DIR"
-        "${SCRIPT_DIR}/workloads/run_workloads.sh" "$WORKLOAD_SUITE" "${EXTRA_ARGS[@]}"
+        run_workload_suite
         ;;
     merge)
         bolt_run_stages merge_fdata_files
@@ -102,7 +131,7 @@ case "$CMD" in
         bolt_run_stages setup_directories backup_libraries \
                         link_fdata_output_dir instrument_libraries \
                         install_instrumented_libraries
-        "${SCRIPT_DIR}/workloads/run_workloads.sh" "$WORKLOAD_SUITE" "${EXTRA_ARGS[@]}"
+        run_workload_suite
         bolt_run_stages merge_fdata_files optimize_libraries install_optimized_libraries
         ;;
     preflight)
