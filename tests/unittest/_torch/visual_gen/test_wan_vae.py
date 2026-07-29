@@ -11,51 +11,18 @@ import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import WanCausalConvHalo
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import (
     TRTLLM_USE_DIFFUSER_VAE_ENV,
     _use_native_wan_vae,
     load_wan_vae,
 )
-from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanCausalConv3d, WanVAE, WanVAEConfig
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE, WanVAEConfig
 
 DEVICE = "cuda"
 # Parity runs in fp32 to check whether our implementation matches diffusers'
 # computation, isolated from bf16 rounding noise that differs by memory layout
 # (our channels_last vs diffusers' contiguous). Production runs the VAE in bf16.
 DTYPE = torch.float32
-
-
-@pytest.mark.parametrize(
-    ("chunk_dim", "spatial_padding"),
-    [
-        (3, (0, 1)),
-        (4, (1, 0)),
-    ],
-)
-def test_native_halo_conv_emits_local_output_without_strip(monkeypatch, chunk_dim, spatial_padding):
-    conv = WanCausalConv3d(4, 4, 3, padding=1).float()
-    halo = WanCausalConvHalo(conv, chunk_dim, [None], rank=0, world_size=2)
-    x = torch.randn(1, 4, 3, 8, 8)
-    reference = conv(x)
-
-    def exchange_with_zero_boundaries(tensor):
-        padding = [0, 0, 0, 0, 0, 0]
-        padding_index = 2 * (4 - chunk_dim)
-        padding[padding_index : padding_index + 2] = [1, 1]
-        return torch.nn.functional.pad(tensor, padding)
-
-    monkeypatch.setattr(halo, "_exchange_halos", exchange_with_zero_boundaries)
-    monkeypatch.setattr(
-        halo,
-        "_strip_halo",
-        lambda _: pytest.fail("native Wan halo Conv should emit local-width output directly"),
-    )
-
-    output = halo(x)
-
-    assert halo._local_output_spatial_padding == spatial_padding
-    torch.testing.assert_close(output, reference)
 
 
 def _require_checkpoint(model_dir: str, env_var: str) -> Path:

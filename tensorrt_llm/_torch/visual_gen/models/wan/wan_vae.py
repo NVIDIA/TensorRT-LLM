@@ -331,16 +331,17 @@ class WanCausalConv3d(nn.Conv3d):
             x = F.pad(x, padding)
         x = _channels_last_3d_if_needed(x)
         if spatial_padding is None:
-            spatial_padding = self.padding[1:]
-        x = F.conv3d(
-            x,
-            self.weight,
-            self.bias,
-            self.stride,
-            (0, *spatial_padding),
-            self.dilation,
-            self.groups,
-        )
+            x = super().forward(x)
+        else:
+            x = F.conv3d(
+                x,
+                self.weight,
+                self.bias,
+                self.stride,
+                (0, *spatial_padding),
+                self.dilation,
+                self.groups,
+            )
         return _channels_last_3d_if_needed(x)
 
 
