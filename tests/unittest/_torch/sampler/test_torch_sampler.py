@@ -2682,7 +2682,7 @@ class TestTopPDecay:
         #   runtime = initial                    if token == reset_id
         #           = max(runtime * decay, min)  otherwise
         sampler = self._make_sampler()
-        store = sampler.store.top_p_decay_store
+        store = sampler._top_p_decay.store
         configs = [
             dict(initial=0.8, decay=0.3, top_p_min=0.5, reset_id=2),  # decay, then reset
             dict(initial=0.2, decay=0.9, top_p_min=0.1, reset_id=-1),  # plain decay, floored
@@ -2691,7 +2691,7 @@ class TestTopPDecay:
         token_steps = [[1, 2, 3], [9, 9, 9], [9, 9, 9]]
         slots = list(range(len(configs)))
         for slot, cfg in zip(slots, configs):
-            sampler._top_p_decay_slots.add(slot)
+            sampler._top_p_decay._slots.add(slot)
             store.runtime_top_p_decay_cuda[slot] = cfg["initial"]
             store.initial_top_p_decay_cuda[slot] = cfg["initial"]
             store.top_p_decay_cuda[slot] = cfg["decay"]
@@ -2704,8 +2704,8 @@ class TestTopPDecay:
         for step in range(3):
             for slot in slots:
                 sampler.store.new_tokens[0, slot, 0] = token_steps[slot][step]
-            sampler._update_top_p_decay_after_sample(
-                new_tokens_cuda=sampler.store.new_tokens, sampled_slots_cuda=slots_cuda
+            sampler._top_p_decay.update_after_sample(
+                step_tokens=sampler.store.new_tokens[0, :, 0], sampled_slots_cuda=slots_cuda
             )
             got = store.runtime_top_p_decay_cuda.cpu()
             for slot, cfg in zip(slots, configs):

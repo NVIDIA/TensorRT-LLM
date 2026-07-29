@@ -383,7 +383,7 @@ class Fusions:
     # mark_dynamic on the batch-varying dims avoids recompilation as the batch
     # composition changes. Compilation is lazy: the first decay-active request
     # pays it (roughly a second); non-decay workloads never trigger it. See
-    # TorchSampler.TopPDecayStore for the feature-level semantics.
+    # top_p_decay.TopPDecayStore for the feature-level semantics.
 
     @staticmethod
     @torch.compile(mode="max-autotune-no-cudagraphs")
@@ -420,7 +420,7 @@ class Fusions:
     ) -> None:
         """Fused in-place update of ``runtime_top_p`` for the sampled decay slots.
 
-        Applies the Top-P Decay recurrence (see ``TorchSampler.TopPDecayStore``
+        Applies the Top-P Decay recurrence (see ``top_p_decay.TopPDecayStore``
         for the feature-level semantics) to every sampled row whose slot is
         decay-active per ``is_decay_slot``.
 

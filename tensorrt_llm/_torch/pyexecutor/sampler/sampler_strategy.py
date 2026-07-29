@@ -132,7 +132,7 @@ class TopPDecayMetadata(StrategyMetadata):
     per-row top-p is gathered on-device from the per-slot ``runtime_top_p``
     store, gated by ``is_decay_slot`` (non-decay rows keep their static top-p).
     Consumed by the TopP*/TopKTopP* strategy impls in ``sample()``. See
-    ``TorchSampler.TopPDecayStore`` for the feature-level semantics.
+    ``top_p_decay.TopPDecayStore`` for the feature-level semantics.
     """
 
     slots: torch.Tensor
