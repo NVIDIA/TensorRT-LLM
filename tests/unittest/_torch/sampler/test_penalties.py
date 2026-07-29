@@ -17,11 +17,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    apply_batched_occurrence_penalties,
-    update_occurrence_workspace,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.sampler import _OccurrencePenaltyHandler
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions
+from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
+
+PenaltyHandler = TorchSampler.PenaltyHandler
+
+apply_batched_occurrence_penalties = Fusions.apply_batched_occurrence_penalties
+update_occurrence_workspace = Fusions.update_occurrence_workspace
 
 
 @pytest.fixture(autouse=True)
@@ -54,7 +56,7 @@ def _dense_penalty_reference(
     """Dense post-temperature reference for ``apply_batched_occurrence_penalties``.
 
     Follows the TorchSampler order: repetition where the token is present anywhere
-    (``counts > 0`` or the prefix bitmap), then presence + frequency where counted
+    (``counts > 0`` or the prefix mask), then presence + frequency where counted
     (``counts > 0``), followed by temperature division in the sampling strategy.
     ``rep/pre/freq/temp`` are per-row ``[A, 1]`` tensors.
     """
@@ -110,7 +112,7 @@ def _dense_presence_prefix(counts: torch.Tensor, presence: torch.Tensor) -> torc
             [0.7, 1.3, 2.0],
             False,
         ),
-        # ignored-prompt-prefix bitmap affects repetition only, not presence/frequency
+        # ignored-prompt-prefix mask affects repetition only, not presence/frequency
         ("prefix", [1.4, 1.1, 0.9], [0.4, 0.6, 0.2], [0.3, 0.1, 0.5], [1.0, 0.8, 1.6], True),
     ],
 )
@@ -124,7 +126,7 @@ def test_penalties_match_dense_logits_reference(
     use_prefix: bool,
     num_steps: int,
 ) -> None:
-    # vocab=5000 is not a multiple of BLOCK_SIZE (1024), exercising the tail mask.
+    # vocab=5000 is deliberately not a round power of two.
     A, V = len(rep), 5000
     gen = torch.Generator(device="cuda").manual_seed(sum(name.encode()) + num_steps)
     logits = torch.randn(A * num_steps, V, device="cuda", generator=gen) * 5.0
@@ -217,8 +219,8 @@ def test_penalties_indirect_indexing_bf16() -> None:
     )
     expected = orig[active_rows].clone()
     active_temperature = temp[active_slots].view(-1, 1)
-    # Recover the pre-temperature kernel output, then match its fp32-compute -> bf16-store
-    # boundary. This keeps the tolerance about Triton math, not bf16 rounding.
+    # Recover the pre-temperature op output, then match its fp32-compute -> bf16-store
+    # boundary. This keeps the tolerance about the op's fp32 math, not bf16 rounding.
     expected[active_row_mask] = (ref * active_temperature).to(torch.bfloat16)
     torch.testing.assert_close(logits[active_rows], expected, rtol=5e-3, atol=5e-3)
     torch.testing.assert_close(
@@ -342,11 +344,28 @@ def _make_handler_request(
         py_seq_slot=slot,
         py_return_log_probs=False,
         get_tokens=lambda _beam_idx: tokens,
+        # PenaltyHandler.apply runs the min-length half first; no min_length here means
+        # it short-circuits and leaves the logits to the occurrence half alone.
+        py_min_length=None,
+        max_beam_num_tokens=len(tokens),
+        py_is_draft=False,
+    )
+
+
+def _admit(handler: PenaltyHandler, request: SimpleNamespace, slot: int) -> None:
+    """Admit one request, mirroring TorchSampler.setup_sampler_step.
+
+    ``prepare_for_new_request`` only accumulates on the host; the device buffers are
+    written by the batched ``update_for_new_requests`` flush at the end of the step.
+    """
+    handler.prepare_for_new_request(request, slot=slot)
+    handler.update_for_new_requests(
+        new_seq_slots_cuda_long=torch.tensor([slot], dtype=torch.int64, device="cuda")
     )
 
 
 def _apply_handler(
-    handler: _OccurrencePenaltyHandler,
+    handler: PenaltyHandler,
     request: SimpleNamespace,
     logits: torch.Tensor,
     num_steps: int,
@@ -359,19 +378,20 @@ def _apply_handler(
         seq_slots=torch.tensor([request.py_seq_slot], dtype=torch.int64, device="cuda"),
         request_offsets=torch.zeros(1, dtype=torch.int32),
         request_num_steps=torch.tensor([num_steps], dtype=torch.int32),
+        request_num_beams=torch.ones(1, dtype=torch.int32),
     )
 
 
 def test_handler_tracks_overlap_and_commits_speculative_tail() -> None:
     vocab = 16
     slot = 2
-    handler = _OccurrencePenaltyHandler(
+    handler = PenaltyHandler(
         max_num_sequences=3,
         device="cuda",
     )
     history = [3]
     request = _make_handler_request(slot=slot, tokens=history)
-    handler.prepare_for_new_request(request, slot=slot)
+    _admit(handler, request, slot)
     new_tokens = torch.zeros(3, 3, 1, dtype=torch.int32, device="cuda")
 
     # The first apply initializes the prompt and marks the first sampled token as
@@ -443,18 +463,18 @@ def test_handler_tracks_overlap_and_commits_speculative_tail() -> None:
 
 def test_regular_handler_slot_reuse_does_not_leak_penalties() -> None:
     vocab = 16
-    handler = _OccurrencePenaltyHandler(
+    handler = PenaltyHandler(
         max_num_sequences=1,
         device="cuda",
     )
     new_tokens = torch.zeros(1, 1, 1, dtype=torch.int32, device="cuda")
 
     first = _make_handler_request(slot=0, tokens=[3, 3], prompt_ignore_length=1)
-    handler.prepare_for_new_request(first, slot=0)
+    _admit(handler, first, 0)
     _apply_handler(handler, first, torch.zeros(1, vocab, device="cuda"), 1, new_tokens)
 
     second = _make_handler_request(slot=0, tokens=[5])
-    handler.prepare_for_new_request(second, slot=0)
+    _admit(handler, second, 0)
     logits = torch.linspace(-2.0, 2.0, steps=vocab, device="cuda").view(1, vocab)
     original = logits.clone()
     _apply_handler(handler, second, logits, 1, new_tokens)
@@ -471,3 +491,25 @@ def test_regular_handler_slot_reuse_does_not_leak_penalties() -> None:
         torch.ones(1, 1, device="cuda"),
     )
     torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_handler_ignores_occurrence_penalties_with_beam_search() -> None:
+    """Beam-search requests never become penalty-active.
+
+    ``TorchSampler.validate_request`` rejects this combination at admission, so the
+    handler should only ever see beam_width == 1 requests. It stays defensive anyway:
+    a beam-search request leaves its slot inactive, and ``apply`` is then a no-op.
+    """
+    vocab = 16
+    handler = PenaltyHandler(max_num_sequences=1, device="cuda")
+    new_tokens = torch.zeros(1, 1, 1, dtype=torch.int32, device="cuda")
+
+    request = _make_handler_request(slot=0, tokens=[3, 3], beam_width=2)
+    _admit(handler, request, 0)
+
+    logits = torch.linspace(-2.0, 2.0, steps=vocab, device="cuda").view(1, vocab)
+    original = logits.clone()
+    _apply_handler(handler, request, logits, 1, new_tokens)
+
+    assert not bool(handler.store.active_cuda[0].item())
+    torch.testing.assert_close(logits, original, rtol=0, atol=0)
