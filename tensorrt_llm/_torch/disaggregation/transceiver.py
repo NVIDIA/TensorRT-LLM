@@ -171,10 +171,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             sessions: Dict[int, Any],
             include_receiver_ready: bool,
         ) -> str:
-            session_items = list(sessions.copy().items())
+            sessions_snapshot = list(sessions.values())
             status_counts = Counter()
             receiver_ready = 0
-            for _, session in session_items:
+            for session in sessions_snapshot:
                 status = session.status
                 if isinstance(status, SessionStatus):
                     status_counts[status] += 1
@@ -185,7 +185,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     receiver_ready += int(bool(session.receiver_ready))
 
             fields = [
-                f"sessions={len(session_items)}",
+                f"sessions={len(sessions_snapshot)}",
                 f"init={status_counts[SessionStatus.INIT]}",
                 f"ready_to_transfer={status_counts[SessionStatus.READY]}",
                 f"transferring={status_counts[SessionStatus.TRANSFERRING]}",
@@ -196,7 +196,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"unknown={status_counts['unknown']}",
             ]
             if include_receiver_ready:
-                fields.append(f"peer_ready={receiver_ready}/{len(session_items)}")
+                fields.append(f"peer_ready={receiver_ready}/{len(sessions_snapshot)}")
             return ", ".join(fields)
 
         tx_status = summarize(self._send_sessions, include_receiver_ready=True)
