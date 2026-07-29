@@ -1011,8 +1011,6 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
-            enable_token_budget_fallback=getattr(
-                self._llm_args, "enable_token_budget_fallback", True),
         )
 
         if not self._skip_est:
@@ -1722,8 +1720,7 @@ def _create_kv_cache_manager(
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
         kv_cache_type=None,
-        is_disagg: bool = False,
-        enable_token_budget_fallback: bool = True) -> KVCacheManager:
+        is_disagg: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2076,11 +2073,6 @@ def _create_kv_cache_manager(
                   KVCacheManager) and model_engine is not None:
         kv_cache_manager.enable_chunked_prefill = bool(
             model_engine.attn_runtime_features.chunked_prefill)
-    # Opt-out switch (TorchLlmArgs.enable_token_budget_fallback) for the
-    # prep-boundary token-budget fallback in _fit_token_budget.
-    if isinstance(kv_cache_manager, KVCacheManager):
-        kv_cache_manager.enable_token_budget_fallback = (
-            enable_token_budget_fallback)
 
     return kv_cache_manager
 

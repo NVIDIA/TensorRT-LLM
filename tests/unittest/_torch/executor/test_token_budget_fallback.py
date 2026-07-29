@@ -248,61 +248,23 @@ class TestFitTokenBudget(unittest.TestCase):
         self.assertIn(ctx1, kept)
         self.assertNotIn(ctx3, kept)
 
-    def test_fallback_can_be_disabled_via_flag(self):
-        # The fallback is opt-out (TorchLlmArgs.enable_token_budget_fallback,
-        # default True). When disabled, prepare_resources must NOT invoke
-        # _fit_token_budget, leaving the scheduled batch untouched.
-        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
-        mgr.is_draft = False
-        mgr.enable_token_budget_fallback = False
-
-        called = []
-        mgr._fit_token_budget = lambda batch: called.append(batch)
-
-        # Reproduce the gate from KVCacheManager.prepare_resources without the
-        # surrounding GPU work.
-        if not mgr.is_draft and mgr.enable_token_budget_fallback:
-            mgr._fit_token_budget(object())
-
-        self.assertEqual(called, [])
-
-        # Sanity: enabling it does call through.
-        mgr.enable_token_budget_fallback = True
-        if not mgr.is_draft and mgr.enable_token_budget_fallback:
-            mgr._fit_token_budget(object())
-        self.assertEqual(len(called), 1)
-
-    def test_torch_llm_args_flag_default_is_opt_out(self):
-        # The user-facing flag must default to enabled (opt-out semantics).
-        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-        field = TorchLlmArgs.model_fields["enable_token_budget_fallback"]
-        self.assertEqual(field.default, True)
-
-    def test_maybe_fit_token_budget_honors_flag_and_draft(self):
+    def test_maybe_fit_token_budget_skips_draft_manager(self):
         # maybe_fit_token_budget is the single entry point driven by the
-        # aggregate ResourceManager. It must apply the fallback only for the
-        # non-draft manager and only when the opt-out flag is enabled.
+        # aggregate ResourceManager. It must apply the fallback for the target
+        # manager only -- the draft-model engine builds inputs with a different
+        # token shape and its budget is handled separately.
         ctx = _FakeRequest(context_chunk_size=64, prompt_len=64)
         gen = _FakeRequest(py_beam_width=120)  # remaining = 8 -> defer ctx
 
-        # Non-draft + enabled -> defers.
+        # Non-draft -> defers.
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False)
         mgr.is_draft = False
-        mgr.enable_token_budget_fallback = True
         batch = _make_batch([ctx], [gen])
         mgr.maybe_fit_token_budget(batch)
         self.assertEqual(batch.num_context_requests, 0)
 
         # Draft manager -> never fits (handled separately).
         mgr.is_draft = True
-        batch = _make_batch([ctx], [gen])
-        mgr.maybe_fit_token_budget(batch)
-        self.assertEqual(batch.num_context_requests, 1)
-
-        # Disabled flag -> no-op.
-        mgr.is_draft = False
-        mgr.enable_token_budget_fallback = False
         batch = _make_batch([ctx], [gen])
         mgr.maybe_fit_token_budget(batch)
         self.assertEqual(batch.num_context_requests, 1)
@@ -324,7 +286,6 @@ class TestFitTokenBudget(unittest.TestCase):
             max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False
         )
         target.is_draft = False
-        target.enable_token_budget_fallback = True
         # Don't touch the GPU: only the budget fallback matters for ordering.
         target.prepare_resources = lambda batch: None
 

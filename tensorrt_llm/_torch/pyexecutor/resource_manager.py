@@ -303,7 +303,6 @@ class KVCacheManager(BaseResourceManager):
         # head_dim=512).
         pool_configurations: Optional[List[PoolConfiguration]] = None,
         enable_chunked_prefill: bool = False,
-        enable_token_budget_fallback: bool = True,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -397,10 +396,6 @@ class KVCacheManager(BaseResourceManager):
         # Defaults to False (safe: defer instead of re-chunk) and is set to the
         # finalized value by _create_kv_cache_manager.
         self.enable_chunked_prefill = enable_chunked_prefill
-        # Opt-out switch for the prep-boundary token-budget fallback
-        # (_fit_token_budget). Enabled by default; set False to restore the
-        # pre-fallback behavior. Wired from TorchLlmArgs.enable_token_budget_fallback.
-        self.enable_token_budget_fallback = enable_token_budget_fallback
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
@@ -804,10 +799,12 @@ class KVCacheManager(BaseResourceManager):
         tokens actually materialized by ``_prepare_tp_inputs`` -- for example
         when a reuse-discounted last context chunk lands next to a near-full
         generation batch (see GitHub issue #13318). Rather than letting that
-        divergence trip a hard assert and wedge the executor loop, re-validate
-        the budget here -- before any KV cache is allocated -- and gracefully
-        shed only the deferrable work (context chunks), leaving in-flight
-        generation requests untouched.
+        divergence trip the ``total_num_tokens <= max_num_tokens`` assert in
+        ``_prepare_tp_inputs`` -- which fails every request in the batch and
+        charges the executor's error budget -- re-validate the budget here,
+        before any KV cache is allocated, and gracefully shed only the
+        deferrable work (context chunks), leaving in-flight generation requests
+        untouched.
 
         Deferred context requests are simply dropped from this iteration's
         ``scheduled_batch``; they remain in the active pool and are rescheduled
@@ -920,10 +917,9 @@ class KVCacheManager(BaseResourceManager):
         orphaning those sequences and tripping a double-add (``emplaceDone``,
         kvCacheManager.cpp) when the deferred requests reschedule.
         """
-        if not self.is_draft and self.enable_token_budget_fallback:
+        if not self.is_draft:
             # The draft-model engine builds inputs with a different token shape;
-            # its budget is handled separately. Gated by an opt-out flag so the
-            # fallback can be disabled to restore pre-fallback behavior.
+            # its budget is handled separately.
             self._fit_token_budget(scheduled_batch)
 
     def _context_seq_len(self, req: LlmRequest, is_cross: bool,
