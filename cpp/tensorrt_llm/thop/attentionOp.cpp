@@ -404,7 +404,8 @@ public:
         // is not enough.
         // The attention kernel might split the heads into multiple blocks, so we might need to reserve more semaphores.
         // Use mMultiProcessorCount as the lower-bound to make sure we reserve enough semaphores.
-        op.reserveSemaphoreArray(std::max(op.mNumHeads * max_num_requests, op.getMultiProcessorCount()));
+        int32_t const maxNumSequences = max_num_requests * beam_width;
+        op.reserveSemaphoreArray(std::max(op.mNumHeads * maxNumSequences, op.getMultiProcessorCount()));
     }
 
     int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
@@ -412,8 +413,9 @@ public:
     {
         size_t const context_workspace_size = op.getWorkspaceSizeForContext(
             op.mType, max_num_requests, op.mMaxContextLength, 0, num_tokens, ctx_total_kv_len);
+        int32_t const maxNumSequences = max_num_requests * beam_width;
         size_t const generation_workspace_size = op.getWorkspaceSizeForGeneration(
-            op.mType, max_num_requests, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
+            op.mType, maxNumSequences, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
 
         return std::max(context_workspace_size, generation_workspace_size);
     }

@@ -973,36 +973,41 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(tensorrt_llm::DataType type, i
     }
 
     size_t generation_workspace_size = 0;
-    // The minimum number of sequence length tiles (limited by the shared memory size).
-    int minSeqLenTile
-        = estimate_min_multi_block_count(max_attention_window_size, mMaxSharedMemoryPerBlockOptin - 2048, size);
-    int32_t const maxSeqLenTile
-        = std::max({minSeqLenTile, getMaxNumSeqLenTile(batch_beam), (int) tc::divUp(mMultiProcessorCount, mNumHeads)});
-
-    size_t const partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
-    size_t const partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
-    size_t const partial_max_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
-    size_t const shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
-        ? 0
-        : size * batch_beam * mNumHeads * mHeadSize * max_attention_window_size;
-    size_t const cpMaxPaddedSequenceLength = (batch_beam + mCpSize - 1) / mCpSize * mCpSize;
-    size_t const cpWorkspaceSize
-        = mCpSize == 1 ? 0 : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads));
-
-    AttentionGenerationWorkspaceSizes generationWorkspaceSizes{};
-    generationWorkspaceSizes.cpWorkspace = cpWorkspaceSize;
-    generationWorkspaceSizes.partialOut = partial_out_size;
-    generationWorkspaceSizes.partialSum = partial_sum_size;
-    generationWorkspaceSizes.partialMax = partial_max_size;
-    generationWorkspaceSizes.shiftKCache = shift_k_cache_size;
+    if (!mIsMLAEnabled)
     {
-        auto const cascadeSizes
-            = tensorrt_llm::kernels::mmha::cascade::getCascadeWorkspaceSizes(batch_beam, mNumHeads, mHeadSize);
-        generationWorkspaceSizes.cascadeOut = cascadeSizes.out;
-        generationWorkspaceSizes.cascadeMax = cascadeSizes.mMax;
-        generationWorkspaceSizes.cascadeSum = cascadeSizes.lSum;
+        // MLA generation uses dedicated kernels and does not consume the MMHA generation workspace.
+        // The minimum number of sequence length tiles (limited by the shared memory size).
+        int const minSeqLenTile
+            = estimate_min_multi_block_count(max_attention_window_size, mMaxSharedMemoryPerBlockOptin - 2048, size);
+        int32_t const maxSeqLenTile = std::max({minSeqLenTile, getMaxNumSeqLenTile(batch_beam),
+            static_cast<int>(tc::divUp(mMultiProcessorCount, mNumHeads))});
+
+        size_t const partial_out_size = size * batch_beam * mNumHeads * mHeadSize * maxSeqLenTile;
+        size_t const partial_sum_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
+        size_t const partial_max_size = sizeof(float) * batch_beam * mNumHeads * maxSeqLenTile;
+        size_t const shift_k_cache_size = (!mPosShiftEnabled || isCrossAttention())
+            ? 0
+            : size * batch_beam * mNumHeads * mHeadSize * max_attention_window_size;
+        size_t const cpMaxPaddedSequenceLength = (batch_beam + mCpSize - 1) / mCpSize * mCpSize;
+        size_t const cpWorkspaceSize
+            = mCpSize == 1 ? 0 : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads));
+
+        AttentionGenerationWorkspaceSizes generationWorkspaceSizes{};
+        generationWorkspaceSizes.cpWorkspace = cpWorkspaceSize;
+        generationWorkspaceSizes.partialOut = partial_out_size;
+        generationWorkspaceSizes.partialSum = partial_sum_size;
+        generationWorkspaceSizes.partialMax = partial_max_size;
+        generationWorkspaceSizes.shiftKCache = shift_k_cache_size;
+        {
+            auto const cascadeSizes
+                = tensorrt_llm::kernels::mmha::cascade::getCascadeWorkspaceSizes(batch_beam, mNumHeads, mHeadSize);
+            generationWorkspaceSizes.cascadeOut = cascadeSizes.out;
+            generationWorkspaceSizes.cascadeMax = cascadeSizes.mMax;
+            generationWorkspaceSizes.cascadeSum = cascadeSizes.lSum;
+        }
+        generation_workspace_size
+            = AttentionWorkspaceManager::buildGenerationLayout(generationWorkspaceSizes).totalSize;
     }
-    generation_workspace_size = AttentionWorkspaceManager::buildGenerationLayout(generationWorkspaceSizes).totalSize;
 
     size_t xqa_workspace_size = 0;
     if (mEnableXQA)
