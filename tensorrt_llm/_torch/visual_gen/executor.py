@@ -522,6 +522,15 @@ def run_diffusion_worker(
             if _is_vsa and _has_ulysses:
                 os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
+        # NCCL user-buffer registration: set NCCL_CUMEM_ENABLE before
+        # init_process_group so NCCL uses VMM-backed scratch buffers.
+        # Must happen before the communicator is created.
+        _parallel_cfg = getattr(visual_gen_args, "parallel_config", None)
+        if _parallel_cfg is not None and getattr(_parallel_cfg, "nccl_buffer_reg", False):
+            from tensorrt_llm._torch.visual_gen.nccl_ub_reg import enable_nccl_cumem
+
+            enable_nccl_cumem()
+
         dist.init_process_group(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
             init_method="env://",
