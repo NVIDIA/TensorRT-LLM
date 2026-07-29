@@ -52,16 +52,7 @@ class TestDefaults:
     def test_mx_config_defaults(self):
         args = _make_args()
         assert args.mx_config.server_url is None
-        assert args.mx_config.server_query_timeout_s is None
         assert args.mx_config.preshard_strategy == "per_module"
-
-    def test_mx_server_query_timeout_accepts_nonnegative_int(self):
-        args = _make_args(checkpoint_format="MX", mx_config={"server_query_timeout_s": 1200})
-        assert args.mx_config.server_query_timeout_s == 1200
-
-    def test_mx_server_query_timeout_rejects_negative(self):
-        with pytest.raises(ValueError):
-            _make_args(checkpoint_format="MX", mx_config={"server_query_timeout_s": -1})
 
     def test_mx_preshard_strategy_accepts_per_module(self):
         args = _make_args(checkpoint_format="MX", mx_config={"preshard_strategy": "per_module"})
