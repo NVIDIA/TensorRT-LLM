@@ -1135,3 +1135,71 @@ def test_cute_dsl_gvr_topk_decode_launch_autoconfig(dtype, top_k, N, batch_size)
     _tie_aware_check(out_sec, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
     if dtype == torch.float32:
         assert torch.equal(out.sort(dim=-1).values, out_sec.sort(dim=-1).values)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cute_dsl_gvr_topk_decode_p4_exact_tail_16bit(dtype):
+    """16-bit exact-tail adversarial: two DISTINCT half-precision values in
+    ONE fine bin straddling the K boundary (window-relative binning cannot
+    separate them under a wide Phase-2 bracket — e.g. fp16 1.0 vs 1.25
+    under a [0, 65504]-scale bracket). With p4_exact_tail now default-on
+    for all dtypes the tail radix must keep every 1.25 above every 1.0."""
+    torch.manual_seed(11)
+    top_k, n = 1024, 32768
+    bs = 2
+    lo = torch.full((bs, n), -1.0, dtype=dtype, device="cuda")
+    # wide bracket anchors (force a wide Phase-2 window)
+    lo[:, :8] = torch.tensor([60000.0, 40000.0, 20000.0, 10000.0,
+                              5000.0, 2500.0, 1200.0, 600.0],
+                             device="cuda").to(dtype)
+    # boundary: (top_k - 8 - 512) high-tie values 1.25 and 1024 low-tie 1.0
+    n_hi, n_lo = top_k - 8 - 512, 1024
+    perm = torch.randperm(n - 8, device="cuda") + 8
+    hi_pos, lo_pos = perm[:n_hi], perm[n_hi:n_hi + n_lo]
+    for r in range(bs):
+        lo[r, hi_pos] = torch.tensor(1.25, dtype=dtype, device="cuda")
+        lo[r, lo_pos] = torch.tensor(1.0, dtype=dtype, device="cuda")
+    seq_lens = torch.full((bs,), n, dtype=torch.int32, device="cuda")
+    pre = torch.zeros(bs, top_k, dtype=torch.int32, device="cuda")
+    pre[:, 0] = lo.float().argmax(dim=-1).int()
+    pre[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
+    out = torch.empty(bs, top_k, dtype=torch.int32, device="cuda")
+    _GvrTopKKernel.launch(lo, pre, seq_lens, out, top_k, compress_ratio=1)
+    torch.cuda.synchronize()
+    sel = torch.gather(lo.float(), -1, out.long())
+    # every 1.25 must be selected before any 1.0 fills the remainder
+    assert int((sel == 1.25).sum()) == n_hi * bs, (
+        f"exact-tail 16-bit: {(sel == 1.25).sum()} of {n_hi * bs} "
+        f"high-tie values selected")
+    ref = torch.topk(lo.float(), top_k, dim=-1).values.sort(-1).values
+    got = sel.sort(-1).values
+    assert torch.equal(ref, got)
+
+
+def test_cute_dsl_gvr_topk_decode_pick_policy_single_source():
+    """The production runner's tuning adapter must agree with the kernel's
+    pick_cluster_size/pick_tuning single source across a shape sweep
+    (guards the de-duplicated launch-shape policy against drift)."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLGvrTopKDecodeRunner as R, )
+    num_sms = 148
+    for torch_dtype in (torch.float32, torch.bfloat16, torch.float16):
+        for num_rows in (1, 4, 32, 148, 300, 512):
+            for n in (4096, 16384, 65536, 131072, 262144):
+                for msl in (None, 262144):
+                    cs = _GvrTopKKernel.pick_cluster_size(
+                        num_rows, msl if msl is not None else n, num_sms)
+                    cfg = _GvrTopKKernel.pick_config(
+                        torch_dtype, num_rows, n, max_seq_len=msl,
+                        num_sms=num_sms)
+                    assert cfg["cluster_size"] == cs
+                    tuning = R._pick_tuning(
+                        torch_dtype, num_rows,
+                        (msl if msl is not None else n) // cs, num_sms,
+                        msl, 0)
+                    assert tuning["num_threads_per_block"] == cfg["num_threads"]
+                    assert tuning["use_256bit_load"] == cfg["use_256bit_load"]
+                    assert tuning["min_blocks_per_mp"] == cfg["min_blocks_per_mp"]
+                    assert (tuning["enable_warp_parallel_reduce"]
+                            == cfg["enable_warp_parallel_reduce"])
