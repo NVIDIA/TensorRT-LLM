@@ -33,6 +33,7 @@ from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
+from .modeling_minicpmv4_6 import MiniCPMV4_6Model
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
 from .modeling_minimaxm3 import (MiniMaxM3ForCausalLM,
                                  MiniMaxM3VLForConditionalGeneration)
@@ -49,7 +50,7 @@ from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_5 import (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM,
-                               Qwen3_5MoeVLModel)
+                               Qwen3_5MoeVLModel, Qwen3_5VLModel)
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import Qwen3VLModel
@@ -64,6 +65,7 @@ from .modeling_step3p7vl import Step3p7VLForConditionalGeneration
 from .modeling_t5 import T5ForConditionalGeneration
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
+from .modeling_whisper import WhisperForConditionalGeneration
 
 # Note: for better readiblity, this should have same order as imports above
 __all__ = [
@@ -89,6 +91,7 @@ __all__ = [
     "KimiK25ForConditionalGeneration",
     "LlamaForCausalLM",
     "LlavaNextModel",
+    "MiniCPMV4_6Model",
     "Mistral3VLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
@@ -117,6 +120,7 @@ __all__ = [
     "Qwen3_5MoeForCausalLM",
     "QwenImageBenchModel",
     "Qwen3_5MoeVLModel",
+    "Qwen3_5VLModel",
     "Qwen3NextForCausalLM",
     "Qwen3MoeVLModel",
     "GptOssForCausalLM",
@@ -129,6 +133,7 @@ __all__ = [
     "Cohere2ForCausalLM",
     "Step3p7ForCausalLM",
     "Step3p7VLForConditionalGeneration",
+    "WhisperForConditionalGeneration",
 ]
 
 if transformers.__version__ >= "4.45.1":

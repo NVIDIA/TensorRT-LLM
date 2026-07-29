@@ -70,6 +70,30 @@ class ConsumableWeightsDict:
         with self._lock:
             self._weights.update(other)
 
+    def clear(self) -> None:
+        """Drop every remaining reference.
+
+        Use once a downstream dict owns the tensors: a derived dict aliases the
+        source tensors it did not rewrite, so consuming it frees nothing while
+        this dict still holds them.
+        """
+        with self._lock:
+            self._weights.clear()
+
+    def mark_consumed_keys(self, keys) -> int:
+        """Delete an exact set of keys to free memory.
+
+        Use instead of :meth:`mark_consumed` when a module consumed specific
+        tensors rather than a whole ``name.*`` subtree.
+        """
+        deleted = 0
+        with self._lock:
+            for key in keys:
+                if key in self._weights:
+                    del self._weights[key]
+                    deleted += 1
+        return deleted
+
     def mark_consumed(self, prefix: str) -> int:
         """
         Delete all keys starting with the given prefix to free memory.

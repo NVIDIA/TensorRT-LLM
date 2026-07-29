@@ -115,24 +115,66 @@ def _build_per_rank_num_tokens(
     spec: RoutingControlSpec,
     num_tokens: int,
     world_size: int,
+    enable_dp: bool,
 ) -> List[int]:
     """Resolve ``per_rank_num_tokens`` for a workload.
 
-    Explicit ``spec.per_rank_num_tokens`` wins; otherwise tokens are split
-    evenly across ranks with any remainder on rank 0.
+    Explicit ``spec.per_rank_num_tokens`` wins; otherwise the token count per
+    rank depends on the attention-DP setting:
+
+    * ``enable_dp=True``  (DEP / DTP): tokens are DP-sharded across ranks, so
+      each rank holds ``num_tokens / world_size``.
+    * ``enable_dp=False`` (TEP / TTP): attention is tensor-parallel, so every
+      rank sees the complete batch and holds ``num_tokens``.
+
+    When an explicit list is provided its sum is validated against the expected
+    total (``num_tokens`` for DP modes, ``num_tokens * world_size`` for non-DP).
     """
     if spec.per_rank_num_tokens is None:
+        if not enable_dp:
+            return [int(num_tokens)] * world_size
         return _distribute_tokens(int(num_tokens), world_size)
+    expected_total = int(num_tokens) * (1 if enable_dp else world_size)
     return _validate_per_rank_token_list(
-        spec.per_rank_num_tokens, world_size=world_size, expected_total=int(num_tokens)
+        spec.per_rank_num_tokens, world_size=world_size, expected_total=expected_total
     )
 
 
-def _per_rank_tokens(workload: WorkloadSpec, world_size: int) -> List[int]:
+def _per_rank_tokens(workload: WorkloadSpec, world_size: int, enable_dp: bool) -> List[int]:
     """Materialize the ``per_rank_num_tokens`` list for a workload + world size."""
     return _build_per_rank_num_tokens(
-        workload.routing_control, int(workload.num_tokens), world_size
+        workload.routing_control, int(workload.num_tokens), world_size, enable_dp
     )
+
+
+def _aggregate_dispatch_source_tokens(
+    per_rank_num_tokens: List[int],
+    ep_size: int,
+    enable_dp: bool,
+) -> List[int]:
+    """Project world-rank token counts onto EP-source rows.
+
+    TRT-LLM Mapping orders MoE ranks with ``moe_ep_rank = tp_rank % moe_ep_size``.
+    In attention-DP modes each world rank owns a distinct token shard, so TP
+    shards targeting the same EP row are summed. In non-DP MoE-TP modes those TP
+    shards carry the same logical tokens, so only the first TP shard contributes
+    to the logical dispatch plan.
+    """
+    if ep_size <= 0:
+        return []
+    if len(per_rank_num_tokens) == ep_size:
+        return [int(v) for v in per_rank_num_tokens]
+
+    source_tokens = [0] * ep_size
+    if not enable_dp:
+        for ep_rank in range(ep_size):
+            if ep_rank < len(per_rank_num_tokens):
+                source_tokens[ep_rank] = int(per_rank_num_tokens[ep_rank])
+    else:
+        for rank, num_tokens in enumerate(per_rank_num_tokens):
+            source_tokens[rank % ep_size] += int(num_tokens)
+
+    return source_tokens
 
 
 def _build_dispatch_matrix(
@@ -140,18 +182,21 @@ def _build_dispatch_matrix(
     per_rank_num_tokens: List[int],
     top_k: int,
     ep_size: int,
+    enable_dp: bool,
     seed: int = 0,
 ) -> List[List[int]]:
     """Build the canonical slot ``dispatch_matrix`` for ``comm_pattern``.
 
-    Row sums always equal ``per_rank_num_tokens[src] * top_k``. The matrix is
-    a pure planning artefact: it does not enforce per-token uniqueness yet.
-    That constraint is checked at materialisation time.
+    Row sums equal the EP-source token counts projected from
+    ``per_rank_num_tokens`` times ``top_k``. When world ranks outnumber EP
+    ranks (DTP / TTP / CUSTOM MoE-TP layouts), multiple world-rank rows are
+    aggregated onto the same EP-source row.
     """
     name, kwargs = _parse_comm_pattern(comm_pattern)
+    source_tokens = _aggregate_dispatch_source_tokens(per_rank_num_tokens, ep_size, enable_dp)
     matrix: List[List[int]] = [[0] * ep_size for _ in range(ep_size)]
     for src in range(ep_size):
-        row_total = int(per_rank_num_tokens[src]) * int(top_k)
+        row_total = int(source_tokens[src]) * int(top_k)
         if row_total == 0:
             continue
         if name == "file":
@@ -309,6 +354,7 @@ def _build_routing_plan(
     top_k: int,
     num_experts: int,
     moe_ep_size: int,
+    enable_dp: bool,
 ) -> RoutingPlan:
     """Translate a ``RoutingControlSpec`` into a canonical normalised plan."""
     if moe_ep_size <= 0 or num_experts % moe_ep_size != 0:
@@ -318,11 +364,10 @@ def _build_routing_plan(
     experts_per_rank = num_experts // moe_ep_size
     if top_k > num_experts:
         raise ValueError(f"top_k ({top_k}) must be <= num_experts ({num_experts})")
-    per_rank = _build_per_rank_num_tokens(spec, num_tokens, world_size)
-    # The dispatch matrix is indexed by EP rank on both axes. The current
-    # worker only calls routing-control planning when ``moe_ep_size`` equals
-    # ``world_size`` so that this EP-axis matrix also matches the user-visible
-    # per-rank token list.
+    per_rank = _build_per_rank_num_tokens(spec, num_tokens, world_size, enable_dp)
+    # The dispatch matrix stays on EP axes. When MoE-TP makes multiple world
+    # ranks share one EP rank, the world-rank token counts are aggregated onto
+    # the corresponding EP-source row before building the matrix.
     if spec.routing_pattern_file:
         default_patterns = {("balanced_alltoall", "balanced"), ("random", "random")}
         if (spec.comm_pattern, spec.expert_pattern) not in default_patterns:
@@ -335,26 +380,32 @@ def _build_routing_plan(
         )
     else:
         dispatch_matrix = _build_dispatch_matrix(
-            spec.comm_pattern, per_rank, top_k, moe_ep_size, seed=spec.seed
+            spec.comm_pattern,
+            per_rank,
+            top_k,
+            moe_ep_size,
+            enable_dp=enable_dp,
+            seed=spec.seed,
         )
         expert_histogram = _build_expert_histogram(
             spec.expert_pattern, dispatch_matrix, experts_per_rank, moe_ep_size, seed=spec.seed
         )
 
     # Per-row sums are an invariant; emit a clearer error than the materialiser would.
+    source_tokens = _aggregate_dispatch_source_tokens(per_rank, moe_ep_size, enable_dp)
     for src in range(moe_ep_size):
-        expected = int(per_rank[src]) * int(top_k) if src < len(per_rank) else 0
+        expected = int(source_tokens[src]) * int(top_k) if src < len(source_tokens) else 0
         actual = sum(dispatch_matrix[src])
         if actual != expected:
             raise ValueError(
-                f"dispatch_matrix row {src} sums to {actual}, expected per_rank_num_tokens[{src}] * top_k = {expected}"
+                f"dispatch_matrix row {src} sums to {actual}, expected aggregate source tokens * top_k = {expected}"
             )
     # Global expert histogram total must match total slots.
-    total_slots = sum(int(t) for t in per_rank) * int(top_k)
+    total_slots = sum(int(t) for t in source_tokens) * int(top_k)
     hist_total = sum(sum(row) for row in expert_histogram)
     if hist_total != total_slots:
         raise ValueError(
-            f"expert_histogram sum={hist_total} must equal sum(per_rank_num_tokens) * top_k = {total_slots}"
+            f"expert_histogram sum={hist_total} must equal aggregate source tokens * top_k = {total_slots}"
         )
 
     return RoutingPlan(

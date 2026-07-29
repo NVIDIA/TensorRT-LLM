@@ -117,7 +117,9 @@ def test_qwen_image_bench_config_uses_internal_arch_and_normalizes_text(tmp_path
         "linear_attention",
         "full_attention",
     ]
-    assert extract_mamba_kv_cache_params(config.text_config).mamba_ssm_cache_dtype is torch.float32
+    # The declared mamba_ssm_dtype=float32 (SSM compute intent) is deliberately
+    # not used for cache allocation; the cache stays in the weights dtype.
+    assert extract_mamba_kv_cache_params(config.text_config).mamba_ssm_cache_dtype is torch.bfloat16
 
 
 def test_qwen3_5_conditional_text_config_does_not_use_image_bench_arch(tmp_path):

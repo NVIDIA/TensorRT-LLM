@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 import time
@@ -96,6 +111,14 @@ class WanImageToVideoPipeline(BasePipeline):
             pipeline_config.primary_pretrained_config, "boundary_ratio", None
         )
         self.is_wan22_14b = self.boundary_ratio is not None
+
+        _sa_cfg = pipeline_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for Wan I2V."
+            )
 
         super().__init__(pipeline_config)
 
@@ -228,7 +251,6 @@ class WanImageToVideoPipeline(BasePipeline):
             self.vae = load_wan_vae(
                 checkpoint_dir,
                 device,
-                self.pipeline_config.visual_gen_mapping,
                 dtype=self.pipeline_config.torch_dtype,
             )
 
@@ -334,15 +356,13 @@ class WanImageToVideoPipeline(BasePipeline):
 
             if not self.is_wan22_14b:
                 self._apply_teacache_coefficients(WAN_I2V_TEACACHE_COEFFICIENTS)
-                self._setup_cache_acceleration()
-            else:
-                if self.pipeline_config.cache_backend == "cache_dit":
-                    self._setup_cache_acceleration()
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
 
+        # Wan 2.2 TeaCache validation; cache acceleration itself is enabled by
+        # the loader after torch.compile (see PipelineLoader.load).
         if (
             self.transformer is not None
             and self.transformer_2 is not None
@@ -355,7 +375,6 @@ class WanImageToVideoPipeline(BasePipeline):
                     "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
                     "There is no built-in coefficient table for Wan 2.2."
                 )
-            self._setup_cache_acceleration()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         dummy_image = PIL.Image.new("RGB", (width, height))

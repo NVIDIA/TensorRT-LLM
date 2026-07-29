@@ -17,6 +17,7 @@
 #include <tuple>
 
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
@@ -87,24 +88,25 @@ TEST_P(LookaheadAlgorithmTest, predict)
     auto shape = ITensor::makeShape({maxTokensPerStep});
     auto shape2d = ITensor::makeShape({maxTokensPerStep, maxTokensPerStep});
     auto shapeSingle = ITensor::makeShape({1});
-    TensorPtr posidMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
-    TensorPtr attentionMaskMax = BufferManager::cpu(shape2d, nvinfer1::DataType::kBOOL);
-    TensorPtr inputLengthPtr = BufferManager::cpu(shapeSingle, nvinfer1::DataType::kINT32);
+    TensorPtr posidMax = BufferManager::cpu(shape, tensorrt_llm::DataType::kINT32);
+    TensorPtr attentionMaskMax = BufferManager::cpu(shape2d, tensorrt_llm::DataType::kBOOL);
+    TensorPtr inputLengthPtr = BufferManager::cpu(shapeSingle, tensorrt_llm::DataType::kINT32);
     auto& inputLength(*BufferRange<SizeType32>(*inputLengthPtr).begin());
 
-    TensorPtr outputMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
-    TensorPtr endIdPtr = BufferManager::cpu(shapeSingle, nvinfer1::DataType::kINT32);
+    TensorPtr outputMax = BufferManager::cpu(shape, tensorrt_llm::DataType::kINT32);
+    TensorPtr endIdPtr = BufferManager::cpu(shapeSingle, tensorrt_llm::DataType::kINT32);
     auto& endId(*BufferRange<TokenIdType>(*endIdPtr).begin());
     endId = ascii->getEndToken();
 
-    TensorPtr acceptedMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
-    TensorPtr acceptedOffsetsMax = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
-    TensorPtr acceptedLengthPtr = BufferManager::cpu(shapeSingle, nvinfer1::DataType::kINT32);
+    TensorPtr acceptedMax = BufferManager::cpu(shape, tensorrt_llm::DataType::kINT32);
+    TensorPtr acceptedOffsetsMax = BufferManager::cpu(shape, tensorrt_llm::DataType::kINT32);
+    TensorPtr acceptedLengthPtr = BufferManager::cpu(shapeSingle, tensorrt_llm::DataType::kINT32);
     auto& acceptedLength(*BufferRange<SizeType32>(*acceptedLengthPtr).begin());
 
-    TensorPtr sequence = BufferManager::cpu(ITensor::makeShape({maxSeqLen + maxDraftLen}), nvinfer1::DataType::kINT32);
+    TensorPtr sequence
+        = BufferManager::cpu(ITensor::makeShape({maxSeqLen + maxDraftLen}), tensorrt_llm::DataType::kINT32);
     BufferRange<TokenIdType> sequenceRange(*sequence);
-    TensorPtr sequenceLengthPtr = BufferManager::cpu(shapeSingle, nvinfer1::DataType::kINT32);
+    TensorPtr sequenceLengthPtr = BufferManager::cpu(shapeSingle, tensorrt_llm::DataType::kINT32);
     auto& sequenceLength(*bufferCast<SizeType32>(*sequenceLengthPtr));
 
     std::copy(promptRange.begin(), promptRange.end(), sequenceRange.begin());
@@ -224,13 +226,13 @@ TEST(LookaheadAlgorithmTest, treeEncodeTest)
         auto shape = inputTokens->getShape();
         auto shape2d = ITensor::makeShape({shape.d[0], shape.d[0]});
 
-        TensorPtr inputMasks = BufferManager::cpu(shape2d, nvinfer1::DataType::kBOOL);
+        TensorPtr inputMasks = BufferManager::cpu(shape2d, tensorrt_llm::DataType::kBOOL);
         LookaheadAlgorithm::posIdsToMask(inputMasks, inputPosIds);
 
-        TensorPtr outputTokens = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
-        TensorPtr outputPosIds = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
-        TensorPtr encodeMap = BufferManager::cpu(shape, nvinfer1::DataType::kINT32);
-        TensorPtr outputMasks = BufferManager::cpu(shape2d, nvinfer1::DataType::kBOOL);
+        TensorPtr outputTokens = BufferManager::cpu(shape, tensorrt_llm::DataType::kINT32);
+        TensorPtr outputPosIds = BufferManager::cpu(shape, tensorrt_llm::DataType::kINT32);
+        TensorPtr encodeMap = BufferManager::cpu(shape, tensorrt_llm::DataType::kINT32);
+        TensorPtr outputMasks = BufferManager::cpu(shape2d, tensorrt_llm::DataType::kBOOL);
 
         // auto len = LookaheadAlgorithm::treeEncode(outputTokens, outputPosIds, outputMasks, inputTokens, inputPosIds,
         // inputMasks, '$', 9);

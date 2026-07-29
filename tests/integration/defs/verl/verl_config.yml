@@ -11,12 +11,21 @@ verl_config:
       git clone -b v2.5.1 https://github.com/NVIDIA/gdrcopy.git &&
       (cd gdrcopy && make prefix=/usr/local lib_install) &&
       rm -rf gdrcopy
-    # Install nvshmem
-    - "pip install nvidia-nvshmem-cu13==3.3.20"
-    # Create nvshmem symlink (needed before DeepEP build)
+    # DeepEP's deep_ep_cpp extension hard-links against the static device archive
+    # (-l:libnvshmem_device.a) and the host lib (-l:libnvshmem_host.so), neither of
+    # which the NGC PyTorch base image ships (it provides only libnvshmem_host.so.3
+    # + a bitcode device lib under CUDA, no static .a and no nvidia.nvshmem package).
+    # So install the nvidia-nvshmem-cu13 wheel, but PIN it to 3.6.5 -- the exact
+    # NVSHMEM version this container's torch was built against (its libtorch_nvshmem.so
+    # needs nvshmem_selected_device_transport@NVSHMEM, which only a matching version
+    # exports). An unpinned/newer wheel would shadow torch's copy on LD_LIBRARY_PATH
+    # and break `import torch`. Then expose the wheel at a stable NVSHMEM_DIR and add
+    # the libnvshmem_host.so symlink DeepEP links by soname-less name.
     - >-
-      (cd /usr/local/cuda/targets/x86_64-linux/lib &&
-      [ -e libnvshmem_host.so ] || ln -s libnvshmem_host.so.3 libnvshmem_host.so)
+      pip3 install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 &&
+      NVSHMEM_PKG=$(python3 -c "import nvidia.nvshmem as n; print(list(n.__path__)[0])") &&
+      ln -sfn "$NVSHMEM_PKG" /opt/nvshmem &&
+      (cd /opt/nvshmem/lib && [ -e libnvshmem_host.so ] || ln -sf libnvshmem_host.so.3 libnvshmem_host.so)
     # Install DeepEP
     - >-
       git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git &&
@@ -36,7 +45,7 @@ verl_config:
 
   # The environment variables to expose in the container before setting up
   env_vars:
-    - "NVSHMEM_DIR=/usr/local/cuda/targets/x86_64-linux"
+    - "NVSHMEM_DIR=/opt/nvshmem"
     - "LD_LIBRARY_PATH=\"${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH\""
     - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
     - "TRTLLM_TEST_MODEL_PATH_ROOT=/tmp/verl-models"

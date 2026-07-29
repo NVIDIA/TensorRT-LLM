@@ -17,7 +17,7 @@
 
 #include "cutlass/gemm_coord.h"
 #include "tensorrt_llm/common/config.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -29,7 +29,7 @@ int64_t getGroupedGemmParamsWorkSpaceSize(int64_t problem_count);
 void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkspace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
-    bool isLoraIn, nvinfer1::DataType dataType, int minKN, cudaStream_t stream);
+    bool isLoraIn, tensorrt_llm::DataType dataType, int minKN, cudaStream_t stream);
 
 } // namespace kernels
 

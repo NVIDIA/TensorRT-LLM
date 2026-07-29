@@ -78,12 +78,17 @@ class PipelineOutput:
     denoise: float = 0.0
     post_denoise: float = 0.0
 
-    def to_handle(self) -> None:
-        """Replace media tensors with handle dicts in place (avoids pickling the full blob over IPC)."""
+    def to_handle(self, local: bool = False) -> None:
+        """Replace media tensors with handle dicts in place (avoids pickling the full blob over IPC).
+
+        ``local=True`` (producer and consumer share a process, e.g. external launch)
+        keeps the tensor in-process instead of using cross-process CUDA IPC."""
         for f in fields(self):
             t = getattr(self, f.name)
             if isinstance(t, torch.Tensor):
-                setattr(self, f.name, SharedTensorContainer.from_tensor(t).dump_to_dict())
+                setattr(
+                    self, f.name, SharedTensorContainer.from_tensor(t, local=local).dump_to_dict()
+                )
 
     def to_tensor(self) -> None:
         """Rebuild media tensors from handle dicts, in place. ``clone()`` so the client

@@ -119,7 +119,7 @@ class SAWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self._max_draft_len
 
-    def forward(
+    def _forward_impl(
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,

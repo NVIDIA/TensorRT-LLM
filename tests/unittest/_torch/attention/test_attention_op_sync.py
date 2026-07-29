@@ -42,15 +42,12 @@ import textwrap
 import typing
 from dataclasses import fields
 
-import pytest
-
 from tensorrt_llm._torch.attention_backend.fmha.fallback import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
     FallbackFmha,
 )
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxKernelParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 # Roots used as the LHS of attribute chains at the call site. Match the
@@ -59,7 +56,6 @@ _SOURCE_CLASSES = {
     "attn": TrtllmAttention,
     "metadata": TrtllmAttentionMetadata,
     "forward_args": AttentionForwardArgs,
-    "skip_softmax_kernel_params": SkipSoftmaxKernelParams,
 }
 
 _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -74,13 +70,26 @@ _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
         "metadata",
         ("max_total_draft_tokens",),
     ),
+    "skip_softmax_threshold_scale_factor_decode": (
+        "forward_args",
+        (
+            "skip_softmax_kernel_params",
+            "threshold_scale_factor_decode",
+        ),
+    ),
+    "skip_softmax_threshold_scale_factor_prefill": (
+        "forward_args",
+        (
+            "skip_softmax_kernel_params",
+            "threshold_scale_factor_prefill",
+        ),
+    ),
     "workspace_": ("metadata", ("effective_workspace",)),
 }
 
 # The C++ attention() declaration is the single source of truth for kwarg
 # names, ordering, and types.
 _HEADER = pathlib.Path(__file__).resolve().parents[4] / ("cpp/tensorrt_llm/thop/attentionOp.h")
-_THOP_SYNC_NVBUG = pytest.mark.skip(reason="https://nvbugs/6336801")
 
 
 # ---- C++ declaration parser -------------------------------------------------
@@ -459,7 +468,6 @@ def test_each_source_attr_kwarg_resolves_uniquely():
                 )
 
 
-@_THOP_SYNC_NVBUG
 def test_attr_kwarg_names_match_source_leaf_attrs_except_allowlisted_aliases():
     """Most ``thop.attention`` kwargs should bind to a source attribute with
     the same name. Existing aliases must stay explicit so new semantic
@@ -560,7 +568,6 @@ def _verify_consumed(cls, chains: set[tuple[str, ...]], excluded=frozenset()):
             )
 
 
-@_THOP_SYNC_NVBUG
 def test_every_forward_args_field_is_consumed():
     """Recursively check that every dataclass field reachable from
     ``AttentionForwardArgs`` (including nested sub-bags such as

@@ -680,3 +680,8 @@ class LagunaHfWeightMapper(HfWeightMapper):
                 updated[new_wn] = wv
             del module_weights
             module.load_weights(weights=[updated], allow_partial_loading=allow_partial_loading)
+
+
+@register_mapper("HF", "DFlashLagunaForCausalLM")
+class DFlashLagunaHfWeightMapper(LagunaHfWeightMapper):
+    """The DFlash drafter is a Laguna model; reuse Laguna's weight mapper."""

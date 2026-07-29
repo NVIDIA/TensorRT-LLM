@@ -90,12 +90,17 @@ def _resolve_mapping_layout(config: ConfigSpec, world_size: int) -> Tuple[int, i
 def _build_mapping_from_config(config: ConfigSpec, world_size: int) -> Mapping:
     """Build ``Mapping`` from a ``ConfigSpec`` + world size; sets ``rank=mpi_rank()``."""
     moe_ep, moe_tp, enable_dp = _resolve_mapping_layout(config, world_size)
+    # gpus_per_node must match actual visible GPUs per node so that
+    # mapping.local_rank (= rank % gpus_per_node) gives the correct device index.
+    # The Mapping default (8) is wrong for multi-node runs with fewer GPUs per node.
+    gpus_per_node = torch.cuda.device_count()
     mapping = Mapping(
         world_size=world_size,
         tp_size=world_size,
         moe_ep_size=moe_ep,
         moe_tp_size=moe_tp,
         enable_attention_dp=enable_dp,
+        gpus_per_node=gpus_per_node,
     )
     mapping.rank = mpi_rank()
     return mapping
@@ -124,7 +129,7 @@ def _create_routing_method(
             topk_group=topk_group,
             routed_scaling_factor=1.0,
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
-            is_fused=False,
+            is_fused=True,
         )
 
     if routing_method_cls is MiniMaxM2MoeRoutingMethod:

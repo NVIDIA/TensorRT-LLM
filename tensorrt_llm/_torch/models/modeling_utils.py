@@ -1,10 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import inspect
 import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from typing import (Any, Dict, Generic, List, Literal, Optional, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from torch import nn
@@ -374,6 +378,72 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
+    @staticmethod
+    def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:
+        """Whether the checkpoint stores a quantized lm_head (a weight scale).
+
+        Used to decide lm_head quantization for homogeneous checkpoints, which
+        carry no explicit per-layer quant entry. Reads only the safetensors
+        header for ``lm_head.weight_scale`` (no weight load).
+        """
+        checkpoint_dir = getattr(config.pretrained_config, "_name_or_path",
+                                 None)
+        if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+            return False
+        return ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, "lm_head.weight_scale") is not None
+
+    @staticmethod
+    def _resolve_lm_head_quant_config(
+            config: ModelConfig[TConfig]) -> Optional[QuantConfig]:
+        """Resolve the quant config for lm_head, or None to keep it unquantized.
+
+        lm_head is quantized only when the checkpoint actually stores a
+        quantized lm_head: MIXED_PRECISION checkpoints carry an explicit
+        per-layer entry in ``quant_config_dict``; homogeneous checkpoints have
+        no per-layer entry, so we additionally require the checkpoint to carry
+        an ``lm_head`` weight scale. (A bf16 lm_head is commonly left OUT of
+        ``exclude_modules``, so "not excluded" alone must NOT imply quantized —
+        otherwise a homogeneous checkpoint with a bf16 lm_head would be built
+        quantized and fail / change its logits.) Several further cases force it
+        back to unquantized.
+        """
+        if config.quant_config_dict is not None:
+            quant_config = config.quant_config_dict.get("lm_head")
+        elif (config.quant_config is not None
+              and config.quant_config.quant_algo is not None and
+              DecoderModelForCausalLM._checkpoint_has_lm_head_scale(config)):
+            quant_config = config.quant_config
+        else:
+            quant_config = None
+        if quant_config is None:
+            return None
+
+        # exclude_modules always wins (an FP16 lm_head is listed there).
+        if (config.quant_config is not None
+                and config.quant_config.is_module_excluded_from_quantization(
+                    "lm_head")):
+            return None
+
+        # Tied embeddings replace lm_head.weight with the dense bf16 embedding
+        # weight, which would silently clash with a quantized (packed) weight.
+        if getattr(config.pretrained_config, 'tie_word_embeddings', False):
+            logger.info("Ignoring lm_head quant entry: tie_word_embeddings "
+                        "shares the dense embedding weight, so lm_head stays "
+                        "unquantized")
+            return None
+
+        # lm_head TP in ADP slices the dense weight at forward time for the
+        # spec-decoding head (see LMHead.forward), which is incompatible with
+        # quantized (packed) weights — LMHead rejects that at construction.
+        if (config.mapping.enable_attention_dp
+                and config.mapping.enable_lm_head_tp_in_adp):
+            logger.info("Ignoring lm_head quant entry: lm_head TP in ADP "
+                        "slices the dense weight, so lm_head stays unquantized")
+            return None
+
+        return quant_config
+
     def __init__(self, model: TModel, *, config: ModelConfig[TConfig],
                  hidden_size: int, vocab_size: int):
         super().__init__()
@@ -383,15 +453,18 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
 
+        # Quant config for lm_head (applies to both the attention-DP replicated
+        # and TP lm_head below); None keeps it unquantized.
+        lm_head_quant_config = self._resolve_lm_head_quant_config(config)
+
         if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
+                quant_config=lm_head_quant_config,
             )
         else:
-            # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
-            # will considering per layer QuantConfig in the future.
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
@@ -403,16 +476,22 @@ class DecoderModelForCausalLM(nn.Module,
                         self.has_custom_lm_head = True
                         vocab_size = lora_loader.vocab_size
 
+            # A custom LoRA lm_head replaces the checkpoint weight with a
+            # dense bf16 tensor, so the quant entry must not apply.
+            if self.has_custom_lm_head:
+                lm_head_quant_config = None
+
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
+                gather_output=config.lm_head_gather_output,
                 reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
+                quant_config=lm_head_quant_config,
             )
 
             if self.has_custom_lm_head:
@@ -582,8 +661,40 @@ class DecoderModelForCausalLM(nn.Module,
 
         The returned dict is deep-merged with the user's llm_args, with
         user-set values taking priority over these defaults.
+
+        Note: ``cache_transceiver_config`` is rejected here (enforced at
+        load time) — the deep-merge could materialize or silently enable a
+        transceiver config the user did not turn on. Use
+        :meth:`get_preferred_transceiver_runtime` instead.
         """
         return {}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+            cls,
+            pretrained_config: Any = None
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Return the model's preferred KV-cache transceiver runtime.
+
+        Subclasses can override this to opt into a specific transceiver
+        implementation ('CPP' or 'PYTHON') that is adopted when the user
+        leaves ``cache_transceiver_config.transceiver_runtime`` at its
+        default 'auto'. Return None to defer to the global default (C++).
+
+        Args:
+            pretrained_config: the loaded HF pretrained config (may be None
+                on paths where no config was loaded). Implementation classes
+                shared by several architectures can inspect e.g.
+                ``pretrained_config.architectures`` to differentiate per
+                checkpoint.
+
+        This preference is intentionally kept out of the generic
+        :meth:`get_model_defaults` deep-merge: it must not materialize a
+        ``cache_transceiver_config`` when disaggregated serving is disabled,
+        and it is only honored when the effective backend supports it (the
+        Python transceiver requires NIXL).
+        """
+        return None
 
     @property
     def config(self):
@@ -853,7 +964,7 @@ def get_model_architecture(
             model_config.architectures) > 0:
         cls = MODEL_CLASS_MAPPING.get(model_config.architectures[0])
     else:
-        raise RuntimeError(f"Model architecture is not provided.")
+        raise RuntimeError("Model architecture is not provided.")
 
     if cls is None:
         arch = model_config.architectures[0]
@@ -1073,16 +1184,28 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                             module.load_weights(
                                 weights=[module_weights],
                                 allow_partial_loading=allow_partial_loading)
+                        loaded_own_params = None
                     else:
+                        loaded_own_params = []
                         for n, p in module.named_parameters(recurse=False):
                             if not allow_partial_loading:
                                 assert n in module_weights
                             if n in module_weights:
                                 p.data.copy_(module_weights[n][:])
+                                loaded_own_params.append(n)
 
-                    # Mark consumed weights
+                    # Only a module handed the full `name.*` subtree may
+                    # consume it wholesale. Otherwise just its own
+                    # `recurse=False` params were loaded, and since
+                    # `named_modules()` is pre-order, consuming the subtree
+                    # would drop weights its descendants have not loaded yet --
+                    # they would silently keep uninitialized weights.
                     if hasattr(weights, 'mark_consumed'):
-                        weights.mark_consumed(name)
+                        if loaded_own_params is None:
+                            weights.mark_consumed(name)
+                        elif loaded_own_params:
+                            weights.mark_consumed_keys(
+                                f'{name}.{n}' for n in loaded_own_params)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
@@ -1174,6 +1297,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                             module_name,
                             module_weights,
                             allow_partial_loading=allow_partial_loading)
+                        # Handed the full subtree, like the `load_weights` case.
+                        loaded_own_params = None
                     elif hasattr(module, 'load_weights'):
                         if "linear_attn.conv1d" in name:
                             module_weights['weight'] = module_weights[
@@ -1186,7 +1311,9 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                             module.load_weights(
                                 weights=[module_weights],
                                 allow_partial_loading=allow_partial_loading)
+                        loaded_own_params = None
                     else:
+                        loaded_own_params = []
                         for n, p in module.named_parameters(recurse=False):
                             weight_mapper.handle_manual_copy(
                                 module_name,
@@ -1194,10 +1321,16 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                 n,
                                 p,
                                 allow_partial_loading=allow_partial_loading)
+                            loaded_own_params.append(n)
 
-                    # Mark consumed weights
+                    # Consume precisely what was loaded; see the matching
+                    # comment in `_load_weights_impl`.
                     if hasattr(weights, 'mark_consumed'):
-                        weights.mark_consumed(name)
+                        if loaded_own_params is None:
+                            weights.mark_consumed(name)
+                        elif loaded_own_params:
+                            weights.mark_consumed_keys(
+                                f'{name}.{n}' for n in loaded_own_params)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:

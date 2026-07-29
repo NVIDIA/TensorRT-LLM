@@ -7,6 +7,7 @@ Tests cover:
 - VANILLA backend (PyTorch SDPA)
 - TRTLLM backend (fmha_v2)
 - Backend equivalence comparison
+- Fused QK-norm + RoPE TP gating
 
 Note: With random weights, attention can produce NaN due to numerical instability.
       These tests use scaled inputs and primarily verify correct output shapes.
@@ -34,14 +35,28 @@ class TestFluxAttentionBackend(unittest.TestCase):
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    def _create_config(self, backend: str) -> DiffusionModelConfig:
-        """Create DiffusionModelConfig with specified backend."""
+    def _create_config(self, backend: str, tp_size: int = 1) -> DiffusionModelConfig:
+        """Create DiffusionModelConfig with specified backend and TP size."""
         return DiffusionModelConfig(
             pretrained_config=SimpleNamespace(),
             quant_config=QuantConfig(),
-            mapping=Mapping(),
+            mapping=Mapping(world_size=tp_size, tp_size=tp_size),
             attention=AttentionConfig(backend=backend),
         )
+
+    def test_fused_qk_norm_rope_enabled_only_for_tp1(self) -> None:
+        """Test FLUX enables fused QK-norm + RoPE only when TP=1."""
+        from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
+
+        for tp_size, expected in ((1, True), (2, False)):
+            with self.subTest(tp_size=tp_size):
+                attn = FluxJointAttention(
+                    hidden_size=128,
+                    num_attention_heads=2,
+                    head_dim=64,
+                    config=self._create_config("VANILLA", tp_size=tp_size),
+                )
+                self.assertEqual(attn.fuse_qk_norm_rope, expected)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_vanilla_backend_sanity(self):

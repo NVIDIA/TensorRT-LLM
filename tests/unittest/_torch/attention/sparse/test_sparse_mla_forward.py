@@ -2001,8 +2001,9 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         **kv_cache_manager_kwargs,
     )
 
-    AttentionCls = get_attention_backend("TRTLLM",
-                                         sparse_attention_config=sparse_config)
+    sparse_params = sparse_config.to_sparse_params(
+        pretrained_config=model_config.pretrained_config)
+    AttentionCls = get_attention_backend("TRTLLM", sparse_params=sparse_params)
 
     # Allocate and pre-populate KV cache in batch order [context...][generation...]
 
