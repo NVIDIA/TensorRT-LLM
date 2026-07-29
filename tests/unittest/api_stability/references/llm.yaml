@@ -87,6 +87,10 @@ methods:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
+      encoder_cuda_graph_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig]
+        default: null
+        status: prototype
       multimodal_config:
         annotation: tensorrt_llm.llmapi.llm_args.MultimodalConfig
         default: null

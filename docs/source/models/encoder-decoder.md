@@ -42,7 +42,7 @@ The following table describes the supported and recommended configurations.
 | Beam search | Yes with V1 | Configure `max_beam_width` when constructing `LLM`, then set `use_beam_search=True` in `SamplingParams`. |
 | Attention backend | `TRTLLM` | Use this backend for encoder-decoder models. It is required when `tensor_parallel_size > 1`. |
 | Decoder CUDA graphs | Yes | `CudaGraphConfig` captures decoder work. V1 supports greedy and beam search; V2 supports its single-beam path. |
-| Encoder CUDA graphs | No | `EncodeCudaGraphConfig` is disabled for encoder-decoder models. The encoder runs eagerly. |
+| Encoder CUDA graphs | Yes | Set `encoder_cuda_graph_config=EncodeCudaGraphConfig(...)` and `encoder_max_batch_size`. The `TRTLLM` attention backend is required. |
 | Overlap scheduler | Yes | Enabled by default. V1 supports greedy decoding and beam search; V2 remains limited to `max_beam_width=1`. |
 | Tensor parallelism | Yes | Use `tensor_parallel_size > 1` with `attn_backend="TRTLLM"`. Attention head counts must be divisible by the TP size. |
 | Pipeline parallelism | No | Keep `pipeline_parallel_size=1`. |
@@ -319,12 +319,12 @@ to return only the best hypothesis.
 Beam search expands decoder-side cache and compute requirements. Include this
 expansion when sizing the self-attention KV pool and CUDA graph batch sizes.
 
-## Enable decoder CUDA graphs
+## Enable encoder and decoder CUDA graphs
 
-Pass `CudaGraphConfig` to capture and replay decoder iterations:
+Configure the decoder and encoder graph grids separately:
 
 ```python
-from tensorrt_llm.llmapi import CudaGraphConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, EncodeCudaGraphConfig
 
 
 llm = LLM(
@@ -332,8 +332,15 @@ llm = LLM(
     backend="pytorch",
     attn_backend="TRTLLM",
     max_batch_size=8,
+    encoder_max_batch_size=8,
     cuda_graph_config=CudaGraphConfig(
         max_batch_size=8,
+        enable_padding=True,
+    ),
+    encoder_cuda_graph_config=EncodeCudaGraphConfig(
+        batch_sizes=[1, 2, 4, 8],
+        num_tokens=[128, 256, 512, 1024, 2048, 4096],
+        seq_lens=[128, 256, 512, 1024],
         enable_padding=True,
     ),
     kv_cache_config=KvCacheConfig(
@@ -343,14 +350,17 @@ llm = LLM(
 )
 ```
 
-This configuration captures decoder work only; the encoder continues to run
-eagerly. With beam search, graph batch sizes must cover the active decoder
-sequences after beam expansion. Padding lets nearby runtime batch sizes reuse a
-captured graph.
+`cuda_graph_config` controls decoder and mixed decoder graphs.
+`encoder_cuda_graph_config` controls encoder-forward graph buckets for batch
+size, total packed tokens, and maximum sequence length. The
+`encoder_max_batch_size` value is the hard encoder capacity and admission
+limit. With beam search, decoder graph batch sizes must cover the active
+decoder sequences after beam expansion.
 
-Do not use `EncodeCudaGraphConfig` for an encoder-decoder model. The runtime
-warns and disables it. Piecewise CUDA graphs through `TorchCompileConfig` are
-also unsupported for this model type.
+Passing `EncodeCudaGraphConfig` through `cuda_graph_config` remains unsupported
+for encoder-decoder models; pass it through `encoder_cuda_graph_config`
+instead. Piecewise CUDA graphs through `TorchCompileConfig` are also
+unsupported for this model type.
 
 ## Control the overlap scheduler
 
@@ -566,11 +576,12 @@ Check all of the following:
 - `pipeline_parallel_size=1` and `context_parallel_size=1`.
 - `enable_attention_dp=False`.
 
-### CUDA graphs do not capture the encoder
+### Encoder CUDA graphs fall back to eager execution
 
-This is expected. `CudaGraphConfig` accelerates decoder iterations only. The
-encoder path runs eagerly, and `EncodeCudaGraphConfig` is disabled for
-encoder-decoder models.
+Check that `encoder_cuda_graph_config` and `encoder_max_batch_size` are set,
+that the encoder graph buckets cover the request shape, and that
+`attn_backend="TRTLLM"`. Unsupported shapes and attention backends fall back to
+eager encoder execution.
 
 ### Output quality differs from the Hugging Face example
 

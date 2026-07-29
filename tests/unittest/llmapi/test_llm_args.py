@@ -1511,6 +1511,56 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.seq_lens == [8, 32]
         assert args.cuda_graph_config.max_seq_len == 32
 
+    def test_encoder_decoder_cuda_graph_configs(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            cuda_graph_config=DecodeCudaGraphConfig(
+                batch_sizes=[1, 4],
+                enable_padding=True,
+            ),
+            encoder_cuda_graph_config=EncodeCudaGraphConfig(
+                batch_sizes=[1, 4],
+                num_tokens=[16, 64],
+                seq_lens=[8, 32],
+                enable_padding=True,
+            ),
+        )
+
+        assert isinstance(args.cuda_graph_config, DecodeCudaGraphConfig)
+        assert isinstance(args.encoder_cuda_graph_config, EncodeCudaGraphConfig)
+        assert args.encoder_cuda_graph_config.batch_sizes == [1, 4]
+        assert args.encoder_cuda_graph_config.num_tokens == [16, 64]
+        assert args.encoder_cuda_graph_config.seq_lens == [8, 32]
+
+    def test_encoder_cuda_graph_config_requires_encoder_max_batch_size(self):
+        with pytest.raises(ValidationError,
+                           match=("encoder_cuda_graph_config requires "
+                                  "encoder_max_batch_size")):
+            TorchLlmArgs(
+                model=llama_model_path,
+                encoder_cuda_graph_config=EncodeCudaGraphConfig(
+                    batch_sizes=[1, 4],
+                    num_tokens=[16, 64],
+                    seq_lens=[8, 32],
+                    enable_padding=True,
+                ),
+            )
+
+    def test_encoder_cuda_graph_config_requires_shape_dimensions(self):
+        with pytest.raises(
+                ValidationError,
+                match=("encoder_cuda_graph_config requires "
+                       "num_tokens/max_num_token and seq_lens/max_seq_len")):
+            TorchLlmArgs(
+                model=llama_model_path,
+                encoder_max_batch_size=4,
+                encoder_cuda_graph_config=EncodeCudaGraphConfig(
+                    batch_sizes=[1, 4],
+                    enable_padding=True,
+                ),
+            )
+
     def test_cuda_graph_config_infers_encode_mode_from_raw_dict(self):
         args = TorchLlmArgs(
             model=llama_model_path,

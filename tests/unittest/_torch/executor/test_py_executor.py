@@ -16,7 +16,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -145,17 +145,46 @@ def _make_async_encoder_executor(future):
     return executor
 
 
-def _make_encoder_batch_wait_executor():
+def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8):
     executor = object.__new__(PyExecutor)
     executor.max_batch_size = 32
+    batch_sizes = batch_sizes or [1, 2, 4, 8]
+    executor.llm_args = types.SimpleNamespace(
+        encoder_cuda_graph_config=types.SimpleNamespace(
+            batch_sizes=batch_sizes,
+            enable_padding=True,
+            num_tokens=[96],
+            seq_lens=[512],
+        ),
+        encoder_max_batch_size=encoder_max_batch_size,
+    )
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
 
 
-def test_encoder_microbatch_graph_waits_for_target(monkeypatch):
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+def test_encoder_graph_warmup_uses_runtime_encoder_stream():
+    executor = object.__new__(PyExecutor)
+    executor.device_id = 3
+    executor.encoder_stream = Mock()
+    executor.resource_manager = object()
+    executor.model_engine = Mock()
+    stream_context = MagicMock()
+
+    with (
+        patch("torch.cuda.set_device") as set_device,
+        patch("torch.cuda.stream", return_value=stream_context) as cuda_stream,
+    ):
+        executor._warmup_encoder_decoder_encoder_cuda_graphs()
+
+    set_device.assert_called_once_with(3)
+    cuda_stream.assert_called_once_with(executor.encoder_stream)
+    executor.model_engine._warmup_encoder_decoder_encoder_cuda_graphs.assert_called_once_with(
+        executor.resource_manager
+    )
+
+
+def test_encoder_microbatch_graph_waits_for_target():
     executor = _make_encoder_batch_wait_executor()
     encoder_requests = [object()] * 7
     generation_requests = [object()] * 24
@@ -170,9 +199,7 @@ def test_encoder_microbatch_graph_waits_for_target(monkeypatch):
     assert executor.encoder_batch_wait_iters_count == 1
 
 
-def test_encoder_microbatch_graph_releases_target(monkeypatch):
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+def test_encoder_microbatch_graph_releases_target():
     executor = _make_encoder_batch_wait_executor()
     encoder_requests = [object()] * 8
 
@@ -186,9 +213,7 @@ def test_encoder_microbatch_graph_releases_target(monkeypatch):
     assert executor.encoder_batch_wait_iters_count == 0
 
 
-def test_encoder_microbatch_graph_does_not_release_partial_at_low_watermark(monkeypatch):
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+def test_encoder_microbatch_graph_does_not_release_partial_at_low_watermark():
     executor = _make_encoder_batch_wait_executor()
     encoder_requests = [object()]
 
@@ -202,9 +227,7 @@ def test_encoder_microbatch_graph_does_not_release_partial_at_low_watermark(monk
     assert executor.encoder_batch_wait_iters_count == 1
 
 
-def test_encoder_microbatch_graph_caps_scheduler_overfill(monkeypatch):
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+def test_encoder_microbatch_graph_caps_scheduler_overfill():
     executor = _make_encoder_batch_wait_executor()
     encoder_requests = [object() for _ in range(12)]
 
@@ -218,9 +241,7 @@ def test_encoder_microbatch_graph_caps_scheduler_overfill(monkeypatch):
     assert executor.encoder_batch_wait_iters_count == 0
 
 
-def test_encoder_microbatch_graph_releases_supported_tail_at_deadline(monkeypatch):
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE", "8")
-    monkeypatch.setenv("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK", "24")
+def test_encoder_microbatch_graph_releases_supported_tail_at_deadline():
     executor = _make_encoder_batch_wait_executor()
     executor.encoder_batch_wait_iters_count = executor.batch_wait_timeout_iters
     encoder_requests = [object() for _ in range(7)]
@@ -232,6 +253,45 @@ def test_encoder_microbatch_graph_releases_supported_tail_at_deadline(monkeypatc
     )
 
     assert scheduled == encoder_requests[:4]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_encoder_microbatch_graph_uses_configured_batch_sizes_at_deadline():
+    executor = _make_encoder_batch_wait_executor(batch_sizes=[1, 3, 6], encoder_max_batch_size=8)
+    executor.encoder_batch_wait_iters_count = executor.batch_wait_timeout_iters
+    encoder_requests = [object() for _ in range(5)]
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [],
+    )
+
+    assert scheduled == encoder_requests[:3]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_encoder_microbatch_graph_waits_above_low_watermark_after_deadline():
+    executor = _make_encoder_batch_wait_executor()
+    executor.encoder_batch_wait_iters_count = executor.batch_wait_timeout_iters
+    encoder_requests = [object() for _ in range(8)]
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object() for _ in range(25)],
+    )
+
+    assert scheduled == []
+    assert executor.encoder_batch_wait_iters_count == executor.batch_wait_timeout_iters + 1
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object() for _ in range(24)],
+    )
+
+    assert scheduled == encoder_requests
     assert executor.encoder_batch_wait_iters_count == 0
 
 

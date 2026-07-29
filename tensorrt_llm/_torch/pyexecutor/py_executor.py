@@ -831,6 +831,12 @@ class PyExecutor:
             max_workers=1, thread_name_prefix="encoder-launch")
                                         if self.is_encoder_decoder else None)
         self.pending_encoder_steps: List[PendingEncoderStep] = []
+        if self.encoder_launch_executor is not None:
+            # CUDA graph capture inherits per-thread CUDA library state. Capture
+            # on the same single worker that owns every runtime encoder replay.
+            self.encoder_stream.wait_stream(self.execution_stream)
+            self.encoder_launch_executor.submit(
+                self._warmup_encoder_decoder_encoder_cuda_graphs).result()
 
         self.is_warmup = False
 
@@ -5276,42 +5282,54 @@ class PyExecutor:
             self.encoder_batch_wait_iters_count = 0
             return encoder_requests
 
-        microbatch_graph_max_batch_size = int(
-            os.environ.get(
-                "TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_MAX_BATCH_SIZE",
-                "0"))
-        microbatch_admission_enabled = (os.environ.get(
-            "TLLM_ENCODER_DECODER_MICROBATCH_ADMISSION_ENABLED", "1") == "1")
-        if (microbatch_graph_max_batch_size > 0
-                and microbatch_admission_enabled):
-            microbatch_target = min(microbatch_graph_max_batch_size,
-                                    self.max_batch_size)
-            decoder_occupancy = (len(context_requests) +
-                                 len(generation_requests))
-            decoder_low_watermark = int(
-                os.environ.get("TLLM_ENCODER_DECODER_MICROBATCH_LOW_WATERMARK",
-                               str(self.max_batch_size - microbatch_target)))
-            deadline_reached = (self.encoder_batch_wait_iters_count
-                                >= self.batch_wait_timeout_iters)
+        encoder_max_batch_size = self.llm_args.encoder_max_batch_size
+        encoder_cuda_graph_config = self.llm_args.encoder_cuda_graph_config
+        if (encoder_max_batch_size is not None
+                and encoder_cuda_graph_config is not None
+                and bool(encoder_cuda_graph_config.num_tokens)
+                and bool(encoder_cuda_graph_config.seq_lens)):
+            encoder_batch_size_limit = min(encoder_max_batch_size,
+                                           self.max_batch_size)
+            configured_batch_sizes = (encoder_cuda_graph_config.batch_sizes
+                                      or [])
+            supported_batch_sizes = [
+                batch_size for batch_size in configured_batch_sizes
+                if batch_size <= encoder_batch_size_limit
+            ]
+            if (encoder_cuda_graph_config.enable_padding
+                    and any(batch_size > encoder_batch_size_limit
+                            for batch_size in configured_batch_sizes) and
+                (not supported_batch_sizes
+                 or supported_batch_sizes[-1] != encoder_batch_size_limit)):
+                supported_batch_sizes.append(encoder_batch_size_limit)
 
-            if (len(encoder_requests) >= microbatch_target
-                    and decoder_occupancy <= decoder_low_watermark):
-                self.encoder_batch_wait_iters_count = 0
-                return encoder_requests[:microbatch_target]
+            if supported_batch_sizes:
+                microbatch_target = supported_batch_sizes[-1]
+                decoder_occupancy = (len(context_requests) +
+                                     len(generation_requests))
+                decoder_low_watermark = (self.max_batch_size -
+                                         microbatch_target)
+                deadline_reached = (self.encoder_batch_wait_iters_count
+                                    >= self.batch_wait_timeout_iters)
 
-            if deadline_reached:
-                supported_batch_sizes = [
-                    batch_size for batch_size in (1, 2, 4, 8)
-                    if batch_size <= microbatch_target
-                ]
-                fallback_batch_size = max(
-                    batch_size for batch_size in supported_batch_sizes
-                    if batch_size <= len(encoder_requests))
-                self.encoder_batch_wait_iters_count = 0
-                return encoder_requests[:fallback_batch_size]
+                if decoder_occupancy <= decoder_low_watermark:
+                    if len(encoder_requests) >= microbatch_target:
+                        self.encoder_batch_wait_iters_count = 0
+                        return encoder_requests[:microbatch_target]
 
-            self.encoder_batch_wait_iters_count += 1
-            return []
+                    if deadline_reached:
+                        releasable_batch_sizes = [
+                            batch_size for batch_size in supported_batch_sizes
+                            if batch_size <= len(encoder_requests)
+                        ]
+                        fallback_batch_size = (
+                            releasable_batch_sizes[-1] if releasable_batch_sizes
+                            else min(len(encoder_requests), microbatch_target))
+                        self.encoder_batch_wait_iters_count = 0
+                        return encoder_requests[:fallback_batch_size]
+
+                self.encoder_batch_wait_iters_count += 1
+                return []
 
         num_scheduled_tokens = sum(request.encoder_output_len
                                    for request in encoder_requests)
@@ -5404,6 +5422,20 @@ class PyExecutor:
     # micro-batch; this preserves the cross-KV lifecycle and the
     # dual-pool budget.
     # ---------------------------------------------------------------
+    def _warmup_encoder_decoder_encoder_cuda_graphs(self) -> None:
+        """Capture encoder graphs on the worker used for runtime replay."""
+        warmup = getattr(
+            self.model_engine,
+            "_warmup_encoder_decoder_encoder_cuda_graphs",
+            None,
+        )
+        if not callable(warmup):
+            return
+
+        torch.cuda.set_device(self.device_id)
+        with torch.cuda.stream(self.encoder_stream):
+            warmup(self.resource_manager)
+
     def _submit_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
         """Queue encoder work without blocking the decoder executor thread."""
         executor = self.encoder_launch_executor
