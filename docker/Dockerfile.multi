@@ -106,7 +106,6 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
-COPY benchmarks benchmarks
 COPY cpp cpp
 COPY docker docker
 COPY scripts scripts
@@ -136,7 +135,6 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=cpp/include,target=/mnt/ctx/include \
     --mount=type=bind,source=examples,target=/mnt/ctx/examples \
     --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/mnt/wheel \
-    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/benchmarks,target=/mnt/benchmarks \
     # Copy build context files
     cp /mnt/ctx/README.md ./ && \
     cp -r /mnt/ctx/docs ./docs && \
@@ -145,7 +143,6 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     chmod -R a+w examples && \
     # Copy wheel stage outputs
     cp /mnt/wheel/tensorrt_llm*.whl ./ && \
-    cp -r /mnt/benchmarks ./benchmarks && \
     # Create a symlink to installed package libraries
     ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
     test -f lib/libtensorrt_llm.so && \
