@@ -421,6 +421,31 @@ class KvCacheCreator:
                                                   KVCacheManagerV2)
         self._draft_config = draft_config
         self._skip_est = skip_est
+        self._maybe_enable_fabric_memory_for_python_transceiver()
+
+    def _maybe_enable_fabric_memory_for_python_transceiver(self) -> None:
+        """Default TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 for the Python
+        transceiver on the C++ V1 KV cache manager.
+
+        The Python transceiver (KvCacheTransceiverV2) transfers KV blocks
+        directly out of the C++ pool, so the pool should be allocated with
+        fabric memory to enable MNNVL transfers. This must run before any
+        pool allocation because the C++ env getter caches the value on first
+        read. Explicit user settings are respected, and platforms without
+        fabric memory support fall back to standard allocation in C++.
+        """
+        if (self._cache_transceiver_config is None
+                or self._cache_transceiver_config.backend is None or
+                self._cache_transceiver_config.transceiver_runtime != "PYTHON"):
+            return
+        if not issubclass(self._kv_cache_manager_cls, KVCacheManager):
+            return
+        if os.environ.get("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY") is None:
+            os.environ["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
+            logger.info(
+                "Python cache transceiver with C++ KV cache manager detected; "
+                "defaulting TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 (set it "
+                "to 0 explicitly to disable)")
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -860,6 +885,17 @@ class KvCacheCreator:
             logger.info(
                 "KV cache size estimation is not supported for Vanilla attention backend, disable it."
             )
+        if getattr(model_config, "is_encoder_decoder", False):
+            # The estimation dummies are text-only, and the cross-KV block
+            # accounting needs an encoder length (getEncoderOutputLen throws).
+            # _skip_est (not just the local flag) so build_managers runs
+            # configure_kv_cache_capacity(), which KVCacheManagerV2 needs for
+            # its memory quota — the TRTLLM_SKIP_KV_CACHE_ESTIMATION=1 path.
+            self._skip_est = True
+            estimating_kv_cache = False
+            logger.info(
+                "KV cache size estimation is not supported for encoder-decoder "
+                "models, disable it.")
 
         if estimating_kv_cache:
             estimate_max_tokens = self._get_token_num_for_estimation()
@@ -2692,6 +2728,17 @@ def create_py_executor_instance(
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
 
+    # For enc-dec models max_seq_len covers the (longer) encoder sequence, so
+    # cap the executor's per-request max_tokens at the decoder position table
+    # (max_target_positions).
+    executor_max_seq_len = max_seq_len
+    if model_engine.model.model_config.is_encoder_decoder:
+        decoder_position_limit = getattr(config, "max_target_positions", None)
+        if (decoder_position_limit is not None
+                and executor_max_seq_len is not None):
+            executor_max_seq_len = min(executor_max_seq_len,
+                                       int(decoder_position_limit))
+
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -2715,7 +2762,7 @@ def create_py_executor_instance(
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         kv_connector_manager=kv_connector_manager,
         resource_governor_queue=resource_governor_queue,
-        max_seq_len=max_seq_len,
+        max_seq_len=executor_max_seq_len,
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
