@@ -334,6 +334,19 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
     api = load_internal_apis()
     model_cls, hf_view = _lookup_model_cls(model_dir)
 
+    # Runtime BEFORE V2, like serving: the V2 resolver's disagg gating reads
+    # cache_cfg.transceiver_runtime and treats an unresolved "auto" as non-PYTHON.
+    if getattr(cache_cfg, "transceiver_runtime", None) == "auto":
+        try:
+            shim = types.SimpleNamespace(cache_transceiver_config=cache_cfg)
+            api.resolve_transceiver_runtime_auto(shim, model_cls, hf_view)
+        except Exception as e:  # noqa: BLE001 - fall back to the create() default (CPP)
+            print(
+                f"[precheck] WARNING: transceiver_runtime 'auto' resolution failed "
+                f"({e!r}); create_kv_cache_transceiver will fall back to CPP",
+                flush=True,
+            )
+
     setting = side["use_kv_cache_manager_v2"]
     if setting == "auto":
         defaults = {}
@@ -348,8 +361,11 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
         try:
             # The REAL serving resolver, via the same shim pattern as the
             # runtime resolution below -- one owner for the 'auto' semantics.
+            # cache_transceiver_config feeds the resolver's disagg gating
+            # (a V2 model default requires the NIXL Python transceiver).
             shim = types.SimpleNamespace(
-                kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2="auto")
+                kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2="auto"),
+                cache_transceiver_config=cache_cfg,
             )
             use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, defaults))
         except Exception as e:  # noqa: BLE001 - fall back like a missing model
@@ -359,17 +375,6 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
             use_v2 = False
     else:
         use_v2 = bool(setting)
-
-    if getattr(cache_cfg, "transceiver_runtime", None) == "auto":
-        try:
-            shim = types.SimpleNamespace(cache_transceiver_config=cache_cfg)
-            api.resolve_transceiver_runtime_auto(shim, model_cls, hf_view)
-        except Exception as e:  # noqa: BLE001 - fall back to the create() default (CPP)
-            print(
-                f"[precheck] WARNING: transceiver_runtime 'auto' resolution failed "
-                f"({e!r}); create_kv_cache_transceiver will fall back to CPP",
-                flush=True,
-            )
     return use_v2
 
 

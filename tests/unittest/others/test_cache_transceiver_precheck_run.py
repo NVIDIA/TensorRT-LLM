@@ -389,7 +389,11 @@ class TestInternalApiContract:
     def test_serving_resolvers(self, api):
         import inspect
 
-        assert len(inspect.signature(api.resolve_kv_cache_manager_v2_auto).parameters) == 2
+        # The driver calls resolve_kv_cache_manager_v2_auto(shim, defaults):
+        # the first two params are fixed, anything added later must default.
+        v2 = inspect.signature(api.resolve_kv_cache_manager_v2_auto).parameters
+        assert list(v2)[:2] == ["llm_args", "model_defaults_dict"]
+        assert all(p.default is not inspect.Parameter.empty for p in list(v2.values())[2:])
         rt = inspect.signature(api.resolve_transceiver_runtime_auto).parameters
         assert list(rt)[:1] == ["llm_args"] and len(rt) >= 3
 
