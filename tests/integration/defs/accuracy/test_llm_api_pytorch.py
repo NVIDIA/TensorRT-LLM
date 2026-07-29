@@ -16,7 +16,6 @@ import asyncio
 import json
 import os
 import sys
-import time
 from unittest import mock
 
 import pytest
@@ -3603,9 +3602,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             (8, 1, 8, 3, False, 16, "TRTLLM", True, True),
         ],
         ids=["baseline", "mtp3_fp8kv_chunked"])
-    def test_nvfp4_multi_gpus_breakable_cuda_graph(
-            self, tp_size, pp_size, ep_size, mtp_nextn, attention_dp,
-            max_batch_size, moe_backend, fp8kv, chunked_prefill):
+    def test_nvfp4_multi_gpus_breakable_cuda_graph(self, tp_size, pp_size,
+                                                   ep_size, mtp_nextn,
+                                                   attention_dp, max_batch_size,
+                                                   moe_backend, fp8kv,
+                                                   chunked_prefill):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")

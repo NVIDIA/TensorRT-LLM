@@ -1976,6 +1976,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             PyTorchModelEngine
 
         class FakeDist:
+
             def __init__(self, decisions):
                 self.decisions = decisions
 
@@ -1991,8 +1992,9 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
         all_rank_num_tokens = [1, 129, 1, 1]
         engine.dist = FakeDist([True, True, True, True])
-        assert engine._get_padding_params(
-            1, 0, all_rank_num_tokens) == (256, True, [256] * 4)
+        assert engine._get_padding_params(1, 0,
+                                          all_rank_num_tokens) == (256, True,
+                                                                   [256] * 4)
 
         engine.dist = FakeDist([True, False, True, True])
         assert engine._get_padding_params(

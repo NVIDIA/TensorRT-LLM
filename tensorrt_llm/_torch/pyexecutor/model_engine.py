@@ -834,7 +834,8 @@ class PyTorchModelEngine(ModelEngine):
                 raise ValueError(
                     "breakable prefill CUDA graph requires a decoder model body"
                 )
-            self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(decoder_model.model)
+            self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(
+                decoder_model.model)
 
         # Create Encoder CUDA graph config and runner.
         encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
@@ -2118,8 +2119,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager):
         """Capture configured CUDA graphs for context/prefill steps."""
-        if (self.prefill_cuda_graph_backend
-                == PrefillCudaGraphBackend.DISABLED
+        if (self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
                 or (self.prefill_cuda_graph_backend
                     == PrefillCudaGraphBackend.PIECEWISE
                     and not self._torch_compile_enabled)):
@@ -2179,10 +2179,10 @@ class PyTorchModelEngine(ModelEngine):
                 if self.breakable_cuda_graph_runner is not None:
                     with self.no_cuda_graph():
                         self.breakable_cuda_graph_runner.warmup(
-                            lambda: self.forward(
-                                batch,
-                                new_tensors_device=None,
-                                resource_manager=resource_manager),
+                            lambda: self.forward(batch,
+                                                 new_tensors_device=None,
+                                                 resource_manager=
+                                                 resource_manager),
                             steps=1)
                 else:
                     self.forward(batch,
@@ -3163,8 +3163,7 @@ class PyTorchModelEngine(ModelEngine):
             return self._prefill_cuda_graph_num_tokens[bisect.bisect_left(
                 self._prefill_cuda_graph_num_tokens, tokens)]
 
-        if (self.prefill_cuda_graph_backend
-                != PrefillCudaGraphBackend.DISABLED
+        if (self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED
                 and self._prefill_cuda_graph_num_tokens):
             max_captured_num_tokens = self._prefill_cuda_graph_num_tokens[-1]
             if attn_all_rank_num_tokens is not None:
@@ -4000,7 +3999,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = \
             self._get_padding_params(num_requests, 0, attn_all_rank_num_tokens)
-        set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
+        set_per_request_prefill_cuda_graph_flag(can_run_piecewise_cuda_graph)
         attn_metadata.padded_num_tokens = (
             padded_num_tokens if padded_num_tokens != num_requests else None)
         virtual_num_tokens = num_requests
@@ -6546,8 +6545,10 @@ class PyTorchModelEngine(ModelEngine):
                             inputs,
                             gather_ids=gather_ids,
                             gather_context_logits=gather_context_logits)
+
                 if not can_run_graph:
-                    if (breakable_runner is not None and breakable_runner.is_capturing):
+                    if (breakable_runner is not None
+                            and breakable_runner.is_capturing):
                         return breakable_runner.capture_model_body(forward_step)
 
                     num_tokens = inputs['input_ids'].shape[0]

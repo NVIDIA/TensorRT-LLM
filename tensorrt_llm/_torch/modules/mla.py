@@ -2715,9 +2715,7 @@ class MLA(nn.Module):
         dsv4_cos_sin_cache = None
         if enable_dsv4_epilogue_fusion:
             assert self.is_deepseek_v4
-            dsv4_output, o_lora_bmm_input_scale = (
-                self._create_dsv4_epilogue_buffers(q, num_tokens)
-            )
+            dsv4_output, o_lora_bmm_input_scale = self._create_dsv4_epilogue_buffers(q, num_tokens)
             dsv4_cos_sin_cache = self.inverse_rotary_emb.rotary_cos_sin
 
         attn_out_latent = self._attn_forward_gen(
@@ -2892,9 +2890,7 @@ class MLA(nn.Module):
         dsv4_cos_sin_cache = None
         if enable_dsv4_epilogue_fusion:
             assert self.is_deepseek_v4
-            dsv4_output, o_lora_bmm_input_scale = (
-                self._create_dsv4_epilogue_buffers(q, num_tokens)
-            )
+            dsv4_output, o_lora_bmm_input_scale = self._create_dsv4_epilogue_buffers(q, num_tokens)
             dsv4_cos_sin_cache = self.inverse_rotary_emb.rotary_cos_sin
 
         attn_out_latent = self._attn_forward_gen(
