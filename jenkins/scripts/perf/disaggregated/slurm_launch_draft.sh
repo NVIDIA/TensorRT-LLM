@@ -55,12 +55,28 @@ for i in $(seq 0 $((numGenServers - 1))); do
     gen_world_size=$((nodesPerGenServer * gpusPerNodePerGenServer))
     export DISAGG_SERVING_TYPE="GEN_$i"
     export pytestCommand="$pytestCommandGENWorker"
-    srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
-        -N $nodesPerGenServer \
-        -w "${genNodeLists[$i]}" \
-        --ntasks=$gen_world_size \
-        --ntasks-per-node=$gpusPerNodePerGenServer \
-        $runScript &> $testOutputDir/gen_server_$i.log &
+    # End-of-write sentinel: gen_server_$i.log is the srun's &> aggregate of
+    # every gen-worker rank (the per-iter prev_device_step_time lines the
+    # benchmark parses live only here, not in trtllm-serve.GEN_*.log). The
+    # file descriptor is owned by this srun, so the log is only guaranteed
+    # fully flushed once the srun is reaped. Run srun in the foreground of a
+    # backgrounded subshell and touch gen_server_$i.done immediately after it
+    # returns: the benchmark srun blocks on that sentinel before parsing, so
+    # it never reads a truncated / not-yet-flushed log (nvbugs 6487036 /
+    # 6487040). A stale sentinel from a re-run output dir is removed first.
+    # Note: srun is foreground inside the subshell (not `srun ... &` + a
+    # `kill -0` poll) so `touch` runs strictly after reap, with no
+    # late-zombie race that could either skip or prematurely fire the signal.
+    rm -f "$testOutputDir/gen_server_$i.done"
+    (
+        srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
+            -N $nodesPerGenServer \
+            -w "${genNodeLists[$i]}" \
+            --ntasks=$gen_world_size \
+            --ntasks-per-node=$gpusPerNodePerGenServer \
+            $runScript &> $testOutputDir/gen_server_$i.log
+        touch "$testOutputDir/gen_server_$i.done"
+    ) &
     echo "Started gen server $i on ${genNodeLists[$i]}"
     sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
 done
