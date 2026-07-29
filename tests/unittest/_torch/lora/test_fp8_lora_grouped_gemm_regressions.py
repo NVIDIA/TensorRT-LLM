@@ -155,12 +155,13 @@ def test_fp8_grouped_gemm_dispatch_has_explicit_unsupported_cutlass_guard(filena
 
 
 @pytest.mark.parametrize("filename", ["groupGemm.cu", "cuda_graph_grouped_gemm.cu"])
-def test_fp8_grouped_gemm_dispatch_requires_sm90_or_newer(filename):
+def test_fp8_grouped_gemm_dispatch_requires_sm90(filename):
     source = _kernel_source(filename)
 
     assert "getSMVersion()" in source
-    assert "smVersion >= 90" in source
-    assert "requires Hopper (SM90) or newer" in source
+    assert "smVersion == 90" in source
+    assert "requires Hopper (SM90)" in source
+    assert "SM120/SM121" in source
 
 
 def test_fp8_grouped_gemm_alignment_checks_require_multiples_of_16():

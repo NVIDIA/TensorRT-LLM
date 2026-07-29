@@ -53,8 +53,9 @@ void checkFp8CudaGraphAlignment(
     cutlass::gemm::GemmCoord const* hostMaxProblemSizesPtr, int problemCount, int minKN, char const* kernelName)
 {
     static int const smVersion = tensorrt_llm::common::getSMVersion();
+    // CUTLASS also exposes this kernel level on SM120/SM121; enable those after validation.
     TLLM_CHECK_WITH_INFO(
-        smVersion >= 90, "%s requires Hopper (SM90) or newer, but the current device is SM%d", kernelName, smVersion);
+        smVersion == 90, "%s requires Hopper (SM90), but the current device is SM%d", kernelName, smVersion);
 
     TLLM_CHECK_WITH_INFO(minKN >= kFp8TmaAlignment && minKN % kFp8TmaAlignment == 0,
         "%s requires active LoRA ranks to be multiples of %d elements for 128-bit TMA alignment. "
@@ -387,7 +388,7 @@ void cudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problem
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         TLLM_CHECK_WITH_INFO(false,
-            "FP8 CUDA graph grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper sm90+ "
+            "FP8 CUDA graph grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper SM90 "
             "kernels).");
     }
 #endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
@@ -575,7 +576,7 @@ void cudaGraphSplitKGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int p
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         TLLM_CHECK_WITH_INFO(false,
-            "FP8 CUDA graph split-K grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper sm90+ "
+            "FP8 CUDA graph split-K grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper SM90 "
             "kernels).");
     }
 #endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED

@@ -53,8 +53,9 @@ namespace
 void checkFp8GroupedGemmAlignment(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, char const* kernelName)
 {
     int const smVersion = tensorrt_llm::common::getSMVersion();
+    // CUTLASS also exposes this kernel level on SM120/SM121; enable those after validation.
     TLLM_CHECK_WITH_INFO(
-        smVersion >= 90, "%s requires Hopper (SM90) or newer, but the current device is SM%d", kernelName, smVersion);
+        smVersion == 90, "%s requires Hopper (SM90), but the current device is SM%d", kernelName, smVersion);
 
     for (size_t problemIdx = 0; problemIdx < problemSizes.size(); ++problemIdx)
     {
@@ -260,7 +261,7 @@ void groupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::
 #ifdef ENABLE_FP8
 
 // ====================================================================
-// FP8 grouped GEMM using CUTLASS 3.x collective API (Hopper sm90+).
+// FP8 grouped GEMM using CUTLASS 3.x collective API (Hopper SM90).
 //
 // The legacy CUTLASS 2.x DefaultGemmGrouped does NOT support fp8 element
 // types. This implementation uses the CUTLASS 3.x CollectiveBuilder and
@@ -492,7 +493,7 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         TLLM_CHECK_WITH_INFO(
-            false, "FP8 grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper sm90+ kernels).");
+            false, "FP8 grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper SM90 kernels).");
     }
 #endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
 #endif // ENABLE_FP8
