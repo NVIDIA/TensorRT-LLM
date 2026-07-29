@@ -255,6 +255,14 @@ class HaloExchangeConv2dStride2(nn.Module):
         else:
             raise ValueError(f"chunk_dim={chunk_dim} not supported for stride-2")
 
+    def _adj_group(self, index: int) -> dist.ProcessGroup:
+        group = self.adj_groups[index]
+        if group is None:
+            raise RuntimeError(
+                f"Missing VAE adjacent process group {index} for local rank {self.rank}"
+            )
+        return group
+
     def _recv_from_right(self, x: torch.Tensor) -> torch.Tensor:
         """Receive halo context from the right neighbor.
 
@@ -270,24 +278,15 @@ class HaloExchangeConv2dStride2(nn.Module):
         right_context = None
         if self.rank != self.world_size - 1:
             right_context = torch.zeros_like(send_left)
-            right_group = self.adj_groups[self.rank]
-            if right_group is None:
-                raise RuntimeError(
-                    f"Missing VAE adjacent process group {self.rank} for local rank {self.rank}"
-                )
+            right_group = self._adj_group(self.rank)
             right_global_rank = dist.get_global_rank(right_group, 1)
             dist.recv(right_context, src=right_global_rank, group=right_group)
         if self.rank != 0:
-            left_group = self.adj_groups[self.rank - 1]
-            if left_group is None:
-                raise RuntimeError(
-                    f"Missing VAE adjacent process group {self.rank - 1} for local rank {self.rank}"
-                )
+            left_group = self._adj_group(self.rank - 1)
             left_global_rank = dist.get_global_rank(left_group, 0)
             dist.send(send_left, dst=left_global_rank, group=left_group)
 
-        if self.rank != self.world_size - 1:
-            assert right_context is not None
+        if right_context is not None:
             # Match the halo slice's layout to ``x`` so the cat preserves
             # channels-last (see ``_spatial_channels_last_format``).
             mf = _spatial_channels_last_format(x)
