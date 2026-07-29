@@ -27,8 +27,9 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 
 from ..llm_request import LlmRequest, get_draft_token_length
+from .ops.vanilla import Fusions
 from .sampler_common import _request_get_sampling_params
-from .sampler_strategy import Fusions, TopPDecayMetadata, top_p_decay_active
+from .sampler_strategy import TopPDecayMetadata, top_p_decay_active
 
 __all__ = ["TopPDecayHandler", "TopPDecayStore"]
 

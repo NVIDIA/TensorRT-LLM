@@ -99,9 +99,11 @@ from .logprobs import (
     store_logprobs_list_to_request,
 )
 from .sampler_common import (
+    DEFAULT_BEAM_IDX,
+    DEFAULT_STEP_IDX,
+    FinishReasonsList,
     _get_max_beam_width,
     _request_get_sampling_params,
-    _request_strategy,
     add_token,
     int_tensor,
 )
@@ -115,6 +117,7 @@ from .sampler_strategy import (
     Strategy,
     StrategyMetadata,
     TopPDecayMetadata,
+    _request_strategy,
     get_rejected_indices,
     sample,
     sample_rejected,
@@ -945,14 +948,6 @@ class _UnpackedStepIndexer(_StridedStepIndexTranslator):
             )
         else:
             raise ValueError(f"Invalid dim_order: {dim_order}")
-
-
-# Beam index to use when no beam search is used but a beam index is required
-DEFAULT_BEAM_IDX = 0
-# Step index to use when no speculative decoding is used but a step index is required
-DEFAULT_STEP_IDX = 0
-
-FinishReasonsList: TypeAlias = list[list[list[int]]]
 
 
 @dataclass(kw_only=True)

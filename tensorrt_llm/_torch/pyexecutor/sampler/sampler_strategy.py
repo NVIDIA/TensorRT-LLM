@@ -12,10 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helper functions for sampling.
+"""Sampling strategies: what to draw, and how to get there from a request.
 
-Code in this module should operate on logits and probs, without
-referring to types like LlmRequest.
+Two layers live here. The bulk of the module -- strategy resolution, the
+strategy implementations and the grouped samplers -- operates purely on logits
+and probs. At the end sits ``_request_strategy``, the one helper that maps an
+``LlmRequest`` onto a :data:`Strategy`; it is here rather than in
+``sampler_common`` because deciding a strategy is precisely what this module
+does.
+
+The plain per-request queries it builds on (``_request_get_sampling_params``
+and friends) live in ``sampler_common``, so feature modules that only need to
+read a request's sampling config -- token bans, top-p decay, penalties -- can
+do so without importing this module.
 """
 
 import abc
@@ -52,6 +61,13 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
 )
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.sampling_params import SamplingParams
+
+from ..llm_request import LlmRequest
+from .sampler_common import (
+    UtilsSamplingParams,
+    _request_get_sampling_params,
+    _request_sampling_params_cachable,
+)
 
 # Ops imported above are re-exported for dependent modules (sampler, drafting
 # loops, tests). mypy runs in strict mode (no implicit re-export), so they must
@@ -93,34 +109,6 @@ Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSe
 
 # Re-exported from the beam-search op implementation (single source of truth).
 BEAM_SEARCH_PAD_TOKEN = vanilla.BEAM_SEARCH_PAD_TOKEN
-
-
-@dataclass(frozen=True, kw_only=True)
-class UtilsSamplingParams:
-    """Subset of tensorrt_llm::runtime::SamplingConfig supported by sampling_utils.
-
-    Args:
-        temperature: The temperature to use for sampling.
-        top_p: The top-p to use for sampling.
-        top_k: The top-k to use for sampling.
-        use_beam_search: Whether to use beam search.
-        beam_width_in: The beam_width of a request before the sampling step.
-        beam_width_out: The beam_width of a request after the sampling step.
-        top_p_decay: Per-step multiplicative decay applied to the runtime top-p.
-        top_p_min: Lower bound for the decayed runtime top-p.
-        top_p_reset_ids: Token id which, when sampled, resets the runtime top-p to
-            its initial value. A value < 0 never matches a token.
-    """
-
-    temperature: Optional[float]
-    top_p: Optional[float]
-    top_k: Optional[int]
-    use_beam_search: Optional[bool]
-    beam_width_in: Optional[int] = None
-    beam_width_out: Optional[int] = None
-    top_p_decay: Optional[float] = None
-    top_p_min: Optional[float] = None
-    top_p_reset_ids: Optional[int] = None
 
 
 @dataclass(kw_only=True)
@@ -901,3 +889,17 @@ class FlashInferGroupedStrategySampler:
             group_metadata=group_metadata,
         )
         return next_tokens, softmax, strategy_impl.get_temperature()
+
+
+def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
+    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
+    # resolve it on every iteration.
+    cached_sampling_strategy = request.py_sampling_strategy
+    if cached_sampling_strategy is not None:
+        return cached_sampling_strategy
+
+    params = _request_get_sampling_params(request)
+    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
+    if _request_sampling_params_cachable(params):
+        request.py_sampling_strategy = sampling_strategy
+    return sampling_strategy

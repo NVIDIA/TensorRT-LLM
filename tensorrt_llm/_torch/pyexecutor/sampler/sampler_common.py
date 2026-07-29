@@ -12,32 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared foundation for the sampler package.
+"""Shared building blocks for the sampler package.
 
-Common code that the feature modules (beam search, penalties, token ban, ...)
-and the pipeline all depend on: generic helpers, per-request queries that read
-``LlmRequest`` / ``SamplingConfig``, and the ``UtilsSamplingParams`` value type.
+This is the base layer: it imports nothing else from the sampler package, so
+every module above it -- the feature modules, ``sampler_strategy`` and
+``sampler`` itself -- may depend on it without creating a cycle. Anything a
+feature module needs from a request that does not require resolving a sampling
+*strategy* belongs here.
 
-This is the base layer: it may depend on ``ops`` and ``sampler_strategy`` but
-nothing above it imports back into it, keeping the sampler package's import
-graph acyclic.
+Deciding a request's ``Strategy`` is deliberately NOT here: that lives in
+``sampler_strategy._request_strategy``, the only request-facing helper that has
+to know what a strategy is. :class:`UtilsSamplingParams` -- the plain scalar
+view of a request's sampling config -- does live here, because it is the
+*input* to that decision and several features (top-p decay, token bans,
+penalties) read it without ever resolving a strategy.
 """
 
-from typing import List, Optional, TypeVar, cast
+from dataclasses import dataclass
+from typing import List, Optional, TypeAlias, TypeVar, cast
 
 import torch
 
 from ..llm_request import LlmRequest
-from .sampler_strategy import Strategy, UtilsSamplingParams, resolve_sampling_strategy
 
 T = TypeVar("T")
 
+# Beam index to use when no beam search is used but a beam index is required
+DEFAULT_BEAM_IDX = 0
+# Step index to use when no speculative decoding is used but a step index is required
+DEFAULT_STEP_IDX = 0
 
-def _unwrap_singleton(p: Optional[List[T]]) -> Optional[T]:
-    if p is None:
-        return None
-    (t,) = p
-    return t
+FinishReasonsList: TypeAlias = list[list[list[int]]]
+
+
+@dataclass(frozen=True, kw_only=True)
+class UtilsSamplingParams:
+    """Subset of tensorrt_llm::runtime::SamplingConfig supported by sampling_utils.
+
+    Args:
+        temperature: The temperature to use for sampling.
+        top_p: The top-p to use for sampling.
+        top_k: The top-k to use for sampling.
+        use_beam_search: Whether to use beam search.
+        beam_width_in: The beam_width of a request before the sampling step.
+        beam_width_out: The beam_width of a request after the sampling step.
+        top_p_decay: Per-step multiplicative decay applied to the runtime top-p.
+        top_p_min: Lower bound for the decayed runtime top-p.
+        top_p_reset_ids: Token id which, when sampled, resets the runtime top-p to
+            its initial value. A value < 0 never matches a token.
+    """
+
+    temperature: Optional[float]
+    top_p: Optional[float]
+    top_k: Optional[int]
+    use_beam_search: Optional[bool]
+    beam_width_in: Optional[int] = None
+    beam_width_out: Optional[int] = None
+    top_p_decay: Optional[float] = None
+    top_p_min: Optional[float] = None
+    top_p_reset_ids: Optional[int] = None
 
 
 def int_tensor(shape: tuple[int, ...], device: str = "cuda") -> torch.Tensor:
@@ -53,6 +86,13 @@ def add_token(
     new_token = new_tokens[step][seq_slot][beam_idx]
     request.add_new_token(new_token, beam_idx)
     return new_token
+
+
+def _unwrap_singleton(p: Optional[List[T]]) -> Optional[T]:
+    if p is None:
+        return None
+    (t,) = p
+    return t
 
 
 def _get_beam_width_in(request: LlmRequest) -> int:
@@ -112,17 +152,3 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
 
 def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
     return not params.use_beam_search
-
-
-def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
-    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
-    # resolve it on every iteration.
-    cached_sampling_strategy = request.py_sampling_strategy
-    if cached_sampling_strategy is not None:
-        return cached_sampling_strategy
-
-    params = _request_get_sampling_params(request)
-    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
-    if _request_sampling_params_cachable(params):
-        request.py_sampling_strategy = sampling_strategy
-    return sampling_strategy

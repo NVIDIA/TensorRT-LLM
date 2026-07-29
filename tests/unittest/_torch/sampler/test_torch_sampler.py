@@ -48,6 +48,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _request_strategy,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import UtilsSamplingParams
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     GREEDY,
     BeamSearch,
@@ -59,7 +60,6 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     TopK,
     TopKTopP,
     TopP,
-    UtilsSamplingParams,
     resolve_sampling_strategy,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
