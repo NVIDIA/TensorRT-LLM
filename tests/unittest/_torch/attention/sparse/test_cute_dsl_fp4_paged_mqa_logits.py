@@ -906,7 +906,15 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         torch.testing.assert_close(lf[row, :ctx], lf0[row, :ctx], atol=0.0, rtol=0.0)
     if packed:
         assert torch.equal(seed_row[:, 0:3], seed_thr), "lines clobbered"
-        assert (seed_row[:, 6:8] == 0).all(), "stray write past counts"
+        # col 6 carries the adaptive-skip pass count (lane0-accumulated
+        # diagnostic; the top-k consumer reads it when block_max rides
+        # along), so it is a legitimate output here - bounded by the
+        # block-max record count. Only col 7 must stay untouched.
+        assert (seed_row[:, 7] == 0).all(), "stray write past counts"
+        nrec = block_max.shape[1]
+        assert ((seed_row[:, 6] >= 0) & (seed_row[:, 6] <= nrec)).all(), (
+            "adaptive-skip pass count out of range"
+        )
         seed_counts = seed_row[:, 3:6].to(torch.int32)
     for row in range(num_rows):
         ctx = int(context_lens[row // next_n].item())
