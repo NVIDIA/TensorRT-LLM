@@ -24,6 +24,8 @@ from tensorrt_llm.bench.benchmark.utils.asynchronous import LlmManager
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.asyncio
 async def test_llm_manager_duration():
