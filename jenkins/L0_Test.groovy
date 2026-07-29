@@ -4462,6 +4462,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 if (noRegularTests && noIsolateTests) {
                     error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
                 }
+
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    sh """
+                        python3 ${llmSrc}/tests/test_common/s3_output.py \
+                            --drain-spool "${WORKSPACE}/${stageName}" || true
+                    """
+                }
             }
 
             // CBTS coverage liveness signal: log this stage's touch counts (no artifacts); never fails the stage (|| true).

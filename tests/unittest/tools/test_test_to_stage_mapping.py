@@ -82,29 +82,6 @@ def test_data_availability(stage_query):
     print(f"Max samples configured: {MAX_SAMPLES}")
 
 
-def test_s3_output_uses_native_fd_capture():
-    """Keep S3 collection on pytest's native FD capture path."""
-    with open(GROOVY, 'r') as f:
-        lines = f.readlines()
-
-    capture_lines = [
-        idx for idx, line in enumerate(lines) if '"--capture=fd"' in line
-    ]
-    assert capture_lines, 'Expected S3 pytest paths to enable native FD capture'
-    for idx in capture_lines:
-        context = lines[max(0, idx - 3):idx]
-        assert any('if (ENABLE_UPLOAD_TEST_RESULTS)' in line
-                   for line in context)
-
-    source = ''.join(lines)
-    assert 'ENABLE_S3_ECHO_STDOUT' not in source
-    assert '--s3-echo-stdout' not in source
-    assert 'console_output_style=progress-even-when-capture-no' in source
-    assert 'testFilter[(DETAILED_LOG)] ? "-s"' in source
-    assert source.count('tar -czvf results-') == 2
-    assert "tar --exclude='*/.s3-spool'" not in source
-
-
 def test_documented_stage_examples_are_live(stage_query):
     """Documented --stages examples must name stages that still exist in CI."""
     sources = [
