@@ -336,64 +336,6 @@ def _vllm_wire_hash_from_radix_key(block_key: bytes) -> int:
     return unsigned_hash - 2**64 if unsigned_hash >= 2**63 else unsigned_hash
 
 
-class KVEventAdapter:
-    """Converts local V2 events and publishes one wire batch per iteration."""
-
-    def __init__(
-        self,
-        config: KVEventsConfig,
-        *,
-        data_parallel_rank: int,
-    ) -> None:
-        self._rank = data_parallel_rank
-        self._publisher = create_event_publisher(config, data_parallel_rank)
-        self._closed = False
-        self.local_batches = 0
-        self.local_events = 0
-        self.enqueued_batches = 0
-        self.enqueued_events = 0
-        self.dropped_batches = 0
-
-    def publish_wire_events(
-        self,
-        wire_events: list[BlockStored | BlockRemoved | AllBlocksCleared],
-    ) -> None:
-        """Enqueue an already-converted local iteration batch."""
-        if self._closed or not wire_events:
-            return
-        self.local_batches += 1
-        self.local_events += len(wire_events)
-        try:
-            batch = KVEventBatch(
-                ts=time.time(),
-                events=wire_events,
-                data_parallel_rank=self._rank,
-            )
-            if self._publisher.publish(batch):
-                self.enqueued_batches += 1
-                self.enqueued_events += len(wire_events)
-            else:
-                self.dropped_batches += 1
-        except Exception:
-            self.dropped_batches += 1
-            logger.exception(f"Dropping native KV event iteration batch on rank={self._rank}")
-
-    def shutdown(self) -> None:
-        """Close the publisher once and report direct-path counters."""
-        if self._closed:
-            return
-        self._closed = True
-        self._publisher.shutdown()
-        logger.info(
-            f"Native KV events rank={self._rank} "
-            f"local_batches={self.local_batches} "
-            f"local_events={self.local_events} "
-            f"enqueued_batches={self.enqueued_batches} "
-            f"enqueued_events={self.enqueued_events} "
-            f"dropped_batches={self.dropped_batches}"
-        )
-
-
 class _NativeStoredBlockState:
     __slots__ = ("block_hash",)
 
@@ -413,13 +355,15 @@ class NativeKVCacheEventManager:
 
     def __init__(
         self,
-        adapter: KVEventAdapter,
+        config: KVEventsConfig,
         *,
+        data_parallel_rank: int,
         block_size: int,
         max_window_size: int,
         max_entries: int = 50_000,
     ) -> None:
-        self._adapter = adapter
+        self._rank = data_parallel_rank
+        self._publisher = create_event_publisher(config, data_parallel_rank)
         self._block_size = block_size
         self._max_window_size = max_window_size
         self._max_entries = max_entries
@@ -433,6 +377,9 @@ class NativeKVCacheEventManager:
         self.partial_blocks_suppressed = 0
         self.non_target_life_cycles_ignored = 0
         self.dropped_events = 0
+        self.enqueued_batches = 0
+        self.enqueued_events = 0
+        self.dropped_batches = 0
 
     def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None:
         target_ids = [
@@ -606,7 +553,20 @@ class NativeKVCacheEventManager:
         events = self._pending_events
         self._pending_events = []
         self._pending_entries = 0
-        self._adapter.publish_wire_events(events)
+        batch = KVEventBatch(
+            ts=time.time(),
+            events=events,
+            data_parallel_rank=self._rank,
+        )
+        try:
+            if self._publisher.publish(batch):
+                self.enqueued_batches += 1
+                self.enqueued_events += len(events)
+            else:
+                self.dropped_batches += 1
+        except Exception:
+            self.dropped_batches += 1
+            logger.exception(f"Dropping native KV event iteration batch on rank={self._rank}")
 
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]:
         # Native publishing pushes events out-of-band, so the pull API has
@@ -619,12 +579,15 @@ class NativeKVCacheEventManager:
             return
         self.flush_iteration_events()
         self._closed = True
+        self._publisher.shutdown()
         logger.info(
             "Native KV event fast path "
+            f"rank={self._rank} "
             f"stored_blocks={self.stored_blocks} "
             f"removed_blocks={self.removed_blocks} "
             f"partial_blocks_suppressed={self.partial_blocks_suppressed} "
-            f"non_target_life_cycles_ignored="
-            f"{self.non_target_life_cycles_ignored} "
-            f"dropped_events={self.dropped_events}"
+            f"non_target_life_cycles_ignored={self.non_target_life_cycles_ignored} "
+            f"dropped_events={self.dropped_events} "
+            f"enqueued_batches={self.enqueued_batches} "
+            f"dropped_batches={self.dropped_batches}"
         )

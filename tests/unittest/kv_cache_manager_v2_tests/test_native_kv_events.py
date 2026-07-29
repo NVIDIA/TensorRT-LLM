@@ -20,11 +20,7 @@ from types import SimpleNamespace
 import msgspec
 import zmq
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
-    BlockRemoved,
-    KVEventAdapter,
-    NativeKVCacheEventManager,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import BlockRemoved, NativeKVCacheEventManager
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 
 
@@ -45,7 +41,7 @@ def test_native_fast_path_publishes_only_full_max_window_blocks():
     subscriber.setsockopt_string(zmq.SUBSCRIBE, topic)
     subscriber.connect(connect_endpoint)
 
-    adapter = KVEventAdapter(
+    manager = NativeKVCacheEventManager(
         KVEventsConfig(
             enable_kv_cache_events=True,
             publisher="zmq",
@@ -54,9 +50,6 @@ def test_native_fast_path_publishes_only_full_max_window_blocks():
             max_queue_size=8,
         ),
         data_parallel_rank=0,
-    )
-    manager = NativeKVCacheEventManager(
-        adapter,
         block_size=4,
         max_window_size=128,
     )
@@ -143,8 +136,6 @@ def test_native_fast_path_publishes_only_full_max_window_blocks():
 
     manager.shutdown()
     manager.shutdown()
-    adapter.shutdown()
-    adapter.shutdown()
     subscriber.close(linger=0)
 
     replacement = context.socket(zmq.PUB)
@@ -154,12 +145,9 @@ def test_native_fast_path_publishes_only_full_max_window_blocks():
 
 def test_native_removals_are_never_dropped_by_the_entry_cap():
     """Removals must survive the per-iteration cap or the consumer desyncs."""
-    adapter = KVEventAdapter(
+    manager = NativeKVCacheEventManager(
         KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
         data_parallel_rank=0,
-    )
-    manager = NativeKVCacheEventManager(
-        adapter,
         block_size=2,
         max_window_size=128,
         max_entries=2,
@@ -193,4 +181,3 @@ def test_native_removals_are_never_dropped_by_the_entry_cap():
     assert sum(len(event.block_hashes) for event in removed) == 2
 
     manager.shutdown()
-    adapter.shutdown()

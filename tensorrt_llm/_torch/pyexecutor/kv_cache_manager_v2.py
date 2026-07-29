@@ -82,7 +82,7 @@ from ...logger import logger
 from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .kv_cache_events import KVEventAdapter, NativeKVCacheEventManager
+from .kv_cache_events import NativeKVCacheEventManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -869,7 +869,6 @@ class KVCacheManagerV2(BaseResourceManager):
             for window_size in self.max_attention_window_vec
         )
         self.event_manager: Optional[KVCacheEventManager | NativeKVCacheEventManager] = None
-        self.kv_event_adapter: Optional[KVEventAdapter] = None
         native_events_enabled = (
             kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
@@ -881,12 +880,9 @@ class KVCacheManagerV2(BaseResourceManager):
             assert kv_events_config is not None
             if mapping.enable_attention_dp or mpi_rank() == 0:
                 event_rank = mapping.rank if mapping.enable_attention_dp else 0
-                self.kv_event_adapter = KVEventAdapter(
+                self.event_manager = NativeKVCacheEventManager(
                     kv_events_config,
                     data_parallel_rank=event_rank,
-                )
-                self.event_manager = NativeKVCacheEventManager(
-                    self.kv_event_adapter,
                     block_size=self.tokens_per_block,
                     max_window_size=event_window_size,
                 )
@@ -2928,6 +2924,10 @@ class KVCacheManagerV2(BaseResourceManager):
             return []
         return self.event_manager.get_latest_events(timeout_ms)
 
+    @property
+    def native_kv_events_enabled(self) -> bool:
+        return isinstance(self.event_manager, NativeKVCacheEventManager)
+
     def get_iteration_stats(self):
         if not self.enable_stats:
             return None
@@ -3450,12 +3450,9 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
-        if self.kv_event_adapter is not None:
-            self.flush_iteration_events()
-            if isinstance(self.event_manager, NativeKVCacheEventManager):
-                self.event_manager.shutdown()
-            self.kv_event_adapter.shutdown()
-            self.kv_event_adapter = None
+        if isinstance(self.event_manager, NativeKVCacheEventManager):
+            self.event_manager.shutdown()
+            self.event_manager = None
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
