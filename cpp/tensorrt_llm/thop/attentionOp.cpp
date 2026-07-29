@@ -1049,8 +1049,8 @@ static std::shared_ptr<AttentionOp> get_attention_op(
     static std::shared_mutex op_cache_mutex;
 
     std::shared_lock<std::shared_mutex> read_lock{op_cache_mutex};
-    auto iter = op_cache.find(cache_key);
-    if (iter != op_cache.end())
+
+    if (auto iter = op_cache.find(cache_key); iter != op_cache.end())
     {
         TLLM_LOG_TRACE("Attention op for layer %lld is cached", local_layer_idx);
         return iter->second;
