@@ -909,6 +909,7 @@ class TestGenerationFirstPreActiveRequests:
             request_id=request_id,
             py_request_id=request_id,
             is_child=False,
+            is_context_only_request=True,
             priority=priority,
             request_type=RequestType.REQUEST_TYPE_CONTEXT_ONLY,
             py_disaggregated_params=SimpleNamespace(
@@ -1249,6 +1250,27 @@ class TestGenerationFirstPreActiveRequests:
             [request]
         )
         executor.kv_cache_transceiver.prepare_context_requests.assert_not_called()
+
+    def test_fetch_prepares_then_schedulability_check_polls_same_request(self):
+        executor = self._executor()
+        request = self._request(11)
+        executor.canceled_req_ids = []
+        executor.waiting_queue = FCFSWaitingQueue()
+        executor._fetch_new_requests = Mock(return_value=([], [request]))
+        executor._validate_request = Mock()
+
+        new_requests = PyExecutor._fetch_and_activate_new_requests(executor)
+
+        first_prepared = executor.kv_cache_transceiver.prepare_context_requests.call_args.args[0]
+        assert len(first_prepared) == 1
+        assert first_prepared[0] is request
+
+        PyExecutor._check_disagg_ctx_schedulable_status(executor, new_requests)
+
+        assert executor.kv_cache_transceiver.prepare_context_requests.call_count == 2
+        second_prepared = executor.kv_cache_transceiver.prepare_context_requests.call_args.args[0]
+        assert len(second_prepared) == 1
+        assert second_prepared[0] is request
 
     def test_multi_return_request_uses_legacy_capacity_accounted_fallback(self):
         executor = self._executor()
