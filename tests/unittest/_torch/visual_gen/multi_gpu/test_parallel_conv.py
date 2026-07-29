@@ -199,7 +199,7 @@ def _logic_halo_conv2d_stride2(rank, world_size):
         _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
 
 
-def _logic_halo_conv2d_stride2_offset_group(rank, world_size):
+def _logic_halo_conv2d_stride2_offset_group(rank: int, world_size: int) -> None:
     """Stride-2 halo works when VAE-local ranks differ from global ranks."""
     assert world_size == 4
     vae_ranks = [2, 3]
@@ -247,7 +247,7 @@ class TestHaloExchangeConv2dStride2:
     def test_conv2d_stride2_2gpu(self):
         _run(2, _logic_halo_conv2d_stride2)
 
-    def test_conv2d_stride2_offset_group_4gpu(self):
+    def test_conv2d_stride2_offset_group_4gpu(self) -> None:
         _run(4, _logic_halo_conv2d_stride2_offset_group)
 
 
