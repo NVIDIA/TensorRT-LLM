@@ -77,6 +77,29 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
     def is_generation_model(self) -> bool:
         return True
 
+    def validate_request(self, request: LlmRequest) -> None:
+        """Reject sampling parameters the one-model speculative path cannot honor.
+
+        The one-model sampling kernels take only temperature/top_k/top_p (see
+        SpecMetadata.populate_sampling_params_for_one_model); min_p has no
+        buffer there, so it would be silently dropped and the request would
+        decode from a different distribution than the user asked for. Threading
+        it through costs measurable throughput on the rejection path, so reject
+        instead. Raised from validate_request (request admission), so only the
+        offending request fails rather than the whole executor step.
+        """
+        sampling_config = request.sampling_config
+        if sampling_config is None:
+            return
+        # min_p lives on the C++ SamplingConfig as an optional singleton list.
+        min_p = sampling_config.min_p
+        if min_p and min_p[0] > 0.0:
+            raise ValueError(
+                "min_p is not supported with one-model speculative decoding "
+                "(MTP / Eagle3 one-model / SA / draft-target-one-model). Drop "
+                "min_p from the request, or disable speculative decoding."
+            )
+
     @dataclass(kw_only=True)
     class Store:
         """Storage for speculative decoding tensors."""

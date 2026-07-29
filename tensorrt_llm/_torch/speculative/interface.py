@@ -542,12 +542,10 @@ class SpecMetadata:
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
-    min_ps: Optional[torch.Tensor] = None
-    # Whether top-k/top-p/temperature/min-p are globally disabled for the current batch.
+    # Whether top-k/top-p/temperature are globally disabled for the current batch.
     skip_temperature: bool = False
     skip_top_k: bool = False
     skip_top_p: bool = False
-    skip_min_p: bool = False
     # Pre-computed top_k_max scalar (CPU-side) to avoid CUDA-graph-incompatible
     # dynamic boolean tensor indexing inside verify_dynamic_tree_rejection_from_logits_out.
     top_k_max: int = 0
@@ -555,7 +553,6 @@ class SpecMetadata:
     request_temperatures: Optional[torch.Tensor] = None
     request_top_ks: Optional[torch.Tensor] = None
     request_top_ps: Optional[torch.Tensor] = None
-    request_min_p: Optional[torch.Tensor] = None
     # Whether to use sampling parameters when sampling draft tokens.
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
@@ -733,8 +730,6 @@ class SpecMetadata:
         # Very large values disable topk.
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
-        # min_p disabled = 0.0 (keeps all tokens; min_p_renorm_probs is a no-op).
-        DISABLE_MINP_VAL = 0.0
 
         def _first_or_none(values):
             """Return the first sampling parameter value when present."""
@@ -745,21 +740,25 @@ class SpecMetadata:
             temperature: Optional[float],
             top_k: Optional[int],
             top_p: Optional[float],
-            min_p: Optional[float],
-        ) -> tuple[float, int, float, float, bool, bool, bool, bool, bool]:
+        ) -> tuple[float, int, float, bool, bool, bool, bool]:
             """Convert request sampling params into normalized per-request scalars."""
+            # NB: min_p is intentionally omitted here. One-engine speculative
+            # decoding does not support min_p (there is no request_min_p buffer
+            # nor min_p wiring in the sampling_batch_spec_dec_one_model*
+            # kernels); a min_p request is rejected at admission by
+            # SpecSamplerBase.validate_request, so nothing reaching this scan
+            # carries a min_p that would change its classification. The
+            # two-model draft/target path honors min_p via _request_strategy.
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                min_p=min_p,
                 use_beam_search=False)
 
             use_temperature = (not is_greedy
                                and temperature not in (None, 0, 1))
             use_top_k = not is_greedy and top_k is not None and top_k > 0
             use_top_p = not is_greedy and top_p is not None and top_p < 1.0
-            use_min_p = not is_greedy and min_p is not None and min_p > 0.0
 
             normalized_temperature = (DISABLE_TEMP_VAL
                                       if is_greedy or temperature is None
@@ -767,26 +766,22 @@ class SpecMetadata:
             normalized_top_k = DISABLE_TOPK_VAL if not use_top_k else top_k
             normalized_top_p = (DISABLE_TOPP_VAL
                                 if is_greedy or top_p is None else top_p)
-            normalized_min_p = DISABLE_MINP_VAL if not use_min_p else min_p
 
             return (
                 normalized_temperature,
                 normalized_top_k,
                 normalized_top_p,
-                normalized_min_p,
                 use_temperature,
                 use_top_k,
                 use_top_p,
-                use_min_p,
                 is_greedy,
             )
 
         # Phase 1: collect per-request flags and normalized values.
-        per_request_normalized: list[tuple[float, int, float, float, int]] = []
+        per_request_normalized: list[tuple[float, int, float, int]] = []
         temperature_enabled = False
         top_k_enabled = False
         top_p_enabled = False
-        min_p_enabled = False
         has_non_greedy_requests = False
         per_request_slot_ids: list[int] = []
 
@@ -795,7 +790,6 @@ class SpecMetadata:
             temp_val = _first_or_none(sampling_config.temperature)
             tk_val = _first_or_none(sampling_config.top_k)
             tp_val = _first_or_none(sampling_config.top_p)
-            mp_val = _first_or_none(sampling_config.min_p)
 
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
@@ -804,27 +798,23 @@ class SpecMetadata:
                 temp_val,
                 tk_val,
                 tp_val,
-                mp_val,
                 use_temperature,
                 use_top_k,
                 use_top_p,
-                use_min_p,
                 is_greedy,
             ) = _normalize_request_sampling_params(
                 temperature=temp_val,
                 top_k=tk_val,
                 top_p=tp_val,
-                min_p=mp_val,
             )
 
             temperature_enabled |= use_temperature
             top_k_enabled |= use_top_k
             top_p_enabled |= use_top_p
-            min_p_enabled |= use_min_p
             has_non_greedy_requests |= not is_greedy
 
             per_request_normalized.append(
-                (temp_val, tk_val, tp_val, mp_val, num_tokens))
+                (temp_val, tk_val, tp_val, num_tokens))
             # py_seq_slot is a stable per-request id used to scatter/gather draft
             # probs across iterations. Dummy/padding requests (py_seq_slot is
             # None) route to the scratch row captured at allocation time (the
@@ -837,7 +827,6 @@ class SpecMetadata:
         self.skip_temperature = not temperature_enabled
         self.skip_top_k = not top_k_enabled
         self.skip_top_p = not top_p_enabled
-        self.skip_min_p = not min_p_enabled
         # Used in the CUDA graph key to pick the argmax / advanced variant.
         # All-greedy iff EVERY request is greedy. Derived from per-request
         # greediness, not from the skip_* filter flags (a non-greedy request may
@@ -848,19 +837,14 @@ class SpecMetadata:
         # graph for the (is_all_greedy_sample=False) key gets captured. Dummy
         # warmup requests carry no sampling params, so substitute synthetic
         # non-greedy scalars to populate the GPU buffers.
-        # Every filter is forced on so the captured graph holds the superset of
-        # renorm kernels; a batch that leaves one unused replays it against the
-        # filter's neutral buffer value, which is a no-op. Capturing a subset
-        # instead would silently drop that filter for batches that need it.
         if getattr(self, '_force_non_greedy_for_capture', False):
             self.skip_temperature = False
             self.skip_top_k = False
             self.skip_top_p = False
-            self.skip_min_p = False
             self.is_all_greedy_sample = False
             per_request_normalized = [
-                (0.7, 50, 0.9, 0.1, num_tokens)
-                for (*_, num_tokens) in per_request_normalized
+                (0.7, 50, 0.9, num_tokens)
+                for (_, _, _, num_tokens) in per_request_normalized
             ]
 
         # Apply the group-synchronized override last (semantics: see the
@@ -901,7 +885,7 @@ class SpecMetadata:
     def populate_sampling_params_for_one_model(
             self, requests: list["LlmRequest"]) -> None:
         """
-        Set up topp/topk/temperatures/min_p for 1-model sampler.
+        Set up topp/topk/temperatures for 1-model sampler.
 
         Scans sampling configs to set skip_*/is_all_greedy_sample flags. When
         any request needs sampling, also builds per-token/per-request lists
@@ -926,8 +910,8 @@ class SpecMetadata:
                               self.is_spec_dec_tree else self.max_draft_len + 1)
         # Warmup batches may exceed max_num_requests * tokens_per_request (e.g.
         # when CUDA-graph warmup passes use max_batch_size > max_num_requests).
-        actual_flat_size = sum(num_tokens
-                               for *_, num_tokens in per_request_normalized)
+        actual_flat_size = sum(
+            num_tokens for _, _, _, num_tokens in per_request_normalized)
         required_flat_size = max(tokens_per_request * self.max_num_requests,
                                  actual_flat_size)
 
@@ -943,10 +927,6 @@ class SpecMetadata:
             self.top_ps = torch.ones(required_flat_size,
                                      dtype=torch.float32,
                                      device='cuda')
-            # min_p disabled sentinel is 0.0, hence zeros (unlike temp/top_p ones).
-            self.min_ps = torch.zeros(required_flat_size,
-                                      dtype=torch.float32,
-                                      device='cuda')
             self.request_temperatures = torch.ones(self.max_num_requests,
                                                    dtype=torch.float32,
                                                    device='cuda')
@@ -954,9 +934,6 @@ class SpecMetadata:
                                               dtype=torch.int32,
                                               device='cuda')
             self.request_top_ps = torch.ones(self.max_num_requests,
-                                             dtype=torch.float32,
-                                             device='cuda')
-            self.request_min_p = torch.zeros(self.max_num_requests,
                                              dtype=torch.float32,
                                              device='cuda')
 
@@ -981,20 +958,16 @@ class SpecMetadata:
         temperatures: list[float] = []
         top_ks: list[int] = []
         top_ps: list[float] = []
-        min_ps: list[float] = []
         request_temperatures: list[float] = []
         request_top_ks: list[int] = []
         request_top_ps: list[float] = []
-        request_min_p: list[float] = []
-        for temp_val, tk_val, tp_val, mp_val, num_tokens in per_request_normalized:
+        for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
             request_temperatures.append(temp_val)
             request_top_ks.append(tk_val)
             request_top_ps.append(tp_val)
-            request_min_p.append(mp_val)
             temperatures.extend(temp_val for _ in range(num_tokens))
             top_ks.extend(tk_val for _ in range(num_tokens))
             top_ps.extend(tp_val for _ in range(num_tokens))
-            min_ps.extend(mp_val for _ in range(num_tokens))
 
         self.temperatures[:len(temperatures)].copy_(torch.tensor(
             temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
@@ -1004,9 +977,6 @@ class SpecMetadata:
                                         non_blocking=True)
         self.top_ps[:len(top_ps)].copy_(torch.tensor(
             top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                        non_blocking=True)
-        self.min_ps[:len(min_ps)].copy_(torch.tensor(
-            min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
         self.request_temperatures[:len(request_temperatures)].copy_(
             torch.tensor(request_temperatures,
@@ -1021,12 +991,6 @@ class SpecMetadata:
         )
         self.request_top_ps[:len(request_top_ps)].copy_(
             torch.tensor(request_top_ps,
-                         dtype=torch.float32,
-                         pin_memory=prefer_pinned()),
-            non_blocking=True,
-        )
-        self.request_min_p[:len(request_min_p)].copy_(
-            torch.tensor(request_min_p,
                          dtype=torch.float32,
                          pin_memory=prefer_pinned()),
             non_blocking=True,
@@ -1553,7 +1517,6 @@ class SpecWorkerBase(nn.Module, ABC):
         temperatures = spec_metadata.request_temperatures[:batch_size]
         top_ks = spec_metadata.request_top_ks[:batch_size]
         top_ps = spec_metadata.request_top_ps[:batch_size]
-        min_ps = spec_metadata.request_min_p[:batch_size]
 
         self._update_advance_draft_sampling_seed(logits.device)
         if spec_metadata.use_rejection_sampling and draft_step is not None:
@@ -1563,7 +1526,6 @@ class SpecWorkerBase(nn.Module, ABC):
                     temperatures,
                     top_ks,
                     top_ps,
-                    min_p=min_ps,
                     seed=self.seed,
                     offset=self.offset))
             # Scatter probs into the slot-indexed buffer so each request's data
@@ -1581,7 +1543,6 @@ class SpecWorkerBase(nn.Module, ABC):
                                                              temperatures,
                                                              top_ks,
                                                              top_ps,
-                                                             min_p=min_ps,
                                                              seed=self.seed,
                                                              offset=self.offset)
 
@@ -1733,11 +1694,9 @@ class SpecWorkerBase(nn.Module, ABC):
                       spec_metadata.top_ks[gen_start:gen_end])
             top_ps = (None if spec_metadata.skip_top_p else
                       spec_metadata.top_ps[gen_start:gen_end])
-            min_ps = (None if spec_metadata.skip_min_p else
-                      spec_metadata.min_ps[gen_start:gen_end])
 
             target_probs_flat = compute_probs_from_logits(
-                gen_logits, temperatures, top_ks, top_ps, min_ps)
+                gen_logits, temperatures, top_ks, top_ps)
             target_probs = target_probs_flat.reshape(num_gens,
                                                      runtime_draft_len + 1,
                                                      vocab_size)
@@ -1961,8 +1920,6 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts:batch_size].repeat_interleave(K)
         top_ps = spec_metadata.request_top_ps[
             num_contexts:batch_size].repeat_interleave(K)
-        min_ps = spec_metadata.request_min_p[
-            num_contexts:batch_size].repeat_interleave(K)
 
         self._update_advance_draft_sampling_seed(gen_logits.device)
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
@@ -1974,7 +1931,6 @@ class SpecWorkerBase(nn.Module, ABC):
                     temps,
                     top_ks,
                     top_ps,
-                    min_p=min_ps,
                     seed=self.seed,
                     offset=self.offset))
             # Scatter the K prob rows per gen request into its stable slot row.
@@ -1992,7 +1948,6 @@ class SpecWorkerBase(nn.Module, ABC):
                                                             temps,
                                                             top_ks,
                                                             top_ps,
-                                                            min_p=min_ps,
                                                             seed=self.seed,
                                                             offset=self.offset)
 
@@ -2247,7 +2202,6 @@ class SpecWorkerBase(nn.Module, ABC):
             temperatures = spec_metadata.temperatures[:num_tokens]
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
-            min_ps = spec_metadata.min_ps[:num_tokens]
 
             # Lazily initialize seed/offset tensors on correct device
             if self.seed is None:
@@ -2265,7 +2219,6 @@ class SpecWorkerBase(nn.Module, ABC):
                 temperatures,
                 top_ks,
                 top_ps,
-                min_p=min_ps,
                 seed=self.seed,
                 offset=self.offset)
         else:

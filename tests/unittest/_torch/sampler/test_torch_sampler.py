@@ -1259,63 +1259,6 @@ def test_min_p_sample_top_k_disabled_sentinel():
     assert kept.gather(1, tokens.unsqueeze(-1)).all()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_compute_probs_from_logits_applies_min_p():
-    """compute_probs_from_logits applies the min_p renorm stage used by the
-    one-model speculative-decoding kernels (flashinfer has no min_p kernel, so
-    this is the repo's min_p_renorm_probs stage, run before top_k/top_p). Tokens
-    below min_p * max are zeroed and the row renormalizes to 1."""
-    from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import compute_probs_from_logits
-
-    torch.manual_seed(0)
-    n, vocab = 4, 128
-    logits = torch.randn(n, vocab, device="cuda")
-    temperatures = torch.ones(n, device="cuda")
-    top_k = torch.zeros(n, dtype=torch.int32, device="cuda")  # 0 -> keep all
-    top_p = torch.ones(n, device="cuda")  # 1.0 -> disabled
-    min_p_val = 0.3
-    min_p = torch.full((n,), min_p_val, device="cuda")
-
-    probs_ref = compute_probs_from_logits(logits, temperatures, top_k, top_p)
-    probs = compute_probs_from_logits(logits, temperatures, top_k, top_p, min_p)
-
-    # Renormalizes to 1 and the argmax token always survives the min_p filter.
-    torch.testing.assert_close(probs.sum(dim=-1), torch.ones(n, device="cuda"))
-    assert (probs.gather(1, probs_ref.argmax(dim=-1, keepdim=True)) > 0).all()
-    # Every kept token clears the threshold on the pre-min_p distribution, and
-    # min_p actually pruned something.
-    max_ref = probs_ref.max(dim=-1, keepdim=True).values
-    kept = probs > 0
-    assert torch.all((probs_ref >= min_p_val * max_ref - 1e-6)[kept])
-    assert (probs == 0).any()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_min_p_runs_before_top_p():
-    """min_p is applied before top_k/top_p (vLLM semantics).
-
-    The two orders are not interchangeable once top_p is active: top_p
-    thresholds cumulative mass, and min_p's renorm redistributes that mass. With
-    p = [.4, .3, .2, .1], min_p=0.6 and top_p=0.5, filtering min_p first drops
-    everything below 0.24, renormalizes to [.571, .429], and top_p then needs
-    only the first token; the reverse order keeps two. Asserting the support
-    size pins the order down without depending on exact probabilities.
-    """
-    from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import compute_probs_from_logits
-
-    logits = torch.log(torch.tensor([[0.4, 0.3, 0.2, 0.1]], device="cuda"))
-    ones = torch.ones(1, device="cuda")
-    probs = compute_probs_from_logits(
-        logits,
-        ones,  # temperature
-        torch.zeros(1, dtype=torch.int32, device="cuda"),  # top_k: 0 -> keep all
-        torch.full((1,), 0.5, device="cuda"),  # top_p
-        torch.full((1,), 0.6, device="cuda"),  # min_p
-    )
-    assert int((probs > 0).sum()) == 1, f"expected min_p-then-top_p support of 1, got {probs}"
-    torch.testing.assert_close(probs.sum(dim=-1), ones)
-
-
 class TestBatchedSampling:
     """Validate batched/mixed sampling.
 

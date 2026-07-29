@@ -230,7 +230,6 @@ class DynamicTreeOpsConverter:
         temperatures: torch.Tensor,
         top_k: torch.Tensor | None,
         top_p: torch.Tensor | None,
-        min_p: torch.Tensor | None,
         num_gens: int,
         num_spec_step: int,
         seed: int | torch.Tensor = 0,
@@ -265,7 +264,6 @@ class DynamicTreeOpsConverter:
         temps_exp = temperatures.repeat_interleave(num_draft_tokens)
         top_k_exp = top_k.repeat_interleave(num_draft_tokens) if top_k is not None else None
         top_p_exp = top_p.repeat_interleave(num_draft_tokens) if top_p is not None else None
-        min_p_exp = min_p.repeat_interleave(num_draft_tokens) if min_p is not None else None
 
         # Compute target probs using the shared linear-path interface (FlashInfer fast
         # path when available, sort-based fallback otherwise). Returns dense full-vocab
@@ -275,7 +273,6 @@ class DynamicTreeOpsConverter:
             temps_exp,
             top_k_exp,
             top_p_exp,
-            min_p_exp,
         )
         vocab_size = target_probs_flat.shape[-1]
         target_probs_tree = target_probs_flat.reshape(num_gens, num_draft_tokens, vocab_size)

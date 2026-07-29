@@ -217,36 +217,7 @@ def top_p_sampling_from_probs_op(
     return tokens
 
 
-def min_p_sampling_from_probs_op(
-    probs: torch.Tensor,
-    min_p: torch.Tensor,
-    *,
-    generator: Optional[torch.Generator] = None,
-    seed: Optional[SeedOrTensor] = None,
-    offset: Optional[SeedOrTensor] = None,
-    check_nan: bool = False,
-) -> torch.Tensor:
-    """Min-p filtered sampling from probabilities.
-
-    Keeps tokens whose probability is at least ``min_p`` times the max
-    probability, renormalizes, and samples. ``min_p`` is a per-request tensor.
-    Randomness: pass ``generator`` (eager) or ``seed``/``offset`` (CUDA graph);
-    see module docstring for the full contract.
-    """
-    tokens: torch.Tensor = flashinfer.sampling.min_p_sampling_from_probs(
-        probs,
-        min_p,
-        deterministic=True,
-        check_nan=check_nan,
-        generator=generator,
-        seed=seed,
-        offset=offset,
-    )
-
-    return tokens
-
-
-# The three ops below wrap the mask -> softmax -> renorm pipeline stages 1:1.
+# The four ops below wrap the mask -> softmax -> renorm pipeline stages 1:1.
 # The wrappers exist so callers stay importable without flashinfer installed
 # (the flashinfer import above is guarded); softmax_op additionally centralizes
 # the PDL env decision.
@@ -272,6 +243,7 @@ def top_k_mask_logits_op(
     return masked
 
 
+@_compiler_disable
 def top_k_renorm_probs_op(
     probs: torch.Tensor,
     top_k: torch.Tensor,
@@ -298,13 +270,9 @@ def compute_probs_from_logits_op(
 ) -> torch.Tensor:
     """FlashInfer fast path for compute_probs_from_logits with per-request tensors.
 
-    Covers temperature + optional top-k / top-p only. min_p is intentionally
-    absent here: flashinfer exposes no min-p renorm kernel, so the
-    ``compute_probs_from_logits`` wrapper (sampling_utils.py) applies min_p as a
-    separate ``min_p_renorm_probs`` stage on the probs this op returns. Used by
-    the spec-decoding path where each request may have different temperature /
-    top-k / top-p values. Note: temperature is applied AFTER optional top-k
-    masking (via fused flashinfer softmax+temp).
+    Used by the spec-decoding path where each request may have different
+    temperature / top-k / top-p values.  Note: temperature is applied AFTER
+    optional top-k masking (via fused flashinfer softmax+temp).
     """
     if top_k is not None:
         logits = flashinfer.sampling.top_k_mask_logits(logits, top_k)
