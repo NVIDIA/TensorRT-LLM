@@ -224,6 +224,74 @@ async def test_llm_manager_cancels_in_flight_requests_on_failure():
 
 
 @pytest.mark.asyncio
+async def test_llm_manager_stops_draining_when_a_request_fails():
+    """A failure during the duration drain is not held back by a hung request.
+
+    Draining preserves the statistics of requests still running at the
+    deadline, but once one of them fails the run ends regardless, so the
+    remaining ones must not delay the error.
+    """
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    duration = 1
+    fail_latency = 1.5  # Fails after the deadline, while draining.
+    hang_latency = 30  # Must never be waited on in full.
+    call_count = itertools.count()
+
+    def generate_async(*args, **kwargs):
+        output = MagicMock()
+        output.prompt_token_ids = [1, 2, 3]
+        output.outputs = [MagicMock(token_ids=[4, 5])]
+        output.finished = True
+        output.id = next(call_count)
+        output.decoding_iter = 1
+
+        if output.id == 0:
+
+            async def mock_aresult():
+                await asyncio.sleep(fail_latency)
+                raise ValueError("simulated request failure")
+        else:
+
+            async def mock_aresult():
+                await asyncio.sleep(hang_latency)
+                return output
+
+        output.aresult = mock_aresult
+        return output
+
+    mock_llm.generate_async.side_effect = generate_async
+
+    outbox = asyncio.Queue()
+    manager = LlmManager(
+        llm=mock_llm,
+        outbox=outbox,
+        streaming=False,
+        concurrency=2,
+        duration=duration,
+    )
+
+    req = InferenceRequest(task_id=0, input_ids=[1, 2, 3], output_tokens=10)
+    for _ in range(2):
+        await manager.enqueue(req, SamplingParams(), PostprocParams())
+
+    start = asyncio.get_running_loop().time()
+    manager.run()
+    with pytest.raises(ValueError, match="simulated request failure"):
+        await asyncio.wait_for(manager._backend_task, timeout=15)
+    elapsed = asyncio.get_running_loop().time() - start
+
+    # The failure surfaces once it happens; draining for the hung request
+    # would delay it until hang_latency.
+    assert elapsed < hang_latency, (
+        "Drain waited for the hung request instead of surfacing the failure."
+    )
+
+
+@pytest.mark.asyncio
 async def test_llm_manager_duration_not_exceeded():
     # Mock LLM
     mock_llm = MagicMock(spec=LLM)

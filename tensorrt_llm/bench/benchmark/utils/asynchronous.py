@@ -279,17 +279,32 @@ class LlmManager:
             logger.info("Worker task cancelled.")
         finally:
             logger.debug("Worker task finishing...")
-            if drain_in_flight:
+            # Snapshot: the done callback removes tasks from the set as they
+            # finish, and asyncio.wait must not race with that.
+            pending = set(self._tasks)
+            if not drain_in_flight:
+                logger.debug("Worker task cancelling remaining requests...")
+                for task in pending:
+                    task.cancel()
+            elif pending:
                 logger.debug(
                     "Duration reached. Waiting for in-flight requests to complete..."
                 )
-            else:
-                logger.debug("Worker task cancelling remaining requests...")
-                for task in self._tasks:
-                    task.cancel()
+                # Draining preserves the statistics of requests still running at
+                # the deadline, but a failure ends the run regardless, so stop
+                # draining as soon as one occurs. Without this a slow or hung
+                # sibling would hold the error back until it finished.
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_EXCEPTION)
+                if any(not task.cancelled() and task.exception() is not None
+                       for task in done):
+                    logger.debug(
+                        "Request failed during drain. Cancelling the rest...")
+                    for task in pending:
+                        task.cancel()
             logger.debug("Waiting for requests...")
-            if self._tasks:
-                await asyncio.wait(self._tasks)
+            if pending:
+                await asyncio.wait(pending)
             self._raise_for_failed_tasks()
 
     # This asynchronous function acts as a worker that logs iteration statistics.
