@@ -22,6 +22,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
+    EncodeCudaGraphConfig,
     KvCacheConfig,
     RequestOutput,
     SamplingParams,
@@ -819,13 +820,16 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
             )
 
 
-def test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch(
+def test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Continuously admit work and replay encoder and mixed decoder graphs."""
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
     model_name = "t5-small"
     model_path = _get_t5_model_path(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     first_sampling_params = SamplingParams(
         max_tokens=_MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS,
         temperature=0.0,
@@ -836,15 +840,25 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch(
         max_tokens=_MAX_NEW_TOKENS,
         temperature=0.0,
     )
+    encoder_graph_config = EncodeCudaGraphConfig(
+        batch_sizes=[1],
+        num_tokens=[64],
+        seq_lens=[64],
+        enable_padding=True,
+    )
 
     with LLM(
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
         cuda_graph_config=_decoder_cuda_graph_config([2]),
-        disable_overlap_scheduler=True,
+        encoder_cuda_graph_config=encoder_graph_config,
+        enable_encoder_decoder_mixed_cuda_graph=True,
+        disable_overlap_scheduler=False,
         dtype="bfloat16",
         enable_chunked_prefill=False,
+        encoder_max_batch_size=1,
+        encoder_max_num_tokens=64,
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=_MAX_KV_TOKENS,
@@ -860,6 +874,31 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch(
         model_kwargs={"torch_dtype": "bfloat16"},
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
     ) as llm:
+        model_engine = llm._executor.engine.model_engine
+        encoder_runner = model_engine.encoder_cuda_graph_runner
+        decoder_runner = model_engine.cuda_graph_runner
+
+        assert encoder_runner.enabled
+        assert encoder_runner.graphs
+        captured_mixed_keys = {key for key in decoder_runner.graphs if key[5] and key[6]}
+        assert captured_mixed_keys
+
+        encoder_replay_keys = []
+        decoder_replay_keys = []
+        original_encoder_replay = encoder_runner.replay
+        original_decoder_replay = decoder_runner.replay
+
+        def record_encoder_replay(key, inputs):
+            encoder_replay_keys.append(key)
+            return original_encoder_replay(key, inputs)
+
+        def record_decoder_replay(key, inputs):
+            decoder_replay_keys.append(key)
+            return original_decoder_replay(key, inputs)
+
+        monkeypatch.setattr(encoder_runner, "replay", record_encoder_replay)
+        monkeypatch.setattr(decoder_runner, "replay", record_decoder_replay)
+
         first_response = llm.generate_async(
             _SOURCE_TEXT,
             sampling_params=first_sampling_params,
@@ -877,9 +916,27 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch(
         first_response.result()
         second_response.result()
 
-        _assert_t5_response(
+        first_token_ids = _assert_t5_response(
             first_response,
             num_return_sequences=1,
             max_tokens=_MIXED_CONTEXT_GENERATION_MAX_NEW_TOKENS,
         )
-        _assert_t5_response(second_response, num_return_sequences=1)
+        second_token_ids = _assert_t5_response(second_response, num_return_sequences=1)
+
+        expected_token_ids_by_request = _MIXED_ENCODER_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS[
+            (model_name, 1)
+        ]
+        assert first_token_ids[0][:_MAX_NEW_TOKENS] == expected_token_ids_by_request[0][0]
+        _assert_expected_generation(
+            tokenizer,
+            second_token_ids,
+            exact_match=True,
+            expected_token_ids_by_output=expected_token_ids_by_request[1],
+            expected_text_fragment=_MIXED_ENCODER_EXPECTED_TEXT_FRAGMENTS_BY_MODEL[model_name][1],
+        )
+
+        assert len(encoder_replay_keys) >= 2
+        assert set(encoder_replay_keys) <= set(encoder_runner.graphs)
+        replayed_mixed_keys = {key for key in decoder_replay_keys if key[5] and key[6]}
+        assert replayed_mixed_keys
+        assert replayed_mixed_keys <= captured_mixed_keys

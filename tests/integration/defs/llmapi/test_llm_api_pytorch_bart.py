@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from transformers import AutoTokenizer
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
+    EncodeCudaGraphConfig,
     KvCacheConfig,
     RequestOutput,
     SamplingParams,
@@ -46,6 +48,7 @@ _MBART_SOURCE_LANG = "ro_RO"
 _MBART_TARGET_LANG = "en_XX"
 _MBART_SOURCE_TEXT = "Şeful ONU spune că nu există o soluţie militară în Siria."
 _MAX_NEW_TOKENS = 10
+_CONTINUOUS_ADMISSION_MAX_NEW_TOKENS = 16
 _MAX_SEQUENCE_LENGTH = 128
 _MAX_KV_TOKENS = 384
 _MIN_GPU_MEMORY_MB = 16_000
@@ -301,6 +304,14 @@ def _decoder_cuda_graph_config(
         batch_sizes=batch_sizes or [1],
         enable_padding=True,
     )
+
+
+class _SleepLogitsProcessor:
+    def __init__(self, delay_seconds: float) -> None:
+        self.delay_seconds = delay_seconds
+
+    def __call__(self, req_id, logits, token_ids, stream_ptr, client_id) -> None:
+        time.sleep(self.delay_seconds)
 
 
 def _assert_bart_response(
@@ -593,3 +604,122 @@ def test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
                     request_idx
                 ],
             )
+
+
+def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admit encoder work while an older request remains in decoder generation."""
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    model_path = _get_model_path(_MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    first_sampling_params = SamplingParams(
+        max_tokens=_CONTINUOUS_ADMISSION_MAX_NEW_TOKENS,
+        temperature=0.0,
+        ignore_eos=True,
+        logits_processor=_SleepLogitsProcessor(delay_seconds=0.02),
+    )
+    second_sampling_params = _sampling_params(
+        num_beams=1,
+        num_return_sequences=1,
+    )
+    encoder_graph_config = EncodeCudaGraphConfig(
+        batch_sizes=[1],
+        num_tokens=[64],
+        seq_lens=[64],
+        enable_padding=True,
+    )
+
+    with LLM(
+        model_path,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        cuda_graph_config=_decoder_cuda_graph_config([2]),
+        encoder_cuda_graph_config=encoder_graph_config,
+        enable_encoder_decoder_mixed_cuda_graph=True,
+        disable_overlap_scheduler=False,
+        dtype="bfloat16",
+        enable_chunked_prefill=False,
+        encoder_max_batch_size=1,
+        encoder_max_num_tokens=64,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            use_kv_cache_manager_v2=False,
+        ),
+        max_batch_size=2,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        model_kwargs={"torch_dtype": "bfloat16"},
+        scheduler_config=SchedulerConfig(use_python_scheduler=True),
+    ) as llm:
+        model_engine = llm._executor.engine.model_engine
+        encoder_runner = model_engine.encoder_cuda_graph_runner
+        decoder_runner = model_engine.cuda_graph_runner
+
+        assert encoder_runner.enabled
+        assert encoder_runner.graphs
+        captured_mixed_keys = {key for key in decoder_runner.graphs if key[5] and key[6]}
+        assert captured_mixed_keys
+
+        encoder_replay_keys = []
+        decoder_replay_keys = []
+        original_encoder_replay = encoder_runner.replay
+        original_decoder_replay = decoder_runner.replay
+
+        def record_encoder_replay(key, inputs):
+            encoder_replay_keys.append(key)
+            return original_encoder_replay(key, inputs)
+
+        def record_decoder_replay(key, inputs):
+            decoder_replay_keys.append(key)
+            return original_decoder_replay(key, inputs)
+
+        monkeypatch.setattr(encoder_runner, "replay", record_encoder_replay)
+        monkeypatch.setattr(decoder_runner, "replay", record_decoder_replay)
+
+        first_response = llm.generate_async(
+            _SOURCE_TEXT,
+            sampling_params=first_sampling_params,
+            streaming=True,
+        )
+        first_stream_step = next(first_response)
+        assert not first_stream_step.finished
+
+        second_response = llm.generate_async(
+            _MIXED_ENCODER_SOURCE_TEXTS[1],
+            sampling_params=second_sampling_params,
+            streaming=False,
+        )
+
+        first_response.result()
+        second_response.result()
+
+        first_token_ids = _assert_bart_response(
+            first_response,
+            num_return_sequences=1,
+            max_tokens=_CONTINUOUS_ADMISSION_MAX_NEW_TOKENS,
+        )
+        second_token_ids = _assert_bart_response(
+            second_response,
+            num_return_sequences=1,
+        )
+        assert first_token_ids[0][:_MAX_NEW_TOKENS] == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+        _assert_expected_generation(
+            tokenizer,
+            second_token_ids,
+            exact_match=True,
+            expected_token_ids_by_output=_MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST[1],
+        )
+
+        assert len(encoder_replay_keys) >= 2
+        assert set(encoder_replay_keys) <= set(encoder_runner.graphs)
+        replayed_mixed_keys = {key for key in decoder_replay_keys if key[5] and key[6]}
+        assert replayed_mixed_keys
+        assert replayed_mixed_keys <= captured_mixed_keys
