@@ -904,7 +904,7 @@ class _AutotunerJsonlProfiler:
     disaggregated-serving sweep where **each rank of each worker (gen / ctx)
     emits its own file**; concatenate and group by ``(custom_op, opt_shapes)``.
 
-    Record shape (schema_version 2)::
+    Record shape::
 
         {"type":"tuning", "custom_op":str, "opt_shapes":[[int,...],...],
          "input_dtypes":[str,...],
@@ -921,9 +921,7 @@ class _AutotunerJsonlProfiler:
     before its outer op), so consumers must group by ``(custom_op, opt_shapes)``
     and never rely on line order. A ``(custom_op, opt_shapes)`` re-tuned in one
     session (``exclude_from_cache`` / after ``clear_cache``) yields more than one
-    ``tuning`` record for that key; consumers keep the last (or all). This
-    bucketed layout is ~89% smaller than the earlier one-line-per-tactic format
-    with no loss of per-tactic timings.
+    ``tuning`` record for that key; consumers keep the last (or all).
 
     Activation is env-gated and entirely opt-in: unless
     ``TLLM_AUTOTUNER_PROFILE_JSONL_DIR`` is set the profiler is a no-op with
@@ -956,7 +954,7 @@ class _AutotunerJsonlProfiler:
     anyway.
     """
 
-    _SCHEMA_VERSION = 2
+    _SCHEMA_VERSION = 1
 
     def __init__(self, tuner: "AutoTuner"):
         self._tuner = tuner
