@@ -78,6 +78,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
+    MiniMaxM3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
@@ -411,15 +412,18 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype, model_
             is_fused=False,  # Use PyTorch implementation for testing
         )
 
-    # MiniMaxM2 routing method requires special parameters
-    if routing_method_cls == MiniMaxM2MoeRoutingMethod:
+    # MiniMax routing methods require the correction bias and expert count.
+    if routing_method_cls in (MiniMaxM2MoeRoutingMethod, MiniMaxM3MoeRoutingMethod):
         # Create e_score_correction_bias as a zero tensor (no bias correction in test)
         e_score_correction_bias = torch.zeros(num_experts, dtype=dtype, device="cuda")
-        return routing_method_cls(
+        kwargs = dict(
             top_k=top_k,
             num_experts=num_experts,
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
         )
+        if routing_method_cls == MiniMaxM3MoeRoutingMethod:
+            kwargs["routed_scaling_factor"] = 2.0
+        return routing_method_cls(**kwargs)
 
     # SigmoidRenorm routing method requires num_experts
     if routing_method_cls == SigmoidRenormMoeRoutingMethod:
@@ -1571,9 +1575,9 @@ def test_configurable_moe_single_gpu(
 # ============================================================================
 # FP32 Routing Bias Tests
 # ============================================================================
-# MiniMax-M2 and DeepSeek models can have fp32 routing_bias with bf16 model dtype.
-# These tests verify that the trtllmGen MoE backend correctly handles fp32 bias
-# across all quantization paths (fp4, fp8, mxfp4, fp8_per_tensor).
+# MiniMax-M2/M3 and DeepSeek models can have fp32 routing_bias with bf16 model
+# dtype. These tests verify that the trtllmGen MoE backend correctly handles
+# fp32 bias across all quantization paths (fp4, fp8, mxfp4, fp8_per_tensor).
 
 
 def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bias_tensor):
@@ -1603,6 +1607,7 @@ def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bia
     "routing_method_cls,moe_model_config",
     [
         (MiniMaxM2MoeRoutingMethod, MoeModelConfig(256, 6, 2048, 1408)),
+        (MiniMaxM3MoeRoutingMethod, MoeModelConfig(128, 4, 512, 512)),
         (DeepSeekV3MoeRoutingMethod, MoeModelConfig(256, 8, 7168, 2048, n_group=8, topk_group=4)),
     ],
 )
@@ -1620,10 +1625,12 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
     """
     Test that trtllmGen MoE backend correctly handles fp32 routing_bias.
 
-    MiniMax-M2 and DeepSeek models emit fp32 routing_bias from trust_remote_code
-    model definitions. This test verifies that the fp32 bias is correctly plumbed
-    through the thop boundary (TORCH_CHECK), Runner::run() (dtypeRoutingBias),
-    and routing kernels (mDtypeBias) without silent corruption (reading fp32 as bf16).
+    MiniMax-M2/M3 and DeepSeek models emit fp32 routing_bias from
+    trust_remote_code model definitions. This test verifies that the fp32 bias
+    is correctly plumbed through the thop boundary (TORCH_CHECK), Runner::run()
+    (dtypeRoutingBias), and routing kernels (mDtypeBias) without silent
+    corruption (reading fp32 as bf16). The MiniMax-M3 case also verifies its
+    routed scaling factor through the unified ConfigurableMoE output reference.
 
     Compares fused trtllmGen output against the PyTorch reference module.
     """
@@ -1654,9 +1661,9 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
     )
 
     dtype_routing_logits = None
-    if (
-        moe_backend == MoeBackendType.TRTLLM.value
-        and routing_method_cls == DeepSeekV3MoeRoutingMethod
+    if moe_backend == MoeBackendType.TRTLLM.value and routing_method_cls in (
+        DeepSeekV3MoeRoutingMethod,
+        MiniMaxM3MoeRoutingMethod,
     ):
         dtype_routing_logits = torch.float32
 
