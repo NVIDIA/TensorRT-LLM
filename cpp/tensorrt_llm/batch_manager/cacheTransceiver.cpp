@@ -54,6 +54,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <numeric>
@@ -971,38 +972,14 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
+    static std::atomic<bool> sLegacyBlockingObserved{false};
     bool const blockAll = !atLeastRequestNum.has_value();
-    bool const needsProgress = atLeastRequestNum.value_or(0) > 0;
-    std::optional<int> genTransferPollIntervalMs = std::nullopt;
-    if (mCacheTransceiverConfig.has_value())
-    {
-        genTransferPollIntervalMs = mCacheTransceiverConfig->getKvTransferPollIntervalMs();
-    }
-    auto const futureWaitInterval = getTransferFutureWaitInterval(genTransferPollIntervalMs, needsProgress);
-
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
-    auto collectReadyRequestIds = [&]()
+    for (auto&& [request, future] : mRequesterFutures)
     {
-        genTransferReadyRequestIds.clear();
-        for (auto&& [request, future] : mRequesterFutures)
+        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
         {
-            if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
-            {
-                genTransferReadyRequestIds.push_back(request->mRequestId);
-            }
-        }
-    };
-    collectReadyRequestIds();
-    if (needsProgress)
-    {
-        auto const deadline = std::chrono::steady_clock::now() + futureWaitInterval;
-        while (static_cast<int>(genTransferReadyRequestIds.size()) < atLeastRequestNum.value()
-            && std::chrono::steady_clock::now() < deadline)
-        {
-            auto const remaining
-                = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
-            std::this_thread::sleep_for(std::min(std::chrono::milliseconds(kTransferFuturePollIntervalMs), remaining));
-            collectReadyRequestIds();
+            genTransferReadyRequestIds.push_back(request->mRequestId);
         }
     }
     std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
@@ -1031,6 +1008,53 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         [](std::pair<LlmRequest::RequestIdType, int> const& left,
             std::pair<LlmRequest::RequestIdType, int> const& right) { return left.second > right.second; });
     std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
+    size_t idx = 0;
+    while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
+    {
+        if (idx >= freqVec.size())
+        {
+            break;
+        }
+        toCompleteIdSet.insert(freqVec.at(idx).first);
+        if (useMPI())
+        {
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
+        }
+        idx++;
+    }
+    idx = 0;
+
+    // insert order
+    while (atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()))
+    {
+        if (idx >= mRequesterFutures.size())
+        {
+            break;
+        }
+        if (toCompleteIdSet.find(mRequesterFutures.at(idx).first->mRequestId) == toCompleteIdSet.end())
+        {
+            toCompleteIdSet.insert(mRequesterFutures.at(idx).first->mRequestId);
+            if (useMPI())
+            {
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                    " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
+                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
+            }
+            else
+            {
+                TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+                    " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
+                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
+            }
+        }
+        idx++;
+    }
     for (auto&& [requestId, freq] : freqVec)
     {
         if (freq == ((syncComm != nullptr) ? syncComm->getSize() : 1))
@@ -1088,35 +1112,28 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             try
             {
-                auto const status = blockAll ? std::future_status::ready : it->second.wait_for(futureWaitInterval);
-                if (status == std::future_status::ready)
+                if (atLeastRequestNum.value_or(0) > 0 && !sLegacyBlockingObserved.load(std::memory_order_relaxed)
+                    && it->second.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
                 {
-                    it->second.get();
-                    bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
-                    if (failed)
+                    bool expected = false;
+                    if (sLegacyBlockingObserved.compare_exchange_strong(expected, true, std::memory_order_relaxed))
                     {
-                        // The receiver uses the error state as a local transfer-failed signal.
-                        // Keep that signal local until the consensus outcome commits it globally.
-                        request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+                        TLLM_LOG_INFO(
+                            "DIAGNOSTIC OBSERVED: legacy generation transfer polling selected a non-ready request "
+                            "immediately before future.get() for atLeastRequestNum=%d.",
+                            atLeastRequestNum.value());
                     }
-                    recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
-                        mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
                 }
-                else if (status == std::future_status::timeout)
+                it->second.get();
+                bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                if (failed)
                 {
-                    TLLM_LOG_DEBUG(
-                        "Generation KV cache transfer for request %ld is not ready after %ld ms wait slice; keeping "
-                        "it in progress.",
-                        requestId, static_cast<long>(futureWaitInterval.count()));
-                    ++it;
-                    continue;
+                    // The receiver uses the error state as a local transfer-failed signal.
+                    // Keep that signal local until the consensus outcome commits it globally.
+                    request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
                 }
-                else
-                {
-                    TLLM_LOG_ERROR("Future returned unexpected status for request %ld. Marking as error.", requestId);
-                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedRequesterRequestIds,
-                        mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
-                }
+                recordLocalTransferOutcome(requestId, request, failed, mCompletedRequesterRequestIds,
+                    mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
             }
             catch (std::exception const& e)
             {
