@@ -40,7 +40,7 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
     at::Tensor w_k_t, at::Tensor w_v_t, at::Tensor bias_q, at::Tensor bias_k, at::Tensor bias_v, at::Tensor cs_q,
     at::Tensor cs_k, at::Tensor cs_v, at::Tensor a_log, at::Tensor g, at::Tensor dt_bias, at::Tensor beta,
     at::Tensor onorm_g, at::Tensor onorm_weight, std::optional<at::Tensor> const& ssm_state_indices,
-    at::Tensor cu_seqlens, at::Tensor state, at::Tensor out, bool apply_onorm, bool update_conv_cache)
+    at::Tensor cu_seqlens, at::Tensor state, bool apply_onorm, bool update_conv_cache)
 {
     TORCH_CHECK(x_q.is_cuda() && x_q.scalar_type() == at::kBFloat16, "x_q must be a CUDA bfloat16 tensor");
     TORCH_CHECK(x_k.is_cuda() && x_k.scalar_type() == at::kBFloat16, "x_k must be a CUDA bfloat16 tensor");
@@ -62,7 +62,6 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
     TORCH_CHECK(onorm_weight.is_cuda() && onorm_weight.scalar_type() == at::kFloat,
         "onorm_weight must be a CUDA float32 tensor");
     TORCH_CHECK(state.is_cuda() && state.scalar_type() == at::kFloat, "state must be a CUDA float32 tensor");
-    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kBFloat16, "out must be a CUDA bfloat16 tensor");
 
     TORCH_CHECK(x_q.dim() == 4 && x_k.dim() == 4 && x_v.dim() == 4, "x_q, x_k, and x_v must be rank-4 tensors");
     TORCH_CHECK(x_q.size(0) == 1 && x_k.size(0) == 1 && x_v.size(0) == 1, "only T=1 decode inputs are supported");
@@ -125,10 +124,6 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
         state.stride(0));
     TORCH_CHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0,
         "state must start at a 16B-aligned address (check the storage offset of the view passed in)");
-    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
-    TORCH_CHECK(out.size(0) == B && out.size(1) == 1 && out.size(2) == HV && out.size(3) == kDimV,
-        "out must have shape [B, 1, HV, 128]");
-
     if (ssm_state_indices.has_value())
     {
         TORCH_CHECK(ssm_state_indices->is_cuda() && ssm_state_indices->scalar_type() == at::kInt,
@@ -211,12 +206,12 @@ at::Tensor kda_decode_fusion_forward(at::Tensor x_q, at::Tensor x_k, at::Tensor 
     bool apply_onorm, bool update_conv_cache, bool use_lower_bound, bool apply_beta_sigmoid, double lower_bound,
     double scale, double onorm_eps)
 {
+    validate_kda_decode_fusion_inputs(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v,
+        a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, apply_onorm,
+        update_conv_cache);
     int const B = static_cast<int>(x_q.size(1));
     int const HV = static_cast<int>(x_v.size(2));
     auto out = at::empty({B, 1, HV, kDimV}, x_q.options());
-    validate_kda_decode_fusion_inputs(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v,
-        a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, out, apply_onorm,
-        update_conv_cache);
     launch_selected_kernel(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g,
         dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, out, apply_onorm, update_conv_cache,
         use_lower_bound, apply_beta_sigmoid, lower_bound, scale, onorm_eps);
