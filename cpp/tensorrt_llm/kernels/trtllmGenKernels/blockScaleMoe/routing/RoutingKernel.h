@@ -365,6 +365,12 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
 
 void run(Data const& data, void* stream);
 
+// Individual small-batch launchers, exposed for unit tests that A/B the classic
+// single-block kernel against the cooperative block kernel (bit-identical outputs).
+// Production code should always go through run().
+void launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+void launchCoopBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+
 } // namespace routingCustom
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
