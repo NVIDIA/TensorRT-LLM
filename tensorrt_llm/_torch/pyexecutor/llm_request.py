@@ -593,6 +593,11 @@ class LlmResult:
         self._py_result = py_result
         self.is_final = is_final
         self.cached_tokens = 0
+        # Cumulative (accepted, drafted) speculative-decoding draft-token
+        # totals from the PyTorch executor; used to backfill
+        # RequestPerfMetrics.speculative_decoding on the client side
+        # (GenerationResultBase._handle_sequence). None when no drafting ran.
+        self.spec_dec_totals = None
         # Context-worker usage for gen-first disagg, delivered via the
         # KV-transfer aux buffer (see _maybe_attach_ctx_usage).
         self.ctx_usage = None
@@ -752,6 +757,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
+        # Cumulative spec-decode counters backing
+        # RequestPerfMetrics.speculative_decoding for return_perf_metrics. The
+        # C++ runtime fills that section in updateNumTokensPerIteration(),
+        # which the PyTorch flow (TorchSampler) never calls, so the PyTorch
+        # executor accumulates these instead (exact, unlike the per-pos arrays
+        # capped at MAX_SPEC_DECODE_POSITIONS) and attaches them to the
+        # response (see PyExecutor._handle_responses / LlmResult.spec_dec_totals).
+        self.py_total_draft_tokens = 0
+        self.py_total_accepted_draft_tokens = 0
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False

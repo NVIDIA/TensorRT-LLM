@@ -6999,6 +6999,8 @@ class PyExecutor:
                                       0)
             draft_len = get_draft_token_length(request)
             if draft_len > 0:
+                request.py_total_draft_tokens += draft_len
+                request.py_total_accepted_draft_tokens += py_num_accepted
                 for pos in range(min(draft_len, MAX_SPEC_DECODE_POSITIONS)):
                     request.py_per_pos_drafted[pos] += 1
                 for pos in range(min(py_num_accepted,
@@ -7034,6 +7036,14 @@ class PyExecutor:
                     self._maybe_attach_ctx_usage(request, response)
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
+                    if request.py_total_draft_tokens > 0:
+                        # Backfills RequestPerfMetrics.speculative_decoding on
+                        # the client side; the C++ section is only populated
+                        # by updateNumTokensPerIteration, which the PyTorch
+                        # flow never calls.
+                        response.result.spec_dec_totals = (
+                            request.py_total_accepted_draft_tokens,
+                            request.py_total_draft_tokens)
                     new_responses.append((req_id, response))
 
             if request_done:

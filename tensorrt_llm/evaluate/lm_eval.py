@@ -294,6 +294,12 @@ class LmEvalWrapper(TemplateLM):
                     if current is not None and current > value:
                         continue
                 setattr(sampling_params, trtllm_key, value)
+        if self.spec_stats:
+            # The AR line in _log_spec_stats reads per-request
+            # request_perf_metrics.speculative_decoding, which is only
+            # populated when perf metrics are requested. Small per-request
+            # overhead, opted into together with the stats themselves.
+            sampling_params.return_perf_metrics = True
         return sampling_params
 
     def _log_spec_stats(self, outputs: List[RequestOutput]) -> None:
@@ -311,21 +317,33 @@ class LmEvalWrapper(TemplateLM):
         per-request values. Skips silently when the run produced no
         speculative metrics (non-spec-dec config).
 
-        Acceptance rate (AR) is intentionally not reported: the per-request
-        ``request_perf_metrics.speculative_decoding`` counters it needs are
-        only maintained by TRTLLMSampler (not the TorchSampler used by
-        one-engine spec-dec), so it would silently read 0 on the default
-        PyTorch path. Revisit once those counters are populated there.
+        Acceptance rate (AR) is the corpus-level ratio of accepted to drafted
+        tokens, summed over per-request
+        ``request_perf_metrics.speculative_decoding`` counters. Those counters
+        require ``SamplingParams(return_perf_metrics=True)``, which
+        ``_get_sampling_params`` enables when spec stats are requested; the
+        AR line is skipped when no request drafted any tokens (non-spec-dec
+        config, or perf metrics unavailable).
         """
         samples = []  # (avg_decoded_tokens_per_iter, weight=decode iterations)
+        total_accepted = 0
+        total_drafted = 0
         for output in outputs:
             tpi = getattr(output, "avg_decoded_tokens_per_iter", None)
-            if tpi is None:
-                continue
-            iters = getattr(output, "decoding_iter", None)
-            weight = iters if isinstance(iters, (int, float)) and iters > 0 \
-                else 1
-            samples.append((tpi, weight))
+            if tpi is not None:
+                iters = getattr(output, "decoding_iter", None)
+                weight = iters if isinstance(iters,
+                                             (int, float)) and iters > 0 \
+                    else 1
+                samples.append((tpi, weight))
+            completions = getattr(output, "outputs", None)
+            perf_metrics = getattr(completions[0], "request_perf_metrics",
+                                   None) if completions else None
+            spec_dec = perf_metrics.speculative_decoding \
+                if perf_metrics is not None else None
+            if spec_dec is not None and spec_dec.total_draft_tokens > 0:
+                total_accepted += spec_dec.total_accepted_draft_tokens
+                total_drafted += spec_dec.total_draft_tokens
         if samples:
             weighted_al = (sum(tpi * w for tpi, w in samples) /
                            sum(w for _, w in samples))
@@ -335,6 +353,10 @@ class LmEvalWrapper(TemplateLM):
                 f"iteration-weighted) {weighted_al:.3f} "
                 f"(per-request min {min(tokens_per_iter):.3f}, "
                 f"max {max(tokens_per_iter):.3f}, n={len(tokens_per_iter)})")
+        if total_drafted > 0:
+            logger.info(f"Spec-dec stats: AR (corpus draft acceptance) "
+                        f"{total_accepted}/{total_drafted} = "
+                        f"{total_accepted / total_drafted:.1%}")
 
     def _generate_until_windowed(self, requests, scorer,
                                  disable_tqdm: bool) -> List[RequestOutput]:
