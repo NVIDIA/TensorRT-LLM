@@ -5836,8 +5836,8 @@ class PyExecutor:
             if self.model_engine.enable_spec_decode:
                 kv_mgr = self.resource_manager.resource_managers.get(
                     ResourceManagerType.KV_CACHE_MANAGER)
-                seed = getattr(kv_mgr,
-                               'seed_kda_replay_caches_for_disagg_gen', None)
+                seed = getattr(kv_mgr, 'seed_kda_replay_caches_for_disagg_gen',
+                               None)
                 if seed is not None:
                     seed([
                         req.py_request_id

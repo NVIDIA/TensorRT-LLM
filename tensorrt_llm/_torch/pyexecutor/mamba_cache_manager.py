@@ -33,13 +33,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager,
-    CacheTypeCpp,
-    DataType,
-    KVCacheManager,
-    PoolConfiguration,
-    get_pp_layers,
-)
+    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
+    PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  nvtx_range, prefer_pinned,
@@ -577,27 +572,25 @@ class PythonMambaCacheManager(BaseResourceManager):
                 spec_kwargs['kda_conv_q'] = _dim_contiguous_conv_cache()
                 spec_kwargs['kda_conv_k'] = _dim_contiguous_conv_cache()
                 spec_kwargs['kda_conv_v'] = _dim_contiguous_conv_cache()
-                spec_kwargs['kda_qkg_cache'] = torch.zeros(
-                    num_local_layers,
-                    max_batch_size,
-                    M,
-                    3,
-                    section_dim,
-                    dtype=torch.float32,
-                    device=device)
+                spec_kwargs['kda_qkg_cache'] = torch.zeros(num_local_layers,
+                                                           max_batch_size,
+                                                           M,
+                                                           3,
+                                                           section_dim,
+                                                           dtype=torch.float32,
+                                                           device=device)
                 spec_kwargs['kda_v_cache'] = torch.zeros(num_local_layers,
                                                          max_batch_size,
                                                          M,
                                                          section_dim,
                                                          dtype=torch.float32,
                                                          device=device)
-                spec_kwargs['kda_beta_cache'] = torch.zeros(
-                    num_local_layers,
-                    max_batch_size,
-                    M,
-                    nheads,
-                    dtype=torch.float32,
-                    device=device)
+                spec_kwargs['kda_beta_cache'] = torch.zeros(num_local_layers,
+                                                            max_batch_size,
+                                                            M,
+                                                            nheads,
+                                                            dtype=torch.float32,
+                                                            device=device)
                 ssm_spec_cache = [
                     spec_kwargs['kda_conv_q'], spec_kwargs['kda_conv_k'],
                     spec_kwargs['kda_conv_v'], spec_kwargs['kda_qkg_cache'],
@@ -782,8 +775,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                         self._seed_rank_offset))
 
     @torch.inference_mode()
-    def seed_kda_replay_caches_for_disagg_gen(
-            self, request_ids: List[int]) -> None:
+    def seed_kda_replay_caches_for_disagg_gen(self,
+                                              request_ids: List[int]) -> None:
         """Seed the fused-verify KDA replay conv caches from the conv pool.
 
         On a disaggregated generation server the ctx->gen transfer populates
@@ -823,13 +816,14 @@ class PythonMambaCacheManager(BaseResourceManager):
         ):
             # cache: [L, slots, D, committed + num_spec]; zero the draft
             # tail columns and seed the committed window in one copy.
-            seeded = torch.zeros((cache.shape[0], idx.numel()) +
-                                 cache.shape[2:],
-                                 dtype=cache.dtype,
-                                 device=cache.device)
+            seeded = torch.zeros(
+                (cache.shape[0], idx.numel()) + cache.shape[2:],
+                dtype=cache.dtype,
+                device=cache.device)
             seeded[:, :, :, :committed] = section[:, :, :, 1:].to(cache.dtype)
             cache.index_copy_(1, idx, seeded)
-        for buf in (self.mamba_cache.kda_qkg_cache, self.mamba_cache.kda_v_cache,
+        for buf in (self.mamba_cache.kda_qkg_cache,
+                    self.mamba_cache.kda_v_cache,
                     self.mamba_cache.kda_beta_cache):
             buf.index_fill_(1, idx, 0)
         self.mamba_cache.prev_num_accepted_tokens[idx] = 0
@@ -851,7 +845,8 @@ class PythonMambaCacheManager(BaseResourceManager):
         # cuda_graph_runner caches one dummy per runtime_draft_len value
         # (see _get_padded_batch), so any id in the range of dummy request IDs
         # may be live concurrently.
-        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+            CUDA_GRAPH_DUMMY_REQUEST_ID
         max_dl = self.speculative_num_draft_tokens or 0
         return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
                 CUDA_GRAPH_DUMMY_REQUEST_ID)
@@ -1201,10 +1196,9 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         return self._impl.get_conv_states(layer_idx)
 
-    def seed_kda_replay_caches_for_disagg_gen(
-            self, request_ids: List[int]) -> None:
+    def seed_kda_replay_caches_for_disagg_gen(self,
+                                              request_ids: List[int]) -> None:
         self._impl.seed_kda_replay_caches_for_disagg_gen(request_ids)
-
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         return self._impl.get_ssm_states(layer_idx)
@@ -1722,13 +1716,12 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         # the reserved padding slot (a harmless scratch write).
         slot_index = self.mamba_cache_index
         padding_slot = self._impl._padding_slot
-        state_indices = torch.tensor(
-            [
-                slot_index.get(r.py_request_id, padding_slot)
-                for r in scheduled_batch.context_requests + gen_requests
-            ],
-            dtype=torch.int32,
-            device=device)
+        state_indices = torch.tensor([
+            slot_index.get(r.py_request_id, padding_slot)
+            for r in scheduled_batch.context_requests + gen_requests
+        ],
+                                     dtype=torch.int32,
+                                     device=device)
         self.update_mamba_states(attn_metadata, num_accepted, state_indices)
 
 
