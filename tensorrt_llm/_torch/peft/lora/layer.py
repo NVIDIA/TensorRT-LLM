@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
 from os import getenv
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 
@@ -242,7 +242,7 @@ class LoraLayer(torch.nn.Module):
         assert len(lora_module_types) == len(output_hidden_sizes)
 
         self._par_events: List[torch.cuda.Event] | None = None
-        self._split_k_runners: Dict[Tuple, "_LoraGroupedGemmRunner"] = {}
+        self._split_k_runner: Optional["_LoraGroupedGemmRunner"] = None
 
     @staticmethod
     def forward_with_base(
@@ -681,17 +681,8 @@ class LoraLayer(torch.nn.Module):
             )  # TODO: hardcode to 8 for now, for alignments in kernels, might have alignment error if rank is less than 8!
 
         problem_count = cuda_graph_params.get_problem_count(layer_key)
-        runner_key = (
-            layer_idx,
-            hidden_size,
-            max_rank,
-            cuda_graph_params.max_lora_size,
-            problem_count,
-            x.dtype,
-            min_kn,
-        )
-        if runner_key not in self._split_k_runners:
-            self._split_k_runners[runner_key] = _LoraGroupedGemmRunner(
+        if self._split_k_runner is None:
+            self._split_k_runner = _LoraGroupedGemmRunner(
                 layer=self,
                 layer_idx=layer_idx,
                 input_hidden_size=hidden_size,
@@ -701,7 +692,8 @@ class LoraLayer(torch.nn.Module):
                 dtype=x.dtype,
                 min_kn=min_kn,
             )
-        runner = self._split_k_runners[runner_key]
+        runner = self._split_k_runner
+        runner.min_kn = min_kn
         runner_inputs = [
             x,
             cuda_graph_params.slot_counts,
@@ -828,8 +820,9 @@ class _LoraGroupedGemmRunner(TunableRunner):
     def unique_id(self):
         return (
             self.layer_idx,
-            tuple(int(module_type)
-                  for module_type in self.layer.lora_module_types),
+            tuple(
+                int(module_type)
+                for module_type in self.layer.lora_module_types),
             tuple(self.layer.output_hidden_sizes),
             self.input_hidden_size,
             self.max_rank,
@@ -884,10 +877,9 @@ class _LoraGroupedGemmRunner(TunableRunner):
         slot_counts[0] = num_tokens
         slot_ranks = torch.zeros_like(slot_counts)
         slot_ranks[0] = self.max_rank
-        slot_offsets_full = torch.zeros(
-            self.max_lora_size + 1,
-            dtype=CudaGraphLoraParams.PTR_DTYPE,
-            device=device)
+        slot_offsets_full = torch.zeros(self.max_lora_size + 1,
+                                        dtype=CudaGraphLoraParams.PTR_DTYPE,
+                                        device=device)
         slot_offsets_full[1:] = num_tokens
 
         output_hidden_sizes = torch.tensor(
