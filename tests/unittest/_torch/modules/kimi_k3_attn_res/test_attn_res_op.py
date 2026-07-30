@@ -57,7 +57,7 @@ def test_fused_attn_res_matches_torch_reference(num_tokens: int, num_snapshots: 
     projection.weight.mul_(0.02)
 
     prefix_sum = torch.randn(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
-    block_residual = (
+    block_residual_hf = (
         torch.randn(
             num_tokens,
             num_snapshots,
@@ -70,11 +70,12 @@ def test_fused_attn_res_matches_torch_reference(num_tokens: int, num_snapshots: 
 
     expected = apply_attn_res_reference(
         prefix_sum,
-        block_residual,
+        block_residual_hf,
         projection.weight,
         norm.weight,
         RMS_EPS,
     )
+    block_residual = block_residual_hf.transpose(0, 1).contiguous()
     actual = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
 
     assert actual is not None
