@@ -17,8 +17,8 @@ from .open_search_db_utils import _match
 from .test_perf_sanity import ClientConfig, ServerConfig
 
 
-def _server_config(**overrides) -> ServerConfig:
-    config = {
+def _server_config(**overrides: object) -> ServerConfig:
+    config: dict[str, object] = {
         "model_name": "example_model",
         "gpus": 8,
         "tensor_parallel_size": 8,
@@ -29,8 +29,8 @@ def _server_config(**overrides) -> ServerConfig:
     return ServerConfig(config)
 
 
-def _client_config(**overrides) -> ClientConfig:
-    config = {
+def _client_config(**overrides: object) -> ClientConfig:
+    config: dict[str, object] = {
         "concurrency": 32,
         "iterations": 10,
         "isl": 1024,
@@ -43,7 +43,7 @@ def _client_config(**overrides) -> ClientConfig:
     return ClientConfig(config, model_name="example_model")
 
 
-def _benchmark_data(server_config: ServerConfig, client_config: ClientConfig) -> dict:
+def _benchmark_data(server_config: ServerConfig, client_config: ClientConfig) -> dict[str, object]:
     return {
         "s_gpu_type": "b200",
         "s_runtime": "aggr_server",
@@ -61,7 +61,7 @@ def _benchmark_match_keys(server_config: ServerConfig, client_config: ClientConf
     ]
 
 
-def test_scenario_matching_ignores_recipe_tuning_changes():
+def test_scenario_matching_ignores_recipe_tuning_changes() -> None:
     previous_config = _server_config()
     updated_config = _server_config(
         match_mode="scenario",
@@ -82,7 +82,7 @@ def test_scenario_matching_ignores_recipe_tuning_changes():
     )
 
 
-def test_config_matching_keeps_recipe_tuning_keys():
+def test_config_matching_keeps_recipe_tuning_keys() -> None:
     previous_config = _server_config()
     updated_config = _server_config(
         tensor_parallel_size=4,
@@ -99,7 +99,7 @@ def test_config_matching_keeps_recipe_tuning_keys():
     )
 
 
-def test_scenario_matching_distinguishes_gpu_count():
+def test_scenario_matching_distinguishes_gpu_count() -> None:
     previous_config = _server_config()
     updated_config = _server_config(match_mode="scenario", gpus=4)
     client_config = _client_config()
@@ -111,7 +111,7 @@ def test_scenario_matching_distinguishes_gpu_count():
     )
 
 
-def test_scenario_matching_distinguishes_client_workload():
+def test_scenario_matching_distinguishes_client_workload() -> None:
     server_config = _server_config(match_mode="scenario")
     previous_client_config = _client_config()
     updated_client_config = _client_config(concurrency=64)
