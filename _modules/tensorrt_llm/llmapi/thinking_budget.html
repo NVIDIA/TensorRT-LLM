@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=4351f35f" />
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,7 +51,7 @@
     <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../../_static/config_selector.js?v=52eb2d38"></script>
+    <script src="../../../_static/config_selector.js?v=5991fb72"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -418,7 +418,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -432,7 +432,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc22" />
+  <meta name="docsearch:version" content="1.3.0rc23" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -982,7 +982,20 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;reasoning_end_token_ids must not be empty&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">thinking_token_budget</span> <span class="o">=</span> <span class="n">budget</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">reasoning_start_token_ids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">reasoning_start_token_ids</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">reasoning_end_token_ids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">reasoning_end_token_ids</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">reasoning_end_token_ids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">reasoning_end_token_ids</span><span class="p">)</span>
+        <span class="c1"># Progress through the reasoning end sequence, keyed by (req_id, beam_idx):</span>
+        <span class="c1"># 0 = not closing, 1..len-1 = mid-sequence, &gt;= len = fully emitted. A</span>
+        <span class="c1"># missing key defaults to 0; the key is popped when the block closes.</span>
+        <span class="c1">#</span>
+        <span class="c1"># We keep this instead of re-deriving from `token_ids` because the overlap</span>
+        <span class="c1"># scheduler runs the processor one step behind the sampled tokens: a stale</span>
+        <span class="c1"># view would not show the just-forced end sequence, so re-derivation would</span>
+        <span class="c1"># force it again and leak a duplicate end tag (e.g. `&lt;/think&gt;`).</span>
+        <span class="c1">#</span>
+        <span class="c1"># Keys are reclaimed only when a block is seen to close, so entries for</span>
+        <span class="c1"># blocks that never close persist for the processor&#39;s lifetime -- bounded</span>
+        <span class="c1"># per request, but a slow drip if one SamplingParams is shared across many.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_end_progress</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span>
@@ -993,27 +1006,40 @@ window.runMermaid = runMermaid;</script>
         <span class="n">stream_ptr</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
         <span class="n">client_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">del</span> <span class="n">req_id</span><span class="p">,</span> <span class="n">client_id</span>
+        <span class="k">del</span> <span class="n">client_id</span>
         <span class="k">if</span> <span class="n">stream_ptr</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_apply</span><span class="p">(</span><span class="n">token_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_apply</span><span class="p">(</span><span class="n">req_id</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>
             <span class="k">return</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">ExternalStream</span><span class="p">(</span><span class="n">stream_ptr</span><span class="p">)):</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_apply</span><span class="p">(</span><span class="n">token_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_apply</span><span class="p">(</span><span class="n">req_id</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_apply</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span> <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span> <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">for</span> <span class="n">beam_idx</span><span class="p">,</span> <span class="n">beam_token_ids</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">token_ids</span><span class="p">):</span>
-            <span class="n">forced_token</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_forced_token</span><span class="p">(</span><span class="n">beam_token_ids</span><span class="p">)</span>
+            <span class="n">forced_token</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_forced_token</span><span class="p">((</span><span class="n">req_id</span><span class="p">,</span> <span class="n">beam_idx</span><span class="p">),</span> <span class="n">beam_token_ids</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">forced_token</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_force_token</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">beam_idx</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">),</span> <span class="n">forced_token</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_forced_token</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_forced_token</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
         <span class="n">start_idx</span> <span class="o">=</span> <span class="n">_find_last_sequence_index</span><span class="p">(</span><span class="n">token_ids</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">reasoning_start_token_ids</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">start_idx</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
 
         <span class="n">end_idx</span> <span class="o">=</span> <span class="n">_find_last_sequence_index</span><span class="p">(</span><span class="n">token_ids</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">reasoning_end_token_ids</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">end_idx</span> <span class="o">&gt;</span> <span class="n">start_idx</span><span class="p">:</span>
+            <span class="c1"># Reasoning block closed; reset so a later block is budgeted again.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_end_progress</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="k">return</span> <span class="kc">None</span>
+
+        <span class="c1"># Block still open. If we have already begun forcing the end sequence,</span>
+        <span class="c1"># trust recorded progress (see _end_progress) over the lagging token view.</span>
+        <span class="n">progress</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_end_progress</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">progress</span> <span class="o">&gt;=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">reasoning_end_token_ids</span><span class="p">):</span>
+            <span class="c1"># Whole end sequence already forced; stop so we don&#39;t leak a second tag.</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">progress</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="c1"># Mid end-sequence: emit the next token and advance (don&#39;t restart at 0).</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_end_progress</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">progress</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">reasoning_end_token_ids</span><span class="p">[</span><span class="n">progress</span><span class="p">]</span>
 
         <span class="n">reasoning_start</span> <span class="o">=</span> <span class="n">start_idx</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">reasoning_start_token_ids</span><span class="p">)</span>
         <span class="n">reasoning_token_count</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span> <span class="o">-</span> <span class="n">reasoning_start</span>
@@ -1022,9 +1048,11 @@ window.runMermaid = runMermaid;</script>
             <span class="n">partial_end_len</span> <span class="o">&gt;</span> <span class="mi">0</span>
             <span class="ow">and</span> <span class="n">reasoning_token_count</span> <span class="o">-</span> <span class="n">partial_end_len</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">thinking_token_budget</span>
         <span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_end_progress</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">partial_end_len</span> <span class="o">+</span> <span class="mi">1</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">reasoning_end_token_ids</span><span class="p">[</span><span class="n">partial_end_len</span><span class="p">]</span>
 
         <span class="k">if</span> <span class="n">reasoning_token_count</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">thinking_token_budget</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_end_progress</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">reasoning_end_token_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
         <span class="k">return</span> <span class="kc">None</span>
 
@@ -1253,9 +1281,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 20, 2026.</p>
+  <p>Last updated on July 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
   
 </div></div>
       
