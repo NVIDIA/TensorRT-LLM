@@ -291,8 +291,8 @@ def _assert_parity(
     actual: torch.Tensor,
     expected: torch.Tensor,
     *,
-    min_cosine: float = 0.999,
-    max_relative_l2: float = 3e-2,
+    min_cosine: float = 0.9999,
+    max_relative_l2: float = 1e-2,
 ) -> None:
     actual_float = actual.float().flatten()
     expected_float = expected.float().flatten()

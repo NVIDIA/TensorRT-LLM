@@ -1393,11 +1393,10 @@ void launch_kda_decode_compact_heads_raw(void const* x_q, void const* x_k, void 
     cudaStream_t stream)
 {
     constexpr int kStageDynamicSmemBytes = 3 * 32 * kDimK * static_cast<int>(sizeof(float));
-    TLLM_CUDA_CHECK(
-        cudaFuncSetAttribute(kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, kUseStaticDecodeLayout, kHeads,
-                                 kHeads, false, false, false, true, false, true, kUpdateConvState, kUseLowerBound,
-                                 kApplyBetaSigmoid>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kStageDynamicSmemBytes));
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+        kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, kUseStaticDecodeLayout, kHeads, kHeads, false, false,
+            false, true, false, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, kStageDynamicSmemBytes));
     kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, kUseStaticDecodeLayout, kHeads, kHeads, false, false,
         false, true, false, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>
         <<<dim3(B * HV), dim3(kThreads), kStageDynamicSmemBytes, stream>>>(reinterpret_cast<__nv_bfloat16 const*>(x_q),
@@ -1423,8 +1422,8 @@ void launch_kda_decode_many_heads_raw(void const* x_q, void const* x_k, void con
 {
     constexpr bool kUseHeadGrid = kUseStaticDecodeLayout;
     dim3 const grid = kUseStaticDecodeLayout ? dim3(B, HV) : dim3(B * HV);
-    kda_decode_fusion_many_heads_kernel<kApplyOnorm, kUseStaticDecodeLayout, kHeads, kHeads, kUseHeadGrid, false,
-        false, false, false, false, true, true, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>
+    kda_decode_fusion_many_heads_kernel<kApplyOnorm, kUseStaticDecodeLayout, kHeads, kHeads, kUseHeadGrid, false, false,
+        false, false, false, true, true, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>
         <<<grid, dim3(kThreads), 0, stream>>>(reinterpret_cast<__nv_bfloat16 const*>(x_q),
             reinterpret_cast<__nv_bfloat16 const*>(x_k), reinterpret_cast<__nv_bfloat16 const*>(x_v),
             reinterpret_cast<__nv_bfloat16 const*>(w_q_t), reinterpret_cast<__nv_bfloat16 const*>(w_k_t),
@@ -1448,15 +1447,15 @@ void launch_kda_decode_compact_heads_selected(void const* x_q, void const* x_k, 
     if (update_conv_cache)
     {
         launch_kda_decode_compact_heads_raw<kHeads, kUseStaticDecodeLayout, kApplyOnorm, true, kUseLowerBound,
-            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log,
-            g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
+            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g,
+            dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
             HV, lower_bound, scale, onorm_eps, stream);
     }
     else
     {
         launch_kda_decode_compact_heads_raw<kHeads, kUseStaticDecodeLayout, kApplyOnorm, false, kUseLowerBound,
-            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log,
-            g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
+            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g,
+            dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
             HV, lower_bound, scale, onorm_eps, stream);
     }
 }
@@ -1472,15 +1471,15 @@ void launch_kda_decode_many_heads_selected(void const* x_q, void const* x_k, voi
     if (update_conv_cache)
     {
         launch_kda_decode_many_heads_raw<kHeads, kUseStaticDecodeLayout, kApplyOnorm, true, kUseLowerBound,
-            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log,
-            g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
+            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g,
+            dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
             HV, lower_bound, scale, onorm_eps, stream);
     }
     else
     {
         launch_kda_decode_many_heads_raw<kHeads, kUseStaticDecodeLayout, kApplyOnorm, false, kUseLowerBound,
-            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log,
-            g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
+            kApplyBetaSigmoid>(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g,
+            dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B, H,
             HV, lower_bound, scale, onorm_eps, stream);
     }
 }
@@ -1547,8 +1546,8 @@ void dispatch_kda_decode_beta(KdaDecodeLaunchParams const& p, bool apply_beta_si
 {
     if (apply_beta_sigmoid)
     {
-        launch_kda_decode_selected_backend<kCompact, kHeads, kUseStaticDecodeLayout, kApplyOnorm, kUseLowerBound,
-            true>(p);
+        launch_kda_decode_selected_backend<kCompact, kHeads, kUseStaticDecodeLayout, kApplyOnorm, kUseLowerBound, true>(
+            p);
     }
     else
     {
@@ -1592,13 +1591,11 @@ void dispatch_kda_decode_layout(
 {
     if (p.ssm_state_indices == nullptr)
     {
-        dispatch_kda_decode_features<kCompact, kHeads, true>(
-            p, apply_onorm, use_lower_bound, apply_beta_sigmoid);
+        dispatch_kda_decode_features<kCompact, kHeads, true>(p, apply_onorm, use_lower_bound, apply_beta_sigmoid);
     }
     else
     {
-        dispatch_kda_decode_features<kCompact, kHeads, false>(
-            p, apply_onorm, use_lower_bound, apply_beta_sigmoid);
+        dispatch_kda_decode_features<kCompact, kHeads, false>(p, apply_onorm, use_lower_bound, apply_beta_sigmoid);
     }
 }
 
