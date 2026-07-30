@@ -437,6 +437,10 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._fallback_if_unsupported_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
+        if is_hybrid_linear(model_config.pretrained_config):
+            logger.info_once(
+                f"Selected hybrid KV cache manager: {cls.__name__}",
+                key=f"hybrid_kv_cache_manager_{cls.__name__}")
         # Compatibility managers do not support MTP block reuse. Warn at the
         # routing site so users see the concrete manager selected for the
         # incompatible combination.
