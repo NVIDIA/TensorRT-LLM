@@ -16,6 +16,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from tensorrt_llm import bindings
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module

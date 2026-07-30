@@ -1291,6 +1291,28 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.enable_swa_scratch_reuse:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
 
+    def _kv_pool_mapping_offset(
+        self, layer_id: LayerId, layer_group_id: int, key_base_addr: int
+    ) -> int:
+        """Per-layer offset recorded in ``kv_cache_pool_mapping``.
+
+        The default derives the layer's position within its pool from the K
+        base address, assuming every layer contributes exactly K(+V) to the
+        pool slot so the layer stride is uniform. Managers whose pool slots
+        may interleave extra per-layer buffers between layers (non-uniform
+        layer strides) must override this with a positional formula.
+        """
+        addr_offset = (
+            self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED)
+            - key_base_addr
+        )
+        return exact_div(
+            addr_offset,
+            self.get_layer_bytes_per_token(layer_id, Role.KEY)
+            * self.kv_factor
+            * self.tokens_per_block,
+        )
+
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
         layer_sizes = []
         attention_windows = []

@@ -192,6 +192,121 @@ def test_mamba_kv_cache_params_separate_target_and_draft_masks():
     )
 
 
+def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
+    config = SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=4,
+        linear_attn_config={
+            "head_dim": 8,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1, 3],
+            "full_attn_layers": [2, 4],
+        },
+        dtype=torch.bfloat16,
+    )
+
+    params = extract_mamba_kv_cache_params(config)
+
+    assert params.state_size == 8
+    assert params.conv_kernel == 5
+    assert params.num_heads == 4
+    assert params.n_groups == 4
+    assert params.head_dim == 8
+    assert params.mamba_layer_mask == [True, False, True, False]
+    assert params.target_full_attention_layer_mask == [
+        False,
+        True,
+        False,
+        True,
+    ]
+    assert params.num_mamba_layers == 2
+    assert params.dtype is torch.bfloat16
+    assert params.mamba_ssm_cache_dtype is torch.float32
+
+
+def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class RecordingV2Manager(MambaHybridCacheManagerV2):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    config = SimpleNamespace(
+        architectures=["KimiLinearForCausalLM"],
+        model_type="kimi_linear",
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        num_hidden_layers=4,
+        kv_lora_rank=32,
+        qk_rope_head_dim=8,
+        linear_attn_config={
+            "head_dim": 8,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1, 3],
+            "full_attn_layers": [2, 4],
+        },
+        dtype=torch.bfloat16,
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        quant_config=None,
+        sparse_attention_config=None,
+        get_num_mamba_layers=lambda: 2,
+    )
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    assert get_kv_cache_manager_cls(model_config, kv_cache_config) is MambaHybridCacheManagerV2
+
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingV2Manager,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        kv_cache_config=kv_cache_config,
+        tokens_per_block=64,
+        max_seq_len=2048,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+    args = captured["args"]
+    kwargs = captured["kwargs"]
+    assert isinstance(args, tuple)
+    assert isinstance(kwargs, dict)
+    assert args[:9] == (
+        8,
+        5,
+        4,
+        4,
+        8,
+        2,
+        [True, False, True, False],
+        torch.bfloat16,
+        torch.float32,
+    )
+    assert kwargs["num_layers"] == 2
+    assert kwargs["layer_mask"] == [False, True, False, True]
+    assert kwargs["num_kv_heads"] == 1
+    assert kwargs["head_dim"] == 40
+    assert kwargs["conv_state_layout"] == "q_k_v"
+    assert "kda_replay_num_spec" not in kwargs
+    assert "model_type" not in kwargs
+
+
 @pytest.mark.parametrize(
     ("use_v2", "enable_block_reuse", "expected"),
     [
@@ -2189,12 +2304,16 @@ def test_v2_hybrid_intermediate_states_size_by_tokens_per_gen_step():
 
 
 @skip_no_cuda
-def test_v2_hybrid_static_dynamic_tree_capacity():
-    spec_config = MTPDecodingConfig(
+def test_v2_hybrid_non_linear_spec_capacity():
+    # Kimi's MTP config does not expose main's dynamic-tree fields. Model the
+    # cache-manager contract directly: a non-linear speculative step reserves
+    # all draft tokens, not only the draft depth.
+    spec_config = SimpleNamespace(
         max_draft_len=6,
         max_total_draft_tokens=31,
-        use_dynamic_tree=True,
-        dynamic_tree_max_topK=10,
+        tokens_per_gen_step=32,
+        is_linear_tree=False,
+        spec_dec_mode=SimpleNamespace(use_one_engine=lambda: False),
     )
     mgr = _build_v2_hybrid_with_mamba_layer(
         max_batch_size=4,

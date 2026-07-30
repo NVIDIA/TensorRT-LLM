@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
 from typing import Dict, List, Sequence
 
 import numpy as np
@@ -37,11 +36,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PhysicalPoolGroup,
     PoolView,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import (
-    compute_layer_byte_ranges,
-    get_physical_pool,
-)
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,

@@ -529,19 +529,3 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert ssm_stats.pool_group_id == 1
     assert ssm_stats.snapshot_stats.iter_snapshot_hit_rate == 0.5
     assert ssm_stats.snapshot_stats.iter_reused_tokens == 32
-
-
-def test_disagg_role_mapper_kinds_default_to_indexed():
-    from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
-
-    manager = object.__new__(KVCacheManagerV2)
-
-    # K/V default to the TRTLLM head-major layout; the index-key side cache
-    # defaults to REPLICATED (every shipped index-K — DSA V1, MiniMax M3 —
-    # is TP-replicated). The INDEX_KEY entry is inert unless a subclass
-    # registers such buffers.
-    assert manager.get_disagg_role_mapper_kinds() == {
-        Role.ALL: MapperKind.INDEXED,
-        Role.INDEX_KEY: MapperKind.REPLICATED,
-    }

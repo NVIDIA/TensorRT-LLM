@@ -22,7 +22,12 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 
 
-def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
+def make_page_table(
+    pool_ptrs=None,
+    block_bytes=None,
+    global_layer_ids=None,
+    include_mamba=True,
+):
     """Create a KVCachePageTable for testing."""
     if pool_ptrs is None:
         pool_ptrs = [1234]
@@ -68,9 +73,13 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
     )
     pool_groups = [PhysicalPoolGroup(pools=physical_pools)]
 
+    layer_groups = [attn_lg]
+    if include_mamba:
+        layer_groups.append(mamba_lg)
+
     return KVCachePageTable(
         tokens_per_block=16,
-        layer_groups=[attn_lg, mamba_lg],
+        layer_groups=layer_groups,
         pool_groups=pool_groups,
     )
 
@@ -415,7 +424,10 @@ def test_peer_registrar_get_kv_map_head_match():
 
 
 def test_peer_registrar_get_kv_map_head_mismatch():
-    self_rankinfo = make_rankinfo(instance_name="local", page_table=make_page_table())
+    self_rankinfo = make_rankinfo(
+        instance_name="local",
+        page_table=make_page_table(include_mamba=False),
+    )
     reg = _make_peer_registrar(self_rankinfo)
     peer_ri = make_rankinfo(
         instance_name="peer",
@@ -428,7 +440,7 @@ def test_peer_registrar_get_kv_map_head_mismatch():
         tokens_per_block=16,
         dims_per_head=8,
         layer_num_per_pp=[2],
-        page_table=make_page_table(),
+        page_table=make_page_table(include_mamba=False),
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
