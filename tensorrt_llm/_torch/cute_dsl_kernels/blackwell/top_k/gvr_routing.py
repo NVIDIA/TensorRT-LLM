@@ -56,15 +56,21 @@ SKIP_CS_MIN_N_RUNGS = 196608  # vb: cluster split on top of bm from here
 # batch 1..128), as the wall delta of the same kernel with the emission
 # outputs attached:
 #
-#   batch    1      2      4      8     32     128
-#   list  +13.8% +64.3% +60.7% +62.0% +122.9% +150.7%
-#   counts +9.4%  +3.5%  +0.9%  +1.1%   +0.9%   +2.6%
+# What the list tier costs tracks B*N - the total emitted volume - not
+# batch on its own:
 #
-# The list tier only clears its own tax at batch 1; from batch 2 the tax
-# is tens of microseconds against a top-k saving of a few. The counts
-# tax stays inside ~2.6us throughout, and at large batch even that is
-# not repaid, so the zero-emission rungs tier takes over.
-LIST_EMIT_MAX_B = 1
+#   B*N (raw tokens)   <=0.5M    1M      >=2M
+#   list                +11-14%  +55-71%  +150-270%
+#   counts               +1-3%    +1-3%     +0-3%
+#
+# Volume is the main term but not the only one: at the same 1M tokens
+# the tax is +21% as 1M x B1 and +71% as 128k x B8, so there is a
+# per-row cost on top. Both measured-cheap regions are covered by
+# "half a megatoken, or a single row". The counts tax stays inside 3%
+# everywhere, which is why it remains the default; past RUNGS_MIN_B
+# even that is not repaid and the zero-emission rungs tier takes over.
+LIST_EMIT_MAX_TOKENS = 786432  # B * raw length; between the measured
+# cheap band (<=0.52M) and the first expensive point (1.05M)
 LIST_EMIT_MIN_N = 32768
 RUNGS_MIN_B = 32
 
@@ -93,7 +99,9 @@ class TopkRoute:
     attach_block_max: bool = False
 
 
-def plan_emission(batch: int, n_comp: int, k: int, have_epilogue: bool) -> str:
+def plan_emission(
+    batch: int, n_comp: int, k: int, have_epilogue: bool, compress_ratio: int = 4
+) -> str:
     """Which assist tier the indexer epilogue should emit this step.
 
     ``n_comp``: compressed row length (post compress_ratio) - the
@@ -107,7 +115,9 @@ def plan_emission(batch: int, n_comp: int, k: int, have_epilogue: bool) -> str:
         return "none"
     if not have_epilogue:
         return "rungs"  # closed-loop lines cost nothing to carry
-    if batch <= LIST_EMIT_MAX_B and n_comp >= LIST_EMIT_MIN_N:
+    if n_comp >= LIST_EMIT_MIN_N and (
+        batch == 1 or batch * n_comp * compress_ratio <= LIST_EMIT_MAX_TOKENS
+    ):
         return "list"
     if batch >= RUNGS_MIN_B:
         return "rungs"  # throughput regime: emitting anything is a loss

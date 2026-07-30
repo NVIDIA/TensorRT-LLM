@@ -101,10 +101,14 @@ class GvrExtState:
             )
         return self.block_max
 
-    def plan(self, batch: int, n_comp: int, num_sms: int) -> tuple[str, TopkRoute]:
+    def plan(
+        self, batch: int, n_comp: int, num_sms: int, compress_ratio: int = 4
+    ) -> tuple[str, TopkRoute]:
         """Route this step: (tier to EMIT next, launch knobs to CONSUME
         what was emitted last step)."""
-        emit_tier = plan_emission(batch, n_comp, self.top_k, have_epilogue=True)
+        emit_tier = plan_emission(
+            batch, n_comp, self.top_k, have_epilogue=True, compress_ratio=compress_ratio
+        )
         if emit_tier == "list" and self.cand_vals is None:
             # constructed with enable_list_tier=False: no candidate
             # buffers to emit into, demote to the counts tier

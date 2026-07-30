@@ -2837,9 +2837,11 @@ class Indexer(nn.Module):
                         n_comp = indexer_max_seq_len // max(
                             self.compress_ratio, 1)
                         emit_tier, self._gvr_route = st.plan(
-                            batch_size, n_comp,
+                            batch_size,
+                            n_comp,
                             torch.cuda.get_device_properties(
-                                q_fp8.device).multi_processor_count)
+                                q_fp8.device).multi_processor_count,
+                            compress_ratio=max(self.compress_ratio, 1))
                         st.update_seed_rows(batch_size)
                         gvr_emit_kwargs = st.indexer_emit_kwargs(
                             emit_tier, batch_size)
