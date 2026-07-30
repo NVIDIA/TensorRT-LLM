@@ -46,6 +46,7 @@ MODEL_PATH_DICT = {
     "gemma_3_12b_it_fp4": "gemma/gemma-3-12b-it-fp4",
     "gemma_3_1b_it": "gemma/gemma-3-1b-it",
     "gemma_4_26b_a4b_nvfp4": "gemma/nvidia-Gemma-4-26B-A4B-NVFP4",
+    "gemma_4_31b_it_nvfp4": "gemma/nvidia-Gemma-4-31B-IT-NVFP4",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
@@ -120,6 +121,11 @@ MODEL_PATH_DICT = {
     "deepseek_v4_pro_dspark": "DeepSeek-V4-Pro-DSpark",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
+    # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)
+    "glm_5.2_fp4": "GLM-5.2-NVFP4",
+    # MiniMax-M3 NVFP4: MXFP8 base layers with NVFP4 routed experts
+    # (the MXFP8 checkpoint is registered as "minimax_m3_mxfp8" above).
+    "minimax_m3_fp4": "MiniMax-M3-NVFP4",
     # Kimi K2.5 NVFP4 (~1T MoE multimodal)
     "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
     # Keys below are sanity-side aliases; some point to the same weights as
