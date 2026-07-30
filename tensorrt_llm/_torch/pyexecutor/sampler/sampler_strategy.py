@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helper functions for sampling.
+"""Sampling strategies: what to draw, and how to get there from a request.
 
-Code in this module should operate on logits and probs, without
-referring to types like LlmRequest.
+Holds the :data:`Strategy` types, their implementations and the grouped
+samplers, which operate on logits and probs; ``_request_strategy`` maps an
+``LlmRequest`` onto a strategy, reading its sampling config via
+``sampler_common``.
 """
 
 import abc
@@ -26,12 +28,13 @@ from typing import Any, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer, vanilla
+from tensorrt_llm._torch.pyexecutor.sampler.ops import vanilla
 
 # These op wrappers are safe to import without flashinfer installed; they are
 # only called on the flashinfer sampler / speculative-worker paths.
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     sampling_from_probs_op,
+    sanitize_top_k,
     softmax_op,
     top_k_mask_logits_op,
     top_k_renorm_probs_op,
@@ -55,6 +58,13 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
 )
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.sampling_params import SamplingParams
+
+from ..llm_request import LlmRequest
+from .sampler_common import (
+    UtilsSamplingParams,
+    _request_get_sampling_params,
+    _request_sampling_params_cachable,
+)
 
 # Ops imported above are re-exported for dependent modules (sampler, drafting
 # loops, tests). mypy runs in strict mode (no implicit re-export), so they must
@@ -101,36 +111,6 @@ Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | MinP |
 BEAM_SEARCH_PAD_TOKEN = vanilla.BEAM_SEARCH_PAD_TOKEN
 
 
-@dataclass(frozen=True, kw_only=True)
-class UtilsSamplingParams:
-    """Subset of tensorrt_llm::runtime::SamplingConfig supported by sampling_utils.
-
-    Args:
-        temperature: The temperature to use for sampling.
-        top_p: The top-p to use for sampling.
-        top_k: The top-k to use for sampling.
-        min_p: The min-p to use for sampling.
-        use_beam_search: Whether to use beam search.
-        beam_width_in: The beam_width of a request before the sampling step.
-        beam_width_out: The beam_width of a request after the sampling step.
-        top_p_decay: Per-step multiplicative decay applied to the runtime top-p.
-        top_p_min: Lower bound for the decayed runtime top-p.
-        top_p_reset_ids: Token id which, when sampled, resets the runtime top-p to
-            its initial value. A value < 0 never matches a token.
-    """
-
-    temperature: Optional[float]
-    top_p: Optional[float]
-    top_k: Optional[int]
-    use_beam_search: Optional[bool]
-    min_p: Optional[float] = None
-    beam_width_in: Optional[int] = None
-    beam_width_out: Optional[int] = None
-    top_p_decay: Optional[float] = None
-    top_p_min: Optional[float] = None
-    top_p_reset_ids: Optional[int] = None
-
-
 @dataclass(kw_only=True)
 class TopPDecayMetadata(StrategyMetadata):
     """Per-group runtime top-p override for Top-P Decay (attached to top_p /
@@ -140,7 +120,7 @@ class TopPDecayMetadata(StrategyMetadata):
     per-row top-p is gathered on-device from the per-slot ``runtime_top_p``
     store, gated by ``is_decay_slot`` (non-decay rows keep their static top-p).
     Consumed by the TopP*/TopKTopP* strategy impls in ``sample()``. See
-    ``TorchSampler.TopPDecayStore`` for the feature-level semantics.
+    ``top_p_decay.TopPDecayStore`` for the feature-level semantics.
     """
 
     slots: torch.Tensor
@@ -1063,81 +1043,15 @@ class FlashInferGroupedStrategySampler:
         return next_tokens, softmax, strategy_impl.get_temperature()
 
 
-# ---------------------------------------------------------------------------
-# Spec-decoding interface: compute_probs_from_logits (per-request tensor params)
-# ---------------------------------------------------------------------------
+def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
+    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
+    # resolve it on every iteration.
+    cached_sampling_strategy = request.py_sampling_strategy
+    if cached_sampling_strategy is not None:
+        return cached_sampling_strategy
 
-
-def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
-    """Map ``top_k`` into a backend-safe range before top-k filtering.
-
-    Per ``SamplingParams``, ``top_k == 0`` means "all logits" (top-k disabled),
-    but the flashinfer top-k kernels (``top_k_mask_logits``) break on a literal
-    0 — they mask the entire row (all-zero probs). Map any non-positive value
-    (and any oversized disable sentinel such as ``INT32_MAX``) to
-    ``vocab_size`` (== keep all tokens), leaving genuine top_k values
-    untouched.
-    """
-    return top_k.clamp(max=vocab_size).masked_fill_(top_k <= 0, vocab_size)
-
-
-@torch.compile(options={"max-autotune": True})
-def compute_probs_from_logits(
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    top_k: Optional[torch.Tensor],
-    top_p: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """Compute filtered+normalized probs via flashinfer (hard dependency).
-
-    ``temperatures``, ``top_k``, ``top_p`` are per-request tensors matching the
-    spec-decoding call sites in interface.py. min_p is not part of this
-    interface: it is unsupported on the one-model speculative path and rejected
-    at request admission (``SpecSamplerBase.validate_request``).
-    """
-    if top_k is not None:
-        top_k = sanitize_top_k(top_k, logits.shape[-1])
-
-    return flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
-
-
-@torch.compile(options={"max-autotune": True})
-def sampling_batch_spec_dec_one_model(
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
-    seed: Optional[torch.Tensor] = None,
-    offset: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
-    top_k = sanitize_top_k(top_k, logits.shape[-1])
-    # Greedy rows (temperature <= threshold) reduce to top_k=1 sampling: with the
-    # divisor clamped to 1.0 by safely_apply_temperature_inplace (order-preserving
-    # for those rows), flashinfer deterministically returns the max-probability
-    # token, i.e. the argmax of the original logits. All ops remain branch-free
-    # (no data-dependent control flow), so this stays CUDA-graph safe.
-    is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
-    top_k = torch.where(is_greedy, torch.ones_like(top_k), top_k)
-    top_p = torch.where(is_greedy, torch.ones_like(top_p), top_p)
-    logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
-    return flashinfer.top_k_top_p_sampling_from_logits_op(
-        logits, top_k, top_p, seed=seed, offset=offset
-    )
-
-
-@torch.compile(options={"max-autotune": True})
-def sampling_batch_spec_dec_one_model_for_rejection(
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
-    seed: Optional[torch.Tensor] = None,
-    offset: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Draft sampler returning tokens AND probs for the downstream rejection-sampling path."""
-    # Rejection sampling relies on flashinfer's seed/offset support for
-    # determinism and cross-rank consistency.
-    probs = compute_probs_from_logits(logits, temperatures, top_k, top_p)
-    tokens = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
-    return tokens, probs
+    params = _request_get_sampling_params(request)
+    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
+    if _request_sampling_params_cachable(params):
+        request.py_sampling_strategy = sampling_strategy
+    return sampling_strategy

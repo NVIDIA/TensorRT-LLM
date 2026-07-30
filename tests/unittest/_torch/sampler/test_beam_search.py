@@ -36,7 +36,9 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
 from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
-from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.logprobs import \
+    convert_logprobs_tensor_to_list
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, beam_search_sampling_batch)
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor import RequestError
@@ -1094,7 +1096,7 @@ def test_create_beam_history():
         ) > 0, "Original log prob indices must not only contain zeros. Otherwise change the seed."
 
         # set the logprobs in the request:
-        token_logprobs = sampler._convert_logprobs_tensor_to_list(
+        token_logprobs = convert_logprobs_tensor_to_list(
             original_logprob_indices[:beam_width, :num_generated_tokens - 1],
             original_logprobs[:beam_width, :num_generated_tokens - 1],
         )

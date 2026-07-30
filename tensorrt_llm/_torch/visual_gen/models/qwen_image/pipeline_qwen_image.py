@@ -251,12 +251,12 @@ class QwenImagePipeline(BasePipeline):
         prompt: List[str],
         device: torch.device,
         max_sequence_length: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Encode a list of prompts via Qwen2.5-VL + chat template.
 
         Returns:
             prompt_embeds: ``(B, S, 3584)`` in transformer dtype.
-            prompt_embeds_mask: ``(B, S)`` bool mask.
+            prompt_embeds_mask: Optional ``(B, S)`` mask. ``None`` means all tokens are valid.
         """
         drop_idx = _PROMPT_TEMPLATE_START_IDX
         txt = [_PROMPT_TEMPLATE.format(e) for e in prompt]
@@ -292,6 +292,8 @@ class QwenImagePipeline(BasePipeline):
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
         prompt_embeds = prompt_embeds.to(dtype=self.dtype, device=device)
+        if prompt_embeds_mask.bool().all():
+            return prompt_embeds, None
         return prompt_embeds, prompt_embeds_mask
 
     # ------------------------------------------------------------------

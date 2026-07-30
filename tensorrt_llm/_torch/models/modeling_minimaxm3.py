@@ -52,7 +52,14 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
+from ..modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+    copy_weight,
+    load_weight_shard,
+)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import (
@@ -64,7 +71,13 @@ from ..utils import (
 )
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    ModelConfig,
+    filter_weights,
+    register_auto_model,
+)
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
@@ -645,12 +658,10 @@ class MiniMaxM3Attention(Attention):
 
     Both branches share the same dense GQA scaffolding (``qkv_proj`` +
     ``o_proj`` + per-head Gemma Q/K norm + partial RoPE). Sparse layers
-    additionally carry the MiniMax index branch (``index_q_proj``,
-    ``index_k_proj`` and their per-head norms). The index value/output
-    branch is omitted because the M3 checkpoint sets
-    ``sparse_disable_index_value=True`` on every sparse layer; if a
-    future config variant flips that flag the gate will catch the
-    unmapped keys.
+    additionally carry the MiniMax index branch: a fused index_qk_proj that
+    outputs [idx_q | idx_k], plus per-head index norms. The index value and
+    output branch is omitted because the M3 checkpoint sets
+    sparse_disable_index_value=True on every sparse layer.
     """
 
     def __init__(
@@ -717,33 +728,23 @@ class MiniMaxM3Attention(Attention):
             self.sparse_local_block = int(sparse_cfg.get("sparse_local_block", 1))
             self.sparse_score_type = str(sparse_cfg.get("sparse_score_type", "max"))
 
-            # index_q_proj is **replicated** across TP ranks. The sparse
-            # forward reshapes idx_q to
-            # ``[num_tokens, sparse_num_index_heads, sparse_index_dim]``,
-            # which requires the rank-local idx_q to carry all heads.
-            index_q_total = self.sparse_num_index_heads * self.sparse_index_dim
-            self.index_q_proj = Linear(
+            # Index Q and K are both replicated and project the same
+            # hidden_states, so fuse them into one GEMM with output
+            # [idx_q | idx_k]. idx_q holds all index heads; idx_k is a single K
+            # per token, broadcast across heads when scoring.
+            self.index_q_size = self.sparse_num_index_heads * self.sparse_index_dim
+            self.index_k_size = self.sparse_index_dim
+            self.index_qk_proj = Linear(
                 config.hidden_size,
-                index_q_total,
+                self.index_q_size + self.index_k_size,
                 bias=False,
                 dtype=config.torch_dtype,
                 mapping=model_config.mapping,
                 tensor_parallel_mode=None,
                 quant_config=None,
-                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-            )
-            # index_k_proj is also replicated across TP ranks and
-            # outputs ``sparse_index_dim`` channels — a single K per
-            # token (not per-head), broadcast across index heads when
-            # scoring blocks.
-            self.index_k_proj = Linear(
-                config.hidden_size,
-                self.sparse_index_dim,
-                bias=False,
-                dtype=config.torch_dtype,
-                mapping=model_config.mapping,
-                tensor_parallel_mode=None,
-                quant_config=None,
+                weights_loading_config=WeightsLoadingConfig(
+                    weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
+                ),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
             # Per-head Gemma RMSNorm of width ``sparse_index_dim``;
@@ -1194,8 +1195,8 @@ class MiniMaxM3Attention(Attention):
         # 1. Projections.
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        idx_q = self.index_q_proj(hidden_states)
-        idx_k = self.index_k_proj(hidden_states)
+        idx_qk = self.index_qk_proj(hidden_states)
+        idx_q, idx_k = idx_qk.split([self.index_q_size, self.index_k_size], dim=-1)
 
         # 2. Per-head Gemma RMSNorm on both branches.
         q, k = self.apply_qk_norm(q, k)
@@ -1473,6 +1474,33 @@ class MiniMaxM3Model(DecoderModel):
         return hidden_states
 
 
+def _load_index_qk_proj_weights(model: nn.Module, weights) -> None:
+    """Fuse checkpoint index_q_proj and index_k_proj into index_qk_proj.
+
+    The shared weight loader fuses only qkv_proj and gate_up_proj by name, so
+    load the sibling checkpoint tensors into each fused index module through the
+    FUSED_GATE_UP_LINEAR row-concatenation path and mark the sources consumed.
+    """
+    for name, module in model.named_modules():
+        if name.split(".")[-1] != "index_qk_proj":
+            continue
+        parent = name.rsplit(".", 1)[0]
+        q_weights = filter_weights(f"{parent}.index_q_proj", weights)
+        k_weights = filter_weights(f"{parent}.index_k_proj", weights)
+        # Missing sources make Linear.load_weights assert rather than leave
+        # the fused module silently uninitialized.
+        module.load_weights(weights=[q_weights, k_weights])
+        if hasattr(weights, "mark_consumed"):
+            weights.mark_consumed(f"{parent}.index_q_proj")
+            weights.mark_consumed(f"{parent}.index_k_proj")
+        else:
+            for key in list(weights.keys()):
+                if key.startswith(f"{parent}.index_q_proj.") or key.startswith(
+                    f"{parent}.index_k_proj."
+                ):
+                    del weights[key]
+
+
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
@@ -1495,6 +1523,9 @@ class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedCon
         params_map: Optional[Dict[str, str]] = None,
         allow_partial_loading: bool = False,
     ) -> None:
+        # The generic loader has no rule for this fusion. The VL subclass routes
+        # its text weights through here, so both paths are covered.
+        _load_index_qk_proj_weights(self, weights)
         if weight_mapper is None:
             weight_mapper = MiniMaxM3HfWeightMapper()
         weight_mapper.init_model_and_config(self, self.model_config)
