@@ -4327,12 +4327,18 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
         // download TRT-LLM tarfile
-        def tarName = BUILD_CONFIGS[config][TARNAME]
-        def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
-        timeout(time: 30, unit: 'MINUTES') {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
+        // When running inside a fat sqsh the tarball is already extracted at
+        // /tmp/TensorRT-LLM; symlink it into the workspace instead of re-downloading.
+        if (skipInstallWheel) {
+            sh "ln -sfn /tmp/TensorRT-LLM ${llmPath}/TensorRT-LLM"
+        } else {
+            def tarName = BUILD_CONFIGS[config][TARNAME]
+            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            timeout(time: 30, unit: 'MINUTES') {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
+            }
+            sh "cd ${llmPath} && tar -zxf ${tarName}"
         }
-        sh "cd ${llmPath} && tar -zxf ${tarName}"
 
         // install python package
         // skipInstallWheel=true means the fat sqsh has requirements-dev.txt,
