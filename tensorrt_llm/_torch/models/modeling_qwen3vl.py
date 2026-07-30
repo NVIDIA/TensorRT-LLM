@@ -1410,8 +1410,12 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         mrope_config = {}
         deepstack_embeds = []
 
-        # NOTE: Qwen*-VL series has mrope_config even on the text-only prompts,
-        # so we need to separate the mm_multimodal_params from the text-only prompts.
+        # `multimodal_params` holds one entry per request that carried any
+        # multimodal data, context entries first, followed by the generation
+        # entries that only seed the MRoPE delta cache. The slice bounds the
+        # scan to the context prefix; `_get_requests_with_mm_data` is what
+        # actually selects the entries with encoder input, so this does not
+        # rely on the entries lining up with the context requests.
         if num_context_requests > 0:
             mm_multimodal_params, has_raw_image_or_video_data = self._get_requests_with_mm_data(
                 multimodal_params[:num_context_requests]

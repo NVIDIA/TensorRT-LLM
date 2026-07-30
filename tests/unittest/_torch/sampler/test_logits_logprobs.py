@@ -16,7 +16,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import Logprob, ScheduledRequests, TorchSampler
-from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import _StrategyImpls
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import _StrategyImpls
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig

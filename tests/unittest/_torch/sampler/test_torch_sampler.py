@@ -47,7 +47,9 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _request_get_sampling_params,
     _request_strategy,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import UtilsSamplingParams
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     GREEDY,
     BeamSearch,
     FlashInferGroupedStrategySampler,
@@ -58,7 +60,6 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     TopK,
     TopKTopP,
     TopP,
-    UtilsSamplingParams,
     resolve_sampling_strategy,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -876,11 +877,9 @@ class TestFinishReasons:
         @contextmanager
         def raising_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
+                patch_ctx.setattr(FinishReasonsHandler, "_are_stop_words", stop_words_that_raises)
                 patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler, "_are_stop_words", stop_words_that_raises
-                )
-                patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler,
+                    FinishReasonsHandler,
                     "_are_stop_words_single_token",
                     stop_words_that_raises,
                 )
@@ -932,7 +931,7 @@ class TestFinishReasons:
         def raising_single_token_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
                 patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler,
+                    FinishReasonsHandler,
                     "_are_stop_words_single_token",
                     stop_words_that_raises,
                 )
@@ -2682,7 +2681,7 @@ class TestTopPDecay:
         #   runtime = initial                    if token == reset_id
         #           = max(runtime * decay, min)  otherwise
         sampler = self._make_sampler()
-        store = sampler.store.top_p_decay_store
+        store = sampler._top_p_decay.store
         configs = [
             dict(initial=0.8, decay=0.3, top_p_min=0.5, reset_id=2),  # decay, then reset
             dict(initial=0.2, decay=0.9, top_p_min=0.1, reset_id=-1),  # plain decay, floored
@@ -2691,7 +2690,7 @@ class TestTopPDecay:
         token_steps = [[1, 2, 3], [9, 9, 9], [9, 9, 9]]
         slots = list(range(len(configs)))
         for slot, cfg in zip(slots, configs):
-            sampler._top_p_decay_slots.add(slot)
+            sampler._top_p_decay._slots.add(slot)
             store.runtime_top_p_decay_cuda[slot] = cfg["initial"]
             store.initial_top_p_decay_cuda[slot] = cfg["initial"]
             store.top_p_decay_cuda[slot] = cfg["decay"]
@@ -2704,8 +2703,8 @@ class TestTopPDecay:
         for step in range(3):
             for slot in slots:
                 sampler.store.new_tokens[0, slot, 0] = token_steps[slot][step]
-            sampler._update_top_p_decay_after_sample(
-                new_tokens_cuda=sampler.store.new_tokens, sampled_slots_cuda=slots_cuda
+            sampler._top_p_decay.update_after_sample(
+                step_tokens=sampler.store.new_tokens[0, :, 0], sampled_slots_cuda=slots_cuda
             )
             got = store.runtime_top_p_decay_cuda.cpu()
             for slot, cfg in zip(slots, configs):

@@ -56,6 +56,7 @@ class Attention(nn.Module):
         module_name: Optional[str] = None,
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
+        separate_qkv_is_self_attention: bool = False,
     ):
         super().__init__()
 
@@ -234,7 +235,12 @@ class Attention(nn.Module):
             sparse_params=sparse_params,
         )
 
-        if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:
+        if (
+            enable_sequence_parallel
+            and self.qkv_mode == QKVMode.SEPARATE_QKV
+            and not separate_qkv_is_self_attention
+            and vgm is not None
+        ):
             ring_size = vgm.ring_size
             if ring_size > 1:
                 raise ValueError(
