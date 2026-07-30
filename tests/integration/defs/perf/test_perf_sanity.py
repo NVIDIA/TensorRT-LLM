@@ -586,7 +586,6 @@ class ServerConfig:
             "gpus_per_node",
             "match_mode",
             "client_configs",
-            "match_mode",
             "backend",
             "extra_llm_api_config_path",
             "server_env_var",
@@ -622,6 +621,12 @@ class ServerConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
+        if self.match_mode == "scenario":
+            return [
+                "s_model_name",
+                "l_gpus",
+            ]
+
         return [
             "s_model_name",
             "l_tp",
