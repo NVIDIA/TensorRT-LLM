@@ -1010,11 +1010,11 @@ class KimiKDARuntime(nn.Module):
             use_optimized_decode=True,
         )
         self.proj_size = (num_heads // self._kda_tp_size) * lin["head_dim"]
-        # Decode fast-path constants, built once by
+        # Fused projection and decode-kernel constants, built once by
         # ``finalize_decode_weights()`` after checkpoint load:
         # fused in-projection weight + kernel-layout conv weights + fp32
-        # copies of the small parameters. ``None`` routes decode through
-        # the reference (module-level) path.
+        # copies of the small parameters. ``None`` keeps projection calls
+        # separate and routes decode through the reference module path.
         self._in_proj_weight: Optional[torch.Tensor] = None
         # FP8 variant (``finalize_decode_weights_fp8``): q/k/v/g stay in the
         # mixer's fused FP8 ``qkvg_proj`` GEMM and only the small [f_a | b]
@@ -1032,9 +1032,8 @@ class KimiKDARuntime(nn.Module):
         1. Fused in-projection ``[q | k | v | g | f_a | b]``: all six
            projections consume the same hidden state, so one GEMV replaces
            five GEMV+splitK-reduce pairs plus a cublas dot per layer per
-           decode step. The source parameters are repointed to row views
-           of the fused buffer (no extra memory; prefill/verify paths keep
-           using them unchanged).
+           decode step. The fused verify path reuses the same projection;
+           source parameters remain row views for prefill and fallback paths.
         2. Kernel-layout constants that ``_decode_via_optimized`` used to
            rebuild with ~6 device kernels per layer per decode step:
            transposed conv weights (bf16 ``[W, D]``) and fp32 copies of
@@ -1091,6 +1090,31 @@ class KimiKDARuntime(nn.Module):
         self._A_log_f32 = mixer.A_log.detach().float().contiguous()
         self._dt_bias_f32 = mixer.dt_bias.detach().float().contiguous()
         self._onorm_w_f32 = mixer.o_norm.weight.detach().float().contiguous()
+
+    def _fused_input_projections(
+        self, x: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Project the shared KDA inputs through the decode-fused weights."""
+        mixer = self.mixer
+        d = self.proj_size
+        hd = mixer.head_dim
+        H = mixer.num_heads
+
+        if self._in_proj_weight is not None:
+            proj = torch.nn.functional.linear(x, self._in_proj_weight)
+            x_qkv, onorm_g, f_a, beta = proj.split(
+                [3 * d, d, hd, H], dim=-1
+            )
+        elif self._in_proj_small_weight is not None:
+            qkvg = mixer.qkvg_proj(x)
+            x_qkv, onorm_g = qkvg.split([3 * d, d], dim=-1)
+            small = torch.nn.functional.linear(x, self._in_proj_small_weight)
+            f_a, beta = small.split([hd, H], dim=-1)
+        else:
+            return None
+
+        g = mixer.f_b_proj(f_a)
+        return x_qkv, onorm_g, g, beta
 
     def finalize_decode_weights_fp8(self) -> None:
         """FP8 counterpart of ``finalize_decode_weights()``.
@@ -1401,24 +1425,9 @@ class KimiKDARuntime(nn.Module):
             )
             self._cs_dense = buf
 
-        if self._in_proj_weight is not None:
-            # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
-            proj = torch.nn.functional.linear(x2d, self._in_proj_weight)
-            x_qkv = proj[:, : 3 * d]
-            onorm_g = proj[:, 3 * d : 4 * d]
-            f_a = proj[:, 4 * d : 4 * d + hd]
-            beta = proj[:, 4 * d + hd : 4 * d + hd + H]
-        else:
-            # FP8 weight read (KIMI_K3_KDA_GLUE_FP8=1): the loader's fused
-            # FP8 [q | k | v | g] GEMM plus one BF16 GEMV over [f_a | b];
-            # slices below are views.
-            qkvg = mixer.qkvg_proj(x2d)
-            small = torch.nn.functional.linear(x2d, self._in_proj_small_weight)
-            x_qkv = qkvg[:, : 3 * d]
-            onorm_g = qkvg[:, 3 * d : 4 * d]
-            f_a = small[:, :hd]
-            beta = small[:, hd : hd + H]
-        g = mixer.f_b_proj(f_a)  # [B, d]
+        projections = self._fused_input_projections(x2d)
+        assert projections is not None
+        x_qkv, onorm_g, g, beta = projections
 
         # Gather the HF-layout conv windows once, then repack the
         # historical W-1 columns into the kernel's dense per-section
@@ -1588,13 +1597,25 @@ class KimiKDARuntime(nn.Module):
         x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
         T_total = num_decodes * num_steps
 
-        x_q = mixer.q_proj(x).view(1, T_total, H, K)
-        x_k = mixer.k_proj(x).view(1, T_total, H, K)
-        x_v = mixer.v_proj(x).view(1, T_total, H, mixer.head_dim)
+        projections = self._fused_input_projections(x)
+        if projections is None:
+            x_q = mixer.q_proj(x)
+            x_k = mixer.k_proj(x)
+            x_v = mixer.v_proj(x)
+            onorm_g = None
+            g = mixer.f_b_proj(mixer.f_a_proj(x))
+            beta = mixer.b_proj(x)
+        else:
+            x_qkv, onorm_g, g, beta = projections
+            x_q, x_k, x_v = x_qkv.split(self.proj_size, dim=-1)
+
+        x_q = x_q.view(1, T_total, H, K)
+        x_k = x_k.view(1, T_total, H, K)
+        x_v = x_v.view(1, T_total, H, mixer.head_dim)
         # Raw gate / beta: the kernel applies dt_bias, A_log, the
         # lower-bound sigmoid gate, and the beta sigmoid itself.
-        g = mixer.f_b_proj(mixer.f_a_proj(x)).view(1, T_total, H, K)
-        beta = mixer.b_proj(x).view(1, T_total, H)
+        g = g.view(1, T_total, H, K)
+        beta = beta.view(1, T_total, H)
 
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         lower_bound = (
@@ -1639,7 +1660,7 @@ class KimiKDARuntime(nn.Module):
             scale=mixer.head_k_dim**-0.5,
         )
         o = out.view(num_decodes, num_steps, H, mixer.head_dim)
-        return self._output_gate_and_proj(x, o)
+        return self._output_gate_and_proj(x, o, onorm_g)
 
     def _get_mtp_conv_weights(self):
         """fp32 ``[dim, W]`` conv weights for the fused verify kernel,
@@ -1734,14 +1755,20 @@ class KimiKDARuntime(nn.Module):
         o = torch.cat(step_outputs, dim=1)  # [B, T, H, V]
         return self._output_gate_and_proj(x, o)
 
-    def _output_gate_and_proj(self, x: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+    def _output_gate_and_proj(
+        self,
+        x: torch.Tensor,
+        o: torch.Tensor,
+        g_out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         from einops import rearrange
 
         mixer = self.mixer
-        if mixer.use_full_rank_gate:
-            g_out = mixer.g_proj(x)
-        else:
-            g_out = mixer.g_b_proj(mixer.g_a_proj(x))
+        if g_out is None:
+            if mixer.use_full_rank_gate:
+                g_out = mixer.g_proj(x)
+            else:
+                g_out = mixer.g_b_proj(mixer.g_a_proj(x))
         g_out = rearrange(g_out, "... (h d) -> ... h d", d=mixer.head_dim)
         o = mixer.o_norm(o, g_out)
         o = rearrange(o, "b t h d -> (b t) (h d)")

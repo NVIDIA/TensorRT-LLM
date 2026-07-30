@@ -41,8 +41,8 @@ import torch
 _HAVE_DEPS = True
 _DEP_ERR = None
 try:
-    import cutlass  # noqa: F401
     import cuda.bindings.driver  # noqa: F401
+    import cutlass  # noqa: F401
     from fla.ops.kda import fused_recurrent_kda  # noqa: F401
 except ImportError as e:
     _HAVE_DEPS = False
@@ -71,8 +71,7 @@ LB = -5.0
 
 
 def _make_runtime(seed):
-    from tensorrt_llm._torch.models.modeling_kimi_linear import \
-        KimiKDARuntime
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
 
     cfg = SimpleNamespace(
         hidden_size=HIDDEN,
@@ -98,6 +97,8 @@ def _make_runtime(seed):
             else:
                 p.copy_((torch.randn(p.shape, generator=gen, device="cuda",
                                      dtype=torch.float32) * 0.03).to(p.dtype))
+    rt.finalize_decode_weights()
+    assert rt._in_proj_weight is not None
     return rt
 
 
