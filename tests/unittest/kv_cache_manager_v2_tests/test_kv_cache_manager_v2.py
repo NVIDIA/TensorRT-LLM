@@ -80,7 +80,6 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         round_up,
         temporary_sys_path,
         typed_range,
-        unwrap_rawref,
     )
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -138,7 +137,6 @@ else:
         round_up,
         temporary_sys_path,
         typed_range,
-        unwrap_rawref,
     )
 
 from copy import deepcopy
@@ -151,6 +149,19 @@ with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
 
 
 def get_cached_cuda_event_type():
+    backend = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
+    if backend == "cpp":
+        try:
+            from bindings.internal.batch_manager.kv_cache_manager_v2 import CachedCudaEvent
+
+            return CachedCudaEvent
+        except ImportError:
+            from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (
+                CachedCudaEvent,
+            )
+
+            return CachedCudaEvent
+
     if find_spec("kv_cache_manager_v2") is not None:
         from kv_cache_manager_v2._utils import CachedCudaEvent
 
@@ -673,21 +684,18 @@ class TestNoBatching(TestKVCacheManagerV2):
             kv1.close()
         stream_holder.take_finish_event().synchronize()
 
-        match = self.manager._radix_tree.match(ReuseScope(), prompt)
-        self.assertEqual(match.num_tokens, len(prompt))
-        self.assertEqual(len(match.blocks), 4)
-
-        swa_lc_id = next(
-            lc_id
-            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
-            if lc.window_size is not None
+        swa_lc_id = _introspection.swa_life_cycle_ids(self.manager)[0]
+        num_tokens, pages = _introspection.reuse_match_pages(
+            self.manager, ReuseScope(), prompt, swa_lc_id
         )
+        self.assertEqual(num_tokens, len(prompt))
+        self.assertEqual(len(pages), 4)
         # The committed snapshot is reusable at the post-commit token count, but
         # old SWA blocks outside that window should not keep reusable pages.
-        self.assertIsNone(match.blocks[0].storage[swa_lc_id])
-        self.assertIsNone(match.blocks[1].storage[swa_lc_id])
-        self.assertIsNotNone(match.blocks[2].storage[swa_lc_id])
-        self.assertIsNotNone(match.blocks[3].storage[swa_lc_id])
+        self.assertIsNone(pages[0])
+        self.assertIsNone(pages[1])
+        self.assertIsNotNone(pages[2])
+        self.assertIsNotNone(pages[3])
         self.assertEqual(
             self.manager.probe_reuse(input_tokens=prompt[: tokens_per_block * 3]),
             0,
@@ -2034,8 +2042,8 @@ class TestSSMSupport(unittest.TestCase):
         reused.commit_pending_stats()
         self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), set())
 
-        assert self.manager._life_cycles.ssm_life_cycle_id is not None
-        ssm_life_cycle_id = self.manager._life_cycles.ssm_life_cycle_id
+        ssm_life_cycle_id = _introspection.ssm_life_cycle_id(self.manager)
+        assert ssm_life_cycle_id is not None
         snapshot_stats = self.manager.get_and_reset_ssm_snapshot_iteration_stats()
         self.assertEqual(set(snapshot_stats), {ssm_life_cycle_id})
         stats = snapshot_stats[ssm_life_cycle_id]
@@ -2279,24 +2287,20 @@ class TestSSMSupport(unittest.TestCase):
         drop_handle = kv_cache.plan_committed_block_drop()
         self.assertIsNotNone(drop_handle)
 
-        match = self.manager._radix_tree.match(
-            ReuseScope(), prompt, self.manager.enable_partial_match
+        attn_lc_id = _introspection.attention_life_cycle_ids(self.manager)[0]
+        ssm_lc_id = _introspection.ssm_life_cycle_id(self.manager)
+        assert ssm_lc_id is not None
+        num_tokens, attn_counts = _introspection.reuse_match_planned_drop_counts(
+            self.manager, ReuseScope(), prompt, attn_lc_id, self.manager.enable_partial_match
         )
-        self.assertEqual(match.num_tokens, len(prompt))
-        attn_lc_id = next(iter(self.manager._life_cycles.attention_life_cycles()))[0]
-        assert self.manager._life_cycles.ssm_life_cycle_id is not None
-        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
-        planned_pages = []
-        for block in match.blocks:
-            page_ref = block.storage[attn_lc_id]
-            assert page_ref is not None
-            planned_pages.append(unwrap_rawref(page_ref))
-        ssm_page_ref = match.blocks[-1].storage[ssm_lc_id]
-        assert ssm_page_ref is not None
-        planned_pages.append(unwrap_rawref(ssm_page_ref))
-        self.assertTrue(all(page.planned_drop_count == 1 for page in planned_pages))
-        planned_pages.clear()
-        del page_ref, ssm_page_ref
+        self.assertEqual(num_tokens, len(prompt))
+        # Every partial SWA-window attention page is planned for drop exactly once.
+        self.assertTrue(attn_counts and all(count == 1 for count in attn_counts))
+        _, ssm_counts = _introspection.reuse_match_planned_drop_counts(
+            self.manager, ReuseScope(), prompt, ssm_lc_id, self.manager.enable_partial_match
+        )
+        # The SSM snapshot on the last committed block is planned for drop.
+        self.assertEqual(ssm_counts[-1], 1)
 
         kv_cache.close()
         assert drop_handle is not None
@@ -2434,17 +2438,21 @@ class TestSSMSupport(unittest.TestCase):
             exact.resume(stream)
             exact.close()
 
-            match = self.manager._radix_tree.match(
-                ReuseScope(), prompt[:48], self.manager.enable_partial_match
+            ssm_lc_id = _introspection.ssm_life_cycle_id(self.manager)
+            assert ssm_lc_id is not None
+            num_tokens, pages = _introspection.reuse_match_pages(
+                self.manager,
+                ReuseScope(),
+                prompt[:48],
+                ssm_lc_id,
+                self.manager.enable_partial_match,
             )
-            self.assertEqual(match.num_tokens, 48)
-            assert self.manager._life_cycles.ssm_life_cycle_id is not None
-            page_ref = match.blocks[-1].storage[self.manager._life_cycles.ssm_life_cycle_id]
-            assert page_ref is not None
-            page = unwrap_rawref(page_ref)
-            self.assertEqual(page.num_tokens_in_block, 16)
+            self.assertEqual(num_tokens, 48)
+            last_page = pages[-1]
+            assert last_page is not None
+            self.assertEqual(last_page[1], 16)
 
-            del exact, kv1, longer, match, page, page_ref
+            del exact, kv1, longer
             gc.collect()
             stream_holder.synchronize()
             self.manager.shutdown()
@@ -2464,30 +2472,30 @@ class TestSSMSupport(unittest.TestCase):
         kv_cache.capacity = len(prompt)
         kv_cache.history_length = len(prompt)
 
-        attn_lc_id = next(iter(self.manager._life_cycles.attention_life_cycles()))[0]
-        assert self.manager._life_cycles.ssm_life_cycle_id is not None
-        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        attn_lc_id = _introspection.attention_life_cycle_ids(self.manager)[0]
+        ssm_lc_id = _introspection.ssm_life_cycle_id(self.manager)
+        assert ssm_lc_id is not None
         attn_tail_slot = kv_cache.get_base_page_indices(LayerGroupId(attn_lc_id))[1]
         ssm_slot = kv_cache.get_ssm_block_base_index(LayerGroupId(ssm_lc_id))
 
         kv_cache.commit(prompt, is_end=True)
         kv_cache.close()
 
-        match = self.manager._radix_tree.match(
-            ReuseScope(), prompt, self.manager.enable_partial_match
+        _, attn_pages = _introspection.reuse_match_pages(
+            self.manager, ReuseScope(), prompt, attn_lc_id, self.manager.enable_partial_match
         )
-        self.assertEqual(match.num_tokens, len(prompt))
-        tree_block = match.blocks[-1]
+        num_tokens, ssm_pages = _introspection.reuse_match_pages(
+            self.manager, ReuseScope(), prompt, ssm_lc_id, self.manager.enable_partial_match
+        )
+        self.assertEqual(num_tokens, len(prompt))
 
-        attn_ref = tree_block.storage[attn_lc_id]
-        ssm_ref = tree_block.storage[ssm_lc_id]
-        assert attn_ref is not None
-        assert ssm_ref is not None
-        attn_page = unwrap_rawref(attn_ref)
-        ssm_page = unwrap_rawref(ssm_ref)
-        self.assertEqual(attn_page.slot_id, attn_tail_slot)
-        self.assertEqual(ssm_page.slot_id, ssm_slot)
-        self.assertEqual(ssm_page.num_tokens_in_block, 16)
+        attn_page = attn_pages[-1]
+        ssm_page = ssm_pages[-1]
+        assert attn_page is not None
+        assert ssm_page is not None
+        self.assertEqual(attn_page[0], attn_tail_slot)
+        self.assertEqual(ssm_page[0], ssm_slot)
+        self.assertEqual(ssm_page[1], 16)
 
     def test_commit_min_snapshot_requires_history_alignment(self) -> None:
         """commit_min_snapshot requires commit() to start or end at history length."""
@@ -2767,9 +2775,9 @@ class TestInitRatioConfig(unittest.TestCase):
     def test_zero_capacity_request_reserves_only_an_ssm_slot(self):
         """Every request reserves one SSM slot, including a zero-token dummy."""
         manager = KVCacheManager(self._make_hybrid_config())
-        ssm_lc = manager._life_cycles.ssm_life_cycle_id
+        ssm_lc = _introspection.ssm_life_cycle_id(manager)
         assert ssm_lc is not None
-        ssm_pg = manager._storage.get_pool_group_index(ssm_lc)
+        ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
         attn_pg = 1 - ssm_pg
 
         batch = BatchDesc(
@@ -2778,7 +2786,7 @@ class TestInitRatioConfig(unittest.TestCase):
                 KVCacheDesc(capacity=0, history_length=0),
             ]
         )
-        slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
+        slots = _introspection.compute_slots_for_batch(manager, batch, self.TOKENS_PER_BLOCK, None)
         self.assertEqual(slots[ssm_pg], 2)
         self.assertEqual(slots[attn_pg], 2)
         manager.shutdown()
@@ -2825,8 +2833,16 @@ class TestInitRatioConfig(unittest.TestCase):
             kv_cache.close()
         manager.shutdown()
 
-    def test_initial_pool_ratio_overrides_typical_step_and_constraints(self):
-        """Explicit initial_pool_ratio takes precedence over inferred sizing inputs."""
+    def test_constraint_floor_overrides_infeasible_initial_pool_ratio(self):
+        """A constraint's feasibility floor overrides an infeasible initial_pool_ratio.
+
+        initial_pool_ratio is the target split and still overrides typical_step, but
+        constraints stay feasibility floors (mirrors PR #16269): if a declared batch
+        needs more slots than its target share can hold, that pool group's share is
+        clamped up so the batch can be resumed, rather than starving it during warmup.
+        Here pool group 1's 0.2 target cannot satisfy the 256-request constraint, so
+        its share is clamped above 0.2 and pool group 0 gives up the remainder.
+        """
         typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)
         constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=256, history_length=128)] * 256)
         cfg = self._make_config(
@@ -2837,7 +2853,8 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
         ratio = _introspection.current_gpu_ratio(manager)
 
-        self.assertGreater(ratio[0], ratio[1])
+        self.assertGreater(ratio[1], 0.2)
+        self.assertLess(ratio[0], 0.8)
         self.assertAlmostEqual(sum(ratio), 1.0, places=6)
         manager.shutdown()
 
@@ -3705,11 +3722,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             tokens_per_block=tokens_per_block,
             gpu_quota=64 << 20,
         )
-        swa_lc_id = next(
-            lc_id
-            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
-            if lc.window_size is not None
-        )
+        swa_lc_id = _introspection.swa_life_cycle_ids(self.manager)[0]
 
         prompt1 = [TokenId(i) for i in range(2 * window_size - 1)]  # 127 tokens
         prompt2 = [TokenId(i) for i in range(200)]  # first 127 tokens identical to prompt1
@@ -3732,11 +3745,12 @@ class TestScratchReuse(TestKVCacheManagerV2):
         # match() is documented volatile, so read what we need and drop the reference before
         # mutating the tree again (holding live Block refs across a later clear would leave the
         # eviction accounting inconsistent).
-        match1 = self.manager._radix_tree.match(ReuseScope(), prompt1)
-        self.assertEqual(match1.num_tokens, len(prompt1))
-        self.assertEqual(len(match1.blocks), 4)
-        has_page = [b.storage[swa_lc_id] is not None for b in match1.blocks]
-        del match1
+        num_tokens1, pages1 = _introspection.reuse_match_pages(
+            self.manager, ReuseScope(), prompt1, swa_lc_id
+        )
+        self.assertEqual(num_tokens1, len(prompt1))
+        self.assertEqual(len(pages1), 4)
+        has_page = [p is not None for p in pages1]
         self.assertEqual(
             has_page,
             [False, False, True, True],  # positions 0..63 out of window; 64..126 in window
