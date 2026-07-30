@@ -297,6 +297,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # speculative draft lengths, or any batch with a context request) has to
     # keep using the fmha_sm100 plans.
     _msa_decode_query_len: Optional[int] = None
+    # Staged max per-request KV length, a scheduling upper bound for the
+    # ported decode kernels.
+    _msa_max_kv_len: int = 0
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -392,6 +395,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def msa_decode_query_len(self) -> Optional[int]:
         """Uniform per-request query length on a pure-decode step, else None."""
         return self._msa_decode_query_len
+
+    @property
+    def msa_max_kv_len(self) -> int:
+        """Staged max per-request KV length for this step."""
+        return self._msa_max_kv_len
 
     @property
     def msa_eager_n_valid_blocks(self) -> Optional[torch.Tensor]:
@@ -787,6 +795,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_eager_dense_plan = None
         self._msa_eager_n_valid_blocks = None
         self._msa_decode_query_len = None
+        self._msa_max_kv_len = 0
         if not self._msa_fields_ready:
             return
         # Geometry is captured in __post_init__; skip when it is unavailable.
@@ -877,10 +886,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 self._msa_eager_n_valid_blocks = dev_buf[:total_q]
             return
 
-        # Host-side tensor, so these reads do not sync the device.
+        # Host-side tensors, so these reads do not sync the device.
         qo_min, qo_max = int(qo_lens_cpu.min()), int(qo_lens_cpu.max())
         if qo_min == qo_max:
             self._msa_decode_query_len = qo_max
+        # Staged, i.e. before the overlap scheduler's correction, which only
+        # shrinks lengths. That keeps it a valid upper bound for the ported
+        # kernels' scheduling hints even when it is baked into a CUDA graph.
+        self._msa_max_kv_len = int(kv_lens_cpu.max())
 
         required_max_k_tiles = int(proxy_plan[3]["max_k_tiles"])
         self._ensure_msa_decode_scratch_buffers(

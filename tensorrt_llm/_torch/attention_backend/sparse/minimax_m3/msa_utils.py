@@ -55,21 +55,33 @@ def msa_kernel_choice(env_var: str) -> str:
     return value
 
 
+def _uniform_decode_step(metadata) -> bool:
+    """Whether the step is pure decode with one query length and a block table.
+
+    The ported kernels derive the request id as ``token // decode_query_len``,
+    so a ragged step (mixed draft lengths, or any batch holding a context
+    request) keeps using the fmha_sm100 plans.
+    """
+    return (
+        getattr(metadata, "msa_decode_query_len", None) is not None
+        and getattr(metadata, "msa_block_table", None) is not None
+        and getattr(metadata, "msa_seq_lens_cuda", None) is not None
+    )
+
+
 def msa_triton_sparse_decode_active(metadata) -> bool:
     """Whether this step's sparse layers should run the Triton decode kernel.
 
     Both the indexer (which orients its top-k table) and the attention call
     consult this, so they can never disagree about the layout within a step.
     """
-    if msa_kernel_choice("TLLM_M3_SPARSE_DECODE") != "triton":
-        return False
-    # The kernel derives the request id as token // decode_query_len, so a
-    # ragged step (mixed draft lengths, or any batch holding a context request)
-    # keeps using the fmha_sm100 plans.
-    return (
-        getattr(metadata, "msa_decode_query_len", None) is not None
-        and getattr(metadata, "msa_block_table", None) is not None
-        and getattr(metadata, "msa_seq_lens_cuda", None) is not None
+    return msa_kernel_choice("TLLM_M3_SPARSE_DECODE") == "triton" and _uniform_decode_step(metadata)
+
+
+def msa_trtllm_gen_dense_decode_active(metadata) -> bool:
+    """Whether this step's dense layers should run trtllm-gen decode."""
+    return msa_kernel_choice("TLLM_M3_DENSE_DECODE") == "trtllm_gen" and _uniform_decode_step(
+        metadata
     )
 
 
@@ -300,6 +312,7 @@ __all__ = [
     "msa_package_available",
     "msa_paged_kv",
     "msa_triton_sparse_decode_active",
+    "msa_trtllm_gen_dense_decode_active",
     "per_token_valid_blocks",
     "require_msa_module",
     "select_blocks_from_maxscore",

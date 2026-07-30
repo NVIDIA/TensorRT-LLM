@@ -128,6 +128,7 @@ def run_msa_paged_gqa(
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_paged_kv,
         msa_triton_sparse_decode_active,
+        msa_trtllm_gen_dense_decode_active,
         write_msa_main_kv,
     )
 
@@ -182,6 +183,31 @@ def run_msa_paged_gqa(
             decode_query_len=decode_query_len,
         )
         return
+
+    if kv_block_indexes is None and msa_trtllm_gen_dense_decode_active(metadata):
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
+            dense_decode_sm_scale,
+            dense_decode_supported,
+            minimax_m3_trtllm_gen_dense_decode,
+        )
+
+        unsupported = dense_decode_supported(kv_cache_manager, q_view)
+        if unsupported is None:
+            decode_query_len = int(metadata.msa_decode_query_len)
+            batch = num_tokens // decode_query_len
+            minimax_m3_trtllm_gen_dense_decode(
+                q_view,
+                kv_cache_manager,
+                layer_idx,
+                metadata.msa_block_table[:batch],
+                metadata.msa_seq_lens_cuda[:batch],
+                sm_scale=dense_decode_sm_scale(head_dim, float(attn.q_scaling)),
+                output=out_view,
+                decode_query_len=decode_query_len,
+                max_seq_len=int(metadata.msa_max_kv_len),
+                max_num_requests=int(metadata.max_num_requests),
+            )
+            return
 
     # The fmha_sm100 variant is chosen from q.dtype and shares one dtype across
     # q/k/v, so q must be FP8 to match an FP8 paged K/V. MiniMax-M3 has no

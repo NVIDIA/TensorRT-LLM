@@ -13,6 +13,7 @@ l0_b200_m3:
       stage: pre_merge
       backend: pytorch
   tests:
+  - unittest/_torch/attention/sparse/test_minimax_m3_dense_decode.py
   - unittest/_torch/attention/sparse/test_minimax_m3_index_decode_score.py
   - unittest/_torch/attention/sparse/test_minimax_m3_msa_backend.py
   - unittest/_torch/attention/sparse/test_minimax_m3_msa_selector.py
