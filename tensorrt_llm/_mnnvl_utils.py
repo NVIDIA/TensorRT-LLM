@@ -365,6 +365,7 @@ class MnnvlMemory:
         link_count = pynvml.NVML_NVLINK_MAX_LINKS
         active_links = 0
         available_links = 0
+        probed_links = link_count
         for link_idx in range(link_count):
             try:
                 if pynvml.nvmlDeviceGetNvLinkCapability(
@@ -376,11 +377,22 @@ class MnnvlMemory:
                         active_links += 1
             except pynvml.NVMLError_NotSupported:
                 continue
-        return (
+            except pynvml.NVMLError_InvalidArgument:
+                # NVML_NVLINK_MAX_LINKS (36) is an upper bound over all architectures;
+                # the driver rejects indices past this GPU's link count (18 on GB200).
+                probed_links = link_idx
+                break
+        supported = (
             active_links == available_links and available_links > 0
             if need_all_up
             else available_links > 0
         )
+        logger.info(
+            f"[MnnvlMemory] dev {dev_id} NVLink: {active_links}/{available_links} links up "
+            f"({probed_links} of {link_count} link indices accepted by the driver), "
+            f"need_all_up={need_all_up}, supported={supported}"
+        )
+        return supported
 
     @staticmethod
     def supports_mnnvl() -> bool:
