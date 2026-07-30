@@ -206,17 +206,22 @@ class InklingConfig(PretrainedConfig):
         # Multimodal placeholder ids. One appears per media item in the
         # pre-rendered token stream; the input processor expands it to one token
         # per patch (image) / audio frame and the vision/audio fusion overwrites
-        # those positions. The IMAGE placeholder is the IN-VOCAB chat-template
-        # token ``<|unused_200054|>`` (id 200054): TensorRT-LLM's executor
-        # validates request token ids and rejects an out-of-range id, so the
-        # SGLang-internal -101 sentinel (parser/inkling_tokenizer.py) raises
-        # ``RequestError: Token ID out of range`` at ``llm.generate``. -101 and
-        # 200054 are interchangeable for parity (both are replaced by the same
-        # vision embeddings); the SGLang reference is POSTed with -101, TRT runs
-        # 200054. The in-scope checkpoint's config.json omits these, so the
+        # those positions. Both placeholders are IN-VOCAB chat-template tokens:
+        # image ``<|unused_200054|>`` (id 200054) and audio ``<|unused_200053|>``
+        # (id 200053) -- exactly the tokens the Inkling chat template renders for
+        # an image / audio content part
+        # (``<|content_image|><|unused_200054|>...`` and
+        # ``<|content_audio_input|><|unused_200053|><|audio_end|>...``).
+        # They MUST be in-vocab: TensorRT-LLM's executor validates request token
+        # ids and rejects an out-of-range id, so the SGLang-internal -101/-102
+        # sentinels (parser/inkling_tokenizer.py) raise ``RequestError: Token ID
+        # out of range`` at ``llm.generate``. The sentinel and the in-vocab id
+        # are interchangeable for parity (both are replaced by the same tower
+        # embeddings); the SGLang reference is POSTed with -101/-102, TRT runs
+        # 200054/200053. The in-scope checkpoint's config.json omits these, so the
         # defaults are authoritative unless a config spells them out.
         image_token_id: int = 200054,
-        audio_token_id: int = -102,
+        audio_token_id: int = 200053,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):

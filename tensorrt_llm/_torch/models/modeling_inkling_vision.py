@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inkling vision preprocessing + multimodal input processor (Stage-1 / Goal 1.2).
+"""Inkling vision + audio preprocessing, towers, and multimodal input processor.
 
-Scope of this module (image path only):
+Scope of this module (image + audio media paths; the video path reuses the image
+tower as multi-frame images and lives with the vision plumbing here):
   * :class:`InklingImagePreprocessor` -- turn raw images into the Inkling hMLP
     ``vision_patches_bthwc`` tensor, numerically matching the SGLang reference
     ``sglang.srt.multimodal.inkling.image_processing.InklingImageProcessor``
@@ -100,9 +101,28 @@ DEFAULT_RESCALE_MAX_UPSCALED_LONG_EDGE = 2048
 # which placeholder id the token carried before replacement. config.json may
 # override via ``image_token_id``.
 DEFAULT_IMAGE_TOKEN_ID = 200054  # <|unused_200054|> (in-vocab; see note above)
-# Audio placeholder (Stage 2). SGLang uses -102 internally; the audio content
-# token is resolved from config/chat-template when the audio tower lands.
-DEFAULT_AUDIO_TOKEN_ID = -102
+# Inkling audio placeholder id. Like the image sentinel, one appears per audio
+# clip in the pre-rendered token stream; the input processor expands it into one
+# token per dMel frame and the audio fusion overwrites those positions with tower
+# rows. The Inkling chat template renders an audio content part as
+# ``<|content_audio_input|>(200020) <|unused_200053|>(200053) <|audio_end|>
+# <|end_message|>``, so ``<|unused_200053|>`` (id 200053, IN-VOCAB) IS the trained
+# audio placeholder token (the direct analogue of the image ``<|unused_200054|>``).
+# SGLang uses -102 only as an INTERNAL sentinel; both ids are interchangeable for
+# parity because the audio tower overwrites those positions identically.
+# config.json / the top-level config may override via ``audio_token_id``.
+DEFAULT_AUDIO_TOKEN_ID = 200053  # <|unused_200053|> (in-vocab; see note above)
+
+# Default Inkling dMel audio-preprocessing geometry (checkpoint ``audio_config`` +
+# ``processor_config.json`` ``feature_extractor``; SGLang
+# ``multimodal/inkling/feature_extraction.py`` ``InklingAudioEncoderParams``).
+DEFAULT_AUDIO_SAMPLE_RATE = 16000
+DEFAULT_AUDIO_WINDOW_SIZE_MULTIPLIER = 2.0
+DEFAULT_AUDIO_N_MELS = 80
+DEFAULT_AUDIO_NUM_DMEL_BINS = 16  # == audio_config.mel_vocab_size
+DEFAULT_AUDIO_DMEL_MIN_VALUE = -7.0
+DEFAULT_AUDIO_DMEL_MAX_VALUE = 2.0
+DEFAULT_AUDIO_TOKEN_DURATION_S = 0.05  # 1 dMel frame == 1 audio token (hop/sr)
 
 
 # ===========================================================================
@@ -310,6 +330,88 @@ def _resolve_vision_geometry(config: Any) -> Tuple[int, int]:
     )
 
 
+# ===========================================================================
+# Video utilities (Stage-7 / Goal 7.1) -- video is multi-frame images
+# ===========================================================================
+# Inkling has NO separate video tower: a video is decoded to frames, a subset of
+# frames is sampled, and each sampled frame is fed as an ordinary image through
+# the SAME hMLP vision tower (one ``<image>`` placeholder span per frame). So the
+# only genuinely video-specific logic is choosing WHICH frames to keep; the
+# per-frame preprocessing, tower forward, and fusion all reuse the accepted image
+# path (:class:`InklingImagePreprocessor` + :meth:`InklingInputProcessor.assemble`
+# already handle a list of images, i.e. a list of frames, in encounter order).
+#
+# ``sample_video_frames`` is a verbatim port of the SGLang reference
+# ``sglang.srt.utils.common.sample_video_frames`` (the requested serving
+# comparand; covered by SGLang ``test/registered/vlm/test_video_utils.py``), so
+# frame sampling matches SGLang frame-for-frame on the same clip.
+
+
+def sample_video_frames(video: Any, *, desired_fps: int, max_frames: int) -> List[int]:
+    """Frame indices to keep from ``video``, matching SGLang frame-for-frame.
+
+    ``video`` is any object exposing ``__len__`` (total decoded frames) and
+    ``avg_fps`` (the clip's average FPS) -- exactly the interface SGLang's
+    ``sample_video_frames`` and its ``test_video_utils.py`` ``DummyVideo`` use.
+    The sampled count is bounded by the desired FPS, ``max_frames``, and the
+    total frame count, with at least one frame always kept; the returned indices
+    are strictly increasing (temporal order preserved). Verbatim port of SGLang
+    ``sglang.srt.utils.common.sample_video_frames``.
+    """
+    total_frames = len(video)
+    assert total_frames > 0, "Video must have at least one frame"
+
+    avg_fps = video.avg_fps
+    duration = total_frames / avg_fps if avg_fps > 0 else 0
+    fps = min(desired_fps, avg_fps)
+
+    num_frames = math.floor(duration * fps)
+    num_frames = min(max_frames, num_frames, total_frames)
+    num_frames = max(1, num_frames)  # At least one frame
+    if num_frames == total_frames:
+        return list(range(total_frames))
+    else:
+        return np.linspace(0, total_frames - 1, num_frames, dtype=int).tolist()
+
+
+class DecodedVideo:
+    """A minimal decoded-video view over an ordered list of frame images.
+
+    Wraps already-decoded frames (PIL images, numpy arrays, or raw image bytes --
+    whatever :class:`InklingImagePreprocessor` accepts) plus the clip's average
+    FPS so :func:`sample_video_frames` can select a subset. This deliberately does
+    NOT own codec/decoding: real serving decodes the container upstream (SGLang's
+    ``encode_video``); this bring-up path takes the decoded frames directly, which
+    keeps the video utility free of a third-party video-decoder dependency.
+    """
+
+    def __init__(self, frames: Sequence[Any], avg_fps: float) -> None:
+        self.frames = list(frames)
+        if not self.frames:
+            raise ValueError("DecodedVideo requires at least one frame")
+        self.avg_fps = float(avg_fps)
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+
+def sample_video_as_images(
+    video: "DecodedVideo", *, desired_fps: int, max_frames: int
+) -> List[Any]:
+    """Video -> the sampled frames as an ordered list of images.
+
+    Selects frame indices with :func:`sample_video_frames` (SGLang-parity) and
+    returns those frames in temporal order. The caller renders one ``<image>``
+    content part per returned frame; the accepted multi-image
+    :meth:`InklingInputProcessor.assemble` then expands each ``<image>``
+    placeholder into that frame's own patch span and the shared hMLP tower + fusion
+    handle the rest -- no separate video tower. Frame count and ordering are
+    preserved (this is what the Stage-7 utility test asserts).
+    """
+    idxs = sample_video_frames(video, desired_fps=desired_fps, max_frames=max_frames)
+    return [video.frames[i] for i in idxs]
+
+
 def _resolve_image_token_id(config: Any) -> int:
     """The single ``<image>`` placeholder id the token stream carries per image.
 
@@ -378,12 +480,19 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         super().__init__(model_path, config, tokenizer, trust_remote_code, **kwargs)
         patch_size, temporal = _resolve_vision_geometry(config)
         self.image_token_id = _resolve_image_token_id(config)
+        self.audio_token_id = _resolve_audio_token_id(config)
         self._dtype = torch.bfloat16
         self._preprocessor = InklingImagePreprocessor(
             patch_size=patch_size,
             temporal_patch_size=temporal,
             dtype=self._dtype,
         )
+        # dMel audio preprocessor (Stage-6 / Goal 6.1). Built unconditionally so
+        # an audio request works even for a checkpoint whose config omits an
+        # ``audio_config`` blob (the geometry falls back to the checkpoint
+        # defaults); it is only exercised when the token stream actually carries
+        # an audio placeholder, so it is inert for text/image-only requests.
+        self._audio_preprocessor = InklingAudioPreprocessor(**_resolve_audio_geometry(config))
         # Text-only requests must tokenize EXACTLY as the accepted text tower
         # did before this processor was registered (tiktoken special-token
         # handling, add_special_tokens, truncation, query). Delegate to the
@@ -421,29 +530,36 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         return self._dtype
 
     def get_mm_token_ids(self) -> Optional[torch.Tensor]:
-        """The placeholder id(s) that mark vision rows in the token stream.
+        """The placeholder id(s) that mark media rows in the token stream.
 
         The image path expands each ``<image>`` sentinel into ``num_patches``
-        copies of ``image_token_id``; the model engine locates those rows to
-        overwrite with vision embeddings (Goal 1.4). Returned as int32 so the
-        engine's ``torch.isin(input_ids, mm_token_ids)`` lookup matches.
-        """
-        return torch.tensor([self.image_token_id], dtype=torch.int32)
+        copies of ``image_token_id`` and the audio path expands each ``<audio>``
+        sentinel into ``num_frames`` copies of ``audio_token_id``; the model
+        engine locates those rows to overwrite with tower embeddings (Goals 1.4 /
+        6.1). Returned as int32 so the engine's
+        ``torch.isin(input_ids, mm_token_ids)`` lookup matches both."""
+        return torch.tensor([self.image_token_id, self.audio_token_id], dtype=torch.int32)
 
     # ---- core (pure, testable) expansion + validation ---------------------
     def assemble(
         self,
         input_ids: Sequence[int],
         image_data: Optional[Sequence[Any]] = None,
+        audio_data: Optional[Sequence[Any]] = None,
     ) -> Tuple[List[int], Dict[str, Any]]:
-        """Expand ``<image>`` placeholders in ``input_ids`` and attach features.
+        """Expand ``<image>`` / ``<audio>`` placeholders and attach media features.
 
         Returns ``(expanded_ids, multimodal_data)`` where ``multimodal_data`` is
-        ``{}`` for a text-only request or ``{"image": {...}}`` otherwise. Raises
-        ``ValueError`` on any count mismatch (fail-loud contract).
+        ``{}`` for a text-only request, or carries an ``"image"`` and/or
+        ``"audio"`` entry. Each image placeholder expands to one token per vision
+        patch (hMLP emits one row per patch) and each audio placeholder to one
+        token per dMel frame (the audio tower emits one row per frame). Raises
+        ``ValueError`` on any placeholder/media/feature-row count mismatch
+        (fail-loud contract; media is never dropped or padded silently).
         """
         input_ids = list(input_ids)
         image_data = list(image_data) if image_data else []
+        audio_data = list(audio_data) if audio_data else []
 
         n_img_ph = sum(1 for t in input_ids if t == self.image_token_id)
         if n_img_ph != len(image_data):
@@ -453,22 +569,30 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 f"{len(image_data)} image(s) provided; counts must match "
                 f"(media is never dropped or padded silently)."
             )
+        n_aud_ph = sum(1 for t in input_ids if t == self.audio_token_id)
+        if n_aud_ph != len(audio_data):
+            raise ValueError(
+                f"InklingInputProcessor: {n_aud_ph} audio placeholder token(s) "
+                f"(id={self.audio_token_id}) in input_ids but "
+                f"{len(audio_data)} audio clip(s) provided; counts must match "
+                f"(media is never dropped or padded silently)."
+            )
 
-        if not image_data:
+        if not image_data and not audio_data:
             return input_ids, {}  # text-only passthrough
 
-        feat = self._preprocessor.preprocess(image_data)
-        num_patches: List[int] = feat["num_patches"]
-        num_tokens: List[int] = feat["num_tokens"]
-        vision_patches = feat["vision_patches_bthwc"]
+        img_feat = self._preprocessor.preprocess(image_data) if image_data else None
+        aud_feat = self._audio_preprocessor.preprocess(audio_data) if audio_data else None
 
         out_ids: List[int] = []
-        offsets: List[Tuple[int, int]] = []  # (start, end) inclusive per image
+        img_offsets: List[Tuple[int, int]] = []  # (start, end) inclusive per image
+        aud_offsets: List[Tuple[int, int]] = []  # (start, end) inclusive per clip
         i_img = 0
+        i_aud = 0
         for tok in input_ids:
-            if tok == self.image_token_id:
-                n_tok = int(num_tokens[i_img])
-                n_pat = int(num_patches[i_img])
+            if image_data and tok == self.image_token_id:
+                n_tok = int(img_feat["num_tokens"][i_img])
+                n_pat = int(img_feat["num_patches"][i_img])
                 if n_tok != n_pat:
                     raise ValueError(
                         f"InklingInputProcessor: image {i_img} expands to "
@@ -477,31 +601,59 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                     )
                 start = len(out_ids)
                 out_ids.extend([self.image_token_id] * n_tok)
-                offsets.append((start, start + n_tok - 1))
+                img_offsets.append((start, start + n_tok - 1))
                 i_img += 1
+            elif audio_data and tok == self.audio_token_id:
+                n_tok = int(aud_feat["num_tokens"][i_aud])
+                n_frm = int(aud_feat["num_frames"][i_aud])
+                if n_tok != n_frm:
+                    raise ValueError(
+                        f"InklingInputProcessor: audio {i_aud} expands to "
+                        f"{n_tok} token(s) but has {n_frm} dMel frame(s); the "
+                        f"audio tower emits exactly one token per frame."
+                    )
+                start = len(out_ids)
+                out_ids.extend([self.audio_token_id] * n_tok)
+                aud_offsets.append((start, start + n_tok - 1))
+                i_aud += 1
             else:
                 out_ids.append(int(tok))
 
-        # Central fail-loud invariant: the number of expanded placeholder tokens
-        # must equal the number of vision feature rows the tower will emit.
-        total_rows = int(sum(num_patches))
-        n_mm_out = sum(1 for t in out_ids if t == self.image_token_id)
-        feat_rows = int(vision_patches.shape[0]) if vision_patches.ndim else 0
-        if not (n_mm_out == total_rows == feat_rows):
-            raise ValueError(
-                f"InklingInputProcessor: placeholder-token count ({n_mm_out}) "
-                f"must equal feature-row count "
-                f"(sum(num_patches)={total_rows}, "
-                f"vision_patches rows={feat_rows})."
-            )
-
-        multimodal_data = {
-            "image": {
+        # Central fail-loud invariant, per modality: the number of expanded
+        # placeholder tokens must equal the number of feature rows the tower emits.
+        multimodal_data: Dict[str, Any] = {}
+        if image_data:
+            vision_patches = img_feat["vision_patches_bthwc"]
+            total_rows = int(sum(img_feat["num_patches"]))
+            n_mm_out = sum(1 for t in out_ids if t == self.image_token_id)
+            feat_rows = int(vision_patches.shape[0]) if vision_patches.ndim else 0
+            if not (n_mm_out == total_rows == feat_rows):
+                raise ValueError(
+                    f"InklingInputProcessor: image placeholder-token count "
+                    f"({n_mm_out}) must equal feature-row count "
+                    f"(sum(num_patches)={total_rows}, vision_patches rows={feat_rows})."
+                )
+            multimodal_data["image"] = {
                 "vision_patches_bthwc": vision_patches,
-                "num_patches": num_patches,
-                "offsets": offsets,
+                "num_patches": img_feat["num_patches"],
+                "offsets": img_offsets,
             }
-        }
+        if audio_data:
+            dmel_bins = aud_feat["dmel_bins"]
+            total_rows = int(sum(aud_feat["num_frames"]))
+            n_mm_out = sum(1 for t in out_ids if t == self.audio_token_id)
+            feat_rows = int(dmel_bins.shape[0]) if dmel_bins.ndim else 0
+            if not (n_mm_out == total_rows == feat_rows):
+                raise ValueError(
+                    f"InklingInputProcessor: audio placeholder-token count "
+                    f"({n_mm_out}) must equal feature-row count "
+                    f"(sum(num_frames)={total_rows}, dmel_bins rows={feat_rows})."
+                )
+            multimodal_data["audio"] = {
+                "dmel_bins": dmel_bins,
+                "num_frames": aud_feat["num_frames"],
+                "offsets": aud_offsets,
+            }
         return out_ids, multimodal_data
 
     # ---- SamplingParams/TextPrompt entrypoint -----------------------------
@@ -522,15 +674,18 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         images = mm_data.get("image") or []
         if images and not isinstance(images, list):
             images = [images]
+        audios = mm_data.get("audio") or []
+        if audios and not isinstance(audios, list):
+            audios = [audios]
 
-        if not images:
+        if not images and not audios:
             # Exactly the pre-registration text path (tiktoken-safe, honors
             # add_special_tokens / truncation / query). Returns (ids, None).
             return self._text_processor(inputs, sampling_params)
 
         token_ids, _extra = self._text_processor(inputs, sampling_params)
-        expanded_ids, multimodal_data = self.assemble(token_ids, images)
-        # ``multimodal_data`` is ``{"image": {...}}`` here (images are present).
+        expanded_ids, multimodal_data = self.assemble(token_ids, images, audios)
+        # ``multimodal_data`` carries an ``"image"`` and/or ``"audio"`` entry here.
         return expanded_ids, {"multimodal_data": multimodal_data}
 
     # ---- pre-tokenized (-101) + image fast path ---------------------------
@@ -557,10 +712,13 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         images = mm_data.get("image") or []
         if images and not isinstance(images, list):
             images = [images]
-        if not images:
+        audios = mm_data.get("audio") or []
+        if audios and not isinstance(audios, list):
+            audios = [audios]
+        if not images and not audios:
             # No media -> plain token passthrough (no multimodal payload).
             return ids, None
-        expanded_ids, multimodal_data = self.assemble(ids, images)
+        expanded_ids, multimodal_data = self.assemble(ids, images, audios)
         return expanded_ids, {"multimodal_data": multimodal_data}
 
 
@@ -768,6 +926,59 @@ def emit_vision_scatter_probe(n_mm_idx: int, n_vision_rows: int) -> None:
     )
 
 
+# ===========================================================================
+# Human feedback #21.1a -- LIVE production vision-tower INTERNALS dump (B1-B4).
+#
+# ``INKLING_VISION_DUMP=<base>`` turns on an env-gated, default-OFF tensor dump of
+# the tower interior (fold / linear_i / norm_i / final_norm / visual_out) from
+# INSIDE ``InklingVisionModel.forward`` during a LIVE TP=4 production run, so the
+# fb21 analyzer can compare the tower INTERNALS -- not just the tower output row
+# (C4) -- against the SGLang ``visual.vision_encoder.*`` forward-hook capture.
+# Sections A/B of the fb15 walk proved the two ports byte-identical only as
+# CPU_SOURCE_REPLAY (feedback #16); this makes the internals a LIVE_RUNTIME
+# comparison. The capture keys mirror the SGLang ``make_visual_hook`` capture
+# points EXACTLY (linear_0..3 = layers.linear_i out, norm_0..2 = layers.norm_i out,
+# final_norm = final_norm out, visual_out = tower output rows) so the analyzer
+# compares like with like. Each TP worker writes its own rank file; the tower is
+# replicated across ranks, so rank 0 carries the full interior. Default-off: the
+# accepted text/production path never sets the env, so this is a zero-cost no-op
+# there (the guard short-circuits before any clone/host-copy).
+_VISION_DUMP_CALLS = [0]  # monotonic tower-forward dump counter (per worker process)
+
+
+def vision_dump_base() -> "Optional[str]":
+    """Base path for the env-gated tower-internal tensor dump, or ``None`` when off."""
+    return os.environ.get("INKLING_VISION_DUMP") or None
+
+
+def emit_vision_tower_dump(base: str, caps: Dict[str, "torch.Tensor"], num_patches: int) -> None:
+    """Save the captured tower internals to ``<base>.call<n>.rank<r>.pt`` (feedback #21.1a).
+    Wrapped so a dump failure prints a marker but never breaks the production forward."""
+    try:
+        n = _VISION_DUMP_CALLS[0] = _VISION_DUMP_CALLS[0] + 1
+        r = _probe_rank()
+        path = f"{base}.call{n}.rank{r}.pt"
+        meta = {
+            k: {
+                "shape": list(v.shape),
+                "dtype": str(v.dtype),
+                "max_abs": float(v.abs().max()) if v.numel() else 0.0,
+            }
+            for k, v in caps.items()
+        }
+        torch.save(
+            {"num_patches": int(num_patches), "call": n, "rank": r, "internals": caps, "meta": meta},
+            path,
+        )
+        print(
+            f"INKLING_VISION_DUMP_SAVED rank={r} call={n} num_patches={int(num_patches)} "
+            f"keys={sorted(caps)} -> {path}",
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"INKLING_VISION_DUMP_ERROR rank={_probe_rank()} {e!r}", flush=True)
+
+
 class InklingVisionModel(nn.Module):
     """Inkling hMLP vision tower: ``vision_patches_bthwc`` -> one text-hidden row
     per patch (Goal 1.3). Reimplements HF ``InklingVisionModel`` / SGLang
@@ -809,18 +1020,36 @@ class InklingVisionModel(nn.Module):
         """``(num_patches, T, H, W, C)`` -> ``(num_patches, decoder_dmodel)``."""
         num_patches = vision_patches_bthwc.shape[0]
         x = vision_patches_bthwc
+        # feedback #21.1a: env-gated, default-OFF LIVE tower-internals capture. ``caps`` stays None
+        # (zero cost) unless INKLING_VISION_DUMP is set; the capture keys mirror the SGLang
+        # ``make_visual_hook`` points exactly so fb21 compares like with like.
+        _dump = vision_dump_base()
+        caps: Optional[Dict[str, torch.Tensor]] = {} if _dump else None
         for i, (start, end) in enumerate(zip(self.scales[:-1], self.scales[1:])):
             t_fold = end[0] // start[0]
             hw_fold = end[1] // start[1]
             if hw_fold > 1 or t_fold > 1:
                 x = fold_timespace_to_depth(x, t_fold, hw_fold)
+                if caps is not None:
+                    caps[f"fold_{i}"] = x.detach().float().cpu().clone()
             x = self.layers[f"linear_{i}"](x)
+            if caps is not None:
+                caps[f"linear_{i}"] = x.detach().float().cpu().clone()
             if i < self.n_layers - 1:
                 x = self.layers[f"norm_{i}"](x)
+                if caps is not None:
+                    caps[f"norm_{i}"] = x.detach().float().cpu().clone()
                 x = F.gelu(x)
+                if caps is not None:
+                    caps[f"gelu_{i}"] = x.detach().float().cpu().clone()
         if self.final_norm is not None:
             x = self.final_norm(x)
+            if caps is not None:
+                caps["final_norm"] = x.detach().float().cpu().clone()
         out = x.reshape(num_patches, -1)
+        if caps is not None:
+            caps["visual_out"] = out.detach().float().cpu().clone()
+            emit_vision_tower_dump(_dump, caps, num_patches)
         if vision_probe_enabled():
             emit_vision_tower_probe(num_patches, out)
         return out
@@ -856,3 +1085,338 @@ def _require_vc(vision_config: Any, name: str) -> Any:
             f"missing; it must be set so the hMLP geometry matches the model."
         )
     return val
+
+
+# ===========================================================================
+# Audio dMel preprocessing (Stage-6 / Goal 6.1) -- InklingAudioPreprocessor
+# ===========================================================================
+# A faithful port of the SGLang reference
+# ``sglang.srt.multimodal.inkling.feature_extraction`` (the requested NVFP4
+# serving comparand): raw waveform -> log-mel spectrogram (Slaney mel scale,
+# area-normalized) -> per-bin nearest-center quantization into ``num_dmel_bins``
+# discrete levels ("dMel"). One STFT frame == one audio token
+# (``hop_length == audio_token_duration_s * sample_rate``), matching the audio
+# tower which emits one text-hidden row per dMel frame. Pure numpy + torch (the
+# mel basis in numpy float64, the STFT/quantization in torch); ``soundfile`` /
+# ``torchaudio`` are imported lazily and only when decoding raw file bytes, so
+# passing an already-decoded waveform array needs neither dependency.
+
+
+def _audio_hz_to_mel(frequencies: np.ndarray) -> np.ndarray:
+    """Slaney mel scale (librosa/torchaudio convention), verbatim from the SGLang
+    ``feature_extraction._hz_to_mel``."""
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    f_sp = 200.0 / 3.0
+    min_log_hz = 1000.0
+    min_log_mel = min_log_hz / f_sp
+    logstep = np.log(6.4) / 27.0
+    linear = frequencies / f_sp
+    log = min_log_mel + np.log(np.maximum(frequencies, min_log_hz) / min_log_hz) / logstep
+    return np.where(frequencies >= min_log_hz, log, linear)
+
+
+def _audio_mel_to_hz(mels: np.ndarray) -> np.ndarray:
+    """Inverse Slaney mel scale, verbatim from SGLang ``_mel_to_hz``."""
+    mels = np.asarray(mels, dtype=np.float64)
+    f_sp = 200.0 / 3.0
+    min_log_hz = 1000.0
+    min_log_mel = min_log_hz / f_sp
+    logstep = np.log(6.4) / 27.0
+    linear = mels * f_sp
+    log = min_log_hz * np.exp(logstep * (mels - min_log_mel))
+    return np.where(mels >= min_log_mel, log, linear)
+
+
+def audio_mel_basis(sample_rate: int, n_fft: int, n_mels: int) -> np.ndarray:
+    """Slaney area-normalized mel filterbank ``(n_mels, n_fft//2+1)`` (float32).
+
+    Verbatim port of SGLang ``feature_extraction._mel_basis`` so the dMel bins
+    match the reference on the same clip."""
+    fft_bins = n_fft // 2 + 1
+    fft_freqs = np.arange(fft_bins, dtype=np.float64) * sample_rate / n_fft
+    mel_edges = _audio_mel_to_hz(
+        np.linspace(
+            _audio_hz_to_mel(np.array([0.0]))[0],
+            _audio_hz_to_mel(np.array([sample_rate / 2.0]))[0],
+            n_mels + 2,
+            dtype=np.float64,
+        )
+    )
+    mel_widths = np.diff(mel_edges)
+    lower = (fft_freqs[None, :] - mel_edges[:-2, None]) / mel_widths[:-1, None]
+    upper = (mel_edges[2:, None] - fft_freqs[None, :]) / mel_widths[1:, None]
+    weights = np.maximum(0.0, np.minimum(lower, upper))
+    # Slaney area normalization.
+    weights *= (2.0 / (mel_edges[2:] - mel_edges[:-2]))[:, None]
+    return np.ascontiguousarray(weights.astype(np.float32, copy=False))
+
+
+def _audio_to_exact_int(value: float, name: str, tolerance: float = 1e-6) -> int:
+    rounded = round(value)
+    if abs(value - rounded) > tolerance:
+        raise ValueError(f"{name} must resolve to an integer sample count, got {value}")
+    return int(rounded)
+
+
+class InklingAudioPreprocessor:
+    """Raw audio -> Inkling dMel bin tensor for the audio tower (Goal 6.1).
+
+    Numerically matches SGLang ``InklingAudioFeatureExtractor`` (defaults
+    ``sample_rate=16000``, ``window_size_multiplier=2.0``, ``n_mels=80``,
+    ``num_dmel_bins=16``, ``dmel_min_value=-7.0``, ``dmel_max_value=2.0``,
+    ``audio_token_duration_s=0.05``). ``encode_one`` accepts an already-decoded
+    mono waveform (``torch.Tensor`` / ``np.ndarray``) OR raw file bytes / a local
+    path (decoded lazily via ``soundfile`` + ``torchaudio`` resample).
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = DEFAULT_AUDIO_SAMPLE_RATE,
+        window_size_multiplier: float = DEFAULT_AUDIO_WINDOW_SIZE_MULTIPLIER,
+        n_fft: Optional[int] = None,
+        n_mels: int = DEFAULT_AUDIO_N_MELS,
+        num_dmel_bins: int = DEFAULT_AUDIO_NUM_DMEL_BINS,
+        dmel_min_value: float = DEFAULT_AUDIO_DMEL_MIN_VALUE,
+        dmel_max_value: float = DEFAULT_AUDIO_DMEL_MAX_VALUE,
+        audio_token_duration_s: float = DEFAULT_AUDIO_TOKEN_DURATION_S,
+    ) -> None:
+        self.sample_rate = int(sample_rate)
+        self.window_size_multiplier = float(window_size_multiplier)
+        self.n_fft = int(n_fft) if n_fft else None
+        self.n_mels = int(n_mels)
+        self.num_dmel_bins = int(num_dmel_bins)
+        self.dmel_min_value = float(dmel_min_value)
+        self.dmel_max_value = float(dmel_max_value)
+        self.audio_token_duration_s = float(audio_token_duration_s)
+        self._mel_basis_cache: Dict[Tuple[int, int, int], torch.Tensor] = {}
+
+    def _mel_basis(self, n_fft: int) -> torch.Tensor:
+        key = (self.sample_rate, n_fft, self.n_mels)
+        cached = self._mel_basis_cache.get(key)
+        if cached is None:
+            cached = torch.from_numpy(audio_mel_basis(self.sample_rate, n_fft, self.n_mels))
+            self._mel_basis_cache[key] = cached
+        return cached
+
+    def _to_waveform(self, audio: Any) -> torch.Tensor:
+        """Coerce one audio input into a 1-D mono float32 waveform at ``sample_rate``."""
+        if isinstance(audio, torch.Tensor):
+            wav = audio.detach().to(torch.float32)
+            return wav.mean(dim=-1) if wav.ndim > 1 else wav.reshape(-1)
+        if isinstance(audio, np.ndarray):
+            wav = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
+            return wav.mean(dim=-1) if wav.ndim > 1 else wav.reshape(-1)
+        # Raw file bytes / path: decode lazily (matches SGLang ``_decode_audio``).
+        import io as _io
+
+        import soundfile as sf  # lazy: only real-file decode needs it
+
+        if isinstance(audio, (bytes, bytearray, memoryview)):
+            raw = bytes(audio)
+        elif hasattr(audio, "read"):
+            raw = audio.read()
+        elif isinstance(audio, str):
+            path = audio[len("file://") :] if audio.startswith("file://") else audio
+            with open(path, "rb") as f:
+                raw = f.read()
+        else:
+            raise TypeError(f"Unsupported audio input type: {type(audio)!r}")
+        samples, src_sr = sf.read(_io.BytesIO(raw), dtype="float32", always_2d=True)
+        mono = samples.mean(axis=1)
+        wav = torch.from_numpy(np.ascontiguousarray(mono, dtype=np.float32))
+        if int(src_sr) != self.sample_rate:
+            import torchaudio.functional as AF  # lazy: only resampling needs it
+
+            wav = AF.resample(wav, orig_freq=int(src_sr), new_freq=self.sample_rate)
+        return wav
+
+    def _dmel_bins(self, audio: torch.Tensor) -> torch.Tensor:
+        """1-D float32 waveform -> ``(n_frames, n_mels)`` int32 dMel bins.
+
+        Verbatim port of SGLang ``feature_extraction._dmel_bins``."""
+        hop_length = _audio_to_exact_int(
+            self.audio_token_duration_s * self.sample_rate,
+            "audio_token_duration_s * sample_rate",
+        )
+        window_size = _audio_to_exact_int(
+            self.audio_token_duration_s * self.window_size_multiplier * self.sample_rate,
+            "audio_token_duration_s * window_size_multiplier * sample_rate",
+        )
+        n_fft = self.n_fft or window_size
+        if hop_length <= 0 or window_size <= 0 or n_fft <= 0:
+            raise ValueError("audio hop length, window size, and n_fft must be positive")
+        if audio.numel() == 0:
+            return torch.empty((0, self.n_mels), dtype=torch.int32)
+
+        right_pad = math.ceil(audio.numel() / hop_length) * hop_length - audio.numel()
+        left_pad = max(n_fft - hop_length, 0)
+        audio = F.pad(audio, (left_pad, right_pad))
+
+        window = torch.hann_window(window_size, periodic=True, dtype=torch.float32)
+        spec = torch.stft(
+            audio.unsqueeze(0),
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=window_size,
+            window=window,
+            center=False,
+            normalized=False,
+            onesided=True,
+            return_complex=True,
+        )
+        spec_ri = torch.view_as_real(spec)
+        magnitude = (
+            (spec_ri[..., 0].square() + spec_ri[..., 1].square()).clamp_min(1e-10).sqrt().squeeze(0)
+        )
+        mel = self._mel_basis(n_fft).matmul(magnitude).clamp_min(1e-10).log10()
+        mel = mel.to(torch.float64).clamp(min=self.dmel_min_value, max=self.dmel_max_value)
+        bin_centers = torch.linspace(
+            self.dmel_min_value, self.dmel_max_value, self.num_dmel_bins, dtype=torch.float64
+        )
+        dmel_bins = (mel.unsqueeze(-1) - bin_centers).abs().argmin(dim=-1)
+        return dmel_bins.to(torch.int32).T.contiguous()
+
+    def encode_one(self, audio: Any) -> torch.Tensor:
+        """One audio clip -> ``(n_frames, n_mels)`` int32 dMel bins."""
+        return self._dmel_bins(self._to_waveform(audio))
+
+    def preprocess(self, audios: Union[Any, Sequence[Any]]) -> Dict[str, Any]:
+        """Raw audio -> ``{dmel_bins, num_frames, num_tokens}``.
+
+        ``dmel_bins`` concatenates all clips' frames along dim 0 (one contiguous
+        slice per clip, in encounter order); ``num_frames`` / ``num_tokens`` are
+        per-clip and equal (one audio token per dMel frame)."""
+        if not isinstance(audios, (list, tuple)):
+            audios = [audios]
+        per_clip: List[torch.Tensor] = []
+        num_frames: List[int] = []
+        for a in audios:
+            bins = self.encode_one(a)
+            per_clip.append(bins)
+            num_frames.append(int(bins.shape[0]))
+        if len(per_clip) == 1:
+            dmel_bins = per_clip[0]
+        elif per_clip:
+            dmel_bins = torch.cat(per_clip, dim=0)
+        else:
+            dmel_bins = torch.empty((0, self.n_mels), dtype=torch.int32)
+        return {
+            "dmel_bins": dmel_bins,
+            "num_frames": num_frames,
+            "num_tokens": list(num_frames),  # one audio token per dMel frame
+        }
+
+
+def _resolve_audio_geometry(config: Any) -> Dict[str, Any]:
+    """Return the dMel preprocessing kwargs from a top-level or audio config,
+    defaulting to the checkpoint/``processor_config.json`` values."""
+    ac = getattr(config, "audio_config", None)
+
+    def _get(name, default):
+        val = getattr(ac, name, None)
+        return default if val is None else val
+
+    return {
+        "n_mels": int(_get("n_mel_bins", DEFAULT_AUDIO_N_MELS)),
+        "num_dmel_bins": int(_get("mel_vocab_size", DEFAULT_AUDIO_NUM_DMEL_BINS)),
+        "dmel_min_value": float(_get("dmel_min_value", DEFAULT_AUDIO_DMEL_MIN_VALUE)),
+        "dmel_max_value": float(_get("dmel_max_value", DEFAULT_AUDIO_DMEL_MAX_VALUE)),
+    }
+
+
+def _resolve_audio_token_id(config: Any) -> int:
+    """The single ``<audio>`` placeholder id the token stream carries per clip.
+
+    Prefer an explicit ``audio_token_id`` on the (top-level or audio) config; fall
+    back to the in-vocab chat-template token ``<|unused_200053|>`` (200053)."""
+    for obj in (config, getattr(config, "audio_config", None)):
+        tok = getattr(obj, "audio_token_id", None)
+        if tok is not None:
+            return int(tok)
+    return DEFAULT_AUDIO_TOKEN_ID
+
+
+def _require_ac(audio_config: Any, name: str) -> Any:
+    val = getattr(audio_config, name, None) if audio_config is not None else None
+    if val is None:
+        raise ValueError(
+            f"InklingAudioModel: required audio_config field {name!r} is missing; "
+            f"it must be set so the dMel tower geometry matches the model."
+        )
+    return val
+
+
+class InklingAudioModel(nn.Module):
+    """Inkling dMel audio tower: dMel bins -> one text-hidden row per frame (Goal 6.1).
+
+    Reimplements the SGLang ``InklingAudio`` / HF ``InklingAudioModel`` math
+    (identical) in pure torch. ``audio_mode='dmel'``: each of the ``n_mel_bins``
+    per-frame bin indices selects a row from a shared
+    ``nn.Embedding(n_mel_bins * mel_vocab_size, decoder_dmodel)`` codebook (bin
+    ``m`` occupies rows ``[m*mel_vocab_size, (m+1)*mel_vocab_size)``); the
+    per-bin embeddings are summed per frame, then an optional ``final_norm``
+    (RMSNorm, ``use_audio_norm``) yields one ``decoder_dmodel`` row per frame.
+
+    Module tree mirrors the checkpoint ``model.audio.*`` layout exactly:
+    ``encoder`` (the codebook embedding) and ``final_norm`` (RMSNorm, present
+    when ``use_audio_norm``).
+    """
+
+    def __init__(self, audio_config: Any) -> None:
+        super().__init__()
+        audio_mode = getattr(audio_config, "audio_mode", "dmel")
+        if audio_mode != "dmel":
+            raise ValueError(
+                f"InklingAudioModel supports audio_mode='dmel' only, got {audio_mode!r}."
+            )
+        self.decoder_dmodel = int(_require_ac(audio_config, "decoder_dmodel"))
+        self.n_mel_bins = int(getattr(audio_config, "n_mel_bins", DEFAULT_AUDIO_N_MELS))
+        self.mel_vocab_size = int(
+            getattr(audio_config, "mel_vocab_size", DEFAULT_AUDIO_NUM_DMEL_BINS)
+        )
+        self.use_audio_norm = bool(getattr(audio_config, "use_audio_norm", True))
+        self.encoder = nn.Embedding(self.n_mel_bins * self.mel_vocab_size, self.decoder_dmodel)
+        self.final_norm = (
+            InklingVisionRMSNorm(self.decoder_dmodel) if self.use_audio_norm else None
+        )
+
+    def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
+        """``(n_frames, n_mel_bins)`` dMel bin indices -> ``(n_frames, decoder_dmodel)``."""
+        dev = self.encoder.weight.device
+        if audio_features.numel() == 0:
+            return torch.zeros((0, self.decoder_dmodel), dtype=self.encoder.weight.dtype, device=dev)
+        if audio_features.shape[-1] != self.n_mel_bins:
+            raise ValueError(
+                f"InklingAudioModel: audio_features last dim {audio_features.shape[-1]} "
+                f"!= n_mel_bins {self.n_mel_bins}."
+            )
+        af = audio_features.to(device=dev)
+        n_frames = int(af.shape[0])
+        # bin ``m`` -> codebook rows [m*mel_vocab_size, (m+1)*mel_vocab_size)
+        bin_offsets = torch.arange(self.n_mel_bins, device=dev) * self.mel_vocab_size
+        idx = bin_offsets.unsqueeze(0) + af.to(torch.long)  # (n_frames, n_mel_bins)
+        hidden = (
+            self.encoder(idx.reshape(-1)).reshape(n_frames, self.n_mel_bins, -1).sum(dim=1)
+        )  # (n_frames, decoder_dmodel)
+        if self.final_norm is not None:
+            hidden = self.final_norm(hidden)
+        return hidden
+
+    @torch.no_grad()
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Load ``model.audio.*`` checkpoint tensors into this tower.
+
+        Accepts either full ``model.audio.encoder.weight`` keys or already-stripped
+        ``encoder.weight`` keys. Strict: the module tree mirrors the checkpoint
+        naming exactly (``encoder.weight``, ``final_norm.weight``), so a missing or
+        extra key fails loudly rather than silently leaving a layer at init."""
+        prefix = "model.audio."
+        mapped = {(k[len(prefix) :] if k.startswith(prefix) else k): v for k, v in weights.items()}
+        if any(p.is_meta for p in self.parameters()):
+            self.load_state_dict(mapped, strict=True, assign=True)
+        else:
+            target_dtype = self.encoder.weight.dtype
+            mapped = {
+                k: (v.to(target_dtype) if v.dtype != target_dtype else v) for k, v in mapped.items()
+            }
+            self.load_state_dict(mapped, strict=True)

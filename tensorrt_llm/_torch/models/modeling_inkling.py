@@ -47,7 +47,7 @@ import copy
 import os
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -92,7 +92,9 @@ from ...inputs import (
 )
 from ..configs.inkling import InklingConfig, InklingTextConfig
 from .modeling_inkling_vision import (
+    DEFAULT_AUDIO_TOKEN_ID,
     DEFAULT_IMAGE_TOKEN_ID,
+    InklingAudioModel,
     InklingInputProcessor,
     InklingVisionModel,
     emit_vision_scatter_probe,
@@ -2783,8 +2785,14 @@ class InklingModel(DecoderModel):
                 # residual stream after layer i (non-fused: hidden_states IS the
                 # stream). All-layers mode stores the answer-position (last) token
                 # only, matching the SGLang forward-hook's rs[-1] capture.
+                # feedback #21.1c (Section D): INKLING_DUMP_FULLRESID=1 stores the FULL
+                # residual (all positions) per layer so the analyzer can slice the
+                # per-layer decoder STATE at the vision positions (Q1 first/Q2 mid/Q3
+                # last vision row + Q4 first text row). Default-off; use only on small
+                # items (full 66-layer per-position is large for big-patch images).
+                _save_full = (not _dump_all) or _os.environ.get("INKLING_DUMP_FULLRESID") == "1"
                 _rec["layers"][i] = (
-                    (hidden_states[-1] if _dump_all else hidden_states).detach().float().cpu()
+                    (hidden_states if _save_full else hidden_states[-1]).detach().float().cpu()
                 )
                 if _sink:
                     _rec.setdefault("h_attn", {})[i] = _sink.get("h_attn")
@@ -2992,6 +3000,33 @@ def _encode_inkling_image_embeds(
     return [visual(x)]
 
 
+def _encode_inkling_audio_embeds(
+    audio_tower: InklingAudioModel, multimodal_params: list
+) -> List[torch.Tensor]:
+    """Run the dMel audio tower over the context requests' audio features.
+
+    Reads ``multimodal_data['audio']['dmel_bins']`` (the tensor the
+    :class:`InklingInputProcessor` attaches) from each context
+    ``MultimodalParams``, concatenates them, and runs the tower. Returns a
+    single-element list ``[feats]`` with ``feats`` of shape
+    ``(sum_frames, decoder_dmodel)`` -- the same shape contract as the image
+    encoder -- or ``[]`` when no context request carries audio features."""
+    frames = []
+    for param in multimodal_params:
+        data = getattr(param, "multimodal_data", None) or {}
+        audio = data.get("audio") or {}
+        db = audio.get("dmel_bins")
+        if db is not None:
+            frames.append(db)
+    if not frames:
+        return []
+    dev = audio_tower.encoder.weight.device
+    # dMel bins are integer codebook indices; keep them integral (the tower casts
+    # to long internally), only moving them onto the tower's device.
+    x = torch.cat([f.to(device=dev) for f in frames], dim=0)
+    return [audio_tower(x)]
+
+
 @register_auto_model("InklingForConditionalGeneration")
 @register_input_processor(
     InklingInputProcessor,
@@ -3014,9 +3049,14 @@ class InklingForConditionalGeneration(InklingForCausalLM):
     (:class:`InklingVisionModel`, Goal 1.3) is built as a replicated bf16
     submodule ``self.visual``, and its per-patch outputs are fused into
     ``inputs_embeds`` at the placeholder positions before the text decoder
-    (Goal 1.4, OOV-safe ``fuse_input_embeds``). Audio / MTP remain deferred.
-    See ``checkpoints/hf/inkling_weight_mapper.py`` for the HF→TRT name mapping
-    and consumed/deferred accounting.
+    (Goal 1.4, OOV-safe ``fuse_input_embeds``). Audio requests flow through the
+    identical fusion path (Goal 6.1): the registered processor expands the
+    ``<audio>`` placeholder to one token per dMel frame and the dMel audio tower
+    (:class:`InklingAudioModel`, replicated bf16 ``self.audio_tower``) emits one
+    row per frame, fused at those positions; video is multi-frame images through
+    the vision tower. MTP remains deferred. See
+    ``checkpoints/hf/inkling_weight_mapper.py`` for the HF→TRT name mapping and
+    consumed/deferred accounting.
     """
 
     @classmethod
@@ -3084,20 +3124,40 @@ class InklingForConditionalGeneration(InklingForCausalLM):
             self.visual = InklingVisionModel(vision_config).to(torch.bfloat16)
         else:
             self.visual = None
-        # The in-vocab image placeholder id (``<|unused_200054|>`` = 200054, the
-        # token the Inkling chat template emits for an image content part; see
-        # ``DEFAULT_IMAGE_TOKEN_ID``). It MUST be in-vocab: the TRT-LLM executor
-        # validates request token ids and rejects an out-of-range id, so the
-        # SGLang-internal -101 sentinel raises ``RequestError: Token ID out of
-        # range`` at ``llm.generate``. Surfaced to the model engine's
-        # ``_prepare_multimodal_indices`` (which uses ``torch.isin`` against this)
-        # so it locates the image rows. ``fuse_input_embeds`` is still called with
-        # ``mm_token_ids=None`` (explicit text/mm indices) so the placeholder id
-        # is never embedded -- the vision tower overwrites those positions.
-        image_token_id = int(
+        # --- Goal 6.1: audio-embedding fusion ---------------------------------
+        # Build the dMel audio tower as a replicated bf16 submodule under the same
+        # rules as the vision tower: EXCLUDED from NVFP4, NOT tensor-parallel
+        # sharded, one full-width ``decoder_dmodel`` row per dMel frame fused into
+        # the (replicated, all-reduced) residual stream, so every TP rank runs the
+        # identical tower. ``None`` for a checkpoint with no ``audio_config``.
+        audio_config = getattr(model_config.pretrained_config, "audio_config", None)
+        if audio_config is not None and getattr(audio_config, "decoder_dmodel", None):
+            self.audio_tower = InklingAudioModel(audio_config).to(torch.bfloat16)
+        else:
+            self.audio_tower = None
+        # The in-vocab media placeholder ids: image ``<|unused_200054|>`` (200054)
+        # and audio ``<|unused_200053|>`` (200053) -- the tokens the Inkling chat
+        # template emits for an image / audio content part (see
+        # ``DEFAULT_IMAGE_TOKEN_ID`` / ``DEFAULT_AUDIO_TOKEN_ID``). They MUST be
+        # in-vocab: the TRT-LLM executor validates request token ids and rejects an
+        # out-of-range id, so the SGLang-internal -101/-102 sentinels raise
+        # ``RequestError: Token ID out of range`` at ``llm.generate``. Surfaced to
+        # the model engine's ``_prepare_multimodal_indices`` (which uses
+        # ``torch.isin`` against this) so it locates the media rows.
+        # ``fuse_input_embeds`` is still called with ``mm_token_ids=None`` (explicit
+        # text/mm indices) so a placeholder id is never embedded -- the tower
+        # overwrites those positions. The audio id is registered only when the
+        # audio tower is built, so a vision/text-only checkpoint is unchanged.
+        self.image_token_id = int(
             getattr(model_config.pretrained_config, "image_token_id", DEFAULT_IMAGE_TOKEN_ID)
         )
-        self._mm_token_ids = torch.tensor([image_token_id], dtype=torch.int32)
+        self.audio_token_id = int(
+            getattr(model_config.pretrained_config, "audio_token_id", DEFAULT_AUDIO_TOKEN_ID)
+        )
+        mm_ids = [self.image_token_id]
+        if self.audio_tower is not None:
+            mm_ids.append(self.audio_token_id)
+        self._mm_token_ids = torch.tensor(mm_ids, dtype=torch.int32)
 
     @property
     def mm_token_ids(self) -> torch.Tensor:
@@ -3131,46 +3191,90 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         through. A text-only request is byte-identical to the accepted text path
         (the vision tower is never touched)."""
         inputs_embeds_prenormed = False
-        if inputs_embeds is None and self.visual is not None:
+        if inputs_embeds is None and (self.visual is not None or self.audio_tower is not None):
             multimodal_params = kwargs.get("multimodal_params", []) or []
             num_ctx = attn_metadata.num_contexts
             ctx_params = multimodal_params[:num_ctx]
             if ctx_params:
-                # Keep the replicated tower on the decoder's device (one-time
-                # move; the full-model loader may leave it on CPU).
+                # Keep the replicated tower(s) on the decoder's device (one-time
+                # move; the full-model loader may leave them on CPU).
                 dev = self.model.embed_tokens.weight.device
-                if next(self.visual.parameters()).device != dev:
+                if self.visual is not None and next(self.visual.parameters()).device != dev:
                     self.visual = self.visual.to(dev)
-                mm_embeds = _encode_inkling_image_embeds(self.visual, ctx_params)
-                mm_embeds = find_input_mm_embeds(mm_embeds, ctx_params)
-                if mm_embeds:
-                    ti, mi = self._resolve_mm_indices(input_ids, kwargs)
-                    # Embed TEXT positions through ``embed_norm`` (SGLang folds it
-                    # into ``get_input_embeddings``) so the fused stream carries
-                    # normed text + RAW vision rows; the vision rows keep the
-                    # tower's own final norm and must skip the decoder's
-                    # ``embed_norm`` (``inputs_embeds_prenormed=True``). Pre-fix
-                    # this scattered raw text and let the decoder re-norm the whole
-                    # fused stream, which pushed the image rows through an extra
-                    # RMSNorm SGLang omits and corrupted them ("image not visible").
-                    input_ids, inputs_embeds = fuse_input_embeds(
-                        self._embed_tokens_with_norm,
+                if (
+                    self.audio_tower is not None
+                    and next(self.audio_tower.parameters()).device != dev
+                ):
+                    self.audio_tower = self.audio_tower.to(dev)
+                # Per-modality tower rows (``[feats]`` or ``[]``); presence is read
+                # from the actual attached media data, not the request dict.
+                vis_raw = (
+                    _encode_inkling_image_embeds(self.visual, ctx_params)
+                    if self.visual is not None
+                    else []
+                )
+                aud_raw = (
+                    _encode_inkling_audio_embeds(self.audio_tower, ctx_params)
+                    if self.audio_tower is not None
+                    else []
+                )
+                if vis_raw and not aud_raw:
+                    # Accepted vision-only fusion path (unchanged): the executor's
+                    # precomputed indices already select exactly the image rows.
+                    mm_embeds = find_input_mm_embeds(vis_raw, ctx_params)
+                    if mm_embeds:
+                        ti, mi = self._resolve_mm_indices(input_ids, kwargs)
+                        # Embed TEXT positions through ``embed_norm`` (SGLang folds
+                        # it into ``get_input_embeddings``) so the fused stream
+                        # carries normed text + RAW vision rows; the vision rows
+                        # keep the tower's own final norm and skip the decoder's
+                        # ``embed_norm`` (``inputs_embeds_prenormed=True``).
+                        input_ids, inputs_embeds = fuse_input_embeds(
+                            self._embed_tokens_with_norm,
+                            input_ids,
+                            mm_embeds,
+                            mm_token_ids=None,  # explicit indices: placeholder never embedded
+                            text_token_indices=ti,
+                            mm_token_indices=mi,
+                        )
+                        inputs_embeds_prenormed = True
+                        # Priority-0 image-use probe (S3-C6 / feedback #3 P0-B/V4):
+                        # env-gated, default-off scatter accounting proving every
+                        # image placeholder position was filled by a tower row.
+                        if vision_probe_enabled():
+                            n_rows = int(sum(int(e.shape[0]) for e in mm_embeds))
+                            n_idx = int(mi.numel()) if mi is not None else 0
+                            emit_vision_scatter_probe(n_idx, n_rows)
+                elif aud_raw and not vis_raw:
+                    # Audio-only fusion: identical structure to vision, swapping the
+                    # tower rows and the audio placeholder positions. The audio rows
+                    # carry the tower's own ``final_norm``, so they too are RAW and
+                    # skip the decoder ``embed_norm`` (``inputs_embeds_prenormed``).
+                    mm_embeds = find_input_mm_embeds(aud_raw, ctx_params)
+                    if mm_embeds:
+                        ti, mi = self._resolve_mm_indices(input_ids, kwargs)
+                        input_ids, inputs_embeds = fuse_input_embeds(
+                            self._embed_tokens_with_norm,
+                            input_ids,
+                            mm_embeds,
+                            mm_token_ids=None,
+                            text_token_indices=ti,
+                            mm_token_indices=mi,
+                        )
+                        inputs_embeds_prenormed = True
+                elif vis_raw and aud_raw:
+                    # Mixed image+audio in one request: the two modalities' rows
+                    # occupy disjoint, possibly interleaved placeholder positions, so
+                    # a single combined index tensor cannot align them -- scatter each
+                    # modality to its own placeholder positions.
+                    input_ids, inputs_embeds = self._fuse_media_embeds(
                         input_ids,
-                        mm_embeds,
-                        mm_token_ids=None,  # explicit indices: placeholder never embedded
-                        text_token_indices=ti,
-                        mm_token_indices=mi,
+                        [
+                            (self.image_token_id, vis_raw),
+                            (self.audio_token_id, aud_raw),
+                        ],
                     )
                     inputs_embeds_prenormed = True
-                    # Priority-0 image-use probe (S3-C6 / feedback #3 P0-B/V4):
-                    # env-gated, default-off scatter accounting proving every image
-                    # placeholder position (``mi``) was filled by a tower row
-                    # (``mm_embeds``). Emitted from inside the fusion, not inferred
-                    # from the request dict.
-                    if vision_probe_enabled():
-                        n_rows = int(sum(int(e.shape[0]) for e in mm_embeds))
-                        n_idx = int(mi.numel()) if mi is not None else 0
-                        emit_vision_scatter_probe(n_idx, n_rows)
         return super().forward(
             attn_metadata,
             input_ids=input_ids,
@@ -3189,14 +3293,57 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         text-position ids and scatters the RAW vision rows in afterward."""
         return self.model.embed_norm(self.model.embed_tokens(ids))
 
+    def _fuse_media_embeds(
+        self,
+        input_ids: torch.IntTensor,
+        modality_groups: List[Tuple[int, List[torch.Tensor]]],
+    ) -> Tuple[torch.IntTensor, torch.Tensor]:
+        """Scatter more than one media modality into ``inputs_embeds`` (mixed
+        image+audio requests). Text positions are embedded through ``embed_norm``
+        (SGLang ``get_input_embeddings``); each ``(token_id, embeds)`` group's RAW
+        tower rows overwrite exactly that modality's placeholder positions. This
+        generalizes the OOV branch of ``fuse_input_embeds`` for the case where a
+        single combined index tensor cannot align two disjoint row groups.
+        Fails loudly on any per-modality placeholder/feature-row count mismatch."""
+        device = input_ids.device
+        media_ids = torch.tensor(
+            [tid for tid, _ in modality_groups], device=device, dtype=input_ids.dtype
+        )
+        is_media = torch.isin(input_ids, media_ids)
+        text_idx = torch.nonzero(~is_media, as_tuple=True)[0]
+        rows_per_group = [
+            (tid, torch.cat(embeds, dim=0) if len(embeds) > 1 else embeds[0])
+            for tid, embeds in modality_groups
+            if embeds
+        ]
+        hidden_dim = int(rows_per_group[0][1].shape[-1])
+        text_embed = self._embed_tokens_with_norm(input_ids[text_idx])
+        out = torch.empty(
+            input_ids.shape[0], hidden_dim, device=text_embed.device, dtype=text_embed.dtype
+        )
+        out[text_idx, :] = text_embed
+        for tid, rows in rows_per_group:
+            pos = torch.nonzero(input_ids == tid, as_tuple=True)[0]
+            if int(pos.numel()) != int(rows.shape[0]):
+                raise ValueError(
+                    f"Inkling media fusion: {int(pos.numel())} placeholder "
+                    f"position(s) for token {tid} but {int(rows.shape[0])} feature "
+                    f"row(s); counts must match."
+                )
+            out[pos, :] = rows.to(dtype=out.dtype, device=out.device)
+        return input_ids, out
+
     def load_weights(self, weights: dict, weight_mapper=None):
-        # Load the bf16 vision tower first (Goal 1.4 fusion): the
-        # ``model.visual.*`` keys the text loader intentionally drops. Done
-        # before the text load so any post-load completeness check sees it
-        # populated.
+        # Load the bf16 vision + audio towers first (Goals 1.4 / 6.1 fusion): the
+        # ``model.visual.*`` / ``model.audio.*`` keys the text loader intentionally
+        # drops (INKLING_DEFERRED_PREFIXES). Done before the text load so any
+        # post-load completeness check sees them populated.
         if self.visual is not None:
             visual_weights = {k: v for k, v in weights.items() if k.startswith("model.visual.")}
             self.visual.load_weights(visual_weights)
+        if self.audio_tower is not None:
+            audio_weights = {k: v for k, v in weights.items() if k.startswith("model.audio.")}
+            self.audio_tower.load_weights(audio_weights)
         from tensorrt_llm._torch.models.checkpoints.hf.inkling_weight_mapper import (
             InklingHfWeightMapper,
         )
