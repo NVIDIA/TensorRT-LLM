@@ -636,9 +636,8 @@ class Attention(nn.Module):
                                     key="disable_rope_fusion_for_rocketkv")
                 self.rope_fusion = False
 
-        if (config.kv_cache_compression_config is not None
-                and config.kv_cache_compression_config.
-                kv_cache_compression_mode.is_eviction_method()):
+        if (config.kv_cache_compression_config is not None and
+                config.kv_cache_compression_config.changes_physical_kv_length):
             logger.warning_once(
                 "KV-cache eviction changes the physical cache length; "
                 "setting rope_fusion=False.",

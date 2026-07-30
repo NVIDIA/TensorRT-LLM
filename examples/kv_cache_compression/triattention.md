@@ -22,7 +22,7 @@ TriAttention is integrated into TensorRT-LLM as a KV-cache compression manager o
 * PyTorch backend
 
 **Notes:**
-1. TriAttention requires `enable_block_reuse=False` in the KV-cache configuration — the eviction physically rewrites stored keys, which is incompatible with block reuse. The construction step rejects a cache manager that has block reuse enabled.
+1. TriAttention supports KV-cache block reuse. V2 reuses the committed prompt prefix, while TriAttention preserves that prefix and compacts only the generation suffix.
 2. TriAttention requires the V2 KV-cache manager (`use_kv_cache_manager_v2=True`).
 3. TriAttention does not compute calibration. Bring the official tool's calibration `.pt`; see [Calibration](#calibration).
 4. The current SWA path covers models such as GPT-OSS whose V2 pools remain full length and whose attention kernel applies the window. Native sliding-eviction layouts such as Gemma 4, SSM/hybrid pools, and MLA caches are not supported.
@@ -72,8 +72,8 @@ compression_config = TriAttentionKvCacheCompressionConfig(
     model_path="<path_to_model>",                # used to derive the RoPE tables
 )
 
-# 2. TriAttention needs the V2 KV-cache manager and block reuse disabled.
-kv_config = KvCacheConfig(enable_block_reuse=False, use_kv_cache_manager_v2=True)
+# 2. TriAttention needs the V2 KV-cache manager and supports block reuse.
+kv_config = KvCacheConfig(enable_block_reuse=True, use_kv_cache_manager_v2=True)
 
 llm = LLM(
     model="<path_to_model>",
@@ -102,7 +102,7 @@ kv_cache_compression_config:
   calibration_path: /path/to/qwen3-8b-calibration.pt
   model_path: <path_to_model>
 kv_cache_config:
-  enable_block_reuse: false
+  enable_block_reuse: true
   use_kv_cache_manager_v2: true
 ```
 

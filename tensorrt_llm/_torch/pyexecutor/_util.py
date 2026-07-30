@@ -2259,28 +2259,29 @@ def _create_kv_cache_manager(
     return kv_cache_manager
 
 
-def validate_kv_cache_compression_with_spec(
+def validate_kv_cache_compression_compatibility(
     config: KvCacheCompressionConfig,
+    kv_cache_config: KvCacheConfig,
     spec_config: Optional[SpeculativeConfig],
 ) -> None:
-    """Reject speculative setups the compression method cannot run with."""
+    """Reject unsupported KV-cache compression feature combinations."""
+    if kv_cache_config.enable_block_reuse and not config.supports_block_reuse():
+        raise ValueError(
+            f"KV-cache compression algorithm {config.algorithm!r} does not "
+            "support KV-cache block reuse. Set "
+            "KvCacheConfig.enable_block_reuse=False.")
     if spec_config is None:
         return
-    if not config.kv_cache_compression_mode.is_eviction_method():
-        return
-    if config.algorithm != "triattention":
+    if not config.supports_speculative_decoding():
         raise ValueError(
-            f"KV-cache compression algorithm {config.algorithm!r} has no "
-            "speculative-decoding compatibility contract")
+            f"KV-cache compression algorithm {config.algorithm!r} does not "
+            "support speculative decoding with its current configuration; "
+            "TriAttention requires eviction_mode='union'")
     mode = spec_config.spec_dec_mode
     if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
         raise ValueError(
             f"KV-cache compression does not support speculative decoding "
             f"mode {mode.name}; use one-model MTP or EAGLE3")
-    if getattr(config, "eviction_mode", None) != "union":
-        raise ValueError(
-            "KV-cache compression with speculative decoding requires "
-            "eviction_mode='union'")
 
 
 def create_kv_cache_compression_manager(
@@ -2293,8 +2294,7 @@ def create_kv_cache_compression_manager(
 
     Called from ``create_py_executor`` and registered as a resource manager,
     like the KV cache manager itself. Concrete algorithms add a dispatch branch
-    here. Speculative-decoding compatibility is checked by the caller via
-    ``validate_kv_cache_compression_with_spec``.
+    here. Feature compatibility is checked before resource-manager construction.
     """
     if config.algorithm == "triattention":
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
@@ -2561,8 +2561,6 @@ def create_py_executor_instance(
     if kv_cache_compression_config is not None:
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-        validate_kv_cache_compression_with_spec(kv_cache_compression_config,
-                                                spec_config)
         compression_manager = create_kv_cache_compression_manager(
             kv_cache_compression_config,
             kv_cache_manager,
@@ -3032,6 +3030,14 @@ def _adjust_torch_mem_fraction():
 
 def validate_feature_combination(llm_args, model_engine, sampler_type):
     # Validate the flags for features' combination
+    compression_config = llm_args.kv_cache_compression_config
+    if compression_config is not None:
+        validate_kv_cache_compression_compatibility(
+            compression_config,
+            llm_args.kv_cache_config,
+            model_engine.spec_config,
+        )
+
     def init_feature_status(llm_args) -> Dict[str, bool]:
         assert isinstance(
             llm_args, TorchLlmArgs

@@ -30,11 +30,12 @@ import triton
 from transformers import AutoConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-from ...._utils import prefer_pinned
-from ....bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
 )
-from ....logger import logger
+from tensorrt_llm.logger import logger
+
 from ...distributed import allgather
 from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ...pyexecutor.llm_request import LlmRequestState
@@ -50,7 +51,8 @@ from .triattention_kernels import (
 )
 
 if TYPE_CHECKING:
-    from ....llmapi.llm_args import TriAttentionKvCacheCompressionConfig
+    from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
+
     from ...pyexecutor.llm_request import LlmRequest
     from ...pyexecutor.scheduler import ScheduledRequests
 
@@ -141,8 +143,6 @@ class _MeanPhaseTable:
 class TriAttention(KVCacheCompressionManager):
     """Periodic physical KV eviction driven by trigonometric importance scoring."""
 
-    adjusts_generation_kv_length = True
-
     # ---- construction ----
 
     def __init__(
@@ -151,7 +151,7 @@ class TriAttention(KVCacheCompressionManager):
         kv_cache_manager: KVCacheManagerV2,
         draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
     ) -> None:
-        super().__init__(kv_cache_manager, draft_kv_cache_manager)
+        super().__init__(config, kv_cache_manager, draft_kv_cache_manager)
         self.budget = config.budget
         self.beta = config.beta
         self.eviction_mode = config.eviction_mode

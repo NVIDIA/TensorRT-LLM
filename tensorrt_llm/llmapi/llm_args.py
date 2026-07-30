@@ -3528,19 +3528,21 @@ class KvCacheCompressionConfig(StrictBaseModel):
     as a resource manager in create_py_executor (_util.py), like the KV cache
     manager itself. Concrete algorithms subclass this and add their parameters.
     """
+
+    changes_physical_kv_length: ClassVar[bool] = False
+    """Whether physical and logical KV lengths can diverge."""
+
     algorithm: str = Field(
         description=
         "Name of the KV-cache compression algorithm to run; selects which "
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
 
-    @property
-    def kv_cache_compression_mode(self):
-        # The mode carries algorithm-level traits (``is_*`` predicates) the
-        # raw algorithm string does not.
-        from tensorrt_llm._torch.kv_cache_compression.interface import \
-            KvCacheCompressionMode
-        return KvCacheCompressionMode.from_string(self.algorithm)
+    def supports_block_reuse(self) -> bool:
+        return False
+
+    def supports_speculative_decoding(self) -> bool:
+        return False
 
 
 class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
@@ -3550,6 +3552,9 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     the official .pt via ``calibration_path``). Pure compression — decode
     runs the model's standard attention over the compacted cache.
     """
+
+    changes_physical_kv_length: ClassVar[bool] = True
+
     algorithm: Literal["triattention"] = "triattention"
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
@@ -3588,6 +3593,12 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "(produced by github.com/WeianMao/triattention). TRT-LLM does not "
         "compute calibration; it converts this file to the runtime schema at "
         "load.")
+
+    def supports_block_reuse(self) -> bool:
+        return True
+
+    def supports_speculative_decoding(self) -> bool:
+        return self.eviction_mode == "union"
 
 
 KvCacheCompressionConfigType: TypeAlias = Annotated[

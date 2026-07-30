@@ -73,11 +73,11 @@ def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
     "gate,match",
     [
         ("callsite_dflash", "one-model MTP or EAGLE3"),
-        ("union_only_per_head", "union"),
+        ("union_only_per_head", "eviction_mode='union'"),
     ],
 )
 def test_speculative_admission_gates_raise(gate, match):
-    from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
+    from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_compatibility
     from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, MTPDecodingConfig
 
     if gate == "callsite_dflash":
@@ -90,8 +90,9 @@ def test_speculative_admission_gates_raise(gate, match):
     )
 
     with pytest.raises(ValueError, match=match):
-        validate_kv_cache_compression_with_spec(
+        validate_kv_cache_compression_compatibility(
             config,
+            SimpleNamespace(enable_block_reuse=False),
             spec_config,
         )
 

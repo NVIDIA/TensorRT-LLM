@@ -40,7 +40,10 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import T
 
 # Framework base class lives in pyexecutor.resource_manager; the factory lives
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
-from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
+from tensorrt_llm._torch.pyexecutor._util import (
+    create_kv_cache_compression_manager,
+    validate_kv_cache_compression_compatibility,
+)
 
 
 @pytest.fixture
@@ -64,10 +67,15 @@ def _make_hf_config(**values):
 
 
 class TestConfigAndFactory:
-    def test_factory_returns_triattention_and_propagates_config_fields(self):
+    def test_factory_allows_block_reuse_and_propagates_config_fields(self):
         # The factory contract is independent of GPU-owned persistent buffers.
-        fake_v2 = _make_fake_v2(enable_block_reuse=False)
+        fake_v2 = _make_fake_v2(enable_block_reuse=True)
         cfg = _make_tri_config(budget=32, beta=16, eviction_mode="per_head")
+        validate_kv_cache_compression_compatibility(
+            cfg,
+            SimpleNamespace(enable_block_reuse=True),
+            None,
+        )
         with mock.patch.object(TriAttention, "_initialize_eviction_state") as initialize:
             mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
@@ -75,6 +83,10 @@ class TestConfigAndFactory:
         assert mgr.beta == 16
         assert mgr.eviction_mode == "per_head"
         assert mgr.kv_cache_manager is fake_v2
+        assert fake_v2.kv_compression_manages_history
+        assert cfg.changes_physical_kv_length
+        assert cfg.supports_block_reuse()
+        assert not cfg.supports_speculative_decoding()
         initialize.assert_called_once_with()
 
 
@@ -404,7 +416,7 @@ class TestEvictionLifecycle:
                 draft_kv_cache_manager=draft_manager,
             )
 
-        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
+        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_compatibility
         from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 
         spec_config = (
@@ -417,8 +429,9 @@ class TestEvictionLifecycle:
             )
         )
 
-        validate_kv_cache_compression_with_spec(
+        validate_kv_cache_compression_compatibility(
             _make_tri_config(budget=8),
+            SimpleNamespace(enable_block_reuse=False),
             spec_config,
         )
 
