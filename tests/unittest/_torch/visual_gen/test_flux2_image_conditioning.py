@@ -6,16 +6,14 @@
 import io
 from collections.abc import Iterator
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import PIL.Image
 import pytest
 import torch
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 
-from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import (
-    MAX_REFERENCE_IMAGES,
-    Flux2Pipeline,
-)
+from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
 
 
 def _png_bytes() -> bytes:
@@ -42,13 +40,6 @@ def test_load_reference_images_rejects_invalid_inputs(image: list[object]) -> No
         Flux2Pipeline._load_reference_images(image)
 
 
-def test_load_reference_images_rejects_excessive_references() -> None:
-    images = [PIL.Image.new("RGB", (64, 64)) for _ in range(MAX_REFERENCE_IMAGES + 1)]
-
-    with pytest.raises(ValueError, match="at most"):
-        Flux2Pipeline._load_reference_images(images)
-
-
 def test_preprocess_reference_images_caps_area_and_aligns_to_16() -> None:
     pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
     pipeline.vae_scale_factor = 8
@@ -71,6 +62,71 @@ def test_target_dimensions_default_to_first_processed_reference() -> None:
     assert Flux2Pipeline._resolve_target_dimensions(None, None, condition_images) == (64, 80)
     assert Flux2Pipeline._resolve_target_dimensions(128, None, condition_images) == (128, 80)
     assert Flux2Pipeline._resolve_target_dimensions(None, None, None) == (1024, 1024)
+
+
+def test_prepare_request_resolves_dimensions_and_infer_reuses_images() -> None:
+    pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
+    pipeline.vae_scale_factor = 8
+    pipeline.image_processor = Flux2ImageProcessor(vae_scale_factor=16)
+    req = SimpleNamespace(
+        prompt=["edit this image"],
+        params=SimpleNamespace(
+            image=_png_bytes(),
+            height=None,
+            width=None,
+            num_inference_steps=1,
+            guidance_scale=3.5,
+            seed=0,
+            max_sequence_length=512,
+            num_images_per_prompt=1,
+            num_frames=None,
+        ),
+        prepared_inputs={},
+    )
+
+    pipeline.prepare_request(req)
+
+    condition_images = req.prepared_inputs["condition_images"]
+    assert req.params.height == 64
+    assert req.params.width == 64
+    assert len(condition_images) == 1
+    assert condition_images[0].shape == (1, 3, 64, 64)
+    assert pipeline.request_warmup_cache_key(req) == (64, 64, 1, ((64, 64),))
+
+    pipeline.forward = MagicMock(return_value=object())
+    pipeline.infer(req)
+
+    assert pipeline.forward.call_args.kwargs["_condition_images"] is condition_images
+
+
+def test_text_only_request_preserves_existing_warmup_cache_key() -> None:
+    pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
+    req = SimpleNamespace(
+        params=SimpleNamespace(height=1024, width=1024, num_frames=None),
+        prepared_inputs={},
+    )
+
+    assert pipeline.request_warmup_cache_key(req) == (1024, 1024)
+
+
+def test_reference_warmup_cache_key_preserves_count_and_ordered_shapes() -> None:
+    pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
+    req = SimpleNamespace(
+        params=SimpleNamespace(height=128, width=256, num_frames=None),
+        prepared_inputs={
+            "condition_images": [
+                torch.zeros(1, 3, 32, 48),
+                torch.zeros(1, 3, 64, 80),
+            ]
+        },
+    )
+
+    assert pipeline.request_warmup_cache_key(req) == (
+        128,
+        256,
+        2,
+        ((32, 48), (64, 80)),
+    )
 
 
 @pytest.mark.parametrize("cache_backend", ["teacache", "cache_dit"])

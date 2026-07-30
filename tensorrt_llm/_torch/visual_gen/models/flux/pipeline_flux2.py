@@ -58,8 +58,6 @@ FLUX2_TEACACHE_COEFFICIENTS = {
     },
 }
 
-MAX_REFERENCE_IMAGES = 10
-
 # System message for Mistral3 chat template (matches HF diffusers exactly)
 SYSTEM_MESSAGE = (
     "You are an AI that reasons about image descriptions. You give structured "
@@ -201,6 +199,17 @@ class Flux2Pipeline(BasePipeline):
 
     def warmup_cache_key(self, height: int, width: int, **kwargs) -> tuple:
         return (height, width)
+
+    def request_warmup_cache_key(self, req: Any) -> tuple:
+        cache_key = super().request_warmup_cache_key(req)
+        condition_images = req.prepared_inputs.get("condition_images")
+        if condition_images is None:
+            return cache_key
+
+        reference_shapes = tuple(
+            (int(image.shape[-2]), int(image.shape[-1])) for image in condition_images
+        )
+        return (*cache_key, len(condition_images), reference_shapes)
 
     def _init_transformer(self) -> None:
         """Initialize FLUX.2 transformer with quantization support."""
@@ -360,6 +369,20 @@ class Flux2Pipeline(BasePipeline):
             "max_sequence_length": 512,
         }
 
+    def prepare_request(self, req: Any) -> None:
+        """Load and preprocess reference images before warmup bookkeeping."""
+        if req.params.image is None:
+            return
+
+        reference_images = self._load_reference_images(req.params.image)
+        condition_images = self._preprocess_reference_images(reference_images)
+        req.params.height, req.params.width = self._resolve_target_dimensions(
+            req.params.height,
+            req.params.width,
+            condition_images,
+        )
+        req.prepared_inputs["condition_images"] = condition_images
+
     def infer(self, req):
         """Run inference from DiffusionRequest."""
         return self.forward(
@@ -372,6 +395,7 @@ class Flux2Pipeline(BasePipeline):
             max_sequence_length=req.params.max_sequence_length,
             num_images_per_prompt=req.params.num_images_per_prompt,
             image=req.params.image,
+            _condition_images=req.prepared_inputs.get("condition_images"),
         )
 
     @torch.inference_mode()
@@ -393,6 +417,7 @@ class Flux2Pipeline(BasePipeline):
                 List[Union[PIL.Image.Image, str, bytes]],
             ]
         ] = None,
+        _condition_images: Optional[List[torch.Tensor]] = None,
     ):
         """Generate image(s) from text and optional reference images.
 
@@ -442,9 +467,8 @@ class Flux2Pipeline(BasePipeline):
         if num_images_per_prompt > 1:
             prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
 
-        reference_images = None
-        condition_images = None
-        if image is not None:
+        condition_images = _condition_images
+        if condition_images is None and image is not None:
             reference_images = self._load_reference_images(image)
             condition_images = self._preprocess_reference_images(reference_images)
 
@@ -468,7 +492,7 @@ class Flux2Pipeline(BasePipeline):
             )
             logger.info(
                 "Prepared %d FLUX.2 reference image(s), %d tokens total",
-                len(reference_images),
+                len(condition_images),
                 image_latents.shape[1],
             )
 
@@ -725,11 +749,6 @@ class Flux2Pipeline(BasePipeline):
         inputs = image if isinstance(image, list) else [image]
         if not inputs:
             raise ValueError("`image` must contain at least one reference image.")
-        if len(inputs) > MAX_REFERENCE_IMAGES:
-            raise ValueError(
-                f"FLUX.2 supports at most {MAX_REFERENCE_IMAGES} reference images per request, "
-                f"got {len(inputs)}."
-            )
 
         images = []
         for index, item in enumerate(inputs):

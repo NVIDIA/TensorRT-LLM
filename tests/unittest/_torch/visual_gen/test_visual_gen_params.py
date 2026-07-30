@@ -1185,7 +1185,7 @@ class TestEngineFailureTransport:
 
         executor = self._make_executor(FluxPipeline)
         executor._merge_defaults = lambda req: DiffusionExecutor._merge_defaults(executor, req)
-        executor.pipeline.warmup_cache_key = MagicMock(return_value=(1024, 1024, None))
+        executor.pipeline.request_warmup_cache_key = MagicMock(return_value=(1024, 1024, None))
         executor.pipeline._warmed_up_shapes = None
         executor.pipeline.infer = MagicMock(side_effect=RuntimeError("oops"))
 
@@ -1202,18 +1202,32 @@ class TestEngineFailureTransport:
         assert isinstance(resp, DiffusionResponse)
         assert resp.error_msg == "oops"
 
-    def test_unresolved_reference_size_skips_warmup_warning(self, caplog):
+    def test_reference_size_is_prepared_before_warmup_lookup(self):
         from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor, DiffusionRequest
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
         from tensorrt_llm.visual_gen.params import VisualGenParams
 
+        events = []
         executor = self._make_executor(Flux2Pipeline)
         executor.rank = 1
         executor._merge_defaults = lambda req: DiffusionExecutor._merge_defaults(executor, req)
         executor.pipeline.derive_output_size_from_reference = True
-        executor.pipeline.warmup_cache_key = MagicMock(return_value=(None, None))
+
+        def prepare_request(req):
+            events.append("prepare")
+            req.params.height = 64
+            req.params.width = 80
+
+        def request_warmup_cache_key(req):
+            events.append("warmup_cache_key")
+            return (req.params.height, req.params.width)
+
+        executor.pipeline.prepare_request = MagicMock(side_effect=prepare_request)
+        executor.pipeline.request_warmup_cache_key = MagicMock(side_effect=request_warmup_cache_key)
         executor.pipeline._warmed_up_shapes = {(1024, 1024)}
-        executor.pipeline.infer = MagicMock(return_value=MagicMock())
+        executor.pipeline.infer = MagicMock(
+            side_effect=lambda _req: events.append("infer") or MagicMock()
+        )
         req = DiffusionRequest(
             request_id=8,
             prompt=["test"],
@@ -1222,5 +1236,6 @@ class TestEngineFailureTransport:
 
         DiffusionExecutor.process_request(executor, req)
 
-        assert "Requested shape" not in caplog.text
+        assert events == ["prepare", "warmup_cache_key", "infer"]
+        executor.pipeline.request_warmup_cache_key.assert_called_once_with(req)
         executor.pipeline.infer.assert_called_once_with(req)
