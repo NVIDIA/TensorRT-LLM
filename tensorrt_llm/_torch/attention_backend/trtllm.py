@@ -2091,6 +2091,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_norm_weight: Optional[torch.Tensor] = None,
         kv_norm_eps: float = 1e-6,
         precomputed_cu_seqlens: bool = False,
+        precomputed_fmha_scheduler: bool = False,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2159,4 +2160,5 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_norm_weight,
             kv_norm_eps,
             precomputed_cu_seqlens,
+            precomputed_fmha_scheduler,
         )

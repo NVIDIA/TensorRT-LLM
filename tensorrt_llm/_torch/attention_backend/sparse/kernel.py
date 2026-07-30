@@ -2115,6 +2115,14 @@ def _deepseek_v4_local_to_global_kernel(
     compressed_indices_stride1,
     out_stride0,
     out_stride1,
+    fmha_tile_counter_ptr,
+    bmm1_scale_ptr,
+    bmm2_scale_ptr,
+    quant_scale_o_ptr,
+    dequant_scale_q_ptr,
+    dequant_scale_kv_ptr,
+    host_bmm1_scale,
+    WRITE_FMHA_SCHEDULER: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
 ):
     """
@@ -2128,7 +2136,25 @@ def _deepseek_v4_local_to_global_kernel(
 
     This enables the FMHA kernel to determine which TMA descriptor to use based
     solely on tile index (tile 0 = SWA via tmaKSecondary_, rest = compress via tmaK_).
+
+    Under WRITE_FMHA_SCHEDULER this kernel also emits the FMHA scheduler prologue:
+    zeroing the persistent-CTA tile counter and deriving the bmm1/bmm2 scales. That
+    work used to sit in block (0,0) of the MLA RoPE kernels, which is a worse place
+    for it -- this kernel is the LAST one launched before FMHA, and it already runs
+    once per layer per forward for exactly FMHA's benefit. Program 0 does it, ahead
+    of the grid-dependency wait, since it touches none of the index inputs.
     """
+    if WRITE_FMHA_SCHEDULER and tl.program_id(0) == 0:
+        tl.store(fmha_tile_counter_ptr, 0)
+        dequant_q = tl.load(dequant_scale_q_ptr)
+        dequant_kv = tl.load(dequant_scale_kv_ptr)
+        quant_o = tl.load(quant_scale_o_ptr)
+        bmm1 = dequant_q * dequant_kv * host_bmm1_scale
+        tl.store(bmm1_scale_ptr + 0, bmm1)
+        # Second slot is the log2-optimized copy the FMHA softmax consumes.
+        tl.store(bmm1_scale_ptr + 1, bmm1 * 1.4426950408889634)
+        tl.store(bmm2_scale_ptr, quant_o * dequant_kv)
+
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
 
@@ -2198,20 +2224,28 @@ def _deepseek_v4_local_to_global_kernel(
 
 
 def deepseek_v4_local_to_global_indices(
-        req_id: torch.Tensor,  # int32 [num_tokens]
-        block_table_swa: torch.Tensor,  # int32 [num_requests, max_blocks_swa]
-        swa_local_indices: torch.Tensor,  # int32 [num_tokens, num_swa_indices]
-        swa_pool_base_ptr: int,  # int64: base address of SWA pool
-        swa_buffer_ptr: int,  # int64: base address of SWA buffer
-        tokens_per_block: int,  # tokens per block for SWA
-        token_stride: int,  # bytes per token (use SWA token stride)
-        # Optional compressed arguments (for compress_ratio > 1)
+    req_id: torch.Tensor,  # int32 [num_tokens]
+    block_table_swa: torch.Tensor,  # int32 [num_requests, max_blocks_swa]
+    swa_local_indices: torch.Tensor,  # int32 [num_tokens, num_swa_indices]
+    swa_pool_base_ptr: int,  # int64: base address of SWA pool
+    swa_buffer_ptr: int,  # int64: base address of SWA buffer
+    tokens_per_block: int,  # tokens per block for SWA
+    token_stride: int,  # bytes per token (use SWA token stride)
+    # Optional compressed arguments (for compress_ratio > 1)
     block_table_compressed: torch.Tensor | None = None,
-        compressed_local_indices: torch.Tensor | None = None,
-        compress_pool_base_ptr: int = 0,  # int64: base address of compress pool
-        compressed_buffer_ptr: int = 0,
-        compress_ratio: int = 1,
-        num_compressed_indices: int = 0,  # max number of compressed indices
+    compressed_local_indices: torch.Tensor | None = None,
+    compress_pool_base_ptr: int = 0,  # int64: base address of compress pool
+    compressed_buffer_ptr: int = 0,
+    compress_ratio: int = 1,
+    num_compressed_indices: int = 0,  # max number of compressed indices
+    # Optional FMHA scheduler prologue (see the kernel docstring)
+    fmha_tile_counter: torch.Tensor | None = None,
+    bmm1_scale: torch.Tensor | None = None,
+    bmm2_scale: torch.Tensor | None = None,
+    quant_scale_o: torch.Tensor | None = None,
+    dequant_scale_q: torch.Tensor | None = None,
+    dequant_scale_kv: torch.Tensor | None = None,
+    host_bmm1_scale: float = 1.0,
 ) -> torch.Tensor:
     """
     Convert local token indices to global KV cache pool indices.
@@ -2320,6 +2354,21 @@ def deepseek_v4_local_to_global_indices(
     out_stride0, out_stride1 = out.stride()
     launch_with_pdl = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
+    # The scheduler prologue is all-or-nothing: the tile counter alone is enough to
+    # emit (bf16 KV needs no bmm scales), but the scales come as a set.
+    write_fmha_scheduler = fmha_tile_counter is not None
+    write_bmm_scales = (bmm1_scale is not None and bmm2_scale is not None
+                        and quant_scale_o is not None
+                        and dequant_scale_q is not None
+                        and dequant_scale_kv is not None)
+    if write_fmha_scheduler and not write_bmm_scales:
+        # Point the scale stores at the counter's own slot rather than branching in
+        # the kernel; WRITE_BMM_SCALES gates them off anyway.
+        raise ValueError(
+            "fmha_tile_counter requires the full bmm scale set "
+            "(bmm1_scale, bmm2_scale, quant_scale_o, dequant_scale_q, dequant_scale_kv)"
+        )
+
     # Launch kernel
     _deepseek_v4_local_to_global_kernel[grid](
         req_id_c,
@@ -2348,6 +2397,14 @@ def deepseek_v4_local_to_global_indices(
         compressed_indices_stride1,
         out_stride0,
         out_stride1,
+        fmha_tile_counter,
+        bmm1_scale,
+        bmm2_scale,
+        quant_scale_o,
+        dequant_scale_q,
+        dequant_scale_kv,
+        host_bmm1_scale,
+        WRITE_FMHA_SCHEDULER=write_fmha_scheduler,
         LAUNCH_WITH_PDL=launch_with_pdl,
         launch_pdl=launch_with_pdl,
     )

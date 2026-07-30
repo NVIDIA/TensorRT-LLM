@@ -120,6 +120,12 @@ struct MlaParams
     // recompute them per layer.
     bool precomputed_cu_seqlens = false;
 
+    // When true, `fmha_tile_counter` and the bmm1/bmm2 scales are emitted by the DSv4
+    // sparse indices kernel (`_deepseek_v4_local_to_global_kernel`), which is the last
+    // kernel launched before FMHA. The MLA RoPE kernels must then leave them alone --
+    // writing them twice is harmless but pointless.
+    bool precomputed_fmha_scheduler = false;
+
     // Is it absorption mode?
     bool absorption_mode = false;
 

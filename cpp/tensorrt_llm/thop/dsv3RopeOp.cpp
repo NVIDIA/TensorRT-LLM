@@ -80,6 +80,8 @@ struct MlaRopeGenArgs
     // cu_q_seqlens / cu_kv_seqlens were filled once for the iteration by the attention
     // metadata; the kernel must not recompute them per layer.
     bool precomputed_cu_seqlens;
+    // The DSv4 sparse indices kernel already emits the FMHA scheduler prologue.
+    bool precomputed_fmha_scheduler;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -122,6 +124,7 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
     mla_params.helix_is_inactive_rank = args.helix_is_inactive_rank_ptr;
 
     mla_params.precomputed_cu_seqlens = args.precomputed_cu_seqlens;
+    mla_params.precomputed_fmha_scheduler = args.precomputed_fmha_scheduler;
     mla_params.fuse_kv_norm_in_rope = args.kv_norm_weight_ptr != nullptr;
     mla_params.kv_norm_weight = args.kv_norm_weight_ptr;
     mla_params.kv_norm_eps = args.kv_norm_eps;
@@ -155,7 +158,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     int64_t const tokens_per_block, int64_t const attention_window_size, int64_t const beam_width,
     int64_t const quant_mode, double const q_scaling, int64_t q_lora_rank, int64_t kv_lora_rank,
     int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append,
-    std::optional<torch::Tensor> kv_norm_weight, double const kv_norm_eps, bool const precomputed_cu_seqlens)
+    std::optional<torch::Tensor> kv_norm_weight, double const kv_norm_eps, bool const precomputed_cu_seqlens,
+    bool const precomputed_fmha_scheduler)
 {
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
@@ -268,7 +272,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
         block_ids_per_seq_ptr, cache_type, cu_q_seqlens_ptr, cu_kv_seqlens_ptr, fmha_tile_counter_ptr,
         mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_o_ptr, kv_scale_orig_quant_ptr,
         kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr,
-        kv_norm_weight_ptr, static_cast<float>(kv_norm_eps), latent_row_stride, precomputed_cu_seqlens};
+        kv_norm_weight_ptr, static_cast<float>(kv_norm_eps), latent_row_stride, precomputed_cu_seqlens,
+        precomputed_fmha_scheduler};
 
     auto const input_dtype = fused_q.scalar_type();
     if (input_dtype == torch::kFloat16)
@@ -344,6 +349,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? kv_norm_weight=None"
         ", float kv_norm_eps=1e-6"
         ", bool precomputed_cu_seqlens=False"
+        ", bool precomputed_fmha_scheduler=False"
         ") -> ()");
 }
 

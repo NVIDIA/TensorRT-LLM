@@ -2563,6 +2563,28 @@ class MLA(nn.Module):
         else:
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 
+    def _mla_gen_scheduler_scalars(self, device: torch.device, has_fp8_kv_cache: bool):
+        """Persistent per-layer FMHA scheduler scalars for the generation path.
+
+        `fmha_tile_counter` (the persistent-CTA tile dispenser) plus the bmm1/bmm2
+        scales. All three are written from scratch by the RoPE kernel -- or, on the
+        fused kv-norm path, by `mlaKvNormRopeQuantGenerationKernel` -- before the
+        FMHA kernel reads them, so nothing carries across launches and a single
+        buffer per layer is enough.
+        """
+        counter = getattr(self, "_mla_fmha_tile_counter", None)
+        if counter is None or counter.device != device:
+            counter = torch.empty(1, dtype=torch.uint32, device=device)
+            self._mla_fmha_tile_counter = counter
+        if not has_fp8_kv_cache:
+            return counter, None, None
+        bmm1 = getattr(self, "_mla_bmm1_scale", None)
+        if bmm1 is None or bmm1.device != device:
+            bmm1 = torch.empty(2, dtype=torch.float32, device=device)
+            self._mla_bmm1_scale = bmm1
+            self._mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+        return counter, bmm1, self._mla_bmm2_scale
+
     def forward_absorption_generation(
         self,
         q: torch.Tensor,
@@ -2602,17 +2624,21 @@ class MLA(nn.Module):
             cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
             cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
             precomputed_cu_seqlens = False
-        fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
         has_fp8_kv_cache = (
             self.mqa.has_fp8_kv_cache if hasattr(self.mqa, "has_fp8_kv_cache") else False
         )
 
-        mla_bmm1_scale = None
-        mla_bmm2_scale = None
+        # Scheduler scalars are shape-invariant -- one tile counter and three floats,
+        # rewritten from scratch by the kernel on every launch -- so they are layer
+        # state, not per-forward allocations. Keeping fixed addresses also suits CUDA
+        # graph capture better than re-allocating each step. Created lazily on the
+        # first forward, which warmup runs before any capture.
+        fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale = self._mla_gen_scheduler_scalars(
+            q.device, has_fp8_kv_cache
+        )
+
         quant_q_buffer = None
         if has_fp8_kv_cache:
-            mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
-            mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
             quant_q_buffer = torch.empty(
                 num_tokens,
                 self.num_heads_tp,
@@ -2642,6 +2668,13 @@ class MLA(nn.Module):
                 kv_norm_weight=(self.kv_a_layernorm.weight if _fused_kv_norm else None),
                 kv_norm_eps=float(self.kv_a_layernorm.variance_epsilon),
                 precomputed_cu_seqlens=precomputed_cu_seqlens,
+                # `_deepseek_v4_local_to_global_kernel` emits the tile counter and the
+                # bmm scales on this path -- it is the last kernel before FMHA, so it
+                # is a strictly better home than block (0,0) of the RoPE kernels. Same
+                # condition as the sparse_attn_predict branch that writes them.
+                precomputed_fmha_scheduler=(
+                    has_fp8_kv_cache and mla_bmm1_scale is not None and mla_bmm2_scale is not None
+                ),
             )
         else:
             fused_q = torch.empty(

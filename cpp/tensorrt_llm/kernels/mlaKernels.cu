@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
+#include <algorithm>
 #include <cstdint>
 #include <cub/cub.cuh>
 #include <cuda_fp16.h>
@@ -565,7 +566,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
     float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
-    bool const* helix_is_inactive_rank, bool precomputed_cu_seqlens = false)
+    bool const* helix_is_inactive_rank, bool precomputed_cu_seqlens = false, bool precomputed_fmha_scheduler = false)
 {
     // Constants.
     using VecT = typename VecType<T>::Type;
@@ -604,16 +605,29 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
         }
     }
 
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+    // Under `kSkipKv` the whole FMHA scheduler prologue -- the tile counter and the
+    // bmm scales -- has moved to `mlaKvNormRopeQuantGenerationKernel`, which runs
+    // first in the pair. Only the `seqQOffset[0]` seed can still be owed here, and
+    // only when the metadata did not precompute the array.
+    // Whatever is left of the scheduler prologue. Both halves can be owned
+    // elsewhere: `cu_seqlens` by the attention metadata (once per iteration) and the
+    // tile counter + bmm scales by the DSv4 sparse indices kernel (last launch before
+    // FMHA). When both are, block (0,0) has nothing to do and this kernel is pure Q.
+    bool const owes_cu_seqlens = !precomputed_cu_seqlens;
+    bool const owes_fmha_scheduler = !precomputed_fmha_scheduler && !kSkipKv;
+    if ((owes_cu_seqlens || owes_fmha_scheduler) && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
     {
-        fmha_tile_counter[0] = 0;
-        if (!precomputed_cu_seqlens)
+        if (owes_fmha_scheduler)
+        {
+            fmha_tile_counter[0] = 0;
+        }
+        if (owes_cu_seqlens)
         {
             seqQOffset[0] = 0;
         }
 
         // Calculate bmm scale for FP8 MLA
-        if (cache_type == KvCacheDataType::FP8)
+        if (owes_fmha_scheduler && cache_type == KvCacheDataType::FP8)
         {
             float dequant_scale_q_val = dequant_scale_q ? dequant_scale_q[0] : 1.f;
             float dequant_scale_kv_val = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
@@ -881,12 +895,21 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 // which is what the 16B vector loads require.
 //
 // DSv4-only by construction: no helix parameters (DSv4 + CP Helix raises in
-// mla.py), no Q-side arguments, and none of the FMHA scheduler-prologue buffers --
-// those stay with the RoPE kernel until they are rehomed as a group.
+// mla.py) and no Q-side arguments.
+//
+// This kernel also owns what is left of the FMHA scheduler prologue -- zeroing
+// `fmha_tile_counter` and deriving the bmm1/bmm2 scales. Both are single-thread
+// writes that used to sit in block (0,0) of the generation RoPE kernel. They
+// belong to whichever kernel runs first in the pair, and this one does; moving
+// them here empties that kernel's prologue so it is pure Q work. Correctness is
+// per-LAUNCH, not per-iteration: the counter has to be zero before every FMHA
+// launch, and this kernel is launched exactly once per RoPE kernel launch.
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
 __global__ void mlaKvNormRopeQuantGenerationKernel(T const* fuse_buf, KVCacheBuffer kv_cache,
     float2 const* cos_sin_cache, T const* kv_norm_weight, float kv_norm_eps, int latent_row_stride, int total_s_len,
-    int seq_len, int32_t const* kv_cache_lengths, KvCacheDataType cache_type, float const* quant_scale_kv)
+    int seq_len, int32_t const* kv_cache_lengths, KvCacheDataType cache_type, float const* quant_scale_kv,
+    uint32_t* fmha_tile_counter, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
+    float const* dequant_scale_q, float const* dequant_scale_kv, float host_bmm1_scale)
 {
     using VecT = typename VecType<T>::Type;
     using GPTJEltT = typename VecType<T>::GPTJEltType;
@@ -910,6 +933,43 @@ __global__ void mlaKvNormRopeQuantGenerationKernel(T const* fuse_buf, KVCacheBuf
     int const lane = threadIdx.x % kWarpSize;
     int const warp_id = threadIdx.x / kWarpSize;
     float const quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.f;
+
+    // FMHA scheduler prologue, rehomed from the RoPE kernel. It reads only static
+    // scale tensors, so it deliberately runs BEFORE the grid-dependency wait below:
+    // useful work while the producing GEMM drains. The launcher passes null pointers
+    // when the DSv4 sparse indices kernel already owns this.
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        if (fmha_tile_counter != nullptr)
+        {
+            fmha_tile_counter[0] = 0;
+        }
+        if (cache_type == KvCacheDataType::FP8)
+        {
+            float const dequant_scale_q_val = dequant_scale_q ? dequant_scale_q[0] : 1.f;
+            float const dequant_scale_kv_val = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
+            float const quant_scale_o_val = quant_scale_o ? quant_scale_o[0] : 1.f;
+            if (bmm1_scale)
+            {
+                // The scale prepared for log2 optimization.
+                constexpr float kLog2e = 1.4426950408889634074f;
+                float const bmm1_scale_val = dequant_scale_q_val * dequant_scale_kv_val * host_bmm1_scale;
+                bmm1_scale[0] = bmm1_scale_val;
+                bmm1_scale[1] = bmm1_scale_val * kLog2e;
+            }
+            if (bmm2_scale)
+            {
+                bmm2_scale[0] = quant_scale_o_val * dequant_scale_kv_val;
+            }
+        }
+    }
+
+    // The launch sets `programmaticStreamSerializationAllowed`, so this kernel can
+    // start before its predecessor -- the kv_a_proj GEMM that produces `fuse_buf` --
+    // has finished. Wait for it before touching the latent.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
 
     // One warp per row. Every lane of a warp shares `global_token_idx`, so the
     // early-continue below keeps the shuffles convergent.
@@ -991,6 +1051,12 @@ __global__ void mlaKvNormRopeQuantGenerationKernel(T const* fuse_buf, KVCacheBuf
             }
         }
     }
+
+    // Release the RoPE kernel that follows: it only needs the Q side, so it can
+    // overlap the tail of this one.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename T, typename TCache>
@@ -1550,7 +1616,7 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
         params.quant_scale_q, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
         params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank,
-        params.precomputed_cu_seqlens);
+        params.precomputed_cu_seqlens, params.precomputed_fmha_scheduler);
 }
 
 template <typename T, typename KVCacheBuffer>
@@ -1566,29 +1632,70 @@ void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_c
     TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
         "MLA can only support input sequences with the same sequence length.");
 
-    constexpr int kBlockSize = 256;
-    constexpr int kRowsPerBlock = kBlockSize / 32;
     auto const seq_len = params.acc_q_len / params.batch_size;
-    // Grid is sized purely by rows -- no coupling to head_num or to the FP8 grid
-    // expansion the RoPE kernel needs.
-    dim3 grid(static_cast<int>(tensorrt_llm::common::divUp(params.acc_q_len, kRowsPerBlock)));
-
     auto const* kv_norm_w = static_cast<T const*>(params.kv_norm_weight);
     int const row_stride = params.latent_row_stride > 0 ? params.latent_row_stride : (params.meta.kv_lora_rank + 64);
 
-    cudaLaunchConfig_t config;
-    config.gridDim = grid;
-    config.blockDim = kBlockSize;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
+    // The DSv4 sparse indices kernel owns the FMHA scheduler prologue when it runs;
+    // null pointers turn the in-kernel writes off rather than duplicating them.
+    auto* tile_counter = params.precomputed_fmha_scheduler ? nullptr : params.fmha_tile_counter;
+    auto* bmm1_scale = params.precomputed_fmha_scheduler ? nullptr : params.bmm1_scale;
+    auto* bmm2_scale = params.precomputed_fmha_scheduler ? nullptr : params.bmm2_scale;
+
+    // One warp owns one latent row, so the block size decides how many rows a block
+    // retires and therefore the grid size. Generation is tiny -- one row per token,
+    // e.g. 128 rows for batch 32 with MTP3 -- so a fat block leaves most of the GPU
+    // idle (128 rows / 8 rows-per-block = 16 blocks on 148 SMs) and the kernel is
+    // pure launch latency. Shrink the block until the grid covers the SMs.
+    // `TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK` pins it for tuning.
+    int const sm_count = std::max(1, tensorrt_llm::common::getMultiProcessorCount());
+    int rows_per_block = static_cast<int>(tensorrt_llm::common::divUp(params.acc_q_len, sm_count));
+    if (auto const env_rows = tensorrt_llm::common::getIntEnv("TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK"))
+    {
+        rows_per_block = env_rows.value();
+    }
+    rows_per_block = std::min(std::max(rows_per_block, 1), 8);
+
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    cudaLaunchKernelEx(&config, &mlaKvNormRopeQuantGenerationKernel<T, kBlockSize, 448, 64, KVCacheBuffer>,
-        params.latent_cache, kv_cache_buffer, params.cos_sin_cache, kv_norm_w, params.kv_norm_eps, row_stride,
-        params.acc_q_len, seq_len, params.cache_seq_lens, params.cache_type, params.quant_scale_kv);
+
+    auto launch = [&](auto block_size_tag)
+    {
+        constexpr int kBlockSize = decltype(block_size_tag)::value;
+        constexpr int kRowsPerBlock = kBlockSize / 32;
+        cudaLaunchConfig_t config;
+        // Grid is sized purely by rows -- no coupling to head_num or to the FP8 grid
+        // expansion the RoPE kernel needs.
+        config.gridDim = dim3(static_cast<int>(tensorrt_llm::common::divUp(params.acc_q_len, kRowsPerBlock)));
+        config.blockDim = kBlockSize;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, &mlaKvNormRopeQuantGenerationKernel<T, kBlockSize, 448, 64, KVCacheBuffer>,
+            params.latent_cache, kv_cache_buffer, params.cos_sin_cache, kv_norm_w, params.kv_norm_eps, row_stride,
+            params.acc_q_len, seq_len, params.cache_seq_lens, params.cache_type, params.quant_scale_kv, tile_counter,
+            bmm1_scale, bmm2_scale, params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv,
+            params.host_bmm1_scale);
+    };
+
+    if (rows_per_block <= 1)
+    {
+        launch(std::integral_constant<int, 32>{});
+    }
+    else if (rows_per_block <= 2)
+    {
+        launch(std::integral_constant<int, 64>{});
+    }
+    else if (rows_per_block <= 4)
+    {
+        launch(std::integral_constant<int, 128>{});
+    }
+    else
+    {
+        launch(std::integral_constant<int, 256>{});
+    }
 }
 
 template <typename T, typename TCache>
