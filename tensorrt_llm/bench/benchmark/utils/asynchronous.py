@@ -166,9 +166,10 @@ class LlmManager:
             time_on_first_token = None
             last_response = None
 
+            truncated = False
             for turn_id, question in enumerate(request.turns):
-                # Completed turns are still recorded below.
                 if turn_id > 0 and self._duration_exceeded():
+                    truncated = True
                     break
                 messages.append({"role": "user", "content": question})
 
@@ -201,6 +202,13 @@ class LlmManager:
                 })
 
                 last_response = response
+
+        if truncated:
+            # A conversation cut short by the deadline is not a completed
+            # request: recording it would mix partial and full conversations in
+            # the same statistics. Requests skipped before their first turn are
+            # dropped for the same reason.
+            return
 
         response_end_timestamp = time.perf_counter_ns()
 

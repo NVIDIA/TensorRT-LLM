@@ -294,6 +294,66 @@ async def test_llm_manager_stops_draining_when_a_request_fails():
 
 
 @pytest.mark.asyncio
+async def test_llm_manager_drops_truncated_multi_turn_request():
+    """A conversation cut short by the deadline is not recorded.
+
+    Its turns are incomplete, so emitting it would mix partial and full
+    conversations in the same statistics.
+    """
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    turn_latency = 0.6
+
+    def generate_async(*args, **kwargs):
+        output = MagicMock()
+        output.prompt_token_ids = [1, 2, 3]
+        output.outputs = [MagicMock(token_ids=[4, 5])]
+        output.finished = True
+        output.id = 1
+        output.decoding_iter = 1
+
+        async def mock_aresult():
+            await asyncio.sleep(turn_latency)
+            return output
+
+        output.aresult = mock_aresult
+        return output
+
+    mock_llm.generate_async.side_effect = generate_async
+
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = [1, 2, 3]
+    tokenizer.decode.return_value = "answer"
+
+    outbox = asyncio.Queue()
+    manager = LlmManager(
+        llm=mock_llm,
+        outbox=outbox,
+        streaming=False,
+        concurrency=1,
+        duration=1,
+        tokenizer=tokenizer,
+    )
+
+    # Four turns at 0.6s each cannot finish inside the 1s deadline, so the
+    # conversation is cut short after turn 2.
+    req = InferenceRequest(
+        task_id=0, input_ids=[1, 2, 3], output_tokens=10, turns=["q1", "q2", "q3", "q4"]
+    )
+    await manager.enqueue(req, SamplingParams(), PostprocParams())
+
+    manager.run()
+    await asyncio.wait_for(manager._backend_task, timeout=15)
+
+    assert outbox.empty(), "A conversation truncated by the deadline was recorded as complete."
+
+    await manager.stop()
+
+
+@pytest.mark.asyncio
 async def test_llm_manager_duration_not_exceeded():
     # Mock LLM
     mock_llm = MagicMock(spec=LLM)
