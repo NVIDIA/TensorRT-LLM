@@ -97,7 +97,7 @@ from ..modules.kimi_k3_moe._mlp import KimiK3MLP, KimiK3RMSNorm
 from ..modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..utils import ActType_TrtllmGen
+from ..utils import ActType_TrtllmGen, MxFp8QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
@@ -107,6 +107,18 @@ _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
     os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
 )
 
+# A/B escape hatch for the decode-only latent-down GEMM + MXFP8 epilogue.
+# It is used by TEP's no-dispatch path. Communication paths keep the
+# separate BF16 GEMM and MXFP8 quantization because DEP measurements did
+# not recover the standalone kernel saving.
+_K3_DISABLE_FUSED_LATENT_DOWN_MXFP8 = os.environ.get(
+    "TLLM_K3_DISABLE_FUSED_LATENT_DOWN_MXFP8", "0") == "1"
+
+# A/B escape hatch for the decode-only TRTLLM-Gen finalize + MNNVL
+# AllReduce + latent RMSNorm kernel.
+_K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS = os.environ.get(
+    "TLLM_K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS", "0") == "1"
+
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
 
 # Routed-expert MoE TP/EP split overrides (read per model init, not import).
@@ -114,6 +126,21 @@ _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_
 # tp_size. Without them, an explicit moe_tensor_parallel_size /
 # moe_expert_parallel_size pair from the user config is honored, and the
 # default stays EP-only (moe_ep == tp_size).
+#
+# Measured tradeoff for the TP override (16xGB200, TEP16, ISL 8192 / OSL
+# 1024, concurrency 1, one allocation with the EP-only baseline bracketing
+# the candidates): moe_tp 1 = 53.41 tok/s/user (TPOT 17.93 ms), moe_tp 4 =
+# 61.59 (+15.3%, TPOT 15.54), moe_tp 8 = 61.06 (+14.3%). EP-only is
+# balls-into-bins at decode -- top_k 16 over 16 EP ranks leaves the busiest
+# rank ~3 experts and ~6 ranks with none, and the routed AllReduce waits for
+# the busiest (per-layer routed gemm1 spans 4.1-27.4 us across the 93 layers
+# purely from that draw). Splitting the intermediate makes every rank's share
+# identical. 4 is the sweet spot: 8 leaves too little work per rank for the
+# TRTLLM-Gen 128-wide intermediate tile, and 16 is worse still (3072/16 = 192
+# is not 128-aligned, so the intermediate pads to 4096 and each rank stores
+# and reads 33% more expert weight than it computes on). The win is a
+# small-batch effect and fades as the batch grows (concurrency 4 measured
+# +4.4%, roughly the run-to-run spread), so it stays opt-in.
 _K3_MOE_TP_ENV = "TLLM_K3_MOE_TP_SIZE"
 _K3_MOE_EP_ENV = "TLLM_K3_MOE_EP_SIZE"
 
@@ -464,13 +491,12 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
 
     ``q_proj``/``k_proj``/``v_proj`` and the full-rank ``g_proj`` all read the
     same normed hidden, so their weights are additionally concatenated into one
-    fused ``qkvg_proj`` FP8 GEMM used by the decode path
-    (``KimiKDALinearAttention._decode_via_optimized``): the decode step is
-    launch-bound at the small generation batch, and one GEMM (with one shared
-    activation quant) replaces four. The fused weight is the only storage — the
-    individual ``q_proj``/``k_proj``/``v_proj``/``g_proj`` modules are rebuilt to
-    read a **view** of their slice of it (with their own block scale), so the
-    prefill/verify paths keep calling them per projection with no extra memory.
+    fused ``qkvg_proj`` FP8 GEMM used by decode and by the executor prefill
+    path: decode consumes all four outputs, while prefill consumes only q/k/v
+    and keeps its output gate separate. The fused weight is the only storage —
+    the individual ``q_proj``/``k_proj``/``v_proj``/``g_proj`` modules are
+    rebuilt to read a **view** of their slice of it (with their own block
+    scale), so verify and fallback paths can still call them per projection.
     ``o_proj`` reads the decode-kernel output (not the shared hidden) and is
     converted on its own. Returns the number of projections converted.
     """
@@ -637,7 +663,11 @@ class KimiK3MoERuntime(nn.Module):
             hidden_size=self.moe_hidden_size,
             intermediate_size=cfg.moe_intermediate_size,
             dtype=dtype,
-            reduce_results=True,
+            # Kimi owns the latent reduction so decode can replace
+            # TRTLLM-Gen finalize + AllReduce + RMSNorm with one MNNVL
+            # kernel. Non-fused TEP paths call the same AllReduce module
+            # explicitly below; DEP communication remains unchanged.
+            reduce_results=False,
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
             layer_idx=layer_idx,
@@ -672,6 +702,11 @@ class KimiK3MoERuntime(nn.Module):
         self.experts_per_rank = len(local_expert_ids)
         self.expert_lo = local_expert_ids[0]
         self.expert_hi = self.expert_lo + self.experts_per_rank
+        routed_comm = self.routed_experts.comm
+        self._use_fused_latent_down_mxfp8 = (
+            not _K3_DISABLE_MIN_LATENCY_LATENT_PROJ
+            and not _K3_DISABLE_FUSED_LATENT_DOWN_MXFP8
+            and routed_comm is None)
 
         # Shared experts stay replicated (DeepSeek's attention-DP
         # semantics): ConfigurableMoE owns its own reduction, so there is
@@ -804,10 +839,30 @@ class KimiK3MoERuntime(nn.Module):
             # (A/B escape hatch). When the FP8 weight-read conversion has
             # replaced the projection module, call it directly: its weight is
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
-            # is already a single fused GEMM (fp8_swap_ab_gemm).
-            if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(
-                self.routed_expert_down_proj, nn.Linear
-            ):
+            # is already a single fused GEMM (fp8_swap_ab_gemm). The same
+            # applies to the MXFP8-epilogue variant below, which reads
+            # ``.weight`` directly as well.
+            down_proj_is_bf16_linear = isinstance(self.routed_expert_down_proj,
+                                                  nn.Linear)
+            moe_all_reduce = self.routed_experts.all_reduce
+            use_fused_finalize_ar_rms = (
+                not _K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS
+                and self.routed_experts.comm is None
+                and moe_all_reduce is not None
+                and moe_all_reduce.supports_moe_finalize_allreduce_rms_norm
+                and 1 <= hidden_states.shape[0] <= 16)
+            use_fused_mxfp8 = (
+                self._use_fused_latent_down_mxfp8
+                and down_proj_is_bf16_linear
+                and self.routed_experts.comm is None
+                and 1 <= hidden_states.shape[0] <= 16)
+            if use_fused_mxfp8:
+                op_backend = self.routed_experts.backend.op_backend
+                routed_in, routed_in_sf = op_backend.dsv3_fused_a_gemm_mxfp8(
+                    hidden_states, self.routed_expert_down_proj.weight.t())
+                routed_in = MxFp8QuantizedTensor(routed_in, routed_in_sf)
+            elif (_K3_DISABLE_MIN_LATENCY_LATENT_PROJ
+                  or not down_proj_is_bf16_linear):
                 routed_in = self.routed_expert_down_proj(hidden_states)
             else:
                 routed_in = torch.ops.trtllm.dsv3_fused_a_gemm_op(
@@ -816,11 +871,27 @@ class KimiK3MoERuntime(nn.Module):
             y = self.routed_experts(
                 routed_in,
                 router_logits,
+                output_dtype=torch.bfloat16 if use_fused_mxfp8 else None,
                 all_rank_num_tokens=all_rank_num_tokens,
+                do_finalize=not use_fused_finalize_ar_rms,
             )
-            # EP partial latent sums are completed by the wrapper's own
-            # reduction BEFORE the (nonlinear) latent norm.
-            y = self.routed_expert_norm(y)
+            if use_fused_finalize_ar_rms:
+                fc2_output, expert_scale_factor, expanded_idx_to_permuted_idx = y
+                y = moe_all_reduce.moe_finalize_allreduce_rms_norm(
+                    fc2_output,
+                    expert_scale_factor,
+                    expanded_idx_to_permuted_idx,
+                    self.routed_expert_norm.weight,
+                    self.routed_expert_norm.variance_epsilon,
+                )
+            else:
+                # EP partial latent sums must be completed before the
+                # nonlinear latent norm. ConfigurableMoE was constructed
+                # with reduce_results=False so this explicit call preserves
+                # the former fallback behavior.
+                if self.routed_experts.comm is None and moe_all_reduce is not None:
+                    y = moe_all_reduce(y)
+                y = self.routed_expert_norm(y)
             if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(
                 self.routed_expert_up_proj, nn.Linear
             ):
@@ -1156,9 +1227,14 @@ class KimiKDARuntime(nn.Module):
         d = self.proj_size
         x = x2d.unsqueeze(0)  # [1, T, hidden]
 
-        q_proj_states = mixer.q_proj(x)
-        k_proj_states = mixer.k_proj(x)
-        v_proj_states = mixer.v_proj(x)
+        fused_qkvg = getattr(mixer, "qkvg_proj", None)
+        if fused_qkvg is not None:
+            q_proj_states, k_proj_states, v_proj_states = fused_qkvg(
+                x)[..., :3 * d].split(d, dim=-1)
+        else:
+            q_proj_states = mixer.q_proj(x)
+            k_proj_states = mixer.k_proj(x)
+            v_proj_states = mixer.v_proj(x)
 
         # Initial states: present for continuation chunks (chunked prefill)
         # and for prefix-cache hits (block reuse), where the previous
@@ -1182,6 +1258,7 @@ class KimiKDARuntime(nn.Module):
         v, conv_v = mixer.v_conv1d(
             v_proj_states, cache=conv_v_in, output_final_state=True, cu_seqlens=cu_seqlens
         )
+        del q_proj_states, k_proj_states, v_proj_states
 
         g = mixer.f_b_proj(mixer.f_a_proj(x))
         g = rearrange(g, "... (h d) -> ... h d", d=mixer.head_dim)

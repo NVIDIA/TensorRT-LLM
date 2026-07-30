@@ -73,8 +73,24 @@ struct AllReduceFusionParams
     //! @}
 };
 
+/**
+ * \brief Parameters for fusing MoE finalize, MNNVL AllReduce, and RMSNorm.
+ *
+ * The local MoE FC2 output remains in permuted-route layout. The kernel
+ * applies the per-route weights, reduces the local top-k routes, performs
+ * MNNVL AllReduce, and normalizes the global latent output.
+ */
+struct MoeFinalizeAllReduceRMSNormParams : public AllReduceFusionParams
+{
+    int topK;                                //!< Number of selected routes per token
+    nvinfer1::DataType scaleDType;           //!< Data type of expertScaleFactor
+    void const* expertScaleFactor;           //!< Per-token route weights [numTokens, topK]
+    int32_t const* expandedIdxToPermutedIdx; //!< Route-to-permuted-row map [numTokens, topK]
+};
+
 void oneshotAllreduceFusionOp(AllReduceFusionParams const& params);
 void twoshotAllreduceFusionOp(AllReduceFusionParams const& params);
+void oneshotMoeFinalizeAllreduceRMSNormOp(MoeFinalizeAllReduceRMSNormParams const& params);
 } // namespace kernels::mnnvl
 
 TRTLLM_NAMESPACE_END

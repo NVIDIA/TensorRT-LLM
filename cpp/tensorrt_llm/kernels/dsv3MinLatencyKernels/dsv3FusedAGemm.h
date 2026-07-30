@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +30,10 @@ namespace kernels::dsv3MinLatencyKernels
 
 template <typename T, int kHdIn, int kHdOut, int kTileN>
 void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens, cudaStream_t const stream);
+
+template <typename T, int kHdIn, int kHdOut, int kTileN>
+void invokeFusedAGemmMxFp8(
+    uint8_t* output, uint8_t* output_sf, T const* mat_a, T const* mat_b, int num_tokens, cudaStream_t const stream);
 
 } // namespace kernels::dsv3MinLatencyKernels
 

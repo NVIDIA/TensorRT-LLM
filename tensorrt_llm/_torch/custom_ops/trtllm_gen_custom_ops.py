@@ -1165,6 +1165,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                  local_num_experts: int,
                  routed_scaling_factor: Optional[float],
                  routing_method_type: int,
+                 do_finalize: bool,
                  act_type: int,
                  tune_max_num_tokens: int = 8192,
                  use_dp: bool = False):
@@ -1180,6 +1181,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.local_num_experts = local_num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
+        self.do_finalize = do_finalize
         self.act_type = act_type
 
         self.tuning_config = MxE4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
@@ -1213,7 +1215,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
         output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> List[torch.Tensor]:
         assert isinstance(tactic, list)
 
         args = MxE4m3MxE2m1BlockScaleMoEInputs(*inputs)
@@ -1229,8 +1231,8 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.intermediate_size, self.valid_hidden_size,
             self.valid_intermediate_size, self.local_expert_offset,
             self.local_num_experts, self.routed_scaling_factor,
-            self.routing_method_type, tactic, args.topk_weights, args.topk_ids,
-            output)
+            self.routing_method_type, self.do_finalize, tactic,
+            args.topk_weights, args.topk_ids, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -1380,12 +1382,13 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
+        do_finalize: bool,
         act_type: int,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
-        use_dp: bool = False) -> torch.Tensor:
+        use_dp: bool = False) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     kernel_runner = MxE4m3MxE2m1BlockScaleMoERunner(
@@ -1400,6 +1403,7 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         local_num_experts,
         routed_scaling_factor,
         routing_method_type,
+        do_finalize,
         act_type,
         tune_max_num_tokens=tune_max_num_tokens,
         use_dp=use_dp,
@@ -1463,8 +1467,8 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).
     # Callers should use output directly when they provide it.
-    if output is not None:
-        return torch.empty(0, device=result.device, dtype=result.dtype)
+    if output is not None and do_finalize:
+        return [torch.empty(0, device=output.device, dtype=output.dtype)]
     return result
 
 
@@ -1570,8 +1574,8 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.valid_hidden_size, self.valid_intermediate_size,
             self.local_expert_offset, self.local_num_experts,
-            self.routed_scaling_factor, self.routing_method_type, tactic,
-            args.topk_weights, args.topk_ids, output)
+            self.routed_scaling_factor, self.routing_method_type, True, tactic,
+            args.topk_weights, args.topk_ids, output)[0]
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,

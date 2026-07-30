@@ -6,9 +6,11 @@ import copy
 
 import pytest
 import torch
+from torch.profiler import ProfilerActivity, profile
 
 pytest.importorskip("fla")
 
+from tensorrt_llm._torch.modules.kimi_kda import _kda_decode  # noqa: E402
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import (  # noqa: E402
     KimiKDACachedState,
     KimiKDALinearAttention,
@@ -20,6 +22,8 @@ NUM_HEADS = 96
 HEAD_DIM = 128
 CONV_KERNEL_SIZE = 4
 HIDDEN_SIZE = 7168
+SUPPORTED_HEADS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 96)
+COMPACT_WORK_THRESHOLD = 144
 
 
 def _has_supported_gpu() -> bool:
@@ -112,12 +116,13 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 @torch.no_grad()
-def test_optimized_decode_matches_fla_reference() -> None:
+@pytest.mark.parametrize("batch_size", [1, BATCH_SIZE])
+def test_optimized_decode_matches_fla_reference(batch_size: int) -> None:
     torch.manual_seed(0)
     optimized, reference = _make_attention_pair()
     hidden_states = (
         torch.randn(
-            BATCH_SIZE,
+            batch_size,
             1,
             HIDDEN_SIZE,
             dtype=torch.bfloat16,
@@ -125,7 +130,7 @@ def test_optimized_decode_matches_fla_reference() -> None:
         )
         * 0.05
     )
-    initial_cache = _make_cache()
+    initial_cache = _make_cache(batch_size)
 
     actual_output, actual_cache = optimized.forward_decode(
         hidden_states, copy.deepcopy(initial_cache)
@@ -143,12 +148,16 @@ def test_optimized_decode_matches_fla_reference() -> None:
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("slot_gap", [0, 4096], ids=["dense-pool", "strided-pool"])
+@pytest.mark.parametrize(
+    ("batch_size", "slot_gap"),
+    [(3, 0), (3, 4096), (1, 0)],
+    ids=["many-dense-pool", "many-strided-pool", "compact-dense-pool"],
+)
 def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
+    batch_size: int,
     slot_gap: int,
 ) -> None:
     torch.manual_seed(1)
-    batch_size = 3
     optimized, _ = _make_attention_pair()
     hidden_states = (
         torch.randn(
@@ -166,9 +175,13 @@ def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
         hidden_states, copy.deepcopy(initial_cache))
 
     slots = batch_size + 3
-    slot_indices = torch.tensor([5, 4, 3],
-                                dtype=torch.int32,
-                                device="cuda")
+    slot_indices = torch.arange(
+        slots - 1,
+        slots - batch_size - 1,
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
     dense_slot_stride = NUM_HEADS * HEAD_DIM * HEAD_DIM
     state_storage = torch.randn(
         slots * (dense_slot_stride + slot_gap),
@@ -183,7 +196,7 @@ def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
     assert state_pool.is_contiguous() is (slot_gap == 0)
     state_pool.index_copy_(0, slot_indices.long(),
                            initial_cache.recurrent_state)
-    unselected_indices = torch.tensor([0, 1, 2], device="cuda")
+    unselected_indices = torch.arange(3, device="cuda")
     unselected_before = state_pool.index_select(0,
                                                 unselected_indices).clone()
     indexed_cache = KimiKDACachedState(
@@ -213,3 +226,189 @@ def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
         rtol=0,
         atol=0,
     )
+
+
+def _make_direct_decode_args(
+    batch_size: int,
+    num_heads: int,
+    *,
+    indexed_state: bool,
+) -> dict:
+    device = torch.device("cuda")
+    projection_size = num_heads * HEAD_DIM
+    slots = batch_size + 1 if indexed_state else batch_size
+    state = torch.zeros(
+        slots,
+        num_heads,
+        HEAD_DIM,
+        HEAD_DIM,
+        dtype=torch.float32,
+        device=device,
+    )
+    indices = (
+        torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
+        if indexed_state
+        else None
+    )
+    return {
+        "x_q": torch.randn(
+            1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        * 0.01,
+        "x_k": torch.randn(
+            1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        * 0.01,
+        "x_v": torch.randn(
+            1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        * 0.01,
+        "w_q_t": torch.randn(
+            CONV_KERNEL_SIZE,
+            projection_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.01,
+        "w_k_t": torch.randn(
+            CONV_KERNEL_SIZE,
+            projection_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.01,
+        "w_v_t": torch.randn(
+            CONV_KERNEL_SIZE,
+            projection_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        * 0.01,
+        "bias_q": None,
+        "bias_k": None,
+        "bias_v": None,
+        "cs_q": torch.zeros(
+            batch_size,
+            projection_size,
+            CONV_KERNEL_SIZE - 1,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        "cs_k": torch.zeros(
+            batch_size,
+            projection_size,
+            CONV_KERNEL_SIZE - 1,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        "cs_v": torch.zeros(
+            batch_size,
+            projection_size,
+            CONV_KERNEL_SIZE - 1,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        "A_log": torch.zeros(projection_size, dtype=torch.float32, device=device),
+        "g": torch.zeros(
+            1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+        ),
+        "dt_bias": torch.zeros(projection_size, dtype=torch.float32, device=device),
+        "beta": torch.zeros(
+            1, batch_size, num_heads, dtype=torch.bfloat16, device=device
+        ),
+        "state": state,
+        "onorm_g": torch.zeros(
+            1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+        ),
+        "onorm_weight": torch.ones(HEAD_DIM, dtype=torch.float32, device=device),
+        "out": torch.empty(
+            batch_size,
+            1,
+            num_heads,
+            HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        "ssm_state_indices": indices,
+        "cu_seqlens": torch.arange(
+            batch_size + 1, dtype=torch.int32, device=device
+        ),
+        "lower_bound": -5.0,
+    }
+
+
+def _profile_decode_backend(kwargs: dict) -> str:
+    _kda_decode.run_kda_decode_fusion_cuda(**kwargs)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        _kda_decode.run_kda_decode_fusion_cuda(**kwargs)
+        torch.cuda.synchronize()
+
+    kernel_names = [
+        event.key
+        for event in prof.key_averages()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    has_compact = any("kda_decode_fusion_compact_heads_kernel" in name for name in kernel_names)
+    has_many = any("kda_decode_fusion_many_heads_kernel" in name for name in kernel_names)
+    assert has_compact != has_many, kernel_names
+    return "compact" if has_compact else "many"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("num_heads", SUPPORTED_HEADS)
+def test_sm103_selector_dispatches_each_supported_head_at_boundary(num_heads: int) -> None:
+    if torch.cuda.get_device_capability(0) != (10, 3):
+        pytest.skip("compact-head selector sweep is tuned only for SM103")
+
+    compact_batch = COMPACT_WORK_THRESHOLD // num_heads
+    compact_args = _make_direct_decode_args(
+        compact_batch,
+        num_heads,
+        indexed_state=False,
+    )
+    many_args = _make_direct_decode_args(
+        compact_batch + 1,
+        num_heads,
+        indexed_state=False,
+    )
+    assert _profile_decode_backend(compact_args) == "compact"
+    assert _profile_decode_backend(many_args) == "many"
+
+
+@torch.no_grad()
+def test_selector_falls_back_to_many_heads_off_sm103() -> None:
+    if torch.cuda.get_device_capability(0) == (10, 3):
+        pytest.skip("non-SM103 fallback requires a different Blackwell target")
+    args = _make_direct_decode_args(1, 2, indexed_state=False)
+    assert _profile_decode_backend(args) == "many"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    ("batch_size", "indexed_state", "expected_backend"),
+    [(1, False, "compact"), (2, True, "many")],
+)
+def test_sm103_selector_is_cuda_graph_safe(
+    batch_size: int,
+    indexed_state: bool,
+    expected_backend: str,
+) -> None:
+    if torch.cuda.get_device_capability(0) != (10, 3):
+        pytest.skip("compact-head selector sweep is tuned only for SM103")
+
+    args = _make_direct_decode_args(
+        batch_size,
+        96,
+        indexed_state=indexed_state,
+    )
+    assert _profile_decode_backend(args) == expected_backend
+
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        captured_output = _kda_decode.run_kda_decode_fusion_cuda(**args)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert captured_output is args["out"]
+    assert torch.isfinite(captured_output).all()

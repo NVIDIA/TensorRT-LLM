@@ -38,7 +38,8 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoESchedulerKin
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 from tensorrt_llm._torch.utils import (ActType_TrtllmGen, AuxStreamType,
-                                      EventType, Fp4QuantizedTensor)
+                                      EventType, Fp4QuantizedTensor,
+                                      MxFp8QuantizedTensor)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -561,7 +562,7 @@ class ConfigurableMoE(MoE):
 
     def forward_impl(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         *,
         do_finalize: bool = True,
@@ -585,7 +586,7 @@ class ConfigurableMoE(MoE):
         """
         input_ids = kwargs.get("input_ids")
 
-        if isinstance(x, Fp4QuantizedTensor):
+        if isinstance(x, (Fp4QuantizedTensor, MxFp8QuantizedTensor)):
             assert output_dtype is not None
         else:
             output_dtype = x.dtype
@@ -770,7 +771,7 @@ class ConfigurableMoE(MoE):
 
     def forward_fake(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         *,
         do_finalize: bool = True,

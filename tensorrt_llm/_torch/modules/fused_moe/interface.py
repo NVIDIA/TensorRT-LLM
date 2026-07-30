@@ -48,8 +48,8 @@ def _warn_and_return(reason: str) -> Tuple[bool, Optional[str]]:
 
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
-                      get_model_extra_attrs, is_gated_activation,
-                      is_torch_compiling)
+                      MxFp8QuantizedTensor, get_model_extra_attrs,
+                      is_gated_activation, is_torch_compiling)
 from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
                       get_cached_perfect_router_logits,
                       precompute_common_perfect_router_logits)
@@ -157,8 +157,12 @@ def moe_custom_op(
 ) -> List[torch.Tensor]:
     moe_layer = extract_extra_attrs(layer_idx)
 
-    hidden_states = x if x_sf is None else Fp4QuantizedTensor(
-        x, x_sf, is_swizzled)
+    if x_sf is None:
+        hidden_states = x
+    elif x.dtype == torch.float8_e4m3fn:
+        hidden_states = MxFp8QuantizedTensor(x, x_sf, is_swizzled)
+    else:
+        hidden_states = Fp4QuantizedTensor(x, x_sf, is_swizzled)
 
     res = moe_layer.forward_impl(
         hidden_states,
@@ -188,8 +192,12 @@ def _(
     use_dp_padding,
 ):
     moe_layer = extract_extra_attrs(layer_idx)
-    hidden_states = x if x_sf is None else Fp4QuantizedTensor(
-        x, x_sf, is_swizzled)
+    if x_sf is None:
+        hidden_states = x
+    elif x.dtype == torch.float8_e4m3fn:
+        hidden_states = MxFp8QuantizedTensor(x, x_sf, is_swizzled)
+    else:
+        hidden_states = Fp4QuantizedTensor(x, x_sf, is_swizzled)
     res = moe_layer.forward_fake(
         hidden_states,
         router_logits,
@@ -894,7 +902,7 @@ class MoE(nn.Module):
     @abstractmethod
     def quantize_input(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         **kwargs,
     ) -> Union[Tuple[torch.Tensor, Optional[torch.Tensor]], Dict]:
         """
@@ -908,7 +916,7 @@ class MoE(nn.Module):
         specific quantization logic.
 
         Args:
-            x: Input tensor [num_tokens, hidden_size] or Fp4QuantizedTensor
+            x: Input tensor or a supported pre-quantized activation carrier
             **kwargs: Backend-specific arguments (e.g., token_selected_experts, workspace, etc.)
 
         Returns:
@@ -960,7 +968,7 @@ class MoE(nn.Module):
     @abstractmethod
     def forward_impl(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         *,
         do_finalize: bool = True,
@@ -973,7 +981,7 @@ class MoE(nn.Module):
 
     def forward_fake(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         *,
         do_finalize: bool = True,
@@ -983,19 +991,23 @@ class MoE(nn.Module):
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
+        is_quantized_input = isinstance(
+            x, (Fp4QuantizedTensor, MxFp8QuantizedTensor))
         assert do_finalize, "Default forward_fake does not support do_finalize=False"
-        data_type = output_dtype if is_nvfp4_input else x.dtype
+        data_type = output_dtype if is_quantized_input else x.dtype
         num_tokens = all_rank_num_tokens[
             self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
         hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
-        return x.new_empty((num_tokens, hidden_size), dtype=data_type)
+        raw_x = (x.fp4_tensor if is_nvfp4_input else
+                 x.fp8_tensor if isinstance(x, MxFp8QuantizedTensor) else x)
+        return raw_x.new_empty((num_tokens, hidden_size), dtype=data_type)
 
     # Sub class is not allowed to override forward.
     # This is universal interface for all MoE backends
     @final
     def forward(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
@@ -1018,12 +1030,16 @@ class MoE(nn.Module):
                     "adapter pointers). Disable `register_to_config`/"
                     "torch.compile for this model, or remove the MoE modules "
                     "from `lora_config.lora_target_modules`.")
-            hidden_states = x.fp4_tensor if isinstance(
-                x, Fp4QuantizedTensor) else x
-            x_sf = x.scaling_factor if isinstance(x,
-                                                  Fp4QuantizedTensor) else None
+            if isinstance(x, Fp4QuantizedTensor):
+                hidden_states = x.fp4_tensor
+            elif isinstance(x, MxFp8QuantizedTensor):
+                hidden_states = x.fp8_tensor
+            else:
+                hidden_states = x
+            x_sf = x.scaling_factor if isinstance(
+                x, (Fp4QuantizedTensor, MxFp8QuantizedTensor)) else None
             is_swizzled = x.is_sf_swizzled if isinstance(
-                x, Fp4QuantizedTensor) else False
+                x, (Fp4QuantizedTensor, MxFp8QuantizedTensor)) else False
 
             res = moe_custom_op(
                 self.layer_idx_str,

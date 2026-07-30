@@ -213,6 +213,74 @@ def run_reject_single_rank(tensor_parallel_size, single_rank_forward_func,
     return True
 
 
+def run_moe_finalize_single_rank(
+    tensor_parallel_size,
+    single_rank_forward_func,
+    fc2_output,
+    expert_scale_factor,
+    expanded_idx_to_permuted_idx,
+    norm_weight,
+    reference_output,
+    eps,
+):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        single_rank_forward_func(
+            fc2_output,
+            expert_scale_factor,
+            expanded_idx_to_permuted_idx,
+            norm_weight,
+            reference_output,
+            eps,
+            tensor_parallel_size,
+            rank,
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@torch.inference_mode()
+def mnnvl_moe_finalize_allreduce_rms_norm_forward(
+    fc2_output: torch.Tensor,
+    expert_scale_factor: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    norm_weight: torch.Tensor,
+    reference_output: torch.Tensor,
+    eps: float,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+):
+    fc2_output = fc2_output.cuda()
+    expert_scale_factor = expert_scale_factor.cuda()
+    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.cuda()
+    norm_weight = norm_weight.cuda()
+    reference_output = reference_output.cuda()
+
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    MPI.COMM_WORLD.barrier()
+    allreduce = AllReduce(
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        strategy=AllReduceStrategy.MNNVL,
+        dtype=fc2_output.dtype,
+    )
+    assert allreduce.supports_moe_finalize_allreduce_rms_norm
+    output = allreduce.moe_finalize_allreduce_rms_norm(
+        fc2_output,
+        expert_scale_factor,
+        expanded_idx_to_permuted_idx,
+        norm_weight,
+        eps,
+    )
+    torch.testing.assert_close(output, reference_output, rtol=0.05, atol=0.15)
+
+
 @torch.inference_mode()
 def mnnvl_quant_fusion_forward(
     input: torch.Tensor,
@@ -579,6 +647,64 @@ def test_mnnvl_nvfp4_rejects_fp32_before_launch(mpi_pool_executor):
     )
     for r in results:
         assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mnnvl_moe_finalize_allreduce_rms_norm(mpi_pool_executor):
+    torch.manual_seed(42)
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    num_tokens = 4
+    top_k = 16
+    hidden_size = 2880
+    dtype = torch.bfloat16
+    eps = 1e-5
+
+    fc2_output = torch.randn(
+        (tensor_parallel_size, num_tokens * top_k, hidden_size),
+        dtype=dtype,
+    )
+    expert_scale_factor = torch.rand((num_tokens, top_k), dtype=torch.float32)
+    expanded_idx_to_permuted_idx = torch.full(
+        (tensor_parallel_size, num_tokens, top_k),
+        -1,
+        dtype=torch.int32,
+    )
+    local_outputs = torch.zeros(
+        (tensor_parallel_size, num_tokens, hidden_size),
+        dtype=dtype,
+    )
+    for rank in range(tensor_parallel_size):
+        for token in range(num_tokens):
+            for route in range(top_k):
+                if route % tensor_parallel_size != rank:
+                    continue
+                permuted_idx = token * top_k + route
+                expanded_idx_to_permuted_idx[rank, token, route] = permuted_idx
+                weighted_route = (fc2_output[rank, permuted_idx].float() *
+                                  expert_scale_factor[token, route]).to(dtype)
+                local_outputs[rank, token].add_(weighted_route)
+
+    norm_weight = torch.randn((hidden_size, ), dtype=dtype)
+    reduced = local_outputs.float().sum(dim=0).to(dtype)
+    reference_output = rms_norm(reduced.float(), norm_weight.float(),
+                                eps).to(dtype)
+    results = mpi_pool_executor.map(
+        run_moe_finalize_single_rank,
+        *zip(*[(
+            tensor_parallel_size,
+            mnnvl_moe_finalize_allreduce_rms_norm_forward,
+            fc2_output[rank],
+            expert_scale_factor,
+            expanded_idx_to_permuted_idx[rank],
+            norm_weight,
+            reference_output,
+            eps,
+        ) for rank in range(tensor_parallel_size)]),
+    )
+    for result in results:
+        assert result is True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,

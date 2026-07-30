@@ -650,6 +650,42 @@ class MNNVLAllReduce(nn.Module):
         )
         return tuple(outputs) if is_fusion else outputs[0]
 
+    def moe_finalize_allreduce_rms_norm(
+        self,
+        input: torch.Tensor,
+        expert_scale_factor: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Fuse local MoE finalize, MNNVL AllReduce, and latent RMSNorm."""
+        hidden_dim = input.shape[-1]
+        num_tokens = expanded_idx_to_permuted_idx.shape[0]
+        workspace_size_bytes = self.get_required_workspace_size(
+            num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
+        if workspace_size_bytes >= 2**32 - 1:
+            raise ValueError(
+                f"[MNNVL MoE finalize AllReduce RMSNorm] Required workspace "
+                f"{workspace_size_bytes} bytes exceeds uint32 limits for "
+                f"shard ({num_tokens}, {hidden_dim}), TP "
+                f"{self.mapping.tp_size}.")
+
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping,
+            self.dtype,
+            buffer_size_bytes=workspace_size_bytes,
+        )
+        buffer_base = workspace["uc_buffer"].view(self.dtype).view(3, -1)
+        return torch.ops.trtllm.mnnvl_moe_finalize_allreduce_rmsnorm(
+            input,
+            expert_scale_factor,
+            expanded_idx_to_permuted_idx,
+            norm_weight,
+            buffer_base,
+            workspace["buffer_flags"],
+            eps,
+        )
+
 
 class AllReduce(nn.Module):
 
@@ -809,6 +845,31 @@ class AllReduce(nn.Module):
         return (int(BufferKind.NCCL_WINDOW)
                 if self.uses_nccl_symmetric_memory_window() else int(
                     BufferKind.DEFAULT))
+
+    @property
+    def supports_moe_finalize_allreduce_rms_norm(self) -> bool:
+        """Whether this instance can execute the fused MNNVL MoE epilogue."""
+        return self.mnnvl_allreduce is not None
+
+    def moe_finalize_allreduce_rms_norm(
+        self,
+        input: torch.Tensor,
+        expert_scale_factor: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Fuse MoE finalize, AllReduce, and RMSNorm through MNNVL."""
+        if self.mnnvl_allreduce is None:
+            raise RuntimeError(
+                "Fused MoE finalize AllReduce RMSNorm requires MNNVL.")
+        return self.mnnvl_allreduce.moe_finalize_allreduce_rms_norm(
+            input,
+            expert_scale_factor,
+            expanded_idx_to_permuted_idx,
+            norm_weight,
+            eps,
+        )
 
     def forward(
         self,

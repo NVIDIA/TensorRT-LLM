@@ -401,11 +401,12 @@ def invoke_native_situ_moe(
         local_num_experts,
         None,  # routed_scaling_factor — already folded into topk_weights
         1,  # routing_method_type (Renormalize) — inert under the topk bypass
+        True,  # do_finalize
         act_type,
         topk_weights,
         topk_ids,
         tune_max_num_tokens=tune_max_num_tokens,
-    )
+    )[0]
 
     if output.shape[-1] > valid_hidden_size:
         output = output[:, :valid_hidden_size].contiguous()

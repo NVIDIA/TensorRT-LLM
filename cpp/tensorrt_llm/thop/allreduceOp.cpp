@@ -1998,6 +1998,71 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     return {};
 }
 
+torch::Tensor mnnvlMoeFinalizeAllReduceRMSNorm(torch::Tensor const& input, torch::Tensor const& expertScaleFactor,
+    torch::Tensor const& expandedIdxToPermutedIdx, torch::Tensor const& normWeight, torch::Tensor& commBuffer,
+    torch::Tensor& bufferFlags, double const eps)
+{
+    auto* mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(commBuffer.data_ptr());
+    TORCH_CHECK(mcastMem != nullptr,
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] commBuffer must be obtained from a mcastBuffer instance.");
+    TORCH_CHECK(input.is_cuda() && input.is_contiguous(),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] input must be a contiguous CUDA tensor.");
+    TORCH_CHECK(input.dim() == 2, "[mnnvlMoeFinalizeAllReduceRMSNorm] input must be two-dimensional.");
+    TORCH_CHECK(input.scalar_type() == torch::kBFloat16 || input.scalar_type() == torch::kFloat16,
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] input must have BF16 or FP16 dtype.");
+    TORCH_CHECK(expertScaleFactor.is_cuda() && expertScaleFactor.is_contiguous(),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] expertScaleFactor must be a contiguous CUDA tensor.");
+    TORCH_CHECK(
+        expertScaleFactor.dim() == 2, "[mnnvlMoeFinalizeAllReduceRMSNorm] expertScaleFactor must be two-dimensional.");
+    TORCH_CHECK(
+        expertScaleFactor.scalar_type() == torch::kFloat32 || expertScaleFactor.scalar_type() == input.scalar_type(),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] expertScaleFactor must have FP32 or input dtype.");
+    TORCH_CHECK(expandedIdxToPermutedIdx.is_cuda() && expandedIdxToPermutedIdx.is_contiguous(),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] expandedIdxToPermutedIdx must be a contiguous CUDA tensor.");
+    TORCH_CHECK(expandedIdxToPermutedIdx.scalar_type() == torch::kInt32,
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] expandedIdxToPermutedIdx must have INT32 dtype.");
+    TORCH_CHECK(expandedIdxToPermutedIdx.sizes() == expertScaleFactor.sizes(),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] route index and scale shapes must match.");
+    TORCH_CHECK(normWeight.is_cuda() && normWeight.is_contiguous(),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] normWeight must be a contiguous CUDA tensor.");
+    TORCH_CHECK(normWeight.dim() == 1 && normWeight.size(0) == input.size(1),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] normWeight must match the input hidden dimension.");
+    TORCH_CHECK(normWeight.scalar_type() == input.scalar_type(),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] normWeight dtype must match input dtype.");
+
+    int64_t const numTokens = expertScaleFactor.size(0);
+    int64_t const topK = expertScaleFactor.size(1);
+    int64_t const hiddenDim = input.size(1);
+    TORCH_CHECK(numTokens > 0 && topK > 0, "[mnnvlMoeFinalizeAllReduceRMSNorm] numTokens and topK must be positive.");
+
+    auto output = torch::empty({numTokens, hiddenDim}, input.options());
+    auto params = tensorrt_llm::kernels::mnnvl::MoeFinalizeAllReduceRMSNormParams();
+    params.nRanks = mcastMem->getWorldSize();
+    params.rank = mcastMem->getRank();
+    params.dType = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    params.numTokens = static_cast<int>(numTokens);
+    params.tokenDim = static_cast<int>(hiddenDim);
+    params.bufferPtrsDev = reinterpret_cast<void**>(mcastMem->getBufferPtrsDev());
+    params.bufferPtrLocal = commBuffer.mutable_data_ptr();
+    params.multicastPtr = mcastMem->getMulticastPtr();
+    params.bufferFlags = reinterpret_cast<uint32_t*>(bufferFlags.mutable_data_ptr());
+    params.rmsNormFusion = true;
+    params.pattern = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARRMSNorm;
+    params.input = input.const_data_ptr();
+    params.residualIn = nullptr;
+    params.gamma = normWeight.const_data_ptr();
+    params.epsilon = eps;
+    params.output = output.mutable_data_ptr();
+    params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    params.topK = static_cast<int>(topK);
+    params.scaleDType = tensorrt_llm::runtime::TorchUtils::dataType(expertScaleFactor.scalar_type());
+    params.expertScaleFactor = expertScaleFactor.const_data_ptr();
+    params.expandedIdxToPermutedIdx = static_cast<int32_t const*>(expandedIdxToPermutedIdx.const_data_ptr());
+
+    tensorrt_llm::kernels::mnnvl::oneshotMoeFinalizeAllreduceRMSNormOp(params);
+    return output;
+}
+
 torch::Tensor minimax_allreduce_rms(torch::Tensor const& input, torch::Tensor const& norm_weight,
     torch::Tensor workspace, int64_t const rank, int64_t const nranks, double const eps,
     bool const trigger_completion_at_end_)
@@ -2100,6 +2165,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? scale=None, int fusion_op=0) -> "
         "Tensor[]");
     m.def(
+        "mnnvl_moe_finalize_allreduce_rmsnorm("
+        "Tensor input,"
+        "Tensor expert_scale_factor,"
+        "Tensor expanded_idx_to_permuted_idx,"
+        "Tensor norm_weight,"
+        "Tensor(a!) comm_buffer,"
+        "Tensor buffer_flags,"
+        "float eps) -> Tensor");
+    m.def(
         "allreduce("
         "Tensor input,"
         "Tensor? residual,"
@@ -2179,6 +2253,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mnnvl_fusion_allreduce", &tensorrt_llm::torch_ext::mnnvlFusionAllReduce);
+    m.impl("mnnvl_moe_finalize_allreduce_rmsnorm", &tensorrt_llm::torch_ext::mnnvlMoeFinalizeAllReduceRMSNorm);
     m.impl("allreduce", &tensorrt_llm::torch_ext::allreduce_raw);
     m.impl("allreduce_pg", &tensorrt_llm::torch_ext::allreduce_pg);
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
