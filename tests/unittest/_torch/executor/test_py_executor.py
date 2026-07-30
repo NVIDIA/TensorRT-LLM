@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -37,7 +36,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
 )
 from tensorrt_llm.bindings.executor import FinishReason, RequestType
 from tensorrt_llm.llmapi import DisaggScheduleStyle
-from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, WaitingQueuePolicy
 
 
 class MockPyExecutor:
@@ -907,6 +906,9 @@ class TestGenerationFirstPreActiveRequests:
     def _request(request_id: int, *, priority: float = 0.0):
         return SimpleNamespace(
             request_id=request_id,
+            py_request_id=request_id,
+            is_child=False,
+            is_context_only_request=True,
             priority=priority,
             request_type=RequestType.REQUEST_TYPE_CONTEXT_ONLY,
             py_disaggregated_params=SimpleNamespace(
@@ -920,6 +922,7 @@ class TestGenerationFirstPreActiveRequests:
         request_ids=(),
         *,
         max_num_active_requests: int = 4,
+        pre_active_metadata_capacity: int | None = None,
         waiting_queue_policy=WaitingQueuePolicy.FCFS,
         priorities=None,
     ):
@@ -930,6 +933,11 @@ class TestGenerationFirstPreActiveRequests:
         executor._gen_first_pre_active_requests = {}
         executor._gen_first_pre_active_order = {}
         executor._next_gen_first_pre_active_order = 0
+        executor._gen_first_pre_active_metadata_capacity = (
+            max_num_active_requests
+            if pre_active_metadata_capacity is None
+            else pre_active_metadata_capacity
+        )
         priorities = priorities or {}
         for insertion_order, request_id in enumerate(request_ids):
             request = cls._request(request_id, priority=priorities.get(request_id, 0.0))
@@ -939,6 +947,23 @@ class TestGenerationFirstPreActiveRequests:
         executor.kv_cache_transceiver = Mock()
         executor.kv_cache_transceiver.supports_pre_active_context_requests.return_value = True
         return executor
+
+    def test_metadata_capacity_defaults_to_compute_capacity(self):
+        llm_args = SimpleNamespace(cache_transceiver_config=None)
+
+        assert PyExecutor._resolve_gen_first_pre_active_metadata_capacity(llm_args, 4) == 4
+
+    def test_metadata_capacity_config_is_wired_and_validated(self):
+        llm_args = SimpleNamespace(
+            cache_transceiver_config=CacheTransceiverConfig(
+                max_num_generation_first_pre_active_requests=256
+            )
+        )
+        assert PyExecutor._resolve_gen_first_pre_active_metadata_capacity(llm_args, 4) == 256
+
+        llm_args.cache_transceiver_config.max_num_generation_first_pre_active_requests = 3
+        with pytest.raises(ValueError, match="at least the compute activation capacity 4"):
+            PyExecutor._resolve_gen_first_pre_active_metadata_capacity(llm_args, 4)
 
     def test_default_off_leaves_context_request_in_waiting_queue(self):
         executor = self._executor()
@@ -976,26 +1001,93 @@ class TestGenerationFirstPreActiveRequests:
         assert [request.request_id for request in executor.active_requests] == [97, 98, 99]
 
     def test_pre_active_metadata_admission_is_bounded_and_leaves_backlog(self):
-        executor = self._executor((10,), max_num_active_requests=2)
+        executor = self._executor(
+            (10,),
+            max_num_active_requests=2,
+            pre_active_metadata_capacity=4,
+        )
         executor.kv_cache_transceiver.is_context_request_ready_for_activation.return_value = False
         queue = FCFSWaitingQueue()
         items = [
             RequestQueueItem(id=request_id, request=self._request(request_id))
-            for request_id in (1, 2, 3)
+            for request_id in (1, 2, 3, 4)
         ]
         queue.add_requests(items)
 
         admitted = PyExecutor._take_pre_active_context_items(executor, queue)
 
-        assert admitted == [items[0]]
-        assert list(queue) == items[1:]
+        assert admitted == items[:3]
+        assert list(queue) == items[3:]
 
         # Model the subsequent materialization while readiness remains absent.
-        executor._gen_first_pre_active_requests[1] = admitted[0].request
-        executor._gen_first_pre_active_order[1] = 1
+        for insertion_order, item in enumerate(admitted, start=1):
+            executor._gen_first_pre_active_requests[item.id] = item.request
+            executor._gen_first_pre_active_order[item.id] = insertion_order
         assert PyExecutor._select_ready_pre_active_context_request_ids(executor) == []
         assert PyExecutor._take_pre_active_context_items(executor, queue) == []
-        assert list(queue) == items[1:]
+        assert list(queue) == items[3:]
+
+    def test_metadata_window_admits_256_without_using_compute_slots(self):
+        executor = self._executor(
+            max_num_active_requests=4,
+            pre_active_metadata_capacity=256,
+        )
+        executor.active_requests = [
+            self._request(request_id) for request_id in (997, 998, 999, 1000)
+        ]
+        queue = FCFSWaitingQueue()
+        items = [
+            RequestQueueItem(id=request_id, request=self._request(request_id))
+            for request_id in range(1, 261)
+        ]
+        queue.add_requests(items)
+
+        admitted = PyExecutor._take_pre_active_context_items(executor, queue)
+
+        assert admitted == items[:256]
+        assert list(queue) == items[256:]
+        assert [request.request_id for request in executor.active_requests] == [
+            997,
+            998,
+            999,
+            1000,
+        ]
+
+    def test_metadata_window_does_not_expand_compute_activation_capacity(self):
+        executor = self._executor(
+            range(1, 9),
+            max_num_active_requests=4,
+            pre_active_metadata_capacity=256,
+        )
+        executor.kv_cache_transceiver.is_context_request_ready_for_activation.return_value = True
+
+        assert PyExecutor._select_ready_pre_active_context_request_ids(executor) == [
+            1,
+            2,
+            3,
+            4,
+        ]
+
+    def test_canceled_overflow_has_no_metadata_or_compute_ownership(self):
+        executor = self._executor(
+            (10,),
+            max_num_active_requests=1,
+            pre_active_metadata_capacity=1,
+        )
+        pre_active_request = executor._gen_first_pre_active_requests[10]
+        executor.canceled_req_ids = [1]
+        executor.waiting_queue = FCFSWaitingQueue()
+        canceled = RequestQueueItem(id=1, request=self._request(1))
+        retained = RequestQueueItem(id=2, request=self._request(2))
+        executor.waiting_queue.add_requests([canceled, retained])
+
+        assert PyExecutor._take_pre_active_context_items(executor, executor.waiting_queue) == []
+        PyExecutor._handle_canceled_requests(executor)
+
+        assert list(executor.waiting_queue) == [retained]
+        assert executor.canceled_req_ids == []
+        assert executor._gen_first_pre_active_requests == {10: pre_active_request}
+        executor.kv_cache_transceiver.prepare_context_requests.assert_not_called()
 
     @pytest.mark.parametrize(
         "waiting_queue_policy",
@@ -1058,8 +1150,14 @@ class TestGenerationFirstPreActiveRequests:
 
     def test_rank_local_capacity_cannot_diverge_pre_active_cohort(self):
         executors = [
-            self._executor(max_num_active_requests=4),
-            self._executor(max_num_active_requests=4),
+            self._executor(
+                max_num_active_requests=4,
+                pre_active_metadata_capacity=256,
+            ),
+            self._executor(
+                max_num_active_requests=4,
+                pre_active_metadata_capacity=256,
+            ),
         ]
         executors[0].active_requests = [
             self._request(request_id) for request_id in (91, 92, 93, 94)
@@ -1070,7 +1168,7 @@ class TestGenerationFirstPreActiveRequests:
             queue.add_requests(
                 [
                     RequestQueueItem(id=request_id, request=self._request(request_id))
-                    for request_id in (1, 2, 3)
+                    for request_id in range(1, 9)
                 ]
             )
             queues.append(queue)
@@ -1080,7 +1178,7 @@ class TestGenerationFirstPreActiveRequests:
             for executor, queue in zip(executors, queues)
         ]
 
-        assert cohorts == [[1, 2, 3], [1, 2, 3]]
+        assert cohorts == [list(range(1, 9)), list(range(1, 9))]
         assert all(not queue for queue in queues)
         assert len(executors[0].active_requests) == 4
         assert executors[1].active_requests == []
@@ -1111,6 +1209,27 @@ class TestGenerationFirstPreActiveRequests:
             [request]
         )
         executor.kv_cache_transceiver.prepare_context_requests.assert_not_called()
+
+    def test_fetch_prepares_then_schedulability_check_polls_same_request(self):
+        executor = self._executor()
+        request = self._request(11)
+        executor.canceled_req_ids = []
+        executor.waiting_queue = FCFSWaitingQueue()
+        executor._fetch_new_requests = Mock(return_value=([], [request]))
+        executor._validate_request = Mock()
+
+        new_requests = PyExecutor._fetch_and_activate_new_requests(executor)
+
+        first_prepared = executor.kv_cache_transceiver.prepare_context_requests.call_args.args[0]
+        assert len(first_prepared) == 1
+        assert first_prepared[0] is request
+
+        PyExecutor._check_disagg_ctx_schedulable_status(executor, new_requests)
+
+        assert executor.kv_cache_transceiver.prepare_context_requests.call_count == 2
+        second_prepared = executor.kv_cache_transceiver.prepare_context_requests.call_args.args[0]
+        assert len(second_prepared) == 1
+        assert second_prepared[0] is request
 
     def test_multi_return_request_uses_legacy_capacity_accounted_fallback(self):
         executor = self._executor()

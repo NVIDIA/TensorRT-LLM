@@ -2238,6 +2238,17 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_tokens_in_buffer == 1024
         assert config.kv_transfer_poll_interval_ms == 5000
 
+        # The Python peer-ready metadata window is opt-in and validated as a
+        # positive absolute request count. It remains Python-only and is not
+        # forwarded through _to_pybind().
+        assert config.max_num_generation_first_pre_active_requests is None
+        assert CacheTransceiverConfig(
+            max_num_generation_first_pre_active_requests=256
+        ).max_num_generation_first_pre_active_requests == 256
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            CacheTransceiverConfig(
+                max_num_generation_first_pre_active_requests=0)
+
         # The bounce on/off switch defaults to off (0), accepts a positive size, and rejects
         # negatives at the Pydantic boundary (ge=0). It is a Python-only field consumed directly by
         # the v2 transceiver, so it is intentionally not part of _to_pybind().

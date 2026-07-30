@@ -943,6 +943,11 @@ class PyExecutor:
         self._gen_first_pre_active_requests: Dict[int, LlmRequest] = {}
         self._gen_first_pre_active_order: Dict[int, int] = {}
         self._next_gen_first_pre_active_order = 0
+        self._gen_first_pre_active_metadata_capacity = (
+            self._resolve_gen_first_pre_active_metadata_capacity(
+                self.llm_args,
+                self.max_num_active_requests,
+            ))
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -5299,6 +5304,24 @@ class PyExecutor:
             is True)
 
     @staticmethod
+    def _resolve_gen_first_pre_active_metadata_capacity(
+            llm_args, compute_capacity: int) -> int:
+        configured_capacity = getattr(
+            getattr(llm_args, "cache_transceiver_config", None),
+            "max_num_generation_first_pre_active_requests",
+            None,
+        )
+        if configured_capacity is None:
+            return compute_capacity
+        if configured_capacity < compute_capacity:
+            raise ValueError(
+                "cache_transceiver_config."
+                "max_num_generation_first_pre_active_requests must be at "
+                f"least the compute activation capacity {compute_capacity}; "
+                f"got {configured_capacity}")
+        return configured_capacity
+
+    @staticmethod
     def _is_pre_active_context_item(item: RequestQueueItem) -> bool:
         request = item.request
         params = getattr(request, "py_disaggregated_params", None)
@@ -5322,12 +5345,12 @@ class PyExecutor:
         # Metadata-only waiters do not consume compute slots, but each admitted
         # request materializes an LlmRequest and pins native peer metadata.
         # Bound that ownership independently of rank-local active utilization.
-        # max_num_active_requests is identical across the qualified PP domain,
-        # so every rank extracts the same canonical prefix even when their
-        # active-request counts differ.
+        # The metadata capacity is identical across the qualified PP domain, so
+        # every rank extracts the same canonical prefix even when their active-
+        # request counts differ.
         available = max(
             0,
-            self.max_num_active_requests -
+            self._gen_first_pre_active_metadata_capacity -
             len(self._gen_first_pre_active_requests),
         )
         if available == 0:

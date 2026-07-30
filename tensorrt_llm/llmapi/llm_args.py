@@ -4120,6 +4120,15 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Bounded wait interval in milliseconds for polling KV transfer "
         "progress when active transfers block disaggregated admission.")
 
+    max_num_generation_first_pre_active_requests: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Maximum number of generation-first context requests that may "
+        "wait for peer metadata without consuming compute activation "
+        "slots. When set, the value must be at least the executor's "
+        "compute activation capacity. None uses that compute capacity. "
+        "Only used by the Python transceiver's peer-ready protocol.")
+
     kv_cache_bounce_size_mb: int = Field(
         default=0,
         ge=0,

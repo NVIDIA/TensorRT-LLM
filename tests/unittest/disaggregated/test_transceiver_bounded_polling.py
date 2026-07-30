@@ -1550,6 +1550,122 @@ def test_async_peer_ready_pins_metadata_while_request_is_pre_active() -> None:
     assert transceiver.owns_request(req)
 
 
+def test_async_peer_ready_duplicate_prepare_does_not_publish_next_epoch() -> None:
+    transceiver = _make_transceiver({})
+    coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)
+    req = _FakeRequest(request_id=46)
+    transceiver._transfer_worker.ready_request_ids.add(46)
+    pin = Mock(wraps=transceiver._transfer_worker.pin_peer_req_infos_for_send)
+    transceiver._transfer_worker.pin_peer_req_infos_for_send = pin
+
+    def prepare_after_vote(fake_coordinator: _FakeAsyncCoordinator) -> None:
+        if fake_coordinator.ready_votes and not fake_coordinator.ready_acks:
+            fake_coordinator.events.append(
+                ConsensusEvent(
+                    ConsensusEventKind.READY_PREPARE,
+                    46,
+                    0,
+                    ConsensusOutcome.READY,
+                )
+            )
+
+    coordinator.poll_hook = prepare_after_vote
+    transceiver.prepare_context_requests([req])
+    coordinator.poll_hook = None
+
+    assert transceiver._async_ready_prepared[(46, 0)] is req
+    assert 46 not in transceiver._wait_reqs
+
+    polls_before_duplicate = coordinator.poll_count
+    transceiver.prepare_context_requests([req])
+
+    assert coordinator.poll_count > polls_before_duplicate
+    assert transceiver._async_ready_prepared[(46, 0)] is req
+    assert 46 not in transceiver._wait_reqs
+    pin.assert_called_once_with(46)
+
+    coordinator.events.append(
+        ConsensusEvent(
+            ConsensusEventKind.READY_RELEASE,
+            46,
+            0,
+            ConsensusOutcome.READY,
+        )
+    )
+    transceiver._progress_async_consensus()
+    transceiver.activate_context_requests_for_schedule([req])
+    coordinator.events.append(
+        ConsensusEvent(
+            ConsensusEventKind.READY_COMPLETE,
+            46,
+            0,
+            ConsensusOutcome.READY,
+        )
+    )
+    transceiver._progress_async_consensus()
+    transceiver.prepare_context_requests([])
+
+    assert coordinator.ready_votes == [(46, 0)]
+    assert transceiver._async_ready_epoch[46] == 1
+    assert 46 not in transceiver._async_ready_published
+    assert 46 not in transceiver._wait_reqs
+
+
+def test_async_peer_ready_duplicate_id_with_different_request_fails_closed() -> None:
+    transceiver = _make_transceiver({})
+    _enable_fake_async_consensus(transceiver, peer_ready=True)
+    original = _FakeRequest(request_id=47)
+    replacement = _FakeRequest(request_id=47)
+    transceiver._wait_reqs[47] = original
+
+    with pytest.raises(RuntimeError, match="request ownership mismatch"):
+        transceiver.prepare_context_requests([replacement])
+
+    assert transceiver._wait_reqs == {47: original}
+    assert 47 not in transceiver._transfer_worker.pinned_request_ids
+
+
+@pytest.mark.parametrize(
+    "state_name",
+    ("activated", "aborted"),
+)
+def test_async_peer_ready_duplicate_prepare_preserves_lifecycle_owner(
+    state_name: str,
+) -> None:
+    transceiver = _make_transceiver({})
+    coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)
+    req = _FakeRequest(request_id=48)
+    key = (48, 0)
+    transceiver._async_ready_published[48] = 0
+    getattr(transceiver, f"_async_ready_{state_name}")[key] = req
+    if state_name == "aborted":
+        setattr(req, transceiver_module._ASYNC_READY_CANCELLED_EPOCH_ATTR, 0)
+
+    polls_before_duplicate = coordinator.poll_count
+    transceiver.prepare_context_requests([req])
+
+    assert coordinator.poll_count > polls_before_duplicate
+    assert getattr(transceiver, f"_async_ready_{state_name}") == {key: req}
+    assert 48 not in transceiver._wait_reqs
+    assert 48 not in transceiver._transfer_worker.pinned_request_ids
+
+
+def test_async_peer_ready_multiple_owners_fail_closed() -> None:
+    transceiver = _make_transceiver({})
+    _enable_fake_async_consensus(transceiver, peer_ready=True)
+    req = _FakeRequest(request_id=49)
+    transceiver._async_ready_published[49] = 0
+    transceiver._wait_reqs[49] = req
+    transceiver._async_ready_prepared[(49, 0)] = req
+
+    with pytest.raises(RuntimeError, match="states=waiting, prepared"):
+        transceiver.prepare_context_requests([req])
+
+    assert transceiver._wait_reqs == {49: req}
+    assert transceiver._async_ready_prepared == {(49, 0): req}
+    assert 49 not in transceiver._transfer_worker.pinned_request_ids
+
+
 def test_async_peer_ready_activates_only_from_authoritative_schedule() -> None:
     transceiver = _make_transceiver({})
     coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)

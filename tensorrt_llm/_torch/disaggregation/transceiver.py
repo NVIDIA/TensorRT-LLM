@@ -2185,6 +2185,43 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._async_ready_metadata_leases.discard(rid)
         return cancelled
 
+    def _async_ready_owns_request(self, req: LlmRequest) -> bool:
+        """Return whether an asynchronous readiness phase owns ``req``.
+
+        The executor deliberately calls ``prepare_context_requests`` once
+        while admitting generation-first requests and again while polling
+        readiness in the same iteration. A READY_PREPARE event may move a
+        request out of ``_wait_reqs`` between those calls. Treating the second
+        call as fresh admission would reinsert the prepared request and allow
+        it to publish a second epoch after the first schedule completes.
+        """
+        rid = get_unique_rid(req)
+        owners = []
+        waiting_req = self._wait_reqs.get(rid)
+        if waiting_req is not None:
+            owners.append(("waiting", waiting_req))
+
+        epoch = self._async_ready_published.get(rid)
+        if epoch is not None:
+            key = (rid, epoch)
+            for state, state_req in (
+                ("prepared", self._async_ready_prepared.get(key)),
+                ("activated", self._async_ready_activated.get(key)),
+                ("aborted", self._async_ready_aborted.get(key)),
+            ):
+                if state_req is not None:
+                    owners.append((state, state_req))
+
+        if not owners:
+            return False
+        if len(owners) != 1 or owners[0][1] is not req:
+            states = ", ".join(state for state, _ in owners)
+            raise RuntimeError(
+                "asynchronous readiness request ownership mismatch: "
+                f"request_id={rid}, states={states}"
+            )
+        return True
+
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # Place new generation-first context requests into wait state, then
         # use allgather consensus to promote ready requests to CONTEXT_INIT.
@@ -2199,6 +2236,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     self._wait_reqs.pop(rid, None)
                     continue
                 if getattr(self, "_async_peer_ready_consensus_enabled", False):
+                    if self._async_ready_owns_request(req):
+                        continue
                     self._transfer_worker.pin_peer_req_infos_for_send(rid)
                     self._async_ready_metadata_leases.add(rid)
                 self._wait_reqs[rid] = req
