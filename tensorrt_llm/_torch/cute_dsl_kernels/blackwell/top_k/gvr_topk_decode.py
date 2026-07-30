@@ -2202,6 +2202,7 @@ class GvrTopKKernel:
         # here separately (per-thread order contract: head elements FIRST,
         # then list entries — Phase 3's compact write replays the same).
         skip_ok = cutlass.Int32(0)
+        dense_ok = True  # Python bool: no scf.if when block skip is off
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             skip_ok = cutlass.Int32(1)
             # Capacity/id-width guard: the active list holds at most
@@ -2220,6 +2221,7 @@ class GvrTopKKernel:
                 skip_ok = cutlass.Int32(0)
             if blk_hi_g > cutlass.Int32(32767):
                 skip_ok = cutlass.Int32(0)
+            dense_ok = skip_ok == cutlass.Int32(0)
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             if skip_ok == cutlass.Int32(1):
                 head_end = (
@@ -2360,7 +2362,7 @@ class GvrTopKKernel:
                                     jj = jj + cutlass.Int32(1)
                     li = li + cutlass.Int32(stride_un)
 
-        if self.enable_unroll_4 and skip_ok == cutlass.Int32(0):
+        if self.enable_unroll_4 and dense_ok:
             rng_frag = cute.make_fragment((vec_w,), self.dtype)
             big_iters = cutlass.Int32(0)
             if slice_end > i + cutlass.Int32(vec_w - 1):
@@ -2387,7 +2389,7 @@ class GvrTopKKernel:
             i = i + big_iters * cutlass.Int32(step_elem)
 
         tail_frag = cute.make_fragment((vec_w,), self.dtype)
-        if skip_ok == cutlass.Int32(0):
+        if dense_ok:
             while i + cutlass.Int32(vec_w - 1) < slice_end:
                 src_ptr = cute.make_ptr(
                     self.dtype,
@@ -2932,9 +2934,11 @@ class GvrTopKKernel:
         # Only taken when the list is CURRENT (s_active_cnt[1] == 1, set by
         # the build; cleared on any dense fallback re-count).
         skip_wr = cutlass.Int32(0)
+        park_cursors = False  # Python bool: no scf.if when block skip is off
         if cutlass.const_expr(self.enable_block_skip and smem_active is not None):
             if s_active_cnt[1] == cutlass.Int32(1):
                 skip_wr = cutlass.Int32(1)
+            park_cursors = skip_wr == cutlass.Int32(1)
         if cutlass.const_expr(self.enable_block_skip and smem_active is not None):
             if skip_wr == cutlass.Int32(1):
                 # head region first — same per-thread order as the count pass
@@ -3001,7 +3005,7 @@ class GvrTopKKernel:
         # When the compact write ran, park the dense cursors at the end so
         # all three dense loops below (4-way, vec tail, scalar tail) fall
         # through without re-indenting them.
-        if skip_wr == cutlass.Int32(1):
+        if park_cursors:
             ic = N_local
             n_aligned = N_local
 
@@ -3521,9 +3525,13 @@ class GvrTopKKernel:
                 sc0 = cute.arch.clock64()
             bmin_r = cutlass.Float32(self.FLT_MAX)
             bmax_r = cutlass.Float32(self.NEG_FLT_MAX)
-            use_ext_r = cutlass.Int32(0)
+            # a Python bool here, so with the feature off the stock body
+            # below traces straight-line instead of inside an scf.if whose
+            # predicate is a compile-time constant
+            run_stock_range = True
             if cutlass.const_expr(ext_range_flag is not None):
                 use_ext_r = ext_range_flag
+                run_stock_range = use_ext_r == cutlass.Int32(0)
                 if use_ext_r == cutlass.Int32(1):
                     # list rows: the take walk pre-zeroed the hist and staged
                     # per-warp maxima in smem_wcnt (its end barrier orders
@@ -3538,7 +3546,7 @@ class GvrTopKKernel:
                         bmax_r = cute.arch.fmax(bmax_r, vmax)
                     if bmax_r <= bmin_r:
                         bmax_r = bmin_r + cutlass.Float32(1e-6)
-            if use_ext_r == cutlass.Int32(0):
+            if run_stock_range:
                 # ---- block min/max over candidates ----
                 local_cmin = cutlass.Float32(self.FLT_MAX)
                 local_cmax = cutlass.Float32(self.NEG_FLT_MAX)
@@ -6121,6 +6129,10 @@ class GvrTopKKernel:
             #      an overflow net: count and load are the same compare.
             # cs>1 and 16-bit dtypes keep the plain fallback.
             take_cand = cutlass.Int32(0)
+            # Python bool: with every list/scan feature off, the stock
+            # Phase 2 + Phase 3 below trace straight-line rather than as
+            # one 470-line scf.if region with a large yield list.
+            run_stock_p23 = True
             list_used = cutlass.Int32(0)  # list path taken (xstate publish)
             claimed_c = cutlass.Int32(0)
             if cutlass.const_expr(
@@ -6715,7 +6727,9 @@ class GvrTopKKernel:
                 if cutlass.const_expr(_P4_TAIL_DBG):
                     ck1 = cute.arch.clock64()
 
-            if take_cand == cutlass.Int32(0):
+            if cutlass.const_expr(self.use_ext_cand or self.use_ext_counts or self.self_scan):
+                run_stock_p23 = take_cand == cutlass.Int32(0)
+            if run_stock_p23:
                 # Stage this CTA's slice into SMEM once before Phase 2's
                 # 6-10 secant iters re-scan it. Phase 1 (preIdx) uses
                 # scatter-loads OUTSIDE this slice, so it stays on GMEM.
@@ -6880,6 +6894,7 @@ class GvrTopKKernel:
                                 lane,
                             )
                     r0_par = cutlass.Int32(0)
+                    run_mary = True  # Python bool: no scf.if without ext counts
                     if cutlass.const_expr(self.use_ext_counts and not self.enable_block_skip):
                         # single-column fast path accepted: the parked count
                         # is done and admitted; the M-ary pass, argmin,
@@ -6889,15 +6904,8 @@ class GvrTopKKernel:
                             1
                         ] == cutlass.Int32(1):
                             r0_par = cutlass.Int32(1)
-                    if r0_par == cutlass.Int32(0):
-                        # NOTE: a loosest-line pass-rate veto (packed seed
-                        # col 6) was measured here and REMOVED: the rung-
-                        # tightening build below already salvages fat
-                        # loosest-rung rows by rebuilding at a tighter
-                        # line, so any veto threshold (3/8 and 7/8 both
-                        # tried, cold, 30 layers) only preempts that and
-                        # costs 3-18% across the board. Col 6 stays as a
-                        # zero-cost diagnostic for host-side routing.
+                        run_mary = r0_par == cutlass.Int32(0)
+                    if run_mary:
                         self.block_count_ge_multi(
                             input_row,
                             slice_start,
@@ -6917,7 +6925,7 @@ class GvrTopKKernel:
                             s_active_cnt=s_active_cnt,
                         )
                     cute.arch.barrier()
-                    if tidx == 0 and r0_par == cutlass.Int32(0):
+                    if run_mary and tidx == 0:
                         # tightest admissible rung = SMALLEST count in [K, kC].
                         # (Explicit argmin: with r0_vseed the pmean column is not
                         # sorted into the rung order; for sorted rungs this is
