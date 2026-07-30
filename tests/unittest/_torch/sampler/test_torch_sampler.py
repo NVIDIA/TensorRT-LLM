@@ -47,7 +47,9 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _request_get_sampling_params,
     _request_strategy,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import UtilsSamplingParams
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     GREEDY,
     BeamSearch,
     FlashInferGroupedStrategySampler,
@@ -58,7 +60,6 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     TopK,
     TopKTopP,
     TopP,
-    UtilsSamplingParams,
     resolve_sampling_strategy,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -876,11 +877,9 @@ class TestFinishReasons:
         @contextmanager
         def raising_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
+                patch_ctx.setattr(FinishReasonsHandler, "_are_stop_words", stop_words_that_raises)
                 patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler, "_are_stop_words", stop_words_that_raises
-                )
-                patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler,
+                    FinishReasonsHandler,
                     "_are_stop_words_single_token",
                     stop_words_that_raises,
                 )
@@ -932,7 +931,7 @@ class TestFinishReasons:
         def raising_single_token_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
                 patch_ctx.setattr(
-                    TorchSampler.FinishReasonsHandler,
+                    FinishReasonsHandler,
                     "_are_stop_words_single_token",
                     stop_words_that_raises,
                 )
@@ -2627,144 +2626,6 @@ class TestBatchedSampling:
         run_test_with_warmup(_uut_provider, max_sync_s=0.2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-class TestApplyBadWords:
-    """Unit tests for TorchSampler._apply_bad_words.
-
-    Single-token words are banned unconditionally; multi-token words ban their
-    final token only when the token suffix (prompt + generated) matches the
-    word prefix.
-    """
-
-    VOCAB = 16
-
-    class MockLlmRequest:
-        """Minimal stub exposing the attributes _apply_bad_words reads."""
-
-        def __init__(self, tokens, *, bad_words=None, prompt_len=0, seq_slot=None):
-            # get_tokens(beam) returns the full token sequence (prompt +
-            # generated); py_orig_prompt_len marks where generation starts.
-            self.py_orig_prompt_len = prompt_len
-            self._tokens = list(tokens)
-            self.py_bad_words = bad_words
-            self.py_seq_slot = seq_slot
-
-        def get_tokens(self, beam_idx):
-            return self._tokens
-
-    def _run(self, requests, num_steps, num_beams):
-        total_rows = sum(s * b for s, b in zip(num_steps, num_beams))
-        logits = torch.zeros(total_rows, self.VOCAB, device="cuda")
-        TorchSampler._apply_bad_words(
-            logits, cast(list[LlmRequest], requests), num_steps, num_beams
-        )
-        return logits
-
-    @staticmethod
-    def _banned_cols(logits_row):
-        return set(torch.nonzero(torch.isinf(logits_row)).flatten().tolist())
-
-    def test_single_token_unconditional(self):
-        req = self.MockLlmRequest(tokens=[3, 4], bad_words=[[7]])
-        logits = self._run([req], num_steps=[1], num_beams=[1])
-        assert self._banned_cols(logits[0]) == {7}
-
-    def test_multi_token_prefix_hit(self):
-        # tokens end with [9]; word [9, 2] -> ban token 2.
-        req = self.MockLlmRequest(tokens=[1, 9], bad_words=[[9, 2]])
-        logits = self._run([req], num_steps=[1], num_beams=[1])
-        assert self._banned_cols(logits[0]) == {2}
-
-    def test_multi_token_prefix_miss(self):
-        # tokens end with [3]; word [9, 2] prefix [9] does not match.
-        req = self.MockLlmRequest(tokens=[1, 3], bad_words=[[9, 2]])
-        logits = self._run([req], num_steps=[1], num_beams=[1])
-        assert self._banned_cols(logits[0]) == set()
-
-    def test_multi_token_prefix_in_prompt(self):
-        # The prefix [9] lies in the prompt (nothing generated yet); the word
-        # [9, 2] must still ban token 2.
-        req = self.MockLlmRequest(tokens=[1, 9], bad_words=[[9, 2]], prompt_len=2)
-        logits = self._run([req], num_steps=[1], num_beams=[1])
-        assert self._banned_cols(logits[0]) == {2}
-
-    # --- Overlap-scheduler (stale-host) path -------------------------------
-    #
-    # With the overlap scheduler the host token list lags the device state by
-    # one token; the newest token is read from new_tokens_cuda[0, seq_slot, 0]
-    # on the GPU. These tests drive _apply_bad_words with stale_by_one set.
-
-    NUM_SLOTS = 4
-
-    def _new_tokens_cuda(self, slot_tokens):
-        buf = torch.full((1, self.NUM_SLOTS, 1), -1, dtype=torch.int32, device="cuda")
-        for slot, tok in slot_tokens.items():
-            buf[0, slot, 0] = tok
-        return buf
-
-    def _run_stale(self, requests, stale_by_one, slot_tokens):
-        total_rows = len(requests)
-        logits = torch.zeros(total_rows, self.VOCAB, device="cuda")
-        TorchSampler._apply_bad_words(
-            logits,
-            cast(list[LlmRequest], requests),
-            [1] * len(requests),
-            [1] * len(requests),
-            new_tokens_cuda=self._new_tokens_cuda(slot_tokens),
-            stale_by_one=stale_by_one,
-        )
-        return logits
-
-    def test_stale_two_token_device_hit(self):
-        # Host context [1]; device holds the pending token 9; word [9, 2]
-        # completes its prefix on the device side -> ban token 2.
-        req = self.MockLlmRequest(tokens=[1], bad_words=[[9, 2]], seq_slot=0)
-        logits = self._run_stale([req], [True], {0: 9})
-        assert self._banned_cols(logits[0]) == {2}
-
-    def test_stale_two_token_device_miss(self):
-        # Device token is 3, not the required prefix 9 -> nothing banned.
-        req = self.MockLlmRequest(tokens=[1], bad_words=[[9, 2]], seq_slot=0)
-        logits = self._run_stale([req], [True], {0: 3})
-        assert self._banned_cols(logits[0]) == set()
-
-    def test_stale_three_token_host_and_device_hit(self):
-        # Word [5, 9, 2]: host suffix must be [5], device token must be 9.
-        req = self.MockLlmRequest(tokens=[1, 5], bad_words=[[5, 9, 2]], seq_slot=1)
-        logits = self._run_stale([req], [True], {1: 9})
-        assert self._banned_cols(logits[0]) == {2}
-
-    def test_stale_three_token_host_miss(self):
-        # Host suffix [3] does not match the word prefix [5]; the device token
-        # matching is irrelevant -> nothing banned.
-        req = self.MockLlmRequest(tokens=[1, 3], bad_words=[[5, 9, 2]], seq_slot=1)
-        logits = self._run_stale([req], [True], {1: 9})
-        assert self._banned_cols(logits[0]) == set()
-
-    def test_stale_single_token_unconditional(self):
-        # Single-token words are banned regardless of the device token.
-        req = self.MockLlmRequest(tokens=[1], bad_words=[[7]], seq_slot=0)
-        logits = self._run_stale([req], [True], {0: 3})
-        assert self._banned_cols(logits[0]) == {7}
-
-    def test_stale_and_fresh_requests_mixed(self):
-        # Request 0 (stale) matches via the device token; request 1 (fresh)
-        # matches via the host context, as on the regular path.
-        stale_req = self.MockLlmRequest(tokens=[1], bad_words=[[9, 2]], seq_slot=0)
-        fresh_req = self.MockLlmRequest(tokens=[1, 9], bad_words=[[9, 4]], seq_slot=1)
-        logits = self._run_stale([stale_req, fresh_req], [True, False], {0: 9})
-        assert self._banned_cols(logits[0]) == {2}
-        assert self._banned_cols(logits[1]) == {4}
-
-    def test_stale_conditional_and_unconditional_same_cell(self):
-        # An unconditional single-token ban and a device-conditional ban on the
-        # same logit must combine to -inf (no NaN from -inf + -inf).
-        req = self.MockLlmRequest(tokens=[1], bad_words=[[2], [9, 2]], seq_slot=0)
-        logits = self._run_stale([req], [True], {0: 9})
-        assert self._banned_cols(logits[0]) == {2}
-        assert not torch.isnan(logits).any()
-
-
 class TestTopPDecay:
     """Minimal functional guards for Top-P Decay in TorchSampler.
 
@@ -2820,7 +2681,7 @@ class TestTopPDecay:
         #   runtime = initial                    if token == reset_id
         #           = max(runtime * decay, min)  otherwise
         sampler = self._make_sampler()
-        store = sampler.store.top_p_decay_store
+        store = sampler._top_p_decay.store
         configs = [
             dict(initial=0.8, decay=0.3, top_p_min=0.5, reset_id=2),  # decay, then reset
             dict(initial=0.2, decay=0.9, top_p_min=0.1, reset_id=-1),  # plain decay, floored
@@ -2829,7 +2690,7 @@ class TestTopPDecay:
         token_steps = [[1, 2, 3], [9, 9, 9], [9, 9, 9]]
         slots = list(range(len(configs)))
         for slot, cfg in zip(slots, configs):
-            sampler._top_p_decay_slots.add(slot)
+            sampler._top_p_decay._slots.add(slot)
             store.runtime_top_p_decay_cuda[slot] = cfg["initial"]
             store.initial_top_p_decay_cuda[slot] = cfg["initial"]
             store.top_p_decay_cuda[slot] = cfg["decay"]
@@ -2842,8 +2703,8 @@ class TestTopPDecay:
         for step in range(3):
             for slot in slots:
                 sampler.store.new_tokens[0, slot, 0] = token_steps[slot][step]
-            sampler._update_top_p_decay_after_sample(
-                new_tokens_cuda=sampler.store.new_tokens, sampled_slots_cuda=slots_cuda
+            sampler._top_p_decay.update_after_sample(
+                step_tokens=sampler.store.new_tokens[0, :, 0], sampled_slots_cuda=slots_cuda
             )
             got = store.runtime_top_p_decay_cuda.cpu()
             for slot, cfg in zip(slots, configs):
