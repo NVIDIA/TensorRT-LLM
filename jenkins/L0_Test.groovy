@@ -931,11 +931,10 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         placementContext.lastSlurmClusterName = partition.clusterName
     }
 
-    // Fat sqsh has requirements-dev.txt and the TRT-LLM wheel pre-baked, so
-    // there is no need to reinstall them in Setup Environment.
-    if (cluster.fatBuilderArgs != null) {
-        skipInstallWheel = true
-    }
+    // Fat sqsh is detected at runtime inside runLLMTestlistOnPlatformImpl via
+    // /tmp/TensorRT-LLM existence (isFatSqsh). No need to set skipInstallWheel
+    // here: isFatSqsh handles both the fat sqsh case and the fallback (base image)
+    // case correctly without relying on cluster config.
 
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
@@ -3509,9 +3508,13 @@ def launchTestListCheck(pipeline)
 
 def generateTimeoutTestResultXml(pipeline, stageName) {
     def scriptPath = sh(
-        script: "find -L . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
+        script: "find -L . -name generate_timeout_xml.py | head -n 1 | xargs --no-run-if-empty realpath",
         returnStdout: true
     ).trim()
+    if (!scriptPath) {
+        echo "generate_timeout_xml.py not found (source tree may have been cleaned up); skipping timeout XML generation."
+        return false
+    }
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
     sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}'"""
@@ -4326,9 +4329,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "python3 --version"
 
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
-        // fat sqsh pre-extracts TRT-LLM at /tmp/TensorRT-LLM; symlink instead of re-downloading.
+        // Inside a fat sqsh (SLURM agent) TRT-LLM is pre-extracted at /tmp/TensorRT-LLM;
+        // symlink it to skip the ~2-min download.  In all other contexts (K8s pods,
+        // non-fat-sqsh SLURM) the directory does not exist, so fall back to wget + tar.
         def tarName = BUILD_CONFIGS[config][TARNAME]
-        if (skipInstallWheel) {
+        def isFatSqsh = sh(script: "test -d /tmp/TensorRT-LLM && echo yes || echo no", returnStdout: true).trim() == "yes"
+        if (isFatSqsh) {
             sh "ln -sfn /tmp/TensorRT-LLM ${llmPath}/TensorRT-LLM"
         } else {
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
@@ -4339,10 +4345,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // install python package
-        // skipInstallWheel=true means the fat sqsh has requirements-dev.txt,
-        // the TRT-LLM wheel, and opencv-python-headless pre-baked; skip all three.
+        // isFatSqsh: deps and wheel are pre-baked in the fat sqsh — skip all installs.
+        // skipInstallWheel: wheel already installed externally (e.g. K8s sanity check
+        //   pre-installs a platform-specific wheel) — install deps but skip the wheel.
         timeout(time: 45, unit: 'MINUTES') {
-            if (!skipInstallWheel) {
+            if (!isFatSqsh) {
                 if (env.alternativeTRT) {
                     sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
                 }
@@ -4352,7 +4359,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
             }
-            if (!skipInstallWheel) {
+            if (!isFatSqsh && !skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
             }
         }
@@ -6035,7 +6042,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, false, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt, retryContext)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt, retryContext)
                         }
                     })
                 }

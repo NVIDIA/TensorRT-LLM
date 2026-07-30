@@ -32,6 +32,7 @@ fatSqshPath="${FAT_SQSH_DIR}/fat-${fatHash}.sqsh"
 
 if [ -f "$fatSqshPath" ]; then
     echo "Fat sqsh already cached: $fatSqshPath"
+    touch "$fatSqshPath" 2>/dev/null || true
     echo "=== [Prepare Container] STAGE END (cache hit): $(date '+%Y-%m-%d %H:%M:%S') fat_sqsh=$fatSqshPath ==="
     exit 0
 fi
