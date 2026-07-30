@@ -251,8 +251,8 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
         return ""
     }
 
-    if (TRIGGER_TYPE != "post-merge") {
-        echo "Trigger type is not post-merge, skip preparing wheel from build stage"
+    if (!(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+        echo "Trigger type does not use the build stage wheel"
         return ""
     }
 
@@ -283,16 +283,21 @@ def buildImage(config, imageKeyToTag, versionOverride)
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
     def dockerfileStage = config.dockerfileStage
 
-    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
+    def imageType = TRIGGER_TYPE == "nightly-release" ?
+        "${target}-nightly" : target
+    def dependentImageType = TRIGGER_TYPE == "nightly-release" ?
+        "${dependent.target}-nightly" : dependent.target
+    def tag = "${arch}-${imageType}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
-    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-${dependent.target}-")
+    def dependentTag = tag.replace(
+        "${arch}-${imageType}-", "${arch}-${dependentImageType}-")
 
     def imageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${tag}"
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
-    if (target == "ngc-release" && TRIGGER_TYPE == "post-merge") {
-        echo "Use NGC artifacts for post merge build"
+    if (target == "ngc-release" && (TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+        echo "Use the NGC staging registry for ${TRIGGER_TYPE} build"
         dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
         imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
         customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"

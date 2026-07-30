@@ -2438,12 +2438,15 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def RUN_MODE = "run_mode"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
+    (RUN_MODE): null,
 ]
 
 class GlobalState {
@@ -5955,6 +5958,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         }
     }
 
+    if (globalVars[RUN_MODE] == "nightly_release") {
+        parallelJobsFiltered = sanityCheckJobs
+    }
+
     echo "Check the passed GitLab bot testFilter parameters."
     def keysStr = parallelJobsFiltered.keySet().join(",\n")
     pipeline.echo "Now we will run stages: [\n${keysStr}\n]"
@@ -6121,6 +6128,7 @@ pipeline {
             when {
                 expression {
                     // Only run the test list validation when necessary
+                    globalVars[RUN_MODE] != "nightly_release" &&
                     env.targetArch == X86_64_TRIPLE &&
                     testFilter[ONLY_ONE_GROUP_CHANGED] != "Docs" &&
                     !(env.JOB_NAME ==~ /.*Multi-GPU.*/) &&
