@@ -55,17 +55,6 @@ else
     echo "[WARN] $SRC/requirements.txt not found; assuming deps already present"
 fi
 
-# The devel/release container already ships the full CUDA stack (e.g. 13.2).
-# Installing requirements.txt pulls older pip cu13 runtime wheels (e.g.
-# nvidia-nvjitlink/nvidia-cuda-nvrtc 13.0) into site-packages that SHADOW and
-# downgrade the container's libs -- which breaks e.g. DS R1's MLA JIT kernel
-# (needs nvJitLink >= 13.1). Remove them so the container's matched stack wins.
-# (Pair this with sourcing cuda_env.sh to put the container CUDA libs on the path.)
-echo "[INFO] Removing pip CUDA runtime libs that shadow the container's stack"
-pip uninstall -y \
-    nvidia-nvjitlink nvidia-cuda-nvrtc nvidia-cuda-runtime nvidia-cuda-cupti \
-    2>/dev/null || true
-
 # 3. Verify from a neutral cwd so the extracted source tree doesn't shadow the
 #    installed package (a source `tensorrt_llm/` has no compiled bindings).
 ( cd /tmp && "$PYTHON" -c "import tensorrt, tensorrt_llm; print('[INFO] runtime + trtllm ok:', tensorrt_llm.__file__)" )
