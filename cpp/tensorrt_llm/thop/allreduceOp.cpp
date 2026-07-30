@@ -1633,7 +1633,11 @@ std::optional<size_t> getAllReduceBucketIndex(int64_t bucket)
 
 std::optional<size_t> getAllReduceBucketIndexForTokens(int64_t numTokens)
 {
-    if (numTokens < kAllReduceTuningBuckets.front() || numTokens > kAllReduceTuningBuckets.back())
+    // Match Python's last_positive_power_of_2: the largest bucket also
+    // represents token counts through the value immediately before its next
+    // power of two.
+    if (numTokens < kAllReduceTuningBuckets.front()
+        || numTokens >= 2 * kAllReduceTuningBuckets.back())
     {
         return std::nullopt;
     }
