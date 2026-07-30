@@ -620,77 +620,14 @@ def test_large_head_generation_support_is_owned_by_trtllm_gen(
     assert supported, reason
 
 
-def test_fp8_kv_generation_uses_fp8_query() -> None:
+def test_fp8_kv_uses_fp8_context_fmha() -> None:
     attn = SimpleNamespace(
         quant_mode=int(QuantMode.from_description(use_fp8_kv_cache=True)),
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha._attn_ref = lambda: attn
 
-    assert fmha.get_fp8_context_fmha(
-        torch.empty(1, dtype=torch.bfloat16),
-        torch.empty(1, dtype=torch.bfloat16),
-        SimpleNamespace(),
-        AttentionForwardArgs(),
-        is_gen_only=True,
-    )
-
-
-def test_generation_only_uses_generation_provider_fp8_mode(monkeypatch) -> None:
-    attn = SimpleNamespace(
-        is_mla_enable=False,
-        num_heads=1,
-        num_kv_heads=1,
-        head_dim=4,
-        v_head_dim=None,
-        kv_lora_rank=None,
-        predicted_tokens_per_seq=1,
-    )
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
-    fmha._attn_ref = lambda: attn
-    fmha.kv_factor = 2
-    fmha.context_out_head_size = 4
-    fmha.generation_out_head_size = 4
-
-    monkeypatch.setattr(FlashInferTrtllmGenFmha, "prepare_workspace", lambda *args: None)
-    monkeypatch.setattr(
-        FlashInferTrtllmGenFmha,
-        "get_fp8_context_fmha",
-        lambda *args: True,
-    )
-    fp8_mode = None
-
-    def _run_generation(self, params):
-        nonlocal fp8_mode
-        fp8_mode = params.fp8_context_fmha
-
-    monkeypatch.setattr(FlashInferTrtllmGenFmha, "run_generation", _run_generation)
-
-    metadata = SimpleNamespace(
-        kv_cache_block_offsets=object(),
-        effective_workspace=torch.empty(0, dtype=torch.int8),
-        num_contexts=0,
-        num_ctx_tokens=0,
-        num_generations=1,
-        kv_lens_cuda_runtime=torch.tensor([5], dtype=torch.int32),
-        kv_lens_runtime=torch.tensor([5], dtype=torch.int32),
-        beam_width=1,
-        cache_indirection=None,
-        tokens_per_block=32,
-        kv_cache_manager=None,
-        is_cross=False,
-        is_spec_decoding_enabled=False,
-    )
-    q = torch.empty((1, 4), dtype=torch.bfloat16)
-    forward_args = AttentionForwardArgs(
-        output=torch.empty_like(q),
-        attention_mask=PredefinedAttentionMask.CAUSAL,
-        attention_input_type=AttentionInputType.generation_only,
-        attention_window_size=8,
-    )
-
-    fmha.forward(q, None, None, metadata, forward_args)
-    assert fp8_mode is True
+    assert fmha._use_fp8_context_fmha(torch.empty(1, dtype=torch.bfloat16))
 
 
 def test_preprocessed_generation_launches_trtllm_gen_directly(monkeypatch) -> None:

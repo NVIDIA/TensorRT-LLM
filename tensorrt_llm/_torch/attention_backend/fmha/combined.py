@@ -54,23 +54,6 @@ class CombinedFmha(PhasedFmha):
             raise RuntimeError("CombinedFmha generation implementation is not configured.")
         return self._generation_impl
 
-    def get_fp8_context_fmha(
-        self,
-        q: torch.Tensor,
-        output: torch.Tensor,
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        is_gen_only: bool,
-    ) -> bool:
-        impl = self._get_generation_impl() if is_gen_only else self._get_context_impl()
-        return impl.get_fp8_context_fmha(
-            q,
-            output,
-            metadata,
-            forward_args,
-            is_gen_only,
-        )
-
     def prepare_workspace(
         self,
         q: torch.Tensor,
