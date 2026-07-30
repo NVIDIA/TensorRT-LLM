@@ -113,8 +113,7 @@ def is_elf(path: Path) -> bool:
 # ---------------------------------------------------------------------------
 # BOLT one ELF (in place)
 # ---------------------------------------------------------------------------
-def bolt_elf(elf: Path, profile: Path, flags: list[str], strip: bool,
-             dry_run: bool) -> bool:
+def bolt_elf(elf: Path, profile: Path, flags: list[str], strip: bool, dry_run: bool) -> bool:
     """BOLT `elf` in place using `profile`. Returns True if optimized."""
     rel = elf.name
     if dry_run:
@@ -152,8 +151,9 @@ def _record_hash(path: Path) -> str:
     return f"sha256={b64}"
 
 
-def process_wheel(wheel: Path, profiles_dir: Path, flags: list[str],
-                  strip: bool, dry_run: bool) -> int:
+def process_wheel(
+    wheel: Path, profiles_dir: Path, flags: list[str], strip: bool, dry_run: bool
+) -> int:
     """Bolt matching libs inside a wheel and regenerate its RECORD.
 
     Returns the number of bolted members.
@@ -204,8 +204,7 @@ def process_wheel(wheel: Path, profiles_dir: Path, flags: list[str],
         return bolted
 
 
-def _rewrite_record(record_path: Path, wheel_root: Path,
-                    changed: list[Path]) -> None:
+def _rewrite_record(record_path: Path, wheel_root: Path, changed: list[Path]) -> None:
     changed_rel = {p.relative_to(wheel_root).as_posix() for p in changed}
     rows_out: list[list[str]] = []
     with record_path.open(newline="") as f:
@@ -280,24 +279,40 @@ def resolve_profiles(profiles: Path, workdir: Path) -> Path:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tarball", required=True, type=Path,
-                    help="phase-1 BOLT-compatible release tarball (TensorRT-LLM*.tar.gz)")
-    ap.add_argument("--profiles", required=True, type=Path,
-                    help="profile dir (with <lib>.yaml) or a .tar.zst/.tar.gz bundle")
-    ap.add_argument("--output", required=True, type=Path,
-                    help="path for the new bolted tarball")
-    ap.add_argument("--manifest", type=Path, default=None,
-                    help="optional manifest.json to verify ELF hashes against")
-    ap.add_argument("--strict", action="store_true",
-                    help="fail (not warn) on manifest mismatch")
-    ap.add_argument("--strip", action="store_true",
-                    help="llvm-strip each bolted ELF after optimization")
-    ap.add_argument("--workdir", type=Path, default=None,
-                    help="scratch dir (default: a temp dir, cleaned up)")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="list which ELFs would be bolted; no llvm-bolt, no repack")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--tarball",
+        required=True,
+        type=Path,
+        help="phase-1 BOLT-compatible release tarball (TensorRT-LLM*.tar.gz)",
+    )
+    ap.add_argument(
+        "--profiles",
+        required=True,
+        type=Path,
+        help="profile dir (with <lib>.yaml) or a .tar.zst/.tar.gz bundle",
+    )
+    ap.add_argument("--output", required=True, type=Path, help="path for the new bolted tarball")
+    ap.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="optional manifest.json to verify ELF hashes against",
+    )
+    ap.add_argument("--strict", action="store_true", help="fail (not warn) on manifest mismatch")
+    ap.add_argument(
+        "--strip", action="store_true", help="llvm-strip each bolted ELF after optimization"
+    )
+    ap.add_argument(
+        "--workdir", type=Path, default=None, help="scratch dir (default: a temp dir, cleaned up)"
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list which ELFs would be bolted; no llvm-bolt, no repack",
+    )
     args = ap.parse_args()
 
     if not args.dry_run and shutil.which("llvm-bolt") is None:
@@ -312,9 +327,11 @@ def main() -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     try:
         profiles_dir = resolve_profiles(args.profiles, workdir)
-        log(f"Profiles: {profiles_dir} "
+        log(
+            f"Profiles: {profiles_dir} "
             f"({len(list(profiles_dir.glob('*.yaml')))} yaml, "
-            f"{len(list(profiles_dir.glob('*.fdata')))} fdata)")
+            f"{len(list(profiles_dir.glob('*.fdata')))} fdata)"
+        )
 
         # Extract the tarball.
         extract = workdir / "extract"
@@ -344,8 +361,9 @@ def main() -> int:
 
         # 2) Wheel(s).
         for wheel in sorted(tree.rglob("tensorrt_llm-*.whl")):
-            total += process_wheel(wheel, profiles_dir, DEFAULT_BOLT_FLAGS,
-                                   args.strip, args.dry_run)
+            total += process_wheel(
+                wheel, profiles_dir, DEFAULT_BOLT_FLAGS, args.strip, args.dry_run
+            )
 
         if total == 0:
             err("no ELFs matched a profile -- nothing bolted. Check --profiles names.")
