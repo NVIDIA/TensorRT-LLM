@@ -68,6 +68,7 @@ K = 128
 W = 4
 M = 2  # draft tokens per round
 LB = -5.0
+FUSED_PREFILL_ENV = "TLLM_KDA_ENABLE_FUSED_PREFILL_PROJ"
 
 
 def _make_runtime(seed):
@@ -89,14 +90,20 @@ def _make_runtime(seed):
     with torch.no_grad():
         for name, p in rt.named_parameters():
             if name.endswith("A_log"):
-                p.copy_(torch.randn(p.shape, generator=gen, device="cuda",
-                                    dtype=torch.float32) * 0.5)
+                p.copy_(
+                    torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.5
+                )
             elif name.endswith("dt_bias"):
-                p.copy_(torch.randn(p.shape, generator=gen, device="cuda",
-                                    dtype=torch.float32) * 0.1)
+                p.copy_(
+                    torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.1
+                )
             else:
-                p.copy_((torch.randn(p.shape, generator=gen, device="cuda",
-                                     dtype=torch.float32) * 0.03).to(p.dtype))
+                p.copy_(
+                    (
+                        torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32)
+                        * 0.03
+                    ).to(p.dtype)
+                )
     rt.finalize_decode_weights()
     assert rt._in_proj_weight is not None
     return rt
@@ -105,10 +112,10 @@ def _make_runtime(seed):
 def _make_pools(B, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     d = H * K
-    conv_pool = (torch.randn(B, 3 * d, W, generator=gen, device="cuda",
-                             dtype=torch.float32) * 0.5).to(torch.bfloat16)
-    ssm_pool = torch.randn(B, H, K, K, generator=gen, device="cuda",
-                           dtype=torch.float32)
+    conv_pool = (
+        torch.randn(B, 3 * d, W, generator=gen, device="cuda", dtype=torch.float32) * 0.5
+    ).to(torch.bfloat16)
+    ssm_pool = torch.randn(B, H, K, K, generator=gen, device="cuda", dtype=torch.float32)
     ssm_pool *= torch.linspace(0.5, 1.5, K, device="cuda").view(1, 1, K, 1)
     return conv_pool, ssm_pool
 
@@ -121,23 +128,18 @@ def _make_fused_layer_cache(B, conv_pool):
     S = W - 1 + M
 
     def _conv_cache(section):
-        cache = torch.zeros(B, S, d, device="cuda",
-                            dtype=torch.float32).transpose(-1, -2)
-        cache[:, :, :W - 1] = conv_pool[:, section * d:(section + 1) * d,
-                                        1:].float()
+        cache = torch.zeros(B, S, d, device="cuda", dtype=torch.float32).transpose(-1, -2)
+        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d, 1:].float()
         return cache
 
     return SimpleNamespace(
         kda_conv_q=_conv_cache(0),
         kda_conv_k=_conv_cache(1),
         kda_conv_v=_conv_cache(2),
-        kda_qkg_cache=torch.zeros(B, M, 3, d, device="cuda",
-                                  dtype=torch.float32),
+        kda_qkg_cache=torch.zeros(B, M, 3, d, device="cuda", dtype=torch.float32),
         kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
-        kda_beta_cache=torch.zeros(B, M, H, device="cuda",
-                                   dtype=torch.float32),
-        prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32,
-                                             device="cuda"),
+        kda_beta_cache=torch.zeros(B, M, H, device="cuda", dtype=torch.float32),
+        prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
         intermediate_conv_window=None,
         intermediate_ssm=None,
     )
@@ -147,11 +149,10 @@ def _make_seq_layer_cache(B):
     d = H * K
     return SimpleNamespace(
         kda_qkg_cache=None,
-        intermediate_conv_window=torch.zeros(B, M + 1, 3 * d, W,
-                                             device="cuda",
-                                             dtype=torch.bfloat16),
-        intermediate_ssm=torch.zeros(B, M + 1, H, K, K, device="cuda",
-                                     dtype=torch.float32),
+        intermediate_conv_window=torch.zeros(
+            B, M + 1, 3 * d, W, device="cuda", dtype=torch.bfloat16
+        ),
+        intermediate_ssm=torch.zeros(B, M + 1, H, K, K, device="cuda", dtype=torch.float32),
     )
 
 
@@ -165,11 +166,47 @@ def _promote_sequential(layer_cache, conv_pool, ssm_pool, accept):
 
 def _rep(name, a, b):
     a, b = a.float(), b.float()
-    cos = torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(),
-                                                dim=0).item()
+    cos = torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
     rel = ((a - b).norm() / (b.norm() + 1e-12)).item()
     print(f"  {name}: cos={cos:.6f} rel_l2={rel:.3e}")
     return cos > 0.999 and rel < 3e-2
+
+
+def test_fused_prefill_projection_matches_separate_gemms(monkeypatch):
+    B = 2
+    lengths = (5, 3)
+    T = sum(lengths)
+
+    monkeypatch.delenv(FUSED_PREFILL_ENV, raising=False)
+    sequential = _make_runtime(seed=11)
+    assert not sequential._use_fused_prefill_proj
+    monkeypatch.setenv(FUSED_PREFILL_ENV, "1")
+    fused = _make_runtime(seed=11)
+    assert fused._use_fused_prefill_proj
+
+    gen = torch.Generator(device="cuda").manual_seed(12)
+    x = (torch.randn(T, HIDDEN, generator=gen, device="cuda", dtype=torch.float32) * 0.5).to(
+        torch.bfloat16
+    )
+    cu_seqlens = torch.tensor([0, lengths[0], T], dtype=torch.int64, device="cuda")
+    slot_indices = torch.arange(B, dtype=torch.long, device="cuda")
+    metadata = SimpleNamespace(use_initial_states=False)
+    layer_cache = SimpleNamespace(kda_qkg_cache=None)
+
+    conv_seq, ssm_seq = _make_pools(B, seed=13)
+    conv_fused = conv_seq.clone()
+    ssm_fused = ssm_seq.clone()
+    with torch.no_grad():
+        out_seq = sequential._forward_prefill(
+            x, cu_seqlens, metadata, B, conv_seq, ssm_seq, slot_indices, layer_cache
+        )
+        out_fused = fused._forward_prefill(
+            x, cu_seqlens, metadata, B, conv_fused, ssm_fused, slot_indices, layer_cache
+        )
+
+    assert _rep("prefill out", out_fused, out_seq)
+    assert _rep("prefill conv", conv_fused, conv_seq)
+    assert _rep("prefill ssm", ssm_fused, ssm_seq)
 
 
 def test_fused_vs_sequential_two_rounds():
@@ -188,18 +225,20 @@ def test_fused_vs_sequential_two_rounds():
     gen = torch.Generator(device="cuda").manual_seed(3)
 
     def tokens(scale=0.5):
-        return (torch.randn(B * T, HIDDEN, generator=gen, device="cuda",
-                            dtype=torch.float32) * scale).to(torch.bfloat16)
+        return (
+            torch.randn(B * T, HIDDEN, generator=gen, device="cuda", dtype=torch.float32) * scale
+        ).to(torch.bfloat16)
 
     ok = True
     with torch.no_grad():
         # ---- Round 1 (no pending drafts) ----
         x1 = tokens()
-        out1_seq = rt._forward_verify_sequential(x1, T, cache_seq,
-                                                 conv_pool_seq, ssm_pool_seq,
-                                                 slot_indices)
-        out1_fused = rt._forward_verify(x1, T, cache_fused, conv_pool_fused,
-                                        ssm_pool_fused, slot_indices)
+        out1_seq = rt._forward_verify_sequential(
+            x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
+        )
+        out1_fused = rt._forward_verify(
+            x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+        )
         print("round 1:")
         ok &= _rep("out", out1_fused, out1_seq)
 
@@ -210,19 +249,21 @@ def test_fused_vs_sequential_two_rounds():
 
         # ---- Round 2 (fused path replays the accepted drafts) ----
         x2 = tokens()
-        out2_seq = rt._forward_verify_sequential(x2, T, cache_seq,
-                                                 conv_pool_seq, ssm_pool_seq,
-                                                 slot_indices)
-        out2_fused = rt._forward_verify(x2, T, cache_fused, conv_pool_fused,
-                                        ssm_pool_fused, slot_indices)
+        out2_seq = rt._forward_verify_sequential(
+            x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
+        )
+        out2_fused = rt._forward_verify(
+            x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+        )
         print("round 2 (mixed replay):")
         ok &= _rep("out", out2_fused, out2_seq)
 
         # Committed pool state cross-check: fused pool holds the state after
         # round-2's golden token; reproduce it in the sequential world by
         # promoting with accept=0 (golden only).
-        _promote_sequential(cache_seq, conv_pool_seq, ssm_pool_seq,
-                            torch.zeros(B, dtype=torch.long, device="cuda"))
+        _promote_sequential(
+            cache_seq, conv_pool_seq, ssm_pool_seq, torch.zeros(B, dtype=torch.long, device="cuda")
+        )
         ok &= _rep("committed ssm", ssm_pool_fused, ssm_pool_seq)
 
     assert ok
@@ -230,4 +271,5 @@ def test_fused_vs_sequential_two_rounds():
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main([__file__, "-v", "-x", "-s"]))

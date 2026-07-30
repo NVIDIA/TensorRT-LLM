@@ -974,6 +974,10 @@ class KimiKDARuntime(nn.Module):
         lin = cfg.linear_attn_config
         self.layer_idx = layer_idx
         self._use_indexed_ssm_pool = _KDA_INDEXED_STATE_POOL_ENABLED
+        # Opt-in while prefill token-shape performance is evaluated. When
+        # fused weights are unavailable, _forward_prefill still falls back
+        # to the original per-projection calls.
+        self._use_fused_prefill_proj = os.getenv("TLLM_KDA_ENABLE_FUSED_PREFILL_PROJ", "0") == "1"
         # Attention-family TP semantics (Qwen3-Next GatedDeltaNet pattern,
         # gdn_mixer.py): replicated under attention-DP — each rank runs
         # its own batch with the full head set — and head-sharded across
@@ -1032,8 +1036,9 @@ class KimiKDARuntime(nn.Module):
         1. Fused in-projection ``[q | k | v | g | f_a | b]``: all six
            projections consume the same hidden state, so one GEMV replaces
            five GEMV+splitK-reduce pairs plus a cublas dot per layer per
-           decode step. The fused verify path reuses the same projection;
-           source parameters remain row views for prefill and fallback paths.
+           decode step. The fused verify path and the opt-in prefill path
+           reuse the same projection; source parameters remain row views for
+           fallback paths.
         2. Kernel-layout constants that ``_decode_via_optimized`` used to
            rebuild with ~6 device kernels per layer per decode step:
            transposed conv weights (bf16 ``[W, D]``) and fp32 copies of
@@ -1094,7 +1099,7 @@ class KimiKDARuntime(nn.Module):
     def _fused_input_projections(
         self, x: torch.Tensor
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Project the shared KDA inputs through the decode-fused weights."""
+        """Project shared KDA inputs through the finalized fused weights."""
         mixer = self.mixer
         d = self.proj_size
         hd = mixer.head_dim
@@ -1102,9 +1107,7 @@ class KimiKDARuntime(nn.Module):
 
         if self._in_proj_weight is not None:
             proj = torch.nn.functional.linear(x, self._in_proj_weight)
-            x_qkv, onorm_g, f_a, beta = proj.split(
-                [3 * d, d, hd, H], dim=-1
-            )
+            x_qkv, onorm_g, f_a, beta = proj.split([3 * d, d, hd, H], dim=-1)
         elif self._in_proj_small_weight is not None:
             qkvg = mixer.qkvg_proj(x)
             x_qkv, onorm_g = qkvg.split([3 * d, d], dim=-1)
@@ -1276,15 +1279,24 @@ class KimiKDARuntime(nn.Module):
         d = self.proj_size
         x = x2d.unsqueeze(0)  # [1, T, hidden]
 
-        fused_qkvg = getattr(mixer, "qkvg_proj", None)
-        if fused_qkvg is not None:
-            q_proj_states, k_proj_states, v_proj_states = fused_qkvg(x)[..., : 3 * d].split(
-                d, dim=-1
-            )
+        projections = self._fused_input_projections(x) if self._use_fused_prefill_proj else None
+        if projections is not None:
+            qkv, onorm_g, g, beta = projections
+            q_proj_states, k_proj_states, v_proj_states = qkv.split(d, dim=-1)
+            beta = beta.float()
         else:
-            q_proj_states = mixer.q_proj(x)
-            k_proj_states = mixer.k_proj(x)
-            v_proj_states = mixer.v_proj(x)
+            fused_qkvg = getattr(mixer, "qkvg_proj", None)
+            if fused_qkvg is not None:
+                q_proj_states, k_proj_states, v_proj_states = fused_qkvg(x)[..., : 3 * d].split(
+                    d, dim=-1
+                )
+            else:
+                q_proj_states = mixer.q_proj(x)
+                k_proj_states = mixer.k_proj(x)
+                v_proj_states = mixer.v_proj(x)
+            onorm_g = None
+            g = mixer.f_b_proj(mixer.f_a_proj(x))
+            beta = mixer.b_proj(x).float()
 
         # Initial states: present for continuation chunks (chunked prefill)
         # and for prefix-cache hits (block reuse), where the previous
@@ -1310,9 +1322,7 @@ class KimiKDARuntime(nn.Module):
         )
         del q_proj_states, k_proj_states, v_proj_states
 
-        g = mixer.f_b_proj(mixer.f_a_proj(x))
         g = rearrange(g, "... (h d) -> ... h d", d=mixer.head_dim)
-        beta = mixer.b_proj(x).float()
 
         q = rearrange(q, "... (h d) -> ... h d", d=mixer.head_k_dim)
         k = rearrange(k, "... (h d) -> ... h d", d=mixer.head_k_dim)
@@ -1347,7 +1357,7 @@ class KimiKDARuntime(nn.Module):
         # are zero for a fresh request, so the tail columns are unused).
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_q, conv_k, conv_v)
 
-        return self._output_gate_and_proj(x, o)
+        return self._output_gate_and_proj(x, o, onorm_g)
 
     def _forward_decode(
         self,
