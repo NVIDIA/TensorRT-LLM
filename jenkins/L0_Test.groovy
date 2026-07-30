@@ -3509,7 +3509,7 @@ def launchTestListCheck(pipeline)
 
 def generateTimeoutTestResultXml(pipeline, stageName) {
     def scriptPath = sh(
-        script: "find . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
+        script: "find -L . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
         returnStdout: true
     ).trim()
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
@@ -4326,13 +4326,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "python3 --version"
 
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
-        // download TRT-LLM tarfile
-        // When running inside a fat sqsh the tarball is already extracted at
-        // /tmp/TensorRT-LLM; symlink it into the workspace instead of re-downloading.
+        // fat sqsh pre-extracts TRT-LLM at /tmp/TensorRT-LLM; symlink instead of re-downloading.
+        def tarName = BUILD_CONFIGS[config][TARNAME]
         if (skipInstallWheel) {
             sh "ln -sfn /tmp/TensorRT-LLM ${llmPath}/TensorRT-LLM"
         } else {
-            def tarName = BUILD_CONFIGS[config][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
             timeout(time: 30, unit: 'MINUTES') {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
@@ -6037,7 +6035,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt, retryContext)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, false, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt, retryContext)
                         }
                     })
                 }
