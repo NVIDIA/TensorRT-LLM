@@ -1068,7 +1068,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     } catch (Exception e) {
                         if (e.message?.contains("is no longer active")) {
                             def slurmLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
-                            echoRemoteLogTail(pipeline, remote, slurmLogPath)
+                            CloudManager.withSlurmFrontendFailover(pipeline, remotes) { logRemote ->
+                                echoRemoteLogTail(pipeline, logRemote, slurmLogPath)
+                            }
                             throw new InfraFailure(
                                 "${e.message}. Check SLURM logs at ${slurmLogPath} on ${cluster.host}",
                                 e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>"
