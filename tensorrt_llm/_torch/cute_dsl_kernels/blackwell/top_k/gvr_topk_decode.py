@@ -3521,14 +3521,13 @@ class GvrTopKKernel:
                 output_indices_row[i4] = smem_vals[i4]
                 i4 = i4 + cutlass.Int32(num_threads)
         elif cand_count > cutlass.Int32(kK):
-            sc0 = cutlass.Int64(0)
-            sc1 = cutlass.Int64(0)
-            sc2 = cutlass.Int64(0)
-            sc3 = cutlass.Int64(0)
-            sc4 = cutlass.Int64(0)
-            sc5 = cutlass.Int64(0)
-            sc6 = cutlass.Int64(0)
             if cutlass.const_expr(_P4_SUB_DBG):
+                sc1 = cutlass.Int64(0)
+                sc2 = cutlass.Int64(0)
+                sc3 = cutlass.Int64(0)
+                sc4 = cutlass.Int64(0)
+                sc5 = cutlass.Int64(0)
+                sc6 = cutlass.Int64(0)
                 sc0 = cute.arch.clock64()
             bmin_r = cutlass.Float32(self.FLT_MAX)
             bmax_r = cutlass.Float32(self.NEG_FLT_MAX)
@@ -3671,12 +3670,14 @@ class GvrTopKKernel:
                 # bin b* value range under the inv1 binning: [f_lo, f_lo + 1/inv1)
                 f_lo = bmin_r + cutlass.Float32(b_star) / inv1
                 finv = (cutlass.Float32(fbins - 1) + cutlass.Float32(0.99)) * inv1
-                # bin b* spans [f_lo, f_hi) under the coarse binning; the
-                # clamped ends fold out-of-range values INTO bin 0 and bin
-                # kBins-1, so those two bins drop the matching side.
-                f_hi = f_lo + cutlass.Float32(1.0) / inv1
-                lo_edge = b_star == cutlass.Int32(0)
-                hi_edge = b_star == cutlass.Int32(kBins - 1)
+                # bin b* spans [f_lo, f_hi); the clamped ends fold
+                # out-of-range values into bin 0 and bin kBins-1, so those
+                # two drop the matching side. Only the range-test arms read
+                # these, so upstream's build must not compute them.
+                if cutlass.const_expr(self.p4_fine_rangetest or self.p4_scat_rangetest):
+                    f_hi = f_lo + cutlass.Float32(1.0) / inv1
+                    lo_edge = b_star == cutlass.Int32(0)
+                    hi_edge = b_star == cutlass.Int32(kBins - 1)
                 # re-zero (only fbins slots) + build fine sub-hist of bin-b* cands
                 iz = tidx
                 while iz < cutlass.Int32(fbins):
@@ -5856,10 +5857,10 @@ class GvrTopKKernel:
         # misses (pro-1M cold: stock-skip 21us vs ext-miss 51us). All
         # threads read the same control words, so the predicate is
         # CTA-uniform and the dynamic branches below stay convergent.
-        ck0 = cutlass.Int64(0)
-        ck1 = cutlass.Int64(0)
-        ckE = cutlass.Int64(0)
         if cutlass.const_expr(_P4_TAIL_DBG):
+            ck0 = cutlass.Int64(0)
+            ck1 = cutlass.Int64(0)
+            ckE = cutlass.Int64(0)
             ckE = cute.arch.clock64()  # row-phase entry (device-residency ref)
         ext_row = cutlass.Int32(0)
         if cutlass.const_expr(self.use_ext_counts):
