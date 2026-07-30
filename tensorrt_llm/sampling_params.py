@@ -25,7 +25,7 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
-MAX_TOP_LOGPROBS = 20
+MAX_TOP_LOGPROBS = 100
 
 
 def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
@@ -210,9 +210,9 @@ class SamplingParams:
             If neither temperature, top_p, nor top_k are specified, sampling is greedy.
             If temperature > 0 and/or top_k > 1 are specified, sampling will proceed accordingly and top_p will default to top_p = 1.
             Setting top_p = 0 should result in greedy sampling, but is currently disallowed in the backend.
-        top_p_min (float, optional): Controls decay in the top-P algorithm. topPMin is lower-bound. None means using C++ runtime default 1.e-6. Defaults to None.
-        top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. Indicates where to reset the decay. None means using C++ runtime default 1. Defaults to None.
-        top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. None means using C++ runtime default 1.f. Defaults to None.
+        top_p_min (float, optional): Controls decay in the top-P algorithm. topPMin is lower-bound. Must be in (0, 1]; invalid values are rejected. None means using C++ runtime default 1.e-6. Defaults to None.
+        top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. The token id which, when sampled, resets the decayed top-P to its initial value. Must be >= 0; invalid values are rejected. None means using C++ runtime default -1 (which never matches a token). Defaults to None.
+        top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. Must be in (0, 1]; invalid values are rejected. None means using C++ runtime default 1.f. Defaults to None.
         seed (int, optional): Controls the random seed used by the random number generator in sampling. None means using C++ runtime default 0. Defaults to None.
         temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values >= 0.f. Defaults to None.
             The value None is treated as "not specified" in the following.
@@ -227,7 +227,7 @@ class SamplingParams:
         prompt_ignore_length (int, optional): Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values <= 0 have no effect. Values > input (prompt) length will be clamped. None means using C++ runtime default 0. Defaults to None.
         length_penalty (float, optional): Controls how to penalize longer sequences in beam search. None means using C++ runtime default 0.f. Defaults to None.
         early_stopping (int, optional): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token).  None means using C++ runtime default 1. Defaults to None.
-        no_repeat_ngram_size (int, optional): Controls how many repeat ngram size are acceptable. None means using C++ runtime default 1 << 30. Defaults to None.
+        no_repeat_ngram_size (int, optional): Forbids repeating any n-gram of this size: a token is excluded from sampling if it would recreate an n-gram that already occurs in the sequence (prompt included). None or 0 disables the restriction. Defaults to None.
         min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
         beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
 
@@ -318,6 +318,12 @@ class SamplingParams:
     return_perf_metrics: bool = False
     additional_model_outputs: Optional[List[str]] = None
 
+    # Decoder tokens moved from generated output into the input prefix. The
+    # result layer restores them to the user-visible output.
+    _decoder_output_token_prefix: Tuple[int, ...] = field(
+        default_factory=tuple, init=False, repr=False
+    )
+
     # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
     # Can be deprecated after migration to PyTorch backend.
     _context_logits_auto_enabled: bool = False
@@ -373,6 +379,20 @@ class SamplingParams:
         if self.temperature is not None and self.temperature < 0:
             raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
 
+        # Top-p decay param ranges mirror the hard checks in the
+        # executor::SamplingConfig constructor (samplingConfig.cpp check*
+        # helpers); rejecting here gives a clear, early error instead of a
+        # RuntimeError from the C++ boundary. Note top_p_min > top_p is
+        # intentionally allowed (the runtime top-p may rise toward top_p_min).
+        if self.top_p_decay is not None and not 0.0 < self.top_p_decay <= 1.0:
+            raise ValueError(f"require 0 < top_p_decay <= 1, got top_p_decay={self.top_p_decay}")
+        if self.top_p_min is not None and not 0.0 < self.top_p_min <= 1.0:
+            raise ValueError(f"require 0 < top_p_min <= 1, got top_p_min={self.top_p_min}")
+        if self.top_p_reset_ids is not None and self.top_p_reset_ids < 0:
+            raise ValueError(
+                f"require top_p_reset_ids >= 0, got top_p_reset_ids={self.top_p_reset_ids}"
+            )
+
         if self.best_of is not None and self.best_of < self.n:
             raise ValueError(f"best_of ({self.best_of}) cannot be less than n ({self.n})")
 
@@ -421,8 +441,37 @@ class SamplingParams:
         if self.logprobs_simple_format and self.use_beam_search:
             raise ValueError("logprobs_simple_format is not supported with beam search")
 
-    # NB: Static, because downstream code only holds instances of
-    #     bindings.SamplingConfig (not SamplingParams).
+    # NB: The predicates below are static because downstream code (e.g.
+    #     sampler_strategy.resolve_sampling_strategy) only holds instances of
+    #     bindings.SamplingConfig (not SamplingParams). They are the single
+    #     source of truth for the greedy / top-p-decay resolution shared by
+    #     _greedy_decoding and the torch sampler.
+
+    @staticmethod
+    def params_imply_top_p_decay_active(top_p_decay: Optional[float]) -> bool:
+        """Whether dynamic top-p decay is active.
+
+        Active iff ``top_p_decay`` is explicitly set and ``< 1.0``; a decay of
+        ``1.0`` (the C++ default) is a no-op. Values outside ``(0, 1]`` are
+        rejected up front (_validate and the executor::SamplingConfig
+        constructor), so they never reach this predicate.
+        """
+        return top_p_decay is not None and top_p_decay < 1.0
+
+    @staticmethod
+    def params_imply_explicit_greedy(
+        *,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int],
+    ) -> bool:
+        """Whether the request carries an explicit greedy control.
+
+        Explicit means top_k == 1, top_p == 0.0, or temperature == 0, as opposed
+        to the implicit "all params unset" greedy default.
+        """
+        return top_k == 1 or top_p == 0.0 or temperature == 0
+
     @staticmethod
     def params_imply_greedy_decoding(
         *,
@@ -430,13 +479,23 @@ class SamplingParams:
         top_p: Optional[float],
         top_k: Optional[int],
         use_beam_search: bool | None,
-    ):
-        return (not use_beam_search) and (
-            (temperature is None and top_p is None and top_k is None)
-            or top_k == 1
-            or top_p == 0.0
-            or temperature == 0
-        )
+        top_p_decay: Optional[float] = None,
+    ) -> bool:
+        """Whether the parameters resolve to greedy decoding.
+
+        An explicit greedy control always wins. The implicit "all params unset"
+        greedy default is overridden by an active top-p decay (which implies
+        top-p sampling so the decayed runtime top-p can take effect); callers
+        that do not support decay may omit ``top_p_decay``.
+        """
+        if use_beam_search:
+            return False
+        if SamplingParams.params_imply_explicit_greedy(
+            temperature=temperature, top_p=top_p, top_k=top_k
+        ):
+            return True
+        implicitly_greedy = temperature is None and top_p is None and top_k is None
+        return implicitly_greedy and not SamplingParams.params_imply_top_p_decay_active(top_p_decay)
 
     @property
     def _greedy_decoding(self) -> bool:
@@ -445,6 +504,7 @@ class SamplingParams:
             top_p=self.top_p,
             top_k=self.top_k,
             use_beam_search=self.use_beam_search,
+            top_p_decay=self.top_p_decay,
         )
 
     @property

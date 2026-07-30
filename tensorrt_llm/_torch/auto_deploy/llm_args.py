@@ -16,17 +16,16 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Type, Union
 
-import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.llmapi.llm_args import (
-    BuildConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
     TorchLlmArgs,
     _ParallelConfig,
 )
+from tensorrt_llm.llmapi.utils import get_device_count
 
 from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
@@ -75,13 +74,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     model_config = _get_config_dict()
 
-    build_config: Optional[BuildConfig] = Field(
-        default_factory=BuildConfig,
-        description="!!! DO NOT USE !!! Internal only; needed for BaseLlmArgs compatibility.",
-        exclude_from_json=True,
-        frozen=True,
-        repr=False,
-    )
     backend: Literal["_autodeploy"] = Field(
         default="_autodeploy",
         description="The backend to use for this LLM instance.",
@@ -89,7 +81,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     gpus_per_node: int = Field(
-        default=torch.cuda.device_count(),
+        default=get_device_count(),
         description="The number of GPUs per node.",
         frozen=True,
     )
@@ -100,12 +92,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         if value is not None and value > 1:
             raise ValueError("AutoDeploy does not support beam search (max_beam_width > 1).")
         return value
-
-    @field_validator("build_config", mode="before")
-    @classmethod
-    def ensure_no_build_config(cls, value: Any, info: ValidationInfo) -> Any:
-        msg = "build_config is not in use by AutoDeploy's LlmArgs"
-        return _check_for_default_value_only(cls, value, info, msg)
 
     @field_validator(
         "tensor_parallel_size",

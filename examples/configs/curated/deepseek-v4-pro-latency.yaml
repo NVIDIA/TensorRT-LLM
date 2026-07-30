@@ -1,0 +1,45 @@
+cuda_graph_config:
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 24
+  - 32
+  - 40
+  - 48
+  - 56
+  - 64
+  - 72
+  - 80
+  - 88
+  - 96
+  - 104
+  - 112
+  - 120
+  - 128
+  enable_padding: true
+disable_overlap_scheduler: false
+enable_attention_dp: false
+enable_lm_head_tp_in_adp: false
+kv_cache_config:
+  dtype: fp8
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.9
+  tokens_per_block: 128
+max_batch_size: 128
+max_num_tokens: 8448
+max_seq_len: 9256
+moe_config:
+  backend: TRTLLM
+  use_low_precision_moe_combine: true
+moe_expert_parallel_size: 8
+num_postprocess_workers: 4
+pipeline_parallel_size: 1
+print_iter_log: true
+speculative_config:
+  decoding_type: MTP
+  max_draft_len: 3
+stream_interval: 100
+tensor_parallel_size: 8

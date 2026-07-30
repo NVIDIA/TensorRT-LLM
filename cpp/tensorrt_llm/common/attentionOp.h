@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
@@ -56,10 +57,11 @@ public:
     [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize() const noexcept;
     [[nodiscard]] int getHeadSize(bool checkInit = true) const;
     [[nodiscard]] int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
-    [[nodiscard]] size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
-        int32_t cross_kv_length = 0, int32_t max_num_tokens = 0, int32_t total_kv_len = 0) const noexcept;
+    [[nodiscard]] size_t getWorkspaceSizeForContext(tensorrt_llm::DataType type, int32_t nbReq,
+        int32_t max_input_length, int32_t cross_kv_length = 0, int32_t max_num_tokens = 0,
+        int32_t total_kv_len = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
-    [[nodiscard]] size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq,
+    [[nodiscard]] size_t getWorkspaceSizeForGeneration(tensorrt_llm::DataType type, int32_t total_num_seq,
         int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept;
 
     template <typename T>
@@ -181,14 +183,14 @@ public:
             if (this->context_lengths && batch_size > 0)
             {
                 ss << "context_lengths: "
-                   << *(runtime::ITensor::wrap((void*) this->context_lengths, nvinfer1::DataType::kINT32,
+                   << *(runtime::ITensor::wrap((void*) this->context_lengths, tensorrt_llm::DataType::kINT32,
                           runtime::ITensor::makeShape({batch_size})))
                    << std::endl;
             }
             if (this->sequence_lengths && batch_size > 0)
             {
                 ss << "sequence_lengths: "
-                   << *(runtime::ITensor::wrap((void*) this->sequence_lengths, nvinfer1::DataType::kINT32,
+                   << *(runtime::ITensor::wrap((void*) this->sequence_lengths, tensorrt_llm::DataType::kINT32,
                           runtime::ITensor::makeShape({batch_size})))
                    << std::endl;
             }
@@ -478,7 +480,7 @@ public:
     int mTpSize = 1;
     int mTpRank = 0;
     bool mUnfuseQkvGemm = false;
-    nvinfer1::DataType mType;
+    tensorrt_llm::DataType mType;
     int32_t mMaxContextLength = 0;
     int32_t mMaxSeqLen = 0;
     int32_t mMaxNumRequests = 0;
@@ -501,6 +503,7 @@ public:
     int32_t mSpecDecodingMaxGenerationLength = 1;
     // Static spec-dec tree length used by FMHA autotuning.
     int32_t mSpecDecodingTargetMaxGenLen = 0;
+    bool mForcePrepareSpecDecTreeMask = false;
     bool mIsMLAEnabled = false;
     bool mIsGenerationMLA = false;
     bool mUseGenFlashMLA = false;
@@ -571,11 +574,11 @@ public:
             mCrossAttention, mMaxDistance, mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mFP8AttenOutput,
             mFP8ContextMLA, mFP8GenerationMLA, mChunkPrefillBufferBatchSize, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mIsSpecDecTree, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mSpecDecodingTargetMaxGenLen, mIsMLAEnabled, mIsGenerationMLA,
-            mUseGenFlashMLA, mUseSparseAttention, mUseTllmGenSparseAttentionPaged, mUseTllmGenSparseAttention,
-            mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin,
-            mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA,
-            mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
+            mSpecDecodingMaxGenerationLength, mSpecDecodingTargetMaxGenLen, mForcePrepareSpecDecTreeMask, mIsMLAEnabled,
+            mIsGenerationMLA, mUseGenFlashMLA, mUseSparseAttention, mUseTllmGenSparseAttentionPaged,
+            mUseTllmGenSparseAttention, mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads,
+            mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast,
+            mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
             mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1),
             mSkipSoftmaxThresholdScaleFactorPrefill, mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ,
             mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);

@@ -78,6 +78,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
+    MiniMaxM3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
@@ -411,15 +412,18 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype, model_
             is_fused=False,  # Use PyTorch implementation for testing
         )
 
-    # MiniMaxM2 routing method requires special parameters
-    if routing_method_cls == MiniMaxM2MoeRoutingMethod:
+    # MiniMax routing methods require the correction bias and expert count.
+    if routing_method_cls in (MiniMaxM2MoeRoutingMethod, MiniMaxM3MoeRoutingMethod):
         # Create e_score_correction_bias as a zero tensor (no bias correction in test)
         e_score_correction_bias = torch.zeros(num_experts, dtype=dtype, device="cuda")
-        return routing_method_cls(
+        kwargs = dict(
             top_k=top_k,
             num_experts=num_experts,
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
         )
+        if routing_method_cls == MiniMaxM3MoeRoutingMethod:
+            kwargs["routed_scaling_factor"] = 2.0
+        return routing_method_cls(**kwargs)
 
     # SigmoidRenorm routing method requires num_experts
     if routing_method_cls == SigmoidRenormMoeRoutingMethod:
@@ -1343,24 +1347,33 @@ def generate_multi_gpu_test_params(
     return params
 
 
-def _generate_megamoe_multi_gpu_test_params(
+def _generate_focused_multi_gpu_test_params(
     *,
     backend_type,
     quant_algo,
-    should_skip_fn,
+    parallel_modes,
+    comm_methods,
+    should_skip_fn=None,
 ) -> List:
-    """Generate focused MegaMoE module multi-GPU coverage for one backend.
+    """Generate focused module multi-GPU coverage for one backend.
 
-    Both MegaMoE backends share the same multi-GPU matrix shape; only the
-    backend/quant enum and capability skip hook differ between DeepGemm
-    (W4A8_MXFP4_MXFP8) and CuteDsl (NVFP4). The comm method is hardcoded to
-    the ``IGNORE`` sentinel because the fused kernel owns dispatch/combine
-    (the worker pops ``TRTLLM_FORCE_COMM_METHOD`` and takes the fused path).
+    Shared by the backends that opt out of the full ``COMM_METHODS`` matrix:
+
+    - MegaMoE (DeepGemm / CuteDsl): the fused kernel owns dispatch/combine,
+      so the comm method is the ``IGNORE`` sentinel (the worker pops
+      ``TRTLLM_FORCE_COMM_METHOD`` and takes the fused path) and each backend
+      passes its capability skip hook via ``should_skip_fn``.
+    - Marlin: an EXTERNAL_COMM backend whose ``run_moe`` can route internally,
+      but under attention-DP the scheduler precomputes routing and dispatches
+      plain BF16 activations (W4A16 — no activation scales). Coverage is
+      pinned to ALLGATHER, which is available on every SM90 box; the NVLink
+      a2a strategies in ``COMM_METHODS`` require MNNVL fabric that Hopper CI
+      nodes lack.
     """
     params: List = []
     seq_lens = [8] if IS_CI_MODE else SEQ_LENS
 
-    for parallel_mode, comm_method in product(MEGAMOE_PARALLEL_MODES, [MEGAMOE_IGNORE_COMM_METHOD]):
+    for parallel_mode, comm_method in product(parallel_modes, comm_methods):
         for (
             swiglu_alpha,
             swiglu_beta,
@@ -1382,7 +1395,7 @@ def _generate_megamoe_multi_gpu_test_params(
             [quant_algo],
             MULTI_GPU_ROUTING_METHODS,
         ):
-            if not skip_reason:
+            if not skip_reason and should_skip_fn is not None:
                 skip_reason = should_skip_fn(
                     parallel_mode,
                     comm_method,
@@ -1562,9 +1575,9 @@ def test_configurable_moe_single_gpu(
 # ============================================================================
 # FP32 Routing Bias Tests
 # ============================================================================
-# MiniMax-M2 and DeepSeek models can have fp32 routing_bias with bf16 model dtype.
-# These tests verify that the trtllmGen MoE backend correctly handles fp32 bias
-# across all quantization paths (fp4, fp8, mxfp4, fp8_per_tensor).
+# MiniMax-M2/M3 and DeepSeek models can have fp32 routing_bias with bf16 model
+# dtype. These tests verify that the trtllmGen MoE backend correctly handles
+# fp32 bias across all quantization paths (fp4, fp8, mxfp4, fp8_per_tensor).
 
 
 def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bias_tensor):
@@ -1594,6 +1607,7 @@ def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bia
     "routing_method_cls,moe_model_config",
     [
         (MiniMaxM2MoeRoutingMethod, MoeModelConfig(256, 6, 2048, 1408)),
+        (MiniMaxM3MoeRoutingMethod, MoeModelConfig(128, 4, 512, 512)),
         (DeepSeekV3MoeRoutingMethod, MoeModelConfig(256, 8, 7168, 2048, n_group=8, topk_group=4)),
     ],
 )
@@ -1611,10 +1625,12 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
     """
     Test that trtllmGen MoE backend correctly handles fp32 routing_bias.
 
-    MiniMax-M2 and DeepSeek models emit fp32 routing_bias from trust_remote_code
-    model definitions. This test verifies that the fp32 bias is correctly plumbed
-    through the thop boundary (TORCH_CHECK), Runner::run() (dtypeRoutingBias),
-    and routing kernels (mDtypeBias) without silent corruption (reading fp32 as bf16).
+    MiniMax-M2/M3 and DeepSeek models emit fp32 routing_bias from
+    trust_remote_code model definitions. This test verifies that the fp32 bias
+    is correctly plumbed through the thop boundary (TORCH_CHECK), Runner::run()
+    (dtypeRoutingBias), and routing kernels (mDtypeBias) without silent
+    corruption (reading fp32 as bf16). The MiniMax-M3 case also verifies its
+    routed scaling factor through the unified ConfigurableMoE output reference.
 
     Compares fused trtllmGen output against the PyTorch reference module.
     """
@@ -1645,9 +1661,9 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
     )
 
     dtype_routing_logits = None
-    if (
-        moe_backend == MoeBackendType.TRTLLM.value
-        and routing_method_cls == DeepSeekV3MoeRoutingMethod
+    if moe_backend == MoeBackendType.TRTLLM.value and routing_method_cls in (
+        DeepSeekV3MoeRoutingMethod,
+        MiniMaxM3MoeRoutingMethod,
     ):
         dtype_routing_logits = torch.float32
 
@@ -1676,19 +1692,34 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
     backend_types=[
-        b for b in BACKEND_TYPES if b != MoeBackendType.MARLIN
-    ],  # Marlin doesn't support fused routing
+        # Marlin gets focused ALLGATHER coverage below; the NVLink a2a
+        # strategies in COMM_METHODS require MNNVL fabric unavailable on
+        # the Hopper (SM90) nodes Marlin runs on.
+        b
+        for b in BACKEND_TYPES
+        if b != MoeBackendType.MARLIN
+    ],
     quant_algos=QUANT_ALGOS,
     routing_methods=MULTI_GPU_ROUTING_METHODS,
 )
-MULTI_GPU_TEST_PARAMS += _generate_megamoe_multi_gpu_test_params(
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
+    backend_type=MoeBackendType.MARLIN,
+    quant_algo=QuantAlgo.NVFP4,
+    parallel_modes=["DEP"] if IS_CI_MODE else ["DEP", "TEP"],
+    comm_methods=["ALLGATHER"],
+)
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     backend_type=MoeBackendType.MEGAMOE_DEEPGEMM,
     quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+    parallel_modes=MEGAMOE_PARALLEL_MODES,
+    comm_methods=[MEGAMOE_IGNORE_COMM_METHOD],
     should_skip_fn=should_skip_MegaMoEDeepGemm,
 )
-MULTI_GPU_TEST_PARAMS += _generate_megamoe_multi_gpu_test_params(
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
     quant_algo=QuantAlgo.NVFP4,
+    parallel_modes=MEGAMOE_PARALLEL_MODES,
+    comm_methods=[MEGAMOE_IGNORE_COMM_METHOD],
     should_skip_fn=should_skip_MegaMoECuteDsl,
 )
 

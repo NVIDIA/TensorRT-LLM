@@ -186,7 +186,8 @@ class TestEmitHelpers:
 # ---------------------------------------------------------------------------
 class TestParseCppRecvCsvs:
     def test_basic(self, tmp_path):
-        csv_path = tmp_path / "rank_0_recv.csv"
+        # C++ names files "<instanceId>_<rank>_recv.csv" (instanceId is a UUID).
+        csv_path = tmp_path / "3c9f0e2a-1111-2222-3333-444455556666_0_recv.csv"
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["RequestID", "Bandwidth(Gbps)", "Bandwidth(Gbps)"])
@@ -199,6 +200,7 @@ class TestParseCppRecvCsvs:
         assert abs(bws[0] - 15.0) < 0.01
 
     def test_renamed_pattern(self, tmp_path):
+        # Legacy "rank_*" prefix must still parse (backward compatibility).
         csv_path = tmp_path / "rank_0_recv__c0.csv"
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
@@ -225,7 +227,7 @@ class TestParsePythonCsvs:
                 {
                     "unique_rid": "0",
                     "throughput_mbs": "1048.576",
-                    "task_type": "Send",
+                    "task_type": "KVSendTask",
                     "other": "",
                 }
             )
@@ -234,7 +236,17 @@ class TestParsePythonCsvs:
                 {
                     "unique_rid": "0",
                     "throughput_mbs": "2000.0",
-                    "task_type": "Recv",
+                    "task_type": "KVRecvTask",
+                    "other": "",
+                }
+            )
+            # Aux sends are tiny metadata transfers; they must not drag the
+            # KV bandwidth stats down.
+            w.writerow(
+                {
+                    "unique_rid": "0",
+                    "throughput_mbs": "1.0",
+                    "task_type": "AuxSendTask",
                     "other": "",
                 }
             )
@@ -243,6 +255,47 @@ class TestParsePythonCsvs:
         # 1048.576 MiB/s * 1024^2 / 1e9 ≈ 1.0995 GB/s
         assert len(result[0]) == 1
         assert abs(result[0][0] - 1048.576 * 1024 * 1024 / 1e9) < 0.001
+
+    def test_cpp_naming_without_py_prefix(self, tmp_path):
+        """PerfLogManager prefers the C++ output-path env var for naming.
+
+        With TRTLLM_KVCACHE_TIME_OUTPUT_PATH set, Python task CSVs are named
+        "<instanceUuid>_<rank>.csv" (no py_ prefix); the parser must find them
+        by header columns instead of file name.
+        """
+        csv_path = tmp_path / "cd93dae6-1111-2222-3333-444455556666_3.csv"
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(
+                f,
+                fieldnames=["unique_rid", "throughput_mbs", "task_type"],
+            )
+            w.writeheader()
+            w.writerow({"unique_rid": "0", "throughput_mbs": "1048.576", "task_type": "KVSendTask"})
+        result = _parse_python_csvs(str(tmp_path))
+        assert 0 in result
+        assert abs(result[0][0] - 1048.576 * 1024 * 1024 / 1e9) < 0.001
+
+    def test_ignores_cpp_csvs_in_same_dir(self, tmp_path):
+        """C++ CSVs sharing the directory must not contribute samples.
+
+        C++ send/recv and gen-summary CSVs lack the unique_rid/throughput_mbs
+        columns, so the header check skips them.
+        """
+        with open(
+            tmp_path / "3c9f0e2a-aaaa-bbbb-cccc-ddddeeeeffff_0_recv.csv", "w", newline=""
+        ) as f:
+            w = csv.writer(f)
+            w.writerow(["RequestID", "Bandwidth(Gbps)"])
+            w.writerow([0, 10.0])
+        with open(
+            tmp_path / "3c9f0e2a-aaaa-bbbb-cccc-ddddeeeeffff_0_gen_transfer_summary.csv",
+            "w",
+            newline="",
+        ) as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp", "RequestID", "gen_side_transfer_time(ms)", "kv_cache_size"])
+            w.writerow(["2026-01-01 00:00:00.000", 0, 1.0, 1024])
+        assert _parse_python_csvs(str(tmp_path)) == {}
 
     def test_empty_dir(self, tmp_path):
         assert _parse_python_csvs(str(tmp_path)) == {}
@@ -466,7 +519,9 @@ class TestAggregate:
         # Create CSV for gen side (C++ recv)
         gen_csv = work / "csv" / "0" / "gen"
         gen_csv.mkdir(parents=True)
-        with open(gen_csv / "rank_0_recv.csv", "w", newline="") as f:
+        with open(
+            gen_csv / "5d7b1f80-aaaa-bbbb-cccc-ddddeeeeffff_0_recv.csv", "w", newline=""
+        ) as f:
             w = csv.writer(f)
             w.writerow(["RequestID", "Bandwidth(Gbps)"])
             # warmup rid (r=0) should be excluded

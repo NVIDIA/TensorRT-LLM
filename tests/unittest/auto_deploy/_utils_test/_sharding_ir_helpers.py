@@ -263,7 +263,7 @@ def _path_to_dotted_module(path: str, custom_models_package: str) -> str:
     * A bare module short name such as ``modeling_x``.
 
     ``custom_models_package`` comes from the loaded factory's module, so the
-    result targets either bundled AutoDeploy or standalone ``llmc`` without a
+    result targets either bundled AutoDeploy or standalone ``paragraf`` without a
     filesystem-root or top-level-package assumption. The conversion is purely
     syntactic -- no filename pattern is required.
     """
