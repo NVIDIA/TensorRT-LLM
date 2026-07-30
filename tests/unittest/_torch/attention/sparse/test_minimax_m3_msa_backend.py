@@ -149,6 +149,56 @@ def test_msa_metadata_rejects_undersized_max_score_buffer():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_msa_buffers_include_graph_stable_block_table():
+    """The 2-D page table and per-request length the ported decode kernels take
+    must come from the graph buffer pool at the manager's worst-case geometry,
+    so their addresses survive capture."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    max_num_sequences, max_blocks_per_seq = 8, 64
+
+    metadata.kv_cache_manager = SimpleNamespace(
+        max_blocks_per_seq=max_blocks_per_seq,
+        tokens_per_block=128,
+        get_index_k_buffer=lambda layer_idx, kv_layout=None: None,
+    )
+    class RecordingBuffers:
+        def __init__(self):
+            self.requested = {}
+
+        def get_buffer(self, tensor_shape, dtype, cache_name, capture_graph):
+            self.requested[cache_name] = (tuple(tensor_shape), dtype, capture_graph)
+            return torch.zeros(tensor_shape, device="cuda", dtype=dtype)
+
+    buffers = RecordingBuffers()
+    metadata.is_cuda_graph = True
+    metadata.cuda_graph_buffers = buffers
+    metadata.max_num_sequences = max_num_sequences
+    metadata.max_num_tokens = 512
+    # No sparse params, so the fmha_sm100 proxy scratch is skipped and this
+    # exercises only the layer-invariant buffers.
+    metadata._msa_params = None
+
+    metadata._create_msa_buffers()
+
+    assert metadata._msa_buffers_ready
+    assert metadata.msa_block_table.shape == (max_num_sequences, max_blocks_per_seq)
+    assert metadata.msa_seq_lens_cuda.shape == (max_num_sequences,)
+    # Reserved from the graph pool at the worst-case geometry, alongside the
+    # flat page table the fmha_sm100 path uses.
+    assert buffers.requested["msa_block_table"] == (
+        (max_num_sequences, max_blocks_per_seq),
+        torch.int32,
+        True,
+    )
+    assert buffers.requested["msa_seq_lens_cuda"] == (
+        (max_num_sequences,),
+        torch.int32,
+        True,
+    )
+
+
 def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
     """The proxy view fed to fmha_sm100 must be contiguous in the exact
     [num_index_heads, plan_max_k_tiles, num_tokens] shape the kernel writes,

@@ -19,6 +19,7 @@ import torch
 
 from .msa_utils import (
     MSA_REQUIRED_TOPK,
+    msa_kernel_choice,
     per_token_valid_blocks,
     require_msa_module,
     select_blocks_from_maxscore,
@@ -26,6 +27,72 @@ from .msa_utils import (
 
 if TYPE_CHECKING:
     from .common import MiniMaxM3SparseConfig
+
+
+def _cutedsl_score_runner():
+    """Return the CuTe DSL indexer scoring runner, or None if unavailable.
+
+    The CuTe DSL ops are registered only when the nvidia-cutlass-dsl package is
+    importable, so this stays a soft dependency.
+    """
+    try:
+        from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+    except ImportError:
+        return None
+    return getattr(cute_dsl_custom_ops, "CuteDSLMiniMaxM3IndexDecodeScoreRunner", None)
+
+
+def _cutedsl_score(
+    idx_q: torch.Tensor,
+    idx_k_paged: torch.Tensor,
+    max_score: torch.Tensor,
+    *,
+    block_table: torch.Tensor,
+    seq_lens_cuda: torch.Tensor,
+    decode_query_len: int,
+) -> bool:
+    """Try to fill `max_score` with the CuTe DSL scorer; report whether it ran.
+
+    `max_score` is the [num_index_heads, max_k_tiles, total_q] buffer the block
+    selector consumes. The kernel writes [head, token, block], so it is handed
+    the transposed view: same backing store, no copy, and the stores end up
+    coalesced across tokens rather than strided by max_k_tiles.
+
+    The buffer is deliberately not pre-filled with -inf. The kernel writes
+    blocks [0, ceil(seq_len / page_size)) for every token of a request, and the
+    selector reads only [0, n_valid_blocks[token])), which is bounded by that
+    same count for every token including the shorter ones in a multi-token
+    speculative step. So every entry the selector reads has just been written.
+    """
+    runner = _cutedsl_score_runner()
+    if runner is None:
+        return False
+
+    total_q, num_index_heads, head_dim = idx_q.shape
+    page_size = int(idx_k_paged.shape[2])
+    if not runner.is_supported(
+        q_dtype=idx_q.dtype,
+        num_heads=num_index_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        max_decode_query_len=decode_query_len,
+    ):
+        return False
+    if idx_k_paged.dtype != idx_q.dtype or max_score.shape[2] != total_q:
+        return False
+
+    # The kernel wants MQA index-K as [num_pages, page_size, head_dim]; the
+    # squeeze is zero-copy and keeps the pool's real per-page stride, which the
+    # TMA descriptor reads at runtime.
+    torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
+        idx_q,
+        idx_k_paged.squeeze(1),
+        block_table,
+        seq_lens_cuda,
+        max_score.transpose(1, 2),
+        decode_query_len,
+    )
+    return True
 
 
 def _proxy_max_score(
@@ -132,6 +199,9 @@ class MsaIndexer:
         max_score: Optional[torch.Tensor] = None,
         n_valid_blocks: Optional[torch.Tensor] = None,
         head_major_output: bool = False,
+        block_table: Optional[torch.Tensor] = None,
+        seq_lens_cuda: Optional[torch.Tensor] = None,
+        decode_query_len: Optional[int] = None,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
@@ -140,33 +210,60 @@ class MsaIndexer:
         from the graph-safe scratch, eager from the step-level device buffer);
         decode additionally runs into the preallocated `max_score` buffer inside
         the captured region.
+
+        Pure-decode steps with a uniform per-request query length additionally
+        pass `block_table`, `seq_lens_cuda` and `decode_query_len`, which lets
+        the dedicated CuTe DSL scorer replace the fmha_sm100 proxy pass when
+        TLLM_M3_INDEXER_SCORE selects it.
         """
         config = self.config
 
-        if proxy_plan is None:
-            max_score = _proxy_max_score(
+        scored = False
+        if (
+            msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
+            and max_score is not None
+            and block_table is not None
+            and seq_lens_cuda is not None
+            and decode_query_len is not None
+        ):
+            # The CuTe DSL scorer emits raw Q.K rather than idx_sm_scale * Q.K.
+            # Block ranking, and the +inf forcing of the init/local blocks in
+            # select_blocks_from_maxscore, are both invariant under a positive
+            # scale, so the omission does not change the selection.
+            scored = _cutedsl_score(
                 idx_q,
                 idx_k_paged,
-                qo_lens_cpu=qo_lens_cpu,
-                kv_lens_cpu=kv_lens_cpu,
-                qo_offset_cpu=qo_offset_cpu,
-                kv_indices=kv_indices,
-                sm_scale=idx_sm_scale,
-                causal=True,
+                max_score,
+                block_table=block_table,
+                seq_lens_cuda=seq_lens_cuda,
+                decode_query_len=decode_query_len,
             )
-        else:
-            fmha_sm100 = require_msa_module()
-            _, max_score = fmha_sm100.fmha_sm100(
-                idx_q,
-                idx_k_paged,
-                idx_k_paged,
-                proxy_plan,
-                kv_indices=kv_indices,
-                output_o=False,
-                output_maxscore=True,
-                max_score=max_score,
-                sm_scale=idx_sm_scale,
-            )
+
+        if not scored:
+            if proxy_plan is None:
+                max_score = _proxy_max_score(
+                    idx_q,
+                    idx_k_paged,
+                    qo_lens_cpu=qo_lens_cpu,
+                    kv_lens_cpu=kv_lens_cpu,
+                    qo_offset_cpu=qo_offset_cpu,
+                    kv_indices=kv_indices,
+                    sm_scale=idx_sm_scale,
+                    causal=True,
+                )
+            else:
+                fmha_sm100 = require_msa_module()
+                _, max_score = fmha_sm100.fmha_sm100(
+                    idx_q,
+                    idx_k_paged,
+                    idx_k_paged,
+                    proxy_plan,
+                    kv_indices=kv_indices,
+                    output_o=False,
+                    output_maxscore=True,
+                    max_score=max_score,
+                    sm_scale=idx_sm_scale,
+                )
 
         max_score_kv = _group_max_reduce(max_score, config)
 

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -24,6 +25,36 @@ MSA_REQUIRED_HEAD_DIM = 128
 # Path of the fmha_sm100 package inside the MSA git submodule relative to the
 # repository root (see 3rdparty/MSA/LICENSE and 3rdparty/MSA/NOTICE).
 _MSA_PYTHON_RELPATH = Path("3rdparty") / "MSA" / "python"
+
+# Per-kernel implementation switches for the M3 decode path. The first entry of
+# each tuple is the default. These are env vars rather than
+# MiniMaxM3SparseAttentionConfig fields because the config is user-facing
+# Pydantic: adding fields there would need a golden-manifest regeneration plus
+# telemetry CODEOWNER review, which is disproportionate for a kill switch.
+# Read per call, like TLLM_FMHA_LIBS, so tests can flip them with monkeypatch.
+_M3_KERNEL_CHOICES = {
+    "TLLM_M3_INDEXER_SCORE": ("msa", "cutedsl"),
+    "TLLM_M3_SPARSE_DECODE": ("msa", "triton"),
+    "TLLM_M3_DENSE_DECODE": ("msa", "trtllm_gen"),
+}
+
+
+def msa_kernel_choice(env_var: str) -> str:
+    """Return the selected implementation for one of the M3 decode kernels.
+
+    Selecting a fast path is only a request: each call site still checks that
+    the geometry is supported and silently falls back to MSA when it is not.
+    """
+    choices = _M3_KERNEL_CHOICES[env_var]
+    value = os.environ.get(env_var)
+    if value is None or not value.strip():
+        return choices[0]
+    value = value.strip().lower()
+    if value not in choices:
+        raise ValueError(
+            f"{env_var}={value!r} is not one of {', '.join(choices)}."
+        )
+    return value
 
 
 def _find_msa_python_dir() -> Optional[Path]:
@@ -249,6 +280,7 @@ __all__ = [
     "MSA_REQUIRED_HEAD_DIM",
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
+    "msa_kernel_choice",
     "msa_package_available",
     "msa_paged_kv",
     "per_token_valid_blocks",
