@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# setup_env.sh - Install a BOLT-compatible TRT-LLM wheel + its runtime deps
-# into a runtime-capable container WITHOUT clobbering the container's working
-# `tensorrt` install.
+# setup_env.sh - Overlay a BOLT-compatible TRT-LLM wheel into a runtime-capable
+# container WITHOUT clobbering the container's working `tensorrt` install.
 #
 #   scripts/bolt/setup_env.sh <dir-containing-TensorRT-LLM/>
 #
@@ -13,21 +12,20 @@
 # rebuilding the NVIDIA `tensorrt` meta source package, which produces a stub
 # that provides NO importable `tensorrt` module -- it uninstalls the container's
 # good TensorRT and breaks `import tensorrt` (and thus `import tensorrt_llm`).
-# This script avoids that by:
-#   1. installing the wheel with --no-deps (libs + python only, tensorrt untouched)
-#   2. installing the remaining deps with `tensorrt` excluded AND pinned to the
-#      already-installed version so nothing reinstalls it.
+# So we install the wheel with --no-deps (libs + python only, tensorrt
+# untouched). The remaining runtime deps are expected to already be present in
+# the pinned container image (kept in sync with requirements.txt), so we don't
+# reinstall them here.
 #
 # Works for both a clean devel image (no trtllm preinstalled) and a release-like
 # image (trtllm preinstalled): --force-reinstall overlays the BOLT libs either way.
 
 set -euo pipefail
 
-EXTRACT="${1:?usage: setup_env.sh <dir containing TensorRT-LLM/ (wheel + src)>}"
+EXTRACT="${1:?usage: setup_env.sh <dir containing TensorRT-LLM/ (wheel)>}"
 PYTHON="${PYTHON:-python3}"
 
 WHEEL=$(ls "$EXTRACT"/TensorRT-LLM/tensorrt_llm-*.whl 2>/dev/null | head -1 || true)
-SRC="$EXTRACT/TensorRT-LLM/src"
 [[ -f "$WHEEL" ]] || { echo "[ERROR] No tensorrt_llm wheel under $EXTRACT/TensorRT-LLM/"; exit 1; }
 
 # 0. The container must already have a working tensorrt (runtime-capable image).
@@ -44,18 +42,7 @@ echo "[INFO] tensorrt OK: $("$PYTHON" -c 'import tensorrt; print(tensorrt.__vers
 echo "[INFO] Installing BOLT wheel (--no-deps): $(basename "$WHEEL")"
 pip install --no-deps --force-reinstall "$WHEEL"
 
-# 2. Remaining runtime deps, tensorrt excluded + pinned to the installed version.
-if [[ -f "$SRC/requirements.txt" ]]; then
-    echo "[INFO] Installing runtime deps (tensorrt excluded + pinned)"
-    ( cd "$SRC"
-      grep -viE '^[[:space:]]*tensorrt([[:space:]=~<>!]|$)' requirements.txt > req.notrt.txt
-      echo "tensorrt==$("$PYTHON" -c 'import tensorrt; print(tensorrt.__version__)')" > /tmp/keep-trt.txt
-      pip install -c /tmp/keep-trt.txt -r req.notrt.txt )
-else
-    echo "[WARN] $SRC/requirements.txt not found; assuming deps already present"
-fi
-
-# 3. Verify from a neutral cwd so the extracted source tree doesn't shadow the
+# 2. Verify from a neutral cwd so the extracted source tree doesn't shadow the
 #    installed package (a source `tensorrt_llm/` has no compiled bindings).
 ( cd /tmp && "$PYTHON" -c "import tensorrt, tensorrt_llm; print('[INFO] runtime + trtllm ok:', tensorrt_llm.__file__)" )
 echo "[SUCCESS] Environment ready for BOLT flow."
