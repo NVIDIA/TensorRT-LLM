@@ -1561,7 +1561,7 @@ static-analysis-files: &static_analysis_files |
     )$
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/)'
+exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
