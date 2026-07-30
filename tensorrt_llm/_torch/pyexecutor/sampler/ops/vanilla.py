@@ -485,3 +485,178 @@ class Fusions:
         torch._dynamo.mark_dynamic(slots, 0)
         torch._dynamo.mark_dynamic(static_top_p, 0)
         return Fusions._top_p_decay_gather_impl(runtime_top_p, is_decay_slot, static_top_p, slots)
+
+    # --- Occurrence penalties (repetition / presence / frequency) -----------
+    # torch/torch.compile counterpart of the C++ ``batchApplyPenalty`` kernel,
+    # driven by ``PenaltyHandler`` in penalties.py, which owns the
+    # workspace and documents its semantics (see ``PenaltyStore`` there).
+
+    @staticmethod
+    def update_occurrence_workspace(
+        counts_cuda: torch.Tensor,
+        presence_prefix_cuda: Optional[torch.Tensor],
+        counted_slots: torch.Tensor,
+        counted_tokens: torch.Tensor,
+        prefix_slots: Optional[torch.Tensor] = None,
+        prefix_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Scatter (slot, token) pairs into the persistent occurrence workspace.
+
+        Args:
+            counts_cuda: ``int32[num_slots, vocab_size]``, incremented in place.
+            presence_prefix_cuda: ``bool[num_slots, vocab_size]`` prefix-presence
+                mask, or ``None`` when no active request uses
+                ``prompt_ignore_length``.
+            counted_slots / counted_tokens: 1-D int64 pairs to increment in
+                ``counts_cuda``.
+            prefix_slots / prefix_tokens: 1-D int64 pairs to mark in
+                ``presence_prefix_cuda``; ``None`` when there is nothing to mark.
+        """
+        if counted_slots.numel() > 0:
+            ones = torch.ones(
+                counted_slots.shape[0], dtype=counts_cuda.dtype, device=counts_cuda.device
+            )
+            # accumulate=True sums repeated (slot, token) pairs -> occurrence count.
+            counts_cuda.index_put_((counted_slots, counted_tokens), ones, accumulate=True)
+        if (
+            presence_prefix_cuda is not None
+            and prefix_slots is not None
+            and prefix_tokens is not None
+            and prefix_slots.numel() > 0
+        ):
+            # Marking a dense bool mask is idempotent, so duplicate tokens are safe.
+            presence_prefix_cuda[prefix_slots, prefix_tokens] = True
+
+    # fullgraph=True is safe here: served model has fixed shapes and compiles ~2 graphs,
+    # well under the default limit (8)
+    @staticmethod
+    @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+    def _apply_occurrence_penalties_impl(
+        logits: torch.Tensor,
+        counts_cuda: torch.Tensor,
+        prefix_seen_cuda: Optional[torch.Tensor],
+        active_cuda: torch.Tensor,
+        has_previous_token_cuda: torch.Tensor,
+        new_tokens: torch.Tensor,
+        seq_slots: torch.Tensor,
+        request_offsets: torch.Tensor,
+        request_num_steps: torch.Tensor,
+        repetition_cuda: torch.Tensor,
+        presence_cuda: torch.Tensor,
+        frequency_cuda: torch.Tensor,
+    ) -> None:
+        vocab = logits.size(-1)
+
+        # Fold the device-pending sampled token into the persistent counts, once per armed
+        # active slot, before the gather reads them, via one flat scatter_add. Masked entries
+        # add 0 at counts[slot, 0], so inactive/unarmed/out-of-range slots are no-ops.
+        previous_token = new_tokens[0, seq_slots, 0].to(torch.int64)
+        fold_ok = (
+            active_cuda[seq_slots]
+            & has_previous_token_cuda[seq_slots]
+            & (request_num_steps > 0)
+            & (previous_token >= 0)
+            & (previous_token < vocab)
+        )
+        flat_index = seq_slots * vocab + torch.where(
+            fold_ok, previous_token, previous_token.new_zeros(())
+        )
+        counts_cuda.view(-1).scatter_add_(0, flat_index, fold_ok.to(counts_cuda.dtype))
+
+        # Map each logits row to its owning request with a broadcasted range comparison.
+        # This is O(T * R), but T and R are both small (rows per step x requests) and the
+        # whole thing fuses into the surrounding elementwise graph, so it measures faster
+        # than either a searchsorted lookup or a repeat_interleave expansion. Notably
+        # torch.repeat_interleave must NOT be used here: its output length is
+        # sum(num_steps), which -- without an explicit host-provided output_size -- torch
+        # reads back from the device, and that per-step D2H sync destroys the overlap
+        # between the sampler's host work and the model forward (measured ~20x slower).
+        rows = torch.arange(logits.size(0), device=logits.device).unsqueeze(1)  # [T, 1]
+        owned = (rows >= request_offsets) & (rows < request_offsets + request_num_steps)  # [T, R]
+        row_owned = owned.any(dim=1)  # [T]
+        row_slot = (owned * seq_slots).sum(dim=1)  # [T]; slot per row, 0 for unowned
+        row_active = row_owned & active_cuda[row_slot]
+
+        count = counts_cuda[row_slot]
+        rep = repetition_cuda[row_slot].unsqueeze(1)
+        pre = presence_cuda[row_slot].unsqueeze(1)
+        freq = frequency_cuda[row_slot].unsqueeze(1)
+
+        seen = count > 0
+        if prefix_seen_cuda is not None:
+            # Prompt-ignore-prefix tokens count for repetition only, not presence/frequency.
+            seen = seen | prefix_seen_cuda[row_slot]
+
+        penalized = logits.float()
+        repeated = torch.where(penalized < 0, penalized * rep, penalized / rep)
+        penalized = torch.where(seen, repeated, penalized)
+        penalized = penalized - torch.where(
+            count > 0,
+            pre + freq * count.to(torch.float32),
+            penalized.new_zeros(()),
+        )
+        limit = torch.finfo(logits.dtype).max
+        penalized = penalized.clamp(-limit, limit).to(logits.dtype)
+        # Cast before the select so inactive rows stay bit-identical, then write in place.
+        logits.copy_(torch.where(row_active.unsqueeze(1), penalized, logits))
+
+    @staticmethod
+    def apply_batched_occurrence_penalties(
+        logits: torch.Tensor,
+        counts_cuda: torch.Tensor,
+        presence_prefix_cuda: Optional[torch.Tensor],
+        active_cuda: torch.Tensor,
+        has_previous_token_cuda: torch.Tensor,
+        new_tokens: torch.Tensor,
+        seq_slots: torch.Tensor,
+        request_offsets: torch.Tensor,
+        request_num_steps: torch.Tensor,
+        repetition_cuda: torch.Tensor,
+        presence_cuda: torch.Tensor,
+        frequency_cuda: torch.Tensor,
+    ) -> None:
+        """Apply occurrence penalties to ``logits`` in place, before temperature handling.
+
+        Args:
+            logits: ``[T, vocab_size]`` packed generated-token logits, where
+                ``T == sum(num_steps * num_beams)``. Request ``r`` owns the rows
+                ``request_offsets[r] + step`` for ``step in [0, request_num_steps[r])``;
+                rows no request owns are left bit-identical. Modified in place.
+            counts_cuda / presence_prefix_cuda: the occurrence workspace; see
+                ``PenaltyHandler.PenaltyStore`` for their semantics.
+            active_cuda / has_previous_token_cuda / repetition_cuda / presence_cuda /
+                frequency_cuda: per-slot buffers of length ``max_num_sequences``.
+            new_tokens: ``[max_tokens, max_num_sequences, max_beam_width]`` device
+                buffer holding the previous step's sampled token.
+            seq_slots: ``int64[R]`` slot per request.
+            request_offsets / request_num_steps: ``[R]`` device tensors, already
+                staged by the caller. The owned spans must not overlap, but they need
+                not be ordered, and rows they skip are left bit-identical.
+
+        All heavy lifting is fused into the single compiled ``_apply_occurrence_penalties_impl``
+        graph; this wrapper only marks the batch-varying dims dynamic.
+        """
+        if seq_slots.numel() == 0 or logits.size(0) == 0:
+            return
+
+        # Batch-varying dim-0 tensors; mark every one, or an unmarked peer forces the marked
+        # dims to specialize (ConstraintViolationError under dynamic=None). counts/active/params
+        # keep dim 0 == max_num_sequences (fixed) and new_tokens dim 1 == max_num_sequences.
+        torch._dynamo.mark_dynamic(logits, 0)
+        torch._dynamo.mark_dynamic(seq_slots, 0)
+        torch._dynamo.mark_dynamic(request_offsets, 0)
+        torch._dynamo.mark_dynamic(request_num_steps, 0)
+        Fusions._apply_occurrence_penalties_impl(
+            logits,
+            counts_cuda,
+            presence_prefix_cuda,
+            active_cuda,
+            has_previous_token_cuda,
+            new_tokens,
+            seq_slots,
+            request_offsets,
+            request_num_steps,
+            repetition_cuda,
+            presence_cuda,
+            frequency_cuda,
+        )

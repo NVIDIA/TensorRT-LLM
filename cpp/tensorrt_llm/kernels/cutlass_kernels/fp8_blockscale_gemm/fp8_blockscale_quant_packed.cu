@@ -40,6 +40,17 @@ namespace kernels::fp8_blockscale_gemm
 namespace
 {
 
+// CUDA limits grid.y and grid.z to 65535. Distribute row blocks across both
+// dimensions while keeping the total number of launched blocks near mBlocks.
+dim3 makeQuantizeGrid(int numPackedSfK, int mBlocks)
+{
+    constexpr int kMaxGridDimY = 65535;
+    int const gridZ = (mBlocks + kMaxGridDimY - 1) / kMaxGridDimY;
+    int const gridY = (mBlocks + gridZ - 1) / gridZ;
+    return {
+        static_cast<unsigned int>(numPackedSfK), static_cast<unsigned int>(gridY), static_cast<unsigned int>(gridZ)};
+}
+
 __device__ __forceinline__ float reciprocal_approximate_ftz_local(float a)
 {
     float b;
@@ -60,7 +71,8 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
     int const packed_sf_k_idx = static_cast<int>(blockIdx.x);
     int const warp_id = static_cast<int>(threadIdx.x) >> 5;
     int const lane_id = static_cast<int>(threadIdx.x) & 31;
-    int const m_idx = static_cast<int>(blockIdx.y) * WarpsPerBlock + warp_id;
+    int64_t const mBlockIdx = static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y;
+    int64_t const m_idx = mBlockIdx * WarpsPerBlock + warp_id;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     cudaGridDependencySynchronize();
@@ -239,7 +251,7 @@ void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32
     // extent of packed_scale_output is written (in-kernel zero for rows past `m`),
     // regardless of how the caller padded the input.
     int const m_blocks = (scale_leading_dim_uint32 + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    dim3 const grid(num_packed_sf_k, m_blocks, 1);
+    dim3 const grid = makeQuantizeGrid(num_packed_sf_k, m_blocks);
     dim3 const block(kWarpsPerBlock * 32, 1, 1);
 
     tensorrt_llm::common::launchWithPdlWhenEnabled("fp8_quantize_1x128_packed_kernel_impl",
@@ -258,7 +270,7 @@ void launch_fp8_quantize_1x128_cutedsl_bf16_e4m3(__nv_fp8_e4m3* fp8_output, uint
     constexpr int kWarpsPerBlock = 4;
     int const num_packed_sf_k = (((k + 127) / 128) + 3) / 4;
     int const m_blocks = (padded_m + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    dim3 const grid(num_packed_sf_k, m_blocks, 1);
+    dim3 const grid = makeQuantizeGrid(num_packed_sf_k, m_blocks);
     dim3 const block(kWarpsPerBlock * 32, 1, 1);
 
     tensorrt_llm::common::launchWithPdlWhenEnabled("fp8_quantize_1x128_cutedsl_kernel_impl",
