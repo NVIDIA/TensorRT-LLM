@@ -34,7 +34,7 @@ from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import (
 )
 from tensorrt_llm._torch.visual_gen.utils import as_tuple
 
-TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE = "TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE"
+TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE = "TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE"
 
 # Keep tuned entries explicit so future sweeps can extend this table by
 # parallel size and tensor dtype without changing the selection policy.
@@ -48,17 +48,25 @@ def _native_decode_chunk_size(
     parallel_size: int,
     dtype: torch.dtype,
 ) -> int:
-    """Select an override, tuned value, or conservative multi-rank default."""
-    override = os.environ.get(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE, "").strip()
+    """Choose the internal temporal batch size for native parallel decode.
+
+    The best size depends on the spatial shard size and activation dtype:
+    batching amortizes per-chunk decoder launches, but larger chunks also raise
+    activation pressure. Keep that policy internal and centralized while
+    retaining an environment override for performance experiments.
+    """
+    override = os.environ.get(TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE, "").strip()
     if override:
         try:
             chunk_size = int(override)
         except ValueError:
             raise ValueError(
-                f"{TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE} must be a positive integer."
+                f"{TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE} must be a positive integer."
             ) from None
         if chunk_size < 1:
-            raise ValueError(f"{TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE} must be a positive integer.")
+            raise ValueError(
+                f"{TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE} must be a positive integer."
+            )
         return chunk_size
 
     if parallel_size <= 1:
