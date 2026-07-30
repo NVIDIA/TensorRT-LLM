@@ -75,7 +75,7 @@ def test_fused_routing_matches_eager_reference():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="Kimi fused route+MXFP8 quant requires SM100",
+    reason="Kimi fused route+MXFP8 quant requires an SM10x architecture",
 )
 @pytest.mark.parametrize("num_tokens", [1, 5, 64])
 def test_fused_route_quant_matches_unfused_chain(num_tokens):
