@@ -48,6 +48,7 @@ l0_a10:
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/models/test_qwen3_next_moe_quant.py
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_chat_template_dispatch.py
   - unittest/inputs/test_content_format.py

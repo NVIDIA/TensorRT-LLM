@@ -38,6 +38,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
@@ -112,6 +113,32 @@ def _precompute_fused_norm_weights(module: nn.Module) -> None:
 def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
     return (os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
             and not enable_attention_dp)
+
+
+def _experts_excluded_from_quant(model_config: ModelConfig[Qwen3NextConfig],
+                                 layer_idx: Optional[int]) -> bool:
+    """Is this layer's routed-experts module listed in ``exclude_modules``?
+
+    ``exclude_modules`` is applied only after every module is built, but
+    ``create_moe`` has to pick the MoE backend class before that. A backend
+    picked for FP8/NVFP4 weights rejects the experts if they turn out to be
+    bf16, so look the answer up now instead of waiting for that pass.
+    """
+    quant_config = model_config.quant_config
+    if layer_idx is None or not quant_config.exclude_modules:
+        return False
+    candidates = [f"model.layers.{layer_idx}.mlp.experts"]
+    n_hidden_layers = getattr(model_config.pretrained_config,
+                              "num_hidden_layers", None)
+    # One MTP layer has two names: mtp.layers.<i> in the checkpoint and
+    # model.layers.<n_hidden_layers + i> at runtime. Only the Qwen3.5 entry
+    # points rewrite the first into the second, so try both names here.
+    if n_hidden_layers is not None and layer_idx >= n_hidden_layers:
+        candidates.append(
+            f"mtp.layers.{layer_idx - n_hidden_layers}.mlp.experts")
+    return any(
+        quant_config.is_module_excluded_from_quantization(candidate)
+        for candidate in candidates)
 
 
 class Qwen3NextGate(nn.Module):
@@ -213,6 +240,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if quant_config_dict and layer_idx is not None:
             expert_quant_config = quant_config_dict.get(
                 f"model.layers.{layer_idx}.mlp.experts")
+        # Excluded experts end up bf16 whatever the per-layer entry says, so
+        # hand create_moe a bf16 config and let it pick a backend serving bf16.
+        if _experts_excluded_from_quant(model_config, layer_idx):
+            expert_quant_config = QuantConfig(kv_cache_quant_algo=model_config.
+                                              quant_config.kv_cache_quant_algo)
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -766,20 +798,12 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
                  layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
                                                        torch.cuda.Stream]):
-        # Some HF checkpoints (e.g. Qwen3.5 NVFP4) keep the MTP layer entirely
-        # unquantized -- including its MoE experts (no weight_scale tensors).
-        # Most non-CUTLASS MoE backends (TRTLLMGen, CuteDsl, ...) reject
-        # unquantized / kv-cache-only quant_modes at create_weights or
-        # forward time (e.g. "TRTLLMGenFusedMoE doesn't support
-        # fp16/bf16/fp32 MoE", "CuteDslFusedMoE doesn't support quantization
-        # mode [128]" where bit 128 is FP8_KV_CACHE only).  CUTLASS MoE
-        # supports both BF16 and quantized MoE, so when the checkpoint marks
-        # MTP as excluded from quantization, fall back to CUTLASS *only* for
-        # the MTP layer.  Regular layers (0..num_hidden_layers-1) keep the
-        # user-selected backend.
+        # Some HF checkpoints (e.g. Qwen3.5 NVFP4) keep the whole MTP layer in
+        # bf16. Given a bf16 config most backends switch to CUTLASS on their
+        # own; DEEPGEMM and WIDEEP do not, so switch for them here.
         mtp_model_config = model_config
         if (model_config.moe_backend != "CUTLASS"
-                and Qwen3NextMTP._is_mtp_excluded_from_quant(model_config)):
+                and _experts_excluded_from_quant(model_config, layer_idx)):
             original_backend = model_config.moe_backend
             mtp_model_config = copy.copy(model_config)
             mtp_model_config._frozen = False
@@ -840,56 +864,6 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
         # MTP applies shared_head.norm after the base decoder forward, so its
         # MoE-output all-reduce cannot consume next_layer_layernorm.
         self.fusion_config.POST_MOE_FUSION = False
-
-    @staticmethod
-    def _mtp_pattern_covers_experts(tail: str) -> bool:
-        """Does an MTP exclude pattern cover the routed experts?
-
-        ``tail`` is what follows the ``mtp.`` /
-        ``model.layers.<n_hidden_layers>`` prefix.
-        """
-        stripped = tail.strip(".*")
-        if not stripped:
-            # Bare (or wildcarded) layer prefix: covers the whole layer.
-            return True
-        if stripped.startswith("layers."):
-            # "layers.<idx>[.<module>]" -- drop "layers" and the index.
-            parts = stripped.split(".", 2)
-            stripped = parts[2] if len(parts) > 2 else ""
-            if not stripped:
-                return True
-        return "mlp.experts" in stripped
-
-    @staticmethod
-    def _is_mtp_excluded_from_quant(
-            model_config: ModelConfig[Qwen3NextConfig]) -> bool:
-        """Heuristic: did the checkpoint leave the MTP *MoE* unquantized?
-
-        ``apply_quant_config_exclude_modules`` runs *after* this constructor.
-        For Qwen3.5 paths the exclude_modules list has already been
-        translated to ``model.layers.<n_hidden_layers>*`` by
-        ``_normalize_qwen35_exclude_modules`` -- detect that.  Raw HF
-        ``mtp.*`` patterns are also accepted (defensive: if some future
-        weight mapper does not translate them, this still triggers the
-        backend fallback so the MoE path doesn't crash).
-        """
-        qc = getattr(model_config, "quant_config", None)
-        if qc is None or not getattr(qc, "exclude_modules", None):
-            return False
-        n_layers = getattr(model_config.pretrained_config, "num_hidden_layers",
-                           None)
-        target_prefix = (f"model.layers.{n_layers}"
-                         if n_layers is not None else None)
-        for pat in qc.exclude_modules:
-            if pat.startswith("mtp."):
-                tail = pat[len("mtp."):]
-            elif target_prefix is not None and pat.startswith(target_prefix):
-                tail = pat[len(target_prefix):]
-            else:
-                continue
-            if Qwen3NextMTP._mtp_pattern_covers_experts(tail):
-                return True
-        return False
 
     def forward(
         self,
