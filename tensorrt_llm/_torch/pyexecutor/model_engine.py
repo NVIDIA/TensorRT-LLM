@@ -6024,8 +6024,13 @@ class PyTorchModelEngine(ModelEngine):
                 "defined in `tensorrtllm.sampling_params`.")
             lp(request.py_request_id, logits_rows, token_ids, None, None)
 
+        # `logits_rows` is a VIEW of this same slice, so the processors' in-place edits are
+        # already reflected here; writing the view back onto itself self-overlaps and torch
+        # rejects it ("... refer to a single memory location. Please clone()..."). Clone the
+        # source to make the (otherwise redundant) write-back overlap-safe. Only reached when
+        # a request carries a py_logits_post_processor, so no effect on normal requests.
         logits_tensor[logits_row_offset:logits_row_offset +
-                      beam_width] = logits_rows.view(beam_width, -1)
+                      beam_width] = logits_rows.view(beam_width, -1).clone()
 
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
