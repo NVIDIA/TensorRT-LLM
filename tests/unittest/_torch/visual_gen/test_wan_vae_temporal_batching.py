@@ -39,7 +39,7 @@ def test_decode_chunk_slices_reject_invalid_chunk_size(chunk_size: int) -> None:
     [
         (1, 1),
         (2, 1),
-        (4, 3),
+        (4, 4),
         (8, 1),
     ],
 )

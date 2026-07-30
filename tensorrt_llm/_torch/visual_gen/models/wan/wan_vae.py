@@ -101,7 +101,7 @@ def _to_device_if_needed(x: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 def _decode_chunk_slices(num_frames: int, chunk_size: int) -> list[slice]:
-    """Keep the first latent frame separate, then batch later causal chunks."""
+    """Keep the cache-initializing first frame separate, then batch later frames."""
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
     if num_frames < 1:
@@ -1038,6 +1038,8 @@ class WanVAE(nn.Module):
         x = self.post_quant_conv(z)
         out_chunks: list[torch.Tensor] = []
         for index, frame_slice in enumerate(_decode_chunk_slices(num_frame, temporal_chunk_size)):
+            # Restart the per-pass layer cursor, but preserve _feat_map so each
+            # causal Conv receives its own preceding temporal context.
             self._conv_idx = [0]
             out_chunk = self.decoder(
                 x[:, :, frame_slice, :, :],
@@ -1047,6 +1049,8 @@ class WanVAE(nn.Module):
             )
             out_chunks.append(out_chunk)
 
+        # Every chunk has traversed the complete decoder; concatenate only
+        # these final decoder outputs along the temporal dimension.
         if len(out_chunks) == 1:
             out = out_chunks[0]
         else:

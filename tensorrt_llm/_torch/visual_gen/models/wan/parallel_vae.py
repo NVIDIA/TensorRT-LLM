@@ -35,8 +35,8 @@ from tensorrt_llm._torch.visual_gen.utils import as_tuple
 
 
 def _native_decode_chunk_size(parallel_size: int) -> int:
-    """Return the validated temporal batch size for native parallel Wan decode."""
-    return 3 if parallel_size == 4 else 1
+    """Return the validated native-BF16 temporal batch size for Wan decode."""
+    return 4 if parallel_size == 4 else 1
 
 
 class WanCausalConvHalo(HaloExchangeConv):

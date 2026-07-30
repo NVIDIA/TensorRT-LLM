@@ -144,7 +144,7 @@ def test_wan22_ti2v_vae_matches_diffusers_decode_checkpoint(
 
     with torch.inference_mode():
         reference_decoded = reference_vae.decode(latents).sample
-        wan_decoded = wan_vae.decode(latents, temporal_chunk_size=3).sample
+        wan_decoded = wan_vae.decode(latents, temporal_chunk_size=4).sample
 
     # fp32 parity; the residual gap is only channels_last vs contiguous conv
     # reduction order.
@@ -228,11 +228,33 @@ def test_wan21_t2v_vae_matches_diffusers_decode_checkpoint():
 
     with torch.inference_mode():
         reference_decoded = reference_vae.decode(latents).sample
-        wan_decoded = wan_vae.decode(latents, temporal_chunk_size=3).sample
+        wan_decoded = wan_vae.decode(latents, temporal_chunk_size=4).sample
 
     # fp32 parity; the residual gap is only channels_last vs contiguous conv
     # reduction order.
     _assert_close_metrics(wan_decoded, reference_decoded, max_abs=4e-3, relative_mean=1e-3)
+
+
+def test_wan22_temporal_chunk4_matches_chunk1_checkpoint():
+    checkpoint_dir = _require_wan22_ti2v_checkpoint()
+    _, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
+
+    torch.manual_seed(3)
+    latents = torch.randn(
+        1,
+        wan_vae.config.z_dim,
+        5,
+        8,
+        8,
+        device=DEVICE,
+        dtype=DTYPE,
+    ).to(memory_format=torch.channels_last_3d)
+
+    with torch.inference_mode():
+        framewise = wan_vae.decode(latents, temporal_chunk_size=1).sample
+        batched = wan_vae.decode(latents, temporal_chunk_size=4).sample
+
+    _assert_close_metrics(batched, framewise, max_abs=4e-3, relative_mean=1e-3)
 
 
 def test_wan21_t2v_vae_matches_diffusers_encode_checkpoint():
