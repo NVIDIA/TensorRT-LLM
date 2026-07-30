@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 GROOVY = (REPO_ROOT / "jenkins" / "L0_Test.groovy").read_text()
+PARENT_GROOVY = (REPO_ROOT / "jenkins" / "L0_MergeRequest.groovy").read_text()
 SLURM_RUN = (REPO_ROOT / "jenkins" / "scripts" / "slurm_run.sh").read_text()
 
 
@@ -25,6 +27,14 @@ def _function_body(source, name, next_name):
     start = source.index(f"def {name}")
     end = source.index(f"def {next_name}", start + len(f"def {name}"))
     return source[start:end]
+
+
+def _map_keys(source, assignment_index):
+    start = source.index("[", assignment_index)
+    line_start = source.rindex("\n", 0, assignment_index) + 1
+    indentation = source[line_start:assignment_index]
+    end = source.index(f"\n{indentation}]", start)
+    return set(re.findall(r"""['"]([^'"]+)['"]\s*:""", source[start:end]))
 
 
 class InfraDryRunPipelineTest(unittest.TestCase):
@@ -89,6 +99,142 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         cbts_body = _function_body(GROOVY, "isCbtsStage", "scpFromRemoteCmd")
         self.assertIn("if (isInfraDryRun())", cbts_body)
         self.assertIn("return false", cbts_body)
+
+
+class InfraDryRunParentPipelineTest(unittest.TestCase):
+    def test_parameter_is_propagated_to_the_helper_filter(self):
+        filter_setup = PARENT_GROOVY[
+            PARENT_GROOVY.index("boolean infraDryRun ="):
+            PARENT_GROOVY.index("String reuseBuild =")
+        ]
+        self.assertIn("params.InfraDryRun?.toString()?.toBoolean()", filter_setup)
+        self.assertIn("(INFRA_DRY_RUN): infraDryRun", filter_setup)
+
+    def test_dry_run_helpers_share_parameters_and_do_not_fail_fast(self):
+        body = _function_body(
+            PARENT_GROOVY,
+            "launchInfraDryRunTestJobs",
+            "launchStages",
+        )
+        self.assertEqual(body.count("def additionalParameters ="), 1)
+        self.assertIn('"L0_Test-${arch}-Single-GPU"', body)
+        self.assertIn('"L0_Test-${arch}-Multi-GPU"', body)
+        self.assertEqual(body.count("additionalParameters)"), 2)
+        self.assertEqual(body.count(", false, false, globalVars,"), 2)
+        self.assertLess(
+            body.index("testJobs.failFast = false"),
+            body.index("pipeline.parallel testJobs"),
+        )
+
+    def test_helper_failure_propagates_after_parallel_siblings_finish(self):
+        helper = _function_body(
+            PARENT_GROOVY,
+            "launchInfraDryRunTestJobs",
+            "launchStages",
+        )
+        launch_job = _function_body(
+            PARENT_GROOVY,
+            "launchJob",
+            "launchInfraDryRunTestJobs",
+        )
+        self.assertNotIn("catchError", helper)
+        self.assertNotIn("catch (", helper)
+        self.assertIn('if (buildStatus != "SUCCESS")', launch_job)
+        self.assertIn('error "Downstream job did not succeed"', launch_job)
+        self.assertIn("testJobs.failFast = false", helper)
+
+    def test_shared_filter_and_image_parameters_are_read_only_and_match_normal_jobs(self):
+        helper = _function_body(
+            PARENT_GROOVY,
+            "launchInfraDryRunTestJobs",
+            "launchStages",
+        )
+        launch_job = _function_body(
+            PARENT_GROOVY,
+            "launchJob",
+            "launchInfraDryRunTestJobs",
+        )
+        self.assertNotIn("additionalParameters[", helper + launch_job)
+        self.assertNotIn("additionalParameters.put", helper + launch_job)
+        self.assertIn("parameters += [", launch_job)
+
+        start = PARENT_GROOVY.index("def launchStages")
+        launch_stages = PARENT_GROOVY[
+            start:PARENT_GROOVY.index("\npipeline {", start)
+        ]
+        expected_keys = {
+            "x86_64": {
+                "dockerImage",
+                "wheelDockerImagePy310",
+                "wheelDockerImagePy312",
+            },
+            "SBSA": {"dockerImage", "wheelDockerImage"},
+        }
+        for arch, expected in expected_keys.items():
+            dry_call = launch_stages.index(
+                f'launchInfraDryRunTestJobs(pipeline, "{arch}"'
+            )
+            dry_map = launch_stages.rindex("def imageParameters = [", 0, dry_call)
+            normal_stage = launch_stages.index(
+                f'testStageName = "[Test-{arch}-Single-GPU] Remote Run"',
+                dry_call,
+            )
+            normal_map = launch_stages.index(
+                "def additionalParameters = [",
+                normal_stage,
+            )
+            self.assertEqual(_map_keys(launch_stages, dry_map), expected)
+            self.assertEqual(
+                _map_keys(launch_stages, normal_map) - {"testFilter"},
+                expected,
+            )
+
+    def test_dry_run_branch_precedes_normal_single_gpu_gating(self):
+        start = PARENT_GROOVY.index("def launchStages")
+        launch_stages = PARENT_GROOVY[
+            start:PARENT_GROOVY.index("\npipeline {", start)
+        ]
+        for arch in ("x86_64", "SBSA"):
+            dry_run_call = launch_stages.index(
+                f'launchInfraDryRunTestJobs(pipeline, "{arch}"'
+            )
+            build_call = launch_stages.rindex(
+                f'launchJob(pipeline, "/LLM/helpers/Build-{arch}"',
+                0,
+                dry_run_call,
+            )
+            normal_single = launch_stages.index(
+                f'testStageName = "[Test-{arch}-Single-GPU] Remote Run"',
+                dry_run_call,
+            )
+            marker = launch_stages.index(
+                f'currentBuild.description?.contains("Require {arch} Multi-GPU Testing")',
+                normal_single,
+            )
+            self.assertLess(build_call, dry_run_call)
+            self.assertLess(dry_run_call, normal_single)
+            self.assertLess(normal_single, marker)
+        self.assertIn(
+            "parallelJobs.failFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast",
+            launch_stages,
+        )
+
+    def test_product_reporting_is_excluded_from_dry_run(self):
+        setup = _function_body(
+            PARENT_GROOVY,
+            "setupPipelineEnvironment",
+            "mergeWaiveList",
+        )
+        self.assertLess(
+            setup.index("if (testFilter[INFRA_DRY_RUN])"),
+            setup.index("getCbtsResult("),
+        )
+        self.assertIn(
+            "!testFilter[INFRA_DRY_RUN]) {\n"
+            "                    collectTestResults(",
+            PARENT_GROOVY,
+        )
+        self.assertNotIn("L0_Stability", PARENT_GROOVY)
 
 
 if __name__ == "__main__":
