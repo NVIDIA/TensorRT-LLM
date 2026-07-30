@@ -38,6 +38,8 @@ l0_sanity_check:
     - unittest/others/test_kv_cache_transceiver.py::test_kv_transfer_timeout_warns_once_per_request
     - unittest/others/test_kv_cache_transceiver.py::test_kv_transfer_timeout_silent_when_unset
     - unittest/_torch/executor/test_model_loader_mx.py
+    - unittest/_torch/models/checkpoints/mx/test_mx_checkpoint_loader.py
+    - unittest/_torch/weight_sharing/test_mx_source_identity_gate.py
     - unittest/_torch/executor/test_hang_detector_kill.py
 - condition:
     ranges:
