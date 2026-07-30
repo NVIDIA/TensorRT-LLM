@@ -892,6 +892,21 @@ def main():
         ]
     )
 
+    # Generic, opt-in passthrough hooks (no-op unless the env vars are set), kept
+    # BOLT-agnostic so the perf harness carries no BOLT-specific coupling:
+    #   POST_INSTALL_HOOK        - script run inside the container on each node
+    #                              once, after install (see slurm_install.sh).
+    #   EXTRA_CONTAINER_EXPORTS  - ';'-separated KEY=VALUE list, forwarded as
+    #                              exports (inherited into the container like
+    #                              INSTALL_MODE). Lets a hook receive its config.
+    _post_install_hook = os.environ.get("POST_INSTALL_HOOK", "")
+    if _post_install_hook:
+        script_prefix_lines.append(f"export POST_INSTALL_HOOK='{_post_install_hook}'")
+    for _kv in os.environ.get("EXTRA_CONTAINER_EXPORTS", "").split(";"):
+        _kv = _kv.strip()
+        if _kv:
+            script_prefix_lines.append(f"export {_kv}")
+
     nsys_prefix = ""
     tllm_profile_start_stop = ""
     ctx_tllm_profile_start_stop = ""
