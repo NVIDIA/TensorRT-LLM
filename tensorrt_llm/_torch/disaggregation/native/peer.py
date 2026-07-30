@@ -266,6 +266,17 @@ class PeerRegistrar:
         self._lg_pool_mapping_cache[key] = mapping
         return mapping
 
+    def frags_per_block_per_group(self, peer_ri: RankInfo) -> Dict[int, int]:
+        """Fragments one block expands into, summed over each self layer group's pools.
+
+        Counts pools this rank does not send itself too: the receiver sizes the whole fan-in group.
+        """
+        out: Dict[int, int] = {}
+        for self_key, peer_key in self.get_pool_mapping(peer_ri).items():
+            mapper = self.get_kv_map(peer_ri, self_key, peer_key)
+            out[self_key[0]] = out.get(self_key[0], 0) + int(mapper.frags_per_block)
+        return out
+
     def get_kv_map(
         self,
         peer_ri: RankInfo,
@@ -466,22 +477,52 @@ class PeerRegistrar:
             self_tp_rank_in_dp_group % dup_head_factor
         )
 
-    def _owns_tp_fan_in(self, peer_rank_info: RankInfo) -> bool:
-        """Elect one owner when replicated bytes fan in across TP ranks.
+    @staticmethod
+    def elects_fan_in_owner(
+        *,
+        sender_tp_rank: int,
+        sender_tp_size_per_dp_group: int,
+        receiver_tp_size_per_dp_group: int,
+        receiver_dp_rank: int,
+    ) -> bool:
+        """Whether this sender is the elected owner of replicated bytes for this receiver.
 
-        A peer with fewer TP shards receives identical replicated data from
-        several local ranks. Rotate the elected owner by the destination's
-        DP rank (mirroring ``should_send_kv``'s head-duplication pairing) so
-        that with a multi-DP-group generation side the extra replicated
-        traffic spreads across local ranks instead of always landing on the
-        first rank of each fan-in group.
+        A receiver with fewer TP shards gets identical replicated data from several of the
+        sender's ranks, so exactly one of them must send it. The owner rotates by the
+        destination's DP rank (mirroring ``should_send_kv``'s head-duplication pairing) so
+        that with a multi-DP-group generation side the extra replicated traffic spreads
+        across sender ranks instead of always landing on the first rank of each fan-in group.
+
+        Both sides evaluate it -- the sender to decide what to send, the receiver to size each
+        writer's sub-region -- so it stays one implementation: a mispredicting receiver would
+        under-size the elected writer's slot.
         """
-        ratio = max(
-            1,
-            self._ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group,
+        ratio = max(1, sender_tp_size_per_dp_group // receiver_tp_size_per_dp_group)
+        return (sender_tp_rank % sender_tp_size_per_dp_group) % ratio == receiver_dp_rank % ratio
+
+    def fan_in_replicated_owners(self, peer_ri: RankInfo, sender_ranks: List[int]) -> List[bool]:
+        """Receiver side: which of these senders will carry the replicated pools.
+
+        Mirrors each sender's own ``should_send_pool``; a rank's TP index is ``rank % tp_size``.
+        """
+        return [
+            self.elects_fan_in_owner(
+                sender_tp_rank=rank % peer_ri.tp_size,
+                sender_tp_size_per_dp_group=peer_ri.tp_size_per_dp_group,
+                receiver_tp_size_per_dp_group=self._ri.tp_size_per_dp_group,
+                receiver_dp_rank=self._ri.dp_rank,
+            )
+            for rank in sender_ranks
+        ]
+
+    def _owns_tp_fan_in(self, peer_rank_info: RankInfo) -> bool:
+        """Elect one owner when replicated bytes fan in across TP ranks (sender side)."""
+        return self.elects_fan_in_owner(
+            sender_tp_rank=self._ri.tp_rank,
+            sender_tp_size_per_dp_group=self._ri.tp_size_per_dp_group,
+            receiver_tp_size_per_dp_group=peer_rank_info.tp_size_per_dp_group,
+            receiver_dp_rank=peer_rank_info.dp_rank,
         )
-        self_tp_rank = self._ri.tp_rank % self._ri.tp_size_per_dp_group
-        return self_tp_rank % ratio == peer_rank_info.dp_rank % ratio
 
     def should_send_pool(
         self,

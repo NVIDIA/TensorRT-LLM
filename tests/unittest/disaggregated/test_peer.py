@@ -720,6 +720,57 @@ def test_replicated_pool_owner_rotates_by_destination_dp_rank(peer_dp_rank):
     assert ownership.index(True) == peer_dp_rank % 8
 
 
+@pytest.mark.parametrize("sender_tp,receiver_tp_per_dp", [(2, 1), (4, 1), (8, 1), (4, 2), (2, 2)])
+@pytest.mark.parametrize("receiver_dp_rank", [0, 1, 3])
+def test_receiver_predicts_the_same_replicated_owner_as_the_senders(
+    sender_tp, receiver_tp_per_dp, receiver_dp_rank
+):
+    """Receiver and senders must elect the same replicated-pool owner.
+
+    The receiver sizes bounce sub-regions from its own prediction, so a disagreement would hand
+    the elected sender too small a sub-region and its write would run into the next writer's.
+    """
+    page_table = make_page_table(global_layer_ids=[0])
+    page_table.layer_groups[0].pool_views[0].mapper_kind = MapperKind.REPLICATED
+
+    receiver_ri = make_rankinfo(
+        instance_name="gen",
+        tp_size=receiver_tp_per_dp * 8,
+        dp_size=8,
+        dp_rank=receiver_dp_rank,
+        enable_attention_dp=receiver_tp_per_dp == 1,
+        page_table=page_table,
+        layer_num_per_pp=[1],
+    )
+    sender_ri = make_rankinfo(
+        instance_name="ctx",
+        tp_size=sender_tp,
+        page_table=page_table,
+        layer_num_per_pp=[1],
+    )
+
+    # What each sender decides for itself.
+    overlap = PeerOverlap()
+    decided = [
+        _make_peer_registrar(
+            make_rankinfo(
+                instance_name="ctx",
+                tp_size=sender_tp,
+                tp_rank=tp_rank,
+                page_table=page_table,
+                layer_num_per_pp=[1],
+            )
+        ).should_send_pool(overlap, receiver_ri, 0, 0)
+        for tp_rank in range(sender_tp)
+    ]
+    # What the receiver predicts for those same senders.
+    predicted = _make_peer_registrar(receiver_ri).fan_in_replicated_owners(
+        sender_ri, list(range(sender_tp))
+    )
+
+    assert predicted == decided
+
+
 def test_peer_registrar_tpb_divisible_warns_but_compatible():
     # local=16, peer=32: 32 % 16 == 0 → compatible with warning, register succeeds
     self_rankinfo = make_rankinfo(instance_name="local", tokens_per_block=16)
