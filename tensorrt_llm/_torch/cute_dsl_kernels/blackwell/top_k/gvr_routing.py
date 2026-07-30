@@ -52,10 +52,17 @@ SKIP_MIN_N_COUNTS = 65536  # va: attach block_max unconditionally here up
 SKIP_MIN_N_RUNGS_FLASH = 131072  # vb (flash): bm pays from here
 SKIP_CS_MIN_N_RUNGS = 196608  # vb: cluster split on top of bm from here
 
-# Emission tax ~ B*N on the GEMM side: the candidate list is only worth
-# emitting for latency-bound shapes (small B, long rows).
+# The emission tax is a fraction of the indexer's own time (list ~9-14%,
+# counts ~2%), so in absolute terms it grows with B*N while the top-k
+# saving does not. That gives three regimes, measured over the 126-cell
+# worst-step grid and checked at both ends of the tax range:
+#   long rows, small batch  -> the list repays its tax several times over
+#   large batch             -> emit nothing; the rungs tier has no tax
+#   otherwise               -> counts, whose tax is small either way
 LIST_EMIT_MAX_B = 16
-LIST_EMIT_MIN_N = 65536
+LIST_EMIT_MIN_N = 32768
+# Above this batch even the counts tax outruns what it buys.
+RUNGS_MIN_B = 32
 
 # rungs-tier block_max pays only at small K: with K=1024 the tight-line
 # pass rate runs too high and the prefix read is pure overhead.
@@ -97,8 +104,10 @@ def plan_emission(batch: int, n_comp: int, k: int, have_epilogue: bool) -> str:
     if not have_epilogue:
         return "rungs"  # closed-loop lines cost nothing to carry
     if batch <= LIST_EMIT_MAX_B and n_comp >= LIST_EMIT_MIN_N:
-        return "list"  # latency-bound long rows: list pays big
-    return "counts"  # near-free tax, wins almost everywhere
+        return "list"
+    if batch >= RUNGS_MIN_B:
+        return "rungs"  # throughput regime: emitting anything is a loss
+    return "counts"
 
 
 def pick_config(tier: str, batch: int, n_comp: int, k: int, num_sms: int) -> TopkRoute:
