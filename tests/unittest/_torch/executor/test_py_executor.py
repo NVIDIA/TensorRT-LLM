@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -23,7 +26,11 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    DisaggTransferAdmissionController,
+    PyExecutor,
+    _diagnostic_disagg_admission_bypass_enabled,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
@@ -301,6 +308,24 @@ def _make_disagg_transfer_request(
 
 
 class TestDisaggTransferAdmissionController:
+    @pytest.mark.parametrize(
+        ("raw_value", "enabled"),
+        [
+            (None, False),
+            ("0", False),
+            ("true", False),
+            ("1", True),
+        ],
+    )
+    def test_diagnostic_admission_bypass_is_default_off(self, monkeypatch, raw_value, enabled):
+        env_name = "TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS"
+        if raw_value is None:
+            monkeypatch.delenv(env_name, raising=False)
+        else:
+            monkeypatch.setenv(env_name, raw_value)
+
+        assert _diagnostic_disagg_admission_bypass_enabled() is enabled
+
     def test_disabled_preserves_candidates(self):
         controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer=None, tokens_per_block=32
@@ -364,7 +389,8 @@ class TestDisaggTransferAdmissionController:
         assert result.admitted_requests == [request]
         assert result.admitted_transfer_blocks == 3
 
-    def test_apply_reverts_deferred_v2_allocations(self):
+    def test_default_off_applies_gate_and_reverts_v2_allocations(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS", raising=False)
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
         executor._is_kv_manager_v2 = True
@@ -412,6 +438,87 @@ class TestDisaggTransferAdmissionController:
 
         assert admitted == []
         assert wait_for_progress
+        executor._revert_ctx_alloc.assert_not_called()
+
+    def test_diagnostic_bypass_preserves_order_and_allocations(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS", "1")
+        log_info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = [_make_disagg_transfer_request(9001, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidates = [
+            _make_disagg_transfer_request(9002, 32),
+            _make_disagg_transfer_request(9003, 32),
+        ]
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, candidates
+        )
+
+        assert admitted is candidates
+        assert not wait_for_progress
+        executor._revert_ctx_alloc.assert_not_called()
+        log_info.assert_called_once()
+        marker = log_info.call_args.args[0]
+        assert "DIAGNOSTIC OBSERVED" in marker
+        assert "2 candidate requests" in marker
+        assert "would admit 0 and defer 2" in marker
+        assert "active transfer blocks=1" in marker
+        assert "default admitted transfer blocks=0" in marker
+        assert "budget=1" in marker
+        assert "9001" not in marker
+        assert "9002" not in marker
+        assert "9003" not in marker
+
+    def test_diagnostic_bypass_marker_is_deferred_and_one_shot(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS", "1")
+        log_info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", log_info)
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = False
+        executor.active_requests = []
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidate = _make_disagg_transfer_request(9001, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+
+        assert admitted == [candidate]
+        assert not wait_for_progress
+        log_info.assert_not_called()
+
+        executor.active_requests = [_make_disagg_transfer_request(9002, 32, in_progress=True)]
+        for _ in range(2):
+            admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+                executor, [candidate]
+            )
+            assert admitted == [candidate]
+            assert not wait_for_progress
+
+        log_info.assert_called_once()
+
+    def test_diagnostic_bypass_suppresses_direct_pp_revert(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS", "1")
+        executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        admitted = _make_disagg_transfer_request(9001, 32)
+        deferred = _make_disagg_transfer_request(9002, 32)
+
+        PyExecutor._revert_deferred_disagg_gen_init_alloc(
+            executor, [admitted, deferred], [admitted]
+        )
+
         executor._revert_ctx_alloc.assert_not_called()
 
 

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import functools
@@ -102,6 +105,9 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS_ENV = (
+    "TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS")
+
 
 class PPCommTag(IntEnum):
     """
@@ -151,6 +157,10 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     if not mm_data:
         return
     strip_mm_data_for_generation(mm_data)
+
+
+def _diagnostic_disagg_admission_bypass_enabled() -> bool:
+    return os.getenv(_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS_ENV) == "1"
 
 
 @dataclasses.dataclass
@@ -2739,6 +2749,11 @@ class PyExecutor:
                 and controller.enabled() and fitting_disagg_gen_init_requests):
             return fitting_disagg_gen_init_requests, False
 
+        if _diagnostic_disagg_admission_bypass_enabled():
+            self._observe_diagnostic_disagg_admission_bypass(
+                controller, fitting_disagg_gen_init_requests)
+            return fitting_disagg_gen_init_requests, False
+
         admission_result = controller.select(self.active_requests,
                                              fitting_disagg_gen_init_requests)
         if admission_result.deferred_request_count > 0:
@@ -2757,9 +2772,31 @@ class PyExecutor:
         return (admission_result.admitted_requests,
                 admission_result.is_blocked_by_active_transfers())
 
+    def _observe_diagnostic_disagg_admission_bypass(
+            self, controller: DisaggTransferAdmissionController,
+            candidates: List[LlmRequest]) -> None:
+        if getattr(self, "_diagnostic_disagg_admission_bypass_observed", False):
+            return
+
+        default_result = controller.select(self.active_requests, candidates)
+        if default_result.deferred_request_count == 0:
+            return
+
+        self._diagnostic_disagg_admission_bypass_observed = True
+        logger.info(
+            "DIAGNOSTIC OBSERVED: disaggregated admission bypass preserved "
+            f"{len(candidates)} candidate requests while the default gate "
+            f"would admit {len(default_result.admitted_requests)} and defer "
+            f"{default_result.deferred_request_count}; active transfer blocks="
+            f"{default_result.active_transfer_blocks}, default admitted "
+            f"transfer blocks={default_result.admitted_transfer_blocks}, "
+            f"budget={controller.max_transfer_blocks}")
+
     def _revert_deferred_disagg_gen_init_alloc(
             self, candidates: List[LlmRequest],
             admitted_requests: List[LlmRequest]) -> None:
+        if _diagnostic_disagg_admission_bypass_enabled():
+            return
         if not (self._uses_kv_manager_v2() and candidates):
             return
 
