@@ -58,6 +58,7 @@ from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     strip_string,
 )
 from tensorrt_llm.inputs.content_format import ContentFormat
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.sampling_params import SamplingParams
 
 # ===========================================================================
@@ -301,14 +302,30 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
 # correctly-ordered OpenAI content list.
 
 
-# Uses ``gemma3`` by default because it is always registered regardless of
-# transformers version; the wrapper's interleave logic itself is generic.
-def _make_multimodal_wrapper(model_type: str = "gemma3") -> MultimodalLmEvalWrapper:
+# Interleaving is opt-in per model: the wrapper reads
+# ``MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(model_type)``
+# at construction, and models that don't opt in keep the historical
+# strip-and-bulk-insert behaviour. These tests drive that flag directly
+# instead of naming an opted-in model, because which models are registered
+# varies with the installed transformers version — keying on a real model
+# name would make the tests environment-dependent. ``interleave=False``
+# (the default here) matches an unregistered model such as ``gemma3``.
+def _make_multimodal_wrapper(
+    model_type: str = "gemma3",
+    interleave: bool = False,
+) -> MultimodalLmEvalWrapper:
     fake_llm = MagicMock()
     fake_llm.tokenizer = MagicMock()
     fake_llm.input_processor = MagicMock()
     fake_llm.input_processor.processor = MagicMock()
-    with patch.object(MultimodalLmEvalWrapper, "_get_model_type", return_value=model_type):
+    with (
+        patch.object(MultimodalLmEvalWrapper, "_get_model_type", return_value=model_type),
+        patch.object(
+            MULTIMODAL_PLACEHOLDER_REGISTRY,
+            "get_interleave_placeholders",
+            return_value=interleave,
+        ),
+    ):
         return MultimodalLmEvalWrapper(
             fake_llm,
             sampling_params=None,
@@ -350,8 +367,8 @@ def _call_apply(wrapper, text: str, *, content_format: ContentFormat):
     return convs[0]
 
 
-def test_single_image_does_not_interleave():
-    """Single-image prompts never need interleaving.
+def test_not_opted_in_model_does_not_interleave():
+    """A model that does not opt in keeps the historical bulk-insert path.
 
     content_parts stays absent so the existing BEFORE_TEXT default keeps working.
     """
@@ -367,7 +384,7 @@ def test_multi_image_openai_builds_content_parts():
 
     ``_build_openai_content`` then emits media entries at the correct positions.
     """
-    wrapper = _make_multimodal_wrapper()
+    wrapper = _make_multimodal_wrapper(interleave=True)
     ph = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
     text = f"Consider {ph}. What does {ph} show?"
     conv = _call_apply(wrapper, text, content_format=ContentFormat.OPENAI)
@@ -383,8 +400,8 @@ def test_multi_image_openai_builds_content_parts():
     assert [p["media_index"] for p in media_parts] == [0, 1]
 
 
-def test_multi_image_string_format_skips_interleave():
-    """STRING-format chat templates skip the interleaving path.
+def test_multi_image_string_format_not_opted_in_uses_placeholders():
+    """STRING-format templates on a non-opted-in model use flat placeholders.
 
     Placeholders are inserted into the flat text via
     ``add_multimodal_placeholders`` instead, so ``content_parts`` stays absent.
@@ -406,7 +423,7 @@ def test_trailing_text_after_last_image_preserved():
     Otherwise the question suffix ('Answer:') is dropped before it reaches
     the model.
     """
-    wrapper = _make_multimodal_wrapper()
+    wrapper = _make_multimodal_wrapper(interleave=True)
     ph = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
     text = f"Compare {ph} with {ph}. Answer with a letter."
     conv = _call_apply(wrapper, text, content_format=ContentFormat.OPENAI)
@@ -421,7 +438,7 @@ def test_leading_image_no_empty_text_segment():
 
     content_parts must begin with the image entry itself.
     """
-    wrapper = _make_multimodal_wrapper()
+    wrapper = _make_multimodal_wrapper(interleave=True)
     ph = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
     text = f"{ph} {ph} Answer?"
     conv = _call_apply(wrapper, text, content_format=ContentFormat.OPENAI)
