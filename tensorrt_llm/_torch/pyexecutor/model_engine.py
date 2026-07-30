@@ -3945,8 +3945,14 @@ class PyTorchModelEngine(ModelEngine):
         ]  # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
         mrope_delta_write_seq_slots = []
         mrope_delta_read_seq_slots = []
+        # Whether any generation request in this batch carries real MRoPE
+        # metadata; see the post-loop cleanup below.
+        has_gen_mrope_delta = False
         # Extra model-side cache slot reserved for CUDA graph / warmup dummy
-        # requests, whose outputs are discarded.
+        # requests, whose outputs are discarded, and for generation requests
+        # that carry no MRoPE metadata at all. The cache is zero-initialized and
+        # the write path only ever targets real ``py_seq_slot``s, so this slot
+        # permanently reads back a zero delta.
         mrope_dummy_seq_slot = self.max_num_tokens * self.mapping.pp_size
         num_accepted_draft_tokens = []  # per request
         is_enc_dec = self._is_encoder_decoder_model()
@@ -4098,16 +4104,25 @@ class PyTorchModelEngine(ModelEngine):
                                                 "multimodal_data_device_paths",
                                                 None))
                 if _use_mrope:
-                    mrope_config = multimodal_params.multimodal_data[
-                        'mrope_config']
-                    mrope_pos_ids = mrope_config['mrope_position_ids']
-                    ctx_mrope_position_ids = mrope_pos_ids[:, :, begin_compute:
-                                                           begin_compute +
-                                                           len(prompt_tokens)]
-                    # Record as (start_idx, end_idx, (3,1,L) mrope_pos_ids)
-                    mrope_position_ids.append(
-                        (len(position_ids) - len(prompt_tokens),
-                         len(position_ids), ctx_mrope_position_ids))
+                    # A request may carry multimodal content but no MRoPE
+                    # metadata (a text-only prompt whose input processor skips
+                    # ``mrope_config``, or a model that does not consume it).
+                    # Its per-axis positions are just the scalar positions,
+                    # which the (3,1,N) seeding further below already
+                    # broadcasts, so leave that span alone.
+                    mrope_config = multimodal_params.multimodal_data.get(
+                        'mrope_config') or {}
+                    mrope_pos_ids = mrope_config.get('mrope_position_ids')
+                    if mrope_pos_ids is not None:
+                        ctx_mrope_position_ids = mrope_pos_ids[:, :,
+                                                               begin_compute:
+                                                               begin_compute +
+                                                               len(prompt_tokens
+                                                                   )]
+                        # Record as (start_idx, end_idx, (3,1,L) mrope_pos_ids)
+                        mrope_position_ids.append(
+                            (len(position_ids) - len(prompt_tokens),
+                             len(position_ids), ctx_mrope_position_ids))
                     mrope_position_delta = mrope_config.get(
                         'mrope_position_deltas')
                     if mrope_position_delta is not None:
@@ -4418,19 +4433,21 @@ class PyTorchModelEngine(ModelEngine):
                                                    "py_mrope_position_delta",
                                                    None)
                     if mrope_position_delta is None and request.py_multimodal_data:
-                        mrope_config = request.py_multimodal_data[
-                            'mrope_config']
-                        mrope_position_delta = mrope_config[
-                            'mrope_position_deltas']
-                        if mrope_position_delta.device.type == "cpu":
-                            mrope_position_delta = maybe_pin_memory(
-                                mrope_position_delta).to(device='cuda',
-                                                         dtype=torch.int32,
-                                                         non_blocking=True)
-                            mrope_config[
-                                'mrope_position_deltas'] = mrope_position_delta
-                        request.py_mrope_position_delta = mrope_position_delta
+                        mrope_config = request.py_multimodal_data.get(
+                            'mrope_config') or {}
+                        mrope_position_delta = mrope_config.get(
+                            'mrope_position_deltas')
+                        if mrope_position_delta is not None:
+                            if mrope_position_delta.device.type == "cpu":
+                                mrope_position_delta = maybe_pin_memory(
+                                    mrope_position_delta).to(device='cuda',
+                                                             dtype=torch.int32,
+                                                             non_blocking=True)
+                                mrope_config[
+                                    'mrope_position_deltas'] = mrope_position_delta
+                            request.py_mrope_position_delta = mrope_position_delta
                     if mrope_position_delta is not None:
+                        has_gen_mrope_delta = True
                         # NOTE: Expanding position_ids to 3D tensor who is using mrope
                         gen_mrope_position_ids = (past_seen_token_num +
                                                   mrope_position_delta).expand(
@@ -4464,6 +4481,21 @@ class PyTorchModelEngine(ModelEngine):
                                  gen_mrope_position_ids))
                             mrope_delta_read_seq_slots.append(
                                 delta_read_seq_slot)
+                    else:
+                        # No MRoPE metadata for this request (text-only prompt
+                        # on an MRoPE model): its delta is zero by construction,
+                        # so read the reserved zero slot instead of skipping the
+                        # append. The kernel indexes ``mrope_position_deltas``
+                        # by *generation batch index*
+                        # (decoderMaskedMultiheadAttentionTemplate.h), so a list
+                        # that is sparse w.r.t. the generation batch would
+                        # silently shift every later request onto another
+                        # request's delta. No ``mrope_position_ids`` span is
+                        # recorded: the broadcast scalar position is already
+                        # this request's answer on all three axes.
+                        for _ in range(beam_width):
+                            mrope_delta_read_seq_slots.append(
+                                mrope_dummy_seq_slot)
                 # Equivalent to the original `is_generation_admission and
                 # request.py_multimodal_data`. The batch-level flag is checked
                 # first so non-multimodal models pay one LOAD_FAST per request
@@ -4480,6 +4512,14 @@ class PyTorchModelEngine(ModelEngine):
                 # to prevent access errors due to None values
                 if not request.is_cuda_graph_dummy:
                     gen_request_seq_slots.append(request.py_seq_slot)
+
+        if _use_mrope and not has_gen_mrope_delta:
+            # Every generation request in this batch resolved to the zero slot,
+            # so the gathered deltas would be an all-zero vector -- identical to
+            # passing no deltas at all. Dropping the list keeps the steady-state
+            # generation fast path (which requires the mrope lists to be empty)
+            # reachable for text-only batches on MRoPE models.
+            mrope_delta_read_seq_slots.clear()
 
         previous_batch_len = len(previous_batch_indices)
 

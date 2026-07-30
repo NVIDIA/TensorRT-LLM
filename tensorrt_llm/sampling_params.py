@@ -25,7 +25,7 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
-MAX_TOP_LOGPROBS = 20
+MAX_TOP_LOGPROBS = 100
 
 
 def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
@@ -442,7 +442,7 @@ class SamplingParams:
             raise ValueError("logprobs_simple_format is not supported with beam search")
 
     # NB: The predicates below are static because downstream code (e.g.
-    #     sampling_utils.resolve_sampling_strategy) only holds instances of
+    #     sampler_strategy.resolve_sampling_strategy) only holds instances of
     #     bindings.SamplingConfig (not SamplingParams). They are the single
     #     source of truth for the greedy / top-p-decay resolution shared by
     #     _greedy_decoding and the torch sampler.
