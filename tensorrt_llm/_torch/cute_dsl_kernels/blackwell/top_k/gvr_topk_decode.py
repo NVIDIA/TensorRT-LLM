@@ -280,7 +280,7 @@ class GvrTopKKernel:
         pdl_wait_late: bool = True,
         p4_fine_rangetest: Optional[bool] = None,
         p4_lane_binsum: bool = True,
-        p4_scat_rangetest: bool = True,
+        p4_scat_rangetest: bool = False,
         enable_r0: bool = True,
         accept_cap: "int | None" = None,
         kc_override: "int | None" = None,
@@ -562,12 +562,15 @@ class GvrTopKKernel:
         # p4_fine_rangetest: the fine recursion exists only to locate
         # the handful of candidates inside the straddling coarse bin, so
         # filter them with a value-range compare instead of recomputing
-        # each candidate's bin (subtract + multiply + two clamps). It is
-        # 44% of Phase 4 on the small-N cells. Caching the candidates in
-        # registers during the coarse build was measured and rejected:
-        # the extra live registers push the fp32 kernel past its budget
-        # (0.95-0.99x on 4 of 5 cells).
-        self.p4_fine_rangetest = True if p4_fine_rangetest is None else bool(p4_fine_rangetest)
+        # each candidate's bin (subtract + multiply + two clamps).
+        # DEFAULT OFF - not bit-equivalent to the bin recompute it
+        # replaces. v in [f_lo, f_hi) and floor((v - bmin) * inv1) ==
+        # b_star agree in exact arithmetic but not in fp32, and the
+        # scatter below still classifies by bin recompute. A candidate
+        # the two passes disagree on is counted by one and placed by the
+        # other, leaving one output slot unwritten (observed on a real
+        # 256k chain row: 1023 of 1024 filled, last slot -1).
+        self.p4_fine_rangetest = False if p4_fine_rangetest is None else bool(p4_fine_rangetest)
         # p4_lane_binsum: the per-warp bin sums that open both bin
         # searches indexed by warp only, so all 32 lanes walked the same
         # bins_per_warp bins - a dependency chain as long as the segment,
@@ -579,6 +582,10 @@ class GvrTopKKernel:
         # bin index to do it; the same value-range compare the fine
         # recursion uses answers it without the subtract, multiply and
         # two clamps per candidate.
+        # DEFAULT OFF - same fp32 non-equivalence as p4_fine_rangetest,
+        # in the opposite direction: the range test admits a candidate
+        # the histogram binned elsewhere, so the scatter writes past the
+        # rank it reserved and out-of-range indices reach the output.
         self.p4_scat_rangetest = bool(p4_scat_rangetest)
         self.r0_qfracs = tuple(float(q) for q in r0_qfracs) if r0_qfracs else ()
         if self.r0_qfracs:
