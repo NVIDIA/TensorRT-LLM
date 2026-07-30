@@ -77,6 +77,8 @@ class LmEvalWrapper(TemplateLM):
         # task yaml's max_gen_toks. Opt-in for thinking models (e.g. Kimi K2.5)
         # whose chain-of-thought output exceeds lm-eval's default (~512).
         self.preserve_caller_max_tokens = preserve_caller_max_tokens
+        # The clamp below is per-request; warn about it only once per run.
+        self._warned_max_tokens_clamp = False
 
     @property
     def eot_token_id(self) -> int:
@@ -146,15 +148,26 @@ class LmEvalWrapper(TemplateLM):
         for lm_eval_key, trtllm_key in params_mapping.items():
             value = gen_kwargs.pop(lm_eval_key, None)
             if value is not None and lm_eval_key not in override_keys:
-                # Opt-in: keep the larger caller max_tokens. lm-eval tasks set
-                # a default budget (e.g. 512 for MMMU) which is too small when
-                # thinking mode produces long chain-of-thought output. Default
-                # OFF to preserve behavior for non-thinking models.
-                if (trtllm_key == "max_tokens"
-                        and self.preserve_caller_max_tokens):
+                if trtllm_key == "max_tokens":
                     current = getattr(sampling_params, trtllm_key, None)
                     if current is not None and current > value:
-                        continue
+                        # Opt-in: keep the larger caller max_tokens. lm-eval
+                        # tasks set a default budget (e.g. 512 for MMMU, 32768
+                        # for AIME) which is too small when thinking mode
+                        # produces long chain-of-thought output. Default OFF to
+                        # preserve behavior for non-thinking models.
+                        if self.preserve_caller_max_tokens:
+                            continue
+                        # Otherwise the caller's --max_output_length is about to
+                        # be discarded. Say so — silently reporting a score
+                        # computed under a smaller budget is the real hazard.
+                        if not self._warned_max_tokens_clamp:
+                            self._warned_max_tokens_clamp = True
+                            logger.warning(
+                                f"Overriding max_tokens={current} with the task "
+                                f"yaml's max_gen_toks={value}. Pass "
+                                f"--preserve_caller_max_tokens to keep the "
+                                f"larger caller value.")
                 setattr(sampling_params, trtllm_key, value)
         return sampling_params
 
@@ -620,11 +633,13 @@ class LmEvalEvaluator(Evaluator):
             output_dir=self.output_dir,
             sampling_override=sampling_override,
         )
-        # post_process_fn / preserve_caller_max_tokens only consumed by multimodal.
+        # Both wrappers accept preserve_caller_max_tokens; text tasks need it
+        # too (the aime yaml pins max_gen_toks=32768).
+        lm_kwargs[
+            "preserve_caller_max_tokens"] = self.preserve_caller_max_tokens
+        # post_process_fn is only consumed by multimodal.
         if self.MULTIMODAL:
             lm_kwargs["post_process_fn"] = self.post_process_fn
-            lm_kwargs[
-                "preserve_caller_max_tokens"] = self.preserve_caller_max_tokens
 
         results = lm_eval.evaluate(
             lm=lm_cls(llm, **lm_kwargs),
@@ -1577,6 +1592,13 @@ class AIME2026(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="Directory to save the task infos.")
+    @click.option(
+        "--preserve_caller_max_tokens",
+        is_flag=True,
+        default=False,
+        help="Keep --max_output_length when larger than the lm-eval task "
+        "default (the aime yaml pins max_gen_toks=32768, which truncates "
+        "long-CoT thinking models mid-chain).")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -1694,6 +1716,13 @@ class AIME2025(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="Directory to save the task infos.")
+    @click.option(
+        "--preserve_caller_max_tokens",
+        is_flag=True,
+        default=False,
+        help="Keep --max_output_length when larger than the lm-eval task "
+        "default (the aime yaml pins max_gen_toks=32768, which truncates "
+        "long-CoT thinking models mid-chain).")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
