@@ -2125,8 +2125,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional_v2(
                                               expected_count=3,
                                               timeout=60)
         assert any(
-            record.get("worker", {}).get("server_kind") == "disagg"
-            and {"ctx", "gen"} <= record.get("phases", {}).keys()
+            {"ctx_perf_metrics", "gen_perf_metrics"} <= record.keys()
             for record in records
         ), "new prompt did not produce routed context and generation metrics"
 
