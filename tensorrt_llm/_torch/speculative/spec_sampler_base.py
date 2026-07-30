@@ -175,6 +175,26 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
+    @staticmethod
+    def _verified_len(request: LlmRequest, runtime_draft_len: int) -> int:
+        """How many draft positions THIS request was given to verify.
+
+        Uniform scheduling gives every request the batch-wide
+        ``runtime_draft_len``; ragged (per-request) verification does not, and
+        the KV rewind below is computed per request:
+
+            rewind = verified_positions - accepted_positions
+
+        Using the batch-wide value under ragged verification rewinds the wrong
+        amount for every request that got a shorter window -- silently dropping
+        or keeping KV entries, i.e. wrong output with no error anywhere.
+
+        ``py_verify_len`` is set only by the ragged path, so this is exactly
+        today's behavior for every other speculation mode.
+        """
+        per_request = getattr(request, "py_verify_len", None)
+        return runtime_draft_len if per_request is None else int(per_request)
+
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -208,7 +228,9 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 ):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+            req.py_rewind_len = (
+                self._verified_len(req, runtime_draft_len) - req.py_num_accepted_draft_tokens
+            )
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(

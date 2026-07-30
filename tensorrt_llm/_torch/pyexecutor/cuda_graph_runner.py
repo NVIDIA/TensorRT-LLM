@@ -135,6 +135,10 @@ class CUDAGraphRunner:
         self.spec_config = config.spec_config
         self.sparse_config = config.sparse_attention_config
         self.is_encoder_decoder = config.is_encoder_decoder
+        # Window each ragged padding row carries, in py_verify_len units. Set
+        # by ModelEngine.fit_ragged_verify_lens when it picks the token bucket;
+        # the padding rows are one shared dummy object so they all share it.
+        self.ragged_pad_verify_len = 0
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
@@ -265,7 +269,37 @@ class CUDAGraphRunner:
                 set(draft_len_list)) == 1, "All draft lengths must be the same"
             key = (batch_size, draft_len, False, short_seq_len_mode,
                    is_all_greedy_sample)
+            # Ragged verification breaks the link between the row count and the
+            # token count: the block is still drafted in full (so draft_len is
+            # unchanged) but the number of positions actually verified varies,
+            # and that flat token count is baked into the captured graph. Add it
+            # as a second axis. The element is absent for every uniform batch,
+            # so those keys stay exactly what they were.
+            #
+            # Derived from the batch rather than plumbed in, because this runs
+            # inside pad_batch: the padding rows are already present and must be
+            # counted, and the scheduler has already fitted the total onto a
+            # captured bucket (see ModelEngine.fit_ragged_verify_lens).
+            verify_bucket = self._ragged_verify_bucket(batch)
+            if verify_bucket is not None:
+                key = key + (verify_bucket, )
         return key
+
+    @staticmethod
+    def _ragged_verify_bucket(batch: ScheduledRequests) -> Optional[int]:
+        """Total verified token count when the batch uses ragged windows.
+
+        None unless *every* generation request carries a window, so a batch the
+        scheduler declined to make ragged -- or any non-DSpark batch -- keeps
+        the original key.
+        """
+        total = 0
+        for request in batch.generation_requests:
+            verify_len = getattr(request, "py_verify_len", None)
+            if verify_len is None:
+                return None
+            total += 1 + int(verify_len)
+        return total if total else None
 
     @staticmethod
     def _get_mrope_position_delta(request: Any) -> Optional[Any]:
@@ -615,6 +649,18 @@ class CUDAGraphRunner:
             self.padding_dummy_requests[runtime_draft_len] = dummy_request
 
         padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
+        # Under ragged verification the padding rows are part of the token
+        # budget the scheduler fitted onto a captured bucket. The scheduler
+        # decided their (uniform) window when it chose the bucket -- it has to,
+        # because these rows are one shared object and cannot carry different
+        # values -- so read it back rather than assume. Cleared otherwise: the
+        # dummy is cached across steps and would carry a stale window into a
+        # uniform batch.
+        ragged = any(
+            getattr(request, "py_verify_len", None) is not None
+            for request in batch.generation_requests)
+        padding_dummy_request.py_verify_len = (self.ragged_pad_verify_len
+                                               if ragged else None)
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
 

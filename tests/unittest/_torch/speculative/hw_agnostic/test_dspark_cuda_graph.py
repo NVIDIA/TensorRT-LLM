@@ -250,3 +250,105 @@ def test_batched_attention_cuda_graph_capture_replay():
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(out, eager, rtol=2e-2, atol=2e-2)
+
+
+# --------------------------------------------------------------------------
+# Confidence-scheduled verification: the scoring path must be graph-capturable.
+#
+# DSpark is a one-engine drafter, so its worker forward runs INSIDE the target's
+# CUDA graph. Anything the confidence head adds to that forward has to capture.
+# The head itself is a fixed-shape Linear, but the surrounding code is where
+# capture breaks: the previous implementation followed it with a `.item()` and a
+# `torch.nonzero`, both of which are illegal under capture.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
+@pytest.mark.parametrize("with_markov", [False, True])
+def test_confidence_head_is_cuda_graph_capturable(with_markov):
+    from tensorrt_llm._torch.models.dspark.heads import DSparkConfidenceHead
+
+    B, BLK, HID, RANK = 4, 5, 32, 16
+    head = (
+        DSparkConfidenceHead(
+            hidden_size=HID, markov_rank=RANK, with_markov=with_markov, block_size=BLK
+        )
+        .cuda()
+        .eval()
+    )
+    hid = torch.randn(B, BLK, HID, device="cuda")
+    prev = torch.randn(B, BLK, RANK, device="cuda") if with_markov else None
+    out = torch.empty(B, BLK, device="cuda", dtype=torch.float32)
+
+    def run():
+        return head.apply_sts(head(hid, prev_embeddings=prev))
+
+    # Warm up on a side stream, as CUDA graph capture requires.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(s)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out.copy_(run())
+
+    eager = run()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.allclose(out, eager, atol=1e-5), "replay diverged from eager"
+    assert torch.all((out >= 0.0) & (out <= 1.0)), "calibrated confidence must be a probability"
+
+    # New inputs must flow through on replay -- a graph that captured constants
+    # would keep returning the old scores and silently freeze the scheduler.
+    hid.copy_(torch.randn_like(hid))
+    fresh = run()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.allclose(out, fresh, atol=1e-5), "replay ignored updated inputs"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
+def test_sts_table_update_is_visible_to_a_captured_graph():
+    """STS must be updated in place; rebinding the buffer would be invisible.
+
+    ``nn.Module.__setattr__`` on a registered buffer replaces the tensor object,
+    changing its data_ptr. A graph captured before that keeps reading the OLD
+    storage, so calibration would silently not apply.
+    """
+    from tensorrt_llm._torch.models.dspark.heads import DSparkConfidenceHead
+
+    B, BLK, HID = 2, 5, 32
+    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK).cuda().eval()
+    hid = torch.randn(B, BLK, HID, device="cuda")
+    out = torch.empty(B, BLK, device="cuda", dtype=torch.float32)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            head.apply_sts(head(hid))
+    torch.cuda.current_stream().wait_stream(s)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out.copy_(head.apply_sts(head(hid)))
+
+    g.replay()
+    torch.cuda.synchronize()
+    before = out.clone()
+
+    storage_before = head.sts_temperatures.data_ptr()
+    head.load_sts_temperatures(torch.full((BLK,), 4.0))
+    assert head.sts_temperatures.data_ptr() == storage_before, (
+        "load_sts_temperatures must write in place; rebinding hides it from the graph"
+    )
+
+    g.replay()
+    torch.cuda.synchronize()
+    assert not torch.allclose(out, before), (
+        "the captured graph did not see the new STS temperatures"
+    )
+    assert torch.allclose(out, torch.sigmoid(head(hid) / 4.0), atol=1e-5)

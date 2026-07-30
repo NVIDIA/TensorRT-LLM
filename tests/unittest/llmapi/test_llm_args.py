@@ -3815,3 +3815,51 @@ class TestGlm5TransceiverPreference:
         cfg = self._pretrained_config(["GlmMoeDsaForCausalLM"], "glm_moe_dsa")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+class TestDSparkConfidenceScheduling:
+    """Config surface for DSpark confidence-scheduled verification."""
+
+    def _cfg(self, **kw):
+        from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+        kw.setdefault("max_draft_len", 5)
+        return DSparkDecodingConfig(**kw)
+
+    def test_defaults_are_off(self):
+        c = self._cfg()
+        assert c.enable_confidence_scheduling is False
+        assert c.confidence_verify_len_tiers is None
+        # With scheduling off the ladder is just the static length.
+        assert c.verify_len_tiers == [5]
+
+    def test_knobs_require_the_master_switch(self):
+        for kw in ({
+                "confidence_sts_path": "/tmp/sts.json"
+        }, {
+                "confidence_sps_table_path": "/tmp/sps.json"
+        }, {
+                "confidence_verify_len_tiers": [1, 5]
+        }):
+            with pytest.raises(ValueError,
+                               match="enable_confidence_scheduling"):
+                self._cfg(**kw)
+
+    def test_default_ladder_is_derived_and_includes_the_full_block(self):
+        c = self._cfg(enable_confidence_scheduling=True)
+        assert c.verify_len_tiers == [1, 3, 5]
+
+    def test_full_block_is_always_reachable(self):
+        """The full block is the fallback when confidence is stale; keep it."""
+        c = self._cfg(enable_confidence_scheduling=True,
+                      confidence_verify_len_tiers=[1, 2])
+        assert c.verify_len_tiers[-1] == 5
+
+    def test_ladder_cannot_exceed_max_draft_len(self):
+        with pytest.raises(ValueError, match="exceeds max_draft_len"):
+            self._cfg(enable_confidence_scheduling=True,
+                      confidence_verify_len_tiers=[1, 9])
+
+    def test_ladder_is_deduped_and_sorted(self):
+        c = self._cfg(enable_confidence_scheduling=True,
+                      confidence_verify_len_tiers=[5, 1, 3, 3])
+        assert c.verify_len_tiers == [1, 3, 5]

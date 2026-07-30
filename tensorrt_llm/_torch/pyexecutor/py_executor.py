@@ -3186,6 +3186,97 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    def _dspark_confidence_draft_len(self,
+                                     scheduled_batch: ScheduledRequests) -> int:
+        """Draft length for this iteration, from the DSpark confidence planner.
+
+        Runs entirely outside CUDA-graph capture, which is what makes the
+        device->host relay legal: the worker writes confidence device-side inside
+        the captured graph, and this hook -- called before the next forward --
+        first *reads* the previously staged snapshot, then stages a fresh one.
+        That gives a one-iteration lag for free, with no synchronization.
+
+        Falls back to the full block on any missing piece, so an engine without a
+        confidence-capable checkpoint behaves exactly as before.
+        """
+        max_draft_len = self.model_engine.max_draft_len
+        worker = self.model_engine._get_spec_worker()
+        planner = getattr(worker, "verify_planner", None)
+        if planner is None:
+            return max_draft_len
+
+        num_gen_requests = len(scheduled_batch.generation_requests)
+
+        # Cross-rank agreement: draft_len is part of the CUDA-graph key but is
+        # NOT covered by the attention-DP consistency allgather, so ranks that
+        # pick different lengths select different graphs -- one replays, one
+        # falls back to eager -- and their collectives diverge. Reduce here.
+        #
+        # This costs one extra blocking host collective per decode step under
+        # ADP. ``_can_queue`` already runs ``tp_allgather(batch_size)`` just
+        # before this hook, so the two could be fused into a single
+        # ``[batch_size, local_draft_len]`` gather -- but that means computing
+        # the local draft length inside ``_can_queue``, which is a hot generic
+        # path shared by every speculation mode. Left separate deliberately;
+        # fuse only if the extra collective shows up in a profile.
+        all_rank_max = None
+        if self.dist is not None and getattr(self.dist, "tp_size", 1) > 1:
+
+            def all_rank_max(value: int) -> int:
+                return max(int(v) for v in self.dist.tp_allgather(int(value)))
+
+        ragged_lens = None
+        if getattr(self.model_engine.spec_config, "enable_ragged_verify",
+                   False):
+            ragged_lens = planner.decide_verify_lens(
+                num_gen_requests=num_gen_requests, all_rank_max=all_rank_max)
+
+        # Land the batch's token total on a captured bucket before the graph key
+        # is built, spending the rounding slack on real verification. A batch
+        # with no captured shape gets None back and falls through to uniform,
+        # which always has a graph -- running ragged without one would cost far
+        # more than the trimmed tokens save.
+        bucket = None
+        if ragged_lens is not None:
+            # Under ADP the batch is padded to the widest rank's request count,
+            # so the shape has to be chosen from every rank's (rows, tokens) --
+            # sizing it locally makes each rank pick a different bucket, i.e.
+            # a different graph.
+            peer_stats = None
+            if self.dist is not None and getattr(self.dist, "tp_size", 1) > 1:
+                peer_stats = self.dist.tp_allgather(
+                    [len(ragged_lens),
+                     sum(1 + int(v) for v in ragged_lens)])
+            bucket = self.model_engine.fit_ragged_verify_lens(
+                scheduled_batch.generation_requests,
+                ragged_lens,
+                peer_stats=peer_stats)
+        self.model_engine.ragged_verify_bucket = bucket
+
+        if bucket is not None:
+            # The block is always drafted in full -- only verification is
+            # trimmed -- so the batch-wide draft length stays at the top tier.
+            # That keeps the drafted-token buffer and the padded acceptance
+            # rectangle a fixed width; each request's own (smaller) verify
+            # window rides along on py_verify_len.
+            runtime_draft_len = max(
+                int(t) for t in self.model_engine.spec_config.verify_len_tiers)
+        else:
+            # Clear any window left over from a previous ragged step, otherwise
+            # a fallback iteration would keep trimming on a stale split.
+            for request in scheduled_batch.generation_requests:
+                request.py_verify_len = None
+            runtime_draft_len = planner.decide_draft_len(
+                num_gen_requests=num_gen_requests, all_rank_max=all_rank_max)
+
+        # Stage this step's confidence for the *next* decision. Non-blocking; if
+        # it has not landed by then the planner just verifies the full block.
+        rows = worker.staged_confidence_rows()
+        if rows is not None and rows.shape[0] > 0:
+            planner.stage_confidence(rows, rows.shape[0])
+
+        return int(runtime_draft_len)
+
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
         """Handle dynamic draft length for the current batch.
@@ -3213,19 +3304,31 @@ class PyExecutor:
             self.model_engine.runtime_draft_len = 0
             return
 
-        if (self.model_engine.spec_config is not None
-                and self.model_engine.spec_config.draft_len_schedule is not None
-                and self.model_engine.spec_config.spec_dec_mode.
-                support_dynamic_draft_len()):
+        spec_config = self.model_engine.spec_config
+        schedule_driven = (
+            spec_config is not None
+            and spec_config.draft_len_schedule is not None
+            and spec_config.spec_dec_mode.support_dynamic_draft_len())
+        # DSpark drives the draft length from the batch's confidence rather than
+        # from a static batch-size schedule, but consumes the exact same
+        # pad/truncate machinery below.
+        confidence_driven = (spec_config is not None and getattr(
+            spec_config, "enable_confidence_scheduling", False))
+
+        if schedule_driven or confidence_driven:
             from tensorrt_llm._torch.speculative.utils import \
                 get_draft_len_for_batch_size
 
-            spec_dec_mode = self.model_engine.spec_config.spec_dec_mode
+            spec_dec_mode = spec_config.spec_dec_mode
 
-            # 1. Resolve runtime draft length from schedule
-            runtime_draft_len = get_draft_len_for_batch_size(
-                self.model_engine.spec_config.draft_len_schedule,
-                scheduled_batch.batch_size, self.model_engine.max_draft_len)
+            # 1. Resolve runtime draft length
+            if confidence_driven:
+                runtime_draft_len = self._dspark_confidence_draft_len(
+                    scheduled_batch)
+            else:
+                runtime_draft_len = get_draft_len_for_batch_size(
+                    spec_config.draft_len_schedule, scheduled_batch.batch_size,
+                    self.model_engine.max_draft_len)
             # 2. Pad or truncate draft tokens to the resolved length
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
             rejection_on = getattr(self.model_engine.spec_config,

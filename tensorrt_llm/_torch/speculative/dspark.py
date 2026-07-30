@@ -35,6 +35,10 @@ from .interface import SpecMetadata, SpecWorkerBase
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
 
+# Raw-logit fill for an unscored confidence slot: sigmoid(30) rounds to 1.0 in
+# fp32, so an unwritten row schedules as "verify the whole block".
+_NEUTRAL_CONFIDENCE_LOGIT = 30.0
+
 
 @dataclass
 class DSparkSpecMetadata(SpecMetadata):
@@ -189,8 +193,10 @@ class DSparkWorker(SpecWorkerBase):
     (``DSparkDraftModel.forward``): it projects the captured target-layer hidden
     states (``main_proj`` + ``main_norm``) into the draft's captured-context
     attention, runs the ``num_stages`` DSpark blocks over a rolling captured
-    window, refines the per-position logits with the Markov head, and predicts a
-    per-position acceptance confidence used to truncate the proposed prefix.
+    window, refines the per-position logits with the Markov head, and (when
+    ``enable_confidence_scheduling`` is set) scores each position with the
+    confidence head. The block is always proposed in full; the confidence only
+    feeds the verification scheduler's budget, never the acceptance decision.
 
     Unlike DFlash, the draft does NOT use the paged KV cache or mask-token
     cross-attention: its attention K/V come from the worker-owned rolling window
@@ -240,6 +246,18 @@ class DSparkWorker(SpecWorkerBase):
         # never handed out through ``_free_slots``.
         self._scratch_slot = 0
 
+        # Confidence-scheduled verification. ``return_confidence`` is read once
+        # here (never per step) so the captured draft graph cannot diverge.
+        # ``_confidence_logits`` is the slot-indexed handoff buffer to the
+        # verification scheduler; see ``_lazy_init`` for its neutral value.
+        self.return_confidence = bool(getattr(spec_config, "enable_confidence_scheduling", False))
+        self._confidence_logits: Optional[torch.Tensor] = None  # [max_batch+1, block]
+        self._last_gen_slots: Optional[torch.Tensor] = None
+        # Host-side coordinator that turns the confidence snapshot into this
+        # iteration's draft length. Built in ``_lazy_init`` (it needs the draft
+        # model's block size and calibration head).
+        self.verify_planner = None
+
         # The generation draft path is the batched, host-sync-free
         # ``_draft_gen_block_batched`` + ``DSparkDraftModel.forward_batched`` +
         # ``dspark_attention_forward_batched``: it is correct in eager mode AND safe
@@ -251,6 +269,18 @@ class DSparkWorker(SpecWorkerBase):
             f"DSparkWorker initialized with "
             f"use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
+
+    def staged_confidence_rows(self) -> Optional[torch.Tensor]:
+        """Confidence rows for the requests scored by the last draft, or None.
+
+        Indexes through ``_last_gen_slots`` rather than taking the buffer's
+        leading rows: the buffer is slot-indexed, and a batch rarely occupies
+        slots ``0..G-1``. Reading the leading rows would score a stale, unrelated
+        set of requests.
+        """
+        if self._confidence_logits is None or self._last_gen_slots is None:
+            return None
+        return self._confidence_logits[self._last_gen_slots]
 
     @property
     def max_draft_len(self) -> int:
@@ -299,6 +329,19 @@ class DSparkWorker(SpecWorkerBase):
         )
         self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        if self.return_confidence:
+            # Neutral fill = a large positive logit, i.e. sigmoid ~ 1.0. A slot
+            # that has not been scored yet therefore reads as "certain to be
+            # accepted", which makes the scheduler fall back to verifying the
+            # full block -- the safe direction (never verifies fewer tokens than
+            # today's static behavior on stale/unwritten rows).
+            self._confidence_logits = torch.full(
+                (num_rows, block_size),
+                _NEUTRAL_CONFIDENCE_LOGIT,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            self._build_verify_planner(draft_model, block_size, max_batch)
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
         self._win_inited = True
@@ -306,6 +349,82 @@ class DSparkWorker(SpecWorkerBase):
             f"DSpark: allocated rolling KV windows "
             f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
             f"({max_batch} request slots + 1 scratch row)"
+        )
+
+    def _build_verify_planner(self, draft_model, block_size: int, max_batch: int) -> None:
+        """Construct the host-side verify planner (once, at lazy init).
+
+        ``max_batch`` is only used to derive the verify-length tier ladder when
+        the user did not configure one; see :func:`derive_verify_len_tiers` for
+        why the ladder is a function of batch size.
+        """
+        import json
+
+        from .dspark_planner import SpsCostTable
+        from .dspark_schedule import DSparkScheduleConfig
+        from .dspark_verify import DSparkVerifyPlanner
+
+        cfg = DSparkScheduleConfig(block_size=block_size, min_verify_len=1)
+
+        cost_table = None
+        table_path = getattr(self.spec_config, "confidence_sps_table_path", None)
+        if table_path:
+            with open(table_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            cost_table = SpsCostTable(
+                token_counts=[int(v) for v in raw["token_counts"]],
+                step_time_ms=[float(v) for v in raw["step_time_ms"]],
+            )
+        else:
+            # Explicitly flat: the planner treats this as "unprofiled" and keeps
+            # verifying the full block rather than trimming on a cost model that
+            # says every extra token is free.
+            cost_table = SpsCostTable.flat()
+            logger.warning(
+                "DSpark confidence scheduling is enabled but no "
+                "confidence_sps_table_path was provided. Without a profiled step-cost "
+                "curve the planner cannot tell a cheap verify token from an expensive "
+                "one, so it will keep verifying the full block (no scheduling gain)."
+            )
+
+        # Calibration lives on the draft's confidence head; fall back to a plain
+        # sigmoid when the head is absent (no confidence to calibrate anyway).
+        head = getattr(getattr(draft_model, "mtp_layers", [None])[-1], "confidence_head", None)
+        apply_calibration = head.apply_sts if head is not None else None
+        sts_path = getattr(self.spec_config, "confidence_sts_path", None)
+        if sts_path and head is not None:
+            with open(sts_path, encoding="utf-8") as f:
+                temps = json.load(f)["sts_temperatures"]
+            head.load_sts_temperatures(torch.tensor(temps, dtype=torch.float32))
+            logger.info(f"DSpark: loaded STS calibration from {sts_path}")
+
+        tiers = getattr(self.spec_config, "verify_len_tiers", None)
+        if not tiers:
+            # Not configured: derive the ladder from the measured cost curve
+            # instead of hardcoding one. Each tier is a captured graph whose
+            # memory comes out of KV cache, so the derivation is capped -- and
+            # it is only zero-loss at the batch size it was derived for (the
+            # shelf right edges move with batch size), hence the steady-state
+            # modal batch size is the right input. A flat table yields just
+            # [min, block_size], which is the no-scheduling ladder.
+            from .dspark_planner import derive_verify_len_tiers
+
+            tiers = derive_verify_len_tiers(
+                cost_table=cost_table,
+                num_requests=max(int(max_batch), 1),
+                block_size=block_size,
+                min_verify_len=cfg.min_verify_len,
+            )
+            logger.info(f"DSpark: derived verify-length tiers {tiers}")
+        self.verify_planner = DSparkVerifyPlanner(
+            cfg=cfg,
+            cost_table=cost_table,
+            tiers=tiers,
+            apply_calibration=apply_calibration,
+        )
+        logger.info(
+            f"DSpark verify planner: tiers={self.verify_planner.tiers}, "
+            f"profiled_cost_table={not cost_table.is_flat}"
         )
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
@@ -389,8 +508,21 @@ class DSparkWorker(SpecWorkerBase):
         Confidence truncation stays disabled — the full block is proposed.
         """
         num_gens = batch_size - num_contexts
+        # Two different widths meet here, and conflating them corrupts the gather:
+        #   K      - the DRAFT block width. Fixed by the checkpoint; the draft
+        #            always proposes a full block regardless of how much of it
+        #            the target was asked to verify.
+        #   Kp1    - the TARGET's per-gen-request token stride in ``captured``.
+        #            That is ``runtime_draft_len + 1``, which shrinks when the
+        #            verification scheduler trims the batch's draft length.
+        # Using max_draft_len for the stride reads into the *next* request's
+        # hidden states whenever runtime_draft_len < max_draft_len, silently
+        # drafting from the wrong context.
         K = self.max_draft_len
-        Kp1 = K + 1
+        runtime_draft_len = getattr(spec_metadata, "runtime_draft_len", None)
+        if runtime_draft_len is None:
+            runtime_draft_len = K
+        Kp1 = int(runtime_draft_len) + 1
         device = accepted_tokens.device
 
         if num_gens == 0:
@@ -420,6 +552,10 @@ class DSparkWorker(SpecWorkerBase):
         # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
         # (everything but the bonus) into the rolling window — same frames as the
         # eager path (old+1 .. old+nacc-1), with j >= nacc-1 masked out.
+        # The width stays at the static K even when the runtime stride is smaller:
+        # ``nacc <= runtime_draft_len + 1`` bounds the *valid* j to within this
+        # request's own block, so the extra columns are always masked out. Keeping
+        # the width static also keeps this tensor's shape independent of K.
         old = self._ctx_len[slots]  # [G] pre-increment decode position
         j = torch.arange(K, device=device)  # [K]
         interim_valid = j.unsqueeze(0) < (nacc.unsqueeze(1) - 1)  # [G, K]
@@ -440,17 +576,27 @@ class DSparkWorker(SpecWorkerBase):
         # Surface the per-position corrected block logits ([num_gens, K, vocab])
         # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
         # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
-        _toks, _num_proposed, block_logits = draft_model.forward_batched(
+        _toks, confidence, block_logits = draft_model.forward_batched(
             main_hidden,
             bonus,
             start_pos,
             kv_windows=self._kv_windows,
             slots=slots,
             temperature=0.0,
-            confidence_threshold=0.0,
+            return_confidence=self.return_confidence,
             return_logits=True,
             all_rank_num_tokens=all_rank_num_tokens,
         )
+        # Stash the raw [G, K] confidence logits for the verification scheduler.
+        # Slot-indexed (not batch-position-indexed) so it survives batch
+        # reshuffles; written in place so a captured graph keeps the same storage.
+        # ``_last_gen_slots`` is a *view* into ``_batch_to_slot``, so it keeps
+        # pointing at whichever slots the current batch occupies on replay -- the
+        # scheduler must read the rows for the requests that were actually
+        # scored, not slots 0..G-1.
+        if confidence is not None:
+            self._confidence_logits[slots] = confidence.detach()
+            self._last_gen_slots = slots
         return block_logits
 
     def _forward_impl(

@@ -171,6 +171,7 @@ class DSparkBlock(DeepseekV4DecoderLayer):
         stage_id: int,
         num_stages: int,
         num_capture_layers: int,
+        block_size: int = 0,
     ):
         # The inherited attention uses a draft-local layer index, while the
         # decoder layer keeps its model-level index for weights and captures.
@@ -236,6 +237,8 @@ class DSparkBlock(DeepseekV4DecoderLayer):
                 # markov_rank <= 0); otherwise dspark_propose passes no
                 # prev_embeddings and DSparkConfidenceHead.forward would assert.
                 with_markov=self.markov_rank > 0,
+                # Sizes the per-position STS calibration table once, up front.
+                block_size=int(block_size),
             )
 
     @property
@@ -326,6 +329,7 @@ class DSparkDraftModel(nn.Module):
                     stage_id=s,
                     num_stages=self.num_stages,
                     num_capture_layers=self.num_capture_layers,
+                    block_size=self.block_size,
                 )
                 for s in range(self.num_stages)
             ]
@@ -857,7 +861,7 @@ class DSparkDraftModel(nn.Module):
         *,
         kv_windows: Optional[torch.Tensor] = None,
         temperature: float = 0.0,
-        confidence_threshold: float = 0.0,
+        return_confidence: bool = False,
         return_logits: bool = False,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> tuple:
@@ -877,7 +881,7 @@ class DSparkDraftModel(nn.Module):
                 worker; updated in place each call. ``None`` allocates fresh zero
                 windows (single-shot golden / test path).
         Returns:
-            ``(draft_tokens [T, block], num_proposed [T])`` from ``forward_head``.
+            ``(draft_tokens [T, block], confidence [T, block] or None)``.
         """
         assert start_pos > 0, "DSpark draft runs at generation (start_pos > 0)"
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
@@ -908,7 +912,7 @@ class DSparkDraftModel(nn.Module):
             h,
             bonus_token_ids,
             temperature=temperature,
-            confidence_threshold=confidence_threshold,
+            return_confidence=return_confidence,
             return_logits=return_logits,
         )
 
@@ -921,7 +925,7 @@ class DSparkDraftModel(nn.Module):
         kv_windows: torch.Tensor,
         slots: torch.Tensor,
         temperature: float = 0.0,
-        confidence_threshold: float = 0.0,
+        return_confidence: bool = False,
         return_logits: bool = False,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> tuple:
@@ -933,9 +937,9 @@ class DSparkDraftModel(nn.Module):
         graph). ``start_pos`` is a ``[G]`` tensor (one absolute decode position per
         gen request); the rolling captured-context windows are written/read through
         ``slots`` into the worker-owned ``kv_windows`` buffer; RoPE phases are
-        gathered from a fixed table. ``forward_head`` is run with
-        ``confidence_threshold == 0`` (the worker proposes the full block), which is
-        the graph-safe branch of :func:`dspark_propose`.
+        gathered from a fixed table. ``forward_head`` always proposes the full
+        block; ``return_confidence`` only adds a fixed-shape scoring matmul, so
+        both settings stay capturable.
 
         Args:
             main_hidden: ``[G, num_capture * hidden]`` captured target context.
@@ -945,7 +949,7 @@ class DSparkDraftModel(nn.Module):
                 windows; written in place through ``slots``.
             slots: ``[G]`` int tensor mapping each request to its ``kv_windows`` row.
         Returns:
-            ``(draft_tokens [G, block], num_proposed [G])`` from ``forward_head``.
+            ``(draft_tokens [G, block], confidence [G, block] or None)``.
         """
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             raise RuntimeError(
@@ -976,7 +980,7 @@ class DSparkDraftModel(nn.Module):
             h,
             bonus_token_ids,
             temperature=temperature,
-            confidence_threshold=confidence_threshold,
+            return_confidence=return_confidence,
             return_logits=return_logits,
         )
 
@@ -1025,13 +1029,13 @@ class DSparkDraftModel(nn.Module):
         bonus_token_ids: torch.Tensor,
         *,
         temperature: float = 0.0,
-        confidence_threshold: float = 0.0,
+        return_confidence: bool = False,
         return_logits: bool = False,
     ) -> tuple:
         """Block-draft head: hc_head + norm + lm_head -> markov refine + confidence.
 
         ``block_hidden`` is the last stage's mHC residual ``[*, block, hc_mult, hidden]``.
-        Returns (draft_tokens [*, block], num_proposed [*]); with ``return_logits``
+        Returns (draft_tokens [*, block], confidence [*, block] or None); with ``return_logits``
         also returns the per-position draft logits [*, block, vocab] (§7.9 1-TV).
         """
         last = self.mtp_layers[-1]
@@ -1046,7 +1050,7 @@ class DSparkDraftModel(nn.Module):
             confidence_head=last.confidence_head,
             block_size=self.block_size,
             temperature=temperature,
-            confidence_threshold=confidence_threshold,
+            return_confidence=return_confidence,
             return_logits=return_logits,
         )
 

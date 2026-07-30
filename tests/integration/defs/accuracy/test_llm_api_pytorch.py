@@ -4001,6 +4001,57 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
 
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_dep8_megamoe_deepgemm_confidence_scheduling(self):
+        """Same accuracy bar with confidence-scheduled verification enabled.
+
+        The scheduler only decides how MANY drafted tokens are sent to the
+        target; acceptance still goes through the unchanged target verify, so
+        the output distribution must be untouched. Any drop here means the
+        dynamic draft length broke an invariant (KV rewind amount, the draft
+        hidden-state gather stride, or the per-token sampling-parameter stride)
+        rather than that the scheduler made a bad throughput call -- those are
+        silent-wrong-answer bugs, which is why this asserts the SAME reference
+        accuracy as the baseline above rather than a relaxed one.
+
+        Runs under attention-DP + TP8, so it also covers the cross-rank
+        agreement on the draft length: if ranks disagreed they would select
+        different CUDA graphs and the collectives would diverge.
+        """
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           speculative_model=self.MODEL_PATH,
+                                           enable_confidence_scheduling=True)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 custom_tokenizer="deepseek_v4",
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} with confidence scheduling is below "
+                f"the recorded reference {acc_params.ref_accuracy:.3f}; the "
+                f"scheduler must not change the output distribution")
+
 
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(140000)

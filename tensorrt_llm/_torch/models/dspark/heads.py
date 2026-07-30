@@ -24,9 +24,11 @@ parts of DeepSeek's DSpark speculative-decoding draft network:
     applied autoregressively across the ``block_size`` draft positions (the cheap
     "sequential" half of DSpark's "semi-parallel" drafting). RNN variant carries
     a GRU-style recurrent state across positions.
-  - Confidence head: predicts a per-position acceptance probability; the cumulative
-    product over positions estimates prefix-acceptance and is used only to
-    *truncate* the proposed draft length (NOT to decide acceptance).
+  - Confidence head: predicts a per-position *conditional* acceptance probability
+    (``P(accept_k | accept_1..k-1)``); the cumulative product over positions is the
+    prefix-survival probability the verification scheduler budgets against. It only
+    decides *how many* tokens are verified, never *whether* one is accepted, so
+    scheduling stays lossless. See ``_torch/speculative/dspark_schedule.py``.
 
 This file deliberately depends on ``torch`` only so it can be unit-tested in
 isolation (token-for-token) against the DeepSpec reference.
@@ -214,21 +216,49 @@ class DSparkConfidenceHead(nn.Module):
     """Per-position acceptance-confidence predictor (DeepSpec AcceptRatePredictor).
 
     Input features are the backbone hidden state, optionally concatenated with the
-    Markov head's previous-token embedding. Output is a single logit per position.
+    Markov head's previous-token embedding. Output is a single *raw logit* per
+    position; callers turn it into a probability with :meth:`apply_sts`, which
+    folds in the sequential-temperature-scaling (STS) calibration.
+
+    Calibration matters here because the scheduler consumes the *cumulative
+    product* of per-position probabilities: a per-position bias is amplified
+    geometrically along the block, so an uncalibrated head systematically
+    over-estimates prefix survival. ``sts_temperatures`` defaults to all-ones,
+    which makes :meth:`apply_sts` a plain sigmoid (identity calibration).
     """
 
-    def __init__(self, *, hidden_size: int, markov_rank: int = 0, with_markov: bool = False):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        markov_rank: int = 0,
+        with_markov: bool = False,
+        bias: bool = False,
+        block_size: int = 0,
+    ):
         super().__init__()
         self.with_markov = bool(with_markov)
         input_dim = int(hidden_size) + (int(markov_rank) if with_markov else 0)
         # The checkpoint stores ``proj`` as a bias-free bf16 weight, but the
         # confidence score is computed in fp32 (mirrors the DeepSpec reference
         # ``Linear(input_dim, 1, dtype=torch.float32)`` with the fp32 matmul).
-        self.proj = nn.Linear(input_dim, 1, bias=False, dtype=torch.float32)
+        self.proj = nn.Linear(input_dim, 1, bias=bool(bias), dtype=torch.float32)
+        # Per-position temperatures, broadcast against ``[batch, block]``. Shape
+        # ``(block_size,)`` when known, else ``(1,)``; both broadcast correctly.
+        # ``persistent=False`` keeps it out of ``state_dict`` so it never
+        # participates in checkpoint loading. It is sized at construction and
+        # only ever updated in place, so a captured CUDA graph keeps seeing the
+        # same storage (rebinding the attribute would be invisible to the graph).
+        self.register_buffer(
+            "sts_temperatures",
+            torch.ones(max(int(block_size), 1), dtype=torch.float32),
+            persistent=False,
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, prev_embeddings: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        """``[*, block, hidden] -> [*, block]`` raw (uncalibrated) logits."""
         if self.with_markov:
             assert prev_embeddings is not None
             features = torch.cat([hidden_states, prev_embeddings.to(hidden_states.dtype)], dim=-1)
@@ -237,18 +267,40 @@ class DSparkConfidenceHead(nn.Module):
         # fp32 matmul for a stable confidence score (mirrors the reference).
         return self.proj(features.float()).squeeze(-1)
 
+    def apply_sts(self, confidence_logits: torch.Tensor) -> torch.Tensor:
+        """Raw logits -> calibrated per-position acceptance probabilities in [0, 1]."""
+        return torch.sigmoid(confidence_logits.float() / self.sts_temperatures)
 
-def confident_prefix_length(
-    confidence_logits: torch.Tensor, *, block_size: int, threshold: float
-) -> int:
-    """First position k where ``sigmoid(confidence_k) < threshold``.
+    @torch.no_grad()
+    def load_sts_temperatures(self, temperatures: torch.Tensor) -> None:
+        """In-place update of the STS table (never rebind: see ``__init__``)."""
+        flat = temperatures.reshape(-1).to(device=self.sts_temperatures.device, dtype=torch.float32)
+        if flat.numel() != self.sts_temperatures.numel():
+            raise ValueError(
+                f"STS temperature table has {flat.numel()} entries but the confidence "
+                f"head expects {self.sts_temperatures.numel()} (one per block position)"
+            )
+        if not bool(torch.all(flat > 0.0)):
+            raise ValueError("STS temperatures must be strictly positive")
+        self.sts_temperatures.copy_(flat)
 
-    Returns ``block_size`` when threshold<=0 (no truncation) or all positions
-    are confident. Assumes batch size 1 (functional-first scope).
-    """
-    if threshold <= 0.0:
-        return int(block_size)
-    below = confidence_logits.sigmoid() < threshold
-    if not bool(below[0].any().item()):
-        return int(block_size)
-    return int(torch.nonzero(below[0], as_tuple=False)[0].item())
+    def load_weights(self, weights: list) -> None:
+        """Strict loader that refuses to silently drop a checkpoint bias.
+
+        The generic DeepseekV4 loader copies by iterating ``named_parameters()``,
+        so a ``proj.bias`` present in the checkpoint but absent from the module
+        would be dropped without any error -- shifting every confidence score.
+        Fail loudly instead.
+        """
+        (module_weights,) = weights
+        expected = dict(self.named_parameters())
+        unexpected = [k for k in module_weights if k not in expected]
+        if unexpected:
+            raise ValueError(
+                f"DSpark confidence head checkpoint has unsupported key(s) {sorted(unexpected)}; "
+                f"the module exposes {sorted(expected)}. A checkpoint bias requires constructing "
+                f"DSparkConfidenceHead(bias=True) -- silently dropping it would bias every "
+                f"per-position confidence score."
+            )
+        for name, param in expected.items():
+            param.data.copy_(module_weights[name][:])

@@ -24,7 +24,7 @@ they can be unit-tested in isolation:
   - ``build_draft_input_ids``: ``[bonus_token, noise, noise, ...]`` block input.
   - ``dspark_propose``: given the per-position backbone ``base_logits`` and the
     Markov / confidence heads, run the autoregressive Markov refinement to sample
-    the block tokens and apply the static confidence-threshold truncation.
+    the block tokens and score them with the confidence head.
 
 The backbone (3 V4 blocks producing ``block_hidden``) lives in the model module;
 this file is the part fully specified by the reference and validated against it.
@@ -34,8 +34,6 @@ from typing import Optional
 
 import torch
 from torch import nn
-
-from .heads import confident_prefix_length
 
 
 def build_draft_input_ids(
@@ -61,10 +59,15 @@ def dspark_propose(
     confidence_head: Optional[nn.Module],
     block_size: int,
     temperature: float = 0.0,
-    confidence_threshold: float = 0.0,
+    return_confidence: bool = False,
     return_logits: bool = False,
 ) -> tuple:
     """Produce DSpark draft tokens for one block (functional-first, static length).
+
+    Always proposes the *full* block: the confidence head does not shorten the
+    draft (the block is produced by a single parallel backbone pass, so there is
+    nothing to save there). It scores the block so the verification scheduler can
+    decide how many of those tokens are worth sending to the target.
 
     Args:
         base_logits: ``[batch, block_size, vocab]`` from the backbone + lm_head.
@@ -72,14 +75,16 @@ def dspark_propose(
         block_hidden: ``[batch, block_size, hidden]`` backbone hidden (feeds the
             confidence head, and the RNN-head variant).
         markov_head / confidence_head: the validated DSpark heads (may be None).
+        return_confidence: compute the per-position confidence logits. This is a
+            run-constant flag (read once from the decoding config), never a
+            per-step decision, so it cannot make the captured graph diverge.
     Returns:
         draft_tokens: ``[batch, block_size]`` sampled tokens (full block; callers
             keep the tensor fixed-width for CUDA-graph safety).
-        num_proposed: ``[batch]`` int32 — how many leading tokens survive the
-            static confidence-threshold truncation (== block_size when no head /
-            threshold<=0).
+        confidence: ``[batch, block_size]`` fp32 *raw* confidence logits, or None
+            when disabled / no head. Calibrate with ``confidence_head.apply_sts``
+            before taking the cumulative product.
     """
-    batch = base_logits.shape[0]
     # ``draft_logits`` are the per-position distributions the draft token is drawn
     # from (markov-corrected when a head is present, else the raw base logits).
     # Surfaced under ``return_logits`` for the §7.9 probabilistic-acceptance
@@ -98,15 +103,10 @@ def dspark_propose(
 
         draft_tokens = greedy_or_sample(base_logits, temperature)
 
-    # Scaffolding: confidence-based dynamic drafting is NOT enabled in this PR.
-    # The worker always calls with confidence_threshold=0.0, so the block below is
-    # inert and num_proposed stays == block_size (the full block is proposed). The
-    # returned num_proposed is intentionally not yet consumed by the speculative
-    # scheduler/verifier; wiring it through is a follow-up (see PR description).
-    num_proposed = torch.full(
-        (batch,), int(block_size), dtype=torch.int32, device=base_logits.device
-    )
-    if confidence_head is not None and confidence_threshold > 0.0:
+    # Confidence scoring: branch-free and fixed-shape (no ``.item()``, no
+    # data-dependent shapes), so the whole block stays CUDA-graph capturable.
+    confidence = None
+    if return_confidence and confidence_head is not None:
         # prev token at position k is [bonus, draft_0, ..., draft_{k-1}]
         prev_ids = torch.cat([bonus_token_ids.unsqueeze(1), draft_tokens[:, :-1]], dim=1)
         prev_emb = (
@@ -114,17 +114,11 @@ def dspark_propose(
             if (markov_head is not None and getattr(confidence_head, "with_markov", False))
             else None
         )
-        conf_logits = (
+        confidence = (
             confidence_head(block_hidden, prev_embeddings=prev_emb)
             if prev_emb is not None
             else confidence_head(block_hidden)
         )
-        # Per-request prefix truncation (batch handled row-wise to stay simple;
-        # functional-first scope typically runs batch=1 for the draft).
-        for b in range(batch):
-            num_proposed[b] = confident_prefix_length(
-                conf_logits[b : b + 1], block_size=block_size, threshold=confidence_threshold
-            )
     if return_logits:
-        return draft_tokens, num_proposed, draft_logits
-    return draft_tokens, num_proposed
+        return draft_tokens, confidence, draft_logits
+    return draft_tokens, confidence

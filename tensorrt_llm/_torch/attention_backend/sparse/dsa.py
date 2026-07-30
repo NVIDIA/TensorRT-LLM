@@ -634,6 +634,31 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
     gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
+    # Ragged verification: how many query tokens each generation request
+    # contributes this step, host-side and in batch order. None (the default,
+    # and every non-DSpark path) means the uniform `1 + max_draft_tokens` per
+    # request, which is what the strided expansions below assume. Kept on the
+    # host because the expansions are built host-side and copied in; reading
+    # the repeats off a device tensor would sync.
+    ragged_verify_lens: Optional[List[int]] = None
+
+    @property
+    def is_ragged_verify(self) -> bool:
+        """Whether generation requests have per-request query lengths."""
+        return self.ragged_verify_lens is not None
+
+    def gen_token_repeats(self, device=None) -> torch.Tensor:
+        """Per-generation-request query-token counts as a repeat vector.
+
+        Uniform batches get `1 + max_draft_tokens` for every request, so the
+        callers below stay bit-identical; ragged batches get the scheduler's
+        per-request windows.
+        """
+        if self.ragged_verify_lens is None:
+            repeats = [1 + self.max_draft_tokens] * self.num_generations
+        else:
+            repeats = self.ragged_verify_lens
+        return torch.tensor(repeats, dtype=torch.long, device=device)
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
@@ -894,13 +919,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.scheduler_metadata_buffer_full_next_n.copy_(
                     scheduler_metadata_buffer_full_next_n, non_blocking=True)
             if self.use_expanded_buffers_for_mtp:
-                num_draft_tokens = 1 + self.max_draft_tokens
-                num_tokens = self.num_generations * num_draft_tokens
-                kv_lens_expanded = torch.stack([gen_indexer_kv_lens] *
-                                               num_draft_tokens,
-                                               dim=0)
+                # One row per query token; the repeat count is per-request
+                # under ragged verification and a constant otherwise.
+                token_repeats = self.gen_token_repeats(
+                    device=gen_indexer_kv_lens.device)
+                num_tokens = int(token_repeats.sum())
                 self.kv_lens_expanded_cuda[:num_tokens] = \
-                    kv_lens_expanded.transpose(0, 1).contiguous().flatten()
+                    gen_indexer_kv_lens.repeat_interleave(token_repeats)
                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
                     self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
                     _DG_SCHEDULE_BLOCK_KV, self.num_sms)
@@ -1475,20 +1500,28 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
         # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
         use_dsl = self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
-        self.use_expanded_buffers_for_mtp = (not use_dsl and (
-            (self.max_draft_tokens > 1 and get_sm_version() == 90) or
-            ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-             and get_sm_version() >= 100)))
+        if self.is_ragged_verify:
+            # The DSL paged-MQA path reshapes (num_gen, next_n) -> (num_gen *
+            # factor, atom) and broadcasts a single 1-D kv_lens per request, so
+            # it is structurally uniform: there is no next_n that describes a
+            # ragged batch. The expanded path already materializes one row per
+            # token, which is exactly the ragged layout, so route there.
+            use_dsl = False
+        self.use_expanded_buffers_for_mtp = (
+            not use_dsl
+            and (self.is_ragged_verify or
+                 (self.max_draft_tokens > 1 and get_sm_version() == 90) or
+                 ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+                  and get_sm_version() >= 100)))
         if self.use_expanded_buffers_for_mtp:
-            # Expand kv_lens_cuda (only generation)
-            num_tokens = self.num_generations * (1 + self.max_draft_tokens)
+            # Expand kv_lens_cuda (only generation): one row per query token,
+            # repeating each request's kv_len as many times as it has tokens.
+            token_repeats = self.gen_token_repeats()
+            num_tokens = int(token_repeats.sum())
             gen_kv_lens = self.get_indexer_kv_lens(
                 kv_lens[self.num_contexts:self.num_seqs])
-            gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
-                                               (1 + self.max_draft_tokens),
-                                               dim=0)
-            gen_kv_lens_expanded = gen_kv_lens_expanded.transpose(
-                0, 1).contiguous().flatten()
+            gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(
+                token_repeats.to(gen_kv_lens.device))
             self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
             self.kv_lens_expanded_cuda[:num_tokens].copy_(
                 self.kv_lens_expanded_host[:num_tokens], non_blocking=True)
@@ -1501,7 +1534,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 gen_block_tensor = self.host_indexer_k_cache_block_offsets[
                     self.num_contexts:self.num_seqs, :max_len]
                 expanded_blocks = gen_block_tensor.repeat_interleave(
-                    1 + self.max_draft_tokens, dim=0)
+                    token_repeats.to(gen_block_tensor.device), dim=0)
                 self.host_block_table_expanded[:num_tokens, :max_len].copy_(
                     expanded_blocks, non_blocking=True)
                 self.block_table_expanded[:num_tokens].copy_(
@@ -2709,9 +2742,14 @@ class Indexer(nn.Module):
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
-            max_decode_len = gen_seq_lens.max().item()
-            min_decode_len = gen_seq_lens.min().item()
-            assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
+            if not metadata.is_ragged_verify:
+                # Ragged verification makes unequal decode lengths the whole
+                # point; the expanded path below handles them natively (one
+                # kernel row per query token), so this uniformity check only
+                # applies to the strided paths.
+                max_decode_len = gen_seq_lens.max().item()
+                min_decode_len = gen_seq_lens.min().item()
+                assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
             q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,
@@ -2721,7 +2759,14 @@ class Indexer(nn.Module):
             # Because fp8_paged_mqa_logits can only support next_n == 1/2/4 on sm100, and
             # next_n == 1/2 on sm90, for other next_n, we need to flatten the q_decode tensor
             # and expand the corresponding metadata.
-            if not metadata.use_expanded_buffers_for_mtp or next_n == 1:
+            # Ragged batches have no single next_n, so they always take the
+            # expanded (one row per token) branch.
+            if metadata.is_ragged_verify:
+                take_strided_path = False
+            else:
+                take_strided_path = (not metadata.use_expanded_buffers_for_mtp
+                                     or next_n == 1)
+            if take_strided_path:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
                 # 2D context_lens slice from the pre-allocated buffer; matches
                 # q_decode's (batch, next_n) layout required by the new
@@ -2750,7 +2795,15 @@ class Indexer(nn.Module):
                 block_table = metadata.block_table_expanded[:num_tokens]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
-            assert num_gen_tokens == batch_size * next_n
+            # Ragged verification packs a different number of query tokens per
+            # request, so the only invariant left is that the expanded buffers
+            # cover exactly the tokens handed to the kernel.
+            if metadata.is_ragged_verify:
+                assert num_gen_tokens == sum(metadata.ragged_verify_lens), (
+                    f"ragged gen tokens {num_gen_tokens} != "
+                    f"sum(verify_lens) {sum(metadata.ragged_verify_lens)}")
+            else:
+                assert num_gen_tokens == batch_size * next_n
             weights_decode = weights[num_ctx_tokens:num_ctx_tokens +
                                      num_gen_tokens, ...]
 
@@ -2761,7 +2814,12 @@ class Indexer(nn.Module):
                 self.layer_idx)
             indexer_max_seq_len = metadata.get_indexer_max_seq_len()
 
-            if self.use_cute_dsl_paged_mqa_logits:
+            # The DSL path broadcasts one kv_len per request across all next_n
+            # positions and requires factor * atom == next_n, neither of which
+            # a ragged batch can satisfy. prepare_for_spec_decode already
+            # routed such batches to the expanded buffers; keep the forward
+            # consistent with that decision.
+            if self.use_cute_dsl_paged_mqa_logits and not metadata.is_ragged_verify:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
                 # kNumNextNAtoms = 1 for any real next_n. The matching schedule
                 # is `scheduler_metadata_buffer` — built in `Indexer.prepare()`

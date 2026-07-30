@@ -40,7 +40,7 @@ def test_dspark_propose_full_block_no_confidence():
     bonus = torch.randint(0, VOCAB, (B,))
     hid = torch.randn(B, BLK, HID)
     with torch.no_grad():
-        tokens, num = dspark_propose(
+        tokens, confidence = dspark_propose(
             base,
             bonus_token_ids=bonus,
             block_hidden=hid,
@@ -49,8 +49,7 @@ def test_dspark_propose_full_block_no_confidence():
             block_size=BLK,
         )
     assert tokens.shape == (B, BLK)
-    # No confidence head -> propose the full block.
-    assert torch.all(num == BLK)
+    assert confidence is None
     # Tokens match the markov head's own greedy block sampling.
     ref_tokens, _ = markov.sample_block_tokens(
         base, first_prev_token_ids=bonus, hidden_states=hid, temperature=0.0
@@ -58,42 +57,67 @@ def test_dspark_propose_full_block_no_confidence():
     assert torch.equal(tokens, ref_tokens)
 
 
-def test_dspark_propose_confidence_truncates():
-    torch.manual_seed(1)
-    markov = build_markov_head(
-        markov_head_type="vanilla", vocab_size=VOCAB, markov_rank=RANK, hidden_size=HID
-    ).eval()
-    conf = DSparkConfidenceHead(hidden_size=HID).eval()
-    # The confidence proj is bias-free, so drive the logit via a constant weight
-    # against a constant hidden: logit = weight_val * HID per position.
+def _propose_with_confidence(conf, markov, *, return_confidence):
     base = torch.randn(1, BLK, VOCAB)
     bonus = torch.randint(0, VOCAB, (1,))
     hid = torch.ones(1, BLK, HID)
     with torch.no_grad():
-        conf.proj.weight.fill_(5.0 / HID)  # logit ~ 5 -> sigmoid ~ 0.993, all confident
-    with torch.no_grad():
-        _, num = dspark_propose(
+        return dspark_propose(
             base,
             bonus_token_ids=bonus,
             block_hidden=hid,
             markov_head=markov,
             confidence_head=conf,
             block_size=BLK,
-            confidence_threshold=0.5,
+            return_confidence=return_confidence,
         )
-    # All-confident -> full block proposed.
-    assert int(num[0]) == BLK
-    # Now make the head output low confidence everywhere -> truncate to 0... but
-    # confident_prefix_length returns first sub-threshold index (0 here).
+
+
+def test_dspark_propose_scores_without_shortening_the_block():
+    """The block is always proposed in full; confidence only scores it."""
+    torch.manual_seed(1)
+    markov = build_markov_head(
+        markov_head_type="vanilla", vocab_size=VOCAB, markov_rank=RANK, hidden_size=HID
+    ).eval()
+    conf = DSparkConfidenceHead(hidden_size=HID, block_size=BLK).eval()
+    # The confidence proj is bias-free, so drive the logit via a constant weight
+    # against a constant hidden: logit = weight_val * HID per position.
     with torch.no_grad():
-        conf.proj.weight.fill_(-5.0 / HID)  # logit ~ -5 -> sigmoid ~ 0.0067 < 0.5
-        _, num2 = dspark_propose(
-            base,
-            bonus_token_ids=bonus,
-            block_hidden=hid,
-            markov_head=markov,
-            confidence_head=conf,
-            block_size=BLK,
-            confidence_threshold=0.5,
-        )
-    assert int(num2[0]) == 0
+        conf.proj.weight.fill_(-5.0 / HID)  # sigmoid ~ 0.0067, i.e. hopeless
+
+    tokens, confidence = _propose_with_confidence(conf, markov, return_confidence=True)
+    assert tokens.shape == (1, BLK)
+    assert confidence.shape == (1, BLK)
+    # Low confidence must NOT shorten the proposal -- that decision belongs to
+    # the verification scheduler, not the drafter.
+    assert torch.all(confidence < 0.0)
+    assert torch.all(conf.apply_sts(confidence) < 0.5)
+
+
+def test_dspark_propose_confidence_is_opt_in():
+    torch.manual_seed(2)
+    markov = build_markov_head(
+        markov_head_type="vanilla", vocab_size=VOCAB, markov_rank=RANK, hidden_size=HID
+    ).eval()
+    conf = DSparkConfidenceHead(hidden_size=HID, block_size=BLK).eval()
+    _, confidence = _propose_with_confidence(conf, markov, return_confidence=False)
+    assert confidence is None
+
+
+def test_dspark_propose_is_free_of_host_syncs():
+    """No ``.item()``/``nonzero`` on this path: it runs inside the target's graph."""
+    import inspect
+    import io
+    import tokenize
+
+    from tensorrt_llm._torch.models.dspark import draft as draft_mod
+
+    src = inspect.getsource(draft_mod.dspark_propose)
+    # Strip comments and string literals so the check reads the code, not the
+    # prose describing it (the implementation comments name these very calls).
+    code = "".join(
+        tok.string if tok.type not in (tokenize.COMMENT, tokenize.STRING) else " "
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline)
+    )
+    for banned in (".item(", "nonzero", "range("):
+        assert banned not in code, f"dspark_propose must stay capture-safe: found {banned!r}"

@@ -2759,13 +2759,13 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     layers as cross-attention context and drafts a whole block in a single
     backbone forward, but it additionally refines the per-position draft logits
     with a lightweight sequential head (a low-rank Markov head, optionally an RNN
-    head) and predicts an acceptance-confidence per position to truncate the
-    proposed prefix.
+    head) and predicts a per-position acceptance confidence used to budget how
+    much verification the batch is worth.
 
     Key features:
     - Target-dependent: captures hidden states from ``target_layer_ids``.
     - Semi-parallel: one block backbone forward + cheap sequential head refine.
-    - Confidence head: truncates the proposed draft length (NOT the accept rule;
+    - Confidence head: sizes the *verification* budget (NOT the accept rule;
       acceptance stays standard target verification, preserving greedy parity).
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
@@ -2802,15 +2802,107 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
-    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
-    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
-    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
-    # omitted and will be added when the feature is actually wired into the
-    # speculative scheduling/verification path. The confidence head module and its
-    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
-    # dspark_propose).
+    enable_confidence_scheduling: bool = Field(
+        default=False,
+        description=
+        "Score each drafted position with the draft's confidence head and let "
+        "the verification scheduler size the batch's verify budget from those "
+        "scores. The block is always drafted in full; only the number of tokens "
+        "sent to the target for verification changes, so acceptance (and hence "
+        "output distribution) is unaffected. Requires a checkpoint with trained "
+        "confidence-head weights. Gains only appear at high concurrency -- at "
+        "small batch sizes the step cost is nearly flat in the verified token "
+        "count, so trimming saves nothing and costs acceptance length.",
+        status="prototype")
+
+    confidence_sts_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a JSON file with per-position sequential-temperature-scaling "
+        "(STS) values used to calibrate the confidence head. The scheduler "
+        "consumes a cumulative product of per-position probabilities, so a "
+        "per-position calibration error compounds geometrically along the "
+        "block. If None, the raw sigmoid is used (identity calibration).",
+        status="prototype")
+
+    confidence_sps_table_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a JSON file with the profiled decode step cost as a function of "
+        "the total verified token count. Without it the planner has a flat cost "
+        "model, under which every extra verified token looks free and the budget "
+        "degenerates to verify-all (no scheduling gain).",
+        status="prototype")
+
+    confidence_verify_len_tiers: Optional[List[PositiveInt]] = Field(
+        default=None,
+        description=
+        "Draft lengths to capture CUDA graphs for. The scheduler may only pick "
+        "from this ladder: a length with no captured graph does not raise, it "
+        "silently drops the step out of graph replay into eager execution, which "
+        "costs far more than the trimmed tokens save. Each extra tier is another "
+        "captured graph, and captured graphs consume memory that would otherwise "
+        "be KV cache, so keep the ladder short. If None, defaults to "
+        "[1, ceil(max_draft_len/2), max_draft_len].",
+        status="prototype")
+
+    enable_ragged_verify: bool = Field(
+        default=False,
+        description=
+        "Give each request its own verify length instead of one length for the "
+        "whole batch. The batch's verify budget is then allocated by global "
+        "survival rank, so a request whose draft is still likely alive at depth "
+        "5 can take positions from one whose draft already died at depth 1. "
+        "Requires enable_confidence_scheduling. The packed batch is padded to a "
+        "captured (batch size, token count) pair, so this captures a second "
+        "graph axis and costs more graph memory than uniform scheduling.",
+        status="prototype")
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
+
+    @model_validator(mode="after")
+    def validate_ragged_verify(self):
+        if self.enable_ragged_verify and not self.enable_confidence_scheduling:
+            raise ValueError(
+                "enable_ragged_verify requires enable_confidence_scheduling=True: "
+                "per-request verify lengths are chosen from confidence-head "
+                "survival, which is only computed when scheduling is on")
+        return self
+
+    @model_validator(mode="after")
+    def validate_confidence_scheduling(self):
+        if not self.enable_confidence_scheduling:
+            if (self.confidence_sts_path or self.confidence_sps_table_path
+                    or self.confidence_verify_len_tiers):
+                raise ValueError(
+                    "confidence_sts_path / confidence_sps_table_path / "
+                    "confidence_verify_len_tiers require "
+                    "enable_confidence_scheduling=True")
+            return self
+
+        if self.max_draft_len is not None:
+            tiers = self.confidence_verify_len_tiers or [
+                1, max(1, (self.max_draft_len + 1) // 2), self.max_draft_len
+            ]
+            tiers = sorted({int(t) for t in tiers})
+            if tiers[-1] > self.max_draft_len:
+                raise ValueError(
+                    f"confidence_verify_len_tiers {tiers} exceeds max_draft_len "
+                    f"({self.max_draft_len}); a request cannot verify more tokens "
+                    f"than the draft proposes")
+            # The full block must stay reachable: it is the fallback used whenever
+            # the confidence snapshot is stale or the cost model is unprofiled.
+            if tiers[-1] != self.max_draft_len:
+                tiers.append(self.max_draft_len)
+            self.confidence_verify_len_tiers = tiers
+        return self
+
+    @property
+    def verify_len_tiers(self) -> List[int]:
+        """Captured draft-length ladder; ``[max_draft_len]`` when scheduling is off."""
+        if not self.enable_confidence_scheduling:
+            return [self.max_draft_len]
+        return list(self.confidence_verify_len_tiers or [self.max_draft_len])
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):

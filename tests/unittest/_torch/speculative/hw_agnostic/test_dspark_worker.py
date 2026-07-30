@@ -93,15 +93,24 @@ def test_metadata_prepare_batch_indices():
     assert meta.batch_indices_cuda[:3].tolist() == [0, 1, 2]
 
 
-def _make_worker():
+def _make_worker(enable_confidence_scheduling=False, verify_len_tiers=None):
     cfg = types.SimpleNamespace(
         max_draft_len=5,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
-        confidence_threshold=0.5,
+        enable_confidence_scheduling=enable_confidence_scheduling,
+        verify_len_tiers=verify_len_tiers or [1, 3, 5],
+        confidence_sps_table_path=None,
+        confidence_sts_path=None,
     )
     from tensorrt_llm.mapping import Mapping
 
     return DSparkWorker(cfg, Mapping())
+
+
+def test_worker_reads_confidence_flag_once():
+    """The flag must be run-constant: a per-step read could diverge the graph."""
+    assert _make_worker().return_confidence is False
+    assert _make_worker(enable_confidence_scheduling=True).return_confidence is True
 
 
 def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
@@ -454,3 +463,154 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     # Verified tokens are surfaced unchanged.
     assert torch.equal(out["new_tokens"], accepted)
     assert torch.equal(out["new_tokens_lens"], num_accepted)
+
+
+def _stride_probe_draft_model(block_size=5, num_stages=3, window_size=128, head_dim=64):
+    """Draft model stub that records the ``main_hidden`` it was handed."""
+    seen = {}
+
+    def forward_batched(main_hidden, bonus, start_pos, **kwargs):
+        seen["main_hidden"] = main_hidden.clone()
+        g = main_hidden.shape[0]
+        return (
+            torch.zeros(g, block_size, dtype=torch.int32, device="cuda"),
+            None,
+            torch.zeros(g, block_size, 8, device="cuda"),
+        )
+
+    dm = types.SimpleNamespace(
+        num_stages=num_stages,
+        block_size=block_size,
+        _attn_params={"window_size": window_size, "head_dim": head_dim},
+        write_context_windows_batched=lambda *a, **k: None,
+        forward_batched=forward_batched,
+    )
+    return dm, seen
+
+
+@pytest.mark.parametrize("runtime_draft_len", [5, 3, 1])
+def test_gen_draft_gathers_hidden_with_the_runtime_stride(runtime_draft_len):
+    """The gather stride must follow runtime_draft_len, not max_draft_len.
+
+    The target lays out ``runtime_draft_len + 1`` tokens per generation request.
+    Striding by ``max_draft_len + 1`` instead walks into the *next* request's
+    hidden states as soon as the scheduler trims the draft length -- the draft
+    then conditions on another request's context, with no error anywhere.
+    """
+    num_gens, hidden = 4, HIDDEN * NCAP
+    worker = _make_worker()
+    dm, seen = _stride_probe_draft_model()
+    meta = _make_metadata(max_num_requests=8, max_num_tokens=256)
+    worker._lazy_init(dm, meta)
+    worker._batch_to_slot[:num_gens] = torch.arange(num_gens, device="cuda")
+
+    # Row r of request g is tagged with g so a cross-request read is visible.
+    stride = runtime_draft_len + 1
+    captured = torch.zeros(num_gens * stride, hidden, device="cuda")
+    for g in range(num_gens):
+        captured[g * stride : (g + 1) * stride] = float(g)
+
+    meta.runtime_draft_len = runtime_draft_len
+    meta.get_hidden_states = lambda _n: captured
+    attn = types.SimpleNamespace(num_ctx_tokens=0, num_seqs=num_gens, num_contexts=0)
+
+    # Everyone accepts exactly one token, so the bonus sits at offset 0 of each
+    # request's block: main_hidden[g] must be exactly g.
+    nacc = torch.ones(num_gens, dtype=torch.int32, device="cuda")
+    accepted = torch.zeros(num_gens, worker.max_draft_len + 1, dtype=torch.int32, device="cuda")
+
+    worker._draft_gen_block_batched(
+        dm,
+        meta,
+        attn,
+        accepted,
+        nacc,
+        num_contexts=0,
+        batch_size=num_gens,
+        total_target_tokens=captured.shape[0],
+    )
+
+    got = seen["main_hidden"][:, 0].tolist()
+    assert got == [float(g) for g in range(num_gens)], (
+        f"runtime_draft_len={runtime_draft_len}: drafted from the wrong request's "
+        f"hidden states, got {got}"
+    )
+
+
+def test_gen_draft_stride_falls_back_to_max_draft_len():
+    """Metadata without runtime_draft_len keeps the pre-existing behavior."""
+    num_gens, hidden = 3, HIDDEN * NCAP
+    worker = _make_worker()
+    dm, seen = _stride_probe_draft_model()
+    meta = _make_metadata(max_num_requests=8, max_num_tokens=256)
+    worker._lazy_init(dm, meta)
+    worker._batch_to_slot[:num_gens] = torch.arange(num_gens, device="cuda")
+
+    stride = worker.max_draft_len + 1
+    captured = torch.zeros(num_gens * stride, hidden, device="cuda")
+    for g in range(num_gens):
+        captured[g * stride : (g + 1) * stride] = float(g)
+
+    meta.runtime_draft_len = None
+    meta.get_hidden_states = lambda _n: captured
+    attn = types.SimpleNamespace(num_ctx_tokens=0, num_seqs=num_gens, num_contexts=0)
+    nacc = torch.ones(num_gens, dtype=torch.int32, device="cuda")
+    accepted = torch.zeros(num_gens, worker.max_draft_len + 1, dtype=torch.int32, device="cuda")
+
+    worker._draft_gen_block_batched(
+        dm,
+        meta,
+        attn,
+        accepted,
+        nacc,
+        num_contexts=0,
+        batch_size=num_gens,
+        total_target_tokens=captured.shape[0],
+    )
+    assert seen["main_hidden"][:, 0].tolist() == [float(g) for g in range(num_gens)]
+
+
+def test_staged_confidence_rows_follow_the_slots_not_the_leading_rows():
+    """The confidence buffer is slot-indexed; a batch rarely owns slots 0..G-1.
+
+    Reading the buffer's leading rows would hand the scheduler a stale, unrelated
+    set of requests -- wrong budget, no error.
+    """
+    worker = _make_worker(enable_confidence_scheduling=True)
+    dm, _ = _stride_probe_draft_model()
+    worker._lazy_init(dm, _make_metadata(max_num_requests=8))
+    assert worker._confidence_logits is not None
+
+    # Tag every slot row with its slot index, then say the batch owns 5,2,7.
+    blk = worker.max_draft_len
+    for s in range(worker._confidence_logits.shape[0]):
+        worker._confidence_logits[s] = float(s)
+    worker._last_gen_slots = torch.tensor([5, 2, 7], device="cuda")
+
+    rows = worker.staged_confidence_rows()
+    assert rows.shape == (3, blk)
+    assert rows[:, 0].tolist() == [5.0, 2.0, 7.0]
+
+
+def test_staged_confidence_rows_is_none_before_any_draft():
+    worker = _make_worker(enable_confidence_scheduling=True)
+    dm, _ = _stride_probe_draft_model()
+    worker._lazy_init(dm, _make_metadata(max_num_requests=8))
+    assert worker.staged_confidence_rows() is None
+
+
+def test_confidence_buffer_absent_when_scheduling_is_off():
+    """Zero cost when the feature is off."""
+    worker = _make_worker(enable_confidence_scheduling=False)
+    dm, _ = _stride_probe_draft_model()
+    worker._lazy_init(dm, _make_metadata(max_num_requests=8))
+    assert worker._confidence_logits is None
+    assert worker.verify_planner is None
+
+
+def test_unscored_confidence_slots_read_as_verify_all():
+    """A slot never scored must not make the scheduler trim on garbage."""
+    worker = _make_worker(enable_confidence_scheduling=True)
+    dm, _ = _stride_probe_draft_model()
+    worker._lazy_init(dm, _make_metadata(max_num_requests=8))
+    assert torch.all(torch.sigmoid(worker._confidence_logits) > 0.999)
