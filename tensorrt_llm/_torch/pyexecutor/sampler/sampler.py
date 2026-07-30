@@ -1160,8 +1160,13 @@ class AsyncWorkerMixin:
         # consistent with the semantics of futures
         dest.copy_(src)
 
-    def _copy_to_host(self, src: torch.Tensor) -> torch.Tensor:
-        dest = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
+    def _copy_to_host(self, src: torch.Tensor, dest: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if dest is None:
+            dest = torch.empty_like(src, device="cpu", pin_memory=prefer_pinned())
+        else:
+            assert dest.device.type == "cpu"
+            assert dest.shape == src.shape
+            assert dest.dtype == src.dtype
         if self._async_worker_active():
             # Create a snapshot of the source on the main stream, so as to
             # guarantee that the tensor data hasn't been modified before the

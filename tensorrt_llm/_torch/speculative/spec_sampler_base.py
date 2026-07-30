@@ -24,6 +24,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
@@ -111,6 +112,23 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
             next_draft_tokens=int_tensor((seq_slots, draft_tokens_size)),
             new_tokens_lens=int_tensor((seq_slots,)),
+        )
+        # Recycle pinned D2H destinations after update_requests consumes their
+        # SampleState. A pool preserves correctness when multiple sample states
+        # are in flight (for example, pipeline-parallel microbatches).
+        self._host_store_pool: list[SampleStateTensorsSpec] = []
+
+    def _allocate_host_store(self) -> SampleStateTensorsSpec:
+        return SampleStateTensorsSpec(
+            new_tokens=torch.empty_like(
+                self.store.new_tokens, device="cpu", pin_memory=prefer_pinned()
+            ),
+            new_tokens_lens=torch.empty_like(
+                self.store.new_tokens_lens, device="cpu", pin_memory=prefer_pinned()
+            ),
+            next_draft_tokens=torch.empty_like(
+                self.store.next_draft_tokens, device="cpu", pin_memory=prefer_pinned()
+            ),
         )
 
     def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
@@ -211,6 +229,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
+        self._host_store_pool.append(state.host)
+
     def sample_async(
         self,
         scheduled_requests: ScheduledRequests,
@@ -287,11 +307,12 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=self.store.next_draft_tokens,
         )
 
-        host_tensors = SampleStateTensorsSpec(
-            new_tokens=self._copy_to_host(self.store.new_tokens),
-            new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
-            next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+        host_tensors = (
+            self._host_store_pool.pop() if self._host_store_pool else self._allocate_host_store()
         )
+        self._copy_to_host(self.store.new_tokens, host_tensors.new_tokens)
+        self._copy_to_host(self.store.new_tokens_lens, host_tensors.new_tokens_lens)
+        self._copy_to_host(self.store.next_draft_tokens, host_tensors.next_draft_tokens)
         sampler_event = self._record_sampler_event()
 
         # Add dummy draft tokens to context requests for KV cache preparation
