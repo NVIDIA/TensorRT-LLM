@@ -31,11 +31,11 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (
     AttentionDpConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
     DFlashDecodingConfig, DSparkDecodingConfig, DraftTargetDecodingConfig,
-    Eagle3DecodingConfig, KvCacheConfig, MiniMaxM3SparseAttentionConfig,
-    MoeConfig, MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
-    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
-    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
-    TorchCompileConfig)
+    Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
+    MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
+    NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
+    SADecodingConfig, SamplingParams, SchedulerConfig,
+    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -4689,6 +4689,12 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(
             max_batch_size=32, enable_padding=True),
                               torch_compile_config=torch_compile_config)
+        # Piecewise CUDA-graph capture (torch_compile=True) needs extra
+        # workspace beyond what the default KV-cache fraction reserves on
+        # 44 GiB L40S; lower the fraction in that case to avoid executor OOM.
+        if torch_compile:
+            pytorch_config["kv_cache_config"] = KvCacheConfig(
+                free_gpu_memory_fraction=0.6)
 
         with LLM(f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf",
                  tensor_parallel_size=tp_size,
@@ -5925,7 +5931,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=enable_block_reuse)
         if enable_block_reuse:
-            kv_cache_config.mamba_state_cache_interval = 256
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         pytorch_config = dict(disable_overlap_scheduler=False,
                               cuda_graph_config=CudaGraphConfig(
                                   max_batch_size=512, enable_padding=True))
@@ -6291,6 +6297,9 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=enable_block_reuse)
+        if enable_block_reuse:
+            kv_cache_config.avg_seq_len = 2048
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         # DeepGEMM MoE kernels only support datacenter Blackwell (SM100/SM103).
         # Fall back to the CUTLASS MoE backend (which supports FP8 block scales)
         # on other architectures such as Hopper (SM90) and consumer Blackwell
@@ -6444,6 +6453,9 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
                                         enable_block_reuse=enable_block_reuse)
+        if enable_block_reuse:
+            kv_cache_config.avg_seq_len = 2048
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         cuda_graph_config = CudaGraphConfig(max_batch_size=256,
                                             enable_padding=True)
 
@@ -7128,7 +7140,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
+        "tp_size, ep_size, periodic_snapshot_interval, attention_dp, use_mtp",
         [
             (1, 1, 256, False, False),
             (4, 1, 256, False, True),
@@ -7139,7 +7151,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         ids=["TP1", "TP4_MTP", "TEP4", "DEP4_MTP_OFF", "DEP4_MTP_ON"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
-                                     mamba_state_cache_interval, attention_dp,
+                                     periodic_snapshot_interval, attention_dp,
                                      use_mtp):
         gpu_needed = max(tp_size, ep_size)
         if get_device_count() < gpu_needed:
@@ -7154,9 +7166,11 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
+                    avg_seq_len=2048,
                     mamba_ssm_cache_dtype="float16",
-                    mamba_state_cache_interval=mamba_state_cache_interval,
-                    free_gpu_memory_fraction=0.8,
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=periodic_snapshot_interval),
+                    free_gpu_memory_fraction=0.7,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=tp_size,
@@ -7228,7 +7242,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 model_path,
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
+                    avg_seq_len=2048,
                     mamba_ssm_cache_dtype="float16",
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=256),
                     free_gpu_memory_fraction=0.5,
                 ),
                 max_batch_size=32,
@@ -7561,7 +7578,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
+        "tp_size, ep_size, periodic_snapshot_interval, attention_dp, use_mtp",
         [
             (4, 1, 256, False, True),
             (4, 4, 256, False, False),
@@ -7571,7 +7588,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
         ids=["TP4_MTP", "TEP4", "ADP4", "ADP4_MTP"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
-                                     mamba_state_cache_interval, attention_dp,
+                                     periodic_snapshot_interval, attention_dp,
                                      use_mtp):
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
@@ -7582,8 +7599,10 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
+                    avg_seq_len=2048,
                     mamba_ssm_cache_dtype="float16",
-                    mamba_state_cache_interval=mamba_state_cache_interval,
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=periodic_snapshot_interval),
                     free_gpu_memory_fraction=0.5,
                 ),
                 max_batch_size=max_batch_size,
