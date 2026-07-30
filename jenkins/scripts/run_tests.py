@@ -246,7 +246,9 @@ def run_pytest(pytest_cmd, working_dir):
     """
     print(f"Running pytest: {pytest_cmd}")
     t0 = time.monotonic()
-    result = subprocess.run(pytest_cmd, shell=True, cwd=working_dir)
+    # Merge stderr into stdout so collection errors and other stderr output
+    # appear in the SLURM job log (which is tailed via stdout only).
+    result = subprocess.run(pytest_cmd, shell=True, cwd=working_dir, stderr=subprocess.STDOUT)
     elapsed = time.monotonic() - t0
     print(f"Pytest finished with exit code {result.returncode} ({format_duration(elapsed)})")
     return result.returncode, elapsed
