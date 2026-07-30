@@ -3124,27 +3124,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
                     # Gather logprobs only for non-beam search requests
                     if self._use_beam_search:
-                        gather_processed_logprobs_group_req_indices_list = [
+                        skip_processed_logprobs_group_req_indices_list = [
                             grp_idx
                             for grp_idx, req_idx in enumerate(
                                 need_processed_logprobs_req_indices_list
                             )
-                            if requests[req_idx].py_beam_width == 1
+                            if requests[req_idx].py_beam_width != 1
                         ]
 
                         # repurpose group_need_processed_logprobs
                         group_gather_processed_logprobs = group_need_processed_logprobs
                         del group_need_processed_logprobs
-                        gather_processed_logprobs_group_req_indices = torch.tensor(
-                            gather_processed_logprobs_group_req_indices_list,
+                        skip_processed_logprobs_group_req_indices = torch.tensor(
+                            skip_processed_logprobs_group_req_indices_list,
                             dtype=need_processed_logprobs_req_indices.dtype,
                         )
                         group_gather_processed_logprobs[
-                            gather_processed_logprobs_group_req_indices
+                            skip_processed_logprobs_group_req_indices
                         ] = False
                         num_gather_processed_logprobs_req_indices = len(
-                            gather_processed_logprobs_group_req_indices_list
-                        )
+                            need_processed_logprobs_req_indices_list
+                        ) - len(skip_processed_logprobs_group_req_indices_list)
                     else:
                         # repurpose group_need_processed_logprobs
                         group_gather_processed_logprobs = group_need_processed_logprobs
