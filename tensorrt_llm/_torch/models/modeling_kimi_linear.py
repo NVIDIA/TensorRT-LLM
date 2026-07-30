@@ -2023,26 +2023,30 @@ class KimiLinearDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
+        num_snapshots: int,
         attn_metadata: AttentionMetadata,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
-        Returns ``(prefix_sum, block_residual)`` with the snapshot stack in
-        kernel-native ``[K, M, H]`` layout; the running prefix sum is the
-        hidden state handed to the next layer.
+        ``block_residual`` is a preallocated snapshot bank in kernel-native
+        ``[K_max, M, H]`` layout. Returns the running prefix sum and the
+        number of valid bank rows.
         """
         prefix_sum = hidden_states
+        valid_block_residual = block_residual[:num_snapshots]
 
-        if block_residual.shape[0] > 0:
+        if num_snapshots > 0:
             hidden_states = _apply_attn_res(
                 prefix_sum,
-                block_residual,
+                valid_block_residual,
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
             )
 
         if self.layer_idx % self.attn_res_block_size == 0:
-            block_residual = torch.cat((block_residual, prefix_sum.unsqueeze(0)), dim=0)
+            block_residual[num_snapshots].copy_(prefix_sum)
+            num_snapshots += 1
+            valid_block_residual = block_residual[:num_snapshots]
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -2054,7 +2058,7 @@ class KimiLinearDecoderLayer(nn.Module):
             prefix_sum = hidden_states
 
         hidden_states = _apply_attn_res(
-            prefix_sum, block_residual, self.mlp_res_proj, self.mlp_res_norm
+            prefix_sum, valid_block_residual, self.mlp_res_proj, self.mlp_res_norm
         )
 
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -2069,7 +2073,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 hidden_states = self._mlp_allreduce(hidden_states)
 
         prefix_sum = prefix_sum + hidden_states
-        return prefix_sum, block_residual
+        return prefix_sum, num_snapshots
 
 
 # ---------------------------------------------------------------------------
@@ -2104,6 +2108,9 @@ class KimiLinearModel(DecoderModel):
             cfg.hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
         self.output_attn_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
+        self.num_attn_res_snapshots = (
+            cfg.num_hidden_layers + cfg.attn_res_block_size - 1
+        ) // cfg.attn_res_block_size
 
     def forward(
         self,
@@ -2128,9 +2135,16 @@ class KimiLinearModel(DecoderModel):
             "tokens); disable CUDA graphs and the overlap scheduler."
         )
 
-        block_residual = hidden_states.new_zeros(0, hidden_states.shape[0], hidden_states.shape[1])
+        block_residual = hidden_states.new_empty(
+            self.num_attn_res_snapshots,
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+        )
+        num_snapshots = 0
         for layer in self.layers:
-            hidden_states, block_residual = layer(hidden_states, block_residual, attn_metadata)
+            hidden_states, num_snapshots = layer(
+                hidden_states, block_residual, num_snapshots, attn_metadata
+            )
             if spec_metadata is not None:
                 # DFlash hidden-state capture. K3's attn-residual scheme
                 # already folds the residual into the running prefix sum
@@ -2142,7 +2156,10 @@ class KimiLinearModel(DecoderModel):
                 spec_metadata.maybe_capture_hidden_states(layer.layer_idx, hidden_states, None)
 
         hidden_states = _apply_attn_res(
-            hidden_states, block_residual, self.output_attn_res_proj, self.output_attn_res_norm
+            hidden_states,
+            block_residual[:num_snapshots],
+            self.output_attn_res_proj,
+            self.output_attn_res_norm,
         )
         return self.norm(hidden_states)
 
