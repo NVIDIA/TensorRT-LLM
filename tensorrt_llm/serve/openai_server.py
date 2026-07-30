@@ -75,8 +75,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatMessage, CompletionRequest, CompletionResponse,
     CompletionResponseChoice, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
-    ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse, ImageObject,
+    EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse, ImageEditRequest,
+    ImageGenerationRequest, ImageGenerationResponse, ImageObject,
     MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
     ResponseFormat, ResponsesRequest, ResponsesResponse, TokenizeRequest,
     TokenizeResponse, UpdateWeightsRequest, UsageInfo,
@@ -319,10 +319,15 @@ def _normalize_image_output(image) -> list:
     return [image]
 
 
+_IMAGE_EDIT_MODEL_ID_MARKERS = ("qwen-image-edit", "qwen-image-layered")
+
+
 def _model_supports_image_edit(model_id: Optional[str]) -> bool:
     if not model_id:
         return False
-    return "qwen-image-edit" in str(model_id).replace("_", "-").lower()
+    normalized_model_id = str(model_id).replace("_", "-").lower()
+    return any(marker in normalized_model_id
+               for marker in _IMAGE_EDIT_MODEL_ID_MARKERS)
 
 
 class OpenAIServer(_VideoRoutesMixin):
@@ -598,7 +603,8 @@ class OpenAIServer(_VideoRoutesMixin):
             getattr(self.generator, "model", None),
             getattr(args, "model", None),
         )
-        return any(_model_supports_image_edit(model_id) for model_id in model_ids)
+        return any(
+            _model_supports_image_edit(model_id) for model_id in model_ids)
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
@@ -2734,6 +2740,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
+            # Model-specific ``extra_params`` stay pipeline-owned. Layered
+            # image-edit models such as Qwen-Image-Layered use
+            # ``save_layers_to_grid`` to pack all layers into one image here.
             output_images = _normalize_image_output(output.image)
             pil_format = request.format.upper()
             ext = f".{request.format}"
@@ -2741,8 +2750,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 data = [
                     ImageObject(
                         b64_json=base64.b64encode(
-                            image_to_bytes(
-                                image, format=pil_format)).decode("utf-8"),
+                            image_to_bytes(image,
+                                           format=pil_format)).decode("utf-8"),
                         revised_prompt=request.prompt,
                     ) for image in output_images
                 ]

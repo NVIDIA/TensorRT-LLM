@@ -15,7 +15,6 @@ from tensorrt_llm.serve.openai_protocol import (
     ImageGenerationRequest,
     VideoGenerationRequest,
 )
-
 if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
@@ -167,7 +166,8 @@ def _materialize_conditioning_inputs(
         _materialize_conditioning_input(
             item,
             os.path.join(media_storage_path, f"{id}_{field_name}_{i}.png"),
-        ) for i, item in enumerate(values)
+        )
+        for i, item in enumerate(values)
     ]
     return paths if isinstance(value, list) else paths[0]
 
@@ -218,9 +218,7 @@ def parse_visual_gen_params(
 
     elif isinstance(request, ImageEditRequest):
         if media_storage_path is None:
-            raise ValueError(
-                "media_storage_path is required when image edit inputs are provided"
-            )
+            raise ValueError("media_storage_path is required when image edit inputs are provided")
         params.image = _materialize_conditioning_inputs(
             request.image,
             id=id,

@@ -15,6 +15,7 @@ in OpenAIServer.register_visual_gen_routes():
 
 import asyncio
 import base64
+import json
 import os
 from io import BytesIO
 from pathlib import Path
@@ -27,7 +28,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tensorrt_llm.serve.openai_protocol import VideoJob
-from tensorrt_llm.serve.openai_server import _normalize_image_output
+from tensorrt_llm.serve.openai_server import _model_supports_image_edit, _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
@@ -138,8 +139,12 @@ class MockVisualGen:
         batch_aware: bool = True,
         validation_error: Optional[ValueError] = None,
         generate_error: Optional[BaseException] = None,
+        extra_param_specs: Optional[dict] = None,
+        model: str = "test-model",
     ):
         from types import SimpleNamespace
+
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 
         self._image = image_output
         self._video = video_output
@@ -150,6 +155,8 @@ class MockVisualGen:
         # Raised out of generate(): models an engine-side failure class,
         # where validation_error models a coordinator preflight rejection.
         self._generate_error = generate_error
+        self._extra_param_specs = extra_param_specs or {}
+        self._model = model
         self._healthy = True
         self._req_counter = 0
         # Captured arguments of the most recent generate / generate_async call,
@@ -164,8 +171,6 @@ class MockVisualGen:
         # reject legitimate width/height/num_frames/... requests;
         # ``extra_param_specs`` lists a single known key so tests can
         # exercise both the accept-known and reject-unknown paths.
-        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
-
         self.executor = SimpleNamespace(
             default_generation_params={
                 "height": 64,
@@ -176,9 +181,8 @@ class MockVisualGen:
                 "num_frames": 8,
                 "frame_rate": 8.0,
             },
-            extra_param_specs={
-                "stg_scale": ExtraParamSchema(type="float", default=1.0),
-            },
+            extra_param_specs=extra_param_specs
+            or {"stg_scale": ExtraParamSchema(type="float", default=1.0)},
         )
 
     def _maybe_batch(self, tensor, n):
@@ -240,12 +244,12 @@ class MockVisualGen:
         every request ``extra_params`` key reaches the executor as
         ``unknown_extra_param`` (matches a pipeline with no model-specific
         knobs declared, like Flux or Wan 2.1)."""
-        return {}
+        return self._extra_param_specs
 
     @property
     def model(self):
         """Stand-in for VisualGen.model — used by warn-on-set logic."""
-        return "test-model"
+        return self._model
 
     def _check_health(self) -> bool:
         return self._healthy
@@ -700,13 +704,19 @@ class TestImageGeneration:
 
 
 class TestImageEdit:
-    """``/v1/images/edits`` returns 501 NotImplemented in the current release.
+    """``/v1/images/edits`` support is gated by the loaded visual model."""
 
-    No in-tree pipeline implements image editing: Flux/Flux2 are
-    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-    video, not edited images. Restore the full happy-path coverage when an
-    edit-capable pipeline lands.
-    """
+    @pytest.mark.parametrize(
+        ("model_id", "expected"),
+        [
+            ("Qwen/Qwen-Image-Edit-2511", True),
+            ("Qwen/Qwen-Image-Layered", True),
+            ("Qwen/Qwen-Image", False),
+            (None, False),
+        ],
+    )
+    def test_model_supports_image_edit(self, model_id, expected):
+        assert _model_supports_image_edit(model_id) is expected
 
     def test_image_edit_returns_not_implemented(self, image_client):
         """Valid request body short-circuits to 501 NotImplemented."""
@@ -732,6 +742,42 @@ class TestImageEdit:
         assert resp.status_code == 501
         body = resp.json()
         assert body.get("type") == "NotImplementedError"
+
+    def test_qwen_layered_image_edit_forwards_save_layers_to_grid(self, tmp_path):
+        """Qwen-Image-Layered uses image-edit extra_params to request one layer grid."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+        gen = MockVisualGen(
+            image_output=torch.stack(
+                [
+                    _make_dummy_image_tensor(4, 4),
+                    _make_dummy_image_tensor(4, 4),
+                ]
+            ),
+            extra_param_specs={
+                "save_layers_to_grid": ExtraParamSchema(type="bool", default=False),
+            },
+            model="Qwen/Qwen-Image-Layered",
+        )
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        try:
+            image_bytes = BytesIO(base64.b64decode(_b64_white_png_1x1()))
+            resp = client.post(
+                "/v1/images/edits",
+                data={
+                    "prompt": "split layers",
+                    "response_format": "b64_json",
+                    "extra_params": json.dumps({"save_layers_to_grid": True}),
+                },
+                files={"image": ("input.png", image_bytes, "image/png")},
+            )
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+        assert resp.status_code == 200
+        assert gen.last_params.extra_params == {"save_layers_to_grid": True}
+        assert len(resp.json()["data"]) == 2
 
 
 # =========================================================================
