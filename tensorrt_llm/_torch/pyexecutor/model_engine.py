@@ -323,6 +323,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self.forward_pass_callable = None
         self.ub_buffers = None
+        self._userbuffers_manager_initialized = False
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -2745,10 +2746,9 @@ class PyTorchModelEngine(ModelEngine):
         2. The model module reference.
         3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
         4. Input processors.
-        5. Userbuffers (``ub.ub_deallocate`` per buffer); on per-buffer
-           failure the unfreed buffers are kept attached so a deterministic
-           retry doesn't double-free already-released ones, and the
-           collected errors are re-raised after the loop.
+        5. Legacy directly-owned userbuffers (``ub.ub_deallocate`` per
+           buffer), followed by the engine-scoped userbuffer manager pool.
+           Manager shutdown unregisters the pool's CUDA VMM regions.
 
         Idempotency:
             Subsequent calls are no-ops (guarded by ``_cleanup_done``).
@@ -2803,8 +2803,12 @@ class PyTorchModelEngine(ModelEngine):
                     "Failed to deallocate one or more userbuffers during "
                     "PyTorchModelEngine cleanup") from ub_errors[0]
 
-        # Release model weights.
+        # Release model weights and tensor-owned userbuffers before shutting
+        # down the engine-scoped userbuffer manager.
         release_gc()
+        if self._userbuffers_manager_initialized:
+            ub.shutdown_userbuffers_manager()
+            self._userbuffers_manager_initialized = False
         self._cleanup_done = True
 
     def __del__(self) -> None:
@@ -6997,6 +7001,7 @@ class PyTorchModelEngine(ModelEngine):
                                           self.mapping.rank,
                                           self.mapping.gpus_per_node,
                                           hidden_size * self.max_num_tokens * 2)
+        self._userbuffers_manager_initialized = True
 
         return True
 

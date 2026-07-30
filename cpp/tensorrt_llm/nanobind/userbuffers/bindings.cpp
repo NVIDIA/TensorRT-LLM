@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +51,7 @@ void UserBufferBindings::initBindings(nb::module_& m)
 
     m.def("initialize_userbuffers_manager", &tub::initialize_userbuffers_manager,
         nb::call_guard<nb::gil_scoped_release>());
+    m.def("shutdown_userbuffers_manager", &tub::shutdown_userbuffers_manager, nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace kernels::userbuffers
 
