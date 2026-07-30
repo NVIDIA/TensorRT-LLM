@@ -2919,12 +2919,10 @@ class Indexer(nn.Module):
                 # so we cap it at 256 for now and fall back to the CUDA C++
                 # indexer_topk_decode. This limit can be removed if GPU memory
                 # is not a bottleneck.
-                # tier "none" = the router judged this shape too short for
-                # any assist to pay (gvr_routing.ASSIST_MIN_N_COMP); fall
-                # through to the stock GVR branch below. The ext state is
-                # left untouched, which is exactly the cold-start case its
-                # closed loop already handles: xstate stays invalid, so the
-                # first step above the gate seeds from the stock path.
+                # tier "none" (gvr_routing.ASSIST_MIN_N_COMP): too short for
+                # any assist to pay - fall through to the stock branch. The
+                # untouched ext state reads as cold start, which its closed
+                # loop already handles.
                 if (self.use_gvr_ext and self._gvr_ext is not None
                         and self._gvr_route is not None
                         and self._gvr_route.tier != "none" and next_n == 1

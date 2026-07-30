@@ -818,10 +818,12 @@ class FP4MQALogitsKernel:
         schedule_meta: cute.Tensor,  # [num_sms+1, 2] int32
         num_phys_blocks: cutlass.Int32,
         batch_size: cutlass.Int32,
-        block_max: cute.Tensor,  # [num_rows, nb_pad*4] fp32 warp-partials (or None)
-        hit_stats: cute.Tensor,  # [num_rows, 4] fp32 hit aggregate (or None unless emit_hit_stats)
-        hit_bitmap: cute.Tensor,  # [batch, nb_pad*4] int32 (or None unless emit_block_meta)
         stream: cuda.CUstream,
+        # everything below is emission-only and defaulted, so the
+        # positional signature stays the one callers already use
+        block_max: cute.Tensor = None,  # [num_rows, nb_pad*4] fp32 warp-partials
+        hit_stats: cute.Tensor = None,  # [num_rows, 4] fp32 (emit_hit_stats)
+        hit_bitmap: cute.Tensor = None,  # [batch, nb_pad*4] int32 (emit_block_meta)
         seed_thr: cute.Tensor = None,  # [num_rows, 3] fp32 (emit_seed_counts)
         seed_counts: cute.Tensor = None,  # [num_rows, 3] int32 out, caller-zeroed
         cand: cute.Tensor = None,  # [num_rows, CAP*2] int32 {val bits, idx} pairs
