@@ -1052,6 +1052,11 @@ class MLA(nn.Module):
         # kv_a_layernorm + concat pair as a kill switch.
         if os.environ.get("TRTLLM_DISABLE_FUSED_KV_NORM", "0") == "1":
             return False
+        # Bisect gate: keep the context fusion, fall back to the standalone
+        # kv_a_layernorm for any batch that carries generation tokens. The flag is
+        # per-forward, so this also un-fuses the context half of a mixed batch.
+        if os.environ.get("TRTLLM_FUSED_KV_NORM_CTX_ONLY", "0") == "1" and num_generations > 0:
+            return False
         if not self.is_deepseek_v4:
             return False
         # The kernels describe the latent row with their K_DIM/ROPE_DIM template
@@ -2043,6 +2048,11 @@ class MLA(nn.Module):
                 dsv4_epilogue_output=dsv4_epilogue_output,
             )
 
+        # Both halves have consumed the flag; drop it so a later forward that
+        # reaches forward_absorption_* by another route cannot see a stale True
+        # (the fused branch above is the only place it is ever set).
+        self._fused_kv_norm_active = False
+
     def forward_context_default(
         self,
         q: torch.Tensor,
@@ -2580,6 +2590,11 @@ class MLA(nn.Module):
         # generation RoPE kernel skips its per-layer recomputation. Older metadata
         # objects without the hook fall back to per-layer allocation + in-kernel fill.
         _mla_prep = getattr(attn_metadata, "mla_prepare_scheduler_buffers", None)
+        # Bisect gate: TRTLLM_DISABLE_PRECOMPUTED_CU_SEQLENS=1 keeps the fused KV
+        # kernel but restores the in-kernel cu_seqlens fill, isolating the
+        # metadata-side hoist from the fusion itself.
+        if os.environ.get("TRTLLM_DISABLE_PRECOMPUTED_CU_SEQLENS", "0") == "1":
+            _mla_prep = None
         if _mla_prep is not None:
             cu_q_seqlens, cu_kv_seqlens = _mla_prep(self.num_heads_tp)
             precomputed_cu_seqlens = True
@@ -2933,7 +2948,12 @@ class MLA(nn.Module):
         fused_q = None
         self._fused_quant_q_buffer = None
         self._fused_q_pe = None
-        self._fused_kv_norm_active = False
+        # NOTE: `_fused_kv_norm_active` is deliberately NOT cleared here. In a mixed
+        # batch this function runs before `forward_absorption_generation`, which
+        # reads the flag to decide whether to hand the kernel the norm weight --
+        # clearing it here made the generation half write UN-normalized latent rows
+        # into the KV cache. The owner of the flag (`forward_impl_with_deepseek_v4`)
+        # clears it once both halves are done.
 
         if enable_dsv4_epilogue_fusion:
             return attn_out_latent
