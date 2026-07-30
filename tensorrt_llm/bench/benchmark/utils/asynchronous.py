@@ -282,7 +282,6 @@ class LlmManager:
                                          post_proc_params=post_proc_params))
                 task.add_done_callback(self._task_done_callback)
                 self._tasks.add(task)
-            logger.debug("Worker task finishing...")
         except asyncio.CancelledError:
             logger.info("Worker task cancelled.")
         finally:

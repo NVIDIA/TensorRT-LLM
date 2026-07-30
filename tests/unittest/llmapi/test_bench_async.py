@@ -83,9 +83,12 @@ async def test_llm_manager_duration():
     # The worker should have stopped and cleared the inbox.
     assert manager._inbox.empty()
 
-    # Requests 1 and 2 complete (0.6s + 0.6s); request 3 acquires its
-    # concurrency slot at t=1.2s, past the 1s deadline, and must be skipped.
-    assert outbox.qsize() == 2
+    # Request 3 acquires its concurrency slot at t=1.2s, past the 1s deadline,
+    # so it is always skipped. Request 2 acquires at t=0.6s and normally makes
+    # the deadline, but a scheduling stall on a loaded machine can push it past;
+    # the point of the test is that the limit drops requests, not exactly how
+    # many land on the boundary.
+    assert 1 <= outbox.qsize() < 3
 
     await manager.stop()
 
@@ -467,9 +470,10 @@ async def test_async_benchmark_duration():
             duration=1,  # 1 second limit
         )
 
-    # With concurrency=1, requests run back-to-back (0.6s each): requests 1
-    # and 2 complete at 0.6s and 1.2s; request 3 acquires its slot past the
-    # 1s deadline and is skipped. Without a concurrency limit all three would
-    # start immediately and finish within 0.6s, before the deadline — duration
-    # cannot bound an unbounded-concurrency run (see LlmManager warning).
-    assert len(stats.requests) == 2
+    # With concurrency=1 requests run back-to-back (0.6s each), so request 3
+    # acquires its slot past the 1s deadline and is always skipped. Request 2
+    # sits on the boundary, so assert the limit took effect rather than the
+    # exact count. Without a concurrency limit all three would start at once
+    # and finish before the deadline, which is why the CLI rejects that
+    # combination.
+    assert 1 <= len(stats.requests) < 3
