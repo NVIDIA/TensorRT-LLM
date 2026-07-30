@@ -254,9 +254,7 @@ class Cosmos3SamplingPolicy:
             return scheduler
 
         current_shift = float(_config_get(scheduler.config, "flow_shift", 1.0) or 1.0)
-        target_shift = (
-            self.checkpoint_flow_shift if target_shift is None else float(target_shift)
-        )
+        target_shift = self.checkpoint_flow_shift if target_shift is None else float(target_shift)
         current_karras = bool(_config_get(scheduler.config, "use_karras_sigmas", False))
         base_karras = bool(_config_get(self.unipc_base_config, "use_karras_sigmas", False))
         target_karras = base_karras if use_karras_sigmas is None else bool(use_karras_sigmas)

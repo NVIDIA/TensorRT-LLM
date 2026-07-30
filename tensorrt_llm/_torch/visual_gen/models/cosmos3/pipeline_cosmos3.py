@@ -17,7 +17,7 @@ import json
 import math
 import os
 import time
-from typing import Any, Iterable, List, Optional, Union
+from typing import Iterable, List, Optional, Union
 
 import PIL.Image
 import torch
@@ -263,18 +263,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def infer(self, req):
         extra_params = req.params.extra_params or {}
         output_type = extra_params.get("output_type", "video")
-        is_t2i = str(output_type).lower() == "image"
-
-        # None = unset; resolve by mode exactly once. Non-None values pass through.
-        mode_params = COSMOS3_T2I_PARAMS if is_t2i else COSMOS3_720P_PARAMS
-
-        def resolved(value, field_name):
-            return value if value is not None else mode_params[field_name]
-
-        height = resolved(req.params.height, "height")
-        width = resolved(req.params.width, "width")
-        num_inference_steps = resolved(req.params.num_inference_steps, "num_inference_steps")
-        guidance_scale = resolved(req.params.guidance_scale, "guidance_scale")
         video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
 
         return self.forward(
@@ -772,7 +760,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 "frame at every step, and this pipeline does not re-anchor it per step."
             )
 
-        is_t2i = str(output_type).lower() == "image"
         if image is not None and video is not None:
             raise ValueError(
                 "Cosmos3 generation supports text-only, text + image, "
