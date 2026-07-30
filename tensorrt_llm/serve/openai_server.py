@@ -63,7 +63,8 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
-from tensorrt_llm.serve.disagg_auth import validate_internal_disagg_request
+from tensorrt_llm.serve.disagg_auth import (
+    request_requires_internal_disagg_auth, validate_internal_disagg_request)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
@@ -510,11 +511,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.media_storage_path.mkdir(exist_ok=True, parents=True)
         self.video_gen_tasks = {}
 
-    def _validate_internal_disagg_request(self, request, raw_request) -> None:
-        headers = {} if raw_request is None else raw_request.headers
-        validate_internal_disagg_request(
-            getattr(self, "_internal_disagg_auth_key", None), request, headers)
-
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
         hf_tokenizer_path = self.generator._hf_model_dir
@@ -639,9 +635,22 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def _validate_internal_disagg_request(
             self, request, raw_request: Optional[Request]) -> None:
+        if (request_requires_internal_disagg_auth(request)
+                and not self._has_cache_transceiver_config()):
+            raise ValueError("Protected disaggregated request fields require "
+                             "cache_transceiver_config to be configured")
         headers = None if raw_request is None else raw_request.headers
         validate_internal_disagg_request(
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
+
+    def _has_cache_transceiver_config(self) -> bool:
+        cache_transceiver_config = getattr(
+            getattr(self.generator, "args", None), "cache_transceiver_config",
+            None)
+        if isinstance(cache_transceiver_config, dict):
+            return cache_transceiver_config.get("backend") is not None
+        return (cache_transceiver_config is not None and getattr(
+            cache_transceiver_config, "backend", None) is not None)
 
     def _log_config_info_metrics(self) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""

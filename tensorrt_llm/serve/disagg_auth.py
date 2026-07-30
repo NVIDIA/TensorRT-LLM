@@ -22,6 +22,7 @@ from tensorrt_llm.serve.openai_protocol import UCompletionRequest
 
 INTERNAL_DISAGG_AUTH_HEADER = "x-trtllm-disagg-auth"
 _SIGNATURE_PREFIX = "sha256="
+_INTERNAL_DISAGG_AUTH_FIELDS = ("encoded_opaque_state", "ctx_info_endpoint")
 _MISSING_AUTH_KEY_WARNING = (
     "Internal disaggregated authentication key is required for protected "
     "disaggregated request fields. In a future release the requirement to "
@@ -30,15 +31,19 @@ _MISSING_AUTH_KEY_WARNING = (
 )
 
 
+def get_internal_disagg_auth_fields() -> tuple[str, ...]:
+    return _INTERNAL_DISAGG_AUTH_FIELDS
+
+
 def _warn_missing_auth_key() -> None:
     warnings.warn(_MISSING_AUTH_KEY_WARNING, FutureWarning, stacklevel=2)
 
 
 def request_requires_internal_disagg_auth(request: UCompletionRequest) -> bool:
     disaggregated_params = getattr(request, "disaggregated_params", None)
-    return disaggregated_params is not None and (
-        disaggregated_params.encoded_opaque_state is not None
-        or disaggregated_params.ctx_info_endpoint is not None
+    return disaggregated_params is not None and any(
+        getattr(disaggregated_params, field_name) is not None
+        for field_name in get_internal_disagg_auth_fields()
     )
 
 
@@ -51,8 +56,11 @@ def _canonical_ctx_info_endpoint(endpoint: Any) -> Any:
 def _auth_payload(request: UCompletionRequest) -> bytes:
     disaggregated_params = request.disaggregated_params
     payload = {
-        "ctx_info_endpoint": _canonical_ctx_info_endpoint(disaggregated_params.ctx_info_endpoint),
-        "encoded_opaque_state": disaggregated_params.encoded_opaque_state,
+        field_name: _canonical_ctx_info_endpoint(value)
+        if field_name == "ctx_info_endpoint"
+        else value
+        for field_name in get_internal_disagg_auth_fields()
+        for value in [getattr(disaggregated_params, field_name)]
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -65,7 +73,8 @@ def _sign_request(internal_disagg_auth_key: str, request: UCompletionRequest) ->
 
 
 def build_internal_disagg_auth_headers(
-    internal_disagg_auth_key: Optional[str], request: UCompletionRequest
+    internal_disagg_auth_key: Optional[str],
+    request: UCompletionRequest,
 ) -> dict[str, str]:
     if not request_requires_internal_disagg_auth(request):
         return {}

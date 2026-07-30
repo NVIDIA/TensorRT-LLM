@@ -160,6 +160,33 @@ def test_extract_disagg_cfg_internal_request_auth_key(sample_yaml_config):
         0].other_args
 
 
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_accepts_matching_section_auth_keys(
+        sample_yaml_config):
+    sample_yaml_config["context_servers"][
+        "internal_request_auth_key"] = "test-secret"
+    sample_yaml_config["generation_servers"][
+        "internal_request_auth_key"] = "test-secret"
+
+    config = extract_disagg_cfg(**sample_yaml_config)
+
+    assert config.internal_request_auth_key == "test-secret"
+    assert "internal_request_auth_key" not in config.server_configs[
+        0].other_args
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_rejects_mismatched_section_auth_keys(
+        sample_yaml_config):
+    sample_yaml_config["context_servers"][
+        "internal_request_auth_key"] = "ctx-secret"
+    sample_yaml_config["generation_servers"][
+        "internal_request_auth_key"] = "gen-secret"
+
+    with pytest.raises(ValueError, match="must match"):
+        extract_disagg_cfg(**sample_yaml_config)
+
+
 def test_extract_disagg_cfg_rejects_invalid_internal_request_auth_key():
     with pytest.raises(
             ValueError,

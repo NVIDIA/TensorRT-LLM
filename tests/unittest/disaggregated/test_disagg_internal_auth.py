@@ -17,10 +17,12 @@ import pytest
 from tensorrt_llm.serve.disagg_auth import (
     INTERNAL_DISAGG_AUTH_HEADER,
     build_internal_disagg_auth_headers,
+    get_internal_disagg_auth_fields,
     request_requires_internal_disagg_auth,
     validate_internal_disagg_request,
 )
 from tensorrt_llm.serve.openai_protocol import CompletionRequest, DisaggregatedParams
+from tensorrt_llm.serve.openai_server import OpenAIServer
 
 
 def _make_request(
@@ -57,12 +59,22 @@ def test_unprotected_request_does_not_require_internal_auth():
     validate_internal_disagg_request(None, request, {})
 
 
+def test_protected_fields_come_from_protocol_metadata():
+    assert set(get_internal_disagg_auth_fields()) == {
+        "ctx_info_endpoint",
+        "encoded_opaque_state",
+    }
+
+
 @pytest.mark.parametrize(
     "completion_request",
     [
         _make_request(encoded_opaque_state="b3BhcXVl"),
         _make_request(ctx_info_endpoint="tcp://10.0.0.1:5000"),
-        _make_request(encoded_opaque_state="b3BhcXVl", ctx_info_endpoint="tcp://10.0.0.1:5000"),
+        _make_request(
+            encoded_opaque_state="b3BhcXVl",
+            ctx_info_endpoint="tcp://10.0.0.1:5000",
+        ),
     ],
 )
 def test_protected_fields_allow_missing_internal_auth_key_with_warning(
@@ -84,7 +96,10 @@ def test_protected_fields_allow_missing_internal_auth_key_with_warning(
     [
         _make_request(encoded_opaque_state="b3BhcXVl"),
         _make_request(ctx_info_endpoint="tcp://10.0.0.1:5000"),
-        _make_request(encoded_opaque_state="b3BhcXVl", ctx_info_endpoint="tcp://10.0.0.1:5000"),
+        _make_request(
+            encoded_opaque_state="b3BhcXVl",
+            ctx_info_endpoint="tcp://10.0.0.1:5000",
+        ),
     ],
 )
 def test_protected_fields_accept_valid_internal_auth_header(completion_request):
@@ -155,3 +170,25 @@ def test_protected_fields_reject_missing_auth_header():
 
     with pytest.raises(ValueError, match="Invalid internal"):
         validate_internal_disagg_request("secret", request, {})
+
+
+def test_worker_rejects_protected_fields_without_cache_transceiver_config():
+    request = _make_request(ctx_info_endpoint="tcp://10.0.0.1:5000")
+    server = object.__new__(OpenAIServer)
+    server.generator = type(
+        "Generator",
+        (),
+        {
+            "args": type(
+                "Args",
+                (),
+                {
+                    "cache_transceiver_config": None,
+                },
+            )(),
+        },
+    )()
+    server._internal_disagg_auth_key = "secret"
+
+    with pytest.raises(ValueError, match="cache_transceiver_config"):
+        server._validate_internal_disagg_request(request, raw_request=None)
