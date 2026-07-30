@@ -63,11 +63,14 @@ def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 def ACTION_INFO = "action_info"
 @Field
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
+@Field
+def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
+    (TRTLLM_VERSION_OVERRIDE): null,
 ]
 
 @Field
@@ -268,7 +271,7 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 
-def buildImage(config, imageKeyToTag)
+def buildImage(config, imageKeyToTag, versionOverride)
 {
     def target = config.target
     def action = config.action
@@ -301,6 +304,20 @@ def buildImage(config, imageKeyToTag)
         // Step 1: Clone TRT-LLM source codes
         // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
         trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
+    }
+    if (versionOverride) {
+        def resolvedVersionOverride = versionOverride
+        if (versionOverride.startsWith(".")) {
+            def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
+            def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
+            if (!versionMatcher.find()) {
+                error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
+            }
+            resolvedVersionOverride =
+                "${versionMatcher.group(1)}${versionOverride}"
+        }
+        env.TRTLLM_VERSION_OVERRIDE = resolvedVersionOverride
+        args += ' TRT_LLM_VERSION="${TRTLLM_VERSION_OVERRIDE}"'
     }
 
     // Step 2: Build the images
@@ -439,6 +456,7 @@ def buildImage(config, imageKeyToTag)
 
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
+    def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
@@ -556,7 +574,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                     config.stageName = key
                     try {
                         trtllm_utils.launchKubernetesPod(pipeline, config.podConfig, "docker") {
-                            buildImage(config, imageKeyToTag)
+                            buildImage(config, imageKeyToTag, versionOverride)
                         }
                     } catch (InterruptedException e) {
                         throw e
