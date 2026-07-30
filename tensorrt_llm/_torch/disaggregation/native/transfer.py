@@ -96,6 +96,10 @@ class RecvReqInfo:
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
+    # Upper bound on what a sender may write at bounce_dst_base: the receiver's
+    # per-writer sub-region. Lets the sender fail closed instead of overrunning the
+    # slot if the two sides ever disagree about the coalesced size.
+    bounce_dst_bytes: Optional[int] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -112,6 +116,7 @@ class RecvReqInfo:
                 "mamba_state_index": self.mamba_state_index,
                 "slice_id": self.slice_id,
                 "bounce_dst_base": self.bounce_dst_base,
+                "bounce_dst_bytes": self.bounce_dst_bytes,
             }
         )
 
@@ -121,7 +126,10 @@ class RecvReqInfo:
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
-        return cls(**d)
+        # Drop keys this build does not know: a newer peer's extra field must not raise here and
+        # hang the transfer.
+        known = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 @dataclass
@@ -152,6 +160,7 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    bounce_dst_bytes: Optional[int] = None
 
 
 class MessageType:
@@ -914,6 +923,7 @@ class Sender(SenderBase):
             slice_id=task.slice_id,
             is_last_slice=task._slice.is_last_slice,
             bounce_dst_base=req_info.bounce_dst_base,
+            bounce_dst_bytes=req_info.bounce_dst_bytes,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1549,31 +1559,21 @@ class Receiver(ReceiverBase):
 
     @staticmethod
     def _fanin_bounce_safe(overlap, peer_ri) -> bool:
-        """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
-        The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV (should_send_kv) yet still
-            count in expected_transfers, so the live writers overflow their slots;
-          * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
-            for PP fan-in, every overlapping stage must hold the same number of layers
-            (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
-            list isn't available (shorter than the fan-in degree), be conservative and fall back.
-        Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
-        the mismatched case, so this only needs the count to split evenly."""
+        """Whether reserve() can size a multi-writer bounce here; else fall back to the
+        per-fragment path (correct, just not coalesced). It needs duplicate_head_factor == 1 (else
+        some ranks skip KV yet still count in expected_transfers), an even PP layer split, and no
+        replicated pool under a PP fan-in (reserve() sizes those only for a pure-TP fan-in)."""
         if overlap.duplicate_head_factor != 1:
             return False
-        if overlap.overlap_pp_size > 1:
-            lpp = getattr(peer_ri, "layer_num_per_pp", None)
-            if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
-                return False
-        # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
-        # fan-in owner only, so with multiple writers their contributions
-        # differ in size and the equal split is invalid.
-        if len(overlap.ranks) > 1 and peer_ri.page_table is not None:
-            for layer_group in peer_ri.page_table.layer_groups:
-                for pool_view in getattr(layer_group, "pool_views", ()):
-                    if pool_view.mapper_kind == MapperKind.REPLICATED:
-                        return False
+        if overlap.overlap_pp_size <= 1:  # implies a single writer per stage: nothing to split
+            return True
+        lpp = getattr(peer_ri, "layer_num_per_pp", None)
+        if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
+            return False
+        for layer_group in getattr(peer_ri.page_table, "layer_groups", ()):
+            for pool_view in getattr(layer_group, "pool_views", ()):
+                if pool_view.mapper_kind == MapperKind.REPLICATED:
+                    return False
         return True
 
     def dispatch_task(self, task: KVRecvTask):
@@ -1617,10 +1617,22 @@ class Receiver(ReceiverBase):
         # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
-        allow_bounce = task.expected_transfers == 1 or (
-            sender_dp_rank is not None and self._fanin_bounce_safe(topo_overlap, peer_infos)
+        # Check enabled first: with bounce off, reserve() is a no-op but its arguments would still
+        # build every peer mapper on the receive path.
+        allow_bounce = self._bounce.enabled and (
+            task.expected_transfers == 1
+            or (sender_dp_rank is not None and self._fanin_bounce_safe(topo_overlap, peer_infos))
         )
-        bounced = allow_bounce and self._bounce.reserve(receiver_req, task.expected_transfers)
+        # The gate weighs fragments; the owner list charges replicated bytes to the sender that
+        # actually writes them.
+        bounced = allow_bounce and self._bounce.reserve(
+            receiver_req,
+            task.expected_transfers,
+            frags_per_block=self._registrar.frags_per_block_per_group(peer_infos),
+            writer_owns_replicated=self._registrar.fan_in_replicated_owners(
+                peer_infos, topo_overlap.ranks
+            ),
+        )
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -1640,7 +1652,9 @@ class Receiver(ReceiverBase):
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(rank)
             if fanin_bounce:
-                receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
+                receiver_req.bounce_dst_base, receiver_req.bounce_dst_bytes = (
+                    self._bounce.writer_region(key, i)
+                )
                 receiver_req_bytes = receiver_req.to_bytes()
             self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
         return

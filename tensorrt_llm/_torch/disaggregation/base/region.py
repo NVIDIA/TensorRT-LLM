@@ -106,6 +106,11 @@ class RegionMapperBase(ABC):
     Maps a batch of region descriptors to corresponding destination(s).
     """
 
+    @property
+    def frags_per_block(self) -> int:
+        """Transfer fragments one block expands into; 1 means already coalesced."""
+        return 1
+
     @abstractmethod
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         """
