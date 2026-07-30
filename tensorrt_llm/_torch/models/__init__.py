@@ -29,6 +29,7 @@ from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
+from .modeling_kimi_k3_vl import KimiK3ForConditionalGeneration
 from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .modeling_kimi_linear import KimiLinearForCausalLM
 from .modeling_laguna import LagunaForCausalLM
@@ -88,6 +89,7 @@ __all__ = [
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
     "KimiK25ForConditionalGeneration",
+    "KimiK3ForConditionalGeneration",
     "KimiLinearForCausalLM",
     "LlamaForCausalLM",
     "LlavaNextModel",

@@ -456,6 +456,26 @@ def is_qwen_image_bench_config(config_dict: dict) -> bool:
             and required_multimodal_token_ids.issubset(config_dict))
 
 
+def is_kimi_k3_multimodal_config(config_dict: dict) -> bool:
+    """Detect Kimi K3's composite multimodal VLM checkpoint config.
+
+    The released Kimi K3 VLM checkpoint advertises ``model_type: kimi_k3`` with
+    nested ``text_config`` (the ``kimi_linear`` text core) and ``vision_config``
+    (the MoonViT-3D tower + projector). When both sub-configs are present and
+    multimodal is not explicitly disabled, TRT-LLM keeps the composite
+    ``KimiK3Config`` and routes the checkpoint to
+    ``KimiK3ForConditionalGeneration``. Text-only ``kimi_linear`` checkpoints (or
+    a ``kimi_k3`` config with ``language_model_only: true`` / no vision_config)
+    fall through to the text-only flatten path.
+    """
+    text_config = config_dict.get("text_config")
+    vision_config = config_dict.get("vision_config")
+    return (config_dict.get("model_type") == "kimi_k3"
+            and config_dict.get("language_model_only") is not True
+            and isinstance(text_config, dict) and bool(text_config)
+            and isinstance(vision_config, dict) and bool(vision_config))
+
+
 # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):
 
@@ -535,11 +555,19 @@ def load_pretrained_config(model_name_or_path: str,
             model_name_or_path, **kwargs)
         _normalize_qwen35_vl_config(model_config,
                                     inner_arch="Qwen3_5ForCausalLM")
+    elif is_kimi_k3_multimodal_config(config_dict):
+        # Kimi K3 multimodal VLM: keep the composite KimiK3Config so the vision
+        # tower, projector, and multimodal token id remain available, and route
+        # to KimiK3ForConditionalGeneration. Must precede the text-only flatten
+        # branch below so vision_config isn't dropped. Built from the in-tree
+        # config classes (no trust_remote_code needed for the config).
+        from tensorrt_llm._torch.configs import KimiK3Config
+        model_config = KimiK3Config.from_dict(config_dict, **kwargs)
+        model_config.architectures = ["KimiK3ForConditionalGeneration"]
     elif model_type in ("kimi_k3", "kimi_linear"):
-        # Kimi K3: the checkpoint ships a composite VLM config
-        # (model_type "kimi_k3" with text/vision sub-configs). TRT-LLM runs
-        # the text model only, so flatten to the in-tree KimiLinearConfig
-        # (this also avoids trust_remote_code for the config).
+        # Kimi K3 text-only (or multimodal explicitly disabled): flatten to the
+        # in-tree KimiLinearConfig and run the text model only (this also avoids
+        # trust_remote_code for the config).
         from tensorrt_llm._torch.configs import KimiLinearConfig
         text_dict = dict(config_dict.get("text_config") or config_dict)
         model_config = KimiLinearConfig.from_dict(text_dict)

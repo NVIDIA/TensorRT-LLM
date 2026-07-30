@@ -883,6 +883,17 @@ class KimiK25VisionModel(nn.Module):
 
         converted: Dict[str, torch.Tensor] = {}
         for name, weight in mapped.items():
+            # The runtime HF loader streams weights as lazy safetensors
+            # ``PySafeSlice`` objects (``safe_open(...).get_slice(name)``), which
+            # support slicing but none of the torch.Tensor attributes/methods the
+            # downstream consume path touches (``.chunk`` here, and ``.device`` /
+            # ``.dtype`` / ``.shape`` inside the child ``Linear.load_weights`` ->
+            # ``load_weight_shard``). Materialize EVERY value once, up front, so
+            # no raw PySafeSlice can leak into any child module. The vision tower
+            # + projector is small (168 tensors, non-quantized, tp=1 replicated),
+            # so full materialization is cheap; ``[:]`` on an already-real tensor
+            # is a harmless view, so the module-parity path is unaffected.
+            weight = weight[:]
             if ".wqkv." in name:
                 prefix, suffix = name.split(".wqkv.", 1)
                 q_weight, k_weight, v_weight = weight.chunk(3, dim=0)

@@ -2013,11 +2013,15 @@ def _materialize(value) -> torch.Tensor:
     return value[:]
 
 
-@register_auto_model("KimiK3ForConditionalGeneration")
 @register_auto_model("KimiLinearForCausalLM")
 class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                                                         Any]):
-    """Kimi K3 text model (the vision tower is ignored; text-only serving)."""
+    """Kimi K3 text core (KDA + MLA + MoE).
+
+    Serves text-only ``kimi_linear`` checkpoints directly, and is reused as the
+    text backbone by the multimodal ``KimiK3ForConditionalGeneration`` wrapper
+    (``modeling_kimi_k3_vl``). The composite ``KimiK3ForConditionalGeneration``
+    architecture is registered by that wrapper, not here."""
 
     def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)
