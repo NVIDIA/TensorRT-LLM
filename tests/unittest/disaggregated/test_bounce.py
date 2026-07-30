@@ -297,6 +297,167 @@ def test_receiver_derives_canonical_rank_bound_destination_plan():
     assert sizes.tolist() == [0x50, 0x50]
 
 
+def _make_receiver_dispatch_harness(
+    tfr,
+    *,
+    bounce_enabled,
+    peer_ranks=(0,),
+    register_error=None,
+):
+    peer_infos = SimpleNamespace(
+        instance_name="ctx",
+        instance_rank=0,
+        sender_endpoints=["tcp://ctx-0", "tcp://ctx-1"],
+        dp_size=1,
+        layer_num_per_pp=[1],
+        page_table=None,
+    )
+    peer_overlap = SimpleNamespace(
+        ranks=list(peer_ranks),
+        duplicate_head_factor=1,
+        overlap_pp_size=1,
+    )
+
+    class _Registrar:
+        def __init__(self):
+            self.cache = {}
+            self.registered = []
+
+        def get_peer_overlap(self, _peer_infos, _dp_rank):
+            return peer_overlap
+
+        def get_peer_rank_info(self, peer_name, peer_rank):
+            return self.cache[(peer_name, peer_rank)]
+
+        def register(self, peer_name, peer_rank, peer_info):
+            self.registered.append((peer_name, peer_rank, peer_info))
+            if register_error is not None:
+                raise register_error
+            self.cache[(peer_name, peer_rank)] = peer_info
+
+    class _Bounce:
+        def __init__(self):
+            self.enabled = bounce_enabled
+            self.reserve_calls = []
+            self.bound = []
+
+        def reserve(self, request, expected_transfers, *, expected_destination_plans=None):
+            self.reserve_calls.append((request, expected_transfers, expected_destination_plans))
+            return self.enabled
+
+        def bind_writer(self, key, rank, writer_index):
+            self.bound.append((key, rank, writer_index))
+            return 0xB000
+
+        def set_completion_callback(self, _key, _callback):
+            pass
+
+        def release_idle_reservation(self, _key):
+            pass
+
+    receiver = object.__new__(tfr.Receiver)
+    registrar = _Registrar()
+    bounce = _Bounce()
+    receiver._registrar = registrar
+    receiver._bounce = bounce
+    receiver_req = SimpleNamespace(
+        unique_rid=17,
+        slice_id=0,
+        request_epoch=None,
+        bounce_dst_base=None,
+        to_bytes=lambda: b"receiver-request",
+    )
+    receiver._build_recv_req_info = lambda _task: receiver_req
+    receiver._get_sender_info = lambda _params: peer_infos
+    plan = (
+        np.array([0x1000], dtype=np.int64),
+        np.array([0x80], dtype=np.int64),
+    )
+    receiver._build_bounce_destination_plan = lambda _request, _peer_info: plan
+    session = SimpleNamespace(
+        request_epoch=3,
+        mark_transferring=lambda *_args, **_kwargs: True,
+        _make_bounce_settlement_callback=lambda _task: lambda _success: None,
+    )
+    receiver._get_session = lambda _unique_rid: session
+    receiver._sender_endpoint_capabilities = {}
+    sent = []
+    receiver._request_sender_data = lambda endpoint, request: sent.append((endpoint, request))
+    task = SimpleNamespace(
+        _params=SimpleNamespace(ctx_dp_rank=0),
+        _unique_rid=17,
+        slice_id=0,
+        _perf_timer=None,
+    )
+    return receiver, task, peer_infos, registrar, bounce, plan, sent
+
+
+def test_receiver_first_request_registers_peer_for_exact_bounce_plan():
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    receiver, task, peer_infos, registrar, bounce, plan, sent = _make_receiver_dispatch_harness(
+        tfr, bounce_enabled=True
+    )
+
+    receiver.dispatch_task(task)
+    receiver.dispatch_task(task)
+
+    assert registrar.registered == [("ctx", 0, peer_infos)]
+    assert registrar.get_peer_rank_info("ctx", 0) is peer_infos
+    assert len(bounce.reserve_calls) == 2
+    assert all(call[2][0] is plan for call in bounce.reserve_calls)
+    assert bounce.bound == [((17, 0), 0, 0), ((17, 0), 0, 0)]
+    assert sent == [
+        ("tcp://ctx-0", b"receiver-request"),
+        ("tcp://ctx-0", b"receiver-request"),
+    ]
+
+
+def test_receiver_non_bounce_dispatch_does_not_register_peer():
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    receiver, task, _peer_infos, registrar, bounce, _plan, sent = _make_receiver_dispatch_harness(
+        tfr, bounce_enabled=False
+    )
+
+    receiver.dispatch_task(task)
+
+    assert registrar.registered == []
+    assert bounce.reserve_calls == [(receiver._build_recv_req_info(task), 1, None)]
+    assert sent == [("tcp://ctx-0", b"receiver-request")]
+
+
+def test_receiver_bounce_registration_failure_falls_back_before_reservation():
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    receiver, task, peer_infos, registrar, bounce, _plan, sent = _make_receiver_dispatch_harness(
+        tfr,
+        bounce_enabled=True,
+        register_error=ValueError("incompatible peer"),
+    )
+
+    receiver.dispatch_task(task)
+
+    assert registrar.registered == [("ctx", 0, peer_infos)]
+    assert bounce.reserve_calls == []
+    assert sent == [("tcp://ctx-0", b"receiver-request")]
+
+
+def test_receiver_missing_fanin_rank_falls_back_without_partial_bounce_reservation():
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    receiver, task, peer_infos, registrar, bounce, _plan, sent = _make_receiver_dispatch_harness(
+        tfr,
+        bounce_enabled=True,
+        peer_ranks=(0, 1),
+    )
+
+    receiver.dispatch_task(task)
+
+    assert registrar.registered == [("ctx", 0, peer_infos)]
+    assert bounce.reserve_calls == []
+    assert sent == [
+        ("tcp://ctx-0", b"receiver-request"),
+        ("tcp://ctx-1", b"receiver-request"),
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # NoBounceTransport — disabled no-op fallback
 # --------------------------------------------------------------------------- #

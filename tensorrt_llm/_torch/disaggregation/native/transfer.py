@@ -2917,6 +2917,28 @@ class Receiver(ReceiverBase):
             np.asarray([sizes[index] for index in order], dtype=np.int64),
         )
 
+    def _resolve_bounce_peer_rank_info(self, peer_infos: RankInfo, peer_rank: int) -> RankInfo:
+        """Return exact peer metadata for a receiver-owned bounce plan.
+
+        The instance info endpoint carries rank 0's full RankInfo, while the
+        reciprocal REGISTER_RANK_INFO handshake populates only the context
+        sender's registrar. Lazily mirror the endpoint rank into the receiver
+        registrar so its peer extractor is available for a first-request
+        bounce plan. Other ranks still require exact per-rank metadata and
+        therefore conservatively fall back when it is unavailable.
+        """
+        try:
+            return self._registrar.get_peer_rank_info(peer_infos.instance_name, peer_rank)
+        except KeyError:
+            if peer_rank != peer_infos.instance_rank:
+                raise
+            self._registrar.register(
+                peer_infos.instance_name,
+                peer_infos.instance_rank,
+                peer_infos,
+            )
+            return self._registrar.get_peer_rank_info(peer_infos.instance_name, peer_rank)
+
     @staticmethod
     def _fanin_bounce_safe(overlap, peer_ri) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
@@ -3002,15 +3024,14 @@ class Receiver(ReceiverBase):
                 expected_destination_plans = {
                     rank: self._build_bounce_destination_plan(
                         receiver_req,
-                        self._registrar.get_peer_rank_info(peer_infos.instance_name, rank),
+                        self._resolve_bounce_peer_rank_info(peer_infos, rank),
                     )
                     for rank in peer_overlap.ranks
                 }
             except (AssertionError, IndexError, KeyError, TypeError, ValueError) as error:
                 logger.warning(
                     "KV bounce cannot derive an exact receiver-owned destination plan; "
-                    "using per-fragment transfer: %s",
-                    error,
+                    f"using per-fragment transfer: {error}"
                 )
                 allow_bounce = False
         bounced = allow_bounce and self._bounce.reserve(
