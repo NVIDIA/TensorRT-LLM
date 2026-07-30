@@ -457,7 +457,6 @@ def make_phase_table(offsets, omega, initial_rows):
         cos=torch.cos(angles).mean(dim=1).contiguous(),
         sin=torch.sin(angles).mean(dim=1).contiguous(),
         num_freqs=num_freqs,
-        frequency_block=1 << (num_freqs - 1).bit_length(),
     )
 
 

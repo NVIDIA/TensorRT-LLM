@@ -47,6 +47,40 @@ def _gather_mean_phase_kernel(
         tl.store(swa_destination_bases + request, prompt_length + swa_rebase_delta)
 
 
+def gather_mean_phase(
+    logical_source_lengths: torch.Tensor,
+    phase_cos: torch.Tensor,
+    phase_sin: torch.Tensor,
+    source_lengths: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    mean_cos: torch.Tensor,
+    mean_sin: torch.Tensor,
+    decode_lengths: torch.Tensor,
+    swa_destination_bases: torch.Tensor | None,
+    *,
+    request_count: int,
+    swa_rebase_delta: int,
+) -> None:
+    """Gather mean-phase rows and derive per-request decode metadata."""
+    num_freqs = int(phase_cos.shape[1])
+    _gather_mean_phase_kernel[(request_count,)](
+        logical_source_lengths,
+        phase_cos,
+        phase_sin,
+        source_lengths,
+        prompt_lengths,
+        mean_cos,
+        mean_sin,
+        decode_lengths,
+        swa_destination_bases,
+        swa_rebase_delta,
+        NUM_FREQS=num_freqs,
+        F_BLOCK=triton.next_power_of_2(num_freqs),
+        HAS_SWA=swa_destination_bases is not None,
+        num_warps=1,
+    )
+
+
 # ---- Selection: combine scores per mode, then finalize the top-k set ----
 
 
@@ -280,6 +314,26 @@ def _fold_union_ranks_kernel(
     tl.store(selection_scores_rows + request * WIDTH + token, folded, mask=mask)
 
 
+def fold_union_ranks(
+    gathered_rows: torch.Tensor,
+    selection_scores_rows: torch.Tensor,
+    *,
+    request_count: int,
+) -> None:
+    """Max-fold TP rank-local score rows into the global union rows."""
+    width = int(selection_scores_rows.shape[1])
+    tp_size = int(gathered_rows.shape[0]) // request_count
+    block = 1024
+    _fold_union_ranks_kernel[(request_count, triton.cdiv(width, block))](
+        gathered_rows,
+        selection_scores_rows,
+        request_count,
+        TP_SIZE=tp_size,
+        WIDTH=width,
+        BLOCK=block,
+    )
+
+
 @triton.jit
 def _settle_ties_kernel(
     selection_scores_rows,
@@ -358,3 +412,26 @@ def _settle_ties_kernel(
         )
         output_count += tl.sum(selected_i32)
         ties_seen += tl.sum(tied_i32)
+
+
+def settle_ties(
+    selection_scores_rows: torch.Tensor,
+    selection_row_lengths: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    provisional_rows: torch.Tensor,
+    kept_ordinal_rows: torch.Tensor,
+    *,
+    request_count: int,
+    selection_rows_per_request: int,
+) -> None:
+    """Settle TopK score ties into ascending absolute token ordinals."""
+    _settle_ties_kernel[(request_count, selection_rows_per_request)](
+        selection_scores_rows,
+        selection_row_lengths,
+        prompt_lengths,
+        provisional_rows,
+        kept_ordinal_rows,
+        WIDTH=int(selection_scores_rows.shape[1]),
+        KEEP_COUNT=int(kept_ordinal_rows.shape[1]),
+        SELECTION_ROWS=selection_rows_per_request,
+    )

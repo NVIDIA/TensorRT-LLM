@@ -599,10 +599,8 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
 
 def test_fold_union_ranks_matches_max_oracle():
     """The TP union fold is an exact elementwise max over the gathered rank blocks."""
-    import triton
-
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-        _fold_union_ranks_kernel,
+        fold_union_ranks,
     )
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -610,12 +608,10 @@ def test_fold_union_ranks_matches_max_oracle():
     generator = torch.Generator(device="cpu").manual_seed(46)
     gathered = torch.randn(tp_size * request_count, width, generator=generator).to(device)
     folded = torch.full((request_count, width), float("nan"), device=device)
-    _fold_union_ranks_kernel[(request_count, triton.cdiv(width, 1024))](
+    fold_union_ranks(
         gathered,
         folded,
-        request_count,
-        TP_SIZE=tp_size,
-        WIDTH=width,
+        request_count=request_count,
     )
     expected = gathered.view(tp_size, request_count, width).amax(dim=0)
     torch.cuda.synchronize(device)

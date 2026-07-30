@@ -6,9 +6,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    _settle_ties_kernel,
-)
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import settle_ties
 
 # Settle geometry rows: the width/keep axes flip the WIDTH and KEEP_COUNT
 # static_range trip counts across the 256-lane BLOCK.
@@ -101,15 +99,14 @@ def test_settle_matches_torch_oracle(eviction_mode, width, keep_count):
         )
 
         output_actual = output_stale.clone()
-        _settle_ties_kernel[(request_count, selection_rows)](
+        settle_ties(
             scores,
             row_lengths,
             prompt_offsets,
             provisional,
             output_actual,
-            WIDTH=width,
-            KEEP_COUNT=keep_count,
-            SELECTION_ROWS=selection_rows,
+            request_count=request_count,
+            selection_rows_per_request=selection_rows,
         )
         torch.cuda.synchronize(device)
 
@@ -149,15 +146,14 @@ def test_settle_handles_topk_sentinel_padding():
 
     stale = 0x5EED
     output = torch.full((rows_total, keep_count), stale, dtype=torch.int32, device=device)
-    _settle_ties_kernel[(rows_total, 1)](
+    settle_ties(
         scores,
         row_lengths,
         row_prompt_offsets,
         provisional,
         output,
-        WIDTH=width,
-        KEEP_COUNT=keep_count,
-        SELECTION_ROWS=1,
+        request_count=rows_total,
+        selection_rows_per_request=1,
     )
     torch.cuda.synchronize(device)
 

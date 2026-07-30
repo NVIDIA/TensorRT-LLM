@@ -43,10 +43,10 @@ from ...utils import next_positive_power_of_2
 from ..compaction import build_compaction_params, compact
 from .triattention_cute_score_fused import PADDED_HEAD_COLUMNS, build_score_pipeline
 from .triattention_kernels import (
-    _fold_union_ranks_kernel,
-    _gather_mean_phase_kernel,
-    _settle_ties_kernel,
+    fold_union_ranks,
+    gather_mean_phase,
     reduce_per_head_scores,
+    settle_ties,
 )
 
 if TYPE_CHECKING:
@@ -110,7 +110,6 @@ class _MeanPhaseTable:
         self.sin: Optional[torch.Tensor] = None
         self.rows = 0
         self.num_freqs = int(self._omega.numel())
-        self.frequency_block = triton.next_power_of_2(self.num_freqs)
 
     def reserve(self, rows: int) -> None:
         """Cover positions ``[0, rows)`` with a power-of-two table."""
@@ -530,7 +529,7 @@ class TriAttention(KVCacheCompressionManager):
             request_count = len(eviction_requests)
             union = self.eviction_mode == "union"
             # In-place refresh: the compiled score launches captured these pointers.
-            _gather_mean_phase_kernel[(request_count,)](
+            gather_mean_phase(
                 self._logical_source_lengths_device,
                 self._phase.cos,
                 self._phase.sin,
@@ -540,11 +539,8 @@ class TriAttention(KVCacheCompressionManager):
                 self._mean_sin,
                 self._decode_lengths_device,
                 self._swa_destination_bases,
-                self._swa_rebase_delta,
-                NUM_FREQS=self._phase.num_freqs,
-                F_BLOCK=self._phase.frequency_block,
-                HAS_SWA=self._swa_destination_bases is not None,
-                num_warps=1,
+                request_count=request_count,
+                swa_rebase_delta=self._swa_rebase_delta,
             )
             self._launch_score(request_count)
             if union and self._union_tp_mapping is not None:
@@ -554,17 +550,10 @@ class TriAttention(KVCacheCompressionManager):
                     self._union_tp_mapping,
                     dim=0,
                 )
-                _fold_union_ranks_kernel[
-                    (
-                        request_count,
-                        triton.cdiv(self._selection_width_capacity, 1024),
-                    )
-                ](
+                fold_union_ranks(
                     gathered,
                     self._selection_scores_rows,
-                    request_count,
-                    TP_SIZE=int(self._union_tp_mapping.tp_size),
-                    WIDTH=self._selection_width_capacity,
+                    request_count=request_count,
                 )
             if not union:
                 reduce_per_head_scores(
@@ -648,15 +637,14 @@ class TriAttention(KVCacheCompressionManager):
             self.budget,
             1,
         )
-        _settle_ties_kernel[(request_count, self._selection_rows_per_request)](
+        settle_ties(
             self._selection_scores_rows,
             self._selection_row_lengths,
             self._prompt_lengths_device,
             self._provisional_rows,
             self._kept_ordinal_rows,
-            WIDTH=self._selection_width_capacity,
-            KEEP_COUNT=self.budget,
-            SELECTION_ROWS=self._selection_rows_per_request,
+            request_count=request_count,
+            selection_rows_per_request=self._selection_rows_per_request,
         )
 
     def _resize_compacted_caches(self, eviction_requests: Sequence[_EvictionRequest]) -> None:
