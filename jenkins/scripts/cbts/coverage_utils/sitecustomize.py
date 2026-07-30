@@ -112,7 +112,6 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     _stop_event = threading.Event()
 
     _tracker = PyStartTracker(_src, _data_dir, _stage)
-    _tracker.start()
 
     def switch_test_context(nodeid):
         """Switch the active test context; each test's entered functions are recorded separately."""
@@ -161,6 +160,51 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     _initial_nodeid = os.environ.get("CBTS_TEST_ID", "").strip()
     if _initial_nodeid:
         switch_test_context(_initial_nodeid)
+
+    # mpi4py.futures pool workers enable PY_START only after the product framework's first import
+    # settles (or CBTS_WORKER_ACTIVATE_MAX_SECONDS); every other process enables it now. Deferring
+    # keeps a wait_shutdown MpiPoolSession identity barrier from timing out on the instrumented cold
+    # import; coverage is unaffected since functions a test exercises are re-entered after activation.
+    _defer_worker_activation = _is_mpi_pool_worker and os.environ.get(
+        "CBTS_DEFER_WORKER_ACTIVATION", "1"
+    ) not in ("0", "false", "False", "")
+
+    if not _defer_worker_activation:
+        _tracker.start()
+    else:
+        try:
+            _activate_max = max(
+                1.0, float(os.environ.get("CBTS_WORKER_ACTIVATE_MAX_SECONDS", "120"))
+            )
+        except ValueError:
+            _activate_max = 120.0
+        # Product top-level import names taken from the coverage source roots (e.g. "tensorrt_llm").
+        _product_tops = {os.path.basename(p.rstrip("/")) for p in _src if p}
+
+        def _framework_imported():
+            for _name in _product_tops:
+                _mod = sys.modules.get(_name)
+                _spec = getattr(_mod, "__spec__", None) if _mod is not None else None
+                if _mod is not None and not getattr(_spec, "_initializing", False):
+                    return True
+            return False
+
+        def _deferred_activate():
+            _waited = 0.0
+            _step = 0.2
+            while not _stop_event.is_set() and _waited < _activate_max:
+                if _framework_imported():
+                    break
+                _stop_event.wait(_step)
+                _waited += _step
+            if not _stop_event.is_set():
+                _tracker.start()
+
+        threading.Thread(
+            target=_deferred_activate,
+            daemon=True,
+            name="cbts-deferred-activate",
+        ).start()
 
     if _is_nested_pytest:
         # Inner pytest: install the pool accounting/env patch synchronously instead of via the watcher.
