@@ -14,9 +14,9 @@
 # limitations under the License.
 
 from collections.abc import Callable
+from copy import copy
 from dataclasses import dataclass
 from enum import IntEnum
-from os import getenv
 from typing import Dict, List, Optional
 
 import torch
@@ -27,7 +27,7 @@ from ...modules.multi_stream_utils import (do_multi_stream,
                                            maybe_execute_in_parallel)
 from ...utils import (get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
-from .cuda_graph_lora_params import CudaGraphLoraParams
+from .cuda_graph_lora_params import CudaGraphLoraParams, LoraLayerParams
 
 _FP8_LORA_TMA_ALIGNMENT = 16
 
@@ -69,8 +69,7 @@ def _validate_fp8_lora_cuda_graph_alignment(slot_ranks_host: torch.Tensor,
     return min(hidden_size, min_active_rank)
 
 
-# TODO: Potentially move this fallback to LoraConfig.
-TRTLLM_SPLITK_VAL = int(getenv("TRTLLM_SPLITK_VAL", "8"))
+_LORA_DEFAULT_SPLIT_K = 16
 _LORA_SPLIT_K_CANDIDATES = (1, 2, 4, 8, 16)
 
 
@@ -534,9 +533,14 @@ class LoraLayer(torch.nn.Module):
                                        splitk_offsets=splitk_offsets,
                                        reordered_input=reordered_input)
 
-    def _prepare_max_sizes_cpu(self, bs: int, input_hidden_size: int,
-                               max_lora_size: int, max_rank: int):
-        shape_2d = (len(self.lora_module_types), max_lora_size)
+    def _prepare_max_sizes_cpu(self,
+                               cuda_graph_lora_params: CudaGraphLoraParams,
+                               layer_key: CudaGraphLoraParams.LoraLayerKey,
+                               bs: int, input_hidden_size: int):
+        layer_params = cuda_graph_lora_params.get_layer_params(layer_key)
+        shape_2d = (len(self.lora_module_types),
+                    cuda_graph_lora_params.max_lora_size
+                    )  # [num_layer_modules, max_lora_size]
         shape_3d = shape_2d + (3, )
         # dummy max sizes, on CPU
         host_max_in_sizes = torch.empty(
@@ -546,94 +550,104 @@ class LoraLayer(torch.nn.Module):
             host_max_in_sizes
         )  # m: batch_size, n: max_output_hidden_size, k: max_lora_rank
         host_max_in_sizes[:, :, 0] = bs
-        host_max_in_sizes[:, :, 1] = max_rank
+        host_max_in_sizes[:, :, 1] = cuda_graph_lora_params.max_rank
         host_max_in_sizes[:, :, 2] = input_hidden_size
 
         host_max_out_sizes[:, :, 0] = bs
-        host_max_out_sizes[:, :, 1] = torch.tensor(
-            self.output_hidden_sizes,
-            dtype=CudaGraphLoraParams.SIZES_DTYPE).unsqueeze(1)
-        host_max_out_sizes[:, :, 2] = max_rank
+        host_max_out_sizes[:, :, 1] = layer_params.h_output_sizes.unsqueeze(1)
+        host_max_out_sizes[:, :, 2] = cuda_graph_lora_params.max_rank
 
         return host_max_in_sizes, host_max_out_sizes
 
     def _forward_cuda_graph_mode_impl(
         self,
-        inputs: List[torch.Tensor],
-        max_lora_size: int,
-        max_rank: int,
-        problem_count: int,
-        min_kn: int,
+        x: torch.Tensor,
+        lora_params: Dict,
+        layer_idx: int,
         split_k: int,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """Run the complete CUDA-graph LoRA path with a fixed split-K."""
-        x = inputs[0]
-        batch_size, hidden_size = x.shape
-        output_buffer = torch.empty(
-            (batch_size, sum(self.output_hidden_sizes)),
+        cuda_graph_params: CudaGraphLoraParams = lora_params.get(
+            'cuda_graph_params')
+        # Get layer-specific parameters
+        layer_key = CudaGraphLoraParams.LoraLayerKey(
+            layer_idx=layer_idx, module_ids=tuple(self.lora_module_types))
+
+        if not cuda_graph_params or not cuda_graph_params.layer_info or layer_key not in cuda_graph_params.layer_info:
+            return None
+
+        layer_params = cuda_graph_params.get_layer_params(layer_key)
+
+        # Skip layers that don't have LoRA modules
+        if layer_params is None:
+            return None  # Pass-through for layers without LoRA modules
+
+        batch_size, hidden_size = x.shape[0], x.shape[-1]
+        num_layer_modules = len(self.lora_module_types)
+        max_rank = cuda_graph_params.max_rank
+        total_output_size = sum(self.output_hidden_sizes)
+        if x.dtype == torch.float8_e4m3fn:
+            min_kn = _validate_fp8_lora_cuda_graph_alignment(
+                cuda_graph_params.slot_ranks_host, hidden_size,
+                self.output_hidden_sizes, max_rank)
+        else:
+            min_kn = min(
+                hidden_size, 8, max_rank
+            )  # TODO: hardcode to 8 for now, for alignments in kernels, might have alignment error if rank is less than 8!
+
+        output_buffer = torch.empty(batch_size,
+                                    total_output_size,
+                                    dtype=x.dtype,
+                                    device=x.device)
+
+        host_max_in_sizes, host_max_out_sizes = self._prepare_max_sizes_cpu(
+            cuda_graph_params, layer_key, batch_size, hidden_size)
+
+        # Intermediate buffer: [num_layer_modules, batch_size, max_rank]
+        intermediate_buffer = torch.empty(
+            [num_layer_modules, batch_size, max_rank],
             dtype=x.dtype,
-            device=x.device,
-        )
-        params_input = GroupedGemmParamsInput(
+            device=x.device)
+
+        params_fill_input = GroupedGemmParamsInput(
             x=x,
             output_buffer=output_buffer,
-            intermediate_buffer=torch.empty(
-                (len(self.lora_module_types), batch_size, max_rank),
-                dtype=x.dtype,
-                device=x.device,
-            ),
-            max_lora_size=max_lora_size,
-            max_rank=max_rank,
-            slot_counts=inputs[1],
-            slot_ranks=inputs[2],
-            slot_offsets_full=inputs[3],
-            b_ptrs=inputs[4],
-            b_prime_ptrs=inputs[5],
-            sorted_ids=inputs[6],
-            output_hidden_sizes=inputs[7],
-            output_sizes_offset=inputs[8],
-        )
-        host_max_in_sizes, host_max_out_sizes = self._prepare_max_sizes_cpu(
-            batch_size,
-            hidden_size,
-            max_lora_size,
-            max_rank,
-        )
+            intermediate_buffer=intermediate_buffer,
+            max_lora_size=cuda_graph_params.max_lora_size,
+            max_rank=cuda_graph_params.max_rank,
+            slot_counts=cuda_graph_params.slot_counts,
+            slot_ranks=cuda_graph_params.slot_ranks,
+            slot_offsets_full=cuda_graph_params.slot_offsets_full,
+            b_ptrs=layer_params.d_b_ptrs,
+            b_prime_ptrs=layer_params.d_b_prime_ptrs,
+            sorted_ids=cuda_graph_params.sorted_ids,
+            output_hidden_sizes=layer_params.d_output_sizes,
+            output_sizes_offset=layer_params.d_output_sizes_offset)
         grouped_gemm_params = self._prepare_grouped_gemm_buffers_fused(
-            params_input)
+            params_fill_input)
 
         torch.ops.trtllm.lora_grouped_gemm_cuda_graph(
-            grouped_gemm_params.in_sizes,
-            grouped_gemm_params.out_sizes,
-            grouped_gemm_params.a_offset,
-            params_input.b_ptrs,
-            grouped_gemm_params.d_offset,
-            params_input.b_prime_ptrs,
+            grouped_gemm_params.in_sizes, grouped_gemm_params.out_sizes,
+            grouped_gemm_params.a_offset, layer_params.d_b_ptrs,
+            grouped_gemm_params.d_offset, layer_params.d_b_prime_ptrs,
             grouped_gemm_params.d_prime_offset,
-            problem_count,
-            grouped_gemm_params.lda,
-            grouped_gemm_params.ldb,
-            grouped_gemm_params.ldd,
-            grouped_gemm_params.ldb_prime,
-            grouped_gemm_params.ldd_prime,
-            host_max_in_sizes,
-            host_max_out_sizes,
-            grouped_gemm_params.splitk_offsets,
-            params_input.x.dtype,
-            min_kn,
-            split_k,
-        )
+            cuda_graph_params.get_problem_count(layer_key),
+            grouped_gemm_params.lda, grouped_gemm_params.ldb,
+            grouped_gemm_params.ldd, grouped_gemm_params.ldb_prime,
+            grouped_gemm_params.ldd_prime, host_max_in_sizes,
+            host_max_out_sizes, grouped_gemm_params.splitk_offsets,
+            grouped_gemm_params.reordered_input.dtype, min_kn, split_k)
 
         # PyTorch does not implement index_copy_ for FP8 tensors.
         if output_buffer.dtype == torch.float8_e4m3fn:
             output_buffer = output_buffer.to(torch.bfloat16)
 
+        # TODO: move to kernel
+        # sorted_ids is a permutation, so index_copy_ initializes every row.
         restored_output = torch.empty_like(output_buffer)
-        restored_output.index_copy_(
-            0,
-            params_input.sorted_ids[:batch_size],
-            output_buffer,
-        )
+        restored_output.index_copy_(0,
+                                    cuda_graph_params.sorted_ids[:batch_size],
+                                    output_buffer)
         return restored_output
 
     def _forward_cuda_graph_mode(
@@ -663,48 +677,23 @@ class LoraLayer(torch.nn.Module):
         if not cuda_graph_params or not cuda_graph_params.layer_info or layer_key not in cuda_graph_params.layer_info:
             return None
 
-        layer_params = cuda_graph_params.get_layer_params(layer_key)
-
         # Skip layers that don't have LoRA modules
+        layer_params = cuda_graph_params.get_layer_params(layer_key)
         if layer_params is None:
             return None  # Pass-through for layers without LoRA modules
-
-        _, hidden_size = x.shape
-        max_rank = cuda_graph_params.max_rank
-        if x.dtype == torch.float8_e4m3fn:
-            min_kn = _validate_fp8_lora_cuda_graph_alignment(
-                cuda_graph_params.slot_ranks_host, hidden_size,
-                self.output_hidden_sizes, max_rank)
-        else:
-            min_kn = min(
-                hidden_size, 8, max_rank
-            )  # TODO: hardcode to 8 for now, for alignments in kernels, might have alignment error if rank is less than 8!
-
-        problem_count = cuda_graph_params.get_problem_count(layer_key)
         if self._split_k_runner is None:
             self._split_k_runner = _LoraGroupedGemmRunner(
                 layer=self,
                 layer_idx=layer_idx,
-                input_hidden_size=hidden_size,
-                max_rank=max_rank,
+                input_hidden_size=x.shape[1],
+                max_rank=cuda_graph_params.max_rank,
                 max_lora_size=cuda_graph_params.max_lora_size,
-                problem_count=problem_count,
+                problem_count=cuda_graph_params.get_problem_count(layer_key),
                 dtype=x.dtype,
-                min_kn=min_kn,
             )
+
         runner = self._split_k_runner
-        runner.min_kn = min_kn
-        runner_inputs = [
-            x,
-            cuda_graph_params.slot_counts,
-            cuda_graph_params.slot_ranks,
-            cuda_graph_params.slot_offsets_full,
-            layer_params.d_b_ptrs,
-            layer_params.d_b_prime_ptrs,
-            cuda_graph_params.sorted_ids,
-            layer_params.d_output_sizes,
-            layer_params.d_output_sizes_offset,
-        ]
+        runner_inputs = runner.prepare_inputs(x, lora_params, cuda_graph_params)
         _, split_k = AutoTuner.get().choose_one(
             "trtllm::lora_grouped_gemm_cuda_graph",
             [runner],
@@ -797,7 +786,6 @@ class _LoraGroupedGemmRunner(TunableRunner):
         max_lora_size: int,
         problem_count: int,
         dtype: torch.dtype,
-        min_kn: int,
     ):
         self.layer = layer
         self.layer_idx = layer_idx
@@ -806,7 +794,13 @@ class _LoraGroupedGemmRunner(TunableRunner):
         self.max_lora_size = max_lora_size
         self.problem_count = problem_count
         self.dtype = dtype
-        self.min_kn = min_kn
+        self.layer_key = CudaGraphLoraParams.LoraLayerKey(
+            layer_idx=layer_idx,
+            module_ids=tuple(layer.lora_module_types),
+        )
+        self.lora_params: Optional[Dict] = None
+        self.cuda_graph_params: Optional[CudaGraphLoraParams] = None
+        self.layer_params: Optional[LoraLayerParams] = None
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0,
@@ -829,7 +823,6 @@ class _LoraGroupedGemmRunner(TunableRunner):
             self.max_lora_size,
             self.problem_count,
             self.dtype,
-            self.min_kn,
         )
 
     def get_valid_tactics(
@@ -845,49 +838,56 @@ class _LoraGroupedGemmRunner(TunableRunner):
             if split_k <= k_tiles
         ]
 
+    def prepare_inputs(
+        self,
+        x: torch.Tensor,
+        lora_params: Dict,
+        cuda_graph_params: CudaGraphLoraParams,
+    ) -> List[torch.Tensor]:
+        """Copy the LoRA parameters and pack the autotuner tensor inputs."""
+        self.lora_params = copy(lora_params)
+        self.cuda_graph_params = copy(cuda_graph_params)
+
+        layer_params = cuda_graph_params.get_layer_params(self.layer_key)
+        assert layer_params is not None
+        self.layer_params = copy(layer_params)
+        self.cuda_graph_params.layer_params = {
+            self.layer_key: self.layer_params
+        }
+        self.lora_params['cuda_graph_params'] = self.cuda_graph_params
+
+        return [x]
+
     def _prepare_synthetic_inputs(
-            self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        self,
+        inputs: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
         """Build one active-adapter problem for the requested token bucket."""
+        assert self.cuda_graph_params is not None
+        assert self.layer_params is not None
+
         token_carrier = inputs[0]
         num_tokens = token_carrier.shape[0]
-        device = token_carrier.device
-        module_count = len(self.layer.lora_module_types)
-        shape_2d = (module_count, self.max_lora_size)
 
-        b_ptrs = torch.zeros(shape_2d,
-                             dtype=CudaGraphLoraParams.PTR_DTYPE,
-                             device=device)
-        b_prime_ptrs = torch.zeros_like(b_ptrs)
+        b_ptrs = torch.zeros_like(self.layer_params.d_b_ptrs)
+        b_prime_ptrs = torch.zeros_like(self.layer_params.d_b_prime_ptrs)
         keepalive = []
         for module_idx, output_size in enumerate(
                 self.layer.output_hidden_sizes):
-            lora_a = torch.ones((self.max_rank, self.input_hidden_size),
-                                dtype=self.dtype,
-                                device=device)
-            lora_b = torch.ones((output_size, self.max_rank),
-                                dtype=self.dtype,
-                                device=device)
+            lora_a = token_carrier.new_ones(
+                (self.max_rank, self.input_hidden_size))
+            lora_b = token_carrier.new_ones((output_size, self.max_rank))
             b_ptrs[module_idx, 0] = lora_a.data_ptr()
             b_prime_ptrs[module_idx, 0] = lora_b.data_ptr()
             keepalive.extend((lora_a, lora_b))
 
-        slot_counts = torch.zeros(self.max_lora_size,
-                                  dtype=CudaGraphLoraParams.SIZES_DTYPE,
-                                  device=device)
+        slot_counts = torch.zeros_like(self.cuda_graph_params.slot_counts)
         slot_counts[0] = num_tokens
-        slot_ranks = torch.zeros_like(slot_counts)
+        slot_ranks = torch.zeros_like(self.cuda_graph_params.slot_ranks)
         slot_ranks[0] = self.max_rank
-        slot_offsets_full = torch.zeros(self.max_lora_size + 1,
-                                        dtype=CudaGraphLoraParams.PTR_DTYPE,
-                                        device=device)
+        slot_offsets_full = torch.zeros_like(
+            self.cuda_graph_params.slot_offsets_full)
         slot_offsets_full[1:] = num_tokens
-
-        output_hidden_sizes = torch.tensor(
-            self.layer.output_hidden_sizes,
-            dtype=CudaGraphLoraParams.SIZES_DTYPE,
-            device=device)
-        output_sizes_offset = CudaGraphLoraParams.get_offset_from_counts(
-            output_hidden_sizes).to(dtype=CudaGraphLoraParams.PTR_DTYPE)
 
         return [
             token_carrier,
@@ -896,9 +896,9 @@ class _LoraGroupedGemmRunner(TunableRunner):
             slot_offsets_full,
             b_ptrs,
             b_prime_ptrs,
-            torch.arange(num_tokens, dtype=torch.int64, device=device),
-            output_hidden_sizes,
-            output_sizes_offset,
+            torch.arange(num_tokens, device=token_carrier.device),
+            self.layer_params.d_output_sizes,
+            self.layer_params.d_output_sizes_offset,
         ] + keepalive
 
     def forward(
@@ -910,15 +910,44 @@ class _LoraGroupedGemmRunner(TunableRunner):
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
-        split_k = TRTLLM_SPLITK_VAL if tactic == -1 else tactic
-        return self.layer._forward_cuda_graph_mode_impl(
-            inputs,
-            self.max_lora_size,
-            self.max_rank,
-            self.problem_count,
-            self.min_kn,
+        assert self.lora_params is not None
+        assert self.cuda_graph_params is not None
+        assert self.layer_params is not None
+
+        lora_params = copy(self.lora_params)
+        cuda_graph_params = copy(self.cuda_graph_params)
+        layer_params = copy(self.layer_params)
+        cuda_graph_params.layer_params = {self.layer_key: layer_params}
+        lora_params['cuda_graph_params'] = cuda_graph_params
+
+        x = inputs[0]
+        if len(inputs) > 1:
+            cuda_graph_params.slot_ranks_host = (
+                cuda_graph_params.slot_ranks_host.clone())
+            cuda_graph_params.slot_ranks_host.zero_()
+            cuda_graph_params.slot_ranks_host[0] = self.max_rank
+            (
+                x,
+                cuda_graph_params.slot_counts,
+                cuda_graph_params.slot_ranks,
+                cuda_graph_params.slot_offsets_full,
+                layer_params.d_b_ptrs,
+                layer_params.d_b_prime_ptrs,
+                cuda_graph_params.sorted_ids,
+                layer_params.d_output_sizes,
+                layer_params.d_output_sizes_offset,
+                *_keepalive,
+            ) = inputs
+
+        split_k = _LORA_DEFAULT_SPLIT_K if tactic == -1 else tactic
+        output = self.layer._forward_cuda_graph_mode_impl(
+            x,
+            lora_params,
+            self.layer_idx,
             split_k,
         )
+        assert isinstance(output, torch.Tensor)
+        return output
 
 
 class MoeLoraLayer(LoraLayer):
