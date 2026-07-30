@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-265 captured fields.
+270 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -43,6 +43,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.kv_cache_routing_load_balance_weight` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_match_rate_threshold` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_max_sessions` | `<class 'int'>` | `value` |  |  |
+| `attention_dp_config.kv_cache_routing_new_conv_placement` | `Literal['round_robin', 'least_queued']` | `categorical` |  | `round_robin`, `least_queued` |
 | `attention_dp_config.timeout_iters` | `<class 'int'>` | `value` |  |  |
 | `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER`, `FLASHINFER_STAR_ATTENTION` |
 | `backend` | `Literal['pytorch']` | `categorical` |  | `pytorch` |
@@ -105,7 +106,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `iter_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.avg_seq_len` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
-| `kv_cache_config.block_reuse_policy` | `Literal['all_reusable', 'per_request']` | `categorical` |  | `all_reusable`, `per_request` |
+| `kv_cache_config.block_reuse_policy` | `Literal['all_reusable', 'per_request', 'per_conversation']` | `categorical` |  | `all_reusable`, `per_request`, `per_conversation` |
 | `kv_cache_config.copy_on_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `Optional[float]` | `value` |  |  |
 | `kv_cache_config.disk_cache_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
@@ -163,6 +164,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `mx_config.preshard_strategy` | `<class 'str'>` | `categorical` | allowlist | `per_module` |
 | `mx_config.server_query_timeout_s` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `num_postprocess_workers` | `<class 'int'>` | `value` |  |  |
+| `num_serve_frontends` | `<class 'int'>` | `value` |  |  |
 | `nvfp4_gemm_config.allowed_backends` | `List[Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']]` | `value` |  | `cutlass`, `cublaslt`, `cutedsl`, `cuda_core`, `marlin` |
 | `orchestrator_type` | `Optional[Literal['rpc', 'ray']]` | `categorical` |  | `rpc`, `ray` |
 | `peft_cache_config.device_cache_percent` | `<class 'float'>` | `value` |  |  |
@@ -210,6 +212,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.algorithm` | `Literal['dsa']` | `categorical` |  | `dsa`, `deepseek_v4`, `minimax_m3`, `rocket`, `skip_softmax` |
 | `sparse_attention_config.compress_ratios` | `List[int]` | `value` |  |  |
 | `sparse_attention_config.enable_heuristic_topk` | `<class 'bool'>` | `value` |  |  |
+| `sparse_attention_config.implementation` | `Literal['triton', 'msa']` | `categorical` |  | `triton`, `msa` |
 | `sparse_attention_config.index_head_dim` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.index_n_heads` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.index_topk` | `Optional[int]` | `value` |  |  |
@@ -218,6 +221,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.indexer_rope_interleave` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.kernel_size` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.kt_cache_dtype` | `Optional[str]` | `categorical` | allowlist | `bfloat16`, `float8_e5m2` |
+| `sparse_attention_config.num_attention_heads` | `Optional[int]` | `value` |  |  |
+| `sparse_attention_config.num_key_value_heads` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.page_size` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.prompt_budget` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.q_split_threshold` | `<class 'int'>` | `value` |  |  |
@@ -297,10 +302,3 @@ unset or when the safety sanitizer rejects the runtime value.
 | `use_cute_dsl_bf16_gemm` | `<class 'bool'>` | `value` |  |  |
 | `use_cute_dsl_blockscaling_bmm` | `<class 'bool'>` | `value` |  |  |
 | `use_cute_dsl_blockscaling_mm` | `<class 'bool'>` | `value` |  |  |
-
-### `TrtLlmArgs`
-
-0 captured fields.
-
-| Captured key | Annotation | Kind | Converter | Allowed values |
-|--------------|------------|------|-----------|----------------|

@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=4351f35f" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=52eb2d38"></script>
+    <script src="../_static/config_selector.js?v=5991fb72"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc22" />
+  <meta name="docsearch:version" content="1.3.0rc23" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -1030,9 +1030,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </section>
 <section id="dataset-preparation">
 <h2>Dataset preparation<a class="headerlink" href="#dataset-preparation" title="Link to this heading">#</a></h2>
-<section id="prepare-dataset-py">
-<h3>prepare_dataset.py<a class="headerlink" href="#prepare-dataset-py" title="Link to this heading">#</a></h3>
-<p>trtllm-bench is designed to work with the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/prepare_dataset.py">prepare_dataset.py</a> script, which generates benchmark datasets in the required format. The prepare_dataset script supports:</p>
+<section id="prepare-dataset">
+<h3>prepare-dataset<a class="headerlink" href="#prepare-dataset" title="Link to this heading">#</a></h3>
+<p>trtllm-bench ships a <code class="docutils literal notranslate"><span class="pre">prepare-dataset</span></code> subcommand which generates benchmark datasets in the required format. It supports:</p>
 <p><strong>Dataset Types:</strong></p>
 <ul class="simple">
 <li><p>Real datasets from various sources</p></li>
@@ -1046,14 +1046,14 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li><p>Support for LoRA adapters and task IDs</p></li>
 <li><p>Output in JSON format compatible with trtllm-bench</p></li>
 </ul>
-<div class="admonition important">
-<p class="admonition-title">Important</p>
-<p>The <code class="docutils literal notranslate"><span class="pre">--stdout</span></code> flag is <strong>required</strong> when using prepare_dataset.py with trtllm-bench to ensure proper data streaming format.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The tokenizer is taken from the model passed to <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span></code>. Use <code class="docutils literal notranslate"><span class="pre">--output</span></code> to write the dataset to a file, or <code class="docutils literal notranslate"><span class="pre">--stdout</span></code> to stream it with a JSON dataset entry on each line.</p>
 </div>
 <p><strong>Usage:</strong></p>
-<section id="prepare-dataset">
-<h4>prepare_dataset<a class="headerlink" href="#prepare-dataset" title="Link to this heading">#</a></h4>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>prepare_dataset.py<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+<section id="id1">
+<h4>prepare-dataset<a class="headerlink" href="#id1" title="Link to this heading">#</a></h4>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>&lt;model&gt;<span class="w"> </span>prepare-dataset<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </pre></div>
 </div>
 <p><strong>Options</strong></p>
@@ -1069,38 +1069,35 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--tokenizer</span></code></p></td>
-<td><p>Tokenizer directory or HuggingFace model name (required)</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--output</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--output</span></code></p></td>
 <td><p>Output JSON filename (default: preprocessed_dataset.json)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--stdout</span></code></p></td>
-<td><p>Print output to stdout with JSON dataset entry on each line (<strong>required for trtllm-bench</strong>)</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--stdout</span></code></p></td>
+<td><p>Print output to stdout with a JSON dataset entry on each line instead of writing a file</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--random-seed</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--random-seed</span></code></p></td>
 <td><p>Random seed for token generation (default: 420)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--task-id</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--task-id</span></code></p></td>
 <td><p>LoRA task ID (default: -1)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--rand-task-id</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--rand-task-id</span></code></p></td>
 <td><p>Random LoRA task range (two integers)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--lora-dir</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--lora-dir</span></code></p></td>
 <td><p>Directory containing LoRA adapters</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
 <td><p>Logging level: info or debug (default: info)</p></td>
 </tr>
 </tbody>
 </table>
 </div>
 </section>
-<section id="dataset">
-<h4>dataset<a class="headerlink" href="#dataset" title="Link to this heading">#</a></h4>
+<section id="real-dataset">
+<h4>real-dataset<a class="headerlink" href="#real-dataset" title="Link to this heading">#</a></h4>
 <p>Process real datasets from various sources.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>prepare_dataset.py<span class="w"> </span>dataset<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>&lt;model&gt;<span class="w"> </span>prepare-dataset<span class="w"> </span>real-dataset<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </pre></div>
 </div>
 <p><strong>Options</strong></p>
@@ -1136,9 +1133,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </div>
 </section>
 <section id="token-norm-dist">
-<h4>token_norm_dist<a class="headerlink" href="#token-norm-dist" title="Link to this heading">#</a></h4>
+<h4>token-norm-dist<a class="headerlink" href="#token-norm-dist" title="Link to this heading">#</a></h4>
 <p>Generate synthetic datasets with normal token distribution.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>prepare_dataset.py<span class="w"> </span>token_norm_dist<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>&lt;model&gt;<span class="w"> </span>prepare-dataset<span class="w"> </span>token-norm-dist<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </pre></div>
 </div>
 <p><strong>Options</strong></p>
@@ -1174,9 +1171,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </div>
 </section>
 <section id="token-unif-dist">
-<h4>token_unif_dist<a class="headerlink" href="#token-unif-dist" title="Link to this heading">#</a></h4>
+<h4>token-unif-dist<a class="headerlink" href="#token-unif-dist" title="Link to this heading">#</a></h4>
 <p>Generate synthetic datasets with uniform token distribution</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>prepare_dataset.py<span class="w"> </span>token_unif_dist<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>&lt;model&gt;<span class="w"> </span>prepare-dataset<span class="w"> </span>token-unif-dist<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </pre></div>
 </div>
 <p><strong>Options</strong></p>
@@ -1273,11 +1270,11 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dataset-preparation">Dataset preparation</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-dataset-py">prepare_dataset.py</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-dataset">prepare_dataset</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#dataset">dataset</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#token-norm-dist">token_norm_dist</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#token-unif-dist">token_unif_dist</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-dataset">prepare-dataset</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">prepare-dataset</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#real-dataset">real-dataset</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#token-norm-dist">token-norm-dist</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#token-unif-dist">token-unif-dist</a></li>
 </ul>
 </li>
 </ul>
@@ -1373,9 +1370,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 20, 2026.</p>
+  <p>Last updated on July 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
   
 </div></div>
       

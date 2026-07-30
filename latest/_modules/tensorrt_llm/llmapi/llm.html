@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=4351f35f" />
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,7 +51,7 @@
     <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../../_static/config_selector.js?v=52eb2d38"></script>
+    <script src="../../../_static/config_selector.js?v=5991fb72"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -418,7 +418,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -432,7 +432,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc22" />
+  <meta name="docsearch:version" content="1.3.0rc23" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -984,7 +984,7 @@ window.runMermaid = runMermaid;</script>
                       <span class="n">create_input_processor_with_hash</span><span class="p">,</span>
                       <span class="n">maybe_compute_mm_embed_cumsum</span><span class="p">,</span> <span class="n">prompt_inputs</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">LogitsProcessor</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..scheduling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SchedulingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">TorchLlmArgs</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span>
@@ -1071,82 +1071,6 @@ window.runMermaid = runMermaid;</script>
     <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
     <span class="n">prompt_token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
     <span class="n">prompt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
-
-
-<span class="k">class</span><span class="w"> </span><span class="nc">_BartForcedTokensLogitsProcessor</span><span class="p">(</span><span class="n">LogitsProcessor</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Apply BART forced BOS/EOS tokens from Hugging Face generation config.&quot;&quot;&quot;</span>
-
-    <span class="n">_DECODER_PROMPT_LEN</span> <span class="o">=</span> <span class="mi">1</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span>
-        <span class="o">*</span><span class="p">,</span>
-        <span class="n">forced_bos_token_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
-        <span class="n">forced_eos_token_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
-        <span class="n">max_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">forced_bos_token_id</span> <span class="o">=</span> <span class="n">forced_bos_token_id</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">forced_eos_token_id</span> <span class="o">=</span> <span class="n">forced_eos_token_id</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">=</span> <span class="n">max_tokens</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span>
-        <span class="n">req_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-        <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-        <span class="n">token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
-        <span class="n">stream_ptr</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
-        <span class="n">client_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">del</span> <span class="n">req_id</span><span class="p">,</span> <span class="n">client_id</span>
-        <span class="k">if</span> <span class="n">stream_ptr</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_apply</span><span class="p">(</span><span class="n">token_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>
-            <span class="k">return</span>
-        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">ExternalStream</span><span class="p">(</span><span class="n">stream_ptr</span><span class="p">)):</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_apply</span><span class="p">(</span><span class="n">token_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">_apply</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span> <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">for</span> <span class="n">beam_idx</span><span class="p">,</span> <span class="n">beam_token_ids</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">token_ids</span><span class="p">):</span>
-            <span class="n">forced_token_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_forced_token_id</span><span class="p">(</span><span class="n">beam_token_ids</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">forced_token_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_force_token</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">beam_idx</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">),</span>
-                                  <span class="n">forced_token_id</span><span class="p">)</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">_forced_token_id</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-        <span class="n">generated_len</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_DECODER_PROMPT_LEN</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">generated_len</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">forced_bos_token_id</span>
-        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">generated_len</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">-</span> <span class="mi">1</span><span class="p">):</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">forced_eos_token_id</span>
-        <span class="k">return</span> <span class="kc">None</span>
-
-    <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">_force_token</span><span class="p">(</span><span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">beam_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">beam_count</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                     <span class="n">token_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">token_id</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">token_id</span> <span class="o">&gt;=</span> <span class="n">logits</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Forced BART token id </span><span class="si">{</span><span class="n">token_id</span><span class="si">}</span><span class="s2"> is outside the logits &quot;</span>
-                <span class="sa">f</span><span class="s2">&quot;vocabulary dimension </span><span class="si">{</span><span class="n">logits</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-
-        <span class="n">target</span> <span class="o">=</span> <span class="n">logits</span>
-        <span class="k">if</span> <span class="n">logits</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">logits</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">beam_count</span><span class="p">:</span>
-            <span class="n">target</span> <span class="o">=</span> <span class="n">logits</span><span class="p">[</span><span class="n">beam_idx</span><span class="p">]</span>
-        <span class="n">target</span><span class="p">[:]</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="s2">&quot;-inf&quot;</span><span class="p">)</span>
-        <span class="n">target</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">token_id</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_contains_bart_forced_tokens_logits_processor</span><span class="p">(</span><span class="n">processor</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">processor</span><span class="p">,</span> <span class="n">_BartForcedTokensLogitsProcessor</span><span class="p">):</span>
-        <span class="k">return</span> <span class="kc">True</span>
-    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">processor</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
-        <span class="k">return</span> <span class="nb">any</span><span class="p">(</span>
-            <span class="n">_contains_bart_forced_tokens_logits_processor</span><span class="p">(</span><span class="n">item</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">processor</span><span class="p">)</span>
-    <span class="n">processors</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">processor</span><span class="p">,</span> <span class="s2">&quot;processors&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">processors</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
-        <span class="k">return</span> <span class="nb">any</span><span class="p">(</span>
-            <span class="n">_contains_bart_forced_tokens_logits_processor</span><span class="p">(</span><span class="n">item</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">processors</span><span class="p">)</span>
-    <span class="k">return</span> <span class="kc">False</span>
 
 
 <span class="n">TORCH_LLM_DOCSTRING</span> <span class="o">=</span> <span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">+</span> <span class="s2">&quot;&quot;&quot;</span>
@@ -1265,7 +1189,11 @@ window.runMermaid = runMermaid;</script>
             <span class="n">load_post_processor_hook</span><span class="p">(</span><span class="n">_post_processor_path</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">_post_processor_path</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span><span class="p">:</span>
+        <span class="c1"># Attached serving frontends connect to an already-running worker:</span>
+        <span class="c1"># they must not spawn an MPI session (see GenerationExecutor.create).</span>
+        <span class="n">is_attached_frontend</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span>
+            <span class="s2">&quot;TLLM_EXECUTOR_ATTACH_INFO&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_attached_frontend</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;RAY_LOCAL_WORLD_SIZE&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">get_device_count</span><span class="p">(</span>
             <span class="p">)</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size_per_node</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
@@ -1351,6 +1279,17 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">hostname</span><span class="si">}</span><span class="s2">-</span><span class="si">{</span><span class="n">pid</span><span class="si">}</span><span class="s2">-</span><span class="si">{</span><span class="n">timestamp</span><span class="si">}</span><span class="s2">&quot;</span>
 
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span>
+
+    <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_data_transceiver_state</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get the serialized DataTransceiverState for arbitrary KV cache transfer.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            bytes: Serialized DataTransceiverState, or empty bytes if no transceiver is configured.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="sa">b</span><span class="s2">&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_data_transceiver_state</span><span class="p">()</span>
 
     <span class="nd">@property</span>
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
@@ -1590,6 +1529,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">if</span> <span class="n">is_ctx_only</span><span class="p">:</span>
             <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">=</span> <span class="mi">1</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_configure_bart_decoder_prefix</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">PreprocessedInputs</span><span class="p">):</span>
             <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">prompt_token_ids</span>
@@ -1602,6 +1542,10 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">preprocessed_encoder_input_token_ids</span><span class="p">,</span>
                     <span class="s2">&quot;inputs.encoder_input_token_ids&quot;</span><span class="p">)</span>
             <span class="n">encoder_input_token_ids</span> <span class="o">=</span> <span class="n">preprocessed_encoder_input_token_ids</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">encoder_input_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                    <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_encoder_decoder_model</span><span class="p">()):</span>
+                <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_decoder_prompt_token_ids</span><span class="p">(</span>
+                    <span class="n">sampling_params</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="n">query_token_ids</span><span class="p">,</span> <span class="n">multimodal_params</span><span class="p">,</span>
              <span class="n">encoder_input_token_ids</span><span class="p">)</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preprocess</span><span class="p">(</span>
@@ -1880,7 +1824,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">normalized_encoder_input_token_ids</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_encoder_decoder_model</span><span class="p">():</span>
             <span class="n">normalized_encoder_input_token_ids</span> <span class="o">=</span> <span class="n">prompt_token_ids</span>
-            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_get_decoder_start_token_id</span><span class="p">()]</span>
+            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_decoder_prompt_token_ids</span><span class="p">(</span>
+                <span class="n">sampling_params</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="n">query_token_ids</span><span class="p">,</span> <span class="n">multimodal_params</span><span class="p">,</span>
                 <span class="n">normalized_encoder_input_token_ids</span><span class="p">)</span>
@@ -2240,7 +2185,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="p">)</span>
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">_setup</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">,</span>
                                        <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_add_bart_forced_tokens_logits_processor</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_configure_bart_decoder_prefix</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
             <span class="n">add_thinking_budget_logits_processor</span><span class="p">(</span>
                 <span class="n">sampling_params</span><span class="p">,</span>
                 <span class="n">reasoning_parser</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">reasoning_parser</span><span class="p">,</span>
@@ -2266,37 +2211,37 @@ window.runMermaid = runMermaid;</script>
         <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_perf_metrics</span> <span class="o">=</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_perf_metrics</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">return_perf_metrics</span>
         <span class="k">return</span> <span class="n">sampling_params</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_add_bart_forced_tokens_logits_processor</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_get_decoder_prompt_token_ids</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_get_decoder_start_token_id</span><span class="p">(),</span>
+            <span class="o">*</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">_decoder_output_token_prefix</span><span class="p">,</span>
+        <span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_configure_bart_decoder_prefix</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                                       <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">sampling_params</span><span class="o">.</span><span class="n">_decoder_output_token_prefix</span> <span class="o">=</span> <span class="p">()</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span> <span class="o">!=</span> <span class="s2">&quot;pytorch&quot;</span><span class="p">:</span>
             <span class="k">return</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">,</span> <span class="s2">&quot;model_type&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">&quot;bart&quot;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">,</span> <span class="s2">&quot;model_type&quot;</span><span class="p">,</span>
+                   <span class="kc">None</span><span class="p">)</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;bart&quot;</span><span class="p">,</span> <span class="s2">&quot;mbart&quot;</span><span class="p">):</span>
             <span class="k">return</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span>
 
         <span class="n">forced_bos_token_id</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span><span class="p">,</span>
                                       <span class="s2">&quot;forced_bos_token_id&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">forced_eos_token_id</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span><span class="p">,</span>
-                                      <span class="s2">&quot;forced_eos_token_id&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">forced_bos_token_id</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">forced_eos_token_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">forced_bos_token_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span>
 
-        <span class="n">existing</span> <span class="o">=</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">logits_processor</span>
-        <span class="k">if</span> <span class="n">_contains_bart_forced_tokens_logits_processor</span><span class="p">(</span><span class="n">existing</span><span class="p">):</span>
-            <span class="k">return</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">and</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;BART requires max_tokens &gt;= 2 because its forced BOS token &quot;</span>
+                <span class="s2">&quot;counts against the output token limit.&quot;</span><span class="p">)</span>
 
-        <span class="n">processor</span> <span class="o">=</span> <span class="n">_BartForcedTokensLogitsProcessor</span><span class="p">(</span>
-            <span class="n">forced_bos_token_id</span><span class="o">=</span><span class="n">forced_bos_token_id</span><span class="p">,</span>
-            <span class="n">forced_eos_token_id</span><span class="o">=</span><span class="n">forced_eos_token_id</span><span class="p">,</span>
-            <span class="n">max_tokens</span><span class="o">=</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span><span class="p">,</span>
-        <span class="p">)</span>
-        <span class="k">if</span> <span class="n">existing</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">sampling_params</span><span class="o">.</span><span class="n">logits_processor</span> <span class="o">=</span> <span class="n">processor</span>
-        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">existing</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
-            <span class="n">existing</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">processor</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">sampling_params</span><span class="o">.</span><span class="n">logits_processor</span> <span class="o">=</span> <span class="p">[</span><span class="n">existing</span><span class="p">,</span> <span class="n">processor</span><span class="p">]</span>
+        <span class="n">sampling_params</span><span class="o">.</span><span class="n">_decoder_output_token_prefix</span> <span class="o">=</span> <span class="p">(</span><span class="n">forced_bos_token_id</span><span class="p">,</span> <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_check_arguments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">query_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                          <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">,</span>
@@ -2793,9 +2738,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 20, 2026.</p>
+  <p>Last updated on July 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
   
 </div></div>
       

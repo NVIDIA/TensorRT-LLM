@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=4351f35f" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=52eb2d38"></script>
+    <script src="../_static/config_selector.js?v=5991fb72"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc22" />
+  <meta name="docsearch:version" content="1.3.0rc23" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -695,7 +695,8 @@ One can specify which sampler to use explicitly with:</p>
 <h3>LLM API sampling behavior when using Torch Sampler<a class="headerlink" href="#llm-api-sampling-behavior-when-using-torch-sampler" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>The sampling is controlled via <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>.</p></li>
-<li><p>By default (<code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">None</span></code>), greedy sampling is used.</p></li>
+<li><p>By default (<code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">None</span></code>), greedy sampling is used
+(unless top-p decay is active, see below).</p></li>
 <li><p>If either <code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">0</span></code>, and/or <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">1</span></code>, is specified, sampling is greedy,
 irrespective of the values of the remaining parameters.</p></li>
 <li><p>Otherwise, sampling proceeds according to the specified sampling parameter values and any
@@ -714,6 +715,19 @@ subset is greater or equal than the probability of any not selected token.
 When combined with <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, the probabilities of the tokens selected by <code class="docutils literal notranslate"><span class="pre">top_k</span></code> are rescaled
 such that they sum to one before <code class="docutils literal notranslate"><span class="pre">top_p</span></code> is applied.</p></li>
 <li><p>The implementation does not guarantee any particular treatment of tied probabilities.</p></li>
+</ul>
+</li>
+<li><p>Top-P decay is supported: if <code class="docutils literal notranslate"><span class="pre">top_p_decay</span> <span class="pre">&lt;</span> <span class="pre">1</span></code> is specified, the effective <code class="docutils literal notranslate"><span class="pre">top_p</span></code> is
+multiplied by <code class="docutils literal notranslate"><span class="pre">top_p_decay</span></code> after every sampled token, bounded from below by <code class="docutils literal notranslate"><span class="pre">top_p_min</span></code>
+(default <code class="docutils literal notranslate"><span class="pre">1e-6</span></code>), and reset to the initial <code class="docutils literal notranslate"><span class="pre">top_p</span></code> whenever the token <code class="docutils literal notranslate"><span class="pre">top_p_reset_ids</span></code>
+is sampled (default <code class="docutils literal notranslate"><span class="pre">-1</span></code>, which never matches a token). Out-of-range values
+(<code class="docutils literal notranslate"><span class="pre">top_p_decay</span></code> or <code class="docutils literal notranslate"><span class="pre">top_p_min</span></code> outside <code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">1]</span></code>, negative <code class="docutils literal notranslate"><span class="pre">top_p_reset_ids</span></code>) are rejected.</p>
+<ul>
+<li><p>An active top-p decay implies top-p sampling even if <code class="docutils literal notranslate"><span class="pre">top_p</span></code> is unspecified or <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">1</span></code>
+(the initial <code class="docutils literal notranslate"><span class="pre">top_p</span></code> then defaults to 1). However, explicitly requested greedy sampling
+(<code class="docutils literal notranslate"><span class="pre">temperature</span> <span class="pre">=</span> <span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span> <span class="pre">=</span> <span class="pre">0</span></code>, and/or <code class="docutils literal notranslate"><span class="pre">top_k</span> <span class="pre">=</span> <span class="pre">1</span></code>) takes precedence over top-p decay.</p></li>
+<li><p>Top-P decay is not supported in combination with beam search or with speculative decoding
+modes that route draft tokens through the Torch Sampler; such requests are rejected.</p></li>
 </ul>
 </li>
 </ul>
@@ -946,9 +960,9 @@ of requests with very heterogeneous sampling strategies (e.g. a mix of requests 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 20, 2026.</p>
+  <p>Last updated on July 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
   
 </div></div>
       

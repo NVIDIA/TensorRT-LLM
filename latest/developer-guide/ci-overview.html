@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=4351f35f" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=52eb2d38"></script>
+    <script src="../_static/config_selector.js?v=5991fb72"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc22" />
+  <meta name="docsearch:version" content="1.3.0rc23" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -681,8 +681,8 @@ pytest via <code class="docutils literal notranslate"><span class="pre">--waives
 <p>Each line contains the fully qualified test name followed by an optional
 <code class="docutils literal notranslate"><span class="pre">SKIP</span> <span class="pre">(reason)</span></code> marker. A <code class="docutils literal notranslate"><span class="pre">full:GPU_TYPE/</span></code> prefix restricts the waive to a
 specific hardware family. Example:</p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>examples/test_openai.py::test_llm_openai_triton_1gpu SKIP (https://nvbugspro.nvidia.com/bug/4963654)
-full:GH200/examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (arm is not supported)
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
+full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6422318)
 </pre></div>
 </div>
 <p>Changes to <code class="docutils literal notranslate"><span class="pre">waives.txt</span></code> should include a bug link or brief explanation so other
@@ -711,11 +711,11 @@ default pre-merge set:</p>
 </pre></div>
 </div>
 <p>Both options accept stage names and wildcard patterns defined in
-<code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>. The broad <code class="docutils literal notranslate"><span class="pre">&quot;*&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;*Post-Merge*&quot;</span></code> selectors
-require the same approval label, including when they appear in a comma-separated
-list. Equivalent escaped or repeated-star forms are treated the same. Other
-stage selectors, including explicit stage names and limited patterns such as
-<code class="docutils literal notranslate"><span class="pre">&quot;*PerfSanity*&quot;</span></code>, retain their existing behavior.</p>
+<code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>. The <code class="docutils literal notranslate"><span class="pre">&quot;*&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;*Post-Merge*&quot;</span></code>, and <code class="docutils literal notranslate"><span class="pre">&quot;*PerfSanity*&quot;</span></code>
+selectors require the same approval label, including when they appear in a
+comma-separated list. Equivalent escaped or repeated-star forms are treated the
+same. Other stage selectors, including explicit stage names and other limited
+wildcard patterns, retain their existing behavior.</p>
 <p>Being selective keeps CI turnaround fast and conserves hardware resources.</p>
 </section>
 <section id="avoiding-unnecessary-disable-fail-fast-usage">
@@ -880,9 +880,9 @@ stage selectors, including explicit stage names and limited patterns such as
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 20, 2026.</p>
+  <p>Last updated on July 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
   
 </div></div>
       

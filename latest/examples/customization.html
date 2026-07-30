@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=4351f35f" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=52eb2d38"></script>
+    <script src="../_static/config_selector.js?v=5991fb72"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc23';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc22" />
+  <meta name="docsearch:version" content="1.3.0rc23" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -593,62 +593,43 @@
 <h1>LLM Common Customizations<a class="headerlink" href="#llm-common-customizations" title="Link to this heading">#</a></h1>
 <section id="quantization">
 <h2>Quantization<a class="headerlink" href="#quantization" title="Link to this heading">#</a></h2>
-<p>TensorRT LLM can quantize the Hugging Face model automatically. By setting the appropriate flags in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> instance. For example, to perform an Int4 AWQ quantization, the following code triggers the model quantization. Please refer to complete list of <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/_modules/tensorrt_llm/quantization/mode.html#QuantAlgo">supported flags</a> and acceptable values.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantConfig</span><span class="p">,</span> <span class="n">QuantAlgo</span>
+<p>TensorRT LLM runs quantized models from pre-quantized checkpoints. Use a checkpoint quantized with <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">NVIDIA TensorRT Model Optimizer</a> (for example, the ready-made FP8/NVFP4 checkpoints published on the <a class="reference external" href="https://huggingface.co/nvidia">NVIDIA Hugging Face hub</a>), and the quantization configuration is detected automatically when the model loads:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
 
-<span class="n">quant_config</span> <span class="o">=</span> <span class="n">QuantConfig</span><span class="p">(</span><span class="n">quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">)</span>
-
-<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">model</span><span class="o">-</span><span class="nb">dir</span><span class="o">&gt;</span><span class="p">,</span> <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">)</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;nvidia/Llama-3.1-8B-Instruct-FP8&quot;</span><span class="p">)</span>
 </pre></div>
 </div>
+<p>Refer to the <a class="reference internal" href="../features/quantization.html"><span class="std std-doc">quantization feature documentation</span></a> for the supported formats per GPU architecture and instructions on quantizing your own model.</p>
 </section>
 <section id="sampling">
 <h2>Sampling<a class="headerlink" href="#sampling" title="Link to this heading">#</a></h2>
-<p>SamplingParams can customize the sampling strategy to control LLM generated responses, such as beam search, temperature, and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/utils.py#L55-L76">others</a>.</p>
-<p>As an example, to enable beam search with a beam size of 4, set the <code class="docutils literal notranslate"><span class="pre">sampling_params</span></code> as follows:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">BuildConfig</span>
+<p>SamplingParams can customize the sampling strategy to control LLM generated responses, such as beam search, temperature, and many others.</p>
+<p>As an example, to enable beam search with a beam width of 4, configure the engine limit with <code class="docutils literal notranslate"><span class="pre">max_beam_width</span></code> and request beam search through <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
 
-<span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
-<span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="mi">4</span>
-
-<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">llama_model_path</span><span class="o">&gt;</span><span class="p">,</span> <span class="n">build_config</span><span class="o">=</span><span class="n">build_config</span><span class="p">)</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">llama_model_path</span><span class="o">&gt;</span><span class="p">,</span> <span class="n">max_beam_width</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
 <span class="c1"># Let the LLM object generate text with the default sampling strategy, or</span>
 <span class="c1"># you can create a SamplingParams object as well with several fields set manually</span>
-<span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">beam_width</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span> <span class="c1"># current limitation: beam_width should be equal to max_beam_width</span>
+<span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">n</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">use_beam_search</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
 <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="o">&lt;</span><span class="n">prompt</span><span class="o">&gt;</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">):</span>
     <span class="nb">print</span><span class="p">(</span><span class="n">output</span><span class="p">)</span>
 </pre></div>
 </div>
-<p><code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code> manages and dispatches fields to C++ classes including:</p>
-<ul class="simple">
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfigE">SamplingConfig</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12OutputConfigE">OutputConfig</a></p></li>
-</ul>
-<p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/index.html#tensorrt_llm.llmapi.SamplingParams">class documentation</a> for more details.</p>
-</section>
-<section id="build-configuration">
-<h2>Build Configuration<a class="headerlink" href="#build-configuration" title="Link to this heading">#</a></h2>
-<p>Apart from the arguments mentioned above, you can also customize the build configuration with the <code class="docutils literal notranslate"><span class="pre">build_config</span></code> class and other arguments borrowed from the trtllm-build CLI. These build configuration options provide flexibility in building engines for the target hardware and use cases. Refer to the following example:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">model</span><span class="o">-</span><span class="n">path</span><span class="o">&gt;</span><span class="p">,</span>
-          <span class="n">build_config</span><span class="o">=</span><span class="n">BuildConfig</span><span class="p">(</span>
-            <span class="n">max_num_tokens</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
-            <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span>
-            <span class="n">max_beam_width</span><span class="o">=</span><span class="mi">4</span><span class="p">))</span>
-</pre></div>
-</div>
-<p>Refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/builder.py#L470-L501">buildconfig documentation</a> for more details.</p>
+<p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/index.html#tensorrt_llm.llmapi.SamplingParams">class documentation</a> for the complete list of fields.</p>
 </section>
 <section id="runtime-customization">
 <h2>Runtime Customization<a class="headerlink" href="#runtime-customization" title="Link to this heading">#</a></h2>
-<p>Similar to <code class="docutils literal notranslate"><span class="pre">build_config</span></code>, you can also customize the runtime configuration with the <code class="docutils literal notranslate"><span class="pre">runtime_config</span></code>, <code class="docutils literal notranslate"><span class="pre">peft_cache_config</span></code> or other <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_utils.py#L186-L223">arguments</a> borrowed from the Executor APIs.  These runtime configuration options provide additional flexibility with respect to KV cache management, GPU memory allocation and so on. Refer to the following example:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">KvCacheConfig</span>
+<p>Runtime behavior such as KV cache management and GPU memory allocation can be customized with dedicated configuration classes like <code class="docutils literal notranslate"><span class="pre">kv_cache_config</span></code> and <code class="docutils literal notranslate"><span class="pre">peft_cache_config</span></code> passed to the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> constructor. Refer to the following example:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">KvCacheConfig</span>
 
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">llama_model_path</span><span class="o">&gt;</span><span class="p">,</span>
           <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
             <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.8</span><span class="p">))</span>
 </pre></div>
 </div>
+<p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/index.html">LLM API reference</a> for all available configuration classes.</p>
 </section>
 <section id="tokenizer-customization">
 <h2>Tokenizer Customization<a class="headerlink" href="#tokenizer-customization" title="Link to this heading">#</a></h2>
@@ -667,8 +648,8 @@
 <section id="disable-tokenizer">
 <h3>Disable Tokenizer<a class="headerlink" href="#disable-tokenizer" title="Link to this heading">#</a></h3>
 <p>For performance considerations, you can disable the tokenizer by passing <code class="docutils literal notranslate"><span class="pre">skip_tokenizer_init=True</span></code> when creating <code class="docutils literal notranslate"><span class="pre">LLM</span></code>. In this case, <code class="docutils literal notranslate"><span class="pre">LLM.generate</span></code> and <code class="docutils literal notranslate"><span class="pre">LLM.generate_async</span></code> will expect prompt token ids as input. Refer to the following example:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">llama_model_path</span><span class="o">&gt;</span><span class="p">)</span>
-<span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([[</span><span class="mi">32</span><span class="p">,</span> <span class="mi">12</span><span class="p">]],</span> <span class="n">skip_tokenizer_init</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">llama_model_path</span><span class="o">&gt;</span><span class="p">,</span> <span class="n">skip_tokenizer_init</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([[</span><span class="mi">32</span><span class="p">,</span> <span class="mi">12</span><span class="p">]]):</span>
     <span class="nb">print</span><span class="p">(</span><span class="n">output</span><span class="p">)</span>
 </pre></div>
 </div>
@@ -748,7 +729,6 @@
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization">Quantization</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sampling">Sampling</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#build-configuration">Build Configuration</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-customization">Runtime Customization</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tokenizer-customization">Tokenizer Customization</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#disable-tokenizer">Disable Tokenizer</a></li>
@@ -850,9 +830,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 20, 2026.</p>
+  <p>Last updated on July 30, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/d41ab33">d41ab33</a>.</p>
   
 </div></div>
       
