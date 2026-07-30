@@ -842,9 +842,28 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
         self.fusion_config.POST_MOE_FUSION = False
 
     @staticmethod
+    def _mtp_pattern_covers_experts(tail: str) -> bool:
+        """Does an MTP exclude pattern cover the routed experts?
+
+        ``tail`` is what follows the ``mtp.`` /
+        ``model.layers.<n_hidden_layers>`` prefix.
+        """
+        stripped = tail.strip(".*")
+        if not stripped:
+            # Bare (or wildcarded) layer prefix: covers the whole layer.
+            return True
+        if stripped.startswith("layers."):
+            # "layers.<idx>[.<module>]" -- drop "layers" and the index.
+            parts = stripped.split(".", 2)
+            stripped = parts[2] if len(parts) > 2 else ""
+            if not stripped:
+                return True
+        return "mlp.experts" in stripped
+
+    @staticmethod
     def _is_mtp_excluded_from_quant(
             model_config: ModelConfig[Qwen3NextConfig]) -> bool:
-        """Heuristic: did the checkpoint mark MTP as excluded from quantization?
+        """Heuristic: did the checkpoint leave the MTP *MoE* unquantized?
 
         ``apply_quant_config_exclude_modules`` runs *after* this constructor.
         For Qwen3.5 paths the exclude_modules list has already been
@@ -863,8 +882,12 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
                          if n_layers is not None else None)
         for pat in qc.exclude_modules:
             if pat.startswith("mtp."):
-                return True
-            if target_prefix is not None and pat.startswith(target_prefix):
+                tail = pat[len("mtp."):]
+            elif target_prefix is not None and pat.startswith(target_prefix):
+                tail = pat[len(target_prefix):]
+            else:
+                continue
+            if Qwen3NextMTP._mtp_pattern_covers_experts(tail):
                 return True
         return False
 
@@ -1076,6 +1099,12 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                      params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
         new_weights = weight_mapper.preprocess_weights(weights)
+        # `new_weights` aliases the source tensors for every key
+        # `preprocess_weights` did not rewrite -- the routed experts, i.e. most
+        # of a MoE checkpoint. Holding `weights` too would pin them, so
+        # consuming `new_weights` during the load would free nothing.
+        if hasattr(weights, "clear"):
+            weights.clear()
         super().load_weights(
             new_weights,
             weight_mapper=weight_mapper,
