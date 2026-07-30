@@ -4336,6 +4336,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def isFatSqsh = sh(script: "test -d /tmp/TensorRT-LLM && echo yes || echo no", returnStdout: true).trim() == "yes"
         if (isFatSqsh) {
             sh "ln -sfn /tmp/TensorRT-LLM ${llmPath}/TensorRT-LLM"
+            // Resolve to real path so pytest --rootdir doesn't produce ../../../ node IDs.
+            llmSrc = sh(script: "realpath ${llmPath}/TensorRT-LLM/src", returnStdout: true).trim()
         } else {
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
             timeout(time: 30, unit: 'MINUTES') {
