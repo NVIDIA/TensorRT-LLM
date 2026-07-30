@@ -370,24 +370,72 @@ def is_real_slurm_partition(partition):
     return bool(partition) and partition != "unspecified"
 
 
-def partition_has_gpu_gres(partition):
-    """Return True if the Slurm partition reports GPU GRES (e.g. 'gpu:4'), False if null/absent."""
-    if not is_real_slurm_partition(partition):
-        return False
+def default_slurm_partition():
+    """Name of the cluster's default partition, which sinfo flags as '<name>*'.
+
+    Needed when --partition is "unspecified": the job still lands on the default
+    partition, so that is the partition whose GRES we must inspect.
+    """
     try:
-        gres = (
-            subprocess.check_output(
-                ["sinfo", "-p", partition, "-h", "-o", "%G"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-            .strip()
-            .split("\n")[0]
-            .strip()
+        out = subprocess.check_output(
+            ["sinfo", "-h", "-o", "%P"], stderr=subprocess.DEVNULL, text=True
         )
-        return gres.startswith("gpu:")
     except Exception:
-        return False
+        return ""
+    for line in out.split("\n"):
+        name = line.strip()
+        if name.endswith("*"):
+            return name[:-1]
+    return ""
+
+
+def partition_gpu_gres(partition):
+    """GRES the partition advertises (e.g. 'gpu:4'), or None if undeterminable.
+
+    An empty string means the partition definitively reports no GRES (e.g. EOS,
+    which does not register GPUs as gres at all). None means sinfo could not
+    answer, which callers must not read as "this partition has no GPUs".
+    """
+    if not is_real_slurm_partition(partition):
+        return None
+    try:
+        out = subprocess.check_output(
+            ["sinfo", "-p", partition, "-h", "-o", "%G"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:
+        return None
+    gres = [line.strip() for line in out.split("\n") if line.strip()]
+    # One row per node state, so prefer a GPU row over a '(null)' one.
+    for entry in gres:
+        if entry.startswith("gpu:"):
+            return entry
+    return gres[0] if gres else None
+
+
+def generate_gpu_request(partition, gpus_per_node):
+    """#SBATCH lines requesting GPUs, matching the target partition's config.
+
+    --gpus-per-node is the request internal CI uses (L0_Test.groovy getNodeArgs);
+    --gres is added only where the partition advertises a gpu GRES, since it is
+    rejected as an invalid generic resource on clusters that register no GRES at
+    all.
+
+    When the caller names a real partition its GRES decides everything, so a
+    GPU-less cluster still gets a GPU-less request. When the partition is
+    "unspecified" we are on a cluster that relies on its default partition -- a
+    GPU cluster by construction (see the BSL platform configs) -- and those
+    partitions can reject a job that requests no GPUs outright, so always ask.
+    """
+    known_partition = is_real_slurm_partition(partition)
+    gres = partition_gpu_gres(partition if known_partition else default_slurm_partition())
+    if known_partition and (gres is not None and not gres.startswith("gpu:")):
+        return []
+    lines = [f"#SBATCH --gpus-per-node={gpus_per_node}"]
+    if gres and gres.startswith("gpu:"):
+        lines.append(f"#SBATCH --gres=gpu:{gpus_per_node}")
+    return lines
 
 
 def detect_cluster_name():
@@ -423,9 +471,7 @@ def generate_sbatch_params(args, hardware_config, work_dir):
         f"#SBATCH --ntasks={total_gpus}",
         f"#SBATCH --ntasks-per-node={gpus_per_node}",
     ]
-    if partition_has_gpu_gres(args.partition):
-        lines.append(f"#SBATCH --gpus-per-node={gpus_per_node}")
-        lines.append(f"#SBATCH --gres=gpu:{gpus_per_node}")
+    lines += generate_gpu_request(args.partition, gpus_per_node)
     # Omit --partition when unspecified (same convention as L0_Test.groovy).
     if is_real_slurm_partition(args.partition):
         lines.append(f"#SBATCH --partition={args.partition}")
