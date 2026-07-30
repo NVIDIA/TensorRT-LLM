@@ -30,7 +30,6 @@ import os
 from pathlib import Path
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
-os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
 import PIL.Image
 import pytest
@@ -46,7 +45,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
-pytestmark = pytest.mark.cosmos3
+pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
 
 @pytest.fixture(autouse=True, scope="module")

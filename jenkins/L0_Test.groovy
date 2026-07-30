@@ -1859,7 +1859,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         --script-prefix ${scriptLaunchPrefixPathLocal} \\
                         --srun-args ${scriptLaunchSrunArgsPathLocal} \\
                         --split-group ${splitId} \\
-                        --stage-name ${stageName}
+                        --stage-name ${stageName} \\
+                        --cluster-name ${partition.clusterName}
                     """
                 } else {
                     if(nodeCount > 1) {
@@ -2866,7 +2867,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def extraDeviceEnv = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -4276,11 +4277,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
             withCredentials([
                 string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
-                usernamePassword(
-                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                    usernameVariable: 'GITLAB_API_USER',
-                    passwordVariable: 'GITLAB_API_TOKEN'
-                ),
                 string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {

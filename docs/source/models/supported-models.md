@@ -172,6 +172,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `Qwen/Qwen-Image-Edit-2511` | Image Editing (text+images-to-image) |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
+| `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
 
 ### Feature Matrix
 
