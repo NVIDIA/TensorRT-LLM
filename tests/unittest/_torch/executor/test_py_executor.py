@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -23,7 +25,11 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    DisaggTransferAdmissionController,
+    PyExecutor,
+    _diagnostic_disagg_double_admission_bypass_enabled,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
@@ -300,7 +306,46 @@ def _make_disagg_transfer_request(
     return req
 
 
+def _configure_diagnostic_disagg_double_admission(executor, enabled):
+    executor._diagnostic_disagg_double_admission_bypass_enabled = enabled
+    executor._diagnostic_disagg_double_admission_evaluated = 0
+    executor._diagnostic_disagg_double_admission_divergent = 0
+    executor._diagnostic_disagg_double_admission_candidates = 0
+    executor._diagnostic_disagg_double_admission_default_admitted = 0
+    executor._diagnostic_disagg_double_admission_default_deferred = 0
+    executor._diagnostic_disagg_double_admission_treatment_admitted = 0
+    executor._diagnostic_disagg_double_admission_active_blocks_max = 0
+    executor._diagnostic_disagg_double_admission_exercised_logged = False
+    executor._diagnostic_disagg_double_admission_summary_logged = False
+
+
 class TestDisaggTransferAdmissionController:
+    @pytest.mark.parametrize(
+        ("native_value", "python_value", "expected"),
+        [
+            (None, None, False),
+            ("1", None, False),
+            (None, "1", False),
+            ("0", "1", False),
+            ("1", "0", False),
+            ("1", "1", True),
+        ],
+    )
+    def test_double_admission_bypass_requires_both_envs(
+        self, monkeypatch, native_value, python_value, expected
+    ):
+        env_values = {
+            "TRTLLM_NVBUG_6448152_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY": native_value,
+            "TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS": python_value,
+        }
+        for name, value in env_values.items():
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+
+        assert _diagnostic_disagg_double_admission_bypass_enabled() is expected
+
     def test_disabled_preserves_candidates(self):
         controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer=None, tokens_per_block=32
@@ -340,6 +385,21 @@ class TestDisaggTransferAdmissionController:
         assert result.deferred_request_count == 1
         assert result.is_blocked_by_active_transfers()
 
+    @pytest.mark.parametrize("tokens_per_block", [32, 64])
+    def test_exact_workload_native_candidate_is_masked_by_python_budget(self, tokens_per_block):
+        controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=131104, tokens_per_block=tokens_per_block
+        )
+        active = _make_disagg_transfer_request(1, 131072, in_progress=True)
+        candidate = _make_disagg_transfer_request(2, 131072)
+
+        result = controller.select(active_requests=[active], candidates=[candidate])
+
+        assert result.active_transfer_blocks > 0
+        assert result.admitted_requests == []
+        assert result.deferred_request_count == 1
+        assert result.is_blocked_by_active_transfers()
+
     def test_admits_oversized_head_when_idle(self):
         controller = DisaggTransferAdmissionController(max_tokens_in_buffer=32, tokens_per_block=32)
         oversized = _make_disagg_transfer_request(1, 96)
@@ -364,7 +424,12 @@ class TestDisaggTransferAdmissionController:
         assert result.admitted_requests == [request]
         assert result.admitted_transfer_blocks == 3
 
-    def test_apply_reverts_deferred_v2_allocations(self):
+    def test_apply_reverts_deferred_v2_allocations(self, monkeypatch):
+        monkeypatch.delenv(
+            "TRTLLM_NVBUG_6448152_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY",
+            raising=False,
+        )
+        monkeypatch.delenv("TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS", raising=False)
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
         executor._is_kv_manager_v2 = True
@@ -413,6 +478,172 @@ class TestDisaggTransferAdmissionController:
         assert admitted == []
         assert wait_for_progress
         executor._revert_ctx_alloc.assert_not_called()
+
+    def test_double_admission_bypass_shadows_every_call_and_preserves_candidates(self, monkeypatch):
+        log_info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", log_info)
+        executor = object.__new__(PyExecutor)
+        _configure_diagnostic_disagg_double_admission(executor, enabled=True)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor._is_warmup = False
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        controller = DisaggTransferAdmissionController(max_tokens_in_buffer=32, tokens_per_block=32)
+        controller.select = Mock(wraps=controller.select)
+        executor._disagg_transfer_admission_controller = controller
+        candidates = [
+            _make_disagg_transfer_request(2, 32),
+            _make_disagg_transfer_request(3, 32),
+        ]
+
+        for _ in range(2):
+            admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+                executor, candidates
+            )
+            assert admitted is candidates
+            assert not wait_for_progress
+
+        PyExecutor._log_diagnostic_disagg_double_admission_summary(executor)
+        PyExecutor._log_diagnostic_disagg_double_admission_summary(executor)
+
+        assert controller.select.call_count == 2
+        executor._revert_ctx_alloc.assert_not_called()
+        assert executor._diagnostic_disagg_double_admission_evaluated == 2
+        assert executor._diagnostic_disagg_double_admission_divergent == 2
+        assert executor._diagnostic_disagg_double_admission_candidates == 4
+        assert executor._diagnostic_disagg_double_admission_default_admitted == 0
+        assert executor._diagnostic_disagg_double_admission_default_deferred == 4
+        assert executor._diagnostic_disagg_double_admission_treatment_admitted == 4
+        assert executor._diagnostic_disagg_double_admission_active_blocks_max == 1
+        assert log_info.call_count == 2
+        marker, summary = [call.args[0] for call in log_info.call_args_list]
+        assert "event=python_gate_exercised" in marker
+        assert "candidates=2" in marker
+        assert "default_admitted=0" in marker
+        assert "default_deferred=2" in marker
+        assert "treatment_admitted=2" in marker
+        assert "budget=1" in marker
+        assert "event=python_summary" in summary
+        assert "evaluated_iterations=2" in summary
+        assert "divergent_iterations=2" in summary
+        assert "request_id" not in marker
+        assert "request_id" not in summary
+
+    def test_double_admission_bypass_no_divergence_has_no_exercised_marker(self, monkeypatch):
+        log_info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", log_info)
+        executor = object.__new__(PyExecutor)
+        _configure_diagnostic_disagg_double_admission(executor, enabled=True)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor._is_warmup = False
+        executor.active_requests = []
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=64, tokens_per_block=32
+        )
+        candidates = [
+            _make_disagg_transfer_request(1, 32),
+            _make_disagg_transfer_request(2, 32),
+        ]
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, candidates
+        )
+
+        assert admitted is candidates
+        assert not wait_for_progress
+        assert executor._diagnostic_disagg_double_admission_evaluated == 1
+        assert executor._diagnostic_disagg_double_admission_divergent == 0
+        assert executor._diagnostic_disagg_double_admission_candidates == 2
+        assert executor._diagnostic_disagg_double_admission_default_admitted == 2
+        assert executor._diagnostic_disagg_double_admission_default_deferred == 0
+        assert executor._diagnostic_disagg_double_admission_treatment_admitted == 2
+        executor._revert_ctx_alloc.assert_not_called()
+        log_info.assert_not_called()
+
+    def test_double_admission_bypass_keeps_default_warmup_behavior(self):
+        executor = object.__new__(PyExecutor)
+        _configure_diagnostic_disagg_double_admission(executor, enabled=True)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        executor._is_warmup = True
+        candidate = _make_disagg_transfer_request(2, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+
+        assert admitted == []
+        assert wait_for_progress
+        executor._revert_ctx_alloc.assert_called_once_with([candidate])
+        assert executor._diagnostic_disagg_double_admission_evaluated == 0
+        assert executor._diagnostic_disagg_double_admission_divergent == 0
+        assert executor._diagnostic_disagg_double_admission_candidates == 0
+
+    def test_double_admission_summary_logs_zero_calls_once(self, monkeypatch):
+        log_info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", log_info)
+        executor = object.__new__(PyExecutor)
+        _configure_diagnostic_disagg_double_admission(executor, enabled=True)
+
+        PyExecutor._log_diagnostic_disagg_double_admission_summary(executor)
+        PyExecutor._log_diagnostic_disagg_double_admission_summary(executor)
+
+        log_info.assert_called_once()
+        summary = log_info.call_args.args[0]
+        assert "evaluated_iterations=0" in summary
+        assert "divergent_iterations=0" in summary
+        assert "candidates_total=0" in summary
+        assert "default_admitted_total=0" in summary
+        assert "default_deferred_total=0" in summary
+        assert "treatment_admitted_total=0" in summary
+
+    def test_double_admission_bypass_is_default_off(self, monkeypatch):
+        log_info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", log_info)
+        executor = object.__new__(PyExecutor)
+        _configure_diagnostic_disagg_double_admission(executor, enabled=False)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = []
+        executor._is_warmup = False
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=64, tokens_per_block=32
+        )
+        candidate = _make_disagg_transfer_request(1, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+        PyExecutor._log_diagnostic_disagg_double_admission_summary(executor)
+
+        assert admitted == [candidate]
+        assert not wait_for_progress
+        assert executor._diagnostic_disagg_double_admission_evaluated == 0
+        log_info.assert_not_called()
+
+    def test_double_admission_bypass_preserves_pp_reconciliation(self):
+        executor = object.__new__(PyExecutor)
+        _configure_diagnostic_disagg_double_admission(executor, enabled=True)
+        executor._is_warmup = False
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        admitted = _make_disagg_transfer_request(1, 32)
+        local_extra = _make_disagg_transfer_request(2, 32)
+
+        PyExecutor._revert_deferred_disagg_gen_init_alloc(
+            executor, [admitted, local_extra], [admitted]
+        )
+
+        executor._revert_ctx_alloc.assert_called_once_with([local_extra])
 
 
 class TestDisaggTransferIdleProgress:
@@ -807,6 +1038,9 @@ class _CleanupStub:
             original_notify()
 
         self.response_cv.notify_all = record_notify
+        self._log_diagnostic_disagg_double_admission_summary = Mock(
+            side_effect=lambda: self._events.append("double_admission_summary")
+        )
 
     def wait_on_pp_send_handles(self, handles, idx):
         self._events.append(f"wait_pp_{idx}")
@@ -825,6 +1059,7 @@ class TestExecutorLoopCleanup:
         stub._executor_loop_cleanup()
 
         assert stub._events[0] == "notify_all"
+        assert stub._events[1] == "double_admission_summary"
         assert "wait_pp_0" in stub._events
         assert stub._events.index("notify_all") < stub._events.index("wait_pp_0")
         assert stub.is_shutdown is True

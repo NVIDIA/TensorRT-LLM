@@ -21,12 +21,15 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/scheduledBlocksManager.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -34,8 +37,53 @@ using kv_cache_manager::VecUniqueTokens;
 using kv_cache_manager::BlockKey;
 using kv_cache_manager::BlockKeyHasher;
 
+struct CapacitySchedulerDiagnosticStats
+{
+    explicit CapacitySchedulerDiagnosticStats(SizeType32 maxNumRequests)
+        : treatmentCapacityOutputHistogram(static_cast<std::size_t>(maxNumRequests) + 1, 0)
+        , legacyCapacityOutputHistogram(static_cast<std::size_t>(maxNumRequests) + 1, 0)
+    {
+    }
+
+    std::uint64_t iterations{0};
+    std::uint64_t exercisedIterations{0};
+    std::uint64_t transferActiveTotal{0};
+    std::uint64_t transferActiveMax{0};
+    std::uint64_t legacyLogicalAdmittedTotal{0};
+    std::uint64_t treatmentLogicalAdmittedTotal{0};
+    std::uint64_t treatmentOnlyInitTotal{0};
+    std::uint64_t treatmentOnlyReadyGenerationTotal{0};
+    bool initExercisedLogged{false};
+    bool readyGenerationExercisedLogged{false};
+    std::vector<std::uint64_t> treatmentCapacityOutputHistogram;
+    std::vector<std::uint64_t> legacyCapacityOutputHistogram;
+};
+
 namespace
 {
+
+constexpr char kExcludeDisaggGenerationTransferFromCapacityEnv[]
+    = "TRTLLM_NVBUG_6448152_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY";
+
+std::string formatNonzeroHistogram(std::vector<std::uint64_t> const& histogram)
+{
+    std::ostringstream stream;
+    bool first = true;
+    for (std::size_t batchSize = 0; batchSize < histogram.size(); ++batchSize)
+    {
+        if (histogram[batchSize] == 0)
+        {
+            continue;
+        }
+        if (!first)
+        {
+            stream << ",";
+        }
+        stream << batchSize << ":" << histogram[batchSize];
+        first = false;
+    }
+    return stream.str();
+}
 
 std::tuple<std::unordered_set<BlockKey, BlockKeyHasher>, std::unordered_set<BlockKey, BlockKeyHasher>>
 prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
@@ -158,11 +206,43 @@ MaxUtilizationScheduler::MaxUtilizationScheduler(SizeType32 maxNumRequests, bool
 {
 }
 
-GuaranteedNoEvictScheduler::GuaranteedNoEvictScheduler(
-    SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+GuaranteedNoEvictScheduler::GuaranteedNoEvictScheduler(SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState,
+    LlmRequestState noScheduleAfterState, bool excludeDisaggGenerationTransferFromCapacity)
     : BaseCapacityScheduler(noScheduleUntilState, noScheduleAfterState)
     , mMaxNumRequests(maxNumRequests)
+    , mExcludeDisaggGenerationTransferFromCapacity(excludeDisaggGenerationTransferFromCapacity)
+    , mDiagnosticStats(excludeDisaggGenerationTransferFromCapacity
+              ? std::make_shared<CapacitySchedulerDiagnosticStats>(maxNumRequests)
+              : nullptr)
 {
+    if (mExcludeDisaggGenerationTransferFromCapacity)
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_CAPACITY event=effective_config policy=guaranteed_no_evict "
+            "exclude_disagg_gen_transfer_from_capacity=1 max_num_requests=%d",
+            static_cast<int>(mMaxNumRequests));
+    }
+}
+
+GuaranteedNoEvictScheduler::~GuaranteedNoEvictScheduler()
+{
+    if (!mDiagnosticStats || mDiagnosticStats.use_count() != 1 || mDiagnosticStats->iterations == 0)
+    {
+        return;
+    }
+
+    auto const treatmentHistogram = formatNonzeroHistogram(mDiagnosticStats->treatmentCapacityOutputHistogram);
+    auto const legacyHistogram = formatNonzeroHistogram(mDiagnosticStats->legacyCapacityOutputHistogram);
+    TLLM_LOG_INFO(
+        "NVBUG6448152_CAPACITY event=summary policy=guaranteed_no_evict iterations=%lu "
+        "exercised_iterations=%lu transfer_active_total=%lu transfer_active_max=%lu "
+        "legacy_logical_admitted_total=%lu treatment_logical_admitted_total=%lu "
+        "treatment_only_init_total=%lu treatment_only_ready_generation_total=%lu "
+        "legacy_capacity_output_histogram=%s treatment_capacity_output_histogram=%s",
+        mDiagnosticStats->iterations, mDiagnosticStats->exercisedIterations, mDiagnosticStats->transferActiveTotal,
+        mDiagnosticStats->transferActiveMax, mDiagnosticStats->legacyLogicalAdmittedTotal,
+        mDiagnosticStats->treatmentLogicalAdmittedTotal, mDiagnosticStats->treatmentOnlyInitTotal,
+        mDiagnosticStats->treatmentOnlyReadyGenerationTotal, legacyHistogram.c_str(), treatmentHistogram.c_str());
 }
 
 StaticBatchScheduler::StaticBatchScheduler(
@@ -251,6 +331,14 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     SizeType32 claimedPeftPages{0};
     std::unordered_set<uint64_t> uniqTaskIds{};
     std::size_t numAdmittedRequests{0};
+    std::size_t generationActiveCount{0};
+    std::size_t transferActiveCount{0};
+    std::size_t treatmentDisaggInitAdmits{0};
+    std::size_t treatmentOnlyReadyGeneration{0};
+    std::size_t legacyActiveAdmitted{0};
+    bool legacyScanOpen{true};
+    bool const treatmentEnabled
+        = !StaticBatchScheduling && mExcludeDisaggGenerationTransferFromCapacity && mDiagnosticStats;
     RequestVector pendingRequests;
     RequestVector pendingDisGenInitRequests;
     pendingRequests.reserve(activeRequests.size());
@@ -266,17 +354,49 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
             continue;
         }
 
-        if (numAdmittedRequests >= static_cast<std::size_t>(mMaxNumRequests))
+        bool const isDisaggGenerationTransfer = req->isDisaggGenerationTransmissionInProgress();
+        bool const isGenerationInProgress = req->isGenerationInProgressState();
+        bool legacyWouldInspect = true;
+        if (treatmentEnabled)
         {
+            if (legacyActiveAdmitted >= static_cast<std::size_t>(mMaxNumRequests))
+            {
+                legacyScanOpen = false;
+            }
+            legacyWouldInspect = legacyScanOpen;
+            transferActiveCount += static_cast<std::size_t>(isDisaggGenerationTransfer);
+            generationActiveCount += static_cast<std::size_t>(isGenerationInProgress);
+            if (legacyWouldInspect && (isDisaggGenerationTransfer || isGenerationInProgress))
+            {
+                ++legacyActiveAdmitted;
+            }
+        }
+
+        if (numAdmittedRequests >= static_cast<std::size_t>(mMaxNumRequests)
+            && !(treatmentEnabled && isDisaggGenerationTransfer))
+        {
+            // Keep scanning only so later transfer-only requests retain their
+            // physical KV/PEFT reservations under the diagnostic treatment.
+            if (treatmentEnabled)
+            {
+                continue;
+            }
             break;
         }
 
-        if (req->isDisaggGenerationTransmissionInProgress() || req->isGenerationInProgressState())
+        if (isDisaggGenerationTransfer || isGenerationInProgress)
         {
-            ++numAdmittedRequests;
-            if (req->isGenerationInProgressState())
+            if (!isDisaggGenerationTransfer || !treatmentEnabled)
+            {
+                ++numAdmittedRequests;
+            }
+            if (isGenerationInProgress)
             {
                 scheduledRequests.emplace_back(req);
+                if (treatmentEnabled && !legacyWouldInspect)
+                {
+                    ++treatmentOnlyReadyGeneration;
+                }
             }
             reservedBlocks.enoughAvailableBlocks(*req);
             reservedBlocks.commitBlocks();
@@ -394,6 +514,10 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     {
                         scheduledRequests.emplace_back(req);
                         ++numAdmittedRequests;
+                        if (treatmentEnabled && req->isDisaggGenerationInitState())
+                        {
+                            ++treatmentDisaggInitAdmits;
+                        }
                         // Decrement using the cached values computed by enoughAvailableBlocks.
                         reservedBlocks.commitBlocks();
                         if (reservedCrossBlocks)
@@ -413,6 +537,60 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     }
                 }
             }
+        }
+    }
+
+    if (treatmentEnabled)
+    {
+        auto const maxNumRequests = static_cast<std::size_t>(mMaxNumRequests);
+        auto const legacyRemaining = maxNumRequests - legacyActiveAdmitted;
+        auto const treatmentOnlyInitAdmits
+            = treatmentDisaggInitAdmits > legacyRemaining ? treatmentDisaggInitAdmits - legacyRemaining : 0;
+        auto const treatmentCapacityOutput = scheduledRequests.size();
+        TLLM_CHECK_WITH_INFO(treatmentOnlyInitAdmits + treatmentOnlyReadyGeneration <= treatmentCapacityOutput,
+            "Diagnostic treatment-only admits must not exceed the capacity output");
+        auto const legacyCapacityOutput
+            = treatmentCapacityOutput - treatmentOnlyInitAdmits - treatmentOnlyReadyGeneration;
+        auto const legacyLogicalAdmitted = legacyActiveAdmitted + std::min(legacyRemaining, treatmentDisaggInitAdmits);
+
+        ++mDiagnosticStats->iterations;
+        mDiagnosticStats->transferActiveTotal += transferActiveCount;
+        mDiagnosticStats->transferActiveMax
+            = std::max<std::uint64_t>(mDiagnosticStats->transferActiveMax, transferActiveCount);
+        mDiagnosticStats->legacyLogicalAdmittedTotal += legacyLogicalAdmitted;
+        mDiagnosticStats->treatmentLogicalAdmittedTotal += numAdmittedRequests;
+        mDiagnosticStats->treatmentOnlyInitTotal += treatmentOnlyInitAdmits;
+        mDiagnosticStats->treatmentOnlyReadyGenerationTotal += treatmentOnlyReadyGeneration;
+        ++mDiagnosticStats->legacyCapacityOutputHistogram.at(legacyCapacityOutput);
+        ++mDiagnosticStats->treatmentCapacityOutputHistogram.at(treatmentCapacityOutput);
+
+        if (treatmentOnlyInitAdmits > 0 || treatmentOnlyReadyGeneration > 0)
+        {
+            ++mDiagnosticStats->exercisedIterations;
+        }
+        if (treatmentOnlyInitAdmits > 0 && !mDiagnosticStats->initExercisedLogged)
+        {
+            TLLM_LOG_INFO(
+                "NVBUG6448152_CAPACITY event=exercised path=disagg_init max_num_requests=%lu "
+                "generation_active=%lu transfer_active=%lu legacy_remaining=%lu "
+                "treatment_init_admits=%lu treatment_only_init_admits=%lu "
+                "legacy_logical_admitted=%lu treatment_logical_admitted=%lu "
+                "legacy_capacity_output=%lu treatment_capacity_output=%lu",
+                maxNumRequests, generationActiveCount, transferActiveCount, legacyRemaining, treatmentDisaggInitAdmits,
+                treatmentOnlyInitAdmits, legacyLogicalAdmitted, numAdmittedRequests, legacyCapacityOutput,
+                treatmentCapacityOutput);
+            mDiagnosticStats->initExercisedLogged = true;
+        }
+        if (treatmentOnlyReadyGeneration > 0 && !mDiagnosticStats->readyGenerationExercisedLogged)
+        {
+            TLLM_LOG_INFO(
+                "NVBUG6448152_CAPACITY event=exercised path=ready_generation max_num_requests=%lu "
+                "generation_active=%lu transfer_active=%lu treatment_only_ready_generation=%lu "
+                "legacy_logical_admitted=%lu treatment_logical_admitted=%lu "
+                "legacy_capacity_output=%lu treatment_capacity_output=%lu",
+                maxNumRequests, generationActiveCount, transferActiveCount, treatmentOnlyReadyGeneration,
+                legacyLogicalAdmitted, numAdmittedRequests, legacyCapacityOutput, treatmentCapacityOutput);
+            mDiagnosticStats->readyGenerationExercisedLogged = true;
         }
     }
     return {std::move(scheduledRequests), RequestVector{}};
@@ -657,7 +835,8 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
     {
-        mScheduler = GuaranteedNoEvictScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState};
+        mScheduler = GuaranteedNoEvictScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState,
+            common::getBoolEnv(kExcludeDisaggGenerationTransferFromCapacityEnv)};
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kSTATIC_BATCH)
     {

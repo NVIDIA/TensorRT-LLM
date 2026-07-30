@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import functools
@@ -102,6 +105,11 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY_ENV = (
+    "TRTLLM_NVBUG_6448152_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY")
+_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS_ENV = (
+    "TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS")
+
 
 class PPCommTag(IntEnum):
     """
@@ -151,6 +159,11 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     if not mm_data:
         return
     strip_mm_data_for_generation(mm_data)
+
+
+def _diagnostic_disagg_double_admission_bypass_enabled() -> bool:
+    return (os.getenv(_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY_ENV) == "1"
+            and os.getenv(_DIAGNOSTIC_DISAGG_ADMISSION_BYPASS_ENV) == "1")
 
 
 @dataclasses.dataclass
@@ -774,6 +787,21 @@ class PyExecutor:
                                    None)
         self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer, tokens_per_block)
+        self._diagnostic_disagg_double_admission_bypass_enabled = (
+            _diagnostic_disagg_double_admission_bypass_enabled())
+        self._diagnostic_disagg_double_admission_evaluated = 0
+        self._diagnostic_disagg_double_admission_divergent = 0
+        self._diagnostic_disagg_double_admission_candidates = 0
+        self._diagnostic_disagg_double_admission_default_admitted = 0
+        self._diagnostic_disagg_double_admission_default_deferred = 0
+        self._diagnostic_disagg_double_admission_treatment_admitted = 0
+        self._diagnostic_disagg_double_admission_active_blocks_max = 0
+        self._diagnostic_disagg_double_admission_exercised_logged = False
+        self._diagnostic_disagg_double_admission_summary_logged = False
+        if self._diagnostic_disagg_double_admission_bypass_enabled:
+            logger.info(
+                "NVBUG6448152_DOUBLE_ADMISSION event=effective_config "
+                "exclude_native_transfer_slot=1 bypass_python_admission=1")
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
@@ -2020,6 +2048,7 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+        self._log_diagnostic_disagg_double_admission_summary()
 
         for i in range(self.num_micro_batches):
             try:
@@ -2741,6 +2770,47 @@ class PyExecutor:
 
         admission_result = controller.select(self.active_requests,
                                              fitting_disagg_gen_init_requests)
+        bypass_enabled = (getattr(
+            self,
+            "_diagnostic_disagg_double_admission_bypass_enabled",
+            False,
+        ) and not self.is_warmup)
+        if bypass_enabled:
+            self._diagnostic_disagg_double_admission_evaluated += 1
+            self._diagnostic_disagg_double_admission_candidates += len(
+                fitting_disagg_gen_init_requests)
+            self._diagnostic_disagg_double_admission_default_admitted += len(
+                admission_result.admitted_requests)
+            self._diagnostic_disagg_double_admission_default_deferred += (
+                admission_result.deferred_request_count)
+            self._diagnostic_disagg_double_admission_treatment_admitted += len(
+                fitting_disagg_gen_init_requests)
+            self._diagnostic_disagg_double_admission_active_blocks_max = max(
+                self._diagnostic_disagg_double_admission_active_blocks_max,
+                admission_result.active_transfer_blocks,
+            )
+            if admission_result.deferred_request_count > 0:
+                self._diagnostic_disagg_double_admission_divergent += 1
+                if not self._diagnostic_disagg_double_admission_exercised_logged:
+                    logger.info(
+                        "NVBUG6448152_DOUBLE_ADMISSION "
+                        "event=python_gate_exercised "
+                        f"candidates={len(fitting_disagg_gen_init_requests)} "
+                        "default_admitted="
+                        f"{len(admission_result.admitted_requests)} "
+                        "default_deferred="
+                        f"{admission_result.deferred_request_count} "
+                        "treatment_admitted="
+                        f"{len(fitting_disagg_gen_init_requests)} "
+                        "active_transfer_blocks="
+                        f"{admission_result.active_transfer_blocks} "
+                        "default_admitted_transfer_blocks="
+                        f"{admission_result.admitted_transfer_blocks} "
+                        f"budget={controller.max_transfer_blocks}")
+                    self._diagnostic_disagg_double_admission_exercised_logged = True
+
+            return fitting_disagg_gen_init_requests, False
+
         if admission_result.deferred_request_count > 0:
             logger.debug("Disagg transfer admission deferred "
                          f"{admission_result.deferred_request_count} requests; "
@@ -2756,6 +2826,35 @@ class PyExecutor:
 
         return (admission_result.admitted_requests,
                 admission_result.is_blocked_by_active_transfers())
+
+    def _log_diagnostic_disagg_double_admission_summary(self) -> None:
+        if (not getattr(
+                self,
+                "_diagnostic_disagg_double_admission_bypass_enabled",
+                False,
+        ) or getattr(
+                self,
+                "_diagnostic_disagg_double_admission_summary_logged",
+                False,
+        )):
+            return
+        self._diagnostic_disagg_double_admission_summary_logged = True
+        logger.info(
+            "NVBUG6448152_DOUBLE_ADMISSION event=python_summary "
+            "evaluated_iterations="
+            f"{self._diagnostic_disagg_double_admission_evaluated} "
+            "divergent_iterations="
+            f"{self._diagnostic_disagg_double_admission_divergent} "
+            "candidates_total="
+            f"{self._diagnostic_disagg_double_admission_candidates} "
+            "default_admitted_total="
+            f"{self._diagnostic_disagg_double_admission_default_admitted} "
+            "default_deferred_total="
+            f"{self._diagnostic_disagg_double_admission_default_deferred} "
+            "treatment_admitted_total="
+            f"{self._diagnostic_disagg_double_admission_treatment_admitted} "
+            "active_transfer_blocks_max="
+            f"{self._diagnostic_disagg_double_admission_active_blocks_max}")
 
     def _revert_deferred_disagg_gen_init_alloc(
             self, candidates: List[LlmRequest],
