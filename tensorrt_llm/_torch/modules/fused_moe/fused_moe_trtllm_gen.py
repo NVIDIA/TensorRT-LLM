@@ -594,10 +594,11 @@ class TRTLLMGenFusedMoE(MoE):
         K3 decode shape. Returning ``None`` keeps every other model, shape,
         architecture, and op backend on the existing unfused path.
         """
+        sm_version = get_sm_version()
         if (
             os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1"
             or isinstance(x, MxFp8QuantizedTensor)
-            or get_sm_version() != 100
+            or not 100 <= sm_version < 110
             or not self.has_w4a8_mxfp4_mxfp8
             or not isinstance(self.op_backend, TRTLLMOpBackend)
             or not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)

@@ -167,7 +167,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> kimi_k3_noaux_tc_mxfp
     constexpr int64_t maxNumTokens = 64;
     constexpr int64_t sfVecSize = 32;
 
-    TORCH_CHECK(tl::common::getSMVersion() == 100, "kimi_k3_noaux_tc_mxfp8_quant requires SM100");
+    int const smVersion = tl::common::getSMVersion();
+    TORCH_CHECK(smVersion >= 100 && smVersion < 110, "kimi_k3_noaux_tc_mxfp8_quant requires an SM10x architecture");
     TORCH_CHECK(scores.is_cuda() && bias.is_cuda() && hiddenStates.is_cuda(), "all inputs must be CUDA tensors");
     TORCH_CHECK(scores.get_device() == bias.get_device() && scores.get_device() == hiddenStates.get_device(),
         "all inputs must be on the same device");
