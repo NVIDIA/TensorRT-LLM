@@ -39,6 +39,7 @@ import re
 import sys
 
 import yaml
+from benchmark_utils import parse_positive_concurrency
 from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
 
 
@@ -310,25 +311,9 @@ def get_env_config(config, runtime_mode, benchmark_mode, server_name):
     }
 
 
-def _parse_positive_concurrency(value):
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ValueError(f"benchmark.concurrency_list must be a positive integer, got {value!r}")
-
-    try:
-        concurrency = int(value)
-    except ValueError as error:
-        raise ValueError(
-            f"benchmark.concurrency_list must be a positive integer, got {value!r}"
-        ) from error
-
-    if concurrency <= 0:
-        raise ValueError(f"benchmark.concurrency_list must be a positive integer, got {value!r}")
-    return concurrency
-
-
 def get_benchmark_config(config):
     benchmark = config.get("benchmark", {}) or {}
-    concurrency = _parse_positive_concurrency(benchmark.get("concurrency_list", "1"))
+    concurrency = parse_positive_concurrency(benchmark.get("concurrency_list", "1"))
     return {
         "mode": benchmark.get("mode", ""),
         "concurrency": concurrency,

@@ -27,6 +27,7 @@ from datetime import datetime
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from benchmark_utils import parse_positive_concurrency  # noqa: E402
 from cluster_env import get_ucx_tls_cmd, gpu_type_from_supported_gpus  # noqa: E402
 
 
@@ -343,28 +344,12 @@ def get_env_config(config, runtime_mode, benchmark_mode=None, server_name=None):
     }
 
 
-def _parse_positive_concurrency(value):
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ValueError(f"benchmark.concurrency_list must be a positive integer, got {value!r}")
-
-    try:
-        concurrency = int(value)
-    except ValueError as error:
-        raise ValueError(
-            f"benchmark.concurrency_list must be a positive integer, got {value!r}"
-        ) from error
-
-    if concurrency <= 0:
-        raise ValueError(f"benchmark.concurrency_list must be a positive integer, got {value!r}")
-    return concurrency
-
-
 def get_benchmark_config(config, benchmark_mode):
     """Get benchmark config based on mode."""
     if benchmark_mode is None:
         return {}
     benchmark = config.get("benchmark", {})
-    concurrency = _parse_positive_concurrency(benchmark.get("concurrency_list", "1"))
+    concurrency = parse_positive_concurrency(benchmark.get("concurrency_list", "1"))
 
     return {
         "mode": benchmark_mode,
