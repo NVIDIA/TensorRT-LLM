@@ -21,6 +21,8 @@
 
 #include <ATen/ATen.h>
 
+#include <type_traits>
+
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
@@ -37,7 +39,6 @@
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
-#include "tensorrt_llm/common/memoryUtils.h"
 #endif // ENABLE_FP8
 
 TRTLLM_NAMESPACE_BEGIN
@@ -196,37 +197,8 @@ void cudaGraphGroupedGemmType(cutlass::gemm::GemmCoord* problemSizesPtr, int pro
 // FP8 CUDA-graph-compatible grouped GEMM using CUTLASS 3.x.
 //
 // The CUDA graph variant receives live problem sizes, pointers, and leading
-// dimensions already on the GPU. The 3.x API needs cute stride arrays on
-// device, so a small setup kernel converts the existing graph parameters into
-// the CUTLASS 3.x argument layout on the same stream.
+// dimensions already on the GPU and reuses their compatible storage directly.
 // ====================================================================
-
-template <typename ProblemShape, typename StrideA, typename StrideB, typename StrideC, typename StrideD>
-__global__ void fillFp8CudaGraphGroupedGemmParams(cutlass::gemm::GemmCoord const* problemSizesPtr, int problemCount,
-    int64_t const* ldaGpu, int64_t const* ldbGpu, int64_t const* ldcGpu, int64_t const* lddGpu,
-    typename ProblemShape::UnderlyingProblemShape* problemShapes, StrideA* strideA, StrideB* strideB, StrideC* strideC,
-    StrideD* strideD)
-{
-    int const problemIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (problemIdx >= problemCount)
-    {
-        return;
-    }
-
-    int const m = problemSizesPtr[problemIdx].m();
-    int const n = problemSizesPtr[problemIdx].n();
-    int const k = problemSizesPtr[problemIdx].k();
-
-    problemShapes[problemIdx] = cute::make_shape(m, n, k);
-    strideA[problemIdx]
-        = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, static_cast<int>(ldaGpu[problemIdx]), 1));
-    strideB[problemIdx]
-        = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, static_cast<int>(ldbGpu[problemIdx]), 1));
-    strideC[problemIdx]
-        = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, static_cast<int>(ldcGpu[problemIdx]), 1));
-    strideD[problemIdx]
-        = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, static_cast<int>(lddGpu[problemIdx]), 1));
-}
 
 void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
@@ -282,55 +254,29 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     using StrideC = typename GemmKernel::InternalStrideC;
     using StrideD = typename GemmKernel::InternalStrideD;
 
-    // Allocate device memory for problem shapes, pointer arrays, and strides.
-    auto const tensorOpts = at::TensorOptions().dtype(at::kByte).device(at::kCUDA);
+    using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
+    using PackedStride = cute::Stride<int64_t, cute::_1, cute::_0>;
+    static_assert(std::is_same_v<UnderlyingProblemShape, cute::Shape<int, int, int>>);
+    static_assert(sizeof(UnderlyingProblemShape) == sizeof(cutlass::gemm::GemmCoord));
+    static_assert(alignof(UnderlyingProblemShape) == alignof(cutlass::gemm::GemmCoord));
+    static_assert(std::is_same_v<StrideA, PackedStride>);
+    static_assert(std::is_same_v<StrideB, PackedStride>);
+    static_assert(std::is_same_v<StrideC, PackedStride>);
+    static_assert(std::is_same_v<StrideD, PackedStride>);
+    static_assert(sizeof(PackedStride) == sizeof(int64_t));
+    static_assert(alignof(PackedStride) == alignof(int64_t));
 
-    auto const align16 = [](int64_t bytes) -> int64_t { return (bytes + 15) / 16 * 16; };
-
-    int64_t const szProblemShapes = align16(problemCount * sizeof(typename ProblemShape::UnderlyingProblemShape));
-    int64_t const szPtrA = align16(problemCount * sizeof(ElementA const*));
-    int64_t const szPtrB = align16(problemCount * sizeof(ElementB const*));
-    int64_t const szPtrC = align16(problemCount * sizeof(ElementC const*));
-    int64_t const szPtrD = align16(problemCount * sizeof(ElementD*));
-    int64_t const szStrideA = align16(problemCount * sizeof(StrideA));
-    int64_t const szStrideB = align16(problemCount * sizeof(StrideB));
-    int64_t const szStrideC = align16(problemCount * sizeof(StrideC));
-    int64_t const szStrideD = align16(problemCount * sizeof(StrideD));
-
-    int64_t const totalParamsBytes
-        = szProblemShapes + szPtrA + szPtrB + szPtrC + szPtrD + szStrideA + szStrideB + szStrideC + szStrideD;
-
-    at::Tensor paramsTensor = at::empty({totalParamsBytes}, tensorOpts);
-    char* devBase = static_cast<char*>(paramsTensor.data_ptr());
-
-    int64_t devOff = 0;
-    auto devPtr = [&devBase, &devOff](int64_t sz) -> void*
-    {
-        void* p = devBase + devOff;
-        devOff += (sz + 15) / 16 * 16;
-        return p;
-    };
-
-    auto* devProblemShapes = static_cast<typename ProblemShape::UnderlyingProblemShape*>(devPtr(szProblemShapes));
-    auto* devPtrA = static_cast<ElementA const**>(devPtr(szPtrA));
-    auto* devPtrB = static_cast<ElementB const**>(devPtr(szPtrB));
-    auto* devPtrC = static_cast<ElementC const**>(devPtr(szPtrC));
-    auto* devPtrD = static_cast<ElementD**>(devPtr(szPtrD));
-    auto* devStrideA = static_cast<StrideA*>(devPtr(szStrideA));
-    auto* devStrideB = static_cast<StrideB*>(devPtr(szStrideB));
-    auto* devStrideC = static_cast<StrideC*>(devPtr(szStrideC));
-    auto* devStrideD = static_cast<StrideD*>(devPtr(szStrideD));
-
-    cudaMemcpyAsync(devPtrA, ptrAGpu, problemCount * sizeof(void*), cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(devPtrB, ptrBGpu, problemCount * sizeof(void*), cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(devPtrC, ptrCGpu, problemCount * sizeof(void*), cudaMemcpyDeviceToDevice, stream);
-    cudaMemcpyAsync(devPtrD, ptrDGpu, problemCount * sizeof(void*), cudaMemcpyDeviceToDevice, stream);
-
-    int constexpr kThreads = 256;
-    int const blocks = (problemCount + kThreads - 1) / kThreads;
-    fillFp8CudaGraphGroupedGemmParams<ProblemShape, StrideA, StrideB, StrideC, StrideD>
-        <<<blocks, kThreads, 0, stream>>>(problemSizesPtr, problemCount, ldaGpu, ldbGpu, ldcGpu, lddGpu,
-            devProblemShapes, devStrideA, devStrideB, devStrideC, devStrideD);
+    // The fused LoRA parameter kernel already stores problem shapes as contiguous M/N/K int32 values and each
+    // packed stride's single dynamic component as an int64 leading dimension.
+    auto* problemShapes = reinterpret_cast<UnderlyingProblemShape*>(problemSizesPtr);
+    auto* ptrA = const_cast<ElementA const**>(reinterpret_cast<ElementA**>(ptrAGpu));
+    auto* ptrB = const_cast<ElementB const**>(reinterpret_cast<ElementB**>(ptrBGpu));
+    auto* ptrC = const_cast<ElementC const**>(reinterpret_cast<ElementC**>(ptrCGpu));
+    auto* ptrD = reinterpret_cast<ElementD**>(ptrDGpu);
+    auto* strideA = reinterpret_cast<StrideA*>(ldaGpu);
+    auto* strideB = reinterpret_cast<StrideB*>(ldbGpu);
+    auto* strideC = reinterpret_cast<StrideC*>(ldcGpu);
+    auto* strideD = reinterpret_cast<StrideD*>(lddGpu);
 
     cutlass::KernelHardwareInfo hwInfo;
     hwInfo.device_id = 0;
@@ -338,8 +284,8 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     hwInfo.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hwInfo.device_id);
 
     typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGrouped,
-        {problemCount, devProblemShapes, nullptr}, {devPtrA, devStrideA, devPtrB, devStrideB},
-        {{1.0f, 0.0f}, devPtrC, devStrideC, devPtrD, devStrideD}, hwInfo};
+        {problemCount, problemShapes, nullptr}, {ptrA, strideA, ptrB, strideB},
+        {{1.0f, 0.0f}, ptrC, strideC, ptrD, strideD}, hwInfo};
 
     Gemm gemm;
 
@@ -348,6 +294,7 @@ void fp8CudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int prob
     void* gemmWorkspace = nullptr;
     if (requiredWorkspace > 0)
     {
+        auto const tensorOpts = at::TensorOptions().dtype(at::kByte).device(at::kCUDA);
         workspace = at::empty({static_cast<int64_t>(requiredWorkspace)}, tensorOpts);
         gemmWorkspace = workspace.data_ptr();
     }

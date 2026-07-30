@@ -121,7 +121,7 @@ def test_fp8_cuda_graph_alignment_rejects_misaligned_hidden_dims(hidden_size, ou
         )
 
 
-def test_fp8_cuda_graph_grouped_gemm_uses_live_device_problem_metadata():
+def test_fp8_cuda_graph_grouped_gemm_reuses_live_device_metadata():
     source = _kernel_source("cuda_graph_grouped_gemm.cu")
     fp8_graph_body = _function_block(
         source, "void fp8CudaGraphGroupedGemm(", "\nvoid cudaGraphGroupedGemm("
@@ -129,8 +129,12 @@ def test_fp8_cuda_graph_grouped_gemm_uses_live_device_problem_metadata():
 
     assert "hostMaxProblemSizesPtr" not in fp8_graph_body
     assert "cudaMemcpyHostToDevice" not in fp8_graph_body
-    assert "fillFp8CudaGraphGroupedGemmParams" in fp8_graph_body
-    assert "problemSizesPtr, problemCount, ldaGpu, ldbGpu, ldcGpu, lddGpu" in fp8_graph_body
+    assert "fillFp8CudaGraphGroupedGemmParams" not in source
+    assert "cudaMemcpyDeviceToDevice" not in fp8_graph_body
+    assert "reinterpret_cast<UnderlyingProblemShape*>(problemSizesPtr)" in fp8_graph_body
+    assert "reinterpret_cast<ElementA**>(ptrAGpu)" in fp8_graph_body
+    assert "reinterpret_cast<StrideA*>(ldaGpu)" in fp8_graph_body
+    assert "std::is_same_v<StrideA, PackedStride>" in fp8_graph_body
 
 
 @pytest.mark.parametrize(
