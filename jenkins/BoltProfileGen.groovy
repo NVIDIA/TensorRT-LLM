@@ -52,7 +52,7 @@ BOLT_REF      = params.boltRef      ?: (env.artifactCommit ?: env.gitlabCommit ?
 BRANCH        = params.branch       ?: (env.gitlabTargetBranch ?: "main")
 // SBSA multi-node on oci-hsg: flexible node count (sbatch sets --nodes itself).
 // auto:gb200-flex -> gb200-flex-oci-hsg -> gb200-oci-trtllm (clusterName oci-hsg).
-SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "auto:gb200-flex" : "")
+SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "gb200-flex-aws-dfw" : "")
 BOLT_TARNAME  = params.boltTarName  ?: (TARGET_ARCH == AARCH64_TRIPLE ? "TensorRT-LLM-GH200.tar.gz" : "TensorRT-LLM.tar.gz")
 NUM_NODES     = params.numNodes     ?: "2"   // legacy single-workload wiring (unused by fan-out)
 // promote: publish the packaged bundle to the branch-keyed Artifactory path
@@ -272,8 +272,7 @@ def submitProfileGen(pipeline)
         //    the BOLT POST_INSTALL_HOOK swapping in instrumented libs so the run
         //    emits .fdata under $FDATA_ROOT/<workload>/<host>. submit.py sizes the
         //    SLURM allocation from the config, so we don't pass node counts.
-        def modelsRoot = env.boltModelsRoot ?: '/lustre/fs1/portfolios/coreai/projects/coreai_tensorrt_ci/llm-models'
-        def trtllmSrc = "${ws}/TensorRT-LLM/src"
+        def modelsRoot = env.boltModelsRoot ?: "${scratch}/llm-models"        def trtllmSrc = "${ws}/TensorRT-LLM/src"
         def imageEnroot = (LLM_DOCKER_IMAGE ?: "").replace("urm.nvidia.com/", "urm.nvidia.com#")
         // Cluster values for the harness .conf, AUTO-DERIVED from the same resolved
         // SLURM partition the merge job uses -- so a plain `/bot run` works with
