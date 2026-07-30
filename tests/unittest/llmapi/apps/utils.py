@@ -263,14 +263,26 @@ def expand_slurm_nodelist(nodelist_str):
 
 def wait_for_endpoint_ready(url: str, timeout: int = 300, interval: int = 3):
     start = time.monotonic()
+    last_status = "no response yet"
     while time.monotonic() - start < timeout:
         try:
             time.sleep(interval)
-            if requests.get(url).status_code == 200:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
                 print(f"endpoint {url} is ready")
                 return
-        except Exception as err:
+            # trtllm-serve answers 503 while its engine initializes; that is
+            # "not ready", not "ready", and must still hit the raise below.
+            last_status = f"HTTP {response.status_code}"
+            print(f"endpoint {url} is not ready: {last_status}")
+        except requests.RequestException as err:
+            last_status = f"{type(err).__name__}: {err}"
             print(f"endpoint {url} is not ready, with exception: {err}")
+    # Matches tests/test_common/http_utils.py: returning silently here would
+    # report a never-ready server as a success and defer the failure to a
+    # confusing error further downstream.
+    raise RuntimeError(f"Endpoint {url} did not become ready within {timeout} "
+                       f"seconds (last: {last_status})")
 
 
 def wait_for_endpoint_down(url: str, timeout: int = 300):
