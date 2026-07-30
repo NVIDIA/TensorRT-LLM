@@ -22,13 +22,23 @@ Consolidates the pure-Python tests that guard:
   ``parse_multi_choice_response`` reverse-scan and the
   ``MMMU_PRO_PROMPT_MODE`` env switch.
 * ``LmEvalWrapper._log_spec_stats`` — the ``TLLM_EVAL_SPEC_STATS``-gated
-  speculative-decoding acceptance-length (AL) corpus summary.
+  speculative-decoding acceptance-length (AL) corpus summary,
+  iteration-weighted to match ``bench/dataclasses/reporting.py``.
+* ``LmEvalWrapper._generate_until_windowed`` — the
+  ``TLLM_EVAL_MAX_IN_FLIGHT`` submission window: in-flight cap,
+  submission-order results under out-of-order completion, and fail-fast
+  propagation of request errors.
+* End-to-end: lm-eval's real ``evaluate()`` loop (real ``ConfigurableTask``,
+  filters, aggregation) driven through ``LmEvalWrapper`` over a mocked LLM,
+  for both the final score and the partial-score running estimates.
 """
 
 from __future__ import annotations
 
 import importlib
 import os
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,6 +46,7 @@ import pytest
 from tensorrt_llm.evaluate.covost2 import CoVoST2
 from tensorrt_llm.evaluate.lm_eval import (
     LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER,
+    MAX_IN_FLIGHT_ENV_VAR,
     LmEvalWrapper,
     MultimodalLmEvalWrapper,
 )
@@ -961,16 +972,25 @@ def test_generate_until_invokes_partial_scorer():
 # Only AL (acceptance length) is reported for now; AR needs the
 # request_perf_metrics.speculative_decoding counters, which the TorchSampler
 # used by one-engine spec-dec does not populate (see _log_spec_stats).
+# AL is iteration-weighted (total decoded tokens / total decode iterations)
+# to agree with the repo's canonical definition in
+# ``bench/dataclasses/reporting.py``.
 
 
-def _make_spec_output(tokens_per_iter: float | None = None) -> MagicMock:
+def _make_spec_output(
+    tokens_per_iter: float | None = None,
+    decoding_iter: int | None = 1,
+) -> MagicMock:
     """Fake RequestOutput with an optional per-request AL sample.
 
     ``tokens_per_iter`` as None models a request without speculative
     metrics (non-spec-dec run, or a response that never reported them).
+    ``decoding_iter`` is the AL aggregation weight (decode iterations the
+    request ran); None models a result that never populated it.
     """
     output = MagicMock()
     output.avg_decoded_tokens_per_iter = tokens_per_iter
+    output.decoding_iter = decoding_iter
     output.outputs = [MagicMock()]
     return output
 
@@ -1004,21 +1024,56 @@ def test_spec_stats_env_non_one_values_disable(monkeypatch, value):
 
 
 def test_log_spec_stats_reports_al_mean_min_max():
-    """AL is the mean of per-request avg_decoded_tokens_per_iter."""
+    """AL over equal-weight requests equals the plain mean; min/max/n present."""
     wrapper = _make_lm_eval_wrapper()
     outputs = [
-        _make_spec_output(tokens_per_iter=2.0),
-        _make_spec_output(tokens_per_iter=4.0),
+        _make_spec_output(tokens_per_iter=2.0, decoding_iter=5),
+        _make_spec_output(tokens_per_iter=4.0, decoding_iter=5),
     ]
     with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
         wrapper._log_spec_stats(outputs)
     assert mock_logger.info.call_count == 1
     al_message = mock_logger.info.call_args[0][0]
     assert "AL" in al_message
-    assert "3.000" in al_message  # mean of 2.0 and 4.0
+    assert "3.000" in al_message  # equal weights -> mean of 2.0 and 4.0
     assert "min 2.000" in al_message
     assert "max 4.000" in al_message
     assert "n=2" in al_message
+
+
+def test_log_spec_stats_weights_by_decode_iterations():
+    """AL matches reporting.py's token-level mean: weighted by decode iterations.
+
+    (2.0 tok/iter over 1 iter) + (4.0 tok/iter over 3 iters) = 14 decoded
+    tokens over 4 iterations = 3.5 — NOT the unweighted mean 3.0, which
+    would bias the result toward short requests (see the explicit rationale
+    in ``bench/dataclasses/reporting.py``).
+    """
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [
+        _make_spec_output(tokens_per_iter=2.0, decoding_iter=1),
+        _make_spec_output(tokens_per_iter=4.0, decoding_iter=3),
+    ]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    message = mock_logger.info.call_args[0][0]
+    assert "3.500" in message
+    # min/max stay per-request values, unweighted.
+    assert "min 2.000" in message
+    assert "max 4.000" in message
+
+
+def test_log_spec_stats_missing_decoding_iter_falls_back_to_weight_one():
+    """Requests without a usable decoding_iter contribute with weight 1."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [
+        _make_spec_output(tokens_per_iter=2.0, decoding_iter=None),
+        _make_spec_output(tokens_per_iter=4.0, decoding_iter=0),
+    ]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    message = mock_logger.info.call_args[0][0]
+    assert "3.000" in message  # both fall back to weight 1 -> plain mean
 
 
 def test_log_spec_stats_skips_requests_without_metrics():
@@ -1085,3 +1140,388 @@ def test_generate_until_skips_spec_stats_when_disabled(monkeypatch):
         wrapper.generate_until([fake_request], disable_tqdm=True)
 
     mock_stats.assert_not_called()
+
+
+# ===========================================================================
+# TLLM_EVAL_MAX_IN_FLIGHT — windowed generate_until
+# ===========================================================================
+#
+# The windowed path caps concurrently in-flight requests at W, tops the
+# window up as responses complete, and collects outputs into an
+# index-addressed list. The correctness property the whole design exists to
+# preserve is SUBMISSION-ORDER RESULTS under arbitrary completion order;
+# the liveness property is that a failed request propagates promptly
+# instead of deadlocking behind other in-flight waiters.
+
+
+class _FakeAsyncOutput:
+    """Async handle whose blocking .result() is supplied by the test."""
+
+    def __init__(self, result_fn):
+        self._result_fn = result_fn
+
+    def result(self):
+        return self._result_fn()
+
+
+def _text_result(text: str) -> MagicMock:
+    result = MagicMock()
+    result.outputs = [MagicMock(text=text)]
+    return result
+
+
+def _make_windowed_llm(events, error_idx=None):
+    """LLM whose request i blocks until events[i] is set, then yields resp-i.
+
+    Returns the fake llm and the (mutated) list of submitted request indices,
+    so tests can observe how far submission has progressed.
+    """
+    submitted = []
+    llm = MagicMock()
+    llm.tokenizer = MagicMock()
+
+    def generate_async(prompt, sampling_params=None, streaming=False):
+        idx = len(submitted)
+        submitted.append(idx)
+
+        def _result():
+            assert events[idx].wait(timeout=30), f"request {idx} never released"
+            if error_idx is not None and idx == error_idx:
+                raise RuntimeError(f"request {idx} failed")
+            return _text_result(f"resp-{idx}")
+
+        return _FakeAsyncOutput(_result)
+
+    llm.generate_async = generate_async
+    return llm, submitted
+
+
+def _make_requests(n: int) -> list:
+    requests = []
+    for i in range(n):
+        request = MagicMock()
+        request.args = (f"prompt-{i}", {})
+        requests.append(request)
+    return requests
+
+
+def _wait_until(predicate, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_windowed_caps_in_flight_and_preserves_order(monkeypatch):
+    """At most W requests in flight, and results follow submission order.
+
+    Request 1 is completed before request 0 (out-of-order completion); the
+    window tops up with request 2 only after that completion, and the
+    returned list is still resp-0..resp-4 in submission order.
+    """
+    monkeypatch.setenv(MAX_IN_FLIGHT_ENV_VAR, "2")
+    total = 5
+    events = [threading.Event() for _ in range(total)]
+    llm, submitted = _make_windowed_llm(events)
+    wrapper = LmEvalWrapper(llm=llm)
+    assert wrapper.max_in_flight == 2
+
+    returned = []
+    worker = threading.Thread(
+        target=lambda: returned.append(
+            wrapper.generate_until(_make_requests(total), disable_tqdm=True)
+        )
+    )
+    worker.start()
+    try:
+        # Only the first W requests are submitted while none have completed.
+        assert _wait_until(lambda: len(submitted) == 2)
+        time.sleep(0.05)
+        assert len(submitted) == 2, "window overshot max_in_flight"
+        # Completing request 1 (out of order) tops the window up by one.
+        events[1].set()
+        assert _wait_until(lambda: len(submitted) == 3)
+        time.sleep(0.05)
+        assert len(submitted) == 3
+    finally:
+        for event in events:
+            event.set()
+        worker.join(timeout=30)
+    assert not worker.is_alive()
+    assert returned and returned[0] == [f"resp-{i}" for i in range(total)]
+
+
+def test_windowed_failed_request_raises_without_waiting(monkeypatch):
+    """A failed request propagates while another request is still in flight.
+
+    Regression guard for the deadlock the review called out: a blocking
+    pool shutdown would join every other outstanding waiter with no
+    cancellation or timeout, so if any of them never resolved the exception
+    could not escape and the eval hung instead of failing.
+    """
+    monkeypatch.setenv(MAX_IN_FLIGHT_ENV_VAR, "2")
+    events = [threading.Event() for _ in range(2)]
+    llm, _ = _make_windowed_llm(events, error_idx=0)
+    wrapper = LmEvalWrapper(llm=llm)
+    events[0].set()  # request 0 fails immediately; request 1 stays blocked
+    try:
+        with pytest.raises(RuntimeError, match="request 0 failed"):
+            wrapper.generate_until(_make_requests(2), disable_tqdm=True)
+        # The exception escaped while request 1 had not resolved.
+        assert not events[1].is_set()
+    finally:
+        events[1].set()  # release the lingering waiter thread
+
+
+def test_windowed_window_larger_than_request_count(monkeypatch):
+    """W >= len(requests) submits each request exactly once and stays ordered."""
+    monkeypatch.setenv(MAX_IN_FLIGHT_ENV_VAR, "64")
+    total = 3
+    events = [threading.Event() for _ in range(total)]
+    for event in events:
+        event.set()
+    llm, submitted = _make_windowed_llm(events)
+    wrapper = LmEvalWrapper(llm=llm)
+    result = wrapper.generate_until(_make_requests(total), disable_tqdm=True)
+    assert result == [f"resp-{i}" for i in range(total)]
+    assert submitted == list(range(total))
+
+
+def test_windowed_empty_request_list(monkeypatch):
+    """Zero requests short-circuit without creating a thread pool."""
+    monkeypatch.setenv(MAX_IN_FLIGHT_ENV_VAR, "2")
+    llm, _ = _make_windowed_llm([])
+    wrapper = LmEvalWrapper(llm=llm)
+    assert wrapper.generate_until([], disable_tqdm=True) == []
+
+
+def test_windowed_invokes_partial_scorer(monkeypatch):
+    """The windowed path feeds every completion to the partial scorer."""
+    from tensorrt_llm.evaluate.lm_eval import _RunningScoreTracker
+
+    monkeypatch.setenv(MAX_IN_FLIGHT_ENV_VAR, "2")
+    total = 3
+    events = [threading.Event() for _ in range(total)]
+    for event in events:
+        event.set()
+    llm, _ = _make_windowed_llm(events)
+    wrapper = LmEvalWrapper(
+        llm=llm,
+        partial_scores_every=1,
+        partial_scoring_task_dict={"fake_task": _FakeTask()},
+    )
+    with (
+        patch.object(_RunningScoreTracker, "update") as mock_update,
+        patch.object(_RunningScoreTracker, "maybe_log") as mock_log,
+    ):
+        wrapper.generate_until(_make_requests(total), disable_tqdm=True)
+    assert mock_update.call_count == total
+    assert mock_log.call_count == total
+
+
+# ===========================================================================
+# MultimodalLmEvalWrapper.generate_until — partial scorer wiring
+# ===========================================================================
+
+
+def test_multimodal_generate_until_invokes_partial_scorer():
+    """The multimodal override scores the post-processed text lm-eval sees."""
+    from tensorrt_llm.evaluate.lm_eval import _RunningScoreTracker
+
+    fake_output = MagicMock()
+    fake_output.result.return_value.outputs = [MagicMock(text="<think>reasoning</think>42")]
+    fake_llm = MagicMock()
+    fake_llm.tokenizer = MagicMock()
+    fake_llm.input_processor = MagicMock()
+    fake_llm.generate_async.return_value = fake_output
+
+    with patch.object(MultimodalLmEvalWrapper, "_get_model_type", return_value="gemma3"):
+        wrapper = MultimodalLmEvalWrapper(
+            fake_llm,
+            sampling_params=None,
+            model_type="gemma3",
+            post_process_fn=lambda s: s.split("</think>")[-1],
+            partial_scores_every=1,
+            partial_scoring_task_dict={"fake_task": _FakeTask()},
+        )
+
+    fake_request = MagicMock()
+    fake_request.args = ("prompt", {}, {"visual": [MagicMock()]})
+
+    with (
+        patch(
+            "tensorrt_llm.evaluate.lm_eval.prompt_inputs",
+            side_effect=lambda p: {"prompt": p},
+        ),
+        patch(
+            "tensorrt_llm.evaluate.lm_eval.convert_image_mode",
+            side_effect=lambda img, mode: img,
+        ),
+        patch.object(_RunningScoreTracker, "update") as mock_update,
+        patch.object(_RunningScoreTracker, "maybe_log") as mock_log,
+    ):
+        results = wrapper.generate_until([fake_request], disable_tqdm=True)
+
+    assert results == ["42"]
+    # The scorer must see the post-processed text, not the raw output.
+    mock_update.assert_called_once_with(fake_request, "42")
+    mock_log.assert_called_once_with(1, 1)
+
+
+# ===========================================================================
+# End-to-end: real lm-eval evaluator over a mocked LLM
+# ===========================================================================
+#
+# Runs lm_eval.evaluator.evaluate() — real ConfigurableTask, real filter
+# pipeline, real metric aggregation — against LmEvalWrapper wrapping a
+# mocked LLM that returns canned responses. This exercises the exact
+# calling conventions between the harness and the wrapper (instance
+# shapes, filtered_resps, the process_results list convention) that pure
+# unit mocks can get subtly wrong; the GSM8K first-character bug above
+# survived precisely because nothing ran the real harness loop.
+
+
+_E2E_DOCS = [
+    {"question": "2+2?", "answer": "4"},
+    {"question": "3+4?", "answer": "7"},
+    {"question": "5+6?", "answer": "11"},
+    {"question": "10-3?", "answer": "7"},
+]
+# Model answers: 3 correct, 1 wrong ("12" != "11") -> exact_match 0.75.
+_E2E_RESPONSES = [
+    "The answer is 4.",
+    "The answer is 7.",
+    "The answer is 12.",
+    "The answer is 7.",
+]
+
+
+def _toy_task():
+    """A real generate_until ConfigurableTask over an in-memory dataset."""
+    import datasets
+    from lm_eval.api.task import ConfigurableTask
+
+    return ConfigurableTask(
+        config={
+            "task": "toy_arith",
+            "custom_dataset": lambda **kwargs: datasets.DatasetDict(
+                {"test": datasets.Dataset.from_list(_E2E_DOCS)}
+            ),
+            "test_split": "test",
+            "output_type": "generate_until",
+            "doc_to_text": "Q: {{question}}\nA:",
+            "doc_to_target": "{{answer}}",
+            "generation_kwargs": {"until": ["\n"], "do_sample": False},
+            "filter_list": [
+                {
+                    "name": "strict-match",
+                    "filter": [
+                        {"function": "regex", "regex_pattern": r"(-?[0-9]+)"},
+                        {"function": "take_first"},
+                    ],
+                }
+            ],
+            "metric_list": [
+                {
+                    "metric": "exact_match",
+                    "aggregation": "mean",
+                    "higher_is_better": True,
+                }
+            ],
+        }
+    )
+
+
+def _canned_llm(responses):
+    """LLM whose generate_async yields the canned texts in submission order."""
+    llm = MagicMock()
+    llm.tokenizer = MagicMock()
+    response_iter = iter(responses)
+
+    def generate_async(prompt, sampling_params=None, streaming=False):
+        text = next(response_iter)
+        output = MagicMock()
+        output.result.return_value = _text_result(text)
+        return output
+
+    llm.generate_async = generate_async
+    return llm
+
+
+def test_e2e_harness_final_score_over_mocked_llm():
+    """The real lm-eval evaluator scores canned responses correctly."""
+    from lm_eval.evaluator import evaluate
+
+    task = _toy_task()
+    wrapper = LmEvalWrapper(llm=_canned_llm(_E2E_RESPONSES))
+    results = evaluate(
+        lm=wrapper,
+        task_dict={"toy_arith": task},
+        bootstrap_iters=0,
+        log_samples=False,
+    )
+    score = results["results"]["toy_arith"]["exact_match,strict-match"]
+    assert score == pytest.approx(0.75)
+
+
+def test_e2e_partial_scores_match_final_score():
+    """Partial-score estimates over the full corpus agree with the harness.
+
+    Uses the REAL task's filters and process_results inside
+    _RunningScoreTracker (no fakes), so a calling-convention mismatch
+    between the tracker and lm-eval internals disables the tracker and
+    fails this test.
+    """
+    from lm_eval.evaluator import evaluate
+
+    task = _toy_task()
+    task_dict = {"toy_arith": task}
+    wrapper = LmEvalWrapper(
+        llm=_canned_llm(_E2E_RESPONSES),
+        partial_scores_every=2,
+        partial_scoring_task_dict=task_dict,
+    )
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        results = evaluate(
+            lm=wrapper,
+            task_dict=task_dict,
+            bootstrap_iters=0,
+            log_samples=False,
+        )
+    messages = [call.args[0] for call in mock_logger.info.call_args_list]
+    assert not any("Partial scoring disabled" in m for m in messages), (
+        "tracker was disabled by a scoring failure against the real task"
+    )
+    partial = [m for m in messages if "Partial scores" in m]
+    # interval=2 over 4 responses -> logs at 2/4 and 4/4.
+    assert len(partial) == 2
+    assert "2/4" in partial[0]
+    assert "4/4" in partial[1]
+    # The final running estimate agrees with the true score (0~100 scale).
+    assert "75.00" in partial[1]
+    score = results["results"]["toy_arith"]["exact_match,strict-match"]
+    assert score == pytest.approx(0.75)
+
+
+def test_e2e_windowed_matches_final_score(monkeypatch):
+    """The windowed path produces the same harness score as submit-all.
+
+    Windowing must be a pure scheduling change — outputs are collected in
+    submission order, so the score is identical to the default path.
+    """
+    from lm_eval.evaluator import evaluate
+
+    monkeypatch.setenv(MAX_IN_FLIGHT_ENV_VAR, "2")
+    task = _toy_task()
+    wrapper = LmEvalWrapper(llm=_canned_llm(_E2E_RESPONSES))
+    assert wrapper.max_in_flight == 2
+    results = evaluate(
+        lm=wrapper,
+        task_dict={"toy_arith": task},
+        bootstrap_iters=0,
+        log_samples=False,
+    )
+    score = results["results"]["toy_arith"]["exact_match,strict-match"]
+    assert score == pytest.approx(0.75)
