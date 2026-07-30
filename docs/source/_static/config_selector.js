@@ -1,14 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 (function () {
   "use strict";
 
   let dbPromise = null;
   let widgetId = 0;
-  const GROUP_ORDER = ["model", "topology", "islOsl", "concurrency"];
+  const GROUP_ORDER = ["model", "topology", "islOsl", "concurrency", "profile"];
   const GROUP_LABELS = {
     model: "Model",
     topology: "GPU(s)",
     islOsl: "ISL / OSL",
     concurrency: "Concurrency",
+    profile: "Profile",
   };
 
   function $(root, sel) {
@@ -58,6 +62,7 @@
         state.concurrency != null && state.concurrency !== ""
           ? String(state.concurrency)
           : "",
+      profile: state.profile || "",
     };
   }
 
@@ -138,7 +143,20 @@
 
   function profileLabel(profile) {
     const text = String(profile || "").trim();
+    const labels = {
+      latency: "Latency",
+      balanced: "Balanced",
+      throughput: "Throughput",
+    };
+    if (labels[text]) return labels[text];
     return text || "Unknown Profile";
+  }
+
+  function profileOption(profile) {
+    return {
+      value: profile,
+      label: profileLabel(profile),
+    };
   }
 
   function formatProfileSummary(profiles) {
@@ -194,7 +212,12 @@
       .map((group) => concurrencyOption(group))
       .sort((a, b) => sortNums(a.concurrency, b.concurrency));
 
-    return { model, topology, islOsl, concurrency };
+    const profile = uniqBy(
+      entries.filter((entry) => entry.profile).map((entry) => profileOption(entry.profile)),
+      (option) => option.value
+    );
+
+    return { model, topology, islOsl, concurrency, profile };
   }
 
   function filterEntriesByState(entries, state) {
@@ -213,6 +236,9 @@
       }
       if (normalizedState.concurrency) {
         if (String(entry.concurrency) !== normalizedState.concurrency) return false;
+      }
+      if (normalizedState.profile && entry.profile !== normalizedState.profile) {
+        return false;
       }
       return true;
     });
@@ -362,7 +388,8 @@
       normalizedState.model &&
       normalizedState.topology &&
       normalizedState.islOsl &&
-      normalizedState.concurrency
+      normalizedState.concurrency &&
+      (!groups.profile.options.length || normalizedState.profile)
     ) {
       return "Selection did not resolve to a single configuration.";
     }
@@ -387,6 +414,12 @@
       message: buildSelectorMessage(entries, groups, effectiveState, finalEntries),
       selectedConcurrencyBadge: "",
     };
+  }
+
+  function validatedCommitUrl(commit) {
+    const normalized = String(commit || "").trim().toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(normalized)) return "";
+    return `https://github.com/NVIDIA/TensorRT-LLM/commit/${normalized}`;
   }
 
   function isFileProtocol() {
@@ -608,14 +641,14 @@
       : allCurated
     ).map(normalizeEntry);
 
-    // curatedIndex lives outside normalizeState's scope — it is preserved
-    // across Object.assign(state, view.state) because normalizeState only
-    // touches the four filter keys.
+    // curatedIndex lives outside normalizeState's scope and is preserved
+    // across Object.assign(state, view.state).
     const state = {
       model: "",
       topology: "",
       islOsl: "",
       concurrency: "",
+      profile: "",
       curatedIndex: null,
     };
 
@@ -685,6 +718,7 @@
     const selTopo = mkOptionGroup("GPU(s)", 2);
     const selSeq = mkOptionGroup("ISL / OSL", 3);
     const selConc = mkSelectField("Concurrency", `trtllm-conc-${id}`, 4);
+    const selProfile = mkSelectField("Profile", `trtllm-profile-${id}`, 5);
 
     form.appendChild(selModel.wrap);
 
@@ -707,6 +741,7 @@
     form.appendChild(selTopo.wrap);
     form.appendChild(selSeq.wrap);
     form.appendChild(selConc.wrap);
+    form.appendChild(selProfile.wrap);
 
     const output = el("div", { class: "trtllm-config-selector__output" });
     const cmdPre = el("pre", { class: "trtllm-config-selector__cmd" }, [
@@ -835,7 +870,10 @@
         return { type: "model-select" };
       }
       if (activeEl === selConc.select) {
-        return { type: "select" };
+        return { type: "select", key: "concurrency" };
+      }
+      if (activeEl === selProfile.select) {
+        return { type: "select", key: "profile" };
       }
       if (
         activeEl.classList &&
@@ -857,7 +895,8 @@
         return;
       }
       if (descriptor.type === "select") {
-        selConc.select.focus();
+        if (descriptor.key === "profile") selProfile.select.focus();
+        else selConc.select.focus();
         return;
       }
       if (descriptor.type !== "button") return;
@@ -997,8 +1036,8 @@
       selectEl.dataset.status = (selectedOption && selectedOption.status) || "idle";
     }
 
-    function setSelectOptions(selectEl, group) {
-      const previousValue = state.concurrency || "";
+    function setSelectOptions(selectEl, group, stateKey, placeholder) {
+      const previousValue = state[stateKey] || "";
       const visibleOptions = group.options.filter(
         (option) => option.status !== "incompatible"
       );
@@ -1006,7 +1045,7 @@
       selectEl.appendChild(
         el("option", {
           value: "",
-          text: visibleOptions.length ? "Select concurrency" : "No concurrency available",
+          text: visibleOptions.length ? `Select ${placeholder}` : `No ${placeholder} available`,
         })
       );
       for (const option of visibleOptions) {
@@ -1077,7 +1116,12 @@
 
       setOptionButtons(selTopo.options, "topology", view.groups.topology);
       setOptionButtons(selSeq.options, "islOsl", view.groups.islOsl);
-      setSelectOptions(selConc.select, view.groups.concurrency);
+      setSelectOptions(selConc.select, view.groups.concurrency, "concurrency", "concurrency");
+      const hasProfileChoices =
+        Boolean(view.state.concurrency) &&
+        view.groups.profile.options.some((option) => option.status !== "incompatible");
+      selProfile.wrap.hidden = !hasProfileChoices;
+      setSelectOptions(selProfile.select, view.groups.profile, "profile", "profile");
 
       const code = cmdPre.querySelector("code");
       if (curatedSelected) {
@@ -1132,6 +1176,26 @@
         } else {
           meta.appendChild(el("span", { text: e.config_path || "" }));
         }
+        if (e.validated_trtllm_version) {
+          meta.appendChild(
+            el("span", {
+              text: ` \u00b7 Validated with TensorRT-LLM ${e.validated_trtllm_version}`,
+            })
+          );
+        }
+        const commitUrl = validatedCommitUrl(e.validated_trtllm_commit);
+        if (commitUrl) {
+          meta.appendChild(el("span", { text: " \u00b7 Commit: " }));
+          meta.appendChild(
+            el("a", {
+              class: "trtllm-config-selector__configLink",
+              href: commitUrl,
+              target: "_blank",
+              rel: "noopener",
+              text: e.validated_trtllm_commit.slice(0, 12),
+            })
+          );
+        }
 
         currentEntry = e;
         resetYamlPanel();
@@ -1161,6 +1225,12 @@
 
     selConc.select.addEventListener("change", () => {
       state.concurrency = selConc.select.value;
+      state.profile = "";
+      render();
+    });
+
+    selProfile.select.addEventListener("change", () => {
+      state.profile = selProfile.select.value;
       render();
     });
 
@@ -1218,6 +1288,7 @@
       formatCuratedCommand: formatCommand,
       nextStateAfterSelection,
       normalizeState,
+      validatedCommitUrl,
     };
   }
 

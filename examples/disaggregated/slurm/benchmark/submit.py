@@ -622,12 +622,22 @@ def submit_job(config, log_dir, dry_run):
                             hf.write(f"{host}\n")
                             gm.write(f"{rank} {host} {gpu}\n")
                             rank += 1
+                # Compact packing derives CUDA_VISIBLE_DEVICES from gpu_map.
+                cuda_devices = "none"
             else:
                 # Default packing: each node is dedicated to one worker, so
-                # SLURM_LOCALID directly maps to the physical GPU id in
-                # start_worker.sh (no hostfile/gpu_map needed).
+                # every rank on that node is given the node's full GPU list and
+                # binds to its own device via mapping.local_rank
+                # (= rank % gpus_per_node). Exposing the whole node is required
+                # for intra-node TP custom all-reduce (attention_dp=false /
+                # TEP), whose cudaDeviceCanAccessPeer() topology check must see
+                # the peer GPUs; pinning one GPU per rank only works for DEP.
                 node_list = list(allocation["nodes"].keys())
                 num_nodes = len(node_list)
+                # Whole-node ownership means every node carries the same GPU
+                # layout, so the first node's list applies to all ranks.
+                gpu_ids = sorted(list(allocation["nodes"].values())[0])
+                cuda_devices = ','.join(map(str, gpu_ids))
 
             worker_env = build_worker_environment(
                 worker_config=worker_config,
@@ -670,6 +680,7 @@ def submit_job(config, log_dir, dry_run):
                 log_dir,
                 str(profiling_config['nsys_on']).lower(),
                 server_cfg['config_path'],
+                cuda_devices,
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))

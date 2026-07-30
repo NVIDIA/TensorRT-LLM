@@ -26,7 +26,7 @@ LLM_REPO = "https://github.com/${TARGET_REPO}.git"
 def createKubernetesPodConfig(image, arch = "amd64")
 {
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     def podConfig = [
         cloud: "kubernetes-cpu",
@@ -147,6 +147,7 @@ pipeline {
                         echo "Generated file size: \$(wc -l < new_test_durations.json) lines"
                         echo "Sample output (first 5 lines):"
                         head -5 new_test_durations.json
+
                     """
 
                     // Always archive the freshly generated file so the user can download

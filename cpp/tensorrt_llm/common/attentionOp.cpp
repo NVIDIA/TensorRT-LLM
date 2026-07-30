@@ -217,6 +217,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
+    xqaParams.force_prepare_spec_dec_tree_mask = mForcePrepareSpecDecTreeMask;
     xqaParams.layer_idx = generationsParams.layer_idx;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
@@ -692,6 +693,14 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     }
 
     params.multi_block_mode = input_params.multi_block_mode;
+    // Cascade-attention partials must be wired regardless of multi_block_mode.
+    // Cascade decode runs with multi_block disabled (short-decode workloads have
+    // max_num_seq_len_tiles == 1, so enable_multi_block is structurally false).
+    // Gating these behind multi_block_mode leaves cascade_partial_* null and makes
+    // launch_cascade_attention fall back with "cascade workspace not provisioned".
+    params.cascade_partial_out = input_params.cascade_partial_out;
+    params.cascade_partial_max = input_params.cascade_partial_max;
+    params.cascade_partial_sum = input_params.cascade_partial_sum;
     if (input_params.multi_block_mode)
     {
         params.min_seq_len_tile = input_params.min_seq_len_tile;
@@ -700,10 +709,6 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
         params.partial_out = reinterpret_cast<DataType*>(input_params.partial_out);
         params.partial_sum = input_params.partial_sum;
         params.partial_max = input_params.partial_max;
-
-        params.cascade_partial_out = input_params.cascade_partial_out;
-        params.cascade_partial_max = input_params.cascade_partial_max;
-        params.cascade_partial_sum = input_params.cascade_partial_sum;
 
         params.block_counter = input_params.block_counter;
     }

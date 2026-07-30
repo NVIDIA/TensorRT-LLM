@@ -29,7 +29,9 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <torch/extension.h>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 
@@ -39,7 +41,7 @@ namespace torch_ext
 {
 using tensorrt_llm::common::op::AttentionOp;
 using tensorrt_llm::common::op::AttentionWorkspaceManager;
-using tensorrt_llm::common::op::hash;
+using tensorrt_llm::common::op::OpCustomHash;
 using tensorrt_llm::runtime::RequestType;
 
 namespace
@@ -1038,6 +1040,32 @@ using RunnerPtr = std::shared_ptr<torch_ext::trtllm::attention::RunnerBase>;
 using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
+static std::shared_ptr<AttentionOp> get_attention_op(
+    RunnerPtr const& runner, std::shared_ptr<AttentionOp>& op, int64_t local_layer_idx)
+{
+    auto cache_key = std::make_tuple(op->data(), runner->data());
+    using CacheKey = decltype(cache_key);
+    static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, OpCustomHash<CacheKey>> op_cache;
+    static std::shared_mutex op_cache_mutex;
+
+    std::shared_lock<std::shared_mutex> read_lock{op_cache_mutex};
+
+    if (auto iter = op_cache.find(cache_key); iter != op_cache.end())
+    {
+        TLLM_LOG_TRACE("Attention op for layer %lld is cached", local_layer_idx);
+        return iter->second;
+    }
+
+    read_lock.unlock();
+    TLLM_LOG_TRACE(
+        "Attention op for layer %lld is not cached, cache key: %s", local_layer_idx, to_string(cache_key).c_str());
+    std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
+    op->initialize();
+    runner->prepare(*op);
+    auto [iter, _] = op_cache.try_emplace(cache_key, op);
+    return iter->second;
+}
+
 void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<torch::Tensor> v, torch::Tensor& output,
     std::optional<torch::Tensor> output_sf, std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length,
     torch::Tensor host_past_key_value_lengths, torch::Tensor host_total_kv_lens, torch::Tensor context_lengths,
@@ -1085,7 +1113,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
-    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion)
+    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
+    bool const force_prepare_spec_dec_tree_mask)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1238,6 +1267,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;
     }
+    op->mForcePrepareSpecDecTreeMask = force_prepare_spec_dec_tree_mask;
 
     op->mUseSparseAttention = false;
     op->mUseTllmGenSparseAttentionPaged = false;
@@ -1303,22 +1333,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             = chunked_prefill_buffer_batch_size.has_value() ? chunked_prefill_buffer_batch_size.value() : 1;
     }
 
-    auto cache_key = std::make_tuple(op->data(), runner->data());
-    using CacheKey = decltype(cache_key);
-    static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, hash<CacheKey>> op_cache;
-    if (auto it = op_cache.find(cache_key); it != op_cache.end())
-    {
-        TLLM_LOG_TRACE("Attention op for layer %d is cached", local_layer_idx);
-        op = it->second;
-    }
-    else
-    {
-        TLLM_LOG_TRACE("Preparing new attention op for layer %d with cache key: %s", local_layer_idx,
-            to_string(cache_key).c_str());
-        op->initialize();
-        runner->prepare(*op);
-        op_cache[cache_key] = op;
-    }
+    op = get_attention_op(runner, op, local_layer_idx);
 
     int32_t const num_seqs = host_context_lengths.size(0);
     RequestType const* request_types = static_cast<RequestType const*>(host_request_types.data_ptr());
@@ -1447,7 +1462,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
 
     auto cache_key = op->data();
     using CacheKey = decltype(cache_key);
-    static std::unordered_map<CacheKey, bool, hash<CacheKey>> op_cache;
+    static std::unordered_map<CacheKey, bool, OpCustomHash<CacheKey>> op_cache;
     if (auto it = op_cache.find(cache_key); it != op_cache.end())
     {
         TLLM_LOG_TRACE("Attention op runtime check is cached");
