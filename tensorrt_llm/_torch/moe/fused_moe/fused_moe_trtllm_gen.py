@@ -640,7 +640,25 @@ class TRTLLMGenFusedMoE(MoEImplBase):
             self.act_alpha = nn.Parameter(self.act_alpha, requires_grad=False)
             self.act_beta = nn.Parameter(self.act_beta, requires_grad=False)
 
+        # Set before the SwiGLU work below: `has_deepseek_fp8_block_scales`
+        # asserts on this flag, so reading that property while it is still
+        # False aborts weight creation with a bare AssertionError.
         self._weights_created = True
+
+        # FP8 block-scale kernels consume the uniform scalar directly. The
+        # FP4 cubins consume one value per local expert instead.
+        if (self.swiglu_limit is None and self.swiglu_limit_scalar is not None
+                and not self.has_deepseek_fp8_block_scales):
+            # Current CUDA device, not `w3_w1_weight.device`: weights may still
+            # be on meta here, and this plain attribute would not follow a later
+            # `module.to(...)`.
+            self.swiglu_limit = torch.full(
+                (self.expert_size_per_partition, ),
+                self.swiglu_limit_scalar,
+                dtype=torch.float32,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+
         self._check_configs()
 
         if (self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8

@@ -5,6 +5,11 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 
 
+# K-EXAONE2 spells the architecture `ExaoneMoeForCausalLM`; earlier EXAONE-MoE
+# checkpoints use `ExaoneMoEForCausalLM`. Both share this weight layout, and
+# without both registrations the K-EXAONE2 lookup silently falls back to the
+# generic HfWeightMapper, which has no `params_map` and dies during loading.
+@register_mapper("HF", "ExaoneMoeForCausalLM")
 @register_mapper("HF", "ExaoneMoEForCausalLM")
 class ExaoneMoeWeightMapper(HfWeightMapper):
     def __init__(self):
@@ -42,8 +47,10 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
             if name.startswith("mtp.layers."):
                 # mtp.layers.{idx}.* -> model.layers.{offset + idx}.*
                 _, _, mtp_layer_idx, module_name = name.split(".", 3)
-                new_name = f"model.layers.{mtp_layer_offset + int(mtp_layer_idx)}.{module_name}"
-                rename(name, new_name)
+                rename(
+                    name,
+                    f"model.layers.{mtp_layer_offset + int(mtp_layer_idx)}.{module_name}",
+                )
             elif name.startswith("mtp."):
                 # mtp.fc.* -> model.layers.{offset}.eh_proj.*
                 # mtp.norm.* -> model.layers.{offset}.shared_head.norm.*
@@ -51,8 +58,10 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
                 for mtp_prefix, trtllm_name in self.mtp_mapping.items():
                     if name.startswith(mtp_prefix):
                         suffix = name[len(mtp_prefix) :]
-                        new_name = f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}"
-                        rename(name, new_name)
+                        rename(
+                            name,
+                            f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}",
+                        )
                         break
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
