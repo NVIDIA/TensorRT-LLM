@@ -86,7 +86,26 @@ def dup_up3d(
     factor_s: int,
     first_chunk: bool,
 ) -> torch.Tensor | None:
-    """Write the shuffled output, or return ``None`` when Triton cannot index it."""
+    """Write the shuffled output directly in channels-last-3d format.
+
+    Args:
+        x: Five-dimensional CUDA tensor with shape ``[N, C, T, H, W]``.
+            The output preserves its dtype.
+        output_channels: Number of channels in the shuffled output.
+        repeats: Number of copies of each input channel before shuffling.
+        factor_t: Temporal pixel-shuffle factor.
+        factor_s: Spatial pixel-shuffle factor applied to height and width.
+        first_chunk: Whether to crop the leading ``factor_t - 1`` frames
+            produced by the cache-initializing temporal chunk.
+
+    Returns:
+        The shuffled CUDA tensor, or ``None`` when its size exceeds Triton's
+        signed 32-bit indexing limit and the caller must use the eager path.
+
+    Raises:
+        ValueError: If ``x`` is not a five-dimensional CUDA tensor or the
+            channel and shuffle factors are invalid.
+    """
     if x.dim() != 5:
         raise ValueError(f"DupUp3D expects a five-dimensional tensor, got shape {x.shape}")
     if not x.is_cuda:
