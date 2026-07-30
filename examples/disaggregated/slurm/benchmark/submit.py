@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import argparse
 import glob
@@ -229,6 +243,26 @@ def replace_env_in_file(log_dir, file_path, env_var):
     return tmp_dir
 
 
+def _parse_positive_concurrency(value):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(
+            "benchmark.concurrency_list must be a positive integer, "
+            f"got {value!r}")
+
+    try:
+        concurrency = int(value)
+    except ValueError as error:
+        raise ValueError(
+            "benchmark.concurrency_list must be a positive integer, "
+            f"got {value!r}") from error
+
+    if concurrency <= 0:
+        raise ValueError(
+            "benchmark.concurrency_list must be a positive integer, "
+            f"got {value!r}")
+    return concurrency
+
+
 def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                              nsys_on, profile_range, concurrency):
     """Build complete environment dictionary for worker processes.
@@ -262,6 +296,7 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
         if role == "GEN":
+            concurrency = _parse_positive_concurrency(concurrency)
             upsert_env_config(env_config, 'gen_worker_env_var',
                               'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
                               f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
@@ -623,6 +658,9 @@ def submit_job(config, log_dir, dry_run):
                 gpu_ids = sorted(list(allocation["nodes"].values())[0])
                 cuda_devices = ','.join(map(str, gpu_ids))
 
+            concurrency_list = benchmark_config['concurrency_list']
+            concurrency = (concurrency_list.split(',')[0] if isinstance(
+                concurrency_list, str) else concurrency_list)
             worker_env = build_worker_environment(
                 worker_config=worker_config,
                 env_config=env_config,
@@ -630,7 +668,7 @@ def submit_job(config, log_dir, dry_run):
                 benchmark_mode=benchmark_config['mode'],
                 nsys_on=profiling_config['nsys_on'],
                 profile_range=server_cfg['profile_range'],
-                concurrency=benchmark_config['concurrency_list'].split(',')[0],
+                concurrency=concurrency,
             )
             export_str = format_export_string(worker_env)
 
