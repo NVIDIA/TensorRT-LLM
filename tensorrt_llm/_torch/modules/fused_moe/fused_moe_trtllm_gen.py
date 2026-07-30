@@ -583,6 +583,52 @@ class TRTLLMGenFusedMoE(MoE):
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
 
+    def try_fused_kimi_route_quant(
+        self,
+        x: Union[torch.Tensor, MxFp8QuantizedTensor],
+        router_logits: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
+
+        This launch-overhead optimization is deliberately specialized to the
+        K3 decode shape. Returning ``None`` keeps every other model, shape,
+        architecture, and op backend on the existing unfused path.
+        """
+        if (
+            os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1"
+            or isinstance(x, MxFp8QuantizedTensor)
+            or get_sm_version() != 100
+            or not self.has_w4a8_mxfp4_mxfp8
+            or not isinstance(self.op_backend, TRTLLMOpBackend)
+            or not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
+        ):
+            return None
+
+        routing = self.routing_method.routing_impl
+        bias = self.routing_method.e_score_correction_bias
+        if (
+            not routing.is_fused
+            or routing.n_group != 1
+            or routing.topk_group != 1
+            or routing.top_k != 16
+            or router_logits.ndim != 2
+            or router_logits.shape[1] != 896
+            or router_logits.dtype != torch.float32
+            or not router_logits.is_contiguous()
+            or bias.dtype != torch.float32
+            or not bias.is_contiguous()
+            or x.ndim != 2
+            or x.shape != (router_logits.shape[0], 3584)
+            or not 0 < x.shape[0] <= 64
+            or x.dtype != torch.bfloat16
+            or not x.is_contiguous()
+        ):
+            return None
+
+        return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+            router_logits, bias, x, routing.routed_scaling_factor
+        )
+
     def quantize_input(self, x, post_quant_comm: bool = True):
         """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.
 
