@@ -20,6 +20,19 @@ Syntax
 Dataset preparation
 -------------------
 
+**Dataset Types:**
+
+- Real datasets from various sources
+- Synthetic datasets with normal or uniform token distributions
+- LoRA task-specific datasets
+
+**Key Features:**
+
+- Tokenizer integration for proper text preprocessing
+- Configurable random seeds for reproducible results
+- Support for LoRA adapters and task IDs
+- Output in JSON format compatible with trtllm-bench
+
 prepare-dataset
 ^^^^^^^^^^^^^^^
 
