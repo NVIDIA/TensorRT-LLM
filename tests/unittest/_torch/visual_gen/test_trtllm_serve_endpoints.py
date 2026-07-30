@@ -743,8 +743,8 @@ class TestImageEdit:
         body = resp.json()
         assert body.get("type") == "NotImplementedError"
 
-    def test_qwen_layered_image_edit_forwards_save_layers_to_grid(self, tmp_path):
-        """Qwen-Image-Layered uses image-edit extra_params to request one layer grid."""
+    def test_qwen_layered_image_edit_returns_multiple_layers_by_default(self, tmp_path):
+        """Qwen-Image-Layered returns one response item per layer by default."""
         from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 
         gen = MockVisualGen(
@@ -752,8 +752,40 @@ class TestImageEdit:
                 [
                     _make_dummy_image_tensor(4, 4),
                     _make_dummy_image_tensor(4, 4),
+                    _make_dummy_image_tensor(4, 4),
+                    _make_dummy_image_tensor(4, 4),
                 ]
             ),
+            extra_param_specs={
+                "save_layers_to_grid": ExtraParamSchema(type="bool", default=False),
+            },
+            model="Qwen/Qwen-Image-Layered",
+        )
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+        try:
+            image_bytes = BytesIO(base64.b64decode(_b64_white_png_1x1()))
+            resp = client.post(
+                "/v1/images/edits",
+                data={
+                    "prompt": "split layers",
+                    "response_format": "b64_json",
+                },
+                files={"image": ("input.png", image_bytes, "image/png")},
+            )
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+        assert resp.status_code == 200
+        assert gen.last_params.extra_params is None
+        assert len(resp.json()["data"]) == 4
+
+    def test_qwen_layered_image_edit_save_layers_to_grid_returns_single_image(self, tmp_path):
+        """Qwen-Image-Layered packs layers when the request opts into grid output."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(8, 8),
             extra_param_specs={
                 "save_layers_to_grid": ExtraParamSchema(type="bool", default=False),
             },
@@ -777,7 +809,7 @@ class TestImageEdit:
 
         assert resp.status_code == 200
         assert gen.last_params.extra_params == {"save_layers_to_grid": True}
-        assert len(resp.json()["data"]) == 2
+        assert len(resp.json()["data"]) == 1
 
 
 # =========================================================================
