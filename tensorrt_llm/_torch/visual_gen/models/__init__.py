@@ -36,6 +36,7 @@ from ..pipeline_registry import AutoPipeline, register_pipeline
 from .cosmos3 import Cosmos3OmniMoTPipeline
 from .flux import Flux2Pipeline, FluxPipeline
 from .ltx2 import LTX2Pipeline  # noqa: F401
+from .ltx23 import LTX23Pipeline  # noqa: F401
 from .qwen_image import QwenImageEditPlusPipeline, QwenImagePipeline
 from .qwen_image_layered import QwenImageLayeredPipeline
 from .wan import WanImageToVideoPipeline, WanPipeline
