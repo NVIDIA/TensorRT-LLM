@@ -664,6 +664,7 @@ class MistralLarge3DraftModel(DecoderModel):
         inputs_embeds: torch.FloatTensor | None = None,
         spec_metadata: SpecMetadata | None = None,
         hidden_states: torch.Tensor | None = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -676,18 +677,27 @@ class MistralLarge3DraftModel(DecoderModel):
 
         assert hidden_states is not None
 
-        # NOTE: If hidden states from the target model have to be concatenated,
-        # we expect that to happen outside the model definition. This helps us
-        # avoid data-dependent control flow and gives us better CUDA graph
-        # coverage.
-        residual = None
-        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-        hidden_states = self.fc(hidden_states)
-        hidden_states, residual = self.layers[0](position_ids=position_ids,
-                                                 hidden_states=hidden_states,
-                                                 attn_metadata=attn_metadata,
-                                                 residual=None,
-                                                 spec_metadata=spec_metadata)
+        previous_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+
+        try:
+            # NOTE: If hidden states from the target model have to be concatenated,
+            # we expect that to happen outside the model definition. This helps us
+            # avoid data-dependent control flow and gives us better CUDA graph
+            # coverage.
+            residual = None
+            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+            hidden_states = self.fc(hidden_states)
+            hidden_states, residual = self.layers[0](
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=None,
+                spec_metadata=spec_metadata)
+        finally:
+            if all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 
         return hidden_states, hidden_states
 
@@ -1829,6 +1839,36 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
         )
 
 
+def external_drafter_config_kwargs(model_config, spec_config) -> dict:
+    """`ModelConfig.from_pretrained` kwargs for a one-model external drafter.
+
+    The drafter is a separate checkpoint, so it gets its own `ModelConfig`; the
+    kwargs below are the execution-layout properties it must inherit from the
+    target engine it runs inside.
+
+    `moe_load_balancer` is propagated for DSpark ONLY. DSpark's draft stages are
+    full DeepSeek-V4 blocks sharing the target's expert topology and layer-index
+    namespace (`layer_idx = num_hidden_layers + stage_id`), so they can register
+    into the target's EPLB manager. Other external drafters (PARD, DFlash,
+    draft-target) are independent checkpoints whose expert topology and layer
+    numbering need not match the target's, and whose EPLB configs would therefore
+    be keyed against a different namespace -- do not generalize this without
+    designing a per-drafter EPLB config domain and layer identity first.
+    """
+    kwargs = dict(
+        trust_remote_code=True,
+        attn_backend=model_config.attn_backend,
+        moe_backend=model_config.moe_backend,
+        mapping=model_config.mapping,
+        spec_config=None,  # Avoid recursive spec-dec
+        max_num_tokens=model_config.max_num_tokens,
+        moe_max_num_tokens=model_config.moe_max_num_tokens,
+    )
+    if spec_config.spec_dec_mode.is_dspark():
+        kwargs["moe_load_balancer"] = model_config.moe_load_balancer
+    return kwargs
+
+
 def get_draft_model(model_config, draft_config, lm_head, model):
     """Construct the draft model for the configured speculative-decoding mode
     (EAGLE3 / MTP / PARD / DFlash). The DFlash branch selects the Laguna drafter
@@ -1868,9 +1908,11 @@ def get_draft_model(model_config, draft_config, lm_head, model):
         # modeling_speculative). The DSpark draft reuses the target's aux streams.
         # The draft stage count (n_mtp_layers) is not in the HF config, so derive
         # it from the checkpoint's mtp.* namespace.
-        from .modeling_dspark import DSparkForCausalLM, count_dspark_stages
+        from .modeling_dspark import (DSparkForCausalLM, count_dspark_stages,
+                                      validate_dspark_eplb_layer_base)
         num_stages = count_dspark_stages(
             model_config.spec_config.speculative_model)
+        validate_dspark_eplb_layer_base(model_config, draft_config)
         return DSparkForCausalLM(
             draft_config,
             getattr(model, "aux_stream_dict", None),
@@ -1942,13 +1984,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(
                         model_config.spec_config.speculative_model,
-                        trust_remote_code=True,
-                        attn_backend=model_config.attn_backend,
-                        moe_backend=model_config.moe_backend,
-                        mapping=model_config.mapping,
-                        spec_config=None,  # Avoid recursive spec-dec
-                        max_num_tokens=model_config.max_num_tokens,
-                        moe_max_num_tokens=model_config.moe_max_num_tokens)
+                        **external_drafter_config_kwargs(
+                            model_config, spec_config))
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs

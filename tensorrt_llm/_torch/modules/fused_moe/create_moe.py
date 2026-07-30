@@ -64,10 +64,15 @@ def get_moe_cls(
         quant_config = override_quant_config
     layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
     if moe_backend.upper() == "MARLIN":
-        # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Require nvfp4
-        # quantization explicitly so a misconfigured model fails fast.
+        # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Layers without
+        # NVFP4 quantization (e.g. deliberately-unquantized MTP draft layers in
+        # MIXED_PRECISION checkpoints) fall back to CutlassFusedMoE, matching
+        # the CUTEDSL / DENSEGEMM / MEGAMOE_* fallback behavior below.
         if quant_config is None or not quant_config.quant_mode.has_nvfp4():
-            raise ValueError("MarlinFusedMoE only supports NVFP4 quantization.")
+            logger.warning(f"{layer_prefix}MarlinFusedMoE only supports NVFP4 "
+                           "quantization. Check out details in quant_config: "
+                           f"{quant_config}. Using CutlassFusedMoE instead.")
+            return CutlassFusedMoE
         return MarlinFusedMoE
     if moe_backend.upper() == "CUTLASS":
         return CutlassFusedMoE
@@ -338,9 +343,11 @@ def create_moe_backend(
         ], f"swiglu_limit is not supported in {moe_cls.__name__}."
 
     if swiglu_limit_scalar is not None:
+        # MegaMoECuteDsl uses the scalar only as a fallback when no per-expert
+        # tensor limit is given (see the MegaMoE branch below).
         assert moe_cls in [
             CutlassFusedMoE, TRTLLMGenFusedMoE, WideEPMoE, DeepGemmFusedMoE,
-            MegaMoEDeepGemm, CuteDslFusedMoE
+            MegaMoEDeepGemm, CuteDslFusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
@@ -519,7 +526,11 @@ def create_moe_backend(
             activation_type=activation_type,
         )
         if moe_cls is MegaMoECuteDsl:
-            megamoe_kwargs["swiglu_limit"] = swiglu_limit
+            # ``_resolve_gate_up_clamp`` accepts tensor or scalar; fall back
+            # to the scalar form when only that was wired.
+            megamoe_kwargs["swiglu_limit"] = (swiglu_limit
+                                              if swiglu_limit is not None else
+                                              swiglu_limit_scalar)
         else:
             megamoe_kwargs["swiglu_limit_scalar"] = swiglu_limit_scalar
         return moe_cls(**megamoe_kwargs)

@@ -303,6 +303,15 @@ commands:
         is_flag: false
         flags:
         - "--num_postprocess_workers"
+      num_serve_frontends:
+        type: int
+        default: 1
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--num_serve_frontends"
       num_input_processor_workers:
         type: int
         default: 8

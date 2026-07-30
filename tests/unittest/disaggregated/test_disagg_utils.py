@@ -195,6 +195,17 @@ def test_extract_router_config_propagates_tokens_per_block():
     }).args
 
 
+def test_extract_router_config_propagates_kv_model_path() -> None:
+    cfg = {
+        "model": "/models/gpt-oss-checkpoint",
+        "router": {
+            "type": "kv_cache_aware"
+        },
+    }
+    router_config = extract_router_config(cfg)
+    assert router_config.args["model_path"] == "/models/gpt-oss-checkpoint"
+
+
 def test_get_server_configs_dict():
     server_configs = [
         CtxGenServerConfig(type="ctx",

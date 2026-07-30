@@ -9,7 +9,7 @@ The breadth sweep is **model-derived**: it enumerates the distinct attention
 configurations actually used by the supported models (``model_attn_config.py``), so
 each case maps to a real workload. The orthogonal dimensions are bounded:
 
-* default cross on every cacheable config: phase {ctx, dec, mix} x
+* default cross on every cacheable config: phase {ctx, gen, mix} x
   precision {bf16, fp8-KV} x KV-manager {v1, v2}, at page_size=32, layout=HND.
 * the non-default dimension values (page_size=64, layout=NHD, dtype=fp16) are
   exercised on a small representative set (GQA / MHA / MQA) to avoid a full
@@ -83,6 +83,10 @@ def _phases_for(cfg: ModelAttnConfig) -> dict:
 
     assert cfg.sliding_window is not None
     return _phases_from_window(cfg.sliding_window)
+
+
+def _phases_to_run(cfg: ModelAttnConfig, available_phases: dict) -> tuple[str, ...]:
+    return tuple(available_phases) if cfg.phases is None else cfg.phases
 
 
 def _rope_dict(cfg: ModelAttnConfig):
@@ -193,13 +197,12 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
                                 **base,
                             ),
                         )
-                    elif cfg.is_mla and cfg.mla_context:
-                        yield f"{cfg.id}-ctx-{tag}", BackendCase(**phases["ctx"], **base)
-                    elif cfg.is_mla:
-                        yield f"{cfg.id}-gen-{tag}", BackendCase(**phases["gen"], **base)
                     else:
-                        for phase_name, phase in phases.items():
-                            yield f"{cfg.id}-{phase_name}-{tag}", BackendCase(**phase, **base)
+                        for phase_name in _phases_to_run(cfg, phases):
+                            yield (
+                                f"{cfg.id}-{phase_name}-{tag}",
+                                BackendCase(**phases[phase_name], **base),
+                            )
 
 
 def _model_cases():

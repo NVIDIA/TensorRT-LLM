@@ -88,6 +88,16 @@
       "path": "attention_dp_config.kv_cache_routing_max_sessions"
     },
     {
+      "allowed_values": [
+        "round_robin",
+        "least_queued"
+      ],
+      "annotation": "Literal['round_robin', 'least_queued']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "attention_dp_config.kv_cache_routing_new_conv_placement"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
@@ -710,7 +720,7 @@
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
-      "path": "kv_cache_config.mamba_state_cache_interval"
+      "path": "kv_cache_config.mamba_state_config.periodic_snapshot_interval"
     },
     {
       "allowed_values": [],
@@ -931,9 +941,10 @@
         "VANILLA",
         "TRITON",
         "MARLIN",
-        "MEGAMOE_DEEPGEMM"
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL"
       ],
-      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM']",
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
       "converter": "",
       "kind": "categorical",
       "path": "moe_config.backend"
@@ -1016,6 +1027,13 @@
       "converter": "",
       "kind": "value",
       "path": "num_postprocess_workers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "num_serve_frontends"
     },
     {
       "allowed_values": [
@@ -1391,6 +1409,16 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "allowed_values": [
+        "triton",
+        "msa"
+      ],
+      "annotation": "Literal['triton', 'msa']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.implementation"
+    },
+    {
       "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
@@ -1451,6 +1479,20 @@
       "converter": "allowlist",
       "kind": "categorical",
       "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.num_attention_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.num_key_value_heads"
     },
     {
       "allowed_values": [],

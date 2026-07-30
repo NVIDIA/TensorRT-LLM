@@ -42,14 +42,24 @@ from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import (
     _resolve_mx_model_name,
     _serialize_source_identity,
 )
-from tensorrt_llm._torch.weight_sharing import SourceIdentity
+from tensorrt_llm._torch.weight_sharing import (
+    ARTIFACT_IDENTITY_FORMAT_VERSION,
+    SOURCE_IDENTITY_FORMAT_VERSION,
+    ArtifactIdentity,
+    SourceIdentity,
+)
 
 _MISSING = object()
 
 
 def _identity(rank: int = 0, suffix: str = "same") -> SourceIdentity:
     return SourceIdentity(
-        format_version=1,
+        format_version=SOURCE_IDENTITY_FORMAT_VERSION,
+        artifact_identity=ArtifactIdentity(
+            format_version=ARTIFACT_IDENTITY_FORMAT_VERSION,
+            scheme="checkpoint_manifest_sha256",
+            digest="0" * 64,
+        ),
         model_fingerprint=f"model-{suffix}",
         quant_fingerprint=f"quant-{suffix}",
         backend_fingerprint=f"backend-{suffix}",
@@ -753,12 +763,9 @@ class TestPublishAsSource:
 
     def test_serialized_identity_ignores_local_checkpoint_path(self):
         donor_identity = _identity()
-        receiver_identity = SourceIdentity(
-            **{
-                **donor_identity.to_dict(),
-                "model_name": "/tmp/no-shards/TinyLlama",
-            }
-        )
+        receiver_payload = donor_identity.to_dict()
+        receiver_payload["model_name"] = "/tmp/no-shards/TinyLlama"
+        receiver_identity = SourceIdentity.from_dict(receiver_payload)
 
         assert donor_identity.model_name != receiver_identity.model_name
         assert _serialize_source_identity(donor_identity) == _serialize_source_identity(
