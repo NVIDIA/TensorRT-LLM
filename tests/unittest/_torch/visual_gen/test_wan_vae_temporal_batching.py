@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
-    TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV,
+    TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE,
     _native_decode_chunk_size,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import _decode_chunk_slices
@@ -55,12 +55,12 @@ def test_native_decode_chunk_size_uses_tuned_or_conservative_value(
     dtype: torch.dtype,
     expected: int,
 ) -> None:
-    monkeypatch.delenv(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV, raising=False)
+    monkeypatch.delenv(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE, raising=False)
     assert _native_decode_chunk_size(parallel_size, dtype) == expected
 
 
 def test_native_decode_chunk_size_honors_env_override(monkeypatch):
-    monkeypatch.setenv(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV, "5")
+    monkeypatch.setenv(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE, "5")
     assert _native_decode_chunk_size(1, torch.bfloat16) == 5
 
 
@@ -69,6 +69,6 @@ def test_native_decode_chunk_size_rejects_invalid_env_override(
     monkeypatch,
     override: str,
 ) -> None:
-    monkeypatch.setenv(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV, override)
+    monkeypatch.setenv(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE, override)
     with pytest.raises(ValueError, match="must be a positive integer"):
         _native_decode_chunk_size(4, torch.bfloat16)
