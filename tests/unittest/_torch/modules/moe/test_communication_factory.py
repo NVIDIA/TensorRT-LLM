@@ -167,6 +167,17 @@ def test_forced_nccl_ep_allows_missing_moe_max_num_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ):
     model_config = _make_model_config(torch.bfloat16, None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            multi_processor_count=72,
+            shared_memory_per_block_optin=232448,
+            shared_memory_per_block=102400,
+        ),
+    )
     monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
 
     strategy = communication_factory.CommunicationFactory._create_forced_method(
@@ -195,6 +206,17 @@ def test_auto_selection_uses_nccl_ep_with_missing_moe_max_num_tokens(
     monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
     monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
     monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            multi_processor_count=72,
+            shared_memory_per_block_optin=232448,
+            shared_memory_per_block=102400,
+        ),
+    )
     monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
 
     strategy = communication_factory.CommunicationFactory.create_strategy(
