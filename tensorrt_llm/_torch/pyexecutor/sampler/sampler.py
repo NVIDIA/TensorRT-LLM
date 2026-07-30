@@ -71,7 +71,7 @@ from tensorrt_llm.bindings.internal.runtime import (
     DecoderState,
     GptDecoderBatched,
 )
-from tensorrt_llm.executor.result import Logprob, SimpleTokenLogprobs, TokenLogprobs
+from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -89,7 +89,26 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .sampling_utils import (
+from .finish_reasons import FinishReasonsHandler
+from .logprobs import (
+    LogProbsState,
+    LogProbsStateList,
+    LogProbsStore,
+    convert_logprobs_tensor_to_list,
+    get_logprobs_from_request,
+    store_logprobs_list_to_request,
+)
+from .penalties import PenaltyHandler
+from .sampler_common import (
+    DEFAULT_BEAM_IDX,
+    DEFAULT_STEP_IDX,
+    FinishReasonsList,
+    _get_max_beam_width,
+    _request_get_sampling_params,
+    add_token,
+    int_tensor,
+)
+from .sampler_strategy import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
     BeamSearchMetadata,
@@ -99,14 +118,13 @@ from .sampling_utils import (
     Strategy,
     StrategyMetadata,
     TopPDecayMetadata,
-    UtilsSamplingParams,
+    _request_strategy,
     get_rejected_indices,
-    resolve_sampling_strategy,
     sample,
     sample_rejected,
-    top_p_decay_active,
 )
 from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
+from .top_p_decay import TopPDecayHandler
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -122,38 +140,6 @@ if TYPE_CHECKING:
     _ConfigType = TypeVar("_ConfigType", bound=PretrainedConfig)
 
 T = TypeVar("T")
-
-
-@dataclass(kw_only=True)
-class LogProbsState:
-    sampled_vals: torch.Tensor
-    sampled_indices: torch.Tensor
-    sampled_rank: torch.Tensor
-    topk_vals: torch.Tensor
-    topk_indices: torch.Tensor
-
-
-_LogProbsFloatState: TypeAlias = list[list[list[float]]]
-_LogProbsIntState: TypeAlias = list[list[list[int]]]
-
-
-@dataclass(kw_only=True)
-class LogProbsStateList:
-    sampled_vals: _LogProbsFloatState
-    sampled_indices: _LogProbsIntState
-    sampled_rank: _LogProbsIntState
-    topk_vals: _LogProbsFloatState
-    topk_indices: _LogProbsIntState
-
-    @staticmethod
-    def from_logprobs_state(logprobs_state: LogProbsState) -> "LogProbsStateList":
-        return LogProbsStateList(
-            sampled_vals=logprobs_state.sampled_vals.tolist(),
-            sampled_indices=logprobs_state.sampled_indices.tolist(),
-            topk_vals=logprobs_state.topk_vals.tolist(),
-            topk_indices=logprobs_state.topk_indices.tolist(),
-            sampled_rank=logprobs_state.sampled_rank.tolist(),
-        )
 
 
 @dataclass(kw_only=True)
@@ -442,89 +428,6 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         return False
 
 
-# Due to tensorrt_llm::runtime::SamplingConfig using vectors, params
-# in LlmRequest.sampling_params are either None or single-element lists.
-# This helper method simplifies code using such params.
-def _unwrap_singleton(p: Optional[List[T]]) -> Optional[T]:
-    if p is None:
-        return None
-    (t,) = p
-    return t
-
-
-def _get_beam_width_in(request: LlmRequest) -> int:
-    return (
-        1
-        if request.is_context_init_state
-        else request.get_beam_width_by_iter(for_next_iteration=False)
-    )
-
-
-def _get_beam_width_out(request: LlmRequest) -> int:
-    return request.get_beam_width_by_iter(for_next_iteration=True)
-
-
-def _get_max_beam_width(request: LlmRequest) -> int:
-    sampling_config = request.sampling_config
-    max_beam_width = cast(int, sampling_config.beam_width)
-    if sampling_config.beam_width_array is not None:
-        max_beam_width = max(
-            max_beam_width,
-            cast(
-                int, torch.tensor(sampling_config.beam_width_array, dtype=torch.int32).max().item()
-            ),
-        )
-    return max_beam_width
-
-
-def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
-    sampling_config = request.sampling_config
-    # These sampling fields live on the C++ SamplingConfig as optional<vector<T>>
-    # (a shape designed for the batched TRT-LLM sampler); the torch sampler consumes
-    # them per request, so we unwrap the singleton lists into scalars here. When the
-    # TRT-LLM sampler is removed, this SamplingConfig-based plumbing should be removed
-    # too in favor of reading the values directly from the per-request params.
-    temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
-    top_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p))
-    top_k = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_k))
-    top_p_decay = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_decay))
-    top_p_min = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_min))
-    top_p_reset_ids = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_p_reset_ids))
-    beam_width_out = _get_beam_width_out(request)
-    beam_width_in = _get_beam_width_in(request)
-    use_beam_search = _get_max_beam_width(request) > 1
-
-    return UtilsSamplingParams(
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        beam_width_in=beam_width_in,
-        beam_width_out=beam_width_out,
-        use_beam_search=use_beam_search,
-        top_p_decay=top_p_decay,
-        top_p_min=top_p_min,
-        top_p_reset_ids=top_p_reset_ids,
-    )
-
-
-def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
-    return not params.use_beam_search
-
-
-def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
-    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
-    # resolve it on every iteration.
-    cached_sampling_strategy = request.py_sampling_strategy
-    if cached_sampling_strategy is not None:
-        return cached_sampling_strategy
-
-    params = _request_get_sampling_params(request)
-    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
-    if _request_sampling_params_cachable(params):
-        request.py_sampling_strategy = sampling_strategy
-    return sampling_strategy
-
-
 class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
     """Efficiently groups requests for batched sampling."""
 
@@ -788,21 +691,6 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
         return result
 
 
-def add_token(
-    request: LlmRequest, new_tokens: list[list[list[int]]], *, beam_idx: int, step: int = 0
-) -> int:
-    # NB: Accessing nested lists faster than torch.Tensor or numpy.ndarray
-    seq_slot = request.py_seq_slot
-    assert seq_slot is not None
-    new_token = new_tokens[step][seq_slot][beam_idx]
-    request.add_new_token(new_token, beam_idx)
-    return new_token
-
-
-def int_tensor(shape: tuple[int, ...], device: str = "cuda") -> torch.Tensor:
-    return torch.empty(shape, dtype=torch.int, device=device)
-
-
 @dataclass(kw_only=True, frozen=True)
 class _BatchedSamplingResult:
     # Original request indices for all requests (permuted due to batching by strategy):
@@ -1061,14 +949,6 @@ class _UnpackedStepIndexer(_StridedStepIndexTranslator):
             )
         else:
             raise ValueError(f"Invalid dim_order: {dim_order}")
-
-
-# Beam index to use when no beam search is used but a beam index is required
-DEFAULT_BEAM_IDX = 0
-# Step index to use when no speculative decoding is used but a step index is required
-DEFAULT_STEP_IDX = 0
-
-FinishReasonsList: TypeAlias = list[list[list[int]]]
 
 
 @dataclass(kw_only=True)
@@ -1363,853 +1243,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def is_generation_model(self) -> bool:
         return True
 
-    class FinishReasonsHandler:
-        _EMPTY_STOP_WORD_TOKEN_ID: int = -2
-        _PAD_STOP_WORD_TOKEN_ID: int = -1
-
-        @dataclass(kw_only=True)
-        class _FinishReasonsStore:
-            """Auxiliary data structures used for finish reasons handling."""
-
-            # Per-request dynamic data
-            finish_reasons_cuda: torch.Tensor
-            """Shape: [max_tokens, batch_size, beam_width]
-            Usage: Stores the determined finish reasons for all sampled tokens
-            for each request. Some (draft) tokens and corresponding
-            finish reasons might still be discarded."""
-
-            # Per-request static data
-            max_lengths_cuda: torch.Tensor
-            """Shape: [batch_size]
-            Usage: Stores the maximum sequence lengths for each request"""
-            end_ids_cuda: torch.Tensor
-            """Shape: batch_size
-            Usage: Stores the end ids for each request"""
-            stop_words_cuda: torch.Tensor
-            """Shape: [max_num_stop_words, max_stop_word_length, batch_size]
-            Usage: Stores the stop words for each request as a padded tensor."""
-            past_tokens_cuda: torch.Tensor
-            """Shape: [max_stop_word_length,batch_size, beam_width]
-            Usage: Stores the last max_stop_word_length tokens for each beam."""
-            max_stop_word_lengths_host: torch.Tensor
-            """Shape: [batch_size]
-            Usage: Stores the size of the longest stop word for each request."""
-            num_accepted_draft_tokens_host: torch.Tensor
-            """Shape: [batch_size]
-            Usage: Stores the number of accepted tokens for each request."""
-
-        def __init__(
-            self,
-            *,
-            max_stop_word_length: int,
-            max_num_stop_words: int,
-            max_num_sequences: int,
-            max_beam_width: int,
-            max_tokens: int,
-            max_seq_len: int,
-        ):
-            self._update_sizes(
-                max_stop_word_length=max_stop_word_length,
-                max_num_stop_words=max_num_stop_words,
-                max_num_sequences=max_num_sequences,
-                max_beam_width=max_beam_width,
-                max_tokens=max_tokens,
-                max_seq_len=max_seq_len,
-            )
-            self._setup_store()
-            self._setup_helper_tensors()
-            self._temp_data: TorchSampler.FinishReasonsHandler._TemporaryData = (
-                self._TemporaryData()
-            )
-
-        @property
-        def _use_speculative_decoding(self) -> bool:
-            return self._max_tokens > 1
-
-        @property
-        def new_max_lens(self) -> list[int]:
-            return self._temp_data.max_lens
-
-        @property
-        def new_end_ids(self) -> list[int]:
-            return self._temp_data.end_ids
-
-        def _update_sizes(
-            self,
-            *,
-            max_stop_word_length: int,
-            max_num_stop_words: int,
-            max_num_sequences: int,
-            max_beam_width: int,
-            max_tokens: int,
-            max_seq_len: int,
-        ) -> None:
-            """Updates the sizes of the finish reasons handler
-
-            Sets member variables to store the current sizes.
-            These sizes are used to initialize the buffer tensors.
-            """
-            self._max_stop_word_length: int = max_stop_word_length
-            self._max_num_stop_words: int = max_num_stop_words
-            self._max_num_sequences: int = max_num_sequences
-            self._max_beam_width: int = max_beam_width
-            self._max_tokens: int = max_tokens
-            self._max_seq_len: int = max_seq_len
-            self._stop_words_shape: tuple[int, int, int] = (
-                self._max_num_stop_words,
-                self._max_stop_word_length,
-                self._max_num_sequences,
-            )
-            self._past_tokens_shape: tuple[int, int, int] = (
-                self._max_stop_word_length - 1 + self._max_tokens,
-                self._max_num_sequences,
-                self._max_beam_width,
-            )
-
-        def _setup_store(self) -> None:
-            """Sets up the store for the finish reasons handler by initializing all buffer tensors."""
-            finish_reasons_cuda = int_tensor(
-                (self._max_tokens, self._max_num_sequences, self._max_beam_width)
-            )
-            max_lengths_cuda = int_tensor((self._max_num_sequences,))
-            end_ids_cuda = int_tensor((self._max_num_sequences,))
-            stop_words_cuda = int_tensor(self._stop_words_shape)
-            past_tokens_cuda = int_tensor(self._past_tokens_shape)
-            max_stop_word_lengths_host = torch.empty(
-                self._max_num_sequences, device="cpu", dtype=torch.int32
-            )
-            num_accepted_draft_tokens_host = torch.empty(
-                self._max_num_sequences, device="cpu", dtype=torch.int32
-            )
-            self.store: TorchSampler.FinishReasonsHandler._FinishReasonsStore = (
-                self._FinishReasonsStore(
-                    finish_reasons_cuda=finish_reasons_cuda,
-                    max_lengths_cuda=max_lengths_cuda,
-                    end_ids_cuda=end_ids_cuda,
-                    stop_words_cuda=stop_words_cuda,
-                    past_tokens_cuda=past_tokens_cuda,
-                    max_stop_word_lengths_host=max_stop_word_lengths_host,
-                    num_accepted_draft_tokens_host=num_accepted_draft_tokens_host,
-                )
-            )
-
-        def _setup_helper_tensors(self) -> None:
-            # Helper tensors for finish_reasons:
-            """Preallocate buffer needed for torch.nonzero_static(..., out=finish_reasons_nonzero_static_buffer).
-            See `def _write_reason`."""
-            # setup local buffer for max tokens checking
-            self._max_tokens_offset_cuda: torch.Tensor = torch.arange(
-                1, self._max_tokens + 1, device="cuda", dtype=torch.int32
-            ).view(-1, 1, 1)
-
-            self._stop_words_index_offset_cuda: torch.Tensor = torch.arange(
-                max(0, self._max_stop_word_length - 1), device="cuda"
-            ).unsqueeze(1)
-
-            self._past_token_buffer_cuda: torch.Tensor = torch.empty(
-                self._past_tokens_shape, device="cuda", dtype=torch.int32
-            )
-            starts = torch.arange(self._max_tokens, device="cuda")
-            ends = starts + self._max_stop_word_length
-            self._multi_arange_indexing: torch.Tensor = torch_multi_arange(
-                ends=ends,
-                starts=starts,
-                output_length=self._max_tokens * self._max_stop_word_length,
-            )
-
-        def _resize_stop_word_buffers(self) -> None:
-            self._stop_words_index_offset_cuda = torch.arange(
-                max(0, self._max_stop_word_length - 1), device="cuda"
-            ).unsqueeze(1)
-
-            self._past_tokens_shape = (
-                self._max_stop_word_length - 1 + self._max_tokens,
-                self._max_num_sequences,
-                self._max_beam_width,
-            )
-            self._stop_words_shape = (
-                self._max_num_stop_words,
-                self._max_stop_word_length,
-                self._max_num_sequences,
-            )
-            self._past_token_buffer_cuda = torch.empty(
-                self._past_tokens_shape, device="cuda", dtype=torch.int32
-            )
-            starts = torch.arange(self._max_tokens, device="cuda")
-            ends = starts + self._max_stop_word_length
-            self._multi_arange_indexing = torch_multi_arange(
-                ends=ends,
-                starts=starts,
-                output_length=self._max_tokens * self._max_stop_word_length,
-            )
-            # resize the stop words buffer if necessary
-            # if the sizes are constant, this does nothing
-            store = self.store
-            _ = store.stop_words_cuda.resize_(self._stop_words_shape)
-            _ = store.past_tokens_cuda.resize_(self._past_tokens_shape)
-
-        @dataclass(kw_only=True)
-        class _TemporaryData:
-            """Data structure to store the temporary data during setup_sampler_step for new requests"""
-
-            def __init__(self) -> None:
-                # list of device tensors
-                self.stop_words_cuda_list: list[torch.Tensor] = []
-                self.past_tokens_cuda_list: list[torch.Tensor] = []
-                # list of integers
-                self.stop_word_seq_slots: list[int] = []
-                self.max_lens: list[int] = []
-                self.end_ids: list[int] = []
-                self.max_stop_word_lengths: list[int] = []
-                # integers
-                self.total_max_length: int = 0
-                self.total_max_num_stop_words: int = 0
-
-            def clear(self) -> None:
-                self.stop_words_cuda_list = []
-                self.past_tokens_cuda_list = []
-                self.stop_word_seq_slots = []
-                self.max_lens = []
-                self.end_ids = []
-                self.max_stop_word_lengths = []
-                self.total_max_length = 0
-                self.total_max_num_stop_words = 0
-
-        def setup_new_request_handling(self) -> None:
-            """Setup the new request handling for the finish reasons handler
-
-            Clears the temporary data for the new request handling.
-            This should be called before processing new requests, to avoid
-            stale data from previous requests.
-            """
-            self._temp_data.clear()
-
-        def prepare_for_new_request(self, request: LlmRequest) -> None:
-            """Fill _temp_data with the corresponding data from new requests to be used during setup_sampler_step
-
-            Args:
-                request: The request to prepare for.
-            """
-
-            self._temp_data.max_lens.append(
-                min(self._max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
-            )
-            self._temp_data.end_ids.append(
-                end_id if (end_id := request.py_end_id) is not None else -1
-            )
-
-            if (stop_words_list := request.py_stop_words_list) is not None:
-                assert (seq_slot := request.py_seq_slot) is not None
-                self._temp_data.stop_word_seq_slots.append(seq_slot)
-                extracted_stop_words_cuda, max_length, num_stop_words = self._extract_stop_words(
-                    stop_words_list
-                )
-                self._temp_data.stop_words_cuda_list.append(extracted_stop_words_cuda)
-                self._temp_data.past_tokens_cuda_list.append(self._get_past_tokens(request))
-                self._temp_data.total_max_length = max(self._temp_data.total_max_length, max_length)
-                self._temp_data.total_max_num_stop_words = max(
-                    self._temp_data.total_max_num_stop_words, num_stop_words
-                )
-                self._temp_data.max_stop_word_lengths.append(max_length)
-            else:
-                # max stop word length is used to determine if a request has stop words
-                # explicitly set it to 0 here to avoid stale data from previous requests
-                self._temp_data.max_stop_word_lengths.append(0)
-
-        def update_for_new_request(
-            self,
-            *,
-            seq_slots_cuda_long: torch.Tensor,
-            max_lengths_cuda: torch.Tensor,
-            end_ids_cuda: torch.Tensor,
-            seq_slots_host: torch.Tensor,
-            all_sampling_requests: list[LlmRequest],
-        ) -> None:
-            """Update tensors of this store with the new request data.
-
-            If stop words are present, also update the stop words buffers.
-            If the new stop words exceed either the current max_num_stop_words or max_stop_word_length values,
-            a resize of the stop words buffers is triggered. If a resize is necessary, all requests in the batch
-            need to be re-processed.
-
-            Args:
-                seq_slots_cuda_long: The sequence slots of the processed requests, as int64
-                  CUDA indices (required by ``index_copy_``). Shape: [len(requests)]
-                max_lengths_cuda: The maximum lengths for each request.
-                  Shape: [len(requests)]
-                end_ids_cuda: The end ids for each request.
-                  Shape: [len(requests)]
-                seq_slots_host: The sequence slots of the processed requests. Used for accessing host buffers.
-                  Shape: [len(requests)]
-                all_sampling_requests: If a resize of the stop words related buffers is necessary, all sampling requests
-                    need to be re-processed.
-            """
-
-            temp_data = self._temp_data
-            store = self.store
-            store.max_lengths_cuda.index_copy_(0, seq_slots_cuda_long, max_lengths_cuda)
-            store.end_ids_cuda.index_copy_(0, seq_slots_cuda_long, end_ids_cuda)
-            store.max_stop_word_lengths_host[seq_slots_host] = torch.tensor(
-                temp_data.max_stop_word_lengths, device="cpu", dtype=torch.int32
-            )
-
-            # Handle stop words only if any new ones are added
-            if temp_data.stop_word_seq_slots:
-                self._update_stop_words_buffer(
-                    all_sampling_requests,
-                    temp_data.total_max_length,
-                    temp_data.total_max_num_stop_words,
-                    temp_data.stop_words_cuda_list,
-                    temp_data.past_tokens_cuda_list,
-                    temp_data.stop_word_seq_slots,
-                )
-
-        def _maybe_resize_stop_words_buffer(
-            self, total_max_length: int, total_max_num_stop_words: int
-        ) -> bool:
-            """Checks if the stop words buffer needs to be resized and resizes it if necessary
-
-            If the total maximum length or number of stop words exceeds the current maximum values,
-            the stop words buffer is resized to the new maximum values.
-
-            Args:
-                total_max_length: The maximum length of the stop words in this batch.
-                total_max_num_stop_words: The maximum number of stop words of a request in this batch.
-            Returns:
-                True if the stop words buffer needs to be resized, False otherwise.
-            """
-            if (
-                total_max_length > self._max_stop_word_length
-                or total_max_num_stop_words > self._max_num_stop_words
-            ):
-                self._max_stop_word_length = max(total_max_length, self._max_stop_word_length)
-                self._max_num_stop_words = max(total_max_num_stop_words, self._max_num_stop_words)
-                self._resize_stop_word_buffers()
-                return True
-            return False
-
-        def _reprocess_stop_words_buffer(
-            self, requests: list[LlmRequest]
-        ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[int]]:
-            """Reprocesses the stop words buffer with the new maximum values
-
-            If a resize of the stop words buffer is necessary, all requests in the batch need to be re-processed.
-
-            Args:
-                requests: The requests to reprocess the stop words buffer for.
-            Returns:
-                stop_words_cuda_list: A list of device tensors containing the stop words per request with stop words.
-                past_tokens_cuda_list: A list of device tensors containing the past tokens per request with stop words.
-                stop_word_seq_slots: A list of sequence slot indices (int) per request with stop words.
-            """
-            stop_words_cuda_list: list[torch.Tensor] = []
-            past_tokens_cuda_list: list[torch.Tensor] = []
-            stop_word_seq_slots: list[int] = []
-            # Rerun with the new size. Set the stop words and past tokens for all the requests.
-            for request in requests:
-                if (stop_words_list := request.py_stop_words_list) is not None:
-                    extracted_stop_words_cuda, _, _ = self._extract_stop_words(stop_words_list)
-                    assert (seq_slot := request.py_seq_slot) is not None
-                    stop_word_seq_slots.append(seq_slot)
-                    stop_words_cuda_list.append(extracted_stop_words_cuda)
-                    past_tokens_cuda_list.append(self._get_past_tokens(request))
-            return stop_words_cuda_list, past_tokens_cuda_list, stop_word_seq_slots
-
-        def _update_stop_words_buffer(
-            self,
-            all_sampling_requests: list[LlmRequest],
-            total_max_length: int,
-            total_max_num_stop_words: int,
-            stop_words_cuda_list: list[torch.Tensor],
-            past_tokens_cuda_list: list[torch.Tensor],
-            stop_word_seq_slots: list[int],
-        ) -> None:
-            """Updates the stop words buffer with the new maximum values
-
-            Args:
-                all_sampling_requests: If a resize of the stop words related buffers is necessary, all sampling requests
-                    need to be re-processed.
-                total_max_length: The maximum length of the stop words in this batch.
-                total_max_num_stop_words: The maximum number of stop words of a request in this batch.
-                stop_words_cuda_list: A list of device tensors containing the stop words per request with stop words.
-                past_tokens_cuda_list: A list of device tensors containing the past tokens per request with stop words.
-                stop_word_seq_slots: Sequence slot index (int) per request with stop words;
-                  same order as the lists above.
-            """
-            # Potentially resize the buffers and update
-            # stop_words, past_tokens and stop_word_seq_slots
-            # In case of a resize all requests in the batch need to be re-processed
-            if self._maybe_resize_stop_words_buffer(total_max_length, total_max_num_stop_words):
-                stop_words_cuda_list, past_tokens_cuda_list, stop_word_seq_slots = (
-                    self._reprocess_stop_words_buffer(all_sampling_requests)
-                )
-
-            # Host Tensor for host access of self.store.num_accepted_draft_tokens
-            stop_word_seq_slots_tensor_host = torch.tensor(
-                stop_word_seq_slots, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
-            )
-            # Device Tensor for device access of self.store.stop_words and self.store.past_tokens
-            stop_word_seq_slots_tensor_cuda = stop_word_seq_slots_tensor_host.to(
-                device="cuda", non_blocking=True
-            )
-            # stop_word_seq_slots x max_num_stop_words x max_stop_word_length
-            stop_words_cuda_tensor = torch.stack(stop_words_cuda_list)
-            # stop_word_seq_slots x max_stop_word_length x beam_width
-            past_tokens_cuda_tensor = torch.stack(past_tokens_cuda_list)
-
-            store = self.store
-            # Reset the accepted tokens buffer for the stop word sequence slots
-            store.num_accepted_draft_tokens_host[stop_word_seq_slots_tensor_host] = 0
-
-            store.stop_words_cuda[..., stop_word_seq_slots_tensor_cuda] = (
-                stop_words_cuda_tensor.permute(1, 2, 0)
-            )
-            # Past tokens will be shifted by 1 to the left on their first sampling iteration
-            # We need to consider this here.
-            store.past_tokens_cuda[
-                1 : self._max_stop_word_length, stop_word_seq_slots_tensor_cuda
-            ] = past_tokens_cuda_tensor.permute(1, 0, 2)
-
-        def _extract_stop_words(
-            self, stop_words_list: list[list[int]]
-        ) -> tuple[torch.Tensor, int, int]:
-            """Extract the stop words and size information from the stop words list
-
-            Processes the stop words list and stores the stop words in a padded device tensor.
-            Stop words shorter than FinishReasonsHandler.max_stop_word_length
-            are padded with _PAD_STOP_WORD_TOKEN_ID to max_stop_word_length.
-            Unused stop word slots are padded with _EMPTY_STOP_WORD_TOKEN_ID.
-            This function additionally returns the maximum stop word length and the number of stop words
-            in the processed stop words list.
-
-
-            Args:
-                stop_words_list: A list of two lists: the first contains the token ids of all stop sequences
-                  (concatenated); the second contains the cumulative lengths (prefix sum) of the stop word lengths.
-
-            Returns:
-                stop_words: A padded device tensor containing the stop words
-                  Shape: [max_num_stop_words, max_stop_word_length]
-                max_stop_word_length: The maximum stop word length in the stop words list
-                num_stop_words: The number of stop words in the stop words list
-            """
-            stop_words_host = torch.empty(
-                self._max_num_stop_words,
-                self._max_stop_word_length,
-                device="cpu",
-                dtype=torch.int32,
-            )
-            _ = stop_words_host.fill_(self._EMPTY_STOP_WORD_TOKEN_ID)
-            words, cumulative_stop_word_lengths = stop_words_list
-            words_host = torch.tensor(
-                words, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
-            )
-            begin = 0
-            max_stop_word_length = 0
-            num_stop_words = 0
-            for idx, end in enumerate(cumulative_stop_word_lengths):
-                if end == -1:
-                    break
-                length = end - begin
-                max_stop_word_length = max(max_stop_word_length, length)
-                num_stop_words += 1
-                # skip processing if either the length or the index is greater than the current max values.
-                # These will be updated outside this function.
-                if length > self._max_stop_word_length or idx >= self._max_num_stop_words:
-                    begin = end
-                    continue
-                stop_words_host[idx, -length:] = words_host[begin:end]
-                stop_words_host[idx, :-length] = self._PAD_STOP_WORD_TOKEN_ID
-                begin = end
-            return (
-                stop_words_host.to("cuda", non_blocking=True),
-                max_stop_word_length,
-                num_stop_words,
-            )
-
-        def _get_past_tokens(self, request: LlmRequest) -> torch.Tensor:
-            """Get the past tokens from the request and return the past tokens device tensor
-
-            Args:
-                request: The request to get the past tokens for
-
-            Returns:
-                past_tokens: The past tokens device tensor
-                  Shape: [max_stop_word_length - 1, max_beam_width]
-            """
-            past_tokens_host = torch.zeros(
-                max(0, self._max_stop_word_length - 1),
-                self._max_beam_width,
-                device="cpu",
-                dtype=torch.int32,
-                pin_memory=prefer_pinned(),
-            )
-            tokens = request.get_tokens()
-            for beam_idx in range(self._max_beam_width):
-                max_len = min(past_tokens_host.shape[0], len(tokens[beam_idx]))
-                past_tokens_host[past_tokens_host.shape[0] - max_len :, beam_idx] = torch.tensor(
-                    tokens[beam_idx][len(tokens[beam_idx]) - max_len :],
-                    device="cpu",
-                    dtype=torch.int32,
-                )
-            return past_tokens_host.to("cuda", non_blocking=True)
-
-        def write_finish_reasons(
-            self,
-            seq_slots_host: torch.Tensor,
-            is_draft_batch: bool,
-            seq_slots_cuda: torch.Tensor,
-            seq_lens_cuda: torch.Tensor,
-            new_tokens_cuda: torch.Tensor,
-            first_finish_reasons_cuda: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            """Calculates the finish reasons for each request and returns the finish reasons tensor.
-
-            Prepares stop word handling for each requests and processes all newly generated tokens
-            per request to determine if any finish reason is met. Returns the device finish reasons
-            tensor from the store, which is updated with the calculated finish reason for each newly
-            generated token.
-
-            Args:
-                seq_slots_host: The sequence slots of the processed requests. Used to determine which
-                requests need stop word processing on the host.
-                  Shape: [len(requests)]
-                is_draft_batch: Whether the batch consists of draft requests.
-                seq_slots_cuda: The sequence slots of the processed requests. Used for accessing device buffers.
-                  Shape: [len(requests)]
-                seq_lens_cuda: The sequence lengths of the processed requests.
-                  Shape: [len(requests)]
-                new_tokens_cuda: A buffer containing the newly generated tokens.
-                  Shape: [max_tokens, max_batch_size, max_beam_width]
-                first_finish_reasons_cuda: The first finish reason of each beam. Used only for beam search.
-                  Shape: [max_batch_size, max_beam_width]
-            Returns:
-                finish_reasons_cuda: The finish reasons tensor.
-                  Shape: [max_tokens, max_batch_size, max_beam_width]
-            """
-            num_accepted_tokens_cuda, stop_word_indices_cuda, single_token_stop_words_only = (
-                self._prepare_stop_word_handling_for_finish_reasons(
-                    seq_slots_host,
-                    is_draft_batch,
-                )
-            )
-            self._write_finish_reasons(
-                seq_slots=seq_slots_cuda,
-                seq_lens=seq_lens_cuda,
-                new_tokens=new_tokens_cuda,
-                num_accepted_tokens=num_accepted_tokens_cuda,
-                stop_word_indices=stop_word_indices_cuda,
-                single_token_stop_words_only=single_token_stop_words_only,
-                first_finish_reasons=first_finish_reasons_cuda,
-            )
-            return self.store.finish_reasons_cuda
-
-        def _prepare_stop_word_handling_for_finish_reasons(
-            self,
-            seq_slots_host: torch.Tensor,
-            is_draft_batch: bool,
-        ) -> tuple[torch.Tensor | int | None, torch.Tensor | None, bool]:
-            """Prepare stop word handling for finish reasons.
-
-            Args:
-                seq_slots_host: The sequence slots of the processed requests. Used for accessing host buffers.
-                  Shape: [len(requests)]
-                is_draft_batch: Whether the batch consists of draft requests.
-            Returns:
-                num_accepted_tokens_cuda: The number of accepted draft tokens +1 for each request.
-                  Shape: [len(requests)] if torch.Tensor
-                stop_word_indices_cuda: The indices of the requests that have stop words in the current batch.
-                  Shape: [len(requests_with_stop_words)]
-                single_token_stop_words_only: Whether all stop words in this batch are of length 1.
-            """
-            # Filter all requests, that have stop words
-            store = self.store
-            num_accepted_tokens_cuda: torch.Tensor | int | None = None
-            stop_word_indices_cuda: torch.Tensor | None = None
-            single_token_stop_words_only: bool = False
-
-            # NB: is_draft_batch is a workaround
-            # as draft requests can be in the sampler
-            # without having setup a slot in the FinishReasonsHandler.
-            # These can be removed once this can be avoided.
-            if is_draft_batch:
-                # Do not process stop words for draft requests
-                return (
-                    num_accepted_tokens_cuda,
-                    stop_word_indices_cuda,
-                    single_token_stop_words_only,
-                )
-
-            stop_word_mask = store.max_stop_word_lengths_host[seq_slots_host] > 0
-            batch_has_stop_words = stop_word_mask.any()
-
-            if batch_has_stop_words:
-                num_accepted_tokens_cuda = 1
-                # Only calculate num_accepted_tokens from the accepted draft tokens if speculative decoding is enabled
-                if self._use_speculative_decoding:
-                    num_accepted_tokens_cuda = (
-                        store.num_accepted_draft_tokens_host[seq_slots_host].to(
-                            device="cuda", non_blocking=True
-                        )
-                        + 1
-                    )
-                stop_word_indices_cuda = torch.nonzero(stop_word_mask)[:, 0].to(
-                    device="cuda", non_blocking=True
-                )
-                single_token_stop_words_only = (
-                    store.max_stop_word_lengths_host[seq_slots_host].max().item() == 1
-                )
-            return num_accepted_tokens_cuda, stop_word_indices_cuda, single_token_stop_words_only
-
-        @nvtx_range("_write_finish_reasons")
-        def _write_finish_reasons(
-            self,
-            *,
-            seq_slots: torch.Tensor,
-            seq_lens: torch.Tensor,
-            new_tokens: torch.Tensor,
-            num_accepted_tokens: torch.Tensor | int | None = None,
-            stop_word_indices: torch.Tensor | None = None,
-            single_token_stop_words_only: bool = False,
-            first_finish_reasons: torch.Tensor | None = None,
-        ) -> None:
-            """Writes the finish reasons to the finish_reasons tensor.
-
-            The finish reasons are written to the finish_reasons tensor in the following order:
-            - Stop words
-            - Max length
-            - End ID
-            Later finish reasons overwrite earlier ones, in reverse precedence order.
-
-            Args:
-                seq_slots: The sequence slots of the processed requests. Used for accessing device buffers.
-                  Shape: [len(requests)]
-                seq_lens: The sequence lengths of the processed requests.
-                  Shape: [len(requests)]
-                new_tokens: A buffer containing the newly generated tokens.
-                  Shape: [max_tokens, max_batch_size, max_beam_width]
-                num_accepted_tokens: A buffer containing the number of accepted draft tokens +1 for each request.
-                  Shape: [max_batch_size] if torch.Tensor
-                stop_word_indices: The indices of the requests that have stop words in the current batch.
-                  Shape: [len(requests_with_stop_words)]
-                single_token_stop_words_only: Whether all stop words in this batch are of length 1
-                first_finish_reasons: The first finish reason of each beam.
-                  Shape: [max_batch_size, max_beam_width]
-            """
-
-            # Seq Slots should be on the same device as new_tokens
-            assert seq_slots.device == new_tokens.device
-            assert seq_lens.device == new_tokens.device
-            tokens = new_tokens[:, seq_slots]
-
-            store = self.store
-            finish_reasons = store.finish_reasons_cuda
-
-            # we need to fill with NOT_FINISHED so we can differentiate between
-            # previous requests that had the same seq slot
-            _ = finish_reasons.index_fill_(1, seq_slots, FinishReason.NOT_FINISHED.value)
-            batched_finish_reasons = finish_reasons[:, seq_slots]
-
-            if stop_word_indices is not None:
-                assert num_accepted_tokens is not None, "draft_lengths is required for stop words"
-                stop_seq_slots = seq_slots[stop_word_indices]
-                stop_tokens = new_tokens[:, stop_seq_slots]
-                stop_words_func = (
-                    self._are_stop_words
-                    if not single_token_stop_words_only
-                    else self._are_stop_words_single_token
-                )
-                batched_finish_reasons_stop_words = batched_finish_reasons[:, stop_word_indices]
-                _ = batched_finish_reasons_stop_words.masked_fill_(
-                    stop_words_func(
-                        stop_seq_slots,
-                        stop_tokens,
-                        num_accepted_tokens[stop_word_indices]
-                        if isinstance(num_accepted_tokens, torch.Tensor)
-                        else num_accepted_tokens,
-                    ),
-                    FinishReason.STOP_WORDS.value,
-                )
-                batched_finish_reasons[:, stop_word_indices] = batched_finish_reasons_stop_words
-
-            _ = batched_finish_reasons.masked_fill_(
-                self._are_max_length(seq_lens, store.max_lengths_cuda[seq_slots]),
-                FinishReason.LENGTH.value,
-            )
-
-            _ = batched_finish_reasons.masked_fill_(
-                self._are_end_id(store.end_ids_cuda[seq_slots], tokens),
-                FinishReason.END_ID.value,
-            )
-
-            finish_reasons[:, seq_slots] = batched_finish_reasons
-            if first_finish_reasons is not None:
-                # store the first stop reason for each beam of a seq_slot.
-                batched_first_finish_reasons = first_finish_reasons[seq_slots]
-                first_finish_reasons[seq_slots, ...] = torch.where(
-                    batched_first_finish_reasons == FinishReason.NOT_FINISHED.value,
-                    batched_finish_reasons,
-                    batched_first_finish_reasons,
-                )
-
-        def _are_end_id(
-            self, end_ids_cuda: torch.Tensor, tokens_cuda: torch.Tensor
-        ) -> torch.Tensor:
-            """Checks if the tokens are the end id
-
-            Args:
-                end_ids_cuda: The end ids of the requests to check the end id of.
-                  Shape: [len(requests)]
-                tokens_cuda: A buffer containing the newly generated tokens.
-                  Shape: [max_tokens, len(requests), max_beam_width]
-            Returns:
-                A tensor where each element is True if the corresponding token is the end id, False otherwise
-                Shape: [max_tokens, len(requests), max_beam_width]
-            """
-            return tokens_cuda == end_ids_cuda.view(1, -1, 1).expand(
-                self._max_tokens, -1, self._max_beam_width
-            )
-
-        def _are_max_length(
-            self, seq_lens_cuda: torch.Tensor, max_seq_lens_cuda: torch.Tensor
-        ) -> torch.Tensor:
-            """Checks which sequences are at or beyond the max length
-
-            Args:
-                seq_lens_cuda: The sequence lengths of the requests to check the max length of.
-                  Shape: [len(requests)]
-                max_seq_lens_cuda: The maximum sequence lengths of the requests to check the max length of.
-                  Shape: [len(requests)]
-            Returns:
-                A tensor where each element is True if the sequence at the corresponding token
-                is at or beyond the max length, False otherwise
-                Shape: [max_tokens, len(requests), max_beam_width]
-            """
-            lengths_tensor_cuda = (
-                seq_lens_cuda.view(1, -1, 1) + self._max_tokens_offset_cuda
-            ).expand(self._max_tokens, -1, self._max_beam_width)
-            max_lengths_tensor_cuda = max_seq_lens_cuda.view(1, -1, 1).expand(
-                self._max_tokens, -1, self._max_beam_width
-            )
-            return lengths_tensor_cuda >= max_lengths_tensor_cuda
-
-        @nvtx_range("_are_stop_words")
-        def _are_stop_words(
-            self,
-            seq_slots: torch.Tensor,
-            tokens: torch.Tensor,
-            num_accepted_tokens: torch.Tensor | int,
-        ) -> torch.Tensor:
-            """Checks if the tokens are stop words
-
-            Args:
-                seq_slots: The sequence slots of the processed requests. Used for accessing device buffers.
-                  Shape: [len(requests)]
-                tokens: A buffer containing the newly generated tokens.
-                  Shape: [max_tokens, len(requests), max_beam_width]
-                num_accepted_tokens: The number of accepted draft tokens +1 for each request.
-                  Shape: [len(requests)] if torch.Tensor
-            Returns:
-                A tensor where each element is True if the sequence at the corresponding token
-                ends with a stop word, False otherwise
-                Shape: [max_tokens, len(requests), max_beam_width]
-            """
-            store = self.store
-            # num_words, len_words, batch_size
-            # unsqueeze the beam_width dimension to match the past tokens tensor
-            stop_words = (
-                store.stop_words_cuda[..., seq_slots]
-                .unsqueeze(3)
-                .expand(-1, -1, -1, self._max_beam_width)
-            )
-            # Get the past tokens
-            # num_steps, batch_size, beam_width
-            past_tokens_batch = store.past_tokens_cuda[:, seq_slots]
-            # Shift the past tokens to the left by the number of accepted draft tokens
-
-            full_tokens = self._past_token_buffer_cuda[:, : seq_slots.shape[0]]
-
-            index_tensor = (
-                (self._stop_words_index_offset_cuda + num_accepted_tokens)
-                .unsqueeze(2)
-                .expand(-1, seq_slots.shape[0], self._max_beam_width)
-            )
-            _ = torch.gather(
-                past_tokens_batch,
-                dim=0,
-                index=index_tensor,
-                out=full_tokens[: index_tensor.shape[0]],
-            )
-            # Fill in the new tokens at the end of the past tokens buffer
-            full_tokens[-self._max_tokens :] = tokens
-            # short words are padded with _PAD_STOP_WORD_TOKEN_ID, so we need to mask them
-            mask = stop_words == self._PAD_STOP_WORD_TOKEN_ID
-            matches = torch.empty(
-                (
-                    self._max_tokens,
-                    stop_words.shape[0],
-                    stop_words.shape[1],
-                    stop_words.shape[2],
-                    stop_words.shape[3],
-                ),
-                device="cuda",
-                dtype=torch.bool,
-            )
-
-            # Get the comparison sequence for each step
-            full_tokens_for_match = full_tokens[self._multi_arange_indexing].view(
-                self._max_tokens,
-                1,  # Unsqueeze on dimension 1 to match the num_stop_words dimension of stop words
-                self._max_stop_word_length,
-                seq_slots.shape[0],
-                self._max_beam_width,
-            )
-            # Unsqueeze on dimension 0 to match the max_tokens dimension of full tokens
-            stop_words_for_match = stop_words.unsqueeze(0)
-            _ = torch.eq(full_tokens_for_match, stop_words_for_match, out=matches)
-            # Mask the padding tokens
-            _ = matches.masked_fill_(
-                mask.unsqueeze(0).expand(self._max_tokens, -1, -1, -1, -1), True
-            )
-            # Update the past tokens storage for the next iteration
-            store.past_tokens_cuda[:, seq_slots] = full_tokens
-            # Return the result
-            word_len_dim = 2
-            num_words_dim = 1
-            return torch.any(matches.all(dim=word_len_dim), dim=num_words_dim)
-
-        @nvtx_range("_are_stop_words_single_token")
-        def _are_stop_words_single_token(
-            self,
-            seq_slots: torch.Tensor,
-            tokens: torch.Tensor,
-            _num_accepted_tokens: torch.Tensor | int,
-        ) -> torch.Tensor:
-            """Checks if the tokens are stop words (single token per stop word only)
-
-            Args:
-                seq_slots: The sequence slots of the processed requests. Used for accessing device buffers.
-                  Shape: [len(requests)]
-                tokens: A buffer containing the newly generated tokens.
-                  Shape: [max_tokens, len(requests), max_beam_width]
-                _num_accepted_tokens: Unused
-            Returns:
-                A tensor where each element is True if the sequence at the corresponding token
-                ends with a stop word, False otherwise
-                Shape: [max_tokens, len(requests), max_beam_width]
-            """
-            per_step = torch.zeros(
-                (self._max_tokens, seq_slots.shape[0], self._max_beam_width),
-                dtype=torch.bool,
-                device="cuda",
-            )
-            # num_words, 1, batch_size
-            stop_words = self.store.stop_words_cuda[:, -1:, seq_slots].unsqueeze(3)
-            full_tokens = tokens.unsqueeze(0)
-            matches = full_tokens == stop_words
-            _ = torch.any(matches, dim=0, out=per_step)
-            return per_step
-
     @dataclass(kw_only=True)
     class BeamSearchStore:
         """Auxiliary data structures required for beam search."""
@@ -2243,99 +1276,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
            per-step ``cache_indirection.scatter_``."""
 
     @dataclass(kw_only=True)
-    class LogProbsStore:
-        """Auxiliary data structures used for log-probs handling."""
-
-        sampled_log_prob_indices: torch.Tensor
-        """Shape: batch_size, beam_width, max_tokens
-           Usage: Stores the token indices of the sampled logprobs"""
-        sampled_log_probs: torch.Tensor
-        """Shape: batch_size, beam_width, max_tokens
-           Usage: Stores the values of the sampled logprobs"""
-        sampled_log_prob_ranks: torch.Tensor
-        """Shape: batch_size, beam_width, max_tokens
-           Usage: Stores the ranks of the sampled logprobs"""
-        topk_indices: torch.Tensor
-        """Shape: batch_size, max_tokens, max_topk_logprobs
-           Usage: Stores the token indices of the topk logprobs"""
-        topk_vals: torch.Tensor
-        """Shape: batch_size, max_tokens, max_topk_logprobs
-           Usage: Stores the values of the topk logprobs"""
-
-    @dataclass(kw_only=True)
-    class TopPDecayStore:
-        """Per-slot runtime state for Top-P Decay -- the single source of truth
-        for the feature's semantics on the torch path.
-
-        Semantics (matching the legacy C++ ``computeToppDecay`` kernel): after
-        every sampled token of a decay-active request::
-
-            runtime_top_p = initial_top_p                                if token == reset_id
-                          = max(runtime_top_p * top_p_decay, top_p_min)  otherwise
-
-        A negative ``reset_ids`` sentinel (-1, "reset disabled") never matches,
-        since sampled token ids are non-negative. Decay is active iff
-        ``top_p_decay`` is set and < 1.0 (``SamplingParams.
-        params_imply_top_p_decay_active``); an active decay forces a
-        top-p-capable strategy even for an otherwise implicitly-greedy request
-        (initial top-p defaults to 1.0), while explicit greedy controls win.
-        Beam search and speculative draft tokens are rejected at admission
-        (``_validate_top_p_decay_request``); parameter ranges are enforced by
-        ``SamplingParams._validate`` / the executor::SamplingConfig constructor.
-
-        Lifecycle per slot (each tensor has shape ``(max_num_sequences,)``):
-
-        1. Admission (``_setup_top_p_decay_for_new_requests``): membership is
-           cleared then re-set for the newly-admitted slots -- both the host-side
-           ``TorchSampler._top_p_decay_slots`` set (an O(1) hot-path early-out)
-           and its device mirror ``is_top_p_decay_slot_cuda`` (the gate the
-           fused ops use, so the hot path needs no host-side filtering) --
-           and the per-slot buffers are initialized. This clear-then-set also
-           covers slot reuse: stale entries from a prior occupant are never
-           consumed.
-        2. Pre-sample (``_build_top_p_decay_metadata`` -> ``TopPDecayMetadata``
-           -> ``TopPDecayMixin``): the per-row top-p fed to top_p /
-           top_k_top_p sampling is overridden with the decayed runtime value
-           for decay-active rows (fused gather, ``top_p_decay_gather``).
-        3. Post-sample (``_update_top_p_decay_after_sample``): the recurrence
-           above is applied in place for the sampled decay-active slots (fused
-           update, ``top_p_decay_update``).
-        4. Finish (``_retire_top_p_decay_slot``): the slot leaves the
-           membership set so the early-outs re-arm; the device buffers need no
-           cleanup (a freed slot is never sampled, reuse re-initializes it).
-        """
-
-        runtime_top_p_decay_cuda: torch.Tensor
-        """The current (decaying) top-p per slot; mutated post-sample each step."""
-        initial_top_p_decay_cuda: torch.Tensor
-        """The initial top-p per slot; used to reset on a reset-id match."""
-        top_p_decay_cuda: torch.Tensor
-        """Per-slot multiplicative decay factor."""
-        top_p_decay_min_cuda: torch.Tensor
-        """Per-slot lower bound for the decayed top-p."""
-        top_p_decay_reset_ids_cuda: torch.Tensor
-        """Per-slot reset token id (< 0 never matches a sampled token)."""
-        is_top_p_decay_slot_cuda: torch.Tensor
-        """Per-slot bool gate (device mirror of ``_top_p_decay_slots``). Lets the
-        fused post-sample update op filter decay-active slots on the GPU,
-        avoiding a host-side ``.tolist()`` / set intersection each step."""
-
-        @classmethod
-        def create(cls, max_num_sequences: int) -> "TorchSampler.TopPDecayStore":
-            n = (max_num_sequences,)
-            return cls(
-                runtime_top_p_decay_cuda=torch.empty(n, dtype=torch.float32, device="cuda"),
-                initial_top_p_decay_cuda=torch.empty(n, dtype=torch.float32, device="cuda"),
-                top_p_decay_cuda=torch.empty(n, dtype=torch.float32, device="cuda"),
-                top_p_decay_min_cuda=torch.empty(n, dtype=torch.float32, device="cuda"),
-                top_p_decay_reset_ids_cuda=torch.empty(n, dtype=torch.int, device="cuda"),
-                # The gate buffer IS the gate, so (unlike the others) it must start
-                # False: a slot that was never admitted as decay-active must read
-                # False.
-                is_top_p_decay_slot_cuda=torch.zeros(n, dtype=torch.bool, device="cuda"),
-            )
-
-    @dataclass(kw_only=True)
     class Store:
         new_tokens: torch.Tensor
         """Device tensor containing latest sampled tokens.
@@ -2344,10 +1284,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """
         beam_search_store: "TorchSampler.BeamSearchStore | None" = None
         """Holds data related to beam search."""
-        log_probs_store: "TorchSampler.LogProbsStore"
+        log_probs_store: LogProbsStore
         """Holds data related to log-probs handling."""
-        top_p_decay_store: "TorchSampler.TopPDecayStore"
-        """Holds per-slot runtime state for Top-P Decay."""
 
     def _create_store(self) -> Store:
         # Tensors necessary for all sampling methods
@@ -2363,7 +1301,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # These are 0 sized tensors, if topk-logprobs are not used
         topk_indices = torch.empty(self.TOPK_LOGPROBS_SHAPE, device="cuda", dtype=torch.int32)
         topk_vals = torch.empty(self.TOPK_LOGPROBS_SHAPE, device="cuda", dtype=torch.float32)
-        log_probs_store = self.LogProbsStore(
+        log_probs_store = LogProbsStore(
             sampled_log_prob_indices=sampled_log_prob_indices,
             sampled_log_probs=sampled_log_probs,
             sampled_log_prob_ranks=sampled_log_prob_ranks,
@@ -2398,15 +1336,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 seq_offsets=seq_offsets,
                 beam_idx_arange=beam_idx_arange,
             )
-        # Per-slot Top-P Decay runtime state (FlashInfer path). Allocated for all
-        # sampler instances; only slots in self._top_p_decay_slots are ever read.
-        top_p_decay_store = self.TopPDecayStore.create(self.max_num_sequences)
-
         return self.Store(
             new_tokens=new_tokens,
             log_probs_store=log_probs_store,
             beam_search_store=beam_search_store,
-            top_p_decay_store=top_p_decay_store,
         )
 
     @dataclass(frozen=True, kw_only=True)
@@ -2459,10 +1392,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 "in requirements.txt."
             )
         self._grouped_sampler_cls = FlashInferGroupedStrategySampler
-        # Slots with an active top-p-decay request. Sole gate for reading/updating
-        # the per-slot TopPDecayStore buffers; discarded on slot reuse so stale
-        # buffer entries are never consumed.
-        self._top_p_decay_slots: set[int] = set()
+        # Per-slot Top-P Decay runtime state (FlashInfer path). Allocated for all
+        # sampler instances; only decay-admitted slots are ever read.
+        self._top_p_decay = TopPDecayHandler(self.max_num_sequences)
 
         # Token-ban handling (bad words, no-repeat ngram). The overlap-aware
         # variant is selected once here from whether the overlap scheduler is
@@ -2481,7 +1413,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self._request_grouper: _CachingRequestGrouper[Any] = _CachingRequestGrouper(
                 self.max_num_sequences
             )
-            self._finish_reasons_handler = self.FinishReasonsHandler(
+            self._finish_reasons_handler = FinishReasonsHandler(
                 max_stop_word_length=self.DEFAULT_MAX_STOP_WORD_LENGTH,
                 max_num_stop_words=self.DEFAULT_MAX_STOP_WORDS,
                 max_num_sequences=self.max_num_sequences,
@@ -2492,6 +1424,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             assert (
                 self.store.new_tokens.shape
                 == self._finish_reasons_handler.store.finish_reasons_cuda.shape
+            )
+            self._penalty_handler = PenaltyHandler(
+                max_num_sequences=self.max_num_sequences,
+                device="cuda",
             )
 
         # Initialize seed for multi-GPU consistency
@@ -2571,48 +1507,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @property
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
-
-    def _validate_top_p_decay_request(self, request: LlmRequest) -> None:
-        """Reject unsupported combinations for a top-p-decay-active request.
-
-        Top-p decay is supported only for single-token decode steps without beam
-        search. Called from validate_request (request admission), so a violating
-        request is failed individually instead of aborting the whole batch.
-        """
-        params = _request_get_sampling_params(request)
-        # NB: value ranges need no re-check here. Every request enters through
-        # the executor::SamplingConfig constructor, which hard-validates
-        # top_p_decay in (0, 1], top_p_min in (0, 1] and top_p_reset_ids >= 0
-        # (samplingConfig.cpp check* helpers) for all frontends. A reset id
-        # >= vocab_size is not checked anywhere but is semantically inert: it
-        # can never match a sampled token, i.e. it behaves as "reset disabled".
-        if not top_p_decay_active(params):
-            return
-        if params.use_beam_search:
-            raise ValueError("top_p_decay is not supported with beam search.")
-        # A non-zero draft length means the request carries speculative draft
-        # tokens and produces multiple tokens per step (req_num_steps =
-        # 1 + draft_token_length). One-model speculation (vanilla MTP, one-model
-        # Eagle3 / MTP-Eagle, SA, draft-target-one-model) uses its own
-        # SpecSamplerBase-derived sampler and never reaches TorchSampler; the
-        # drafter-based modes that DO flow draft tokens through TorchSampler
-        # (two-model draft-target, NGram, user-provided, two-model Eagle3 /
-        # MTP-Eagle) are what can make this length non-zero. top-p decay does not
-        # support these multi-token steps.
-        # NB: at admission time the draft tokens of drafter-based modes are
-        # usually not attached yet, so this check is best-effort. Two-model
-        # speculation (the only source of such requests in TorchSampler) is
-        # slated for removal, so in practice no speculative request reaches the
-        # decay path; a debug assert in _build_top_p_decay_metadata guards the
-        # invariant at sample time.
-        if get_draft_token_length(request) > 0:
-            raise ValueError(
-                "top_p_decay is not supported for requests carrying speculative "
-                "draft tokens (req_num_steps > 1). This covers the drafter-based "
-                "modes routed through TorchSampler (two-model draft-target, NGram, "
-                "user-provided, two-model Eagle3 / MTP-Eagle); one-model "
-                "speculation uses its own sampler and is unaffected."
-            )
 
     def _can_use_fast_greedy_path(self, requests: list[LlmRequest]) -> bool:
         """
@@ -2763,125 +1657,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
         original_tokens[seq_slots, :, seq_lens] = new_tokens[0, seq_slots, :]
 
-    def _convert_logprobs_tensor_to_list(
-        self,
-        token_tensor: torch.Tensor,
-        logprobs_tensor: torch.Tensor,
-    ) -> list[list[dict[int, Logprob]]]:
-        """Convert the logprobs tensor to a list of lists of dictionaries of Logprob objects
-
-        Logprobs storage expects logprobs as a list[list[dict[int, Logprob]]] object
-
-        args:
-            token_tensor: torch.Tensor. Shape: beam_width, num_tokens, num_logprobs
-            logprobs_tensor: torch.Tensor. Shape: beam_width, num_tokens, num_logprobs
-        output:
-            list[list[dict[int, Logprob]]]. Shape: (beam_width, num_tokens)
-        """
-        assert token_tensor.dim() == 3 and logprobs_tensor.dim() == 3, (
-            f"Token and logprobs tensors must have 3 dimensions (beam_width, num_tokens, num_logprobs). \
-            Got shapes (token_tensor) {token_tensor.shape} and (logprobs_tensor) {logprobs_tensor.shape} instead"
-        )
-
-        token_log_probs: list[list[dict[int, Logprob]]] = []
-        token_list = token_tensor.tolist()
-        logprobs_list = logprobs_tensor.tolist()
-        for beam_idx in range(token_tensor.shape[0]):
-            beam_token_log_probs: list[dict[int, Logprob]] = []
-            for topk_token, topk_logprob in zip(token_list[beam_idx], logprobs_list[beam_idx]):
-                logprobs = {
-                    token: Logprob(logprob=logprob, rank=rank + 1)
-                    for rank, (token, logprob) in enumerate(zip(topk_token, topk_logprob))
-                }
-                beam_token_log_probs.append(logprobs)
-            token_log_probs.append(beam_token_log_probs)
-
-        return token_log_probs
-
-    def _store_logprobs_list_to_request(
-        self,
-        logprobs_state_list: LogProbsStateList,
-        req_seq_slot: int,
-        beam_width: int,
-        count: int,
-        num_topk_logprobs: int,
-        simple_format: bool = False,
-    ) -> list[list[dict[int, Logprob]]] | list[list[float]]:
-        """Convert the LogProbsStateList object to per-token logprobs.
-
-        By default returns ``list[list[dict[int, Logprob]]]``. When
-        ``simple_format`` is True and ``num_topk_logprobs == 0`` the result is a
-        flat ``list[list[float]]`` (one logprob per generated token, per beam).
-
-        args:
-            logprobs_state_list: LogProbsStateList. Contains the topk indices, topk values,
-                sampled indices, sampled values, and sampled ranks.
-            req_seq_slot: int. The sequence slot of the request.
-            beam_width: int. The beam width of the request.
-            count: int. The number of tokens to store.
-            num_topk_logprobs: int. The number of topk logprobs of each token.
-            simple_format: bool. If True (and num_topk_logprobs == 0), return
-                ``list[list[float]]`` instead of the dict format. Avoids per-token
-                dict allocation when only the sampled-token logprob is needed.
-        output:
-            list[list[dict[int, Logprob]]] (default) or list[list[float]] (simple format).
-            Shape: (beam_width, count)
-        """
-
-        sampled_log_probs_indices_list = logprobs_state_list.sampled_indices[req_seq_slot]
-        sampled_log_probs_vals_list = logprobs_state_list.sampled_vals[req_seq_slot]
-        sampled_log_probs_rank_list = logprobs_state_list.sampled_rank[req_seq_slot]
-
-        if num_topk_logprobs == 0:
-            if simple_format:
-                token_log_probs_simple: list[list[float]] = [
-                    [sampled_log_probs_vals_list[beam_idx][step_idx] for step_idx in range(count)]
-                    for beam_idx in range(beam_width)
-                ]
-                return token_log_probs_simple
-
-            token_log_probs: list[list[dict[int, Logprob]]] = [
-                [
-                    {
-                        sampled_log_probs_indices_list[beam_idx][step_idx]: Logprob(
-                            sampled_log_probs_vals_list[beam_idx][step_idx],
-                            sampled_log_probs_rank_list[beam_idx][step_idx] + 1,
-                        )
-                    }
-                    for step_idx in range(count)
-                ]
-                for beam_idx in range(beam_width)
-            ]
-        else:
-            token_list = logprobs_state_list.topk_indices[req_seq_slot]
-            logprobs_list = logprobs_state_list.topk_vals[req_seq_slot]
-            token_log_probs = [[] for _ in range(beam_width)]
-            for step_idx in range(count):
-                topk_tokens = token_list[step_idx][:num_topk_logprobs]
-                topk_logprobs = logprobs_list[step_idx][:num_topk_logprobs]
-                min_rank = len(topk_tokens) + 1
-
-                topk_logprob_dict = {
-                    token: Logprob(logprob=logprob, rank=rank + 1)
-                    for rank, (token, logprob) in enumerate(zip(topk_tokens, topk_logprobs))
-                }
-
-                for beam_idx in range(beam_width):
-                    # NB: Keeps sampled token in the first position (cf. https://stackoverflow.com/a/67786863)
-                    logprobs = {
-                        sampled_log_probs_indices_list[beam_idx][step_idx]: Logprob(
-                            logprob=sampled_log_probs_vals_list[beam_idx][step_idx],
-                            rank=max(
-                                min_rank,
-                                sampled_log_probs_rank_list[beam_idx][step_idx] + 1,
-                            ),
-                        ),
-                        **topk_logprob_dict,
-                    }
-                    token_log_probs[beam_idx].append(logprobs)
-
-        return token_log_probs
-
     def handle_logprobs(
         self,
         request: LlmRequest,
@@ -2894,7 +1669,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             assert request.py_num_logprobs is not None, "request.py_num_logprobs must be provided"
             assert logprobs_state_list is not None, "logprobs_state_list must be provided"
             assert request.py_seq_slot is not None
-            token_log_probs = self._store_logprobs_list_to_request(
+            token_log_probs = store_logprobs_list_to_request(
                 logprobs_state_list,
                 request.py_seq_slot,
                 beam_width,
@@ -3074,10 +1849,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     @override
     def validate_request(self, request: LlmRequest) -> None:
-        # Reject unsupported top-p-decay combinations at admission, so only the
-        # offending request fails (raising later, inside setup_sampler_step or
-        # sampling, would abort the whole executor step).
-        self._validate_top_p_decay_request(request)
+        # Reject unsupported top-p-decay and penalty combinations at admission, so
+        # only the offending request fails (raising later, inside setup_sampler_step
+        # or sampling, would abort the whole executor step).
+        self._top_p_decay.validate_request(request)
+        self._penalty_handler.validate_request(request)
         if self._use_beam_search:
             if request.py_return_log_probs:
                 if request.py_num_logprobs > 1:
@@ -3126,6 +1902,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._prev_first_finish_reasons_host[slot] = None
 
             self._request_grouper.prepare_for_new_request(request, slot)
+            self._penalty_handler.prepare_for_new_request(request, slot)
 
         max_lens = self._finish_reasons_handler.new_max_lens
         end_ids = self._finish_reasons_handler.new_end_ids
@@ -3152,8 +1929,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             all_sampling_requests=new_requests + scheduled_requests.generation_requests,
         )
 
-        self._setup_top_p_decay_for_new_requests(
+        self._top_p_decay.setup_for_new_requests(
             new_requests, new_seq_slots_cuda_long=seq_slots_tensor_cuda_long
+        )
+
+        self._penalty_handler.update_for_new_requests(
+            new_seq_slots_cuda_long=seq_slots_tensor_cuda_long
         )
 
         if self._use_beam_search:
@@ -3165,106 +1946,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 seq_slots_long=seq_slots_tensor_cuda_long,
                 max_prompt_len=max_prompt_len,
             )
-
-    def _setup_top_p_decay_for_new_requests(
-        self,
-        new_requests: list[LlmRequest],
-        *,
-        new_seq_slots_cuda_long: torch.Tensor,
-    ) -> None:
-        """Refresh top-p-decay membership and per-slot buffers for admitted requests
-        (lifecycle step 1, see ``TopPDecayStore``).
-
-        Drops stale membership from prior occupants of the newly-admitted slots
-        (host set and device gate), then re-admits the decay-active requests and
-        initializes their per-slot store entries. Unsupported decay combinations
-        were already rejected per-request in validate_request at admission.
-        """
-        # Clear the device decay gate for every newly-admitted slot (covers slot
-        # reuse: a slot previously decay-active but reused by a non-decay request
-        # must read False). Decay-active slots are then set True below.
-        decay_gate = self.store.top_p_decay_store.is_top_p_decay_slot_cuda
-        decay_gate.index_fill_(0, new_seq_slots_cuda_long, False)
-
-        decay_seq_slots: list[int] = []
-        initial_top_p: list[float] = []
-        top_p_decay: list[float] = []
-        top_p_min: list[float] = []
-        top_p_reset_ids: list[int] = []
-        for request in new_requests:
-            slot = request.py_seq_slot
-            assert slot is not None
-            self._top_p_decay_slots.discard(slot)
-            sampling_params = _request_get_sampling_params(request)
-            if not top_p_decay_active(sampling_params):
-                continue
-            self._top_p_decay_slots.add(slot)
-            decay_seq_slots.append(slot)
-            # Initial runtime top-p defaults to 1.0 when top_p is unset.
-            initial_top_p.append(
-                sampling_params.top_p if sampling_params.top_p is not None else 1.0
-            )
-            # decay is guaranteed non-None and < 1.0 here (top_p_decay_active);
-            # min/reset fall back to the C++ runtime defaults when unset.
-            assert sampling_params.top_p_decay is not None
-            top_p_decay.append(sampling_params.top_p_decay)
-            top_p_min.append(
-                sampling_params.top_p_min if sampling_params.top_p_min is not None else 1e-6
-            )
-            top_p_reset_ids.append(
-                sampling_params.top_p_reset_ids
-                if sampling_params.top_p_reset_ids is not None
-                else -1
-            )
-
-        if decay_seq_slots:
-            self._update_top_p_decay_store_for_new_requests(
-                decay_seq_slots=decay_seq_slots,
-                initial_top_p=initial_top_p,
-                top_p_decay=top_p_decay,
-                top_p_min=top_p_min,
-                top_p_reset_ids=top_p_reset_ids,
-            )
-
-    def _update_top_p_decay_store_for_new_requests(
-        self,
-        *,
-        decay_seq_slots: list[int],
-        initial_top_p: list[float],
-        top_p_decay: list[float],
-        top_p_min: list[float],
-        top_p_reset_ids: list[int],
-    ) -> None:
-        """Initialize per-slot Top-P Decay buffers for newly admitted decay requests.
-
-        runtime_top_p and initial_top_p both start at the effective initial top-p;
-        the runtime value is decayed post-sample each step.
-        """
-        store = self.store.top_p_decay_store
-        device = store.runtime_top_p_decay_cuda.device
-        slots_cuda = torch.tensor(
-            decay_seq_slots, device="cpu", dtype=torch.int64, pin_memory=prefer_pinned()
-        ).to(device, non_blocking=True)
-        floats_host = torch.tensor(
-            [initial_top_p, top_p_decay, top_p_min],
-            device="cpu",
-            dtype=torch.float32,
-            pin_memory=prefer_pinned(),
-        )
-        floats_cuda = floats_host.to(device, non_blocking=True)
-        initial_cuda = floats_cuda[0]
-        reset_ids_cuda = torch.tensor(
-            top_p_reset_ids, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
-        ).to(device, non_blocking=True)
-
-        store.runtime_top_p_decay_cuda.index_copy_(0, slots_cuda, initial_cuda)
-        store.initial_top_p_decay_cuda.index_copy_(0, slots_cuda, initial_cuda)
-        store.top_p_decay_cuda.index_copy_(0, slots_cuda, floats_cuda[1])
-        store.top_p_decay_min_cuda.index_copy_(0, slots_cuda, floats_cuda[2])
-        store.top_p_decay_reset_ids_cuda.index_copy_(0, slots_cuda, reset_ids_cuda)
-        # Enable the device gate for these decay-active slots (cleared for all new
-        # slots in setup_sampler_step just before this call).
-        store.is_top_p_decay_slot_cuda.index_fill_(0, slots_cuda, True)
 
     @staticmethod
     def _prepare_beam_search(
@@ -3422,68 +2103,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return self._process_draft_tokens_rejection_sampling(
                 request, new_tokens_list=new_tokens_list, new_tokens_tensor=new_tokens_tensor
             )
-
-    def _get_logprobs_from_request(
-        self,
-        request: LlmRequest,
-        pin_memory: bool = True,
-        preallocate_extra_steps: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract the logprobs from the request.
-
-        Returns:
-            logprobs_tensor: A tensor of shape (beam_width, num_generated_tokens, num_logprobs)
-            logprobs_indices_tensor: A tensor of shape (beam_width, num_generated_tokens, num_logprobs)
-        """
-        pin_memory = pin_memory and prefer_pinned()
-        num_generated_tokens = request.max_beam_num_tokens - request.py_prompt_len
-        assert request.py_num_logprobs == 0, (
-            "Beam search only supports returning the sampled logprob per token"
-        )
-        logprobs_tensor_full = torch.empty(
-            (
-                request.py_beam_width,
-                num_generated_tokens + preallocate_extra_steps,
-                request.py_num_logprobs + 1,
-            ),
-            pin_memory=pin_memory,
-            dtype=torch.float32,
-        )
-        logprobs_indices_tensor_full = torch.empty(
-            (
-                request.py_beam_width,
-                num_generated_tokens + preallocate_extra_steps,
-                request.py_num_logprobs + 1,
-            ),
-            pin_memory=pin_memory,
-            dtype=torch.int32,
-        )
-        # NB: forward slicing, because [:, :-0, :] would yield an empty view
-        #     instead of the full history when preallocate_extra_steps == 0.
-        logprobs_tensor = logprobs_tensor_full[:, :num_generated_tokens, :]
-        logprobs_indices_tensor = logprobs_indices_tensor_full[:, :num_generated_tokens, :]
-        if logprobs_tensor.numel() > 0:
-            logprobs_list = request.py_result.log_probs
-            assert logprobs_list is not None
-
-            if request.py_logprobs_simple_format:
-                tokens = request.get_tokens()
-                for beam_idx, beam_logprobs in enumerate(logprobs_list):
-                    beam_logprobs = cast(SimpleTokenLogprobs, beam_logprobs)
-                    for token_idx, token_logprobs_simple in enumerate(beam_logprobs):
-                        logprobs_tensor[beam_idx, token_idx, 0] = token_logprobs_simple
-                        logprobs_indices_tensor[beam_idx, token_idx, 0] = tokens[beam_idx][
-                            token_idx
-                        ]
-            else:
-                for beam_idx, beam_logprobs in enumerate(logprobs_list):
-                    beam_logprobs = cast(TokenLogprobs, beam_logprobs)
-                    for token_idx, token_logprobs in enumerate(beam_logprobs):
-                        for key, value in token_logprobs.items():
-                            assert value.rank is not None
-                            logprobs_tensor[beam_idx, token_idx, value.rank - 1] = value.logprob
-                            logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
-        return logprobs_tensor_full, logprobs_indices_tensor_full
 
     def _prepare_beam_history(
         self,
@@ -3654,7 +2273,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam's history through `cache_indirection`. Returns the gathered
         (logprobs, logprobs_indices, cum_logprobs) triple.
         """
-        current_logprobs, current_logprobs_indices = self._get_logprobs_from_request(
+        current_logprobs, current_logprobs_indices = get_logprobs_from_request(
             request, preallocate_extra_steps=1
         )
         # concatenate the newly generated logprobs and newly
@@ -3725,7 +2344,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 assert beam_history.logprobs_indices is not None
                 assert beam_history.logprobs is not None
                 gen_log_probs_list.append(
-                    self._convert_logprobs_tensor_to_list(
+                    convert_logprobs_tensor_to_list(
                         beam_history.logprobs_indices[beam_idx : beam_idx + 1, :beam_valid_tokens],
                         beam_history.logprobs[beam_idx : beam_idx + 1, :beam_valid_tokens],
                     )[0]
@@ -3791,7 +2410,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     beam_idx_arange=beam_search_store.beam_idx_arange,
                 )
             elif metadata_type is TopPDecayMetadata:
-                metadata = self._build_top_p_decay_metadata(
+                metadata = self._top_p_decay.build_metadata(
                     group_req_indices=value.indices,
                     req_num_steps=req_num_steps,
                     seq_slots=seq_slots,
@@ -3950,6 +2569,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else:
                 return None
 
+        finalized_token_updates: list[tuple[int, list[int]]] = []
         # Fast-path (batched pybind): when the batch is greedy with no beam
         # search, no logprobs, no draft tokens, no stop-words, and no
         # speculative tree, collapse per-request pybind chatter into one
@@ -3994,7 +2614,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
-                self._retire_top_p_decay_slot(req)
+                self._top_p_decay.retire_slot(req)
                 continue
 
             if req.py_beam_width > 1:
@@ -4040,6 +2660,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 req.py_rewind_len = 0
             else:
                 processed = 1
+                num_tokens_before = req.get_num_tokens(DEFAULT_BEAM_IDX)
                 num_accepted = self.process_draft_tokens(
                     req,
                     new_tokens_tensor=new_tokens,
@@ -4054,6 +2675,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     req.py_num_accepted_draft_tokens = 0
                     req.py_rewind_len = 0
                 processed += num_accepted
+                if actual_draft_len > 0:
+                    num_new_tokens = req.get_num_tokens(DEFAULT_BEAM_IDX) - num_tokens_before
+                    if num_new_tokens > 0:
+                        assert req.py_seq_slot is not None
+                        confirmed_tokens = req.get_tokens(DEFAULT_BEAM_IDX)[-num_new_tokens:]
+                        finalized_token_updates.append((req.py_seq_slot, confirmed_tokens))
                 self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=processed)
             req.py_decoding_iter += 1
             # Check None or empty list
@@ -4062,19 +2689,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     req.py_seq_slot
                 ] = req.py_num_accepted_draft_tokens
             if req.state == LlmRequestState.GENERATION_COMPLETE:
-                self._retire_top_p_decay_slot(req)
+                self._top_p_decay.retire_slot(req)
 
-    def _retire_top_p_decay_slot(self, req: LlmRequest) -> None:
-        """Retire a finished request's slot from the top-p-decay membership set
-        (lifecycle step 4, see ``TopPDecayStore``), so the O(1) hot-path
-        early-outs re-arm once decay traffic drains.
-
-        Callers ensure ``req`` has finished. Requests that finish outside the
-        sampler (e.g. cancellation) are covered by the slot-reuse cleanup at
-        admission instead.
-        """
-        if self._top_p_decay_slots and req.py_seq_slot is not None:
-            self._top_p_decay_slots.discard(req.py_seq_slot)
+        self._penalty_handler.update_token_counts(finalized_token_updates)
 
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
         return any(req.py_return_log_probs for req in requests)
@@ -4341,65 +2958,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         #     and thus introduces read-after-write dependencies (including possible false
         #     sharing).
         logits[logits_bias_mask_cuda] += biases_tensor_cuda
-
-    def _build_top_p_decay_metadata(
-        self,
-        *,
-        group_req_indices: torch.Tensor,
-        req_num_steps: torch.Tensor,
-        seq_slots: torch.Tensor,
-        seq_slots_cuda: torch.Tensor,
-    ) -> Optional[TopPDecayMetadata]:
-        """Build the Top-P Decay metadata for a top_p / top_k_top_p group.
-
-        Lifecycle step 2, see ``TopPDecayStore``. Returns None when no request
-        currently uses decay. The metadata's ``slots`` tensor is aligned to the
-        group's per-STEP row order (matching group_strategies_per_step);
-        non-decay rows (possibly multi-step draft rows) are gated out on-device
-        by ``is_decay_slot``, so decay presence in the group is not checked
-        host-side: a group without decay rows samples every row with its static
-        top-p -- same result as returning None.
-        """
-        if not self._top_p_decay_slots:
-            return None
-        store = self.store.top_p_decay_store
-        # Fast path (steady-state decoding): if every row in the group is
-        # single-token, the per-STEP row order equals the per-request order, and
-        # (group_req_indices being sorted ascending) a contiguous group's slots
-        # are just a slice of seq_slots_cuda -- no host layout build and no H2D
-        # copy.
-        first_req = int(group_req_indices[0].item())
-        last_req = int(group_req_indices[-1].item())
-        group_steps = req_num_steps[group_req_indices]
-        if last_req - first_req + 1 == group_req_indices.size(0) and (
-            group_steps.max().item() == 1
-        ):
-            per_step_slots_cuda = seq_slots_cuda[first_req : last_req + 1]
-        else:
-            # Build the per-STEP slot layout (each request contributes
-            # req_num_steps rows).
-            group_seq_slots = seq_slots[group_req_indices]
-            if __debug__:
-                # Internal invariant (stripped under python -O): a decay-active
-                # row is always single-token -- the only source of multi-step
-                # rows in TorchSampler is two-model speculation (slated for
-                # removal), and decay + draft tokens is rejected per-request at
-                # admission in validate_request.
-                decay_row_steps = group_steps[
-                    torch.isin(group_seq_slots, torch.tensor(list(self._top_p_decay_slots)))
-                ]
-                assert decay_row_steps.numel() == 0 or decay_row_steps.max().item() == 1, (
-                    "top_p_decay row with req_num_steps != 1; decay + draft tokens "
-                    "should have been rejected at admission"
-                )
-            per_step_slots_cuda = torch.repeat_interleave(group_seq_slots.long(), group_steps).to(
-                seq_slots_cuda.device, non_blocking=True
-            )
-        return TopPDecayMetadata(
-            slots=per_step_slots_cuda,
-            runtime_top_p=store.runtime_top_p_decay_cuda,
-            is_decay_slot=store.is_top_p_decay_slot_cuda,
-        )
 
     @nvtx_range("sample_batched_by_strategy")
     @torch.inference_mode()
@@ -4711,41 +3269,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # sampled slots is exactly seq_slots (the kernel updates each slot
         # independently; order is irrelevant) -- pass the resident device copy
         # instead of gathering seq_slots[batch_req_indices] on host and copying it.
-        self._update_top_p_decay_after_sample(
-            new_tokens_cuda=new_tokens_cuda,
+        self._top_p_decay.update_after_sample(
+            step_tokens=new_tokens_cuda[DEFAULT_STEP_IDX, :, DEFAULT_BEAM_IDX],
             sampled_slots_cuda=seq_slots_cuda,
         )
         return self._copy_to_host(new_tokens_cuda)
-
-    def _update_top_p_decay_after_sample(
-        self,
-        *,
-        new_tokens_cuda: torch.Tensor,
-        sampled_slots_cuda: torch.Tensor,
-    ) -> None:
-        """Apply the post-sample decay recurrence for sampled decay-active slots.
-
-        See ``TopPDecayStore`` for the feature-level semantics (lifecycle
-        step 3). Restricting to the sampled slots avoids reading stale
-        new_tokens_cuda for slots that were not scheduled this iteration.
-        """
-        # Host-side O(1) early-out: skip the kernel launch when no request uses
-        # decay; otherwise a single fused (torch.compile) op gates on
-        # is_decay_slot on-device and gathers the sampled token in place (decay is
-        # single-token-only, so the token is at local step 0, beam 0).
-        if not self._top_p_decay_slots:
-            return
-        store = self.store.top_p_decay_store
-        Fusions.top_p_decay_update(
-            runtime_top_p=store.runtime_top_p_decay_cuda,
-            initial_top_p=store.initial_top_p_decay_cuda,
-            top_p_decay=store.top_p_decay_cuda,
-            top_p_min=store.top_p_decay_min_cuda,
-            reset_ids=store.top_p_decay_reset_ids_cuda,
-            is_decay_slot=store.is_top_p_decay_slot_cuda,
-            step_tokens=new_tokens_cuda[DEFAULT_STEP_IDX, :, DEFAULT_BEAM_IDX],
-            sampled_slots=sampled_slots_cuda,
-        )
 
     def _compute_pending_steps(self, requests: list[LlmRequest]) -> list[int] | None:
         """Per-request count of tokens sampled but not yet written back, or None.
@@ -5099,6 +3627,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Handle embedding bias
         self._apply_embedding_bias(
             logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
+        )
+
+        # Apply repetition/presence/frequency penalties in place, before the greedy fast
+        # path, so both greedy and grouped-sampling logits are penalized.
+        self._penalty_handler.apply(
+            logits_cuda,
+            sampling_requests,
+            new_tokens=new_tokens_cuda,
+            seq_slots=seq_slots_cuda,
+            request_offsets=sampling_requests_metadata.req_offsets,
+            request_num_steps=sampling_requests_metadata.req_num_steps,
+            # _is_draft_batch reads requests[0]; an empty batch has no penalties to apply
+            # anyway, so short-circuit rather than index into it.
+            is_draft_batch=bool(sampling_requests) and self._is_draft_batch(sampling_requests),
         )
 
         has_min_length = any(getattr(r, "py_min_length", None) for r in sampling_requests)

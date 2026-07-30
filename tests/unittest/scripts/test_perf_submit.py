@@ -16,6 +16,7 @@
 
 import importlib.util
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import yaml
@@ -23,6 +24,7 @@ from test_common.perf_sanity_agreement import (
     expected_disagg_lifecycle_roles,
     extract_agreement_arm_log,
     format_agreement_arm_marker,
+    is_paired_agreement_configuration,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -130,6 +132,19 @@ def test_expected_disagg_lifecycle_roles_matches_three_node_topology():
     }
 
 
+@pytest.mark.parametrize(
+    ("modes", "expected"),
+    (
+        ([("e2e", 1, 1), ("e2e", 0, 1)], True),
+        ([("e2e", 1, 1)], False),
+        ([("e2e", 1, 1), ("e2e", None, 1)], False),
+        ([("e2e", 1, 1), ("gen_only", 0, 1)], False),
+    ),
+)
+def test_is_paired_agreement_configuration(modes, expected):
+    assert is_paired_agreement_configuration(modes) is expected
+
+
 def test_python_consensus_ab_config_changes_only_terminal_mode():
     with open(AGREEMENT_AB_CONFIG) as config_file:
         config = yaml.safe_load(config_file)
@@ -161,10 +176,13 @@ def test_python_consensus_ab_config_changes_only_terminal_mode():
 
 
 @pytest.fixture(params=SUBMIT_PATHS, ids=("ci", "local"))
-def submit_module(request):
+def submit_module(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    monkeypatch.syspath_prepend(str(request.param.parent))
     spec = importlib.util.spec_from_file_location(
         f"perf_submit_{request.param.parent.name}", request.param
     )
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

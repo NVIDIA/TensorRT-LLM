@@ -114,6 +114,7 @@ l0_b200:
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/modules/moe/test_megamoe_streaming_load.py
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
@@ -236,6 +237,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_example
   - examples/visual_gen/test_visual_gen.py::test_qwen_image_example
   - examples/visual_gen/test_visual_gen.py::test_qwen_image_layered_example
+  - examples/visual_gen/test_visual_gen.py::test_qwen_image_edit_example
   # - examples/visual_gen/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
@@ -264,6 +266,7 @@ l0_b200:
   tests:
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/disaggregated/test_openai_server_info.py
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
 - condition:
     ranges:
       system_gpu_count:

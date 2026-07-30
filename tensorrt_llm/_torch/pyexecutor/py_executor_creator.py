@@ -999,7 +999,7 @@ def create_py_executor(
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             resource_governor_queue=resource_governor_queue,
-            max_seq_len=max_seq_len,
+            max_seq_len=net_max_seq_len,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
@@ -1078,7 +1078,7 @@ def create_py_executor(
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
                 resource_governor_queue=resource_governor_queue,
-                max_seq_len=max_seq_len,
+                max_seq_len=net_max_seq_len,
                 max_batch_size=max_batch_size,
                 max_beam_width=max_beam_width,
                 max_num_tokens=max_num_tokens,

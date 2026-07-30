@@ -15,7 +15,7 @@
 """Pure coordination helpers for paired perf-sanity agreement experiments."""
 
 import re
-from typing import Optional, Set
+from typing import Iterable, Optional, Set, Tuple
 
 _AGREEMENT_ARM_MARKER_RE = re.compile(
     r"PYTHON_AGREEMENT_AB_ARM_(START|END) "
@@ -57,6 +57,17 @@ def expected_disagg_lifecycle_roles(
     )
     roles.update(("DISAGG_SERVER.0", "BENCHMARK.0"))
     return roles
+
+
+def is_paired_agreement_configuration(
+    modes: Iterable[Tuple[str, Optional[int], Optional[int]]],
+) -> bool:
+    """Return whether modes describe a fully specified paired e2e A/B."""
+    modes = list(modes)
+    return len(modes) >= 2 and all(
+        benchmark_mode == "e2e" and terminal_mode is not None and peer_ready_mode is not None
+        for benchmark_mode, terminal_mode, peer_ready_mode in modes
+    )
 
 
 def extract_agreement_arm_log(
