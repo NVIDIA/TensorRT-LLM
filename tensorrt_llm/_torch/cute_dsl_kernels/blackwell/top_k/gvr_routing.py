@@ -71,8 +71,8 @@ SKIP_CS_MIN_N_RUNGS = 196608  # vb: cluster split on top of bm from here
 # even that is not repaid and the zero-emission rungs tier takes over.
 LIST_EMIT_MAX_TOKENS = 786432  # B * raw length; between the measured
 # cheap band (<=0.52M) and the first expensive point (1.05M)
-LIST_EMIT_MIN_N = 32768
-RUNGS_MIN_B = 32
+LIST_EMIT_MIN_N = 16384
+RUNGS_MIN_B = 16
 
 # rungs-tier block_max pays only at small K: with K=1024 the tight-line
 # pass rate runs too high and the prefix read is pure overhead.
