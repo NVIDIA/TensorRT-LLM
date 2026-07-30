@@ -286,8 +286,8 @@ You can customize these by:
 - `frame_rate` (canonical) or `fps` (alias): frames per second
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
-- `input_reference`: Reference image (I2V/TI2V) or video (V2V), routed by container signature — filename and content type are ignored; accepted as base64-encoded string in JSON or as a file in multipart form-data. The signature only routes; the bytes pass through and the worker's decoder is what accepts them — Pillow for images, NVDEC for video (PyNvVideoCodec, a declared dependency). An unrecognized container is rejected with HTTP 400 at the boundary.
-  - **Supported formats**: reference images are tested with PNG (`image/png`) and JPEG (`image/jpeg`) and are decoded on the workers with Pillow. Reference videos are routed by container signature (MP4 `video/mp4`, AVI `video/x-msvideo`) and decoded on the workers' NVDEC — tested codec is H.264 in both containers; other codecs/profiles depend on the GPU's decoder capabilities and are best-effort. Filename and MIME metadata are never used for routing. HEIF/AVIF still images (which share the ISO-BMFF `ftyp` signature with MP4) are detected and rejected with a 400 asking for PNG or JPEG, rather than being sent to the video decoder.
+- `input_reference`: Reference image (I2V/TI2V) or video (V2V), accepted as a base64-encoded string in JSON or as a file in multipart form-data
+  - **Supported formats**: PNG and JPEG images; MP4 and AVI video, with H.264 the tested codec and others best-effort. HEIF/AVIF are not supported.
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"b64_json"` or `"url"`
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
