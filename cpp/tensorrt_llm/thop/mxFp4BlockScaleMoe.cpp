@@ -34,8 +34,7 @@ using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodTy
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
 
-std::vector<torch::Tensor> dtype_mxe2m1_block_scale_moe_runner(
-    torch::optional<torch::Tensor> const& routing_logits,
+std::vector<torch::Tensor> dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor> const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
     std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
     torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
@@ -587,8 +586,8 @@ public:
             gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
             gemm2_weights_scale, gemm2_bias, std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group,
             topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size, local_expert_offset,
-            local_num_experts, routed_scaling_factor, tileN, routing_method_type, true, mDtypeAct,
-            *mRunners[tileN], config, topk_weights, topk_ids, output);
+            local_num_experts, routed_scaling_factor, tileN, routing_method_type, true, mDtypeAct, *mRunners[tileN],
+            config, topk_weights, topk_ids, output);
         return outputs.front();
     }
 

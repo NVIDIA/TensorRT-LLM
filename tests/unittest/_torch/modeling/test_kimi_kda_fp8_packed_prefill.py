@@ -11,7 +11,9 @@ from torch import nn
 pytest.importorskip("fla")
 
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
-    KimiKDARuntime, _convert_kda_projections_to_fp8_weight_read)
+    KimiKDARuntime,
+    _convert_kda_projections_to_fp8_weight_read,
+)
 
 
 class _Cfg:
@@ -27,7 +29,6 @@ class _Cfg:
 
 
 class _Layer(nn.Module):
-
     def __init__(self, runtime: KimiKDARuntime) -> None:
         super().__init__()
         self.is_kda = True
@@ -35,15 +36,13 @@ class _Layer(nn.Module):
 
 
 class _Model(nn.Module):
-
     def __init__(self, runtime: KimiKDARuntime) -> None:
         super().__init__()
         self.layers = nn.ModuleList([_Layer(runtime)])
 
 
 def _has_supported_gpu() -> bool:
-    return (torch.cuda.is_available()
-            and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)})
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
 
 
 pytestmark = pytest.mark.skipif(
@@ -54,19 +53,15 @@ pytestmark = pytest.mark.skipif(
 
 def _make_runtime() -> KimiKDARuntime:
     runtime = KimiKDARuntime(_Cfg(), layer_idx=0).to("cuda")
-    assert _convert_kda_projections_to_fp8_weight_read(
-        _Model(runtime)) == 5
+    assert _convert_kda_projections_to_fp8_weight_read(_Model(runtime)) == 5
     return runtime
 
 
-def _assert_numerically_close(actual: torch.Tensor,
-                              expected: torch.Tensor) -> None:
+def _assert_numerically_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     actual_float = actual.float().flatten()
     expected_float = expected.float().flatten()
-    cosine = torch.nn.functional.cosine_similarity(
-        actual_float, expected_float, dim=0).item()
-    relative_l2 = ((actual_float - expected_float).norm() /
-                   (expected_float.norm() + 1e-12)).item()
+    cosine = torch.nn.functional.cosine_similarity(actual_float, expected_float, dim=0).item()
+    relative_l2 = ((actual_float - expected_float).norm() / (expected_float.norm() + 1e-12)).item()
     assert cosine > 0.999
     assert relative_l2 < 3e-2
 
@@ -76,16 +71,11 @@ def test_fp8_packed_qkv_projection_matches_separate_views() -> None:
     torch.manual_seed(0)
     runtime = _make_runtime()
     mixer = runtime.mixer
-    hidden = (torch.randn(1,
-                          193,
-                          _Cfg.hidden_size,
-                          device="cuda",
-                          dtype=torch.bfloat16) * 0.05)
+    hidden = torch.randn(1, 193, _Cfg.hidden_size, device="cuda", dtype=torch.bfloat16) * 0.05
 
-    packed = mixer.qkvg_proj(hidden)[..., :3 * runtime.proj_size]
+    packed = mixer.qkvg_proj(hidden)[..., : 3 * runtime.proj_size]
     actual = packed.split(runtime.proj_size, dim=-1)
-    expected = (mixer.q_proj(hidden), mixer.k_proj(hidden),
-                mixer.v_proj(hidden))
+    expected = (mixer.q_proj(hidden), mixer.k_proj(hidden), mixer.v_proj(hidden))
 
     for packed_part, separate_part in zip(actual, expected):
         _assert_numerically_close(packed_part, separate_part)
@@ -100,7 +90,8 @@ def test_fp8_packed_qkv_projection_matches_separate_views() -> None:
 )
 @torch.no_grad()
 def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
-        sequence_lengths, use_initial_states, has_initial_states) -> None:
+    sequence_lengths, use_initial_states, has_initial_states
+) -> None:
     torch.manual_seed(1)
     runtime = _make_runtime()
     mixer = runtime.mixer
@@ -111,41 +102,24 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
     h = _Cfg.linear_attn_config["num_heads"]
     head_dim = _Cfg.linear_attn_config["head_dim"]
     conv_size = _Cfg.linear_attn_config["short_conv_kernel_size"]
-    slot_indices = torch.arange(2,
-                                2 + num_prefills,
-                                device="cuda",
-                                dtype=torch.long)
+    slot_indices = torch.arange(2, 2 + num_prefills, device="cuda", dtype=torch.long)
     cu_seqlens = torch.tensor(
-        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
-        device="cuda",
-        dtype=torch.long)
+        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()], device="cuda", dtype=torch.long
+    )
     metadata = SimpleNamespace(
         use_initial_states=use_initial_states,
-        has_initial_states=torch.tensor(has_initial_states,
-                                         device="cuda",
-                                         dtype=torch.bool),
+        has_initial_states=torch.tensor(has_initial_states, device="cuda", dtype=torch.bool),
     )
-    hidden = (torch.randn(num_tokens,
-                          _Cfg.hidden_size,
-                          device="cuda",
-                          dtype=torch.bfloat16) * 0.05)
+    hidden = torch.randn(num_tokens, _Cfg.hidden_size, device="cuda", dtype=torch.bfloat16) * 0.05
     hidden_pristine = hidden.clone()
-    conv_seed = (torch.randn(slots,
-                             3 * d,
-                             conv_size,
-                             device="cuda",
-                             dtype=torch.bfloat16) * 0.02)
-    state_seed = (torch.randn(slots,
-                              h,
-                              head_dim,
-                              head_dim,
-                              device="cuda",
-                              dtype=torch.float32) * 0.01)
+    conv_seed = torch.randn(slots, 3 * d, conv_size, device="cuda", dtype=torch.bfloat16) * 0.02
+    state_seed = (
+        torch.randn(slots, h, head_dim, head_dim, device="cuda", dtype=torch.float32) * 0.01
+    )
 
     calls = {"qkvg": 0, "q": 0, "k": 0, "v": 0}
 
     def _count(name):
-
         def _hook(_module, _inputs, _output):
             calls[name] += 1
 
@@ -195,23 +169,22 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
     torch.testing.assert_close(hidden, hidden_pristine, rtol=0, atol=0)
     _assert_numerically_close(actual, expected)
     _assert_numerically_close(
-        actual_conv.index_select(0, slot_indices),
-        ref_conv.index_select(0, slot_indices))
+        actual_conv.index_select(0, slot_indices), ref_conv.index_select(0, slot_indices)
+    )
     _assert_numerically_close(
-        actual_state.index_select(0, slot_indices),
-        ref_state.index_select(0, slot_indices))
+        actual_state.index_select(0, slot_indices), ref_state.index_select(0, slot_indices)
+    )
 
-    untouched = torch.tensor([0, 1, slots - 1],
-                             device="cuda",
-                             dtype=torch.long)
-    torch.testing.assert_close(actual_conv.index_select(0, untouched),
-                               conv_seed.index_select(0, untouched),
-                               rtol=0,
-                               atol=0)
-    torch.testing.assert_close(actual_state.index_select(0, untouched),
-                               state_seed.index_select(0, untouched),
-                               rtol=0,
-                               atol=0)
+    untouched = torch.tensor([0, 1, slots - 1], device="cuda", dtype=torch.long)
+    torch.testing.assert_close(
+        actual_conv.index_select(0, untouched), conv_seed.index_select(0, untouched), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual_state.index_select(0, untouched),
+        state_seed.index_select(0, untouched),
+        rtol=0,
+        atol=0,
+    )
 
     repeat_conv = conv_seed.clone()
     repeat_state = state_seed.clone()

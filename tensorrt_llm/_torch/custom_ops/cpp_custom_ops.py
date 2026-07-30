@@ -482,9 +482,8 @@ def _register_fake():
         scale_dtype = (routing_bias.dtype
                        if routing_bias is not None else torch.bfloat16)
         return [
-            hidden_states.new_empty(
-                (max_num_padded_tokens, hidden_size),
-                dtype=torch.bfloat16),
+            hidden_states.new_empty((max_num_padded_tokens, hidden_size),
+                                    dtype=torch.bfloat16),
             hidden_states.new_empty((num_tokens, top_k), dtype=scale_dtype),
             hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32),
         ]

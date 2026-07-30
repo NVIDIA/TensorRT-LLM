@@ -111,13 +111,15 @@ _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
 # It is used by TEP's no-dispatch path. Communication paths keep the
 # separate BF16 GEMM and MXFP8 quantization because DEP measurements did
 # not recover the standalone kernel saving.
-_K3_DISABLE_FUSED_LATENT_DOWN_MXFP8 = os.environ.get(
-    "TLLM_K3_DISABLE_FUSED_LATENT_DOWN_MXFP8", "0") == "1"
+_K3_DISABLE_FUSED_LATENT_DOWN_MXFP8 = (
+    os.environ.get("TLLM_K3_DISABLE_FUSED_LATENT_DOWN_MXFP8", "0") == "1"
+)
 
 # A/B escape hatch for the decode-only TRTLLM-Gen finalize + MNNVL
 # AllReduce + latent RMSNorm kernel.
-_K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS = os.environ.get(
-    "TLLM_K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS", "0") == "1"
+_K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS = (
+    os.environ.get("TLLM_K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS", "0") == "1"
+)
 
 # Token-count ceiling for that fused epilogue. Read at import, so
 # CUDA-graph capture and replay agree.
@@ -133,12 +135,12 @@ def _read_fused_finalize_ar_rms_max_tokens() -> int:
         # bound and report a false negative.
         raise ValueError(
             "TLLM_K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS must be an "
-            f"integer in [0, 16], got {raw!r}") from None
+            f"integer in [0, 16], got {raw!r}"
+        ) from None
     return min(max(value, 0), 16)
 
 
-_K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS = (
-    _read_fused_finalize_ar_rms_max_tokens())
+_K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS = _read_fused_finalize_ar_rms_max_tokens()
 
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
 
@@ -727,7 +729,8 @@ class KimiK3MoERuntime(nn.Module):
         self._use_fused_latent_down_mxfp8 = (
             not _K3_DISABLE_MIN_LATENCY_LATENT_PROJ
             and not _K3_DISABLE_FUSED_LATENT_DOWN_MXFP8
-            and routed_comm is None)
+            and routed_comm is None
+        )
 
         # Shared experts stay replicated (DeepSeek's attention-DP
         # semantics): ConfigurableMoE owns its own reduction, so there is
@@ -863,28 +866,28 @@ class KimiK3MoERuntime(nn.Module):
             # is already a single fused GEMM (fp8_swap_ab_gemm). The same
             # applies to the MXFP8-epilogue variant below, which reads
             # ``.weight`` directly as well.
-            down_proj_is_bf16_linear = isinstance(self.routed_expert_down_proj,
-                                                  nn.Linear)
+            down_proj_is_bf16_linear = isinstance(self.routed_expert_down_proj, nn.Linear)
             moe_all_reduce = self.routed_experts.all_reduce
             use_fused_finalize_ar_rms = (
                 not _K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS
                 and self.routed_experts.comm is None
                 and moe_all_reduce is not None
                 and moe_all_reduce.supports_moe_finalize_allreduce_rms_norm
-                and 1 <= hidden_states.shape[0] <=
-                _K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS)
+                and 1 <= hidden_states.shape[0] <= _K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS
+            )
             use_fused_mxfp8 = (
                 self._use_fused_latent_down_mxfp8
                 and down_proj_is_bf16_linear
                 and self.routed_experts.comm is None
-                and 1 <= hidden_states.shape[0] <= 16)
+                and 1 <= hidden_states.shape[0] <= 16
+            )
             if use_fused_mxfp8:
                 op_backend = self.routed_experts.backend.op_backend
                 routed_in, routed_in_sf = op_backend.dsv3_fused_a_gemm_mxfp8(
-                    hidden_states, self.routed_expert_down_proj.weight.t())
+                    hidden_states, self.routed_expert_down_proj.weight.t()
+                )
                 routed_in = MxFp8QuantizedTensor(routed_in, routed_in_sf)
-            elif (_K3_DISABLE_MIN_LATENCY_LATENT_PROJ
-                  or not down_proj_is_bf16_linear):
+            elif _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not down_proj_is_bf16_linear:
                 routed_in = self.routed_expert_down_proj(hidden_states)
             else:
                 routed_in = torch.ops.trtllm.dsv3_fused_a_gemm_op(
@@ -1251,8 +1254,9 @@ class KimiKDARuntime(nn.Module):
 
         fused_qkvg = getattr(mixer, "qkvg_proj", None)
         if fused_qkvg is not None:
-            q_proj_states, k_proj_states, v_proj_states = fused_qkvg(
-                x)[..., :3 * d].split(d, dim=-1)
+            q_proj_states, k_proj_states, v_proj_states = fused_qkvg(x)[..., : 3 * d].split(
+                d, dim=-1
+            )
         else:
             q_proj_states = mixer.q_proj(x)
             k_proj_states = mixer.k_proj(x)

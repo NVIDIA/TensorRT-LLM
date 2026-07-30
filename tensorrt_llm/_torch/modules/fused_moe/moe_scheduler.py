@@ -53,12 +53,10 @@ import torch
 # (896 experts / top-16) register-spills and costs ~33 us/layer at decode
 # batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
 # the same math the attention-DP deployments already run.
-FORCE_SEPARATED_ROUTING = os.environ.get(
-    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
+FORCE_SEPARATED_ROUTING = os.environ.get("TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
-from tensorrt_llm._torch.utils import (EventType, Fp4QuantizedTensor,
-                                       MxFp8QuantizedTensor)
+from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor, MxFp8QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided
@@ -149,11 +147,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
     ) -> torch.Tensor:
         moe = self.moe
 
-        if (isinstance(x, MxFp8QuantizedTensor)
-                and getattr(moe, "comm", None) is not None):
+        if isinstance(x, MxFp8QuantizedTensor) and getattr(moe, "comm", None) is not None:
             raise NotImplementedError(
-                "Pre-quantized MXFP8 input is only supported without MoE "
-                "communication")
+                "Pre-quantized MXFP8 input is only supported without MoE communication"
+            )
 
         # ========== Step 1: Handle padding ==========
         if all_rank_num_tokens is None:
@@ -199,8 +196,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             local_n = x.shape[0]
             if local_n < all_rank_max_num_tokens:
                 pad = all_rank_max_num_tokens - local_n
-                x = torch.cat(
-                    [x, x.new_zeros((pad, x.shape[1]))], dim=0)
+                x = torch.cat([x, x.new_zeros((pad, x.shape[1]))], dim=0)
                 router_logits = torch.cat(
                     [router_logits, router_logits.new_zeros((pad, router_logits.shape[1]))], dim=0
                 )
@@ -392,7 +388,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 2: Apply routing ==========
         requires_separated_routing = (
-            moe.backend._supports_load_balancer() or moe.routing_method.requires_separated_routing
+            moe.backend._supports_load_balancer()
+            or moe.routing_method.requires_separated_routing
             or FORCE_SEPARATED_ROUTING
         )
         if requires_separated_routing:
@@ -417,8 +414,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if moe.apply_router_weight_on_input:
                 if isinstance(x, MxFp8QuantizedTensor):
                     raise NotImplementedError(
-                        "apply_router_weight_on_input does not support "
-                        "pre-quantized MXFP8 input")
+                        "apply_router_weight_on_input does not support pre-quantized MXFP8 input"
+                    )
                 assert x.dtype != torch.float8_e4m3fn, (
                     "Current workaround for apply_router_weight_on_input does not support fp8 input"
                 )
@@ -541,8 +538,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No comm: just quantize
-            x, x_sf = moe.backend.quantize_input(
-                x, post_quant_comm=False)
+            x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
 
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
@@ -849,10 +845,15 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # When the scheduler precomputes top-k for DP/load-balancer paths,
             # the backend must not route again.  Single-rank TRTLLMGen paths do
             # not get precomputed top-k, so they still need router_logits.
-            router_logits_arg = (None if
-                                 (moe.backend._supports_load_balancer()
-                                  or moe.routing_method.requires_separated_routing
-                                  or FORCE_SEPARATED_ROUTING) else router_logits)
+            router_logits_arg = (
+                None
+                if (
+                    moe.backend._supports_load_balancer()
+                    or moe.routing_method.requires_separated_routing
+                    or FORCE_SEPARATED_ROUTING
+                )
+                else router_logits
+            )
             kwargs["router_logits"] = router_logits_arg
             kwargs["do_finalize"] = do_finalize
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(

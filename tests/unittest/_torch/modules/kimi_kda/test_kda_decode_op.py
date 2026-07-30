@@ -172,7 +172,8 @@ def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
     initial_cache = _make_cache(batch_size)
 
     local_output, local_cache = optimized.forward_decode(
-        hidden_states, copy.deepcopy(initial_cache))
+        hidden_states, copy.deepcopy(initial_cache)
+    )
 
     slots = batch_size + 3
     slot_indices = torch.arange(
@@ -194,11 +195,9 @@ def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
     )
     state_pool.mul_(0.2)
     assert state_pool.is_contiguous() is (slot_gap == 0)
-    state_pool.index_copy_(0, slot_indices.long(),
-                           initial_cache.recurrent_state)
+    state_pool.index_copy_(0, slot_indices.long(), initial_cache.recurrent_state)
     unselected_indices = torch.arange(3, device="cuda")
-    unselected_before = state_pool.index_select(0,
-                                                unselected_indices).clone()
+    unselected_before = state_pool.index_select(0, unselected_indices).clone()
     indexed_cache = KimiKDACachedState(
         conv_state_q=initial_cache.conv_state_q.clone(),
         conv_state_k=initial_cache.conv_state_k.clone(),
@@ -246,22 +245,14 @@ def _make_direct_decode_args(
         device=device,
     )
     indices = (
-        torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
-        if indexed_state
-        else None
+        torch.arange(1, batch_size + 1, dtype=torch.int32, device=device) if indexed_state else None
     )
     return {
-        "x_q": torch.randn(
-            1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
-        )
+        "x_q": torch.randn(1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
         * 0.01,
-        "x_k": torch.randn(
-            1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
-        )
+        "x_k": torch.randn(1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
         * 0.01,
-        "x_v": torch.randn(
-            1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
-        )
+        "x_v": torch.randn(1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
         * 0.01,
         "w_q_t": torch.randn(
             CONV_KERNEL_SIZE,
@@ -309,13 +300,9 @@ def _make_direct_decode_args(
             device=device,
         ),
         "A_log": torch.zeros(projection_size, dtype=torch.float32, device=device),
-        "g": torch.zeros(
-            1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
-        ),
+        "g": torch.zeros(1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device),
         "dt_bias": torch.zeros(projection_size, dtype=torch.float32, device=device),
-        "beta": torch.zeros(
-            1, batch_size, num_heads, dtype=torch.bfloat16, device=device
-        ),
+        "beta": torch.zeros(1, batch_size, num_heads, dtype=torch.bfloat16, device=device),
         "state": state,
         "onorm_g": torch.zeros(
             1, batch_size, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
@@ -330,9 +317,7 @@ def _make_direct_decode_args(
             device=device,
         ),
         "ssm_state_indices": indices,
-        "cu_seqlens": torch.arange(
-            batch_size + 1, dtype=torch.int32, device=device
-        ),
+        "cu_seqlens": torch.arange(batch_size + 1, dtype=torch.int32, device=device),
         "lower_bound": -5.0,
     }
 

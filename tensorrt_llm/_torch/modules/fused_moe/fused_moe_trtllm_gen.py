@@ -1106,9 +1106,8 @@ class TRTLLMGenFusedMoE(MoE):
                                     and not self.enable_alltoall)
         post_quant_comm = run_post_quant_allgather or self.enable_alltoall
         requires_separated_routing = (
-            self.routing_method.requires_separated_routing
-            or os.environ.get("TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING",
-                              "0") == "1")
+            self.routing_method.requires_separated_routing or os.environ.get(
+                "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1")
 
         x_sf = None
         token_selected_experts = None

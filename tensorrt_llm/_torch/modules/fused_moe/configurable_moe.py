@@ -37,9 +37,13 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoESchedulerKind
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-from tensorrt_llm._torch.utils import (ActType_TrtllmGen, AuxStreamType,
-                                      EventType, Fp4QuantizedTensor,
-                                      MxFp8QuantizedTensor)
+from tensorrt_llm._torch.utils import (
+    ActType_TrtllmGen,
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
