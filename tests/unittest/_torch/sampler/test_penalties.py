@@ -18,9 +18,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions
-from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
-
-PenaltyHandler = TorchSampler.PenaltyHandler
+from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyHandler
 
 apply_batched_occurrence_penalties = Fusions.apply_batched_occurrence_penalties
 update_occurrence_workspace = Fusions.update_occurrence_workspace
@@ -491,7 +489,7 @@ def test_regular_handler_slot_reuse_does_not_leak_penalties() -> None:
 def test_handler_ignores_occurrence_penalties_with_beam_search() -> None:
     """Beam-search requests never become penalty-active.
 
-    ``TorchSampler.validate_request`` rejects this combination at admission, so the
+    ``PenaltyHandler.validate_request`` rejects this combination at admission, so the
     handler should only ever see beam_width == 1 requests. It stays defensive anyway:
     a beam-search request leaves its slot inactive, and ``apply`` is then a no-op.
     """
@@ -508,3 +506,10 @@ def test_handler_ignores_occurrence_penalties_with_beam_search() -> None:
 
     assert not bool(handler.store.active_cuda[0].item())
     torch.testing.assert_close(logits, original, rtol=0, atol=0)
+
+
+def test_validate_request_rejects_penalties_with_beam_search() -> None:
+    """The admission-time check that keeps the combination above from arriving."""
+    PenaltyHandler.validate_request(_make_handler_request(slot=0, tokens=[3], beam_width=1))
+    with pytest.raises(ValueError, match="penalties with beam search"):
+        PenaltyHandler.validate_request(_make_handler_request(slot=0, tokens=[3], beam_width=2))
