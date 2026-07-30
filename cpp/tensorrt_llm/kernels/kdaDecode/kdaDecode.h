@@ -48,6 +48,7 @@ struct KdaDecodeParams
     void const* outputNormGate;
     float const* outputNormWeight;
     int const* ssmStateIndices;
+    //! Must be arange(batchSize + 1): the kernel only advances each state by one token.
     int const* cuSeqlens;
     float* state;
     int64_t stateSlotStride;
