@@ -228,6 +228,14 @@ def latency_command(
     # Parameters from CLI
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
+    # Checked before the model is loaded so the mistake is reported in seconds
+    # rather than after several minutes of startup.
+    if options.duration is not None and options.concurrency <= 0:
+        raise click.UsageError(
+            "--duration requires a concurrency limit. Without one every request "
+            "is submitted to the engine at once, so there is no point at which "
+            "the deadline can be applied and the full dataset would run. Pass "
+            "--concurrency N.")
 
     # Speculative Decode Options
     medusa_choices = params.get("medusa_choices")

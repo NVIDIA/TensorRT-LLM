@@ -335,6 +335,14 @@ def throughput_command(
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
+    # Checked before the model is loaded so the mistake is reported in seconds
+    # rather than after several minutes of startup.
+    if options.duration is not None and options.concurrency <= 0:
+        raise click.UsageError(
+            "--duration requires a concurrency limit. Without one every request "
+            "is submitted to the engine at once, so there is no point at which "
+            "the deadline can be applied and the full dataset would run. Pass "
+            "--concurrency N.")
     tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
