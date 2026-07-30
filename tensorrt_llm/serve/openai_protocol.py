@@ -1687,15 +1687,11 @@ class VideoGenerationRequest(OpenAIBaseModel):
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
         description=(
-            "Optional image or video reference that guides generation. Content "
-            "is routed by its container signature — filename and MIME metadata "
-            "are ignored. Supported references are PNG and JPEG images (which "
-            "condition image-to-video) and MP4 and AVI video; H.264 is the "
-            "tested video codec, other codecs are best-effort. HEIF/AVIF still "
-            "images share a container signature with MP4 and are rejected with "
-            "a 400 asking for PNG or JPEG. Unrecognized, corrupt or "
-            "undecodable content returns 400. JSON requests carry base64 "
-            "bytes; multipart requests upload the file."),
+            "Optional image or video reference that guides generation. PNG or "
+            "JPEG images condition image-to-video; MP4 or AVI video conditions "
+            "video-to-video, with H.264 the tested codec and others "
+            "best-effort. HEIF/AVIF are not supported. JSON requests carry "
+            "base64 bytes; multipart requests upload the file."),
     )
 
     # Resolution
