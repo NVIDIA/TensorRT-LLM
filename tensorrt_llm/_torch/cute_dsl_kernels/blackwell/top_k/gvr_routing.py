@@ -42,6 +42,27 @@ from typing import Optional
 
 # ---- measured thresholds (B200, f15 grid) --------------------------------
 
+# Below this compressed length no assist tier can pay for itself. The
+# kernel has a fixed-cost floor (~12us at K=1024, ~15us at K=512) that
+# does not shrink with N, and by n_comp/K ~ 1 the stock kernel finishes
+# under that floor - there is nothing left to win.
+#
+# f17 worst-step grid (2026-07-30, 162 cells, one B200, emission tax
+# charged) grouped by selectivity n_comp/K:
+#
+#   n_comp/K   cells  geomean  worst  losing
+#   1.0-1.5        9    0.793  0.717     9/9   <- pro 4k: 1027 candidates
+#   1.5-3         18    1.004  0.908    8/18      for K=1024, a top-k that
+#   3-6           18    1.031  0.910    2/18      selects nearly everything
+#   6-20          36    1.094  0.943    5/36
+#   20-80         36    1.174  0.941    2/36
+#   80+           45    1.721  0.880    2/45
+#
+# Gating here costs flash 4k/8k (geomean 1.03, inside the +-3%
+# run-to-run band) and takes the grid from geomean 1.218 / worst 0.717
+# / 28 losing cells to 1.231 / 0.880 / 10.
+ASSIST_MIN_N_COMP = 4096  # ~8k raw context at compress_ratio 4
+
 # Block-skip prefix pays only when whole-row reads dominate.
 SKIP_MIN_N_COUNTS = 65536  # va: attach block_max unconditionally here up
 SKIP_MIN_N_RUNGS_FLASH = 131072  # vb (flash): bm pays from here
@@ -84,6 +105,11 @@ def plan_emission(batch: int, n_comp: int, k: int, have_epilogue: bool) -> str:
     top-k kernel's N. Returns the tier name; the epilogue emits the
     matching buffers and the next top-k launch routes on them.
     """
+    if n_comp < ASSIST_MIN_N_COMP:
+        # short rows: the stock kernel is already under our fixed cost,
+        # and this holds for the zero-emission rungs tier too - it is
+        # the same kernel, so the floor is the same
+        return "none"
     if not have_epilogue:
         return "rungs"  # closed-loop lines cost nothing to carry
     if batch <= LIST_EMIT_MAX_B and n_comp >= LIST_EMIT_MIN_N:
