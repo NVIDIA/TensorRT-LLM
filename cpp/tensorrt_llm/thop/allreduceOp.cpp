@@ -1597,6 +1597,10 @@ namespace
 constexpr std::array<int64_t, 14> kAllReduceTuningBuckets
     = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
 constexpr size_t kAllReduceNumTuningBuckets = kAllReduceTuningBuckets.size();
+constexpr size_t kAllReduceNumInputs = 6;
+
+using AllReduceInputShape = c10::SmallVector<int64_t, 8>;
+using AllReduceInputShapes = std::array<AllReduceInputShape, kAllReduceNumInputs>;
 
 struct AllReduceTacticCacheKey
 {
@@ -1604,12 +1608,12 @@ struct AllReduceTacticCacheKey
     AllReduceFusionOp fusionOp;
     bool inputUsesNcclWindow;
     c10::ScalarType dtype;
-    c10::SmallVector<int64_t, 8> staticInputShape;
+    AllReduceInputShapes staticInputShapes;
 
     bool operator<(AllReduceTacticCacheKey const& other) const
     {
-        return std::tie(group, fusionOp, inputUsesNcclWindow, dtype, staticInputShape)
-            < std::tie(other.group, other.fusionOp, other.inputUsesNcclWindow, other.dtype, other.staticInputShape);
+        return std::tie(group, fusionOp, inputUsesNcclWindow, dtype, staticInputShapes)
+            < std::tie(other.group, other.fusionOp, other.inputUsesNcclWindow, other.dtype, other.staticInputShapes);
     }
 };
 
@@ -1636,8 +1640,7 @@ std::optional<size_t> getAllReduceBucketIndexForTokens(int64_t numTokens)
     // Match Python's last_positive_power_of_2: the largest bucket also
     // represents token counts through the value immediately before its next
     // power of two.
-    if (numTokens < kAllReduceTuningBuckets.front()
-        || numTokens >= 2 * kAllReduceTuningBuckets.back())
+    if (numTokens < kAllReduceTuningBuckets.front() || numTokens >= 2 * kAllReduceTuningBuckets.back())
     {
         return std::nullopt;
     }
@@ -1675,24 +1678,69 @@ std::optional<int64_t> findAllReduceTactic(AllReduceTacticCacheKey const& key, s
     return iterator == cache.tactics.end() ? std::nullopt : iterator->second[*bucketIndex];
 }
 
-AllReduceTacticCacheKey getAllReduceTacticCacheKey(
-    torch::Tensor const& input, torch::List<int64_t> const& group, AllReduceFusionOp fusionOp, bool inputUsesNcclWindow)
+AllReduceInputShapes getAllReduceStaticInputShapes(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& normWeight,
+    torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
+    torch::optional<torch::Tensor> const& workspace)
+{
+    AllReduceInputShapes staticInputShapes;
+    staticInputShapes[0].append(input.sizes().begin() + 1, input.sizes().end());
+
+    if (residual.has_value())
+    {
+        TORCH_CHECK(residual->dim() > 0, "AllReduce residual must have at least one dimension");
+        staticInputShapes[1].append(residual->sizes().begin(), residual->sizes().end());
+        // Match the constrained dimension in the Python OptimizationProfile.
+        staticInputShapes[1].front() = -1;
+    }
+    else
+    {
+        staticInputShapes[1].push_back(0);
+    }
+
+    auto const appendOptionalInputShape
+        = [](AllReduceInputShape& shape, torch::optional<torch::Tensor> const& optionalInput)
+    {
+        if (optionalInput.has_value())
+        {
+            shape.append(optionalInput->sizes().begin(), optionalInput->sizes().end());
+        }
+        else
+        {
+            // Match the [0] placeholder used by OptimizationProfile for None.
+            shape.push_back(0);
+        }
+    };
+    appendOptionalInputShape(staticInputShapes[2], normWeight);
+    appendOptionalInputShape(staticInputShapes[3], scale);
+    appendOptionalInputShape(staticInputShapes[4], bias);
+    appendOptionalInputShape(staticInputShapes[5], workspace);
+    return staticInputShapes;
+}
+
+AllReduceTacticCacheKey getAllReduceTacticCacheKey(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& normWeight,
+    torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
+    torch::optional<torch::Tensor> const& workspace, torch::List<int64_t> const& group, AllReduceFusionOp fusionOp,
+    bool inputUsesNcclWindow)
 {
     TORCH_CHECK(input.dim() > 0, "AllReduce input must have at least one dimension");
     std::vector<int64_t> groupVector(group.begin(), group.end());
-    c10::SmallVector<int64_t, 8> staticInputShape(input.sizes().begin() + 1, input.sizes().end());
-    return {std::move(groupVector), fusionOp, inputUsesNcclWindow, input.scalar_type(), std::move(staticInputShape)};
+    auto staticInputShapes = getAllReduceStaticInputShapes(input, residual, normWeight, scale, bias, workspace);
+    return {std::move(groupVector), fusionOp, inputUsesNcclWindow, input.scalar_type(), std::move(staticInputShapes)};
 }
 
 } // namespace
 
-void registerAllReduceTactic(
-    torch::Tensor const& input, torch::List<int64_t> const& group, int64_t fusionOp, int64_t bucket, int64_t tactic)
+void registerAllReduceTactic(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
+    torch::optional<torch::Tensor> const& normWeight, torch::optional<torch::Tensor> const& scale,
+    torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> const& workspace,
+    torch::List<int64_t> const& group, int64_t fusionOp, int64_t bucket, int64_t tactic)
 {
     auto const bucketIndex = getAllReduceBucketIndex(bucket);
     TORCH_CHECK(bucketIndex.has_value(), "Invalid AllReduce autotuner bucket: ", bucket);
-    insertAllReduceTactic(getAllReduceTacticCacheKey(
-                              input, group, static_cast<AllReduceFusionOp>(fusionOp), isNCCLWindowBuffer(input, group)),
+    insertAllReduceTactic(getAllReduceTacticCacheKey(input, residual, normWeight, scale, bias, workspace, group,
+                              static_cast<AllReduceFusionOp>(fusionOp), isNCCLWindowBuffer(input, group)),
         *bucketIndex, tactic);
 }
 
@@ -1746,7 +1794,8 @@ std::vector<torch::Tensor> autotunedAllreduce(torch::Tensor const& input,
     torch::optional<torch::Tensor> workspace, torch::List<int64_t> const& group, int64_t const, int64_t const fusionOp,
     double const eps, bool const triggerCompletionAtEnd)
 {
-    auto key = getAllReduceTacticCacheKey(input, group, static_cast<AllReduceFusionOp>(fusionOp), false);
+    auto key = getAllReduceTacticCacheKey(
+        input, residual, normWeight, scale, bias, workspace, group, static_cast<AllReduceFusionOp>(fusionOp), false);
     auto const bucketIndex = getAllReduceBucketIndexForTokens(input.size(0));
     auto const defaultTactic = findAllReduceTactic(key, bucketIndex);
     key.inputUsesNcclWindow = true;
@@ -2292,7 +2341,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int op,"
         "float eps,"
         "bool trigger_completion_at_end) -> Tensor[]");
-    m.def("register_allreduce_tactic(Tensor input, int[] group, int op, int bucket, int tactic) -> ()");
+    m.def(
+        "register_allreduce_tactic(Tensor input, Tensor? residual, Tensor? norm_weight, Tensor? scale, Tensor? bias, "
+        "Tensor? workspace, int[] group, int op, int bucket, int tactic) -> ()");
     m.def("validate_allreduce_tuning_buckets(int[] buckets) -> ()");
     m.def("clear_allreduce_tactic_cache() -> ()");
     m.def(

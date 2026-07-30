@@ -77,8 +77,18 @@ def _register_fake():
                          group, strategy, op, eps, trigger_completion_at_end)
 
     @torch.library.register_fake("trtllm::register_allreduce_tactic")
-    def _(input: torch.Tensor, group: List[int], op: int, bucket: int,
-          tactic: int) -> None:
+    def _(
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        group: List[int],
+        op: int,
+        bucket: int,
+        tactic: int,
+    ) -> None:
         return None
 
     @torch.library.register_fake("trtllm::validate_allreduce_tuning_buckets")
