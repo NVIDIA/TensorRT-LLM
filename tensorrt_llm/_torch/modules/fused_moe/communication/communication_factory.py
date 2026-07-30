@@ -38,15 +38,24 @@ from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
 from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 
+# Temporary NCCL-EP v0.1.0 limitation. The LL combine kernel derives its
+# warp-group count and dynamic-SMEM requirement here:
+# https://github.com/NVIDIA/nccl/blob/nccl-ep-v0.1.0/contrib/nccl_ep/device/low_latency.cu#L1990-L2025
+# Its v0.1.0 group initialization limits LL execution to 14 warp groups:
+# https://github.com/NVIDIA/nccl/blob/nccl-ep-v0.1.0/contrib/nccl_ep/nccl_ep.cc#L1302-L1314
+# TODO: Remove this compatibility check after upgrading to NCCL-EP v0.2,
+# which removes the v0.1.0 LL-combine launch limitation.
+_NCCL_EP_V0_1_LL_MAX_WARP_GROUPS = 14
+
 
 def _get_nccl_ep_ll_combine_smem_requirement(
     num_slots: int, hidden_size: int, num_device_sms: int
 ) -> int | None:
     """Return the NCCL-EP LL combine dynamic-SMEM requirement in bytes."""
     num_warp_groups = (num_slots + num_device_sms - 1) // num_device_sms
-    num_warps_per_group = 32 // num_warp_groups
-    if num_warps_per_group == 0:
+    if num_warp_groups > _NCCL_EP_V0_1_LL_MAX_WARP_GROUPS:
         return None
+    num_warps_per_group = 32 // num_warp_groups
 
     num_warps = num_warp_groups * num_warps_per_group
     num_meta_bytes = hidden_size // 128 * 4
@@ -444,7 +453,8 @@ class CommunicationFactory:
             )
             if required_smem is None:
                 return (
-                    "NcclEP low-latency combine requires at most 32 expert warp groups, got "
+                    "NcclEP low-latency combine requires at most "
+                    f"{_NCCL_EP_V0_1_LL_MAX_WARP_GROUPS} expert warp groups, got "
                     f"{num_slots=} and {device_properties.multi_processor_count=}."
                 )
             if required_smem > max_dynamic_smem:

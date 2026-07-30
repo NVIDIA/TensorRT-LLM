@@ -124,13 +124,13 @@ def test_forced_nccl_ep_validates_preconditions(
         )
 
 
-def test_forced_nccl_ep_rejects_more_than_32_warp_groups(
+def test_forced_nccl_ep_rejects_more_than_14_warp_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_config = _make_model_config()
     assert (
         communication_factory._get_nccl_ep_ll_combine_smem_requirement(
-            num_slots=33,
+            num_slots=15,
             hidden_size=4096,
             num_device_sms=1,
         )
@@ -148,14 +148,14 @@ def test_forced_nccl_ep_rejects_more_than_32_warp_groups(
         ),
     )
 
-    with pytest.raises(ValueError, match="at most 32 expert warp groups"):
+    with pytest.raises(ValueError, match="at most 14 expert warp groups"):
         communication_factory.CommunicationFactory._create_forced_method(
             "NCCL_EP",
             model_config,
-            num_experts=34,
-            num_slots=33,
+            num_experts=16,
+            num_slots=15,
             top_k=8,
-            expert_size_per_partition=17,
+            expert_size_per_partition=8,
             payload_in_workspace=False,
             alltoall_result_do_sum=True,
             use_flashinfer=False,
