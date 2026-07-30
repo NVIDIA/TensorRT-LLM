@@ -4,8 +4,12 @@
 """Unit tests for native Wan VAE temporal decode batching."""
 
 import pytest
+import torch
 
-from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import _native_decode_chunk_size
+from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
+    TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV,
+    _native_decode_chunk_size,
+)
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import _decode_chunk_slices
 
 
@@ -35,16 +39,34 @@ def test_decode_chunk_slices_reject_invalid_chunk_size(chunk_size: int) -> None:
 
 
 @pytest.mark.parametrize(
-    ("parallel_size", "expected"),
+    ("parallel_size", "dtype", "expected"),
     [
-        (1, 1),
-        (2, 1),
-        (4, 4),
-        (8, 1),
+        (1, torch.bfloat16, 1),
+        (1, torch.float32, 1),
+        (2, torch.bfloat16, 2),
+        (4, torch.bfloat16, 4),
+        (4, torch.float32, 2),
+        (8, torch.bfloat16, 2),
     ],
 )
-def test_native_decode_chunk_size_uses_validated_parallel_case(
+def test_native_decode_chunk_size_uses_tuned_or_conservative_value(
     parallel_size: int,
+    dtype: torch.dtype,
     expected: int,
 ) -> None:
-    assert _native_decode_chunk_size(parallel_size) == expected
+    assert _native_decode_chunk_size(parallel_size, dtype) == expected
+
+
+def test_native_decode_chunk_size_honors_env_override(monkeypatch):
+    monkeypatch.setenv(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV, "5")
+    assert _native_decode_chunk_size(1, torch.bfloat16) == 5
+
+
+@pytest.mark.parametrize("override", ["0", "-1", "invalid"])
+def test_native_decode_chunk_size_rejects_invalid_env_override(
+    monkeypatch,
+    override: str,
+) -> None:
+    monkeypatch.setenv(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV, override)
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        _native_decode_chunk_size(4, torch.bfloat16)

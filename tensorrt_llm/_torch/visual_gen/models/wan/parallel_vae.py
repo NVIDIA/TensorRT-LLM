@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Literal
 
 import torch
@@ -33,10 +34,36 @@ from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import (
 )
 from tensorrt_llm._torch.visual_gen.utils import as_tuple
 
+TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV = "TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE"
 
-def _native_decode_chunk_size(parallel_size: int) -> int:
-    """Return the validated native-BF16 temporal batch size for Wan decode."""
-    return 4 if parallel_size == 4 else 1
+# Keep tuned entries explicit so future sweeps can extend this table by
+# parallel size and compute dtype without changing the selection policy.
+_NATIVE_DECODE_CHUNK_SIZES = {
+    (4, torch.bfloat16): 4,
+}
+_DEFAULT_MULTI_GPU_DECODE_CHUNK_SIZE = 2
+
+
+def _native_decode_chunk_size(parallel_size: int, dtype: torch.dtype) -> int:
+    """Select the native Wan decode temporal batch size."""
+    override = os.environ.get(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV, "").strip()
+    if override:
+        try:
+            chunk_size = int(override)
+        except ValueError:
+            raise ValueError(
+                f"{TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV} must be a positive integer."
+            ) from None
+        if chunk_size < 1:
+            raise ValueError(f"{TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV} must be a positive integer.")
+        return chunk_size
+
+    if parallel_size <= 1:
+        return 1
+    return _NATIVE_DECODE_CHUNK_SIZES.get(
+        (parallel_size, dtype),
+        _DEFAULT_MULTI_GPU_DECODE_CHUNK_SIZE,
+    )
 
 
 class WanCausalConvHalo(HaloExchangeConv):
@@ -230,5 +257,5 @@ class ParallelVAE_TrtllmWan(ParallelVAE_Wan):
         z: torch.Tensor,
         **kwargs: Any,
     ) -> DecoderOutput | tuple[torch.Tensor]:
-        kwargs["temporal_chunk_size"] = _native_decode_chunk_size(self.world_size)
+        kwargs["temporal_chunk_size"] = _native_decode_chunk_size(self.world_size, z.dtype)
         return super()._decode_impl(z, **kwargs)
