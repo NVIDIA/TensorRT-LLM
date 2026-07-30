@@ -39,22 +39,23 @@ def test_decode_chunk_slices_reject_invalid_chunk_size(chunk_size: int) -> None:
 
 
 @pytest.mark.parametrize(
-    ("parallel_size", "dtype", "expected"),
+    ("parallel_size", "precision", "expected"),
     [
         (1, torch.bfloat16, 1),
         (1, torch.float32, 1),
         (2, torch.bfloat16, 2),
         (4, torch.bfloat16, 4),
         (4, torch.float32, 2),
+        (4, "untuned-quantized", 2),
         (8, torch.bfloat16, 2),
     ],
 )
 def test_native_decode_chunk_size_uses_tuned_or_conservative_value(
     parallel_size: int,
-    dtype: torch.dtype,
+    precision: torch.dtype | str,
     expected: int,
 ) -> None:
-    assert _native_decode_chunk_size(parallel_size, dtype) == expected
+    assert _native_decode_chunk_size(parallel_size, precision) == expected
 
 
 def test_native_decode_chunk_size_honors_env_override(monkeypatch):

@@ -37,14 +37,20 @@ from tensorrt_llm._torch.visual_gen.utils import as_tuple
 TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV = "TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE"
 
 # Keep tuned entries explicit so future sweeps can extend this table by
-# parallel size and compute dtype without changing the selection policy.
-_NATIVE_DECODE_CHUNK_SIZES = {
+# parallel size and compute precision without changing the selection policy.
+# Quantized paths may use a logical precision string because their surrounding
+# activation tensors can retain a higher-precision torch dtype.
+DecodePrecision = torch.dtype | str
+_NATIVE_DECODE_CHUNK_SIZES: dict[tuple[int, DecodePrecision], int] = {
     (4, torch.bfloat16): 4,
 }
 _DEFAULT_MULTI_GPU_DECODE_CHUNK_SIZE = 2
 
 
-def _native_decode_chunk_size(parallel_size: int, dtype: torch.dtype) -> int:
+def _native_decode_chunk_size(
+    parallel_size: int,
+    precision: DecodePrecision,
+) -> int:
     """Select the native Wan decode temporal batch size."""
     override = os.environ.get(TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE_ENV, "").strip()
     if override:
@@ -61,7 +67,7 @@ def _native_decode_chunk_size(parallel_size: int, dtype: torch.dtype) -> int:
     if parallel_size <= 1:
         return 1
     return _NATIVE_DECODE_CHUNK_SIZES.get(
-        (parallel_size, dtype),
+        (parallel_size, precision),
         _DEFAULT_MULTI_GPU_DECODE_CHUNK_SIZE,
     )
 
