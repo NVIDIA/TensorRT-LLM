@@ -89,6 +89,7 @@ from ...attention_backend.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
+from ..multi_stream_utils import maybe_execute_in_parallel
 from ..rms_norm import RMSNorm
 
 
@@ -328,6 +329,7 @@ class KimiK3MLAAttention(nn.Module):
         apply_rotary_mutation: bool = False,
         omit_output_gate_mutation: bool = False,
         quant_config: Optional[QuantConfig] = None,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -345,6 +347,15 @@ class KimiK3MLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.apply_rotary_mutation = apply_rotary_mutation
         self.omit_output_gate_mutation = omit_output_gate_mutation
+        # Side stream (+ fork/join events) for the decode-path overlaps in
+        # ``_forward_decode_fused``: the Q projection chain against the KV
+        # projection chain, and the absorb bmm against ``mla_rope_generation``
+        # (the DeepSeek MLA pattern, mla.py). Engaged only when multi-stream
+        # is active (i.e. under CUDA graphs) and a stream was supplied;
+        # otherwise both legs run in order with an identical result.
+        self.aux_stream = aux_stream
+        self._proj_events = (torch.cuda.Event(), torch.cuda.Event())
+        self._rope_events = (torch.cuda.Event(), torch.cuda.Event())
 
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
         self.q_a_layernorm = RMSNorm(hidden_size=q_lora_rank, eps=rms_norm_eps, dtype=dtype)
@@ -865,8 +876,26 @@ class KimiK3MLAAttention(nn.Module):
         """
         num_tokens = hidden_states.shape[0]
         metadata = rt.metadata
-        q_nope, q_rot = self._project_q_unabsorbed(hidden_states)
-        _, _, latent_cache = self._project_kv_and_latent(hidden_states)
+        # The Q chain (q_a_proj -> q_a_layernorm -> q_b_proj) and the KV chain
+        # (kv_a_proj_with_mqa -> kv_a_layernorm -> cat) both read only
+        # ``hidden_states`` and write disjoint tensors, so they are fully
+        # data-independent. DeepSeek MLA fuses q_a and kv_a into one GEMM and
+        # can therefore overlap only the two layernorms; K3 keeps them as
+        # separate projections, so the whole chains overlap.
+        (q_nope, q_rot), (_, _, latent_cache) = maybe_execute_in_parallel(
+            lambda: self._project_q_unabsorbed(hidden_states),
+            lambda: self._project_kv_and_latent(hidden_states),
+            self._proj_events[0],
+            self._proj_events[1],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
+        if self.aux_stream is not None:
+            # ``latent_cache`` was allocated on the side stream but is consumed
+            # on this one (rope generation, then the FMHA); tell the caching
+            # allocator it is still live here so its storage cannot be recycled
+            # into a later side-stream allocation while still in use.
+            latent_cache.record_stream(torch.cuda.current_stream())
 
         k_absorb, v_absorb = self._kv_b_absorb_split()
 
@@ -877,16 +906,11 @@ class KimiK3MLAAttention(nn.Module):
         fused_q = hidden_states.new_empty(
             (num_tokens, self.num_heads, self.kv_lora_rank + self.qk_rope_head_dim)
         )
-        # Absorb: [H, T, m] × [H, m, kv] -> [H, T, kv] (m = qk_nope_head_dim),
-        # written directly into fused_q's latent slice.
-        torch.ops.trtllm.bmm_out(
-            q_nope.transpose(0, 1), k_absorb, fused_q[..., : self.kv_lora_rank].transpose(0, 1)
-        )
-
         num_seqs = metadata.num_seqs
         cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=hidden_states.device)
         cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=hidden_states.device)
         fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=hidden_states.device)
+        has_fp8_kv_cache = getattr(self._backend_gen, "has_fp8_kv_cache", False)
         # FP8 KV cache: the rope-generation op additionally quantizes the
         # appended latent row and fused_q, emitting the FMHA dequant scales
         # and the quantized-Q buffer (same contract as the DeepSeek MLA
@@ -894,7 +918,7 @@ class KimiK3MLAAttention(nn.Module):
         mla_bmm1_scale = None
         mla_bmm2_scale = None
         quant_q_buffer = None
-        if getattr(self._backend_gen, "has_fp8_kv_cache", False):
+        if has_fp8_kv_cache:
             mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=hidden_states.device)
             mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
             quant_q_buffer = torch.empty(
@@ -904,21 +928,58 @@ class KimiK3MLAAttention(nn.Module):
                 dtype=torch.uint8,
                 device=hidden_states.device,
             )
-        # Identity rope (NoPE): writes q_rot into fused_q's rope tail,
-        # appends the latent row to the paged cache, and fills the
-        # scheduler buffers — one op, CUDA-graph-safe (the DeepSeek MLA
-        # generation path uses it under graphs in production).
-        self._backend_gen.mla_rope_generation(
-            fused_q,
-            q_rot_use,
-            latent_cache,
-            metadata,
-            cu_q_seqlens,
-            cu_kv_seqlens,
-            fmha_scheduler_counter,
-            mla_bmm1_scale,
-            mla_bmm2_scale,
-            quant_q_buffer,
+
+        def _absorb_bmm():
+            # Absorb: [H, T, m] × [H, m, kv] -> [H, T, kv]
+            # (m = qk_nope_head_dim), written directly into fused_q's latent
+            # slice.
+            torch.ops.trtllm.bmm_out(
+                q_nope.transpose(0, 1), k_absorb, fused_q[..., : self.kv_lora_rank].transpose(0, 1)
+            )
+
+        def _rope_generation():
+            # Identity rope (NoPE): writes q_rot into fused_q's rope tail,
+            # appends the latent row to the paged cache, and fills the
+            # scheduler buffers — one op, CUDA-graph-safe (the DeepSeek MLA
+            # generation path uses it under graphs in production).
+            self._backend_gen.mla_rope_generation(
+                fused_q,
+                q_rot_use,
+                latent_cache,
+                metadata,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                fmha_scheduler_counter,
+                mla_bmm1_scale,
+                mla_bmm2_scale,
+                quant_q_buffer,
+            )
+
+        # The absorb bmm writes only fused_q[..., :kv_lora_rank] while the rope
+        # kernel writes only the rope tail (mlaKernels.cu offsets its q store
+        # by +kv_lora_rank), the paged cache, and the scheduler buffers — so
+        # with a BF16 KV cache the two are data-independent and overlap on
+        # disjoint slices with no extra copy.
+        #
+        # NOT so under an FP8 KV cache: the extra CTAs that the grid gains for
+        # cache_type == FP8 read fused_q's latent slice back to quantize it
+        # into quant_q_buffer, i.e. they consume the bmm's output. Overlapping
+        # would race, so keep them serialized there — the same gate the
+        # DeepSeek MLA decode path applies in mla.py.
+        rope_stream = None if has_fp8_kv_cache else self.aux_stream
+        if rope_stream is not None:
+            # These were allocated on this stream but the rope leg writes them
+            # from the side stream, so mark them live there too before the fork.
+            for t in (fused_q, cu_q_seqlens, cu_kv_seqlens,
+                      fmha_scheduler_counter):
+                t.record_stream(rope_stream)
+        maybe_execute_in_parallel(
+            _absorb_bmm,
+            _rope_generation,
+            self._rope_events[0],
+            self._rope_events[1],
+            rope_stream,
+            disable_on_compile=True,
         )
 
         forward_args = AttentionForwardArgs(
