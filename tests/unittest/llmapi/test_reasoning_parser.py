@@ -854,3 +854,77 @@ def test_inkling_reasoning_parser_stream_across_deltas():
     content = "".join(parser.parse_delta(d).content for d in deltas)
     content += parser.finish().content
     assert content == "ANS 5"
+
+
+# --- HUMAN FEEDBACK #9 Task 3.2: streaming == batch under ANY chunk boundary --------
+# Acceptance line 71 (validation_tier=unit): streaming reasoning parsing must match on
+# chunked typed content blocks, partial control tokens, thinking/text/tool blocks, and
+# end-sampling/end-message tokens. The strong invariant that covers all of these: the
+# streamed result (deltas + finish) equals the full parse for EVERY chunk boundary,
+# including boundaries that split a control token mid-token.
+_INK_STREAM_CASES = [
+    # thinking -> visible answer
+    f"{INK_CH}3+4=7{INK_EM}{INK_MM}{INK_CT}The answer is 7{INK_EM}{INK_END}",
+    # interleaved thinking / two content_text blocks
+    (f"{INK_CH}try A{INK_EM}{INK_MM}{INK_CT}Step 1{INK_EM}"
+     f"{INK_CH}reconsider{INK_EM}{INK_MM}{INK_CT} Step 2{INK_EM}{INK_END}"),
+    # tool-invocation block (routes to content, matching SGLang)
+    f'{INK_CH}need a tool{INK_EM}{INK_MM}<|content_invoke_tool_json|>{{"name":"f"}}{INK_EM}{INK_END}',
+    # separator-interleaved repetition (the pre-fix EOS-bug runtime shape)
+    f"{INK_CH}reason{INK_EM}" + f"{INK_MM}{INK_CT}Answer: A{INK_EM}{INK_END}" * 6,
+    # non-Inkling / already-stripped passthrough
+    "plain answer without any markers",
+]
+
+
+def _ink_stream(text, splits):
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    edges = [0] + list(splits) + [len(text)]
+    content = reasoning = ""
+    for a, b in zip(edges, edges[1:]):
+        r = parser.parse_delta(text[a:b])
+        content += r.content
+        reasoning += r.reasoning_content
+    r = parser.finish()
+    return content + r.content, reasoning + r.reasoning_content
+
+
+@pytest.mark.parametrize("text", _INK_STREAM_CASES)
+def test_inkling_reasoning_parser_stream_equals_batch_any_split(text: str):
+    """Streamed result must equal the full parse for char-by-char streaming AND for a
+    split at EVERY single index (each may land mid-control-token)."""
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    batch = parser.parse(text)
+    c, r = _ink_stream(text, range(1, len(text)))
+    assert (c, r) == (batch.content, batch.reasoning_content)
+    for k in range(1, len(text)):
+        c, r = _ink_stream(text, [k])
+        assert c == batch.content, f"content mismatch at split {k}"
+        assert r == batch.reasoning_content, f"reasoning mismatch at split {k}"
+
+
+def test_inkling_reasoning_parser_tool_and_repetition_segmentation():
+    """Tool-invocation blocks route to visible content (matching SGLang); the pre-fix
+    separator-interleaved repetition splits into one reasoning block plus the repeated
+    visible answers, with NO control tokens leaking into either channel."""
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    r = parser.parse(
+        f'{INK_CH}need tool{INK_EM}{INK_MM}<|content_invoke_tool_json|>{{"n":1}}{INK_EM}{INK_END}')
+    assert r.content == '{"n":1}'
+    assert r.reasoning_content == "need tool"
+    rep = f"{INK_CH}reason{INK_EM}" + f"{INK_MM}{INK_CT}Answer: A{INK_EM}{INK_END}" * 6
+    r = parser.parse(rep)
+    assert r.reasoning_content == "reason"
+    assert r.content == "Answer: A" * 6
+    assert "<|" not in r.content and "<|" not in r.reasoning_content
+
+
+def test_inkling_reasoning_parser_end_tokens_split_across_deltas():
+    """<|end_message|> and <|content_model_end_sampling|> split across delta
+    boundaries must still close their block (partial-control holdback)."""
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    deltas = [f"{INK_CH}think{INK_EM}{INK_MM}{INK_CT}ANS<|end_mes",
+              "sage|><|content_model_end_", "sampling|>"]
+    content = "".join(parser.parse_delta(d).content for d in deltas)
+    content += parser.finish().content
+    assert content == "ANS"
