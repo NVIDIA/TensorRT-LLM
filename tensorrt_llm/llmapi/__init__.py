@@ -20,12 +20,12 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        MedusaDecodingConfig, MiniMaxM3SparseAttentionConfig,
                        MoeConfig, MTPDecodingConfig, MultimodalConfig,
                        NGramDecodingConfig, PARDDecodingConfig,
-                       PrometheusMetricsConfig, ReorderRequestPolicyConfig,
-                       RocketSparseAttentionConfig, SADecodingConfig,
-                       SAEnhancerConfig, SaveHiddenStatesDecodingConfig,
-                       SchedulerConfig, SkipSoftmaxAttentionConfig,
-                       TorchCompileConfig, TorchLlmArgs,
-                       UserProvidedDecodingConfig)
+                       PrefillCudaGraphBackend, PrometheusMetricsConfig,
+                       ReorderRequestPolicyConfig, RocketSparseAttentionConfig,
+                       SADecodingConfig, SAEnhancerConfig,
+                       SaveHiddenStatesDecodingConfig, SchedulerConfig,
+                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
+                       TorchLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import KvCacheRetentionConfig, QuantAlgo, QuantConfig
 from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
@@ -90,6 +90,7 @@ __all__ = [
     'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
     'PrometheusMetricsConfig',
+    'PrefillCudaGraphBackend',
     'ThinkingBudgetLogitsProcessor',
     'add_thinking_budget_logits_processor',
     'MultimodalConfig',
