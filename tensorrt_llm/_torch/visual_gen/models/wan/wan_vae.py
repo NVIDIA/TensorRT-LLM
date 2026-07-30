@@ -1037,9 +1037,11 @@ class WanVAE(nn.Module):
         z = _channels_last_3d_if_needed(z)
         x = self.post_quant_conv(z)
         out_chunks: list[torch.Tensor] = []
+        # Decode the first frame alone to initialize each causal Conv cache.
+        # Later slices batch adjacent frames through the complete decoder while
+        # reusing the preceding slice's per-layer temporal context.
         for index, frame_slice in enumerate(_decode_chunk_slices(num_frame, temporal_chunk_size)):
-            # Restart the per-pass layer cursor, but preserve _feat_map so each
-            # causal Conv receives its own preceding temporal context.
+            # Each decoder pass starts from layer zero; cached context persists.
             self._conv_idx = [0]
             out_chunk = self.decoder(
                 x[:, :, frame_slice, :, :],
