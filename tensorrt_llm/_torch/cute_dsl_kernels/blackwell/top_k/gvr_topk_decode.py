@@ -297,6 +297,7 @@ class GvrTopKKernel:
         p4_tail_fast: Optional[bool] = None,  # [p4tt]
         p4_tail_v3: Optional[bool] = None,
         p1r_rescue: bool = True,
+        num_bins: Optional[int] = None,
         p4_warp_redundant: bool = True,
         p2_warp_redundant: bool = True,
         enable_block_skip: bool = False,
@@ -415,7 +416,9 @@ class GvrTopKKernel:
 
         params = GvrParams.get(self._dtype_name, top_k, self.compress_ratio)
         self.kC = params.kC
-        self.kNumBins = params.kNumBins
+        # num_bins: the coarse histogram width. The bin search walks it
+        # per warp, so it sets the barrier count of the P4 head.
+        self.kNumBins = params.kNumBins if num_bins is None else int(num_bins)
         self.kFTarget = params.kFTarget
 
         # Kernel-wide constants.
