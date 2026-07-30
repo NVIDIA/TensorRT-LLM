@@ -426,7 +426,7 @@ class DSparkWorker(SpecWorkerBase):
         else:
             full_logits = gen_logits.transpose(0, 1).contiguous()
 
-        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1)
+        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1).long()
         new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
 
         gen_draft_tokens = []
