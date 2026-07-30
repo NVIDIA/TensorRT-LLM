@@ -1689,22 +1689,12 @@ class VideoGenerationRequest(OpenAIBaseModel):
         description=(
             "Optional image or video reference that guides generation. Content "
             "is routed by its container signature — filename and MIME metadata "
-            "are ignored (JSON requests carry bare base64 with no such "
-            "metadata). Images (PNG image/png, JPEG image/jpeg) condition "
-            "image-to-video. Video containers (MP4 video/mp4, AVI "
-            "video/x-msvideo) pass through encoded and are decoded on the "
-            "workers' NVDEC; tested codec is H.264 in both containers, other "
-            "codecs/profiles depend on the GPU's decoder capabilities and are "
-            "best-effort. The signature only routes: the worker's decoder is "
-            "what accepts a reference, for both modalities. HEIF/AVIF still "
-            "images share the ISO-BMFF signature with MP4 and are rejected "
-            "with a 400 asking for PNG/JPEG rather than routed to the video "
-            "decoder. An unrecognized container is a 400 at the boundary; how "
-            "a decoder failure past it is reported is pipeline-specific — "
-            "Cosmos3 reports undecodable or corrupt references as client "
-            "errors (400) and device-memory exhaustion as capacity (503). "
-            "Reference decoding is bounded to 7200 frames by default "
-            "(TRTLLM_MAX_REFERENCE_DECODE_FRAMES). JSON requests carry base64 "
+            "are ignored. Supported references are PNG and JPEG images (which "
+            "condition image-to-video) and MP4 and AVI video; H.264 is the "
+            "tested video codec, other codecs are best-effort. HEIF/AVIF still "
+            "images share a container signature with MP4 and are rejected with "
+            "a 400 asking for PNG or JPEG. Unrecognized, corrupt or "
+            "undecodable content returns 400. JSON requests carry base64 "
             "bytes; multipart requests upload the file."),
     )
 

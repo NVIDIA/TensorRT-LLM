@@ -51,12 +51,7 @@ class VisualGenResult:
     A single instance backs both single-prompt and batch-prompt requests:
 
     - Single prompt: ``await handle`` resolves to a :class:`VisualGenOutput`.
-      Underlying-request failure raises a built-in exception carrying the
-      detail in its message: :class:`ValueError` for client errors (unusable
-      request content — an undecodable media reference, out-of-range
-      conditioning), :class:`MemoryError` for capacity failures (a valid
-      request that does not fit this deployment), and :class:`RuntimeError`
-      for anything unclassified.
+      Underlying-request failure raises.
     - Batch prompt: ``await handle`` resolves to ``List[VisualGenOutput]``.
       Per-item or whole-batch failure never raises; failed items carry
       ``error != None`` (Option B semantics).
@@ -96,9 +91,7 @@ class VisualGenResult:
         """Wait for the underlying request and return the resolved value.
 
         For single-prompt requests, returns a :class:`VisualGenOutput`.
-        Underlying-request failure raises :class:`ValueError` (client),
-        :class:`MemoryError` (capacity), or :class:`RuntimeError`
-        (unclassified) — see the class docstring.
+        Underlying-request failure raises.
 
         For batch-prompt requests, returns ``List[VisualGenOutput]``. Never
         raises; failed items carry ``error != None``.
@@ -349,13 +342,6 @@ class VisualGen:
             prompts, ``List[VisualGenOutput]`` of the same length.
 
         Raises:
-            ValueError: Single-prompt path, client-class failure (unusable
-                request content).
-            MemoryError: Single-prompt path, capacity failure (a valid
-                request that does not fit this deployment).
-            RuntimeError: Single-prompt path, any unclassified failure. The
-                batch path never raises on per-item or whole-batch failure;
-                failed items carry ``error != None``.
             NotImplementedError: ``params`` is a list (per-item parameters
                 are not yet supported).
         """
