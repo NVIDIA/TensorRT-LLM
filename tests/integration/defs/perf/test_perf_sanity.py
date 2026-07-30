@@ -17,6 +17,7 @@
 import copy
 import fcntl
 import glob
+import json
 import os
 import re
 import shutil
@@ -1390,20 +1391,7 @@ class DisaggTestCmds(NamedTuple):
             time.sleep(poll_interval)
 
     @staticmethod
-    def _wait_for_kv_transfer_trace_files(
-        timeout: int = KV_TRANSFER_TRACE_READY_TIMEOUT_SECONDS,
-    ) -> None:
-        """Require every traced external rank to emit its startup record."""
-        if os.getenv(KV_TRANSFER_TRACE_REQUIRED_ENV, "0") != "1":
-            return
-
-        trace_output_dir = os.getenv(KV_TRANSFER_TRACE_OUTPUT_DIR_ENV)
-        if not trace_output_dir:
-            raise RuntimeError(
-                f"{KV_TRANSFER_TRACE_OUTPUT_DIR_ENV} is missing while "
-                f"{KV_TRANSFER_TRACE_REQUIRED_ENV}=1"
-            )
-
+    def _required_kv_transfer_trace_counts() -> Dict[str, int]:
         try:
             expected_by_side = {
                 "ctx": int(os.environ[KV_TRANSFER_TRACE_EXPECTED_CTX_FILES_ENV]),
@@ -1418,6 +1406,39 @@ class DisaggTestCmds(NamedTuple):
             )
         if sum(expected_by_side.values()) == 0:
             raise RuntimeError("At least one KV transfer trace file must be expected")
+        return expected_by_side
+
+    def _required_kv_transfer_trace_output_dir(self) -> Optional[str]:
+        if os.getenv(KV_TRANSFER_TRACE_REQUIRED_ENV, "0") != "1":
+            return None
+
+        trace_output_dir = os.getenv(KV_TRANSFER_TRACE_OUTPUT_DIR_ENV)
+        if not trace_output_dir:
+            raise RuntimeError(
+                f"{KV_TRANSFER_TRACE_OUTPUT_DIR_ENV} is missing while "
+                f"{KV_TRANSFER_TRACE_REQUIRED_ENV}=1"
+            )
+
+        expected_output_dir = os.path.join(self.test_output_dir, "kv_transfer_traces")
+        if os.path.realpath(trace_output_dir) != os.path.realpath(expected_output_dir):
+            raise RuntimeError(
+                "KV transfer trace output directory does not match the pytest-selected "
+                "test output directory. The perf launcher and pytest shard selected "
+                f"different tests: configured={trace_output_dir}, "
+                f"expected={expected_output_dir}"
+            )
+        return trace_output_dir
+
+    def _wait_for_kv_transfer_trace_files(
+        self,
+        timeout: int = KV_TRANSFER_TRACE_READY_TIMEOUT_SECONDS,
+    ) -> None:
+        """Require every traced external rank to emit its startup record."""
+        trace_output_dir = self._required_kv_transfer_trace_output_dir()
+        if trace_output_dir is None:
+            return
+
+        expected_by_side = self._required_kv_transfer_trace_counts()
 
         start_time = time.time()
         ready_by_side = {"ctx": [], "gen": []}
@@ -1480,6 +1501,60 @@ class DisaggTestCmds(NamedTuple):
                     f"output_dir={trace_output_dir}"
                 )
             time.sleep(1)
+
+    def _write_kv_transfer_trace_manifest(self) -> None:
+        """Persist proof that every required rank trace is in the archived tree."""
+        trace_output_dir = self._required_kv_transfer_trace_output_dir()
+        if trace_output_dir is None:
+            return
+
+        expected_by_side = self._required_kv_transfer_trace_counts()
+        trace_paths = sorted(glob.glob(os.path.join(trace_output_dir, "kv_transfer_trace.*.log")))
+        files_by_side = {
+            side: [
+                path
+                for path in trace_paths
+                if os.path.basename(path).startswith(f"kv_transfer_trace.{side}.")
+            ]
+            for side in expected_by_side
+        }
+        missing = {
+            side: expected_by_side[side] - len(paths)
+            for side, paths in files_by_side.items()
+            if len(paths) < expected_by_side[side]
+        }
+        if missing:
+            raise RuntimeError(
+                "Required KV transfer traces disappeared before artifact collection: "
+                f"missing={missing}, output_dir={trace_output_dir}"
+            )
+
+        manifest = {
+            "snapshot_wall_time_ns": time.time_ns(),
+            "test_output_dir": self.test_output_dir,
+            "trace_output_dir": trace_output_dir,
+            "expected_files": expected_by_side,
+            "files": [
+                {
+                    "name": os.path.basename(path),
+                    "size_bytes": os.path.getsize(path),
+                    "modified_time_ns": os.stat(path).st_mtime_ns,
+                }
+                for path in trace_paths
+            ],
+        }
+        manifest_path = os.path.join(trace_output_dir, "trace_snapshot_manifest.json")
+        temporary_path = f"{manifest_path}.{os.getpid()}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as manifest_file:
+            json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+            manifest_file.write("\n")
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+        os.replace(temporary_path, manifest_path)
+        print_info(
+            f"KV transfer trace snapshot manifest written: {manifest_path}, "
+            f"files={len(trace_paths)}"
+        )
 
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
@@ -1692,8 +1767,11 @@ class DisaggTestCmds(NamedTuple):
                     )
 
             finally:
-                with open(benchmark_status_file, "w") as status_file:
-                    status_file.write("Done")
+                try:
+                    self._write_kv_transfer_trace_manifest()
+                finally:
+                    with open(benchmark_status_file, "w") as status_file:
+                        status_file.write("Done")
 
             # benchmark_status is written, so the gen workers can now stop and
             # their srun will exit and drop gen_server_{i}.done. Wait once for

@@ -18,9 +18,12 @@ Test name → yaml folder mapping mirrors test_perf_sanity.py:parse_test_string.
 """
 
 import argparse
+import heapq
+import json
 import math
 import os
 import re
+import shlex
 import sys
 
 import yaml
@@ -52,26 +55,166 @@ KV_TRANSFER_TRACE_EXPECTED_GEN_FILES_ENV = "TLLM_KV_TRANSFER_TRACE_EXPECTED_GEN_
 # --------------------------------------------------------------------------- #
 # Test list parsing
 # --------------------------------------------------------------------------- #
-def parse_test_case_name(test_list_path, llm_src, split_group=0):
+def _read_test_list_lines(test_list_path):
+    with open(test_list_path, "r") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    if not lines:
+        raise ValueError(f"Test list is empty: {test_list_path}")
+    return lines
+
+
+def _pytest_command_tokens(script_prefix_lines):
+    pytest_command_line = next(
+        (line for line in script_prefix_lines if "export pytestCommand=" in line), ""
+    )
+    if not pytest_command_line:
+        return []
+    command = pytest_command_line.split("=", 1)[1].strip()
+    if len(command) >= 2 and command[0] == command[-1] and command[0] in ('"', "'"):
+        command = command[1:-1]
+    return shlex.split(command)
+
+
+def _pytest_option(tokens, option):
+    for index, token in enumerate(tokens):
+        if token == option:
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        if token.startswith(f"{option}="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _test_nodeid(test_line):
+    """Strip test-list markers from a line, matching pytest's selected nodeid."""
+    return re.split(
+        r"\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)(?:\s|$)",
+        test_line,
+        maxsplit=1,
+    )[0]
+
+
+def _load_pytest_split_durations(tokens, llm_src):
+    durations_option = _pytest_option(tokens, "--durations-path")
+    if durations_option:
+        durations_path = durations_option
+        if not os.path.exists(durations_path):
+            durations_path = os.path.join(
+                llm_src,
+                "tests",
+                "integration",
+                "defs",
+                os.path.basename(durations_option),
+            )
+    else:
+        durations_path = os.path.join(llm_src, "tests", "integration", "defs", ".test_durations")
+
+    try:
+        with open(durations_path, "r") as durations_file:
+            durations = json.load(durations_file)
+    except FileNotFoundError:
+        durations = {}
+    if isinstance(durations, list):
+        durations = dict(durations)
+    if not isinstance(durations, dict):
+        raise ValueError(f"Invalid pytest-split durations file: {durations_path}")
+    return durations, durations_path
+
+
+def _select_least_duration_group(lines, durations, splits, group):
+    """Mirror pytest-split's LeastDurationAlgorithm exactly."""
+    if splits < 1:
+        raise ValueError(f"pytest --splits must be >= 1, got {splits}")
+    if group < 1 or group > splits:
+        raise ValueError(f"pytest --group must be in [1, {splits}], got {group}")
+
+    nodeids = [_test_nodeid(line) for line in lines]
+    relevant_durations = {
+        nodeid: float(durations[nodeid]) for nodeid in nodeids if nodeid in durations
+    }
+    average_duration = (
+        sum(relevant_durations.values()) / len(relevant_durations) if relevant_durations else 1.0
+    )
+    items = [
+        (line, nodeid, relevant_durations.get(nodeid, average_duration), original_index)
+        for original_index, (line, nodeid) in enumerate(zip(lines, nodeids))
+    ]
+
+    # pytest-split first sorts by item name, then performs a stable descending
+    # duration sort. It greedily places each item in the least-loaded group.
+    items.sort(key=lambda item: item[1])
+    items.sort(key=lambda item: item[2], reverse=True)
+    selected = [[] for _ in range(splits)]
+    group_heap = [(0.0, group_index) for group_index in range(splits)]
+    heapq.heapify(group_heap)
+    for line, _nodeid, duration, original_index in items:
+        group_duration, group_index = heapq.heappop(group_heap)
+        selected[group_index].append((original_index, line))
+        heapq.heappush(group_heap, (group_duration + duration, group_index))
+
+    return [line for _original_index, line in sorted(selected[group - 1], key=lambda item: item[0])]
+
+
+def select_test_case_line(test_list_path, llm_src, script_prefix_lines, split_group=0):
+    """Select the same test as the pytest-split shard in ``pytestCommand``."""
+    lines = _read_test_list_lines(test_list_path)
+    if split_group <= 0:
+        return lines[0]
+
+    tokens = _pytest_command_tokens(script_prefix_lines)
+    splits_option = _pytest_option(tokens, "--splits")
+    group_option = _pytest_option(tokens, "--group")
+    algorithm = _pytest_option(tokens, "--splitting-algorithm")
+    if splits_option is None or group_option is None:
+        if split_group > len(lines):
+            raise ValueError(
+                f"split_group {split_group} exceeds number of tests in test list ({len(lines)})"
+            )
+        return lines[split_group - 1]
+    if algorithm != "least_duration":
+        raise ValueError(
+            "Multi-node perf launcher only supports pytest-split's least_duration "
+            f"algorithm, got {algorithm!r}"
+        )
+
+    splits = int(splits_option)
+    pytest_group = int(group_option)
+    if pytest_group != split_group:
+        raise ValueError(
+            f"submit.py split_group={split_group} disagrees with pytest --group={pytest_group}"
+        )
+    durations, durations_path = _load_pytest_split_durations(tokens, llm_src)
+    selected = _select_least_duration_group(lines, durations, splits, pytest_group)
+    if len(selected) != 1:
+        raise ValueError(
+            "Multi-node perf launch requires exactly one test in each pytest-split "
+            f"group, but group {pytest_group}/{splits} selected {len(selected)} tests "
+            f"using {durations_path}: {selected}"
+        )
+    print(
+        f"Selected pytest-split group {pytest_group}/{splits} test using "
+        f"{durations_path}: {_test_nodeid(selected[0])}"
+    )
+    return selected[0]
+
+
+def parse_test_case_name(test_list_path, llm_src, split_group=0, selected_line=None):
     """Parse the selected line of the test list.
 
     Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode).
     See the module docstring for the supported test name shapes.
     """
-    with open(test_list_path, "r") as f:
-        lines = [line.strip() for line in f if line.strip()]
-
-    if not lines:
-        raise ValueError(f"Test list is empty: {test_list_path}")
-
-    if split_group > 0:
-        if split_group > len(lines):
-            raise ValueError(
-                f"split_group {split_group} exceeds number of tests in test list ({len(lines)})"
-            )
-        line = lines[split_group - 1]
+    if selected_line is not None:
+        line = selected_line
     else:
-        line = lines[0]
+        lines = _read_test_list_lines(test_list_path)
+        if split_group > 0:
+            if split_group > len(lines):
+                raise ValueError(
+                    f"split_group {split_group} exceeds number of tests in test list ({len(lines)})"
+                )
+            line = lines[split_group - 1]
+        else:
+            line = lines[0]
 
     if "[" not in line or "]" not in line:
         raise ValueError(f"Invalid test list format. Expected name with brackets: {line}")
@@ -538,7 +681,10 @@ def main():
         "--split-group",
         type=int,
         default=0,
-        help="1-indexed split group id. Selects the N-th test from the test list.",
+        help=(
+            "1-indexed pytest-split group id. Selects the same duration-balanced "
+            "test as pytest."
+        ),
     )
     parser.add_argument("--stage-name", default="", help="Stage name (for logging / GPU detect)")
     parser.add_argument(
@@ -551,19 +697,29 @@ def main():
 
     args = parser.parse_args()
 
+    with open(args.script_prefix, "r") as f:
+        script_prefix_content = f.read()
+    script_prefix_lines = script_prefix_content.split("\n")
+
+    selected_test_line = select_test_case_line(
+        args.test_list,
+        args.llm_src,
+        script_prefix_lines,
+        args.split_group,
+    )
     config_yaml, server_name, benchmark_mode, runtime_mode = parse_test_case_name(
-        args.test_list, args.llm_src, args.split_group
+        args.test_list,
+        args.llm_src,
+        args.split_group,
+        selected_line=selected_test_line,
     )
 
     with open(config_yaml, "r") as f:
         config = yaml.safe_load(f)
 
-    # Recover test_case_name (the bracketed pytest test id) for the per-test
-    # output dir — same line/split logic as parse_test_case_name.
-    with open(args.test_list, "r") as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
-    sel = lines[args.split_group - 1] if args.split_group > 0 else lines[0]
-    test_case_name = sel.split("[")[-1].split("]")[0] if "[" in sel else ""
+    test_case_name = (
+        selected_test_line.split("[")[-1].split("]")[0] if "[" in selected_test_line else ""
+    )
 
     hardware_config = get_hardware_config(config, runtime_mode, benchmark_mode, server_name)
     env_config = get_env_config(config, runtime_mode, benchmark_mode, server_name)
@@ -575,10 +731,6 @@ def main():
     print(f"Hardware configuration: {hardware_config}")
     print(f"Environment configuration: {env_config}")
     print(f"Benchmark configuration: {benchmark_config}")
-
-    with open(args.script_prefix, "r") as f:
-        script_prefix_content = f.read()
-    script_prefix_lines = script_prefix_content.split("\n")
 
     with open(args.srun_args, "r") as f:
         srun_args_content = f.read()
