@@ -588,6 +588,25 @@ def test_cleanup_releases_active_checkpoint_loader(monkeypatch):
     assert loader._checkpoint_loader is None
 
 
+def test_cleanup_swallows_checkpoint_loader_failure(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.cleanup.side_effect = RuntimeError("cleanup failed")
+    loader._checkpoint_loader = checkpoint_loader
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
+
+    loader.cleanup()
+
+    checkpoint_loader.cleanup.assert_called_once_with()
+    assert loader._checkpoint_loader is None
+    warning.assert_called_once_with(
+        "Failed to clean up checkpoint loader %r",
+        checkpoint_loader,
+        exc_info=True,
+    )
+
+
 @pytest.mark.cpu_only
 def test_reload_partial_loading_preserves_weights_transformed_flags(monkeypatch):
     events = []

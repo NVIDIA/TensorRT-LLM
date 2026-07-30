@@ -1485,25 +1485,29 @@ class ModelLoader:
     def cleanup(self) -> None:
         """Release backend resources acquired during :meth:`load`.
 
-        Currently the only backend held by `ModelLoader` is the
-        optional GMS client, established by the `LoadFormat.GMS`
-        branch. Releasing it disconnects from the GMS daemon and evicts
-        the per-tag client registry entry; weights remain alive
-        on-device for any other process holding an RO lock on the same
-        `tag`.
+        This releases the optional GMS client and the active checkpoint
+        loader. Releasing GMS disconnects from the daemon and evicts the
+        per-tag client registry entry; weights remain alive on-device for
+        any other process holding an RO lock on the same `tag`.
 
-        Idempotent: a second call after a successful cleanup is a no-op
-        because the backend handle is dropped. Best-effort: any failure
-        in the underlying `GMSBackend.cleanup()` is swallowed there
-        and logged, so this method never raises — safe to call from
-        :meth:`PyTorchModelEngine.cleanup` and `__del__` paths.
+        A second call is a no-op because both handles are dropped. Cleanup is
+        best effort so shutdown and destructor paths do not propagate backend
+        failures.
         """
         if self._gms_backend is not None:
             self._gms_backend.cleanup()
             self._gms_backend = None
         if self._checkpoint_loader is not None:
-            self._checkpoint_loader.cleanup()
-            self._checkpoint_loader = None
+            try:
+                self._checkpoint_loader.cleanup()
+            except Exception:
+                logger.warning(
+                    "Failed to clean up checkpoint loader %r",
+                    self._checkpoint_loader,
+                    exc_info=True,
+                )
+            finally:
+                self._checkpoint_loader = None
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,

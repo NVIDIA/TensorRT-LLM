@@ -30,8 +30,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeight
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
-from tensorrt_llm._torch.weight_sharing import (
-    SOURCE_IDENTITY_FORMAT_VERSION, SourceIdentity)
+from tensorrt_llm._torch.weight_sharing import SOURCE_IDENTITY_FORMAT_VERSION, SourceIdentity
 from tensorrt_llm.mapping import Mapping
 
 
@@ -96,7 +95,28 @@ class MXCheckpointLoader(HfCheckpointLoader):
         )
 
     def load_weights(self, checkpoint_dir: str, mapping: Mapping, **kwargs) -> dict[str, Any]:
-        """Load weights through ModelExpress's shared strategy chain."""
+        """Load weights through ModelExpress's shared strategy chain.
+
+        Args:
+            checkpoint_dir: Hugging Face checkpoint used by native fallback.
+            mapping: Distributed rank and parallelism mapping.
+            **kwargs: TRT-LLM-owned load state. ``model``, ``model_config``,
+                and ``source_identity`` enable the shared strategy path;
+                ``load_config`` is forwarded to ModelExpress. Qualified
+                post-transform reception additionally supplies
+                ``allow_post_transform_weights``,
+                ``prepare_post_transform_receiver``, and
+                ``post_transform_protocol_version``.
+
+        Returns:
+            Native checkpoint weights on fallback, or an empty dictionary
+            after ModelExpress writes the complete shard into ``model``.
+
+        Raises:
+            ImportError: ModelExpress is requested but unavailable.
+            RuntimeError: Qualified reception lacks its structure,
+                protocol, or current SourceIdentity ABI contract.
+        """
         model = kwargs.pop("model", None)
         self._local_source_identity = kwargs.pop("source_identity", None)
         allow_post_transform_weights = kwargs.pop("allow_post_transform_weights", False)
@@ -138,8 +158,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         if allow_post_transform_weights and transform_protocol_version is None:
             raise RuntimeError("Qualified MX loading requires a transform protocol version")
         if allow_post_transform_weights and (
-            self._local_source_identity.format_version
-            != SOURCE_IDENTITY_FORMAT_VERSION
+            self._local_source_identity.format_version != SOURCE_IDENTITY_FORMAT_VERSION
             or not self._local_source_identity.transform_abi_id
         ):
             raise RuntimeError(
@@ -178,8 +197,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
             # authoritative SourceIdentity into its discovery identity. RDMA
             # success therefore means the selected source matched format v3,
             # the transform-layout ABI, and the remaining TRT identity fields.
-            and self._local_source_identity.format_version
-            == SOURCE_IDENTITY_FORMAT_VERSION
+            and self._local_source_identity.format_version == SOURCE_IDENTITY_FORMAT_VERSION
             and bool(self._local_source_identity.transform_abi_id)
         )
         if self._p2p_succeeded and not post_transform_compatible:

@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
 from _source_identity_fakes import make_identity
 
 from tensorrt_llm._torch.weight_sharing import (
@@ -29,9 +28,7 @@ def _identity(*, transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1):
 def _mx_modules():
     trtllm = pytest.importorskip("modelexpress.engines.trtllm")
     load_strategy = pytest.importorskip("modelexpress.load_strategy")
-    rdma_strategy = pytest.importorskip(
-        "modelexpress.load_strategy.rdma_strategy"
-    )
+    rdma_strategy = pytest.importorskip("modelexpress.load_strategy.rdma_strategy")
     return trtllm, load_strategy, rdma_strategy
 
 
@@ -43,14 +40,10 @@ def test_real_adapter_serializes_authoritative_trt_identity():
         identity,
         transform_protocol_version=1,
     )
-    serialized = json.loads(
-        mx_identity.extra_parameters["trtllm_source_identity"]
-    )
+    serialized = json.loads(mx_identity.extra_parameters["trtllm_source_identity"])
 
     assert serialized == {
-        key: value
-        for key, value in identity.to_dict().items()
-        if key != "model_name"
+        key: value for key, value in identity.to_dict().items() if key != "model_name"
     }
     assert serialized["format_version"] == SOURCE_IDENTITY_FORMAT_VERSION
     assert serialized["transform_abi_id"] == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1

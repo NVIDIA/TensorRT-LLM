@@ -5001,6 +5001,14 @@ class ModelExpressConfig(StrictBaseModel):
         status="prototype",
     )
 
+    server_query_timeout_s: Optional[NonNegativeInt] = Field(
+        default=None,
+        description="Timeout in seconds for upstream MxLiveWeightLoader source "
+        "discovery. When unset, TRT-LLM first probes for existing sources: "
+        "no source uses a short 30-second fallback cap, while an existing "
+        "source uses modelexpress's default wait for long donor loads.",
+        status="prototype")
+
     preshard_strategy: str = Field(
         default="per_module",
         description="How to inform TRT-LLM that MX-delivered weights are already "
