@@ -1,3 +1,4 @@
+import contextlib
 import itertools
 import os
 import time
@@ -8,6 +9,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from pydantic import Field
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.utils import StrictBaseModel
@@ -17,6 +19,7 @@ from tensorrt_llm.mapping import Mapping
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 
 
@@ -170,14 +173,17 @@ class BasePipeline(nn.Module):
                 logger.info("CUDA profiler stopped")
 
     def _setup_cuda_graphs(self):
-        """Wrap all transformer components with CUDA graph capture/replay."""
-        if not self.pipeline_config.cuda_graph.enable:
-            return
+        """Wrap all transformer components with CUDA graph capture/replay.
 
-        if self.pipeline_config.torch_compile.enable:
-            logger.warning(
-                "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
-            )
+        Composes with torch.compile: the runner wraps the (outer) transformer
+        ``forward`` while torch.compile compiles the inner transformer blocks
+        (see ``torch_compile``). Graph capture happens during warmup, by which
+        point the runner's own ``WARMUP_STEPS`` eager iterations have already
+        triggered torch.compile's lazy compilation, so the captured graph
+        contains the optimized compiled kernels. (The ``LTX2Pipeline`` override
+        relies on the same ordering.)
+        """
+        if not self.pipeline_config.cuda_graph.enable:
             return
 
         if len(self.transformer_components) > 1:
@@ -188,6 +194,7 @@ class BasePipeline(nn.Module):
         else:
             shared_pool = None
 
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         for name in self.transformer_components:
             model = getattr(self, name, None)
             if model is None:
@@ -198,9 +205,21 @@ class BasePipeline(nn.Module):
                 shared_pool,
             )
             model.register_cuda_graph_extra_key_fns(runner)
-            logger.info(f"CUDA graph runner: wrapping {name}.forward")
+            logger.info(f"CUDA graph runner: wrapping {name}.forward{compile_note}")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
+
+    @contextlib.contextmanager
+    def disallow_cuda_graph_capture(self):
+        """Run wrapped forwards eagerly instead of capturing new CUDA graphs."""
+        prev = {name: r.allow_capture for name, r in self._cuda_graph_runners.items()}
+        for r in self._cuda_graph_runners.values():
+            r.allow_capture = False
+        try:
+            yield
+        finally:
+            for name, r in self._cuda_graph_runners.items():
+                r.allow_capture = prev[name]
 
     @property
     def rank(self):
@@ -212,9 +231,7 @@ class BasePipeline(nn.Module):
 
     @property
     def dtype(self):
-        if hasattr(self, "transformer"):
-            return next(self.transformer.parameters()).dtype
-        return torch.float32
+        return self.pipeline_config.torch_dtype
 
     @property
     def device(self):
@@ -400,48 +417,92 @@ class BasePipeline(nn.Module):
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
 
-    def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
-        """Pick TeaCache coefficients from checkpoint path; updates pipeline config in place."""
-        if not coefficients:
-            return
+    def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:
+        """Resolve TeaCache polynomial coefficients into pipeline_config.cache (TeaCacheConfig).
+
+        Precedence:
+
+        1. User-specified TeaCacheConfig.coefficients — any non-None list skips built-in
+           variant matching.
+
+        2. Pipeline table — if step 1 does not apply and coefficients is a non-empty dict
+           (model-specific tables from the pipeline subclass), match
+           pretrained_config._name_or_path against keys and set coefficients (and optional
+           default_thresh).
+
+        3. If coefficients are still unresolved after step 2, _setup_cache_acceleration
+           raises: TeaCache must not run without resolved coefficients.
+
+        Args:
+            coefficients: Optional mapping from variant key to coefficient list or nested
+                dict (ret_steps / standard), from the pipeline subclass.
+        """
         teacache_cfg = self.pipeline_config.teacache
-        checkpoint_path = getattr(
-            self.pipeline_config.primary_pretrained_config, "_name_or_path", ""
+        if teacache_cfg is None:
+            return
+        if teacache_cfg.is_explicit_user_override():
+            logger.info(
+                "TeaCache: Using user-configured coefficients "
+                "(skipping built-in checkpoint variant matching)"
+            )
+            return
+
+        teacache_explicit = teacache_cfg.model_dump(exclude_unset=True)
+
+        if not coefficients:
+            if teacache_cfg.coefficients is None:
+                raise ValueError(
+                    "TeaCache is enabled but no polynomial coefficients were resolved. "
+                    "Set teacache.coefficients in VisualGenArgs, or use a pipeline and "
+                    "checkpoint whose path matches a built-in coefficient table."
+                )
+            return
+
+        checkpoint_path = (
+            getattr(self.pipeline_config.primary_pretrained_config, "_name_or_path", "") or ""
         )
-        matched = False
+
         for model_size, coeff_data in coefficients.items():
-            if model_size.lower() in checkpoint_path.lower():
-                matched = True
-                if isinstance(coeff_data, dict):
-                    mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
-                    if mode in coeff_data:
-                        teacache_cfg.coefficients = coeff_data[mode]
-                        logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
-                    default_thresh = coeff_data.get("default_thresh")
-                    if (
-                        default_thresh is not None
-                        and "teacache_thresh" not in teacache_cfg.model_fields_set
-                    ):
-                        teacache_cfg.teacache_thresh = default_thresh
-                        logger.info(
-                            f"TeaCache: Using {model_size} default threshold {default_thresh}"
-                        )
-                else:
-                    teacache_cfg.coefficients = coeff_data
-                    logger.info(f"TeaCache: Using {model_size} coefficients")
+            # Match model size in path (case-insensitive, e.g., "1.3B", "14B", "dev")
+            path_l = checkpoint_path.lower()
+            key_l = model_size.lower()
+            if key_l not in path_l:
+                continue
+
+            if isinstance(coeff_data, dict):
+                # Select coefficient set based on warmup mode
+                mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
+                if mode not in coeff_data:
+                    logger.warning(
+                        "TeaCache: matched variant %r but table has no %r entry "
+                        "(available keys: %s). Trying other variants.",
+                        model_size,
+                        mode,
+                        list(coeff_data.keys()),
+                    )
+                    continue
+                teacache_cfg.coefficients = coeff_data[mode]
+                logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                # Apply model-specific default threshold if user didn't explicitly set one
+                default_thresh = coeff_data.get("default_thresh")
+                if default_thresh is not None and "teacache_thresh" not in teacache_explicit:
+                    teacache_cfg.teacache_thresh = default_thresh
+                    logger.info(f"TeaCache: Using {model_size} default threshold {default_thresh}")
                 break
-        if not matched:
+            else:
+                # Single coefficient list (no mode distinction)
+                teacache_cfg.coefficients = coeff_data
+                logger.info(f"TeaCache: Using {model_size} coefficients")
+                break
+        else:
             raise ValueError(
                 f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
                 f"Available variants: {list(coefficients.keys())}. "
-                f"TeaCache is not supported for this model variant."
+                f"Set teacache.coefficients explicitly in VisualGenArgs to use TeaCache anyway, "
+                f"or use a checkpoint path that contains one of the variant keys."
             )
 
-    def _setup_cache_acceleration(
-        self,
-        model: Optional[nn.Module] = None,
-        coefficients: Optional[Dict] = None,
-    ) -> None:
+    def _setup_cache_acceleration(self) -> None:
         """Enable TeaCache or Cache-DiT from model_config.cache_backend."""
 
         if getattr(self, "cache_accelerator", None) is not None:
@@ -460,15 +521,9 @@ class BasePipeline(nn.Module):
         if not use_teacache:
             return
 
-        BasePipeline._apply_teacache_coefficients(self, coefficients)
-
-        if model is None:
-            return
-
-        acc = TeaCacheAccelerator(cfg.teacache)
-        acc.wrap(model=model)
-        if acc.is_enabled():
-            self.cache_accelerator = acc
+        acc = TeaCacheAccelerator(self, cfg.teacache)
+        acc.wrap()
+        self.cache_accelerator = acc
 
     def setup_parallel_vae(self):
         """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
@@ -590,12 +645,14 @@ class BasePipeline(nn.Module):
     def warmup(self) -> None:
         """Run warmup inference to trigger torch.compile and CUDA initialization.
 
-        Resolves warmup shapes from user config or model defaults, then runs
-        a short denoising loop with dummy inputs for each shape. This:
-        1. Triggers torch.compile's lazy compilation (first forward trace + codegen)
-        2. Pre-captures CUDA graphs (if enabled)
-        3. Warms up CUDA kernels and allocators
-        4. Populates any lazy caches (e.g., RoPE frequencies)
+        Resolves warmup shapes from user config or model defaults, then runs a
+        short denoising loop with dummy inputs for each shape, triggering
+        torch.compile, CUDA graph capture (if enabled), and autotuner tuning.
+
+        With autotuning enabled, a single rank tunes and captures in one pass.
+        On multiple ranks, tactics are tuned with capture off, merged across
+        ranks at ``autotune()`` exit, then recaptured — so every rank bakes the
+        same tactic into its graphs.
 
         Called automatically by PipelineLoader after model loading and torch.compile.
         OOM is not caught — if a warmup shape OOMs, the server fails fast at startup.
@@ -605,24 +662,61 @@ class BasePipeline(nn.Module):
             logger.info("Warmup disabled (no warmup shapes)")
             return
 
+        shape_list = ", ".join(f"{h}x{w}x{f}" for h, w, f in shapes)
         logger.info(
-            f"Running warmup for {self.__class__.__name__} "
-            f"with {len(shapes)} shapes and {steps} steps..."
+            f"Running warmup for {self.__class__.__name__}: "
+            f"{len(shapes)} shape(s) [{shape_list}], {steps} steps..."
         )
         warmup_start = time.time()
 
+        # Autotuner tuning knobs: cache path from env, plus (multi-rank only) a
+        # world-group communicator that drives the post-tune cross-rank merge.
+        enable_autotune = self.pipeline_config.torch_compile.enable_autotune
+        cache_path = None
+        post_tune_merge_dist = None
+        if enable_autotune:
+            cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                amap = self.pipeline_config.visual_gen_mapping.to_autotuner_mapping()
+                post_tune_merge_dist = _VisualGenAutotuneDist(amap)
+
         self._is_warmup = True
-        for height, width, num_frames in shapes:
-            logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
-            self._run_warmup(height, width, num_frames, steps)
-            torch.cuda.synchronize()
-        self._is_warmup = False
+        try:
+            if not enable_autotune:
+                self._run_warmup_pass(shapes, steps)
+            elif post_tune_merge_dist is None:
+                # Single rank: nothing to merge; tune and capture in one pass.
+                with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+                    self._run_warmup_pass(shapes, steps)
+            else:
+                # Multi rank: tune with capture off, merge tactics across ranks
+                # at autotune() exit, then recapture from the merged tactics
+                # (only needed when CUDA graphs are enabled).
+                with (
+                    self.disallow_cuda_graph_capture(),
+                    autotune(
+                        cache_path=cache_path,
+                        skip_dynamic_tuning_buckets=True,
+                        post_tune_merge_dist=post_tune_merge_dist,
+                    ),
+                ):
+                    self._run_warmup_pass(shapes, steps)
+                if self.pipeline_config.cuda_graph.enable:
+                    self._run_warmup_pass(shapes, steps)
+        finally:
+            self._is_warmup = False
 
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
         )
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
+
+    def _run_warmup_pass(self, shapes, steps) -> None:
+        """Run one warmup pass over all shapes (denoise loop with dummy inputs)."""
+        for height, width, num_frames in shapes:
+            self._run_warmup(height, width, num_frames, steps)
+            torch.cuda.synchronize()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         """Run warmup for a single shape. Subclasses must override.
@@ -688,6 +782,26 @@ class BasePipeline(nn.Module):
         std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
         noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
         return guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+
+    @staticmethod
+    def _resolve_step_guidance_scale(
+        t: torch.Tensor,
+        guidance_scale: float,
+        guidance_interval: Optional[Tuple[float, float]] = None,
+        guidance_scale_2: Optional[float] = None,
+        boundary_timestep: Optional[float] = None,
+    ) -> float:
+        """Per-step CFG scale, including two-stage and guidance-interval gating."""
+        current = guidance_scale
+        t_scalar = t.item() if t.dim() == 0 else t[0].item()
+        if guidance_scale_2 is not None and boundary_timestep is not None:
+            if t_scalar < boundary_timestep:
+                current = guidance_scale_2
+        if guidance_interval is not None:
+            interval_lo, interval_hi = guidance_interval
+            if not (interval_lo <= t_scalar <= interval_hi):
+                current = 1.0
+        return current
 
     def _setup_cfg_config(
         self, guidance_scale, prompt_embeds, neg_prompt_embeds, extra_cfg_tensors=None
@@ -847,9 +961,10 @@ class BasePipeline(nn.Module):
         guidance_scale,
         guidance_rescale,
         local_extras,
+        do_cfg: bool = False,
     ):
         """Execute single denoising step without CFG parallel."""
-        if guidance_scale > 1.0:
+        if do_cfg:
             latent_input = torch.cat([latents] * 2)
             # Duplicate extra stream latents for CFG
             extra_stream_input = {
@@ -882,7 +997,7 @@ class BasePipeline(nn.Module):
         t_transformer = time.time() - t_start
 
         c_start = time.time()
-        if guidance_scale > 1.0:
+        if do_cfg:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
@@ -947,6 +1062,7 @@ class BasePipeline(nn.Module):
         extra_streams: Optional[Dict[str, Tuple[torch.Tensor, Any]]] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_timestep: Optional[float] = None,
+        guidance_interval: Optional[Tuple[float, float]] = None,
         post_step_fn: Optional[Callable] = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
@@ -977,6 +1093,9 @@ class BasePipeline(nn.Module):
                              to guidance_scale_2 when timestep < boundary_timestep.
             boundary_timestep: Optional timestep boundary for two-stage denoising.
                               Switches guidance scale when crossing this threshold.
+            guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
+                              is active. Outside the interval the effective scale is 1.0
+                              (conditional prediction only); both branches still run.
             post_step_fn: Optional callable applied to latents after each scheduler step.
                          Signature: post_step_fn(latents) -> latents
                          Use for constraints that must hold throughout denoising.
@@ -1015,6 +1134,7 @@ class BasePipeline(nn.Module):
         cfg_config = self._setup_cfg_config(
             guidance_scale, prompt_embeds, neg_prompt_embeds, extra_cfg_tensors
         )
+        do_cfg = guidance_scale > 1.0
         do_cfg_parallel = cfg_config["enabled"]
         prompt_embeds = cfg_config["prompt_embeds"]
         local_extras = cfg_config["local_extras"]
@@ -1048,12 +1168,13 @@ class BasePipeline(nn.Module):
 
             step_start = time.time()
 
-            # Two-stage denoising: switch guidance scale at boundary
-            current_guidance_scale = guidance_scale
-            if guidance_scale_2 is not None and boundary_timestep is not None:
-                t_scalar = t.item() if t.dim() == 0 else t[0].item()
-                if t_scalar < boundary_timestep:
-                    current_guidance_scale = guidance_scale_2
+            current_guidance_scale = self._resolve_step_guidance_scale(
+                t,
+                guidance_scale,
+                guidance_interval,
+                guidance_scale_2,
+                boundary_timestep,
+            )
 
             # Denoise
             with nvtx_range(f"denoise_step {i}"):
@@ -1092,6 +1213,7 @@ class BasePipeline(nn.Module):
                         current_guidance_scale,
                         guidance_rescale,
                         local_extras,
+                        do_cfg=do_cfg,
                     )
 
             # Scheduler step for all streams
@@ -1140,11 +1262,20 @@ class BasePipeline(nn.Module):
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":
                         logger.info("Cache-DiT stats: %s", stats)
-                    elif "hit_rate" in stats:
-                        logger.info(
-                            f"TeaCache: {stats['hit_rate']:.1%} hit rate "
-                            f"({stats['cached']}/{stats['total']} steps)"
-                        )
+                    elif self.pipeline_config.cache_backend == "teacache":
+                        first_val = next(iter(stats.values()), None)
+                        if isinstance(first_val, dict):
+                            for key, s in stats.items():
+                                if "hit_rate" in s:
+                                    logger.info(
+                                        f"TeaCache {key}: {s['hit_rate']:.1%} hit rate "
+                                        f"({s['cached']}/{s['total']} steps)"
+                                    )
+                        elif "hit_rate" in stats:
+                            logger.info(
+                                f"TeaCache: {stats['hit_rate']:.1%} hit rate "
+                                f"({stats['cached']}/{stats['total']} steps)"
+                            )
                     else:
                         logger.info("Cache acceleration stats: %s", stats)
 

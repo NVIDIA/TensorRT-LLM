@@ -13,8 +13,15 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
+    import sys
+    from pathlib import Path
+
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._utils import get_free_port
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -55,8 +62,14 @@ def _run_multi_gpu(world_size, test_fn):
         pytest.skip("Required modules not available")
     if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} GPUs, have {torch.cuda.device_count()}")
-    port = get_free_port()
-    mp.spawn(_worker, args=(world_size, test_fn, port), nprocs=world_size, join=True)
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _worker,
+            args=(world_size, test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
+    )
 
 
 # =============================================================================
@@ -149,6 +162,23 @@ class TestConstruction:
         assert vgm.ulysses_size == 2
         assert vgm.seq_size == 4
 
+    def test_tp_and_attn2d_constructible(self):
+        """TP + Attention2D is allowed (mapping guard removed in commit 084755212d).
+
+        Prior behavior raised NotImplementedError; ensure the mesh now composes.
+        """
+        vgm = VisualGenMapping(
+            world_size=4,
+            rank=0,
+            tp_size=2,
+            attn2d_row_size=2,
+            attn2d_col_size=1,
+        )
+        assert vgm.tp_size == 2
+        assert vgm.cp_size == 2
+        assert vgm.attn2d_row_size == 2
+        assert vgm.attn2d_col_size == 1
+
     def test_ring_and_attn2d_raises(self):
         """Combining ring and Attention2D raises ValueError (both shard the sequence axis)."""
         with pytest.raises(ValueError, match="mutually exclusive"):
@@ -159,6 +189,32 @@ class TestConstruction:
                 attn2d_row_size=2,
                 attn2d_col_size=2,
             )
+
+
+class TestFlattenCfgRanks:
+    """flatten_cfg_ranks is pure layout arithmetic: one rank list per combined
+    coordinate of every non-(cfg, ulysses) mesh dim, cfg outermost / ulysses
+    innermost within each list."""
+
+    def test_cfg2_u4_is_one_world_list(self):
+        vgm = VisualGenMapping(world_size=8, rank=0, cfg_size=2, ulysses_size=4)
+        assert vgm.flatten_cfg_ranks() == [[0, 1, 2, 3, 4, 5, 6, 7]]
+
+    def test_cfg2_cp2_u2_preserves_ring_fibers(self):
+        vgm = VisualGenMapping(world_size=8, rank=0, cfg_size=2, ring_size=2, ulysses_size=2)
+        lists = vgm.flatten_cfg_ranks()
+        assert lists == [[0, 1, 4, 5], [2, 3, 6, 7]]
+        # Every list holds a single cp coordinate, so stage-1 ring pairs
+        # ({0,2},{1,3},{4,6},{5,7}) are never split across lists.
+        for a, b in ((0, 2), (1, 3), (4, 6), (5, 7)):
+            assert sum(a in grp for grp in lists) == 1
+            assert not any(a in grp and b in grp for grp in lists)
+
+    def test_cfg2_attn2d_2x2_u1(self):
+        vgm = VisualGenMapping(
+            world_size=8, rank=0, cfg_size=2, attn2d_row_size=2, attn2d_col_size=2
+        )
+        assert vgm.flatten_cfg_ranks() == [[0, 4], [1, 5], [2, 6], [3, 7]]
 
 
 class TestSingleGPURanksAndGroups:
@@ -494,6 +550,52 @@ def _logic_attn2d_seq_rank_matches_global_rank(rank, world_size):
     )
 
 
+def _logic_tp2_attn2d_2x1_groups(rank, world_size):
+    """Groups compose under tp=2 × attn2d(2×1) on 4 GPUs (guard removed).
+
+    Mesh cfg-tp-cp_row-cp_col-ulysses with tp=2, attn2d_row=2, attn2d_col=1:
+        tp_rank    = (rank // 2) % 2
+        cp_rank    = rank % 2   (row-major over cp_row × cp_col)
+    TP groups: {0,2} and {1,3}. attn2d_col groups: {0,1} and {2,3}.
+    """
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+    DeviceMeshTopologyImpl.device_mesh = None
+
+    vgm = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        tp_size=2,
+        attn2d_row_size=2,
+        attn2d_col_size=1,
+    )
+
+    assert vgm.tp_size == 2
+    assert vgm.cp_size == 2
+    assert vgm.tp_rank == (rank // 2) % 2
+    assert vgm.cp_rank == rank % 2
+
+    assert vgm.tp_group_pg is not None
+    assert vgm.attn2d_row_group is not None
+    assert vgm.attn2d_col_group is not None
+    assert vgm.attn2d_mesh_group is not None
+    assert dist.get_world_size(vgm.tp_group_pg) == 2
+    assert dist.get_world_size(vgm.attn2d_row_group) == 1
+    assert dist.get_world_size(vgm.attn2d_col_group) == 2
+    assert dist.get_world_size(vgm.attn2d_mesh_group) == 2
+
+    device = torch.device(f"cuda:{rank}")
+    one = torch.ones(1, device=device)
+
+    x = one.clone()
+    dist.all_reduce(x, group=vgm.tp_group_pg)
+    assert x.item() == 2.0, f"Rank {rank}: tp all_reduce expected 2, got {x.item()}"
+
+    x = one.clone()
+    dist.all_reduce(x, group=vgm.attn2d_col_group)
+    assert x.item() == 2.0, f"Rank {rank}: attn2d_col all_reduce expected 2, got {x.item()}"
+
+
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
 class TestMultiGPU:
     def test_default_order_cfg2_ulysses2(self):
@@ -518,3 +620,7 @@ class TestMultiGPU:
     def test_attn2d_ulysses_seq_rank_matches_global_rank(self):
         """Row-major mesh: seq_rank == global rank when cfg=tp=1 (8-way Attn2D+Ulysses)."""
         _run_multi_gpu(8, _logic_attn2d_seq_rank_matches_global_rank)
+
+    def test_tp2_attn2d_2x1_groups(self):
+        """TP + Attn2D groups coexist and support collectives on 4 GPUs."""
+        _run_multi_gpu(4, _logic_tp2_attn2d_2x1_groups)

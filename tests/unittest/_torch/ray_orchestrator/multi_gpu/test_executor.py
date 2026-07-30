@@ -2,8 +2,15 @@ import os
 
 import pytest
 import ray
-from ray.util.placement_group import (PlacementGroupSchedulingStrategy,
-                                      placement_group, remove_placement_group)
+from ray.util.placement_group import placement_group, remove_placement_group
+
+try:
+    # Ray >= 2.55.0
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+except ImportError:
+    # Older Ray re-exported it from ray.util.placement_group
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
+
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM

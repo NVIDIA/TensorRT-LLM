@@ -142,7 +142,7 @@ class _SessionBase(ABC):
     def is_completed(self) -> bool: ...
 
     @abstractmethod
-    def wait_complete(self) -> Optional[WaitResult]: ...
+    def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]: ...
 
     @property
     @abstractmethod
@@ -159,6 +159,9 @@ class TxSessionBase(_SessionBase):
 
     @abstractmethod
     def send(self, slice: KVSlice) -> None: ...
+
+    @abstractmethod
+    def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]: ...
 
 
 class RxSessionBase(_SessionBase):

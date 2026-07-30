@@ -3,6 +3,12 @@ import subprocess
 
 import pytest
 
+# Force a deterministic UCX/NIXL config regardless of what the cluster/CI
+# injects; see test_kv_transfer.py for the full rationale. The subprocesses
+# spawned below inherit these via os.environ.copy().
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+
 
 def test_load_agent_missing_module():
     """_load_agent returns (None, ImportError) for a non-existent module.

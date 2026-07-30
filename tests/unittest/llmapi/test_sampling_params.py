@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import json
+
 import pytest
 import torch
 
@@ -20,7 +23,13 @@ from tensorrt_llm.llmapi.thinking_budget import (
     add_thinking_budget_logits_processor,
 )
 from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, SamplingParams, check_logprobs_limit
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    KVCacheTruncateRequest,
+    ensure_request_chat_template_allowed,
+)
+from tensorrt_llm.serve.resource_governor import ResourceGovernor
 
 
 @pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs", "top_logprobs"])
@@ -52,6 +61,50 @@ def test_chat_top_logprobs_request_limit():
             logprobs=True,
             top_logprobs=MAX_TOP_LOGPROBS + 1,
         )
+
+
+def test_chat_template_request_override_respects_runtime_policy():
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        chat_template="{{ messages }}",
+    )
+
+    with pytest.raises(ValueError, match="chat_template cannot be supplied"):
+        ensure_request_chat_template_allowed(request, allow_request_chat_template=False)
+
+    ensure_request_chat_template_allowed(request, allow_request_chat_template=True)
+
+
+def test_kv_cache_truncate_chat_template_respects_runtime_policy():
+    request = KVCacheTruncateRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        chat_template="{{ messages }}",
+    )
+
+    with pytest.raises(ValueError, match="chat_template cannot be supplied"):
+        ensure_request_chat_template_allowed(request, allow_request_chat_template=False)
+
+    ensure_request_chat_template_allowed(request, allow_request_chat_template=True)
+
+
+def test_resource_governor_rejects_request_chat_template_by_default():
+    governor = ResourceGovernor(
+        resource_governor_queue=None,
+        tokenizer=None,
+        model_config=None,
+    )
+    request = KVCacheTruncateRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        chat_template="{{ messages }}",
+    )
+
+    response = asyncio.run(governor._truncate_kv_cache(request))
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]
 
 
 def test_completion_logprobs_assignment_revalidates():
@@ -146,6 +199,66 @@ def test_thinking_budget_logits_processor_ignores_closed_reasoning_block():
     processor(0, logits, [[1, 5, 2, 6]], None, None)
 
     assert torch.equal(logits, torch.zeros(1, 1, 8))
+
+
+def _run(processor, token_ids):
+    """Call the processor on a fresh logits row and return it."""
+    logits = torch.zeros(1, 1, 8)
+    processor(0, logits, token_ids, None, None)
+    return logits
+
+
+def test_thinking_budget_logits_processor_does_not_force_end_twice_on_stale_view():
+    """Regression: a stale token view must not re-force the end tag.
+
+    With the overlap scheduler, logits processors run one step
+    behind the sampled tokens, so the call right after forcing the end token
+    sees token_ids WITHOUT it. A stateless processor forces the end token a
+    second time, producing e.g. `</think></think>` — the reasoning parser
+    consumes the first tag and the second leaks into message.content.
+    """
+    processor = ThinkingBudgetLogitsProcessor(
+        thinking_token_budget=2,
+        reasoning_start_token_ids=[1],
+        reasoning_end_token_ids=[2],
+    )
+    stale = [[1, 5, 6]]  # budget spent, forced end not visible yet
+
+    logits = _run(processor, stale)
+    assert logits[0, 0, 2] == 0 and torch.isneginf(logits[0, 0, 3])
+
+    # Next step: the forced end token is still not visible (stale view).
+    assert torch.equal(_run(processor, stale), torch.zeros(1, 1, 8))
+
+    # Once the view catches up (end tag present), progress state resets so a
+    # later reasoning block is budgeted again.
+    assert torch.equal(_run(processor, [[1, 5, 6, 2, 7]]), torch.zeros(1, 1, 8))
+    logits = _run(processor, [[1, 5, 6, 2, 7, 1, 8, 9]])
+    assert logits[0, 0, 2] == 0 and torch.isneginf(logits[0, 0, 3])
+
+
+def test_thinking_budget_logits_processor_continues_end_sequence_on_stale_view():
+    """Multi-token end sequence must continue, not restart, on a stale view.
+
+    Under the overlap scheduler the processor must continue from its
+    recorded progress rather than re-derive from token_ids.
+    """
+    processor = ThinkingBudgetLogitsProcessor(
+        thinking_token_budget=2,
+        reasoning_start_token_ids=[1],
+        reasoning_end_token_ids=[2, 3],
+    )
+    stale = [[1, 5, 6]]
+
+    assert _run(processor, stale)[0, 0, 2] == 0
+
+    # Stale view: forced first end token not visible; must force the SECOND
+    # end token, not the first again.
+    logits = _run(processor, stale)
+    assert logits[0, 0, 3] == 0 and torch.isneginf(logits[0, 0, 2])
+
+    # Sequence complete: no further forcing even while the view is stale.
+    assert torch.equal(_run(processor, stale), torch.zeros(1, 1, 8))
 
 
 def test_add_thinking_budget_logits_processor_uses_reasoning_parser_tokens():

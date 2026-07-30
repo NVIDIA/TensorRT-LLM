@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -279,6 +279,34 @@ constexpr int CVT_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 
+// Membermask for the __shfl_xor_sync butterfly among the NUM_THREADS_PER_SF
+// lanes that share one scale factor. The xor-1/xor-2 exchange never crosses
+// this aligned lane group, so only the group has to converge on the shuffle.
+//
+// Do not widen the mask to the full warp. A sync shuffle waits until every
+// lane named in the mask reaches the same call site, but here not every lane
+// of a warp gets there: in quantize_with_block_size, lanes that drew padding
+// columns (or ran out of columns) skip the cvt call and go wait at the CTA
+// barrier at the end of the kernel. If the data/padding boundary cuts through
+// a warp, a full-warp shuffle deadlocks against that barrier. A full mask can
+// also name lanes that were never launched, because blockDim is not always a
+// multiple of 32 (e.g. 200 threads leave the last warp with only 8 lanes);
+// that is undefined behavior.
+//
+// The group mask is always safe: blockDim and every column boundary (data,
+// padded, SF-padded) are multiples of the group size, so the lanes of one
+// group always reach the same set of shuffle calls together.
+template <int NUM_THREADS_PER_SF>
+inline __device__ uint32_t cvt_sf_group_shfl_mask()
+{
+    static_assert(NUM_THREADS_PER_SF == 2 || NUM_THREADS_PER_SF == 4, "Unsupported SF group size.");
+    constexpr uint32_t groupSize = static_cast<uint32_t>(NUM_THREADS_PER_SF);
+    constexpr uint32_t groupMask = (1U << groupSize) - 1U;
+    uint32_t laneId = 0;
+    asm("mov.u32 %0, %%laneid;" : "=r"(laneId));
+    return groupMask << (laneId & ~(groupSize - 1U));
+}
+
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8])
 {
@@ -439,10 +467,11 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 
     constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
     // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    uint32_t const sfGroupMask = cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>();
+    localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 1), localMax);
     if constexpr (CVT_NUM_THREADS_PER_SF == 4)
     {
-        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+        localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 2), localMax);
     }
     // Get the final absolute maximum values.
     float vecMax = float(cuda_max(localMax.x, localMax.y));
@@ -540,7 +569,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     if constexpr (CVT_NUM_THREADS_PER_SF == 2)
     {
         // For block 32, we need to reduce the local max across two threads.
-        localMax = __hmax2(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+        localMax = __hmax2(__shfl_xor_sync(cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>(), localMax, 1), localMax);
     }
 
     // Get the final absolute maximum values.
@@ -616,10 +645,11 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
 
     constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
     // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    uint32_t const sfGroupMask = cvt_sf_group_shfl_mask<CVT_NUM_THREADS_PER_SF>();
+    localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 1), localMax);
     if constexpr (CVT_NUM_THREADS_PER_SF == 4)
     {
-        localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+        localMax = cuda_max(__shfl_xor_sync(sfGroupMask, localMax, 2), localMax);
     }
     // Get the final absolute maximum values.
     float vecMax = float(cuda_max(localMax.x, localMax.y));
@@ -897,6 +927,16 @@ quantize_with_block_size(
             }
         }
     }
+    // PDL completion is reported when every CTA has either exited or called
+    // this function at least once (per CUDA Programming Guide). Without a
+    // CTA-wide barrier, an early-finishing warp can trigger completion while
+    // other warps in the same CTA are still writing sf_out / out, allowing the
+    // downstream NVF4 GEMM consumer to read partial data once
+    // wait_on_dependent_grids returns. Each thread first makes its own stores
+    // device-visible; the barrier then guarantees every thread has done so
+    // before any thread can reach the trigger.
+    __threadfence();
+    __syncthreads();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }

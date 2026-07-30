@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ Modes:
       Stages are parsed from jenkins/L0_Test.groovy; YAMLs from
       tests/integration/test_lists/test-db/. Decision JSON goes to stdout
       with keys: scope, affected_stages, reasons, test_db_dir_override,
-      affected_stage_test_counts.
+      affected_stage_test_counts, affected_stage_split_counts.
 
 Run from the TRT-LLM repo root or pass --repo-root.
 """
@@ -42,7 +42,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from blocks import (  # noqa: E402
     Stage,
     YAMLIndex,
+    compute_stage_split_counts,
     compute_stage_test_counts,
+    load_durations,
     parse_stages_from_groovy,
     write_filtered_test_db,
 )
@@ -101,8 +103,10 @@ class SelectionResult:
     reasons: list[str] = field(default_factory=list)
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
     test_db_dir_override: Optional[str] = None
-    # Per-stage narrowed test count, used by Layer 2.5 split-collapse.
+    # Per-stage kept-entry count (decision telemetry / diagnostics).
     affected_stage_test_counts: dict[str, int] = field(default_factory=dict)
+    # Per-stage duration-sized pytest-split count (Groovy cbtsResizeSplits slices to it).
+    affected_stage_split_counts: dict[str, int] = field(default_factory=dict)
     # Aggregated `any(rule.sanity_relevant)` across fired rules. Default
     # True is safe; Groovy Layer 2 keeps PackageSanityCheck only when True.
     sanity_required: bool = True
@@ -118,6 +122,7 @@ class SelectionResult:
             "reasons": list(self.reasons),
             "test_db_dir_override": self.test_db_dir_override,
             "affected_stage_test_counts": dict(self.affected_stage_test_counts),
+            "affected_stage_split_counts": dict(self.affected_stage_split_counts),
             "sanity_required": self.sanity_required,
             "perfsanity_required": self.perfsanity_required,
         }
@@ -185,7 +190,14 @@ class Selector:
         reasons = [f"[{rule.name}] {r.reason}" for rule, r in pairs]
         scope = _combine_scopes([r.scope for _, r in pairs])
         if scope is None:
-            return SelectionResult(scope=None, reasons=reasons + ["Scopes cannot be combined"])
+            # scope=None is a rule's force-fallback signal; attribute it, not a scope conflict.
+            forced = sorted({rule.name for rule, r in pairs if r.scope is None})
+            if forced:
+                summary = f"Fallback forced by rule(s): {', '.join(forced)}"
+            else:
+                actionable = sorted({r.scope for _, r in pairs if r.scope and r.scope != "noop"})
+                summary = f"Scopes cannot be combined: {', '.join(actionable)}"
+            return SelectionResult(scope=None, reasons=reasons + [summary])
 
         affected_stages: set[str] = set()
         for _, r in pairs:
@@ -237,7 +249,9 @@ def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     # Pre-strip blank- and comment-only `+/-` lines once so every rule
     # sees a "meaningful changes only" diff. Avoids spurious anchor
     # walk-up and stage-select misfires from cosmetic edits.
-    diffs = {path: strip_noop_diff_lines(d) for path, d in data.get("diffs", {}).items()}
+    # A null diff (PR API omits the patch for binary, rename, or
+    # too-large diffs) normalizes to an empty diff.
+    diffs = {path: strip_noop_diff_lines(d or "") for path, d in data.get("diffs", {}).items()}
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=diffs,
@@ -339,6 +353,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             affected_stages=set(result.affected_stages),
             block_filters=result.block_filters,
         )
+        # Size each narrowed stage's split count to ~2h/shard from .test_durations.
+        durations = load_durations(repo_root / "tests/integration/defs/.test_durations")
+        result.affected_stage_split_counts = compute_stage_split_counts(
+            yaml_index=yaml_index,
+            stages=stages,
+            affected_stages=set(result.affected_stages),
+            block_filters=result.block_filters,
+            durations=durations,
+        )
 
     # Trigger-mode filter; recompute derived counts. pre-merge drops Post-Merge
     # stages; post-merge keeps both (adds Post-Merge on top, matching baseline).
@@ -347,6 +370,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" not in s}
     result.affected_stage_test_counts = {
         k: v for k, v in result.affected_stage_test_counts.items() if k in result.affected_stages
+    }
+    result.affected_stage_split_counts = {
+        k: v for k, v in result.affected_stage_split_counts.items() if k in result.affected_stages
     }
 
     _log_decision_to_stderr(stages, result, pr, pre_filter_stages)
@@ -390,7 +416,9 @@ def _log_decision_to_stderr(
             file=out,
         )
         for name, count in sorted(result.affected_stage_test_counts.items()):
-            print(f"    - {name}: {count}", file=out)
+            split = result.affected_stage_split_counts.get(name)
+            split_note = f" -> {split} shard(s)" if split is not None else ""
+            print(f"    - {name}: {count}{split_note}", file=out)
     print(f"  affected_stages ({len(result.affected_stages)}):", file=out)
     for name in sorted(result.affected_stages):
         stage = stages.get(name)

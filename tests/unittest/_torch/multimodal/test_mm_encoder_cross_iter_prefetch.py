@@ -25,7 +25,6 @@ import torch
 
 from tensorrt_llm._torch.models import modeling_multimodal_mixin as mm_mixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalEncoderOutput,
     MultimodalModelMixin,
     _get_mm_aux_stream,
     maybe_prefetch_mm_encoder_for_next_iter,
@@ -40,7 +39,7 @@ class _StubModel(MultimodalModelMixin):
         self.encoder_call_count = 0
         self.encoder_call_stream_id = None
 
-    def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> MultimodalEncoderOutput:
+    def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> torch.Tensor:
         self.encoder_call_count += 1
         self.encoder_call_stream_id = torch.cuda.current_stream().cuda_stream
         pv = multimodal_params[0].multimodal_data["image"]["pixel_values"]
@@ -52,7 +51,7 @@ class _StubModel(MultimodalModelMixin):
             self._hidden_size,
             device=pv.device,
         )
-        return MultimodalEncoderOutput(embeddings=embeddings)
+        return embeddings
 
 
 def _make_request(request_id: int, num_tokens: int) -> LlmRequest:
@@ -93,12 +92,10 @@ def _make_metadata_only_request(request_id: int, num_tokens: int) -> LlmRequest:
 @pytest.fixture(autouse=True)
 def _reset_env_and_streams(monkeypatch):
     monkeypatch.delenv("TLLM_MM_SIDE_STREAM", raising=False)
-    monkeypatch.delenv("TLLM_MM_SIDE_STREAM_MAX_AHEAD", raising=False)
     yield
 
 
 def test_cross_iter_prefetch_max_ahead_counts_cached_requests(monkeypatch):
-    monkeypatch.setenv("TLLM_MM_SIDE_STREAM_MAX_AHEAD", "1")
     monkeypatch.setattr(mm_mixin, "_get_mm_aux_stream", lambda *args, **kwargs: object())
 
     dispatches = []
@@ -113,14 +110,15 @@ def test_cross_iter_prefetch_max_ahead_counts_cached_requests(monkeypatch):
     cached_req.py_multimodal_data["multimodal_embedding"] = torch.zeros((4, 8))
     fresh_req = _make_request(request_id=1, num_tokens=4)
 
-    n = maybe_prefetch_mm_encoder_for_next_iter(model, [cached_req, fresh_req])
+    n = maybe_prefetch_mm_encoder_for_next_iter(
+        model, [cached_req, fresh_req], max_prefetch_ahead=1
+    )
 
     assert n == 0
     assert dispatches == []
 
 
-def test_cross_iter_prefetch_max_ahead_env_override(monkeypatch):
-    monkeypatch.setenv("TLLM_MM_SIDE_STREAM_MAX_AHEAD", "2")
+def test_cross_iter_prefetch_max_ahead_config_override(monkeypatch):
     monkeypatch.setattr(mm_mixin, "_get_mm_aux_stream", lambda *args, **kwargs: object())
 
     dispatches = []
@@ -139,6 +137,7 @@ def test_cross_iter_prefetch_max_ahead_env_override(monkeypatch):
         model,
         [cached_req, fresh_req],
         max_prefetch=4,
+        max_prefetch_ahead=2,
     )
 
     assert n == 1
@@ -147,7 +146,6 @@ def test_cross_iter_prefetch_max_ahead_env_override(monkeypatch):
 
 
 def test_cross_iter_prefetch_max_ahead_counts_pending_event(monkeypatch):
-    monkeypatch.setenv("TLLM_MM_SIDE_STREAM_MAX_AHEAD", "1")
     monkeypatch.setattr(mm_mixin, "_get_mm_aux_stream", lambda *args, **kwargs: object())
 
     dispatches = []
@@ -162,14 +160,15 @@ def test_cross_iter_prefetch_max_ahead_counts_pending_event(monkeypatch):
     in_progress_req.py_mm_encoder_event = object()
     fresh_req = _make_request(request_id=1, num_tokens=4)
 
-    n = maybe_prefetch_mm_encoder_for_next_iter(model, [in_progress_req, fresh_req])
+    n = maybe_prefetch_mm_encoder_for_next_iter(
+        model, [in_progress_req, fresh_req], max_prefetch_ahead=1
+    )
 
     assert n == 0
     assert dispatches == []
 
 
 def test_cross_iter_prefetch_skips_metadata_only_requests(monkeypatch):
-    monkeypatch.setenv("TLLM_MM_SIDE_STREAM_MAX_AHEAD", "1")
     monkeypatch.setattr(mm_mixin, "_get_mm_aux_stream", lambda *args, **kwargs: object())
 
     dispatches = []
@@ -189,6 +188,7 @@ def test_cross_iter_prefetch_skips_metadata_only_requests(monkeypatch):
         model,
         [metadata_with_event_req, metadata_req, fresh_req],
         max_prefetch=4,
+        max_prefetch_ahead=1,
     )
 
     assert n == 1
@@ -213,7 +213,7 @@ def test_cross_iter_prefetch_ignores_old_side_stream_env(monkeypatch):
     assert "multimodal_embedding" not in req.py_multimodal_data
 
 
-def test_cross_iter_prefetch_no_op_when_env_off():
+def test_cross_iter_prefetch_no_op_when_config_off():
     model = _StubModel(hidden_size=8, tokens_per_image=4)
     req = _make_request(request_id=0, num_tokens=4)
     n = maybe_prefetch_mm_encoder_for_next_iter(model, [req])
@@ -223,15 +223,14 @@ def test_cross_iter_prefetch_no_op_when_env_off():
 
 
 def test_cross_iter_prefetch_materializes_on_side_stream(monkeypatch):
-    monkeypatch.setenv("TLLM_MM_SIDE_STREAM_MAX_AHEAD", "1")
-
-    aux_stream = _get_mm_aux_stream()
+    max_prefetch_ahead = 1
+    aux_stream = _get_mm_aux_stream(max_prefetch_ahead)
     assert aux_stream is not None
 
     model = _StubModel(hidden_size=8, tokens_per_image=4)
     req = _make_request(request_id=0, num_tokens=4)
 
-    n = maybe_prefetch_mm_encoder_for_next_iter(model, [req])
+    n = maybe_prefetch_mm_encoder_for_next_iter(model, [req], max_prefetch_ahead=max_prefetch_ahead)
 
     assert n == 1
     assert model.encoder_call_count == 1
@@ -244,8 +243,6 @@ def test_cross_iter_prefetch_materializes_on_side_stream(monkeypatch):
 
 
 def test_cross_iter_prefetch_skips_in_flight_and_cached(monkeypatch):
-    monkeypatch.setenv("TLLM_MM_SIDE_STREAM_MAX_AHEAD", "2")
-
     model = _StubModel(hidden_size=8, tokens_per_image=4)
     in_flight_req = _make_request(request_id=0, num_tokens=4)
     cached_req = _make_request(request_id=1, num_tokens=4)
@@ -257,6 +254,7 @@ def test_cross_iter_prefetch_skips_in_flight_and_cached(monkeypatch):
         model,
         [in_flight_req, cached_req, fresh_req],
         in_flight_request_ids=[0],
+        max_prefetch_ahead=2,
     )
     assert n == 1
     assert "multimodal_embedding" not in in_flight_req.py_multimodal_data

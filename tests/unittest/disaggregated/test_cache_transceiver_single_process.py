@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Single-process test for KVCacheManager (V1/V2) + KvCacheTransceiverV2.
 
 Uses threading + ThreadSafeDistributed to create KvCacheTransceiverV2 instances
@@ -8,6 +23,15 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 import os
 import threading
 import uuid
+from types import SimpleNamespace
+
+# Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
+# (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
+# falls back to cuda_ipc / cuda_copy without affecting correctness).
+# Force a deterministic UCX/NIXL config regardless of what the cluster/CI
+# injects; see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -34,13 +58,11 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
-# Reduce NIXL threads for unit test: default 8 threads per agent causes heavy
-# contention when creating multiple agents on a single GPU in the same process.
-os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 NUM_LAYERS = 4
+INDEXER_HEAD_DIM = 128
 NUM_KV_HEADS = 4  # 1 for MLA
 HEAD_DIM = 128
 TOKENS_PER_BLOCK = 8
@@ -48,6 +70,49 @@ MAX_SEQ_LEN = 256
 MAX_BATCH_SIZE = 4
 VOCAB_SIZE = 32000
 REQUEST_LENGTHS = [30, 60, 80]
+
+
+def test_assert_disagg_history_declared_passes_when_contract_met():
+    req = SimpleNamespace(py_request_id=7, prompt_len=17)
+    cache_manager = SimpleNamespace(get_history_length=lambda r: 17)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = cache_manager
+
+    # Should not raise — history_length matches prompt_len exactly.
+    transceiver._assert_disagg_history_declared(req)
+
+    # And also passes when history_length exceeds prompt_len (e.g., already advanced).
+    cache_manager.get_history_length = lambda r: 100
+    transceiver._assert_disagg_history_declared(req)
+
+
+def test_assert_disagg_history_declared_raises_on_contract_violation():
+    req = SimpleNamespace(py_request_id=7, prompt_len=17)
+    cache_manager = SimpleNamespace(get_history_length=lambda r: 0)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = cache_manager
+
+    with pytest.raises(RuntimeError, match="history_length=0 < prompt_len=17"):
+        transceiver._assert_disagg_history_declared(req)
+
+
+def test_assert_disagg_history_declared_noops_without_capability():
+    """V1 / non-V2 managers lack get_history_length; verify graceful skip."""
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = object()
+
+    # Should not raise — no get_history_length attribute.
+    transceiver._assert_disagg_history_declared(SimpleNamespace(prompt_len=17))
+
+
+def test_assert_disagg_history_declared_noops_when_cache_released():
+    """If the cache was released (e.g., cancelled mid-transfer), skip the check."""
+    req = SimpleNamespace(py_request_id=7, prompt_len=17)
+    cache_manager = SimpleNamespace(get_history_length=lambda r: None)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = cache_manager
+
+    transceiver._assert_disagg_history_declared(req)
 
 
 # ---------------------------------------------------------------------------
@@ -101,11 +166,16 @@ class KvCacheConfigV2:
     cross_kv_cache_fraction: Optional[float] = None
     secondary_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
+    kv_cache_event_hash_algo: str = "auto"
     max_gpu_total_bytes: Optional[int] = None
     enable_partial_reuse: bool = False
     copy_on_partial_reuse: bool = False
     dtype: str = "auto"
     disk_prefetch_num_reqs: int = 4
+    pool_ratio: Optional[List[float]] = None
+    avg_seq_len: Optional[int] = None
+    block_reuse_policy: str = "all_reusable"
+    enable_swa_scratch_reuse: bool = False
     max_util_for_resume: float = 0.95
 
 
@@ -181,9 +251,13 @@ class ThreadSafeDistributed:
             if key not in self._s:
                 self._s[key] = [None] * self._pp_size
             self._s[key][self._pp_rank] = obj
-        self._s["barrier"].wait()
+        # Sync only the PP group that shares this tp_rank. With attention data parallelism
+        # each tp_rank is an independent instance that may run a different number of
+        # collectives, so a single global barrier would deadlock; a per-group one does not.
+        pp_barrier = self._s["pp_barriers"][self._tp_rank]
+        pp_barrier.wait()
         result = list(self._s[key])
-        self._s["barrier"].wait()
+        pp_barrier.wait()
         return result
 
     def tp_allgather(self, obj):
@@ -194,9 +268,11 @@ class ThreadSafeDistributed:
             if key not in self._s:
                 self._s[key] = [None] * self._tp_size
             self._s[key][self._tp_rank] = obj
-        self._s["barrier"].wait()
+        # Sync only the TP group that shares this pp_rank (see pp_allgather).
+        tp_barrier = self._s["tp_barriers"][self._pp_rank]
+        tp_barrier.wait()
         result = list(self._s[key])
-        self._s["barrier"].wait()
+        tp_barrier.wait()
         return result
 
 
@@ -249,8 +325,10 @@ def _create_cache_manager(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    enable_indexer_k_cache: bool = False,
 ) -> "KVCacheManager | KVCacheManagerV2":
     """Create a KVCacheManager (V1) or KVCacheManagerV2 for the given mapping."""
+    assert not (enable_indexer_k_cache and use_v2), "DSA indexer K cache is V1-only"
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     cache_type = CacheTypeCpp.SELFKONLY if is_mla else CacheTypeCpp.SELF
 
@@ -317,6 +395,9 @@ def _create_cache_manager(
             mapping=mapping,
             dtype=DataType.FLOAT,
             model_config=model_config,
+            enable_indexer_k_cache=enable_indexer_k_cache,
+            indexer_k_cache_quant_block_size=128,
+            indexer_k_cache_index_head_dim=INDEXER_HEAD_DIM if enable_indexer_k_cache else 0,
         )
 
 
@@ -329,6 +410,7 @@ def _create_managers_for_instance(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    enable_indexer_k_cache: bool = False,
 ) -> List:
     """Create cache managers for all ranks in an instance."""
     managers = []
@@ -344,7 +426,13 @@ def _create_managers_for_instance(
             )
             managers.append(
                 _create_cache_manager(
-                    mapping, is_mla, use_v2, max_attention_window_vec, num_layers, max_batch_size
+                    mapping,
+                    is_mla,
+                    use_v2,
+                    max_attention_window_vec,
+                    num_layers,
+                    max_batch_size,
+                    enable_indexer_k_cache,
                 )
             )
     return managers
@@ -378,6 +466,27 @@ def _init_pool_data_v1(
             pool_tensor.copy_(random_values)
         else:
             pool_tensor.zero_()
+
+        if getattr(mgr, "enable_indexer_k_cache", False):
+            # DSA indexer K is TP-replicated: seed by PP stage only so every
+            # TP rank of a stage holds identical bytes.
+            indexer_pool = mgr.impl.get_indexer_k_cache_pool().view(torch.uint8)
+            if fill_random:
+                generator = torch.Generator(device=indexer_pool.device).manual_seed(
+                    seed_base + 7000 + pp_rank
+                )
+                indexer_pool.copy_(
+                    torch.randint(
+                        0,
+                        256,
+                        indexer_pool.shape,
+                        dtype=torch.uint8,
+                        device=indexer_pool.device,
+                        generator=generator,
+                    )
+                )
+            else:
+                indexer_pool.zero_()
 
 
 def _init_pool_data_v2(
@@ -433,13 +542,23 @@ def _init_pool_data(managers, tp, is_mla, use_v2, fill_random=True, seed_base=10
 # ---------------------------------------------------------------------------
 # Add sequence to manager
 # ---------------------------------------------------------------------------
-def _add_sequence(mgr, request_id: int, prompt_len: int, use_v2: bool):
+def _add_sequence(
+    mgr, request_id: int, prompt_len: int, use_v2: bool, *, is_generation: bool = False
+):
     """Add a sequence to the cache manager. Returns kv_cache for V2 (needed for cleanup)."""
     if use_v2:
         kv_cache = mgr._create_kv_cache(request_id, None, None)
+        if not mgr.enable_block_reuse:
+            kv_cache.stop_committing()
         success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
         assert success, f"Failed to resume kv_cache for request {request_id}"
-        kv_cache.resize(prompt_len)
+        if is_generation:
+            kv_cache.enable_swa_scratch_reuse = False
+            kv_cache.resize(prompt_len, history_length=prompt_len)
+        else:
+            kv_cache.resize(prompt_len)
+            kv_cache.resize(None, history_length=prompt_len)
+            kv_cache.enable_swa_scratch_reuse = False
         return kv_cache
     else:
         # V1: create a dummy LlmRequest for add_sequence_batch
@@ -487,7 +606,15 @@ def create_instance_transceivers(
 ) -> List[KvCacheTransceiverV2]:
     """Create KvCacheTransceiverV2 for all ranks via threaded init."""
     world_size = tp * pp
-    shared = {"barrier": threading.Barrier(world_size), "lock": threading.Lock()}
+    shared = {
+        "barrier": threading.Barrier(world_size),
+        # Per-group barriers for the grouped collectives, so attention-DP instances can
+        # diverge in how many collectives they issue: pp_allgather syncs the PP ranks that
+        # share a tp_rank, tp_allgather the TP ranks that share a pp_rank.
+        "pp_barriers": [threading.Barrier(pp) for _ in range(tp)],
+        "tp_barriers": [threading.Barrier(tp) for _ in range(pp)],
+        "lock": threading.Lock(),
+    }
     results = [None] * world_size
     errors = [None] * world_size
     threads = []
@@ -738,6 +865,77 @@ def verify_all_requests(
             )
 
 
+def _get_indexer_block_data(mgr, request_id, layer_idx, num_layers, pp, tp, enable_dp, req_idx):
+    """Per-request indexer-K bytes for one global layer on the owning rank.
+
+    Indexer K is TP-replicated, so any TP rank of the layer's PP stage works;
+    with attention DP only the request's DP group holds the request.
+    """
+    pp_rank = _pp_rank_of_layer(layer_idx, num_layers, pp)
+    tp_rank = req_idx % tp if enable_dp else 0
+    owner = mgr[pp_rank * tp + tp_rank]
+    block_indices = owner.get_batch_cache_indices([request_id], layer_idx)[0]
+    valid = [idx for idx in block_indices if idx >= 0]
+    if not valid:
+        return None
+    local_layer = layer_idx - _pp_layer_start(pp_rank, num_layers, pp)
+    # Pool shape: (numBlocks, numLayers, kvFactor, blockSize), dtype uint8.
+    pool = owner.impl.get_indexer_k_cache_pool().view(torch.uint8)
+    return pool[valid, local_layer]
+
+
+def _verify_indexer_k_all_requests(
+    request_lengths: List[int],
+    ctx_managers: List,
+    gen_managers: List,
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    ctx_enable_dp: bool,
+    gen_enable_dp: bool,
+    ctx_request_ids: List[int],
+    gen_request_ids: List[int],
+    num_layers: int,
+):
+    """Compare the transferred DSA indexer K bytes for every request/layer."""
+    for req_idx, _req_len in enumerate(request_lengths):
+        for layer_idx in range(num_layers):
+            ctx_data = _get_indexer_block_data(
+                ctx_managers,
+                ctx_request_ids[req_idx],
+                layer_idx,
+                num_layers,
+                ctx_pp,
+                ctx_tp,
+                ctx_enable_dp,
+                req_idx,
+            )
+            gen_data = _get_indexer_block_data(
+                gen_managers,
+                gen_request_ids[req_idx],
+                layer_idx,
+                num_layers,
+                gen_pp,
+                gen_tp,
+                gen_enable_dp,
+                req_idx,
+            )
+            if ctx_data is None or gen_data is None:
+                continue
+            assert ctx_data.shape == gen_data.shape, (
+                f"Indexer shape mismatch at req={req_idx} layer={layer_idx}: "
+                f"ctx={ctx_data.shape} gen={gen_data.shape}"
+            )
+            torch.testing.assert_close(
+                gen_data,
+                ctx_data,
+                rtol=0,
+                atol=0,
+                msg=lambda m: (f"Indexer data mismatch at req={req_idx} layer={layer_idx}: {m}"),
+            )
+
+
 # ---------------------------------------------------------------------------
 # Main test orchestrator
 # ---------------------------------------------------------------------------
@@ -753,6 +951,7 @@ def run_transfer_test(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     request_lengths: Optional[List[int]] = None,
+    enable_indexer_k_cache: bool = False,
 ):
     """Run a full KV transfer test using KvCacheTransceiverV2."""
     if request_lengths is None:
@@ -771,6 +970,7 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        enable_indexer_k_cache,
     )
     gen_managers = _create_managers_for_instance(
         gen_tp,
@@ -781,6 +981,7 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        enable_indexer_k_cache,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
@@ -800,123 +1001,147 @@ def run_transfer_test(
         gen_tp, gen_pp, gen_enable_dp, gen_managers, config, is_mla
     )
 
-    ctx_info_endpoint = ctx_tcs[0]._context_info_endpoint
+    try:
+        ctx_info_endpoint = ctx_tcs[0]._context_info_endpoint
 
-    # ===== 4. Create requests =====
-    ctx_handle_map: Dict[int, List] = {r: [] for r in range(ctx_world)}
-    gen_handle_map: Dict[int, List] = {r: [] for r in range(gen_world)}
-    ctx_request_ids: List[int] = []
-    gen_request_ids: List[int] = []
-    ctx_kv_caches: Dict[int, List] = {r: [] for r in range(ctx_world)}
-    gen_kv_caches: Dict[int, List] = {r: [] for r in range(gen_world)}
+        # ===== 4. Create requests =====
+        ctx_handle_map: Dict[int, List] = {r: [] for r in range(ctx_world)}
+        gen_handle_map: Dict[int, List] = {r: [] for r in range(gen_world)}
+        ctx_request_ids: List[int] = []
+        gen_request_ids: List[int] = []
+        ctx_kv_caches: Dict[int, List] = {r: [] for r in range(ctx_world)}
+        gen_kv_caches: Dict[int, List] = {r: [] for r in range(gen_world)}
 
-    sampling_params = SamplingParams()
+        sampling_params = SamplingParams()
 
-    for req_idx, req_len in enumerate(request_lengths):
-        unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
-        ctx_rid = req_idx * 2
-        gen_rid = req_idx * 2 + 1
-        ctx_request_ids.append(ctx_rid)
-        gen_request_ids.append(gen_rid)
+        for req_idx, req_len in enumerate(request_lengths):
+            unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+            ctx_rid = req_idx * 2
+            gen_rid = req_idx * 2 + 1
+            ctx_request_ids.append(ctx_rid)
+            gen_request_ids.append(gen_rid)
 
-        ctx_dp_rank = req_idx % ctx_tp if ctx_enable_dp else 0
+            ctx_dp_rank = req_idx % ctx_tp if ctx_enable_dp else 0
 
-        ctx_request = LlmRequest(
-            request_id=ctx_rid,
-            max_new_tokens=1,
-            input_tokens=list(range(req_len)),
-            sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                sampling_params._get_sampling_config()
-            ),
-            is_streaming=False,
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
-        )
-        ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+            ctx_request = LlmRequest(
+                request_id=ctx_rid,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+            )
+            ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
 
-        gen_request = LlmRequest(
-            request_id=gen_rid,
-            max_new_tokens=1,
-            input_tokens=list(range(req_len)),
-            sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                sampling_params._get_sampling_config()
-            ),
-            is_streaming=False,
-            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-        )
-        gen_request.py_disaggregated_params = DisaggregatedParams(
-            ctx_request_id=ctx_rid,
-            ctx_dp_rank=ctx_dp_rank,
-            ctx_info_endpoint=ctx_info_endpoint,
-            disagg_request_id=unique_rid,
-        )
+            gen_request = LlmRequest(
+                request_id=gen_rid,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            )
+            gen_request.py_disaggregated_params = DisaggregatedParams(
+                ctx_request_id=ctx_rid,
+                ctx_dp_rank=ctx_dp_rank,
+                ctx_info_endpoint=ctx_info_endpoint,
+                disagg_request_id=unique_rid,
+            )
 
-        for rank in range(ctx_world):
-            tp_rank = rank % ctx_tp
-            should_handle = (not ctx_enable_dp) or (req_idx % ctx_tp == tp_rank)
-            if should_handle:
-                ctx_handle_map[rank].append((req_idx, ctx_request))
+            for rank in range(ctx_world):
+                tp_rank = rank % ctx_tp
+                should_handle = (not ctx_enable_dp) or (req_idx % ctx_tp == tp_rank)
+                if should_handle:
+                    ctx_handle_map[rank].append((req_idx, ctx_request))
 
+            for rank in range(gen_world):
+                tp_rank = rank % gen_tp
+                should_handle = (not gen_enable_dp) or (req_idx % gen_tp == tp_rank)
+                if should_handle:
+                    gen_handle_map[rank].append((req_idx, gen_request))
+
+        # 5. Add sequences and gen receive first
         for rank in range(gen_world):
-            tp_rank = rank % gen_tp
-            should_handle = (not gen_enable_dp) or (req_idx % gen_tp == tp_rank)
-            if should_handle:
-                gen_handle_map[rank].append((req_idx, gen_request))
+            for req_idx, req in gen_handle_map[rank]:
+                kv = _add_sequence(
+                    gen_managers[rank],
+                    req.py_request_id,
+                    req.prompt_len,
+                    use_v2,
+                    is_generation=True,
+                )
+                if kv is not None:
+                    gen_kv_caches[rank].append(kv)
+                gen_tcs[rank].request_and_receive_async(req)
 
-    # 5. Add sequences and gen receive first
-    for rank in range(gen_world):
-        for req_idx, req in gen_handle_map[rank]:
-            kv = _add_sequence(gen_managers[rank], req.py_request_id, req.prompt_len, use_v2)
-            if kv is not None:
-                gen_kv_caches[rank].append(kv)
-            gen_tcs[rank].request_and_receive_async(req)
-
-    # 6. ctx send after
-    for rank in range(ctx_world):
-        for req_idx, req in ctx_handle_map[rank]:
-            kv = _add_sequence(ctx_managers[rank], req.py_request_id, req.prompt_len, use_v2)
-            if kv is not None:
-                ctx_kv_caches[rank].append(kv)
-            ctx_tcs[rank].respond_and_send_async(req)
-
-    # 7. Wait for completion (threaded, dist calls inside)
-    run_concurrent(ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True))
-    run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
-
-    # 8. Verify
-    verify_all_requests(
-        request_lengths=request_lengths,
-        ctx_managers=ctx_managers,
-        gen_managers=gen_managers,
-        ctx_tp=ctx_tp,
-        ctx_pp=ctx_pp,
-        gen_tp=gen_tp,
-        gen_pp=gen_pp,
-        ctx_enable_dp=ctx_enable_dp,
-        gen_enable_dp=gen_enable_dp,
-        ctx_request_ids=ctx_request_ids,
-        gen_request_ids=gen_request_ids,
-        is_mla=is_mla,
-        use_v2=use_v2,
-        max_attention_window_vec=max_attention_window_vec,
-        num_layers=num_layers,
-    )
-
-    # 9. Cleanup
-    if use_v2:
-        torch.cuda.current_stream().synchronize()
+        # 6. ctx send after
         for rank in range(ctx_world):
-            for kv in ctx_kv_caches[rank]:
-                kv.close()
-        for rank in range(gen_world):
-            for kv in gen_kv_caches[rank]:
-                kv.close()
+            for req_idx, req in ctx_handle_map[rank]:
+                kv = _add_sequence(ctx_managers[rank], req.py_request_id, req.prompt_len, use_v2)
+                if kv is not None:
+                    ctx_kv_caches[rank].append(kv)
+                ctx_tcs[rank].respond_and_send_async(req)
 
-    for tc in ctx_tcs:
-        if hasattr(tc, "transfer_worker") and tc.transfer_worker is not None:
-            tc.transfer_worker.shutdown()
-    for tc in gen_tcs:
-        if hasattr(tc, "transfer_worker") and tc.transfer_worker is not None:
-            tc.transfer_worker.shutdown()
+        # 7. Wait for completion (threaded, dist calls inside)
+        run_concurrent(
+            ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True)
+        )
+        run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
+
+        # 8. Verify
+        verify_all_requests(
+            request_lengths=request_lengths,
+            ctx_managers=ctx_managers,
+            gen_managers=gen_managers,
+            ctx_tp=ctx_tp,
+            ctx_pp=ctx_pp,
+            gen_tp=gen_tp,
+            gen_pp=gen_pp,
+            ctx_enable_dp=ctx_enable_dp,
+            gen_enable_dp=gen_enable_dp,
+            ctx_request_ids=ctx_request_ids,
+            gen_request_ids=gen_request_ids,
+            is_mla=is_mla,
+            use_v2=use_v2,
+            max_attention_window_vec=max_attention_window_vec,
+            num_layers=num_layers,
+        )
+        if enable_indexer_k_cache:
+            _verify_indexer_k_all_requests(
+                request_lengths=request_lengths,
+                ctx_managers=ctx_managers,
+                gen_managers=gen_managers,
+                ctx_tp=ctx_tp,
+                ctx_pp=ctx_pp,
+                gen_tp=gen_tp,
+                gen_pp=gen_pp,
+                ctx_enable_dp=ctx_enable_dp,
+                gen_enable_dp=gen_enable_dp,
+                ctx_request_ids=ctx_request_ids,
+                gen_request_ids=gen_request_ids,
+                num_layers=num_layers,
+            )
+
+        # 9. Cleanup
+        if use_v2:
+            torch.cuda.current_stream().synchronize()
+            for rank in range(ctx_world):
+                for kv in ctx_kv_caches[rank]:
+                    kv.close()
+            for rank in range(gen_world):
+                for kv in gen_kv_caches[rank]:
+                    kv.close()
+
+    finally:
+        for tc in ctx_tcs + gen_tcs:
+            try:
+                tc.shutdown()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1447,50 @@ def test_cache_transceiver_boundary_lengths(
     )
 
     print("PASSED")
+
+
+# DSA (DeepSeek V3.2) indexer K cache: V1-only, MLA, TP-replicated single
+# index head. Covers the REPLICATED pool view end to end through the real
+# python transceiver: fan-in owner election, fan-out, and PP layer subsets
+# (layer-strided ReplicatedMapper offsets).
+DSA_INDEXER_CONFIGS = [
+    # (ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_dp, gen_dp, test_id)
+    (1, 1, 1, 1, False, False, "tp1_to_tp1"),
+    (2, 1, 1, 1, False, False, "tp2_to_tp1_fanin"),
+    (1, 1, 2, 1, False, False, "tp1_to_tp2_fanout"),
+    (1, 2, 1, 1, False, False, "pp2_to_pp1"),
+    (1, 1, 1, 2, False, False, "pp1_to_pp2"),
+    (2, 2, 1, 1, False, False, "tp2pp2_to_tp1"),
+    (2, 1, 2, 1, False, True, "tp2_to_dep2"),
+]
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp",
+    [c[:6] for c in DSA_INDEXER_CONFIGS],
+    ids=[c[6] for c in DSA_INDEXER_CONFIGS],
+)
+def test_cache_transceiver_v1_dsa_indexer(
+    ctx_tp,
+    ctx_pp,
+    gen_tp,
+    gen_pp,
+    ctx_enable_dp,
+    gen_enable_dp,
+):
+    """V1 KVCacheManager + DSA indexer K cache through KvCacheTransceiverV2."""
+    run_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
+        is_mla=True,
+        use_v2=False,
+        enable_indexer_k_cache=True,
+    )
 
 
 if __name__ == "__main__":

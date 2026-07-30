@@ -23,16 +23,20 @@ at various QPS levels, exercising the prefix-aware scheduler's reuse
 estimation logic under realistic serving conditions.
 """
 
+import contextlib
 import csv
 import json
 import math
 import os
 import queue
 import re
+import shlex
+import socket
 import subprocess
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias
 
@@ -59,6 +63,30 @@ _LMBENCHMARK_INSTALL_SPEC = (
     f"{_LMBENCHMARK_PACKAGE} @ git+https://github.com/LMCache/LMBenchmark.git@{LMBENCHMARK_SHA}"
 )
 CsvMetrics: TypeAlias = dict[str, int | float]
+_SERVER_HOST = "0.0.0.0"
+_SERVER_START_MAX_ATTEMPTS = 5
+_PORT_CONFLICT_SUBSTRINGS = (
+    "address already in use",
+    "eaddrinuse",
+    "errno 98",
+)
+_DIAGNOSTIC_LOG_LINES = 200
+_DIAGNOSTIC_CMD_TIMEOUT_S = 5
+
+
+@dataclass(frozen=True)
+class ServerDebugContext:
+    """Context needed to render a useful CI failure snapshot."""
+
+    port: int | None = None
+    server_log: str | None = None
+    config_path: str | None = None
+    cmd: list[str] | None = None
+    proc: subprocess.Popen | None = None
+    attempt: int | None = None
+    max_attempts: int | None = None
+    output_csv: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Scheduler / KV-cache config combinations
@@ -100,6 +128,9 @@ SCHED_CONFIGS = [
         {
             "kv_cache_config": {"max_tokens": 200000},
             "enable_chunked_prefill": False,
+            # The workload sends prompts up to ~21k tokens. Without chunked
+            # prefill, the full prompt must fit in one forward pass.
+            "max_num_tokens": 32768,
             "print_iter_log": True,
         },
         id="guaranteed-no-chunked",
@@ -214,13 +245,160 @@ def _tail_log(log_path: str, n: int = 40) -> str:
         return "(log not available)"
 
 
-def _assert_no_server_errors(server_log: str) -> None:
+def _read_text_for_diagnostics(path: str, max_chars: int = 12000) -> str:
+    """Read a small diagnostic file, keeping CI output bounded."""
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError as exc:
+        return f"(not available: {exc})"
+    if len(text) > max_chars:
+        return f"(truncated to last {max_chars} chars)\n{text[-max_chars:]}"
+    return text or "(empty)"
+
+
+def _run_diagnostic_command(cmd: list[str]) -> str:
+    """Run a best-effort diagnostic command without failing the test harness."""
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=_DIAGNOSTIC_CMD_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"(timed out after {_DIAGNOSTIC_CMD_TIMEOUT_S}s)"
+    except OSError as exc:
+        return f"(not available: {exc})"
+
+    output = completed.stdout.strip()
+    if not output:
+        return f"(no output; exit code {completed.returncode})"
+    if completed.returncode != 0:
+        return f"(exit code {completed.returncode})\n{output}"
+    return output
+
+
+def _format_cmd(cmd: list[str] | None) -> str:
+    """Return a shell-readable command string for diagnostics."""
+    return shlex.join(cmd) if cmd else "(not available)"
+
+
+def _port_diagnostics(port: int | None) -> str:
+    """Return listening-socket diagnostics for the selected server port."""
+    if port is None:
+        return "(port not available)"
+
+    ss_filter = f"ss -H -ltnp 2>&1 | grep -E '(:{port}\\b|:{port} )' || true"
+    return "\n".join(
+        [
+            "$ ss -H -ltnp | grep <port>",
+            _run_diagnostic_command(["bash", "-lc", ss_filter]),
+            f"$ lsof -nP -iTCP:{port} -sTCP:LISTEN",
+            _run_diagnostic_command(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"]),
+        ]
+    )
+
+
+def _process_diagnostics(proc: subprocess.Popen | None = None) -> str:
+    """Return process snapshots for trtllm-serve and worker children."""
+    sections = [
+        "$ pgrep -af 'trtllm-serve|mpi4py.futures.server|orted'",
+        _run_diagnostic_command(["pgrep", "-af", "trtllm-serve|mpi4py.futures.server|orted"]),
+    ]
+    if proc is not None:
+        rc = proc.poll()
+        sections.extend(
+            [
+                f"server parent pid={proc.pid} poll={rc}",
+                f"$ ps -o pid,ppid,stat,etime,cmd -p {proc.pid}",
+                _run_diagnostic_command(
+                    ["ps", "-o", "pid,ppid,stat,etime,cmd", "-p", str(proc.pid)]
+                ),
+            ]
+        )
+    return "\n".join(sections)
+
+
+def _gpu_diagnostics() -> str:
+    """Return a compact GPU process snapshot when nvidia-smi is available."""
+    return _run_diagnostic_command(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name,used_gpu_memory",
+            "--format=csv",
+        ]
+    )
+
+
+def _csv_diagnostics(output_csv: str | None) -> str:
+    """Return a compact summary of the benchmark output CSV."""
+    if output_csv is None:
+        return "(csv path not available)"
+    try:
+        stat = os.stat(output_csv)
+    except OSError as exc:
+        return f"{output_csv}: not available ({exc})"
+
+    try:
+        with open(output_csv, newline="") as f:
+            rows = max(sum(1 for _ in f) - 1, 0)
+    except OSError as exc:
+        return f"{output_csv}: size={stat.st_size} bytes, row count unavailable ({exc})"
+    return f"{output_csv}: size={stat.st_size} bytes, data_rows={rows}"
+
+
+def _format_server_debug(reason: str, context: ServerDebugContext) -> str:
+    """Render a failure-only snapshot that survives in CI logs."""
+    attempt = (
+        f"{context.attempt}/{context.max_attempts}"
+        if context.attempt is not None and context.max_attempts is not None
+        else "(not available)"
+    )
+    proc_status = "(not available)"
+    if context.proc is not None:
+        proc_status = f"pid={context.proc.pid}, poll={context.proc.poll()}"
+
+    sections = [
+        "=== Prefix-aware scheduling CI debug snapshot ===",
+        f"reason: {reason}",
+        f"host: {socket.gethostname()}",
+        f"cwd: {os.getcwd()}",
+        f"attempt: {attempt}",
+        f"port: {context.port if context.port is not None else '(not available)'}",
+        f"server process: {proc_status}",
+        f"server command: {_format_cmd(context.cmd)}",
+        f"config path: {context.config_path or '(not available)'}",
+    ]
+    if context.config_path:
+        sections.extend(["--- config ---", _read_text_for_diagnostics(context.config_path)])
+    if context.output_csv:
+        sections.extend(["--- benchmark csv ---", _csv_diagnostics(context.output_csv)])
+    sections.extend(["--- listening socket snapshot ---", _port_diagnostics(context.port)])
+    sections.extend(["--- related process snapshot ---", _process_diagnostics(context.proc)])
+    sections.extend(["--- GPU compute-app snapshot ---", _gpu_diagnostics()])
+    if context.server_log:
+        sections.extend(
+            [
+                f"--- server log tail: {context.server_log} ---",
+                _tail_log(context.server_log, _DIAGNOSTIC_LOG_LINES),
+            ]
+        )
+    return "\n".join(sections)
+
+
+def _assert_no_server_errors(server_log: str, context: ServerDebugContext | None = None) -> None:
     """Assert the server log is error-free; include log tail on failure."""
     err = _check_server_errors(server_log)
+    debug = ""
+    if err and context is not None:
+        debug = "\n" + _format_server_debug("server log error pattern detected", context)
     assert err is None, (
         f"Server error detected: {err!r}\n"
         f"--- last lines of {server_log} ---\n"
         f"{_tail_log(server_log)}"
+        f"{debug}"
     )
 
 
@@ -264,6 +442,105 @@ def _wait_for_server_ready(
     raise TimeoutError(f"trtllm-serve not ready within {timeout}s")
 
 
+def _is_port_available_for_server(port: int) -> bool:
+    """Return whether trtllm-serve can bind its configured host/port pair now."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((_SERVER_HOST, port))
+            return True
+    except OSError:
+        return False
+
+
+def _is_port_conflict_error(message: str) -> bool:
+    """Return whether a startup failure came from an occupied server port."""
+    lowered = message.lower()
+    return "bind" in lowered and any(pattern in lowered for pattern in _PORT_CONFLICT_SUBSTRINGS)
+
+
+def _server_attempt_log_path(server_log: str, attempt: int) -> str:
+    """Return an isolated log path for one server startup attempt."""
+    path = Path(server_log)
+    return str(path.with_name(f"{path.name}.attempt{attempt}"))
+
+
+@contextlib.contextmanager
+def _start_server_until_ready(
+    config_path: str,
+    server_log: str,
+    env: Mapping[str, str],
+    max_attempts: int = _SERVER_START_MAX_ATTEMPTS,
+) -> Iterator[tuple[subprocess.Popen, int, str]]:
+    """Start trtllm-serve, retrying only when the selected port races."""
+    last_port_conflict: BaseException | None = None
+    last_debug: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        port = get_free_port_in_ci()
+        attempt_log = _server_attempt_log_path(server_log, attempt)
+        cmd = _make_server_cmd(port, config_path)
+
+        if not _is_port_available_for_server(port):
+            last_port_conflict = RuntimeError(f"Port {_SERVER_HOST}:{port} is already in use")
+            last_debug = _format_server_debug(
+                "selected port was already occupied before trtllm-serve launch",
+                ServerDebugContext(
+                    port=port,
+                    server_log=attempt_log,
+                    config_path=config_path,
+                    cmd=cmd,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                ),
+            )
+            action = "retrying" if attempt < max_attempts else "no attempts remain"
+            print_info(
+                f"trtllm-serve startup attempt {attempt}/{max_attempts} "
+                f"selected occupied port {port}; {action}"
+            )
+            continue
+
+        with open(attempt_log, "w") as log_f:
+            with popen(cmd, stderr=log_f, stdout=log_f, env=env) as proc:
+                try:
+                    _wait_for_server_ready(proc, port, server_log=attempt_log)
+                except (RuntimeError, TimeoutError) as exc:
+                    debug_context = ServerDebugContext(
+                        port=port,
+                        server_log=attempt_log,
+                        config_path=config_path,
+                        cmd=cmd,
+                        proc=proc,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                    )
+                    if _is_port_conflict_error(str(exc)):
+                        last_port_conflict = exc
+                        last_debug = _format_server_debug(
+                            "trtllm-serve lost the selected port before bind",
+                            debug_context,
+                        )
+                        action = "retrying" if attempt < max_attempts else "no attempts remain"
+                        print_info(
+                            f"trtllm-serve startup attempt {attempt}/{max_attempts} "
+                            f"lost port {port} before bind; {action}"
+                        )
+                        continue
+                    raise RuntimeError(
+                        f"{exc}\n"
+                        f"{_format_server_debug('trtllm-serve startup failure', debug_context)}"
+                    ) from exc
+
+                yield proc, port, attempt_log
+                return
+
+    debug = f"\n{last_debug}" if last_debug else ""
+    raise RuntimeError(
+        f"Failed to start trtllm-serve after {max_attempts} attempts due to repeated "
+        f"port conflicts{debug}"
+    ) from last_port_conflict
+
+
 def _make_server_cmd(port: int, config_path: str) -> list[str]:
     """Build the trtllm-serve command used by all tests."""
     return [
@@ -271,12 +548,47 @@ def _make_server_cmd(port: int, config_path: str) -> list[str]:
         "serve",
         MODEL_PATH,
         "--host",
-        "0.0.0.0",
+        _SERVER_HOST,
         "--port",
         str(port),
         "--config",
         config_path,
     ]
+
+
+def _server_debug_context(
+    port: int,
+    server_log: str,
+    config_path: str,
+    proc: subprocess.Popen | None = None,
+) -> ServerDebugContext:
+    """Build debug context for a running or recently stopped server."""
+    return ServerDebugContext(
+        port=port,
+        server_log=server_log,
+        config_path=config_path,
+        cmd=_make_server_cmd(port, config_path),
+        proc=proc,
+    )
+
+
+def _stage_debug_context(
+    context: ServerDebugContext | None,
+    port: int,
+    server_log: str | None,
+    output_csv: str,
+) -> ServerDebugContext:
+    """Attach per-stage output details to an optional server debug context."""
+    return ServerDebugContext(
+        port=context.port if context and context.port is not None else port,
+        server_log=context.server_log if context and context.server_log else server_log,
+        config_path=context.config_path if context else None,
+        cmd=context.cmd if context else None,
+        proc=context.proc if context else None,
+        attempt=context.attempt if context else None,
+        max_attempts=context.max_attempts if context else None,
+        output_csv=output_csv,
+    )
 
 
 def _write_config(tmp_path: Path, cfg: dict[str, object], name: str = "config.yml") -> str:
@@ -304,6 +616,7 @@ def _run_lmbenchmark(
     answer_len: int = 20,
     duration: int = 30,
     server_log: str | None = None,
+    debug_context: ServerDebugContext | None = None,
 ) -> int:
     """Run the LMBenchmark multi-round-qa script and return the exit code.
 
@@ -346,6 +659,7 @@ def _run_lmbenchmark(
     print_info(f"Running LMBenchmark: {' '.join(cmd)}")
 
     t_start = time.time()
+    benchmark_debug_context = _stage_debug_context(debug_context, port, server_log, output_csv)
 
     def _popen_lmbenchmark(call_args: list[str], env: Mapping[str, str]) -> subprocess.Popen:
         return subprocess.Popen(
@@ -397,6 +711,12 @@ def _run_lmbenchmark(
             f"elapsed={elapsed_at_kill:.1f}s drain={elapsed_at_kill - duration:+.1f}s "
             f"grace_s={grace_s}s"
         )
+        print_error(
+            _format_server_debug(
+                reason,
+                benchmark_debug_context,
+            )
+        )
         proc.kill()
         proc.wait()
         stdout_thread.join(timeout=5)
@@ -444,8 +764,12 @@ def _run_lmbenchmark(
             if now - last_poll >= 5:
                 last_poll = now
 
-                if server_log and _check_server_errors(server_log):
-                    return _kill("Server error detected in log, killing benchmark")
+                if server_log:
+                    server_error = _check_server_errors(server_log)
+                    if server_error:
+                        return _kill(
+                            f"Server error detected in log, killing benchmark: {server_error!r}"
+                        )
 
                 try:
                     # 5s (was 2s) — under high offered load the async /health
@@ -483,6 +807,12 @@ def _run_lmbenchmark(
             continue
         if _NAN_RE.search(line):
             print_error(f"NaN detected in benchmark output: {line!r}")
+            print_error(
+                _format_server_debug(
+                    "NaN detected in benchmark output",
+                    benchmark_debug_context,
+                )
+            )
             return -1
         print_info(f"  [benchmark] {line}")
 
@@ -499,6 +829,12 @@ def _run_lmbenchmark(
         for line in "".join(stderr_lines).strip().split("\n")[-10:]:
             if line:
                 print_error(f"  [stderr] {line}")
+        print_error(
+            _format_server_debug(
+                f"LMBenchmark exited with code {proc.returncode}",
+                benchmark_debug_context,
+            )
+        )
     return proc.returncode
 
 
@@ -567,8 +903,10 @@ def _run_and_assert_stage(
     chat_history: int,
     answer_len: int,
     duration: int,
+    debug_context: ServerDebugContext | None = None,
 ) -> CsvMetrics:
     """Run one LMBenchmark stage, assert success, and return the metrics dict."""
+    stage_debug_context = _stage_debug_context(debug_context, port, server_log, output_csv)
     rc = _run_lmbenchmark(
         llm_venv=llm_venv,
         port=port,
@@ -581,16 +919,25 @@ def _run_and_assert_stage(
         answer_len=answer_len,
         duration=duration,
         server_log=server_log,
+        debug_context=stage_debug_context,
     )
-    assert rc == 0, f"{label} failed with rc={rc}. See {server_log}\n{_tail_log(server_log)}"
+    assert rc == 0, (
+        f"{label} failed with rc={rc}. See {server_log}\n"
+        f"{_format_server_debug(f'{label} failed with rc={rc}', stage_debug_context)}"
+    )
     metrics = _parse_csv_metrics(output_csv)
     assert metrics and metrics.get("num_requests", 0) > 0, (
-        f"{label} produced no completed requests (csv={output_csv})"
+        f"{label} produced no completed requests (csv={output_csv})\n"
+        f"{_format_server_debug(f'{label} produced no completed requests', stage_debug_context)}"
     )
-    assert metrics["nan_count"] == 0, f"{label} produced {metrics['nan_count']} NaN ttft values"
+    assert metrics["nan_count"] == 0, (
+        f"{label} produced {metrics['nan_count']} NaN ttft values\n"
+        f"{_format_server_debug(f'{label} produced NaN ttft values', stage_debug_context)}"
+    )
     assert metrics["ttft_count"] > 0, (
         f"{label} produced {metrics['num_requests']} rows but zero usable ttft "
-        f"values — benchmark output is broken (csv={output_csv})"
+        f"values — benchmark output is broken (csv={output_csv})\n"
+        f"{_format_server_debug(f'{label} produced no usable ttft values', stage_debug_context)}"
     )
     return metrics
 
@@ -710,55 +1057,59 @@ class TestServePrefixAwareScheduling:
             "print_iter_log": True,
         }
         config_path = _write_config(tmp_path, baseline_cfg)
-        port = get_free_port_in_ci()
-        cmd = _make_server_cmd(port, config_path)
-        server_log = str(tmp_path / "server.log")
+        server_log_base = str(tmp_path / "server.log")
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 
-        with open(server_log, "w") as log_f:
-            with popen(cmd, stderr=log_f, stdout=log_f, env=env) as proc:
-                _wait_for_server_ready(proc, port, server_log=server_log)
+        with _start_server_until_ready(config_path, server_log_base, env) as (
+            proc,
+            port,
+            server_log,
+        ):
+            server_debug_context = _server_debug_context(port, server_log, config_path, proc)
 
-                # Stage 1: seed radix tree (mimics the low-QPS warmup that
-                # accumulated state before the crash in the original report).
-                print_info("Smoke stage 1: seeding radix tree...")
-                _run_and_assert_stage(
-                    "Smoke warmup",
-                    ensure_lmbenchmark,
-                    port,
-                    str(tmp_path / "smoke_warmup.csv"),
-                    server_log,
-                    qps=4,
-                    num_users=3,
-                    num_rounds=3,
-                    system_prompt=1000,
-                    chat_history=20000,
-                    answer_len=10,
-                    duration=20,
-                )
+            # Stage 1: seed radix tree (mimics the low-QPS warmup that
+            # accumulated state before the crash in the original report).
+            print_info("Smoke stage 1: seeding radix tree...")
+            _run_and_assert_stage(
+                "Smoke warmup",
+                ensure_lmbenchmark,
+                port,
+                str(tmp_path / "smoke_warmup.csv"),
+                server_log,
+                qps=4,
+                num_users=3,
+                num_rounds=3,
+                system_prompt=1000,
+                chat_history=20000,
+                answer_len=10,
+                duration=20,
+                debug_context=server_debug_context,
+            )
 
-                # Stage 2: main load at QPS=32 (the originally failing level).
-                print_info("Smoke stage 2: main load at QPS=32...")
-                _run_and_assert_stage(
-                    "Smoke main stage",
-                    ensure_lmbenchmark,
-                    port,
-                    str(tmp_path / "smoke_main.csv"),
-                    server_log,
-                    qps=32,
-                    num_users=8,
-                    num_rounds=5,
-                    system_prompt=1000,
-                    chat_history=20000,
-                    answer_len=10,
-                    duration=45,
-                )
+            # Stage 2: main load at QPS=32 (the originally failing level).
+            print_info("Smoke stage 2: main load at QPS=32...")
+            _run_and_assert_stage(
+                "Smoke main stage",
+                ensure_lmbenchmark,
+                port,
+                str(tmp_path / "smoke_main.csv"),
+                server_log,
+                qps=32,
+                num_users=8,
+                num_rounds=5,
+                system_prompt=1000,
+                chat_history=20000,
+                answer_len=10,
+                duration=45,
+                debug_context=server_debug_context,
+            )
 
-                assert proc.poll() is None, (
-                    f"Server exited unexpectedly. See {server_log}\n{_tail_log(server_log)}"
-                )
+            assert proc.poll() is None, (
+                f"Server exited unexpectedly. See {server_log}\n"
+                f"{_format_server_debug('server exited unexpectedly', server_debug_context)}"
+            )
 
-        _assert_no_server_errors(server_log)
+        _assert_no_server_errors(server_log, server_debug_context)
 
     @pytest.mark.parametrize(
         "sched_cfg",
@@ -803,63 +1154,67 @@ class TestServePrefixAwareScheduling:
         ~10 min runtime per config.
         """
         config_path = _write_config(tmp_path, sched_cfg)
-        port = get_free_port_in_ci()
-        cmd = _make_server_cmd(port, config_path)
-        server_log = str(tmp_path / "server.log")
+        server_log_base = str(tmp_path / "server.log")
         # Parameters match the long_input_short_output workload that
         # originally surfaced the bug: 1000-token shared system prompt,
         # 20000-token per-user chat history, 100-token answers.
         qps_values = [8, 32]
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 
-        with open(server_log, "w") as log_f:
-            with popen(cmd, stderr=log_f, stdout=log_f, env=env) as proc:
-                _wait_for_server_ready(proc, port, server_log=server_log)
+        with _start_server_until_ready(config_path, server_log_base, env) as (
+            proc,
+            port,
+            server_log,
+        ):
+            server_debug_context = _server_debug_context(port, server_log, config_path, proc)
 
-                # Warmup: seed the radix tree with the shared system prompt.
-                print_info("Warmup to seed the radix tree with the shared system prompt.")
-                _run_and_assert_stage(
-                    "Warmup to seed the radix tree with the shared system prompt.",
+            # Warmup: seed the radix tree with the shared system prompt.
+            print_info("Warmup to seed the radix tree with the shared system prompt.")
+            _run_and_assert_stage(
+                "Warmup to seed the radix tree with the shared system prompt.",
+                ensure_lmbenchmark,
+                port,
+                str(tmp_path / "warmup_1u_qps2.csv"),
+                server_log,
+                qps=2,
+                num_users=1,
+                num_rounds=2,
+                system_prompt=1000,
+                chat_history=20000,
+                answer_len=100,
+                duration=10,
+                debug_context=server_debug_context,
+            )
+
+            for qps in qps_values:
+                print_info(f"Benchmark: 15 users, QPS={qps}...")
+                metrics = _run_and_assert_stage(
+                    f"Benchmark at QPS={qps}",
                     ensure_lmbenchmark,
                     port,
-                    str(tmp_path / "warmup_1u_qps2.csv"),
+                    str(tmp_path / f"benchmark_15u_qps{qps}.csv"),
                     server_log,
-                    qps=2,
-                    num_users=1,
-                    num_rounds=2,
+                    qps=qps,
+                    num_users=15,
+                    num_rounds=3,
                     system_prompt=1000,
                     chat_history=20000,
                     answer_len=100,
-                    duration=10,
+                    duration=30,
+                    debug_context=server_debug_context,
+                )
+                print_info(
+                    f"QPS={qps}: {metrics['num_requests']} requests, "
+                    f"ttft_p50={metrics.get('ttft_p50', float('nan')):.3f}s, "
+                    f"ttft_p99={metrics.get('ttft_p99', float('nan')):.3f}s"
                 )
 
-                for qps in qps_values:
-                    print_info(f"Benchmark: 15 users, QPS={qps}...")
-                    metrics = _run_and_assert_stage(
-                        f"Benchmark at QPS={qps}",
-                        ensure_lmbenchmark,
-                        port,
-                        str(tmp_path / f"benchmark_15u_qps{qps}.csv"),
-                        server_log,
-                        qps=qps,
-                        num_users=15,
-                        num_rounds=3,
-                        system_prompt=1000,
-                        chat_history=20000,
-                        answer_len=100,
-                        duration=30,
-                    )
-                    print_info(
-                        f"QPS={qps}: {metrics['num_requests']} requests, "
-                        f"ttft_p50={metrics.get('ttft_p50', float('nan')):.3f}s, "
-                        f"ttft_p99={metrics.get('ttft_p99', float('nan')):.3f}s"
-                    )
-
-                    _assert_no_server_errors(server_log)
-                    assert proc.poll() is None, (
-                        f"Server exited unexpectedly during QPS={qps}. "
-                        f"See {server_log}\n{_tail_log(server_log)}"
-                    )
+                _assert_no_server_errors(server_log, server_debug_context)
+                assert proc.poll() is None, (
+                    f"Server exited unexpectedly during QPS={qps}. "
+                    f"See {server_log}\n"
+                    f"{_format_server_debug('server exited unexpectedly', server_debug_context)}"
+                )
 
         # Final server-log sanity check across the full sweep.
-        _assert_no_server_errors(server_log)
+        _assert_no_server_errors(server_log, server_debug_context)

@@ -19,7 +19,11 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 from tensorrt_llm.mapping import Mapping
 
@@ -63,6 +67,50 @@ def _create_kv_cache_manager_v2(
 
 class TestPerLayerHeadDimBasic(unittest.TestCase):
     """Tests that don't allocate GPU memory or use uniform buffer sizes."""
+
+    def test_batch_cache_indices_skip_padded_entries(self):
+        mgr = _create_kv_cache_manager_v2(
+            num_layers=2,
+            tokens_per_block=8,
+            max_seq_len=64,
+            max_tokens=64,
+        )
+        try:
+            mgr.add_dummy_requests([7], [16])
+            kv_cache = mgr.kv_cache_map[7]
+            base_page_indices = kv_cache.get_base_page_indices(0)
+            self.assertGreater(len(base_page_indices), kv_cache.num_blocks)
+
+            result = mgr.get_batch_cache_indices([7])
+
+            index_scale = int(mgr.index_scales[0])
+            expected = [
+                base_page_index * index_scale // mgr.kv_factor
+                if base_page_index != BAD_PAGE_INDEX
+                else BAD_PAGE_INDEX
+                for base_page_index in base_page_indices[: kv_cache.num_blocks]
+            ]
+            self.assertEqual(result, [expected])
+        finally:
+            mgr.shutdown()
+
+    def test_batch_cache_indices_honor_requested_blocks(self):
+        mgr = _create_kv_cache_manager_v2(
+            num_layers=2,
+            tokens_per_block=8,
+            max_seq_len=64,
+            max_tokens=64,
+        )
+        try:
+            mgr.add_dummy_requests([7], [16])
+
+            all_indices = mgr.get_batch_cache_indices([7])
+            requested_indices = mgr.get_batch_cache_indices([7], num_blocks_per_seq=[1])
+
+            self.assertGreater(len(all_indices[0]), 1)
+            self.assertEqual(requested_indices, [all_indices[0][:1]])
+        finally:
+            mgr.shutdown()
 
     def test_per_layer_head_dim_wrong_length(self):
         """Test that mismatched list length raises assertion."""

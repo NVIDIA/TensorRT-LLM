@@ -193,6 +193,8 @@ Add the field to the appropriate schema file:
     # No status field for committed arguments
   ```
 
+Before validation, run `python3 scripts/generate_llm_args_golden_manifest.py` and commit the manifest; new fields require telemetry/privacy CODEOWNER approval.
+
 #### 3. Run validation tests
 
 ```bash

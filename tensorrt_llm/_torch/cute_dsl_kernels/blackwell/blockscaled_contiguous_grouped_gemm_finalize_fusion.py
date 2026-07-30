@@ -378,23 +378,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         self.epi_tile_n = cute.size(self.epi_tile[1])
 
-        # Metadata loader pipeline depth (meta warp -> epilogue). Lets the loader
-        # prefetch the per-row {token_idx, combined_scale} ahead of the epilogue.
-        self.num_meta_stage = 2
-        # Per-row metadata smem held by the loader: token_idx (int32) +
-        # combined_scale (final_scale_dtype), cta_M rows per stage.
-        meta_smem_bytes = (
-            self.cta_tile_shape_mnk[0]
-            * self.num_meta_stage
-            * (4 + self.final_scale_dtype.width // 8)
-        )
-
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
             self.num_acc_stage,
             self.num_ab_stage,
             self.num_c_stage,
             self.num_tile_stage,
+            self.num_meta_stage,
         ) = self._compute_stages(
             tiled_mma,
             self.mma_tiler,
@@ -404,9 +394,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.cta_tile_shape_mnk,
             self.sf_dtype,
             self.sf_vec_size,
+            self.final_scale_dtype,
             self.num_smem_capacity,
             self.occupancy,
-            meta_smem_bytes,
         )
 
         # Compute A/B/C/Scale shared memory layout
@@ -2017,10 +2007,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         cta_tile: cute.Tile,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
+        final_scale_dtype: Type[cutlass.Numeric],
         num_smem_capacity: int,
         occupancy: int,
-        meta_smem_bytes: int,
-    ) -> Tuple[int, int, int]:
+    ) -> Tuple[int, int, int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
@@ -2056,6 +2046,15 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         # Default Tile info stages
         num_tile_stage = 2
+
+        # Metadata loader pipeline depth (meta warp -> epilogue). Lets the loader
+        # prefetch the per-row {token_idx, combined_scale} ahead of the epilogue.
+        num_meta_stage = 2
+        # Per-row metadata smem held by the loader: token_idx (int32) +
+        # combined_scale (final_scale_dtype), cta_M rows per stage.
+        token_idx_bytes = cutlass.Int32.width // 8
+        scale_bytes = final_scale_dtype.width // 8
+        meta_smem_bytes = cta_tile[0] * (token_idx_bytes + scale_bytes) * num_meta_stage
 
         # Calculate smem layout and size for one stage of A, B, and C
         a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
@@ -2112,7 +2111,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + meta_smem_bytes)
         ) // ab_bytes_per_stage
 
-        return num_acc_stage, num_ab_stage, num_c_stage, num_tile_stage
+        return num_acc_stage, num_ab_stage, num_c_stage, num_tile_stage, num_meta_stage
 
     @staticmethod
     def _compute_grid(

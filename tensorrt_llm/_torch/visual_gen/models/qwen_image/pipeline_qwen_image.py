@@ -251,12 +251,12 @@ class QwenImagePipeline(BasePipeline):
         prompt: List[str],
         device: torch.device,
         max_sequence_length: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Encode a list of prompts via Qwen2.5-VL + chat template.
 
         Returns:
             prompt_embeds: ``(B, S, 3584)`` in transformer dtype.
-            prompt_embeds_mask: ``(B, S)`` bool mask.
+            prompt_embeds_mask: Optional ``(B, S)`` mask. ``None`` means all tokens are valid.
         """
         drop_idx = _PROMPT_TEMPLATE_START_IDX
         txt = [_PROMPT_TEMPLATE.format(e) for e in prompt]
@@ -292,6 +292,8 @@ class QwenImagePipeline(BasePipeline):
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
         prompt_embeds = prompt_embeds.to(dtype=self.dtype, device=device)
+        if prompt_embeds_mask.bool().all():
+            return prompt_embeds, None
         return prompt_embeds, prompt_embeds_mask
 
     # ------------------------------------------------------------------
@@ -486,6 +488,8 @@ class QwenImagePipeline(BasePipeline):
         # Denoise loop.
         timer.mark_denoise_start()
         logger.info("Denoising (%d steps)...", len(timesteps))
+        pipeline_config = getattr(self, "pipeline_config", None)
+        cuda_graph_enabled = getattr(getattr(pipeline_config, "cuda_graph", None), "enable", False)
         for i, t in enumerate(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             noise_pred = self.transformer(
@@ -496,6 +500,11 @@ class QwenImagePipeline(BasePipeline):
                 img_shapes=img_shapes,
                 return_dict=False,
             )[0]
+
+            if do_true_cfg and cuda_graph_enabled:
+                # CUDA graph outputs are graph-owned buffers; the negative CFG
+                # replay may reuse the same pool before guidance consumes this one.
+                noise_pred = noise_pred.clone()
 
             if do_true_cfg:
                 neg_noise_pred = self.transformer(

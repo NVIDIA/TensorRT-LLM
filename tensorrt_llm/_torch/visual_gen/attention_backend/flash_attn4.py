@@ -89,6 +89,7 @@ class FlashAttn4Attention(AttentionBackend):
             mask_mod=None,
             block_sparse_tensors=None,
             return_lse=True,
+            num_splits=0,
         )
         return output, lse
 

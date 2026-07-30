@@ -94,11 +94,19 @@ The optimizations required for KV cache transmission vary depending on whether i
 
 ### Unique Global Request ID
 
-A disaggregated-serving request can provide a unique global request ID via `DisaggregatedParams.disagg_request_id`.
-When this field is a positive integer, the context and generation requests share that value as their internal request ID, which enables end-to-end tracking.
-To avoid collisions with worker-local or warm-up requests, it is recommended to use a value larger than `1 << 42 = 4398046511104`.
-If the field is unset or non-positive, the context and generation requests instead receive separate local sequence IDs, rotating within the range `(0, 1<<42)`, assigned by the respective workers. When `disagg_request_id` is specified, do not route the context and generation requests to the same worker.
-This field is optional at present; however, some forthcoming features will depend on this unique identifier.
+The context and generation phases of one request must share a single request ID: the ctx↔gen KV-cache transfer is keyed by it, so a collision (two in-flight requests with the same ID) corrupts the transfer. This shared ID is carried on `DisaggregatedParams.disagg_request_id`.
+
+The disaggregated server generates this ID itself as a **snowflake** — a self-contained 64-bit positive integer that is unique without any cross-process coordination. The bit layout is:
+
+```
+[ 0 (1 bit) | timestamp_ms (39 bits) | node_id (8 bits) | process_id (6 bits) | counter (10 bits) ]
+```
+
+- `node_id` (0–255) identifies the node (defaults to a hash of the MAC address; overridable via `node_id` in the disaggregated config).
+- `process_id` (0–63) identifies the orchestrator process on that node. In a [coordinator + worker fleet](#coordinator-and-worker-fleet) each fleet worker receives a distinct value, so co-located workers never emit the same ID in the same millisecond. It is set from the `TRTLLM_DISAGG_WORKER_PROCESS_ID` environment variable (assigned automatically per worker by the launcher).
+- The `(node_id, process_id)` pair therefore makes the ID unique across all orchestrator processes without a shared counter or an extra network round trip — each worker mints its own IDs locally.
+
+Global disaggregated IDs occupy the range `[1 << 40, 2**63)`; worker-local and warm-up request IDs occupy the disjoint range `[0, 1 << 40)`, so the two never collide. If a client supplies its own positive `disagg_request_id`, that value is used verbatim and must be globally unique; when unset, the server mints a snowflake ID as above.
 
 ## Usage
 
@@ -201,7 +209,7 @@ When routing requests to the context servers, the disaggregated server will mark
 when routing requests to the generation servers, the disaggregated server will mark the requests as "generation-only" to skip the context phase.
 
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:
-```bash
+```
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
@@ -233,6 +241,95 @@ Example (two-node deployment):
 - **Client entrypoint**
   - Send requests or use a load balancer forwarding to `node-a:8000` and `node-b:8000`
 
+### Coordinator and Worker Fleet
+
+A single disaggregated server process is itself a single-threaded orchestrator and can become a throughput bottleneck (it terminates every client connection, runs routing, and proxies the ctx→gen hop). To scale the orchestrator on one node without standing up multiple independent instances, `trtllm-serve disaggregated` can run a **fleet** of stateless disaggregated-server worker processes behind a shared **coordinator**.
+
+The two roles split as follows:
+
+- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/cluster_info`, `/health`).
+- **Fleet workers** — `num_workers` stateless disaggregated servers that share the public port via `SO_REUSEPORT` (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct `process_id` for the [global request ID](#unique-global-request-id).
+
+This is controlled by two fields in the disaggregated config:
+
+- `num_workers` (int, default `1`) — number of disaggregated-server worker processes to run on the public port.
+- `disagg_coordinator_url` (str, optional) — URL of an already-running coordinator. When set, this process starts **no** coordinator and its fleet delegates to that external one.
+
+The three resulting topologies:
+
+| `num_workers` | `disagg_coordinator_url` | Behavior |
+|---------------|--------------------------|----------|
+| `1` | unset | Single self-contained server with an in-process coordinator (the default; unchanged from earlier examples). |
+| `> 1` | unset | An **implicit** coordinator starts in this process (on `port - 1`) and a fleet of `num_workers` delegating servers runs on the public port. |
+| any | set | **No** coordinator starts here; a fleet of `num_workers` delegating servers points at the external `disagg_coordinator_url`. |
+
+```{note}
+The fleet is most useful with a *stateful* router (`kv_cache_aware`, `conversation`) where placement must be globally consistent — that decision is delegated to the coordinator. With a *stateless* router (`round_robin`, `load_balancing`) each worker simply places locally and no coordinator round-trip occurs.
+```
+
+#### Example: implicit coordinator + 4-worker fleet
+
+Extend the `disagg_config.yaml` from the [trtllm-serve](#trtllm-serve) example with `num_workers` and a router type:
+
+```yaml
+hostname: localhost
+port: 8000
+backend: pytorch
+# Run 4 stateless disaggregated-server workers on port 8000, with an implicit
+# coordinator started in-process on port 7999 (port - 1).
+num_workers: 4
+context_servers:
+  num_instances: 2
+  urls:
+      - "localhost:8001"
+      - "localhost:8002"
+  router:
+    type: kv_cache_aware
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8003"
+  router:
+    type: kv_cache_aware
+```
+
+Launch it exactly as before — the coordinator and fleet are started for you:
+
+```bash
+trtllm-serve disaggregated -c disagg_config.yaml
+```
+
+Clients still send requests to the public endpoint (`localhost:8000`); the fleet transparently delegates routing to the coordinator.
+
+#### Example: external coordinator
+
+To point a fleet at a coordinator already running elsewhere (for example, one shared across nodes), set `disagg_coordinator_url` and omit the coordinator from this process:
+
+```yaml
+hostname: localhost
+port: 8000
+backend: pytorch
+num_workers: 4
+disagg_coordinator_url: "http://coordinator-host:7999"
+context_servers:
+  num_instances: 2
+  urls:
+      - "localhost:8001"
+      - "localhost:8002"
+  router:
+    type: kv_cache_aware
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8003"
+  router:
+    type: kv_cache_aware
+```
+
+```{note}
+A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's `/cluster_info` with bounded retry (up to `--server_start_timeout` seconds) and exits with an error rather than coming up and returning `Cluster is not ready` for every request.
+```
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
@@ -258,7 +355,12 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
-* `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
+* `NCCL_GRAPH_MIXING_SUPPORT`: TensorRT-LLM now initializes common NCCL communicators with graph
+  mixing support off by default to reduce launch overhead for CUDA graph-captured NCCL operations.
+  This assumes the communicator is not used by parallel graph launches or by uncaptured NCCL calls
+  while a graph launch is outstanding. Set `NCCL_GRAPH_MIXING_SUPPORT=1` to restore NCCL's default
+  graph mixing behavior if your workload needs it. For more details, see the
+  [NCCL_GRAPH_MIXING_SUPPORT documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-graph-mixing-support).
 
 * `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
 
@@ -308,6 +410,12 @@ executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendTy
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
 A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
+
+*Q. How do I debug a suspected hang from overlapping NCCL graph operations?*
+
+A. TensorRT-LLM turns graph mixing support off by default for common NCCL communicators. To check if
+a hang might be related to NCCL graph mixing support, set `NCCL_GRAPH_MIXING_SUPPORT=1` to restore
+NCCL's default graph mixing behavior.
 
 *Q. What causes the substantial bandwidth fluctuations in kvCache transfers, especially during the first few requests following service initialization?*
 

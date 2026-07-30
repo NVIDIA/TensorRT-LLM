@@ -20,6 +20,9 @@ import torch.nn.functional as F
 
 # Try to import the modules - skip tests if not available
 try:
+    import sys
+    from pathlib import Path
+
     from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
@@ -27,7 +30,11 @@ try:
         AttentionBackend,
         AttentionTensorLayout,
     )
-    from tensorrt_llm._utils import get_free_port
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -91,11 +98,14 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
 
     backend = "nccl" if use_cuda else "gloo"
 
-    port = get_free_port()
-
     # Spawn processes
-    mp.spawn(
-        _distributed_worker, args=(world_size, backend, test_fn, port), nprocs=world_size, join=True
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, backend, test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
     )
 
 

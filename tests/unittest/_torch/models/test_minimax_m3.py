@@ -32,6 +32,9 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
+    MiniMaxM3HfWeightMapper,
+)
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
     _build_swiglu_oai_dense_mlp,
@@ -43,7 +46,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     get_text_config,
     is_minimax_m3_vl_config,
 )
-from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl
+from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
 from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
@@ -276,17 +279,11 @@ def test_get_moe_layer_ids_length_mismatch_raises():
 #    ``use_gemma=True`` and ``hidden_size=head_dim``; the
 #    :meth:`apply_qk_norm` reshape matches an independent hand-written
 #    reference.
-#  * Sparse index branch: ``index_q_proj`` is column-parallel and
-#    projects to ``num_index_heads * sparse_index_dim``;
-#    ``index_k_proj`` is **replicated** (tp_mode is None) and projects
-#    to **only** ``sparse_index_dim`` (single K per token, broadcast
-#    across all index heads for block-selection scoring) — this is the
-#    SGLang reference contract, confirmed by the M3 checkpoint shape
-#    ``(sparse_index_dim, hidden_size)``.
+#  * Sparse index branch: fused replicated (tp_mode None) index_qk_proj with
+#    output [idx_q | idx_k] = num_index_heads * sparse_index_dim + sparse_index_dim
+#    (idx_k is one K per token).
 #  * Dense layers do not expose any index branch attributes (negative
 #    control).
-#  * Real M3 checkpoint shape for ``index_k_proj.weight`` is
-#    ``(sparse_index_dim, hidden_size)`` = ``(128, 6144)``.
 
 
 def _make_attention_test_config():
@@ -401,6 +398,7 @@ def test_minimax_m3_attention_dense_construction_matches_config():
     for name in (
         "index_q_proj",
         "index_k_proj",
+        "index_qk_proj",
         "index_q_norm",
         "index_k_norm",
     ):
@@ -478,18 +476,13 @@ def test_minimax_m3_attention_apply_qk_norm_matches_reference():
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
 def test_minimax_m3_attention_sparse_construction_matches_config():
-    """Sparse layer adds index branch with the SGLang-correct shapes.
+    """Sparse layer adds the index branch with the fused index projection.
 
-    Verifies the **bug fix** from the iter-4 work:
-      * ``index_q_proj`` is column-parallel and projects to
-        ``num_index_heads * sparse_index_dim``.
-      * ``index_k_proj`` is replicated (``tp_mode is None``) and projects
-        to **only** ``sparse_index_dim`` — a single replicated K per
-        token, *not* per-head. This matches SGLang's ``ReplicatedLinear``
-        and the M3 checkpoint's ``index_k_proj.weight`` shape
-        ``(sparse_index_dim, hidden_size)``.
-      * ``index_q_norm`` / ``index_k_norm`` are per-head Gemma RMSNorm
-        of width ``sparse_index_dim``.
+    * index_qk_proj is replicated (tp_mode None), out =
+      num_index_heads * sparse_index_dim (idx_q) + sparse_index_dim (idx_k),
+      where idx_k is one K per token (SGLang ReplicatedLinear contract).
+    * index_q_norm / index_k_norm are per-head Gemma RMSNorm of width
+      sparse_index_dim.
     """
     text_cfg, model_cfg = _make_attention_test_config()
     sparse_cfg = text_cfg.sparse_attention_config
@@ -506,33 +499,19 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
     assert attn.is_sparse_attention_layer is True
     assert attn.disable_index_value is True
 
-    # index_q_proj: per-head Q for the index branch. As of iter-15 this
-    # is **replicated** (tp_mode=None) across TP ranks, not
-    # column-parallel: the sparse forward consumes ``idx_q`` reshaped to
-    # ``[num_tokens, num_index_heads, sparse_index_dim]`` and a
-    # column-parallel split would slice the head dimension (breaking the
-    # reshape at any ``tp_size > num_index_heads`` geometry, including
-    # the TP=8 configuration the real-checkpoint smoke test now uses).
-    # The replicated weight is small (~3 MiB BF16) so the per-rank
-    # memory cost is negligible.
-    assert attn.index_q_proj.in_features == hidden
-    assert attn.index_q_proj.out_features == num_index_heads * sparse_index_dim
-    assert attn.index_q_proj.tp_mode is None, (
-        f"index_q_proj must be replicated (tp_mode=None) so the sparse "
-        f"forward's `idx_q.view(num_tokens, num_index_heads, sparse_index_dim)` "
-        f"reshape is well-defined at any TP geometry, got "
-        f"{attn.index_q_proj.tp_mode!r}"
+    # Replication keeps the idx_q -> [num_tokens, num_index_heads,
+    # sparse_index_dim] reshape valid at any TP geometry, whereas a
+    # column-parallel split would slice the head dimension.
+    assert attn.index_q_size == num_index_heads * sparse_index_dim
+    assert attn.index_k_size == sparse_index_dim
+    assert attn.index_qk_proj.in_features == hidden
+    assert attn.index_qk_proj.out_features == num_index_heads * sparse_index_dim + sparse_index_dim
+    assert attn.index_qk_proj.tp_mode is None, (
+        f"index_qk_proj must be replicated, got {attn.index_qk_proj.tp_mode!r}"
     )
-
-    # index_k_proj: REPLICATED, only sparse_index_dim outputs.
-    assert attn.index_k_proj.in_features == hidden
-    assert attn.index_k_proj.out_features == sparse_index_dim, (
-        f"index_k_proj.out_features must be sparse_index_dim={sparse_index_dim}, "
-        f"got {attn.index_k_proj.out_features} (regression of the iter-4 fix)"
-    )
-    assert attn.index_k_proj.tp_mode is None, (
-        f"index_k_proj must be replicated (tp_mode=None), got {attn.index_k_proj.tp_mode!r}"
-    )
+    # Only the fused projection exists.
+    assert not hasattr(attn, "index_q_proj")
+    assert not hasattr(attn, "index_k_proj")
 
     # Per-head Gemma RMSNorm of width sparse_index_dim.
     assert attn.index_q_norm.use_gemma is True
@@ -625,17 +604,10 @@ def test_minimax_m3_attention_dense_apply_index_qk_norm_raises():
 def test_minimax_m3_attention_real_config_index_branch_shapes():
     """Real M3 config → sparse-layer index branch has the checkpoint's shapes.
 
-    Asserts the iter-4 fix in numbers:
-      * ``index_q_proj.out_features == 512`` (= 4 * 128
-        = ``num_index_heads * sparse_index_dim``).
-      * ``index_k_proj.out_features == 128`` (= ``sparse_index_dim``)
-        and ``tp_mode is None`` (replicated). The real
-        ``index_k_proj.weight`` in the checkpoint has shape
-        ``(128, 6144)``; a regression to the old
-        ``num_index_heads * sparse_index_dim`` (512) would break weight
-        loading at runtime.
-      * ``index_q_norm.weight.shape == (128,)`` and
-        ``index_k_norm.weight.shape == (128,)``.
+    Asserts the fused index projection in numbers:
+      * index_qk_proj.out_features == 640 (4 * 128 + 128), replicated. Source
+        weights (512, 6144) + (128, 6144) merge into (640, 6144) at load time.
+      * index_q_norm / index_k_norm weights have shape (128,).
     """
     pytest.importorskip("transformers")
     cfg = AutoConfig.from_pretrained(_checkpoint_path(), trust_remote_code=True)
@@ -668,22 +640,13 @@ def test_minimax_m3_attention_real_config_index_branch_shapes():
     assert num_index_heads == 4
     assert sparse_index_dim == 128
 
-    # index_q_proj: 4 * 128 = 512 out, replicated (tp_mode=None) as of
-    # iter-15. The downstream sparse forward reshapes ``idx_q`` to
-    # ``[num_tokens, num_index_heads, sparse_index_dim]``; a
-    # column-parallel split would slice the head dimension and break
-    # that reshape at any ``tp_size > num_index_heads`` geometry
-    # (including TP=8 used by the real-checkpoint smoke test). The
-    # replicated weight is ~3 MiB BF16 — the per-rank memory cost is
-    # negligible.
-    assert attn.index_q_proj.in_features == int(text_cfg.hidden_size)
-    assert attn.index_q_proj.out_features == num_index_heads * sparse_index_dim
-    assert attn.index_q_proj.tp_mode is None
-
-    # index_k_proj: 128 out (NOT 512), replicated.
-    assert attn.index_k_proj.in_features == int(text_cfg.hidden_size)
-    assert attn.index_k_proj.out_features == sparse_index_dim
-    assert attn.index_k_proj.tp_mode is None
+    assert attn.index_q_size == num_index_heads * sparse_index_dim
+    assert attn.index_k_size == sparse_index_dim
+    assert attn.index_qk_proj.in_features == int(text_cfg.hidden_size)
+    assert attn.index_qk_proj.out_features == num_index_heads * sparse_index_dim + sparse_index_dim
+    assert attn.index_qk_proj.tp_mode is None
+    assert not hasattr(attn, "index_q_proj")
+    assert not hasattr(attn, "index_k_proj")
 
     # Per-head Gemma index norms: width sparse_index_dim.
     assert tuple(attn.index_q_norm.weight.shape) == (sparse_index_dim,)
@@ -762,9 +725,88 @@ def test_minimax_m3_routing_method_default_scale_is_identity():
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="fused MiniMax-M3 routing requires CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 64, 8192])
+def test_minimax_m3_fused_routing_matches_reference(
+    num_tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    num_experts = 128
+    top_k = 4
+    routed_scaling_factor = 2.0
+    logits = torch.full((num_tokens, num_experts), -4.0, device="cuda", dtype=torch.float32)
+    token_offsets = torch.arange(num_tokens, device="cuda", dtype=torch.int64).unsqueeze(1)
+    expert_offsets = torch.arange(top_k, device="cuda", dtype=torch.int64).unsqueeze(0)
+    selected_experts = (token_offsets + expert_offsets) % num_experts
+    selected_logits = torch.tensor([4.0, 3.0, 2.0, 1.0], device="cuda").expand(num_tokens, -1)
+    logits.scatter_(1, selected_experts, selected_logits)
+    bias = torch.linspace(-0.01, 0.01, num_experts, device="cuda", dtype=torch.float32)
+
+    fused = MiniMaxM3MoeRoutingMethod(
+        top_k=top_k,
+        num_experts=num_experts,
+        callable_e_score_correction_bias=lambda: bias,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    scores = torch.sigmoid(logits)
+    _, reference_idx = torch.topk(scores + bias, k=top_k, dim=-1, sorted=False)
+    reference_weights = scores.gather(1, reference_idx)
+    reference_idx = reference_idx.to(torch.int32)
+    reference_weights = (
+        reference_weights / (reference_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    ) * routed_scaling_factor
+
+    monkeypatch.setattr(
+        MiniMaxM2MoeRoutingMethod,
+        "apply",
+        lambda *_args, **_kwargs: pytest.fail("production FP32 routing used the PyTorch fallback"),
+    )
+    fused_idx, fused_weights = fused.apply(logits)
+
+    reference_order = reference_idx.argsort(dim=-1)
+    fused_order = fused_idx.argsort(dim=-1)
+    reference_idx = reference_idx.gather(1, reference_order)
+    reference_weights = reference_weights.gather(1, reference_order)
+    fused_idx = fused_idx.gather(1, fused_order)
+    fused_weights = fused_weights.gather(1, fused_order)
+
+    torch.testing.assert_close(fused_idx, reference_idx, rtol=0, atol=0)
+    torch.testing.assert_close(fused_weights, reference_weights, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="fused MiniMax-M3 routing requires CUDA")
+def test_minimax_m3_fused_routing_cuda_graph_replay_tracks_inputs() -> None:
+    num_tokens = 64
+    num_experts = 128
+    torch.manual_seed(1)
+    logits = torch.empty(num_tokens, num_experts, device="cuda", dtype=torch.float32)
+    bias = torch.randn(num_experts, device="cuda", dtype=torch.float32) * 0.1
+    routing = MiniMaxM3MoeRoutingMethod(
+        top_k=4,
+        num_experts=num_experts,
+        callable_e_score_correction_bias=lambda: bias,
+        routed_scaling_factor=2.0,
+    )
+
+    logits.normal_()
+    routing.apply(logits)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_idx, graph_weights = routing.apply(logits)
+
+    logits.normal_(mean=1.0, std=2.0)
+    reference_idx, reference_weights = routing.apply(logits.clone())
+    graph.replay()
+
+    torch.testing.assert_close(graph_idx, reference_idx, rtol=0, atol=0)
+    torch.testing.assert_close(graph_weights, reference_weights, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 needs CUDA")
-def test_text_norm_weights_real_loader_smoke():
-    """real ``_load_weights_impl`` populates norm parameters.
+def test_text_norm_weights_real_loader_smoke(monkeypatch: pytest.MonkeyPatch):
+    """real ``_load_weights_impl_v2`` populates norm parameters.
 
     Constructs a memory-safe stub containing the top-level ``model.norm``
     and the first decoder layer's ``input_layernorm`` and
@@ -772,7 +814,7 @@ def test_text_norm_weights_real_loader_smoke():
     :class:`RMSNorm`, ~12 KB on CUDA), reads the corresponding tensors
     from the real checkpoint via ``safetensors``, strips the
     ``language_model.`` prefix exactly as the M3 VL wrapper does, and
-    invokes :func:`_load_weights_impl` end-to-end. The test fails if any
+    invokes :func:`_load_weights_impl_v2` end-to-end. The test fails if any
     target parameter remains at its zero-initialisation, proving the
     canonical loader walks the module tree and copies the correct source
     keys for these BF16 parameters.
@@ -871,17 +913,21 @@ def test_text_norm_weights_real_loader_smoke():
         "model.layers.0.post_attention_layernorm.weight",
     }
 
-    # Invoke the canonical loader. `_load_weights_impl` walks the stub's
+    # Invoke the canonical loader. `_load_weights_impl_v2` walks the stub's
     # module tree and uses the generic per-parameter copy fallback because
     # RMSNorm does not define ``load_weights``. Disable the parallel
     # executor so a failure surfaces immediately rather than as a thread
     # traceback (the parallel path is exercised in production; for this
     # tiny 3-module slice the serial walk is what the test should observe).
-    os.environ["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "True"
-    try:
-        _load_weights_impl(stub, text_weights, allow_partial_loading=True)
-    finally:
-        os.environ.pop("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", None)
+    monkeypatch.setenv("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
+    weight_mapper = MiniMaxM3HfWeightMapper()
+    weight_mapper.init_model_and_config(stub, stub.model_config)
+    _load_weights_impl_v2(
+        stub,
+        text_weights,
+        weight_mapper,
+        allow_partial_loading=True,
+    )
 
     # The three norms should now hold the source tensors' values.
     torch.testing.assert_close(

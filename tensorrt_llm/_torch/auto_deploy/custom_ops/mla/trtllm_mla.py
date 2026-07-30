@@ -1623,8 +1623,14 @@ def _handle_decode_impl(
     fused_q_view = fused_q_flat.view(num_tokens, num_heads, gen_head_size)
 
     # BMM: [num_heads, num_tokens, qk_nope_head_dim] @ [num_heads, qk_nope_head_dim, kv_lora_rank]
-    q_absorbed = torch.bmm(q_nope_flat.transpose(0, 1), w_kn)
-    fused_q_view[:, :, :kv_lora_rank] = q_absorbed.transpose(0, 1)
+    # Write the absorbed q straight into fused_q[..., :kv_lora_rank] via a transposed
+    # strided view (bmm out=), avoiding the separate transpose + slice-assign copy
+    # (PT-style bmm_out). bit-identical; drops one direct_copy kernel per layer.
+    torch.bmm(
+        q_nope_flat.transpose(0, 1),
+        w_kn,
+        out=fused_q_view[:, :, :kv_lora_rank].transpose(0, 1),
+    )
 
     cu_q = planner.cu_q_decode[: num_tokens + 1]
     cu_kv = planner.cu_kv_decode[: num_tokens + 1]
@@ -1880,15 +1886,15 @@ def _mla_with_cache_impl(
     # to bucket size.  Subsequent slicing with num_tokens / num_prefill_tokens
     # selects only the real tokens within the padded buffer.
     bs = b * s
-    q_nope_c = q_nope if q_nope.is_contiguous() else q_nope.contiguous()
-    q_pe_c = q_pe if q_pe.is_contiguous() else q_pe.contiguous()
-    compressed_kv_c = compressed_kv if compressed_kv.is_contiguous() else compressed_kv.contiguous()
-    kpe_c = kpe if kpe.is_contiguous() else kpe.contiguous()
+    # Avoid eager .contiguous() on the q/kv split views: bmm, cat and the rope
+    # kernel all accept last-dim-stride-1 strided input. Copy only if that breaks.
+    if q_pe.stride(-1) != 1:
+        q_pe = q_pe.contiguous()
 
-    q_nope_flat = q_nope_c.view(bs, num_heads, qk_nope_head_dim)
-    q_pe_flat = q_pe_c.view(bs, num_heads, qk_rope_head_dim)
-    compressed_kv_flat = compressed_kv_c.view(bs, kv_lora_rank)
-    kpe_flat = kpe_c.view(bs, qk_rope_head_dim)
+    q_nope_flat = q_nope.reshape(bs, num_heads, qk_nope_head_dim)
+    q_pe_flat = q_pe.reshape(bs, num_heads, qk_rope_head_dim)
+    compressed_kv_flat = compressed_kv.reshape(bs, kv_lora_rank)
+    kpe_flat = kpe.reshape(bs, qk_rope_head_dim)
 
     # Create RoPE tables (+ identity fallback) once per planner; consumed by
     # the decode/prefill helpers and referenced in the thop.attention calls.
