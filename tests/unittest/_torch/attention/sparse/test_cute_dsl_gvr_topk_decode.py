@@ -1181,9 +1181,7 @@ def test_cute_dsl_gvr_topk_decode_pick_policy_single_source():
     """The production runner's tuning adapter must agree with the kernel's
     pick_cluster_size/pick_tuning single source across a shape sweep
     (guards the de-duplicated launch-shape policy against drift)."""
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-        CuteDSLGvrTopKDecodeRunner as R,
-    )
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLGvrTopKDecodeRunner as R
 
     num_sms = 148
     for torch_dtype in (torch.float32, torch.bfloat16, torch.float16):
@@ -1217,7 +1215,11 @@ def test_cute_dsl_gvr_topk_decode_pick_policy_single_source():
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize(
     "variant",
-    ["rank_scatter_cs1", "rank_scatter_cs4", "snap_cs1"],
+    # base_r0off exercises the classic secant admission (the exact fallback the
+    # production path takes when the R0 ladder misses): its refine budget can
+    # run out while the bracket is still wide, which is a different route into
+    # the plateau terminal than the R0 ladder's.
+    ["rank_scatter_cs1", "rank_scatter_cs4", "snap_cs1", "base_r0off", "base_r0off_cs4"],
 )
 def test_cute_dsl_gvr_topk_decode_plateau_terminal(dtype, variant):
     """Adversarial plateau terminal (done == 3): a bitwise-equal plateau
@@ -1246,6 +1248,11 @@ def test_cute_dsl_gvr_topk_decode_plateau_terminal(dtype, variant):
         overrides["cluster_size"] = 4
     elif variant == "snap_cs1":
         overrides["enable_p4_rank_scatter"] = False
+    elif variant == "base_r0off":
+        overrides["enable_r0"] = False
+    elif variant == "base_r0off_cs4":
+        overrides["enable_r0"] = False
+        overrides["cluster_size"] = 4
     _GvrTopKKernel.launch(lo, pre, seq_lens, out, top_k, compress_ratio=1, **overrides)
     torch.cuda.synchronize()
     assert int((out < 0).sum()) == 0, (
