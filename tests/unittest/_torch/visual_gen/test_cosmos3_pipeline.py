@@ -31,7 +31,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
-os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
 import PIL.Image
 import pytest
@@ -57,7 +56,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
-pytestmark = pytest.mark.cosmos3
+pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -231,6 +230,11 @@ def _scheduler_use_karras_sigmas(scheduler) -> bool | None:
     return None if value is None else bool(value)
 
 
+def _base_use_karras_sigmas(pipeline) -> bool:
+    """Karras setting the checkpoint shipped with — what ``None`` restores."""
+    return bool(getattr(pipeline.sampling.unipc_base_config, "use_karras_sigmas", False))
+
+
 def _assert_scheduler_config(
     pipeline,
     *,
@@ -240,16 +244,14 @@ def _assert_scheduler_config(
     assert float(getattr(pipeline.scheduler.config, "flow_shift")) == pytest.approx(
         float(flow_shift)
     )
-    assert float(pipeline._current_flow_shift) == pytest.approx(float(flow_shift))
-    assert pipeline._current_scheduler_use_karras_sigmas == use_karras_sigmas
     assert _scheduler_use_karras_sigmas(pipeline.scheduler) == use_karras_sigmas
 
 
 def _assert_default_video_scheduler_config(pipeline):
     _assert_scheduler_config(
         pipeline,
-        flow_shift=pipeline._engine_init_flow_shift,
-        use_karras_sigmas=pipeline._base_scheduler_use_karras_sigmas,
+        flow_shift=pipeline.sampling.checkpoint_flow_shift,
+        use_karras_sigmas=_base_use_karras_sigmas(pipeline),
     )
 
 
@@ -670,14 +672,16 @@ class TestCosmos3V2V:
         class StopAfterTokenize(Exception):
             pass
 
-        def fake_set_flow_shift(target, *, use_karras_sigmas=None):
+        def fake_set_flow_shift(scheduler, target, *, use_karras_sigmas=None):
             calls.append((target, use_karras_sigmas))
+            return scheduler
 
         def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
             token_calls.append((text, max_sequence_length, use_system_prompt, system_prompt))
             raise StopAfterTokenize
 
-        pipeline._set_flow_shift = fake_set_flow_shift
+        pipeline.scheduler = SimpleNamespace(config=SimpleNamespace(flow_shift=1.0))
+        pipeline.sampling = SimpleNamespace(set_flow_shift=fake_set_flow_shift)
         pipeline._tokenize_prompt = fake_tokenize_prompt
 
         with pytest.raises(StopAfterTokenize):
@@ -741,7 +745,7 @@ class TestCosmos3T2I:
         _assert_scheduler_config(
             cosmos3_pipeline,
             flow_shift=COSMOS3_T2I_PARAMS["flow_shift"],
-            use_karras_sigmas=cosmos3_pipeline._base_scheduler_use_karras_sigmas,
+            use_karras_sigmas=_base_use_karras_sigmas(cosmos3_pipeline),
         )
 
 

@@ -101,22 +101,7 @@ def _validate_video_reference(video) -> None:
         )
 
 
-# Fields merged by the executor for every request. Modality-specific values
-# (height/width/num_frames/steps/guidance) are declared with ``None`` so the
-# executor accepts explicit overrides; ``forward()`` resolves unset fields from
-# T2V/T2I context.
-COSMOS3_PIPELINE_DEFAULTS = {
-    "height": None,
-    "width": None,
-    "num_frames": None,
-    "num_inference_steps": None,
-    "guidance_scale": None,
-    "max_sequence_length": COSMOS3_720P_PARAMS["max_sequence_length"],
-    "frame_rate": COSMOS3_720P_PARAMS["frame_rate"],
-}
-
-# Text-to-image (``output_type="image"``) defaults. Applied when the request
-# field is ``None``.
+# Text-to-image (``output_type="image"``) defaults; resolved in ``infer()``.
 COSMOS3_T2I_PARAMS = {
     "height": 1024,
     "width": 1024,
@@ -124,6 +109,17 @@ COSMOS3_T2I_PARAMS = {
     "guidance_scale": 7.0,
     "flow_shift": 3.0,
     "guidance_interval": (400.0, 1000.0),
+}
+
+# Fields merged by the executor into every request. Mode-dependent values
+# remain None until infer() selects the request mode; key membership also
+# declares these fields supported during request validation.
+COSMOS3_PIPELINE_DEFAULTS = {
+    **COSMOS3_720P_PARAMS,
+    "height": None,
+    "width": None,
+    "num_inference_steps": None,
+    "guidance_scale": None,
 }
 
 

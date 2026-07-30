@@ -13,6 +13,7 @@ The PyTorch backend supports a wide variety of features, listed below:
 |                    |  Rejection sampling (composable) | Return Logits                  |
 |                    |                                  | Return LogProbs                |
 |                    |                                  | TopK LogProbs                  |
+|                    |                                  | Penalties                      |
 
 ## General usage
 
@@ -115,6 +116,33 @@ llm.generate(["Hello, my name is",
   * Top-P decay is not supported in combination with beam search or with speculative decoding
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
+* Occurrence penalties are supported: `repetition_penalty`, `presence_penalty` and
+  `frequency_penalty` discourage (or encourage) the model from reusing tokens it has
+  already seen. All three rewrite the logits before temperature scaling, driven by the
+  occurrence history of the prompt plus everything generated so far. Writing `c` for the
+  number of times a token has occurred in that history:
+
+  * `repetition_penalty` (default `1.0`) rescales the logit of every token with `c > 0`:
+    the logit is divided by the penalty when it is non-negative and multiplied by it when
+    it is negative. The two branches move a positive and a negative logit the same way, so
+    a value `> 1` always pushes a seen token down, and a value `< 1` always pulls it up.
+    Must be `> 0`.
+
+  * `presence_penalty` (default `0.0`) subtracts the penalty itself from every token with
+    `c > 0`. The amount does not depend on `c`, so it controls whether a token reappears,
+    not how often.
+
+  * `frequency_penalty` (default `0.0`) subtracts the penalty multiplied by `c`, so the
+    more often a token has already been produced, the harder it is pushed down.
+
+  * `prompt_ignore_length` (default `0`) excludes the first N prompt tokens from the
+    presence and frequency counts. Those ignored tokens still count for
+    `repetition_penalty`. Values `<= 0` have no effect, and values larger than the prompt
+    are clamped to the prompt length.
+
+  * Occurrence penalties are not supported in combination with beam search; such requests
+    are rejected.
+
 * If `no_repeat_ngram_size = n` is specified, any token that would recreate an `n`-gram already
   present in the sequence (prompt included) is excluded from sampling. `None` or `0` disables
   the restriction.
@@ -132,6 +160,49 @@ required for speculative decoding (rejection sampling).
 Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
 can greatly reduce the overall latency of the sampling step when request batches are comprised
 of requests with very heterogeneous sampling strategies (e.g. a mix of requests using greedy and top-p-after-top-k sampling).
+
+## Advanced sampling mode (speculative decoding)
+
+For one-model speculative decoding (e.g. MTP-Eagle one-model), the per-request
+advanced sampler applies a `top_k` mask, a temperature softmax, and a `top_p`
+filter before sampling each draft/target token. When a deployment fixes its
+sampling configuration such that a filter is always disabled (`top_k = 0` /
+`top_k = vocab_size`, or `top_p = 1`), that filter's kernel is pure overhead.
+
+`advanced_sampling_mode` (on `DecodingBaseConfig`, so it is available to any
+speculative config) lets you skip those redundant kernels for a fixed deploy
+config. The output is identical to `FULL` whenever the skipped filter is already
+disabled, so this is a lossless throughput optimization for advanced use cases:
+
+| Mode | `top_k` kernel | `top_p` kernel |
+|---|---|---|
+| `full` (default) | applied | applied |
+| `no_topk` | **skipped** | applied |
+| `no_topp` | applied | **skipped** |
+| `no_topk_no_topp` | **skipped** | **skipped** |
+
+Notes:
+
+* `full` is the default and always safe; the specialization is opt-in.
+* `advanced_sampling_mode` and `use_rejection_sampling` are independent: every mode
+  works with rejection sampling on or off; the flag no longer gates the mode choice.
+* `no_topp` and `no_topk_no_topp` disable `top_p`, switching the sampler from the
+  fused `top_p_sampling_from_probs` to the cheaper `sampling_from_probs`; `no_topk`
+  keeps `top_p`.
+* Greedy requests are handled natively (via a sentinel temperature that makes the
+  softmax collapse to a one-hot argmax), so any mode supports mixed greedy +
+  sampling batches without a special case.
+* `advanced_sampling_mode` is a deploy-time choice; it is *not* part of the CUDA
+  graph key, so it adds no extra warmup graphs.
+
+```python
+from tensorrt_llm.llmapi import MTPDecodingConfig
+
+spec_config = MTPDecodingConfig(
+    max_draft_len=3,
+    advanced_sampling_mode="no_topk_no_topp",  # temperature-only deploy config
+)
+```
 
 ## Beam search
 
