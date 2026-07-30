@@ -721,6 +721,61 @@ class TestCosmos3V2V:
         assert token_calls[0][2] is True
         assert token_calls[0][3] == COSMOS3_DEFAULT_SYSTEM_PROMPT
 
+    def test_v2v_rebuilds_the_audio_scheduler_too(self):
+        """Video and audio denoise in lockstep in one loop, so a V2V request
+        must rebuild both. Rebuilding only the video scheduler leaves audio on
+        the checkpoint's flow shift / Karras sigmas and the streams step on
+        different schedules."""
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.audio_gen = True
+        rebuilt = []
+
+        class StopAfterTokenize(Exception):
+            pass
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+                rebuilt.append((scheduler.name, target, use_karras_sigmas))
+                return scheduler
+
+        def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
+            raise StopAfterTokenize
+
+        pipeline.scheduler = SimpleNamespace(name="video", config=SimpleNamespace(flow_shift=1.0))
+        pipeline.audio_scheduler = SimpleNamespace(
+            name="audio", config=SimpleNamespace(flow_shift=1.0)
+        )
+        pipeline.sampling = FakeSampling()
+        pipeline._tokenize_prompt = fake_tokenize_prompt
+
+        with pytest.raises(StopAfterTokenize):
+            pipeline.forward(
+                prompt="continue",
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=None,
+                use_guardrails=False,
+                enable_audio=True,
+            )
+
+        assert rebuilt == [("video", 10.0, False), ("audio", 10.0, False)]
+
     def test_image_and_video_rejected(self, cosmos3_pipeline):
         with pytest.raises(ValueError, match="not both image and video"):
             _run_forward(

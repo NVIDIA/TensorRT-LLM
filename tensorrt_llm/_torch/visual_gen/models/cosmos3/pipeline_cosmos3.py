@@ -260,20 +260,49 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 enable_audio=False,
             )
 
+    def _apply_flow_shift(
+        self, target_shift: Optional[float], *, use_karras_sigmas: Optional[bool] = None
+    ) -> None:
+        """Rebuild both stream schedulers for the requested sampling knobs.
+
+        Video and audio denoise in lockstep in one loop, so a mode that
+        rebuilds only the video scheduler leaves audio on the checkpoint's
+        sigmas and the two streams step on different schedules.
+        """
+        self.scheduler = self.sampling.set_flow_shift(
+            self.scheduler, target_shift, use_karras_sigmas=use_karras_sigmas
+        )
+        if getattr(self, "audio_scheduler", None) is not None:
+            self.audio_scheduler = self.sampling.set_flow_shift(
+                self.audio_scheduler, target_shift, use_karras_sigmas=use_karras_sigmas
+            )
+
     def infer(self, req):
         extra_params = req.params.extra_params or {}
         output_type = extra_params.get("output_type", "video")
+        is_t2i = str(output_type).lower() == "image"
+
+        # None = unset; resolve by mode exactly once. Non-None values pass through.
+        mode_params = COSMOS3_T2I_PARAMS if is_t2i else COSMOS3_720P_PARAMS
+
+        def resolved(value, field_name):
+            return value if value is not None else mode_params[field_name]
+
+        height = resolved(req.params.height, "height")
+        width = resolved(req.params.width, "width")
+        num_inference_steps = resolved(req.params.num_inference_steps, "num_inference_steps")
+        guidance_scale = resolved(req.params.guidance_scale, "guidance_scale")
         video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
 
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
             image=req.params.image,
-            height=req.params.height,
-            width=req.params.width,
+            height=height,
+            width=width,
             num_frames=req.params.num_frames,
-            num_inference_steps=req.params.num_inference_steps,
-            guidance_scale=req.params.guidance_scale,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             frame_rate=req.params.frame_rate,
@@ -789,8 +818,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             if guidance_scale is None:
                 guidance_scale = COSMOS3_T2I_PARAMS["guidance_scale"]
             guidance_interval = COSMOS3_T2I_PARAMS["guidance_interval"]
-            self.scheduler = self.sampling.set_flow_shift(
-                self.scheduler,
+            self._apply_flow_shift(
                 flow_shift if flow_shift is not None else COSMOS3_T2I_PARAMS["flow_shift"],
             )
         else:
@@ -802,16 +830,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 guidance_scale = COSMOS3_720P_PARAMS["guidance_scale"]
             if is_v2v:
                 # V2V wants a stronger shift and the uniform sigma schedule.
-                self.scheduler = self.sampling.set_flow_shift(
-                    self.scheduler,
+                self._apply_flow_shift(
                     flow_shift if flow_shift is not None else 10.0,
                     use_karras_sigmas=False,
                 )
             else:
                 # Restore the checkpoint sampling knobs in case a prior T2I or
                 # V2V request rebuilt the scheduler with mode-specific values.
-                self.scheduler = self.sampling.set_flow_shift(
-                    self.scheduler,
+                self._apply_flow_shift(
                     flow_shift if flow_shift is not None else self.sampling.checkpoint_flow_shift,
                     use_karras_sigmas=None,
                 )
