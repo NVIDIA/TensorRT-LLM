@@ -69,7 +69,7 @@ def main():
         "--image",
         action="append",
         default=None,
-        help="Reference image path; repeat for a shared set of up to 10 images",
+        help="Reference image path; repeat for a shared set of images",
     )
     parser.add_argument(
         "--height",
