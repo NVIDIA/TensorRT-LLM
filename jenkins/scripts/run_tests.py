@@ -252,6 +252,52 @@ def run_pytest(pytest_cmd, working_dir):
     return result.returncode, elapsed
 
 
+# Isolation tests that finish in under this many seconds almost certainly
+# failed before the test body ran (server not ready, import error, etc.).
+_FAST_FAILURE_THRESHOLD_SECS = 120
+
+
+def print_xml_failure_summary(xml_path):
+    """Parse a pytest result XML and print failure/error messages.
+
+    Called after a fast isolation-test failure to surface the root cause
+    without requiring manual inspection of the SLURM job log.
+    """
+    if not os.path.exists(xml_path):
+        print("  [No result XML — pytest exited before generating results]")
+        return
+    try:
+        root = ET.parse(xml_path).getroot()
+    except ET.ParseError as exc:
+        print(f"  [Could not parse result XML: {exc}]")
+        return
+
+    cases = root.findall(".//testcase")
+    if not cases:
+        print("  [Result XML contains no test cases — 0 tests were collected]")
+        return
+
+    printed = 0
+    for tc in cases:
+        for tag in ("failure", "error"):
+            node = tc.find(tag)
+            if node is None:
+                continue
+            name = f"{tc.get('classname', '')}.{tc.get('name', '')}"
+            msg = (node.get("message") or "").strip()
+            detail = (node.text or "").strip()
+            print(f"  [{tag.upper()}] {name}")
+            if msg:
+                print(f"    message : {msg[:600]}")
+            if detail:
+                lines = detail.splitlines()
+                excerpt = "\n    ".join(lines[-30:])  # last 30 lines
+                print(f"    detail  :\n    {excerpt}")
+            printed += 1
+    if printed == 0:
+        print("  [No failure/error nodes found in result XML]")
+
+
 def rebuild_pytest_command(base_cmd, drop_patterns, append_args):
     """Drop args matching any prefix in drop_patterns, then append append_args.
 
@@ -542,10 +588,18 @@ def run_isolated_tests(
         csv_path = os.path.join(output_dir, f"report_isolated_{i}.csv")
 
         isolated_cmd = build_isolated_command(pytest_cmd, single_test_file, xml_path, csv_path)
-        rc, _ = run_pytest(isolated_cmd, working_dir)
+        rc, elapsed = run_pytest(isolated_cmd, working_dir)
         all_xml_files.append(xml_path)
 
         if rc != 0:
+            if elapsed < _FAST_FAILURE_THRESHOLD_SECS:
+                print(
+                    f"\n  [FAST FAILURE] Isolation test {i + 1} exited in "
+                    f"{format_duration(elapsed)} (< {_FAST_FAILURE_THRESHOLD_SECS}s). "
+                    f"Likely failed before the test body ran (server not ready, "
+                    f"collection error, etc.)."
+                )
+                print_xml_failure_summary(xml_path)
             print_banner(
                 f"RERUN — isolated test {i + 1}/{len(isolate_tests)}: {test_name}",
                 char="-",
