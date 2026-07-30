@@ -2058,6 +2058,54 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     assert high_mamba_allocation[1] < low_mamba_allocation[1]
 
 
+def test_v2_hybrid_constrains_ssm_pool_to_live_slot_floor():
+    """The SSM pool floor must be a constraint, not just a typical_step ratio.
+
+    With avg_seq_len unset the base config emits no constraints, so only the
+    fallback typical_step steers the pool ratio. A ratio is not a floor, so the
+    grain split could round the SSM pool below the live/dummy slot count that
+    __init__ validates (https://nvbugs/6525898). Assert the floor reaches the
+    storage manager as a constraint carrying no attention capacity.
+    """
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.kv_cache_type = CacheTypeCpp.SELF
+    mgr.head_dim_per_layer = [64, 64]
+    mgr.pp_layers = [0, 1]
+    mgr._mamba_layer_mask = [True, False]
+    mgr.ssm_bytes = 64
+    mgr.conv_bytes = 32
+    mgr.max_attention_window_vec = [128, 128]
+    mgr.max_batch_size = 32
+    mgr.mapping = Mapping(world_size=2, rank=0, tp_size=1, pp_size=2)
+    mgr.max_seq_len = 128
+    mgr.max_num_tokens = 128
+    mgr.tokens_per_block = 32
+    mgr.num_local_layers = 2
+    mgr.local_num_mamba_layers = 1
+    mgr._num_reserved_dummy_slots = 2
+    mgr.dtype = DataType.HALF
+    mgr.enable_swa_scratch_reuse = False
+    mgr.enable_stats = False
+    mgr.num_extra_kv_tokens = 0
+    mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+    mgr._minimum_live_gpu_quota = lambda: 0
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+    base_config = mgr._build_base_config(
+        mgr.kv_cache_config,
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+    )
+    # avg_seq_len is unset, so nothing pins the pool sizes yet.
+    assert base_config.typical_step is None
+    assert not base_config.constraints
+
+    config = mgr._build_cache_config(base_config)
+
+    # 32 max_batch_size * pp_size 2 resident lineages + 2 reserved dummy slots.
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=0, history_length=0)] * 66)]
+
+
 # ---------------------------------------------------------------------------
 # Cpp/V2 Mamba hybrid managers: recurrent-state allocation and reuse
 #
