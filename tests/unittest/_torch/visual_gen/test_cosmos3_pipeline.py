@@ -672,16 +672,30 @@ class TestCosmos3V2V:
         class StopAfterTokenize(Exception):
             pass
 
-        def fake_set_flow_shift(scheduler, target, *, use_karras_sigmas=None):
-            calls.append((target, use_karras_sigmas))
-            return scheduler
+        class FakeSampling:
+            """Minimal Cosmos3SamplingPolicy stand-in recording flow-shift calls.
+
+            forward() consults the policy for request validation and the
+            distilled guard before it ever reaches the flow-shift block, so a
+            stub carrying only ``set_flow_shift`` never gets there.
+            """
+
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+                calls.append((target, use_karras_sigmas))
+                return scheduler
 
         def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
             token_calls.append((text, max_sequence_length, use_system_prompt, system_prompt))
             raise StopAfterTokenize
 
         pipeline.scheduler = SimpleNamespace(config=SimpleNamespace(flow_shift=1.0))
-        pipeline.sampling = SimpleNamespace(set_flow_shift=fake_set_flow_shift)
+        pipeline.sampling = FakeSampling()
         pipeline._tokenize_prompt = fake_tokenize_prompt
 
         with pytest.raises(StopAfterTokenize):
