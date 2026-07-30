@@ -47,8 +47,13 @@ from typing import Optional
 # whole n_comp/K < 1.5 band measures below parity.
 ASSIST_MIN_N_COMP = 4096  # ~8k raw context at compress_ratio 4
 
-# Block-skip prefix pays only when whole-row reads dominate.
-SKIP_MIN_N_COUNTS = 65536  # va: attach block_max unconditionally here up
+# Block-skip prefix pays only when whole-row reads dominate. Measured
+# by attaching block_max to the same shape and diffing (30 interleaved
+# cold reps): at n_comp 65538 it is a wash (+0.0 / -0.1 / +0.6us at
+# batch 1/4/16, 9-16 of 30 reps faster), at 131075 it is -4.5 to -5.0us
+# and wins 30 of 30, at 262127 it is -14us. So the prefix earns its
+# setup one doubling later than it was switched on.
+SKIP_MIN_N_COUNTS = 131072  # va: attach block_max from here up
 SKIP_MIN_N_RUNGS_FLASH = 131072  # vb (flash): bm pays from here
 SKIP_CS_MIN_N_RUNGS = 196608  # vb: cluster split on top of bm from here
 
