@@ -118,6 +118,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             logger.info("Initializing Cosmos3OmniMoTPipeline with audio generation.")
             self.audio_gen = True
 
+        if getattr(primary_pretrained_config, "action_gen", False):
+            logger.info("Initializing Cosmos3OmniMoTPipeline with action generation.")
+            self.action_gen = True
+
         super().__init__(pipeline_config)
 
     def _init_transformer(self) -> None:
@@ -781,6 +785,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         is_t2i = output_type == "image"
 
         self.sampling.validate_request(num_inference_steps, guidance_scale)
+
+        # A distilled checkpoint's step count and guidance are checkpoint facts,
+        # not mode defaults, so they resolve before the mode tables below.
+        # Requests through infer() already carry them via
+        # default_generation_params; a direct forward() call would otherwise
+        # fall through to the base tables and run CFG at 6.0 against weights
+        # with guidance baked in.
+        checkpoint_defaults = self.sampling.generation_default_overrides()
+        if num_inference_steps is None:
+            num_inference_steps = checkpoint_defaults.get("num_inference_steps")
+        if guidance_scale is None:
+            guidance_scale = checkpoint_defaults.get("guidance_scale")
 
         if image is not None and self.sampling.is_distilled:
             raise ValueError(

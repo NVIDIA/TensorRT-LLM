@@ -599,3 +599,96 @@ class TestRegistryDispatch:
     def test_hf_id_registered(self):
         entry = PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"]
         assert "nvidia/Cosmos3-Super-Text2Image-4Step" in entry.hf_ids
+
+
+class TestDistilledForwardDefaults:
+    """A distilled checkpoint's step count and guidance are checkpoint facts.
+
+    Requests through ``infer()`` carry them already, merged from
+    ``default_generation_params``. A direct ``forward()`` leaving them unset
+    passes ``validate_request`` (it only rejects *conflicting* values), so
+    without checkpoint-first resolution it would fall through to the base mode
+    tables and run CFG at 6.0 against weights with guidance baked in.
+    """
+
+    def _resolved_recipe(self, monkeypatch, **forward_kwargs):
+        """Run forward() far enough to see the recipe it reports, then bail."""
+        import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as mod
+
+        pipeline = _bare_pipeline(sampling=_distilled_policy())
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.scheduler = SimpleNamespace(config=SimpleNamespace(flow_shift=1.0))
+
+        class StopAfterDims(Exception):
+            pass
+
+        def stop(*args, **kwargs):
+            raise StopAfterDims
+
+        pipeline._tokenize_prompt = stop
+
+        lines = []
+        monkeypatch.setattr(mod, "logger", SimpleNamespace(info=lines.append, warning=print))
+
+        with pytest.raises(StopAfterDims):
+            pipeline.forward(
+                prompt="a distilled render",
+                negative_prompt="",
+                num_frames=COSMOS3_720P_PARAMS["num_frames"],
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=False,
+                use_guardrails=False,
+                **forward_kwargs,
+            )
+        dims = next(line for line in lines if "Cosmos3 generation dims" in line)
+        return dims
+
+    def test_unset_resolves_to_checkpoint_not_base_table(self, monkeypatch):
+        dims = self._resolved_recipe(monkeypatch, num_inference_steps=None, guidance_scale=None)
+        assert f"num_inference_steps={len(DISTILLED_SIGMAS)}" in dims
+        assert f"guidance_scale={DISTILLED_GUIDANCE_SCALE:.2f}" in dims
+        # The base video table's values must not have been substituted.
+        assert f"num_inference_steps={COSMOS3_720P_PARAMS['num_inference_steps']}" not in dims
+        assert f"guidance_scale={COSMOS3_720P_PARAMS['guidance_scale']:.2f}" not in dims
+
+    def test_base_checkpoint_still_uses_the_mode_table(self, monkeypatch):
+        """The checkpoint-first step must be a no-op for a base checkpoint:
+        ``generation_default_overrides()`` is empty, so the mode tables win."""
+        import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as mod
+
+        pipeline = _bare_pipeline()
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.scheduler = SimpleNamespace(config=SimpleNamespace(flow_shift=1.0))
+
+        class StopAfterDims(Exception):
+            pass
+
+        def stop(*args, **kwargs):
+            raise StopAfterDims
+
+        pipeline._tokenize_prompt = stop
+        lines = []
+        monkeypatch.setattr(mod, "logger", SimpleNamespace(info=lines.append, warning=print))
+
+        with pytest.raises(StopAfterDims):
+            pipeline.forward(
+                prompt="a base render",
+                negative_prompt="",
+                num_frames=COSMOS3_720P_PARAMS["num_frames"],
+                num_inference_steps=None,
+                guidance_scale=None,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=False,
+                use_guardrails=False,
+            )
+        dims = next(line for line in lines if "Cosmos3 generation dims" in line)
+        assert f"num_inference_steps={COSMOS3_720P_PARAMS['num_inference_steps']}" in dims
+        assert f"guidance_scale={COSMOS3_720P_PARAMS['guidance_scale']:.2f}" in dims
