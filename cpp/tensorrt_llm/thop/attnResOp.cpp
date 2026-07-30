@@ -33,7 +33,7 @@ namespace torch_ext
 namespace
 {
 
-bool is_sm100_or_later()
+bool is_sm100_family()
 {
     int dev = 0;
     cudaGetDevice(&dev);
@@ -44,7 +44,10 @@ bool is_sm100_or_later()
     }
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, dev);
-    bool const ok = prop.major >= 10;
+    // The kernel binary is compiled for the sm_100 family only (it relies on
+    // tcgen05/TMEM, which later architectures such as sm_120 do not support),
+    // so require compute capability major == 10 rather than >= 10.
+    bool const ok = prop.major == 10;
     if (dev >= 0 && dev < 64)
     {
         cached_state[dev] = ok ? 2 : 1;
@@ -54,7 +57,7 @@ bool is_sm100_or_later()
 
 void check_attn_res_contract(int N, int T, int B, int H)
 {
-    TORCH_CHECK(is_sm100_or_later(), "attn_res_fwd requires sm_100 (Blackwell) or later");
+    TORCH_CHECK(is_sm100_family(), "attn_res_fwd requires an sm_100-family (datacenter Blackwell) GPU");
     TORCH_CHECK(B == 1, "attn_res_fwd: unsupported B=", B, " (only B=1 is supported)");
     TORCH_CHECK(N >= 1 && N <= 12, "attn_res_fwd: unsupported N=", N, " (must be in [1, 12])");
     TORCH_CHECK(T >= 1 && T <= 16384, "attn_res_fwd: unsupported T=", T, " (must be in [1, 16384])");
@@ -62,8 +65,8 @@ void check_attn_res_contract(int N, int T, int B, int H)
         " (must be a multiple of 1024 in [4096, 8192])");
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> attn_res_fwd(at::Tensor layer_residual,
-    at::Tensor block_residual, at::Tensor res_weight, at::Tensor rms_weight, double rms_eps)
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> attn_res_fwd(
+    at::Tensor layer_residual, at::Tensor block_residual, at::Tensor res_weight, at::Tensor rms_weight, double rms_eps)
 {
     TORCH_CHECK(layer_residual.dim() == 3, "attn_res_fwd: layer_residual must be [T, B, H]");
     TORCH_CHECK(block_residual.dim() == 4, "attn_res_fwd: block_residual must be [K, T, B, H]");
@@ -96,8 +99,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> attn_res_fwd(at::Tens
     auto logits = at::empty({N, T, B}, float_options);
 
     kernels::kimiK3AttnRes::AttnResFwdParams params{};
-    params.blockResidual
-        = N > 1 ? reinterpret_cast<__nv_bfloat16 const*>(block_residual.const_data_ptr()) : nullptr;
+    params.blockResidual = N > 1 ? reinterpret_cast<__nv_bfloat16 const*>(block_residual.const_data_ptr()) : nullptr;
     params.layerResidual = reinterpret_cast<__nv_bfloat16 const*>(layer_residual.const_data_ptr());
     params.resWeight = reinterpret_cast<__nv_bfloat16 const*>(res_weight.const_data_ptr());
     params.rmsWeight = reinterpret_cast<__nv_bfloat16 const*>(rms_weight.const_data_ptr());
