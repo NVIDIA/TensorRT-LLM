@@ -152,11 +152,15 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def DISABLE_CBTS = "disable_cbts"
+@Field
+def INFRA_DRY_RUN = "infra_dry_run"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
 @Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
+
+boolean infraDryRun = params.InfraDryRun?.toString()?.toBoolean() ?: false
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -178,6 +182,7 @@ def testFilter = [
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
     (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
+    (INFRA_DRY_RUN): infraDryRun,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -213,6 +218,7 @@ if (runMode == "nightly_release") {
 // GenPostMergeBuilds pipelines do not update GitLab status.
 boolean enableUpdateGitlabStatus =
     !GEN_POST_MERGE_BUILDS_ONLY &&
+    !testFilter[INFRA_DRY_RUN] &&
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
     !testFilter[DISABLE_MULTI_GPU_TEST] &&
@@ -353,16 +359,19 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     }
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-    if (!GEN_POST_MERGE_BUILDS_ONLY) {
+    if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
         trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
     }
     testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-    testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
-    // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
-    // Coverage runs only on the official post-merge pipeline.
-    testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (testFilter[INFRA_DRY_RUN]) {
+        pipeline.echo("CBTS is skipped for the infrastructure dry run.")
+    } else {
+        testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
+        // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    }
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
     getContainerURIs().each { k, v ->
@@ -1688,6 +1697,26 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     return buildStatus
 }
 
+def launchInfraDryRunTestJobs(pipeline, arch, testFilter, globalVars, platform, imageParameters)
+{
+    String testFilterJson = writeJSON returnText: true, json: testFilter
+    def additionalParameters = ['testFilter': testFilterJson] + imageParameters
+    def testJobs = [
+        "[Test-${arch}-Single-GPU] Remote Run": {
+            stage("[Test-${arch}-Single-GPU] Remote Run") {
+                launchJob(pipeline, "L0_Test-${arch}-Single-GPU", false, false, globalVars, platform, additionalParameters)
+            }
+        },
+        "[Test-${arch}-Multi-GPU] Remote Run": {
+            stage("[Test-${arch}-Multi-GPU] Remote Run") {
+                launchJob(pipeline, "L0_Test-${arch}-Multi-GPU", false, false, globalVars, platform, additionalParameters)
+            }
+        },
+    ]
+    testJobs.failFast = false
+    pipeline.parallel testJobs
+}
+
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
@@ -1779,6 +1808,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
                 if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
                     echo "Skipping x86_64 tests (PLC container scanning)"
+                    return
+                }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJobs(pipeline, "x86_64", testFilter, globalVars, "x86_64", imageParameters)
                     return
                 }
 
@@ -1931,6 +1969,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                 if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
                     echo "Skipping SBSA tests (PLC container scanning)"
+                    return
+                }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJobs(pipeline, "SBSA", testFilter, globalVars, "SBSA", imageParameters)
                     return
                 }
 
@@ -2239,7 +2285,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     }]}
 
-    parallelJobs.failFast = enableFailFast
+    parallelJobs.failFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast
     pipeline.parallel parallelJobs
 }
 
@@ -2263,24 +2309,26 @@ pipeline {
     post {
         unsuccessful {
             script {
-                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
                     trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "failed", GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
         }
         success {
             script {
-                if (enableUpdateGitlabStatus) {
-                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
-                } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
-                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
-                    trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                if (!testFilter[INFRA_DRY_RUN]) {
+                    if (enableUpdateGitlabStatus) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
+                        trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    }
                 }
             }
         }
         aborted {
             script {
-                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
                     trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'canceled', GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
@@ -2304,7 +2352,7 @@ pipeline {
                         echo "Upload Build Info failed: ${e.toString()}"
                     }
                 }
-                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
                     collectTestResults(this, testFilter, globalVars)
                 }
             }
