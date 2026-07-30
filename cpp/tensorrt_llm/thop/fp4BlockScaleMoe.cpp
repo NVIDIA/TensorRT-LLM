@@ -492,6 +492,14 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 
     if (!do_finalize)
     {
+        if (topk_weights.has_value())
+        {
+            // Separated routing: the kernels consume the caller's topk_weights through
+            // expert_weights_ptr and never write the locally allocated expert_weights,
+            // so materialize the scales the in-kernel finalize would have consumed.
+            // copy_ also converts bf16 topk_weights to the mDtypeOut-derived dtype.
+            expert_weights.copy_(topk_weights.value());
+        }
         return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
     }
 

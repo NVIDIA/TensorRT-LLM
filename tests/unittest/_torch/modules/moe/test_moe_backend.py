@@ -149,6 +149,7 @@ def create_test_backend(
     swiglu_limit: Optional[torch.Tensor] = None,
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     activation_type: ActivationType = ActivationType.Swiglu,
+    reduce_results: bool = True,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
@@ -179,7 +180,7 @@ def create_test_backend(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         dtype=dtype,
-        reduce_results=True,
+        reduce_results=reduce_results,
         model_config=model_config,
         init_load_balancer=False,
         bias=bias,
@@ -1138,3 +1139,138 @@ def test_trtllm_bf16_unquantized_moe(
         with torch.inference_mode():
             output = run_moe()
             ref_fused_moe.check_accuracy(output, ref_output)
+
+
+# ============================================================================
+# TRTLLM-Gen do_finalize=False with separated routing (host-side top-k)
+# ============================================================================
+# Regression test for the uninitialized expert_weights return: with topk_ids /
+# topk_weights provided (separated routing), the fp4/mxfp4 block-scale runners
+# consume the host scales directly through expert_weights_ptr and never write
+# the internally allocated expert_weights buffer. The do_finalize=False output
+# must still carry the real scales so an external finalize (e.g. the Kimi K3
+# fused finalize+AllReduce+RMSNorm path) applies correct routing weights.
+# W4A8_MXFP4_MXFP8 covers mxFp4BlockScaleMoe.cpp; NVFP4 and W4A8_NVFP4_FP8
+# cover both runner classes routed through fp4BlockScaleMoe.cpp.
+
+
+@pytest.mark.parametrize(
+    "quant_algo",
+    [QuantAlgo.W4A8_MXFP4_MXFP8, QuantAlgo.NVFP4, QuantAlgo.W4A8_NVFP4_FP8],
+    ids=lambda q: q.name,
+)
+def test_trtllm_separated_routing_no_finalize_returns_host_scales(quant_algo):
+    backend_type = MoeBackendType.TRTLLM
+    dtype = torch.bfloat16
+    num_experts = _BF16_UNQUANT_NUM_EXPERTS
+    top_k = _BF16_UNQUANT_TOP_K
+    if quant_algo == QuantAlgo.W4A8_NVFP4_FP8:
+        # The fp8-activation batched-GEMM cubins ship no configs for the
+        # small default shape (gemm1 N=K=1024); use a Qwen1.5-MoE-sized
+        # layer instead.
+        hidden_size, intermediate_size = 2048, 1408
+    else:
+        hidden_size = _BF16_UNQUANT_HIDDEN
+        intermediate_size = _BF16_UNQUANT_INTERMEDIATE
+    seq_len = 8  # decode-scale batch, inside the Kimi K3 fused-finalize gate
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = _make_bf16_routing_method("deepseekv3", top_k, num_experts, "cuda")
+
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, backend_type
+        )
+        can_impl, skip_reason = get_backend_class(backend_type).can_implement(
+            quant_algo, dtype_activation=dtype
+        )
+        if not can_impl:
+            pytest.skip(skip_reason)
+
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+
+        from tensorrt_llm._torch.modules.fused_moe.quantization import (
+            NVFP4TRTLLMGenFusedMoEBaseMethod,
+        )
+
+        NVFP4TRTLLMGenFusedMoEBaseMethod._cache_permute_indices.clear()
+
+        # do_finalize=False requires reduce_results=False on the backend.
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            reduce_results=False,
+        )
+
+        quant_kwargs.pop("ref_cls", None)
+        if quant_algo in (QuantAlgo.W4A8_MXFP4_MXFP8, QuantAlgo.W4A8_MXFP4_FP8):
+            weights, _, _ = quantize_util.prepare_weights_from_backend(backend, **quant_kwargs)
+        else:
+            weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        AutoTuner.get().clear_cache()
+
+        with torch.inference_mode():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            token_selected_experts = token_selected_experts.to(torch.int32)
+            token_final_scales = token_final_scales.to(torch.bfloat16)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+
+            try:
+                finalized = backend.run_moe(
+                    x=x_quantized,
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    x_sf=x_sf,
+                )
+                gemm2_output, expert_scales, expanded_idx_to_permuted_idx = backend.run_moe(
+                    x=x_quantized,
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    x_sf=x_sf,
+                    do_finalize=False,
+                )
+            except RuntimeError as e:
+                if "No valid config found" in str(e):
+                    pytest.skip(f"{quant_algo.name}: no kernel config for this shape: {e}")
+                raise
+
+        # The runner must hand back the host scales, not its internal
+        # (unwritten) buffer.
+        assert torch.equal(expert_scales, token_final_scales.to(expert_scales.dtype))
+
+        # Finalizing manually from the do_finalize=False outputs must
+        # reproduce the in-kernel finalize result.
+        idx = expanded_idx_to_permuted_idx.to(torch.int64)
+        gathered = gemm2_output.to(torch.float32)[idx.clamp_min(0), :hidden_size]
+        gathered = torch.where((idx >= 0).unsqueeze(-1), gathered, torch.zeros_like(gathered))
+        manual = (gathered * expert_scales.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+        torch.testing.assert_close(
+            manual.to(finalized.dtype), finalized[:, :hidden_size], rtol=0.02, atol=0.2
+        )

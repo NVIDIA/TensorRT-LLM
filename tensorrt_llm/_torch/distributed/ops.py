@@ -541,6 +541,11 @@ class MNNVLAllReduce(nn.Module):
         AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
     })
 
+    # Keep these synchronized with oneshotMoeFinalizeAllreduceRMSNormOp.
+    SUPPORTED_MOE_FINALIZE_TP_SIZES: frozenset[int] = frozenset({2, 4, 8, 16})
+    SUPPORTED_MOE_FINALIZE_DTYPES: frozenset[torch.dtype] = frozenset(
+        {torch.float16, torch.bfloat16})
+
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
         self.mapping = mapping
@@ -849,7 +854,10 @@ class AllReduce(nn.Module):
     @property
     def supports_moe_finalize_allreduce_rms_norm(self) -> bool:
         """Whether this instance can execute the fused MNNVL MoE epilogue."""
-        return self.mnnvl_allreduce is not None
+        return (self.mnnvl_allreduce is not None and self.mapping.tp_size
+                in MNNVLAllReduce.SUPPORTED_MOE_FINALIZE_TP_SIZES
+                and self.mnnvl_allreduce.dtype
+                in MNNVLAllReduce.SUPPORTED_MOE_FINALIZE_DTYPES)
 
     def moe_finalize_allreduce_rms_norm(
         self,
@@ -860,9 +868,10 @@ class AllReduce(nn.Module):
         eps: float,
     ) -> torch.Tensor:
         """Fuse MoE finalize, AllReduce, and RMSNorm through MNNVL."""
-        if self.mnnvl_allreduce is None:
+        if not self.supports_moe_finalize_allreduce_rms_norm:
             raise RuntimeError(
-                "Fused MoE finalize AllReduce RMSNorm requires MNNVL.")
+                "Fused MoE finalize AllReduce RMSNorm requires MNNVL with "
+                "TP size 2, 4, 8, or 16 and BF16 or FP16 dtype.")
         return self.mnnvl_allreduce.moe_finalize_allreduce_rms_norm(
             input,
             expert_scale_factor,

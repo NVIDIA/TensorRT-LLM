@@ -119,6 +119,27 @@ _K3_DISABLE_FUSED_LATENT_DOWN_MXFP8 = os.environ.get(
 _K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS = os.environ.get(
     "TLLM_K3_DISABLE_FUSED_MOE_FINALIZE_AR_RMS", "0") == "1"
 
+# Token-count ceiling for that fused epilogue. Read at import, so
+# CUDA-graph capture and replay agree.
+
+
+def _read_fused_finalize_ar_rms_max_tokens() -> int:
+    raw = os.environ.get("TLLM_K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS", "2")
+    try:
+        value = int(raw)
+    except ValueError:
+        # Fail fast with a clear message: silently falling back to the
+        # default would make a mistyped sweep A/B arm measure the wrong
+        # bound and report a false negative.
+        raise ValueError(
+            "TLLM_K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS must be an "
+            f"integer in [0, 16], got {raw!r}") from None
+    return min(max(value, 0), 16)
+
+
+_K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS = (
+    _read_fused_finalize_ar_rms_max_tokens())
+
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
 
 # Routed-expert MoE TP/EP split overrides (read per model init, not import).
@@ -850,7 +871,8 @@ class KimiK3MoERuntime(nn.Module):
                 and self.routed_experts.comm is None
                 and moe_all_reduce is not None
                 and moe_all_reduce.supports_moe_finalize_allreduce_rms_norm
-                and 1 <= hidden_states.shape[0] <= 16)
+                and 1 <= hidden_states.shape[0] <=
+                _K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS)
             use_fused_mxfp8 = (
                 self._use_fused_latent_down_mxfp8
                 and down_proj_is_bf16_linear

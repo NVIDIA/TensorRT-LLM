@@ -16,6 +16,7 @@ import os
 import pickle
 import sys
 import traceback
+from types import SimpleNamespace
 
 import cloudpickle
 import pytest
@@ -77,6 +78,29 @@ QUANT_FUSION_OPS = (
                  id="residual_rms_norm_out_quant_nvfp4",
                  marks=skip_pre_blackwell),
 )
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "dtype", "expected"),
+    [
+        (2, torch.bfloat16, True),
+        (4, torch.float16, True),
+        (8, torch.bfloat16, True),
+        (16, torch.float16, True),
+        (32, torch.bfloat16, False),
+        (64, torch.float16, False),
+        (2, torch.float32, False),
+    ],
+)
+def test_mnnvl_moe_finalize_capability_matches_kernel_dispatch(
+        tp_size, dtype, expected):
+    allreduce = SimpleNamespace(
+        mnnvl_allreduce=SimpleNamespace(dtype=dtype),
+        mapping=SimpleNamespace(tp_size=tp_size),
+    )
+    supports = AllReduce.supports_moe_finalize_allreduce_rms_norm.fget(
+        allreduce)
+    assert supports is expected
 
 
 def _seq_len_id(seq_len: tuple[int, ...]):
@@ -279,6 +303,67 @@ def mnnvl_moe_finalize_allreduce_rms_norm_forward(
         eps,
     )
     torch.testing.assert_close(output, reference_output, rtol=0.05, atol=0.15)
+
+    misaligned_fc2_output = torch.empty(
+        (fc2_output.shape[0], fc2_output.shape[1] + 1),
+        dtype=fc2_output.dtype,
+        device=fc2_output.device,
+    )
+    misaligned_norm_weight = torch.empty(
+        (norm_weight.shape[0] + 1, ),
+        dtype=norm_weight.dtype,
+        device=norm_weight.device,
+    )
+    with pytest.raises(RuntimeError,
+                       match="Hidden dimension must be divisible by 8"):
+        allreduce.moe_finalize_allreduce_rms_norm(
+            misaligned_fc2_output,
+            expert_scale_factor,
+            expanded_idx_to_permuted_idx,
+            misaligned_norm_weight,
+            eps,
+        )
+
+    offset_fc2_output = torch.empty(
+        fc2_output.numel() + 1,
+        dtype=fc2_output.dtype,
+        device=fc2_output.device,
+    )[1:].view_as(fc2_output)
+    with pytest.raises(RuntimeError, match="input must be 16-byte aligned"):
+        allreduce.moe_finalize_allreduce_rms_norm(
+            offset_fc2_output,
+            expert_scale_factor,
+            expanded_idx_to_permuted_idx,
+            norm_weight,
+            eps,
+        )
+
+    offset_norm_weight = torch.empty(
+        norm_weight.numel() + 1,
+        dtype=norm_weight.dtype,
+        device=norm_weight.device,
+    )[1:]
+    with pytest.raises(RuntimeError,
+                       match="normWeight must be 16-byte aligned"):
+        allreduce.moe_finalize_allreduce_rms_norm(
+            fc2_output,
+            expert_scale_factor,
+            expanded_idx_to_permuted_idx,
+            offset_norm_weight,
+            eps,
+        )
+
+    peer_device = torch.device("cuda", (tensor_parallel_rank + 1) %
+                               tensor_parallel_size)
+    with pytest.raises(RuntimeError,
+                       match="all tensors must be on the same CUDA device"):
+        allreduce.moe_finalize_allreduce_rms_norm(
+            fc2_output,
+            expert_scale_factor,
+            expanded_idx_to_permuted_idx,
+            norm_weight.to(device=peer_device),
+            eps,
+        )
 
 
 @torch.inference_mode()

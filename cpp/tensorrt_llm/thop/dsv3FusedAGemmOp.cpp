@@ -20,6 +20,8 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/cublasScaledMM.h"
 
+#include <cstdint>
+
 namespace th = torch;
 namespace tl = tensorrt_llm;
 namespace tk = tensorrt_llm::kernels;
@@ -90,8 +92,11 @@ th::Tensor dsv3_fused_a_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     TORCH_CHECK(!bias.has_value(), "bias is not support yet");
     auto const sm = tensorrt_llm::common::getSMVersion();
+    bool const fused_layout_ok = mat_a.strides()[0] == mat_a.sizes()[1] && mat_b.strides()[1] == mat_b.sizes()[0]
+        && reinterpret_cast<uintptr_t>(mat_a.const_data_ptr()) % sizeof(float4) == 0
+        && reinterpret_cast<uintptr_t>(mat_b.const_data_ptr()) % sizeof(float4) == 0;
     bool const dtype_ok = num_tokens >= 1 && num_tokens <= 16 && data_type == torch::kBFloat16
-        && out_dtype_ == torch::kBFloat16 && sm >= 90;
+        && out_dtype_ == torch::kBFloat16 && sm >= 90 && fused_layout_ok;
 
     if (dtype_ok && hd_in == 7168 && hd_out == 2112) // DeepSeek-V3 fused q_a/kv_a proj
     {
@@ -119,8 +124,14 @@ std::tuple<th::Tensor, th::Tensor> dsv3_fused_a_gemm_mxfp8_op(th::Tensor const& 
     TORCH_CHECK(mat_a.get_device() == mat_b.get_device(), "mat_a and mat_b must be on the same CUDA device");
     TORCH_CHECK(mat_a.scalar_type() == torch::kBFloat16 && mat_b.scalar_type() == torch::kBFloat16,
         "mat_a and mat_b must have bfloat16 dtype");
-    TORCH_CHECK(mat_a.strides()[1] == 1, "mat_a must be row-major");
-    TORCH_CHECK(mat_b.strides()[0] == 1, "mat_b must be column-major");
+    TORCH_CHECK(
+        mat_a.strides()[0] == mat_a.sizes()[1] && mat_a.strides()[1] == 1, "mat_a must be contiguous row-major");
+    TORCH_CHECK(
+        mat_b.strides()[0] == 1 && mat_b.strides()[1] == mat_b.sizes()[0], "mat_b must be contiguous column-major");
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(mat_a.const_data_ptr()) % sizeof(float4) == 0, "mat_a must be 16-byte aligned");
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(mat_b.const_data_ptr()) % sizeof(float4) == 0, "mat_b must be 16-byte aligned");
 
     int const num_tokens = mat_a.sizes()[0];
     int const hd_in = mat_a.sizes()[1];

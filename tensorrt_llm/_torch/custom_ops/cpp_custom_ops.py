@@ -459,6 +459,8 @@ def _register_fake():
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
+        tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
     ) -> List[torch.Tensor]:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]

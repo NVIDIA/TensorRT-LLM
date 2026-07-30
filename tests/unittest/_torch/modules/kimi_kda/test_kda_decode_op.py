@@ -377,11 +377,13 @@ def test_sm103_selector_dispatches_each_supported_head_at_boundary(num_heads: in
 
 
 @torch.no_grad()
-def test_selector_falls_back_to_many_heads_off_sm103() -> None:
+def test_selector_preserves_legacy_compact_heads_off_sm103() -> None:
     if torch.cuda.get_device_capability(0) == (10, 3):
         pytest.skip("non-SM103 fallback requires a different Blackwell target")
+    # Off SM103 the H==2 legacy rule dispatches the compact kernel; the
+    # SM103-only selector must not change that.
     args = _make_direct_decode_args(1, 2, indexed_state=False)
-    assert _profile_decode_backend(args) == "many"
+    assert _profile_decode_backend(args) == "compact"
 
 
 @torch.no_grad()

@@ -133,6 +133,7 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
     bash -c "
         set -x
         ulimit -n 65536
+        export PYTHONNOUSERSITE=1
         $ENV_CMD
         export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}
         mkdir -p \"\$TRITON_CACHE_DIR\"
@@ -150,6 +151,11 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
         export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
         export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
+        # Offline compute nodes cannot reach the Hub: point lm_eval at the
+        # pre-downloaded snapshot when present (falls back to the hub id).
+        GSM8K_DATASET_PATH=\${GSM8K_DATASET_PATH:-\$(ls -d \"\$HF_HOME\"/hub/datasets--openai--gsm8k/snapshots/*/ 2>/dev/null | head -1)}
+        DATASET_ARGS=\"\"
+        [ -n \"\$GSM8K_DATASET_PATH\" ] && DATASET_ARGS=\"--dataset_path \$GSM8K_DATASET_PATH\"
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python3 \
             '$REPO/.venv-3.12/bin/trtllm-eval' \
             --model \"$MODEL\" \
@@ -160,7 +166,7 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
             --max_seq_len $MAX_SEQ_LEN \
             --trust_remote_code \
             --config '$CONFIG_FILE' \
-            gsm8k
+            gsm8k \$DATASET_ARGS
     " 2>&1 | tee "$WORK_DIR/eval.log"
 
 grep -E "average accuracy|exact_match" "$WORK_DIR/eval.log" | tail -4 || true

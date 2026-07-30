@@ -2002,14 +2002,13 @@ torch::Tensor mnnvlMoeFinalizeAllReduceRMSNorm(torch::Tensor const& input, torch
     torch::Tensor const& expandedIdxToPermutedIdx, torch::Tensor const& normWeight, torch::Tensor& commBuffer,
     torch::Tensor& bufferFlags, double const eps)
 {
-    auto* mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(commBuffer.data_ptr());
-    TORCH_CHECK(mcastMem != nullptr,
-        "[mnnvlMoeFinalizeAllReduceRMSNorm] commBuffer must be obtained from a mcastBuffer instance.");
     TORCH_CHECK(input.is_cuda() && input.is_contiguous(),
         "[mnnvlMoeFinalizeAllReduceRMSNorm] input must be a contiguous CUDA tensor.");
     TORCH_CHECK(input.dim() == 2, "[mnnvlMoeFinalizeAllReduceRMSNorm] input must be two-dimensional.");
     TORCH_CHECK(input.scalar_type() == torch::kBFloat16 || input.scalar_type() == torch::kFloat16,
         "[mnnvlMoeFinalizeAllReduceRMSNorm] input must have BF16 or FP16 dtype.");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(input.const_data_ptr()) % sizeof(float4) == 0,
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] input must be 16-byte aligned.");
     TORCH_CHECK(expertScaleFactor.is_cuda() && expertScaleFactor.is_contiguous(),
         "[mnnvlMoeFinalizeAllReduceRMSNorm] expertScaleFactor must be a contiguous CUDA tensor.");
     TORCH_CHECK(
@@ -2029,11 +2028,27 @@ torch::Tensor mnnvlMoeFinalizeAllReduceRMSNorm(torch::Tensor const& input, torch
         "[mnnvlMoeFinalizeAllReduceRMSNorm] normWeight must match the input hidden dimension.");
     TORCH_CHECK(normWeight.scalar_type() == input.scalar_type(),
         "[mnnvlMoeFinalizeAllReduceRMSNorm] normWeight dtype must match input dtype.");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(normWeight.const_data_ptr()) % sizeof(float4) == 0,
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] normWeight must be 16-byte aligned.");
+    TORCH_CHECK(commBuffer.is_cuda() && bufferFlags.is_cuda(),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] commBuffer and bufferFlags must be CUDA tensors.");
+    TORCH_CHECK(expertScaleFactor.device() == input.device() && expandedIdxToPermutedIdx.device() == input.device()
+            && normWeight.device() == input.device() && commBuffer.device() == input.device()
+            && bufferFlags.device() == input.device(),
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] all tensors must be on the same CUDA device.");
+
+    auto* mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(commBuffer.data_ptr());
+    TORCH_CHECK(mcastMem != nullptr,
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] commBuffer must be obtained from a mcastBuffer instance.");
 
     int64_t const numTokens = expertScaleFactor.size(0);
     int64_t const topK = expertScaleFactor.size(1);
     int64_t const hiddenDim = input.size(1);
     TORCH_CHECK(numTokens > 0 && topK > 0, "[mnnvlMoeFinalizeAllReduceRMSNorm] numTokens and topK must be positive.");
+    auto const eltsPerThread = sizeof(float4) / input.itemsize();
+    TORCH_CHECK(hiddenDim % eltsPerThread == 0,
+        "[mnnvlMoeFinalizeAllReduceRMSNorm] Hidden dimension must be divisible by " + std::to_string(eltsPerThread)
+            + ", got " + std::to_string(hiddenDim));
 
     auto output = torch::empty({numTokens, hiddenDim}, input.options());
     auto params = tensorrt_llm::kernels::mnnvl::MoeFinalizeAllReduceRMSNormParams();
