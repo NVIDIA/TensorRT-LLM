@@ -96,8 +96,12 @@ class VisualGenOutput:
     image: Optional[torch.Tensor] = None
     video: Optional[torch.Tensor] = None
     audio: Optional[torch.Tensor] = None
+    action: Optional[torch.Tensor] = None
     frame_rate: Optional[float] = None
     audio_sample_rate: Optional[int] = None
+    raw_action_dim: Optional[int] = None
+    action_mode: Optional[str] = None
+    domain_id: Optional[int] = None
     error: Optional[str] = None
     metrics: Optional[VisualGenMetrics] = None
 
@@ -121,8 +125,8 @@ class VisualGenOutput:
             format: Explicit format. Image encoders: ``"png"``, ``"jpg"``,
                 ``"webp"``. Video encoders: ``"mp4"``, ``"avi"``. Tensor
                 payloads: ``"safetensors"``, ``"pt"`` — these carry every
-                populated modality (image/video/audio) plus scalar
-                metadata (frame_rate, audio_sample_rate) in one file.
+                populated modality (image/video/audio/action) plus scalar
+                metadata in one file.
             frame_rate: Override the frame rate for video output. Defaults to
                 ``self.frame_rate`` when not provided.
             audio_sample_rate: Override the audio sample rate. Defaults to
@@ -138,8 +142,8 @@ class VisualGenOutput:
             ValueError: When video output lacks a frame rate, when the
                 output carries no media tensor at all, or when the list
                 length does not match the batch size.
-            NotImplementedError: When the output is audio-only and a
-                non-tensor format is requested.
+            NotImplementedError: When the output is audio-only or contains
+                action data and a non-tensor format is requested.
         """
         from tensorrt_llm.media.encoding import save_image, save_images, save_video, save_videos
         from tensorrt_llm.media.tensor_payload import is_tensor_format
@@ -152,7 +156,7 @@ class VisualGenOutput:
         is_batch = isinstance(path, list)
 
         # Tensor formats carry every populated modality in one payload,
-        # so the dispatch table for image/video/audio below does not
+        # so the dispatch table for image/video/audio/action below does not
         # apply. When ``format`` is omitted, infer it from the path
         # suffix so callers using the documented extension convention
         # (``out.safetensors``/``out.pt``) reach the tensor path.
@@ -164,6 +168,12 @@ class VisualGenOutput:
                 is_batch=is_batch,
                 frame_rate=frame_rate,
                 audio_sample_rate=audio_sample_rate,
+            )
+
+        if self.action is not None:
+            raise NotImplementedError(
+                "Saving action outputs requires a tensor payload format "
+                "('safetensors' or 'pt') so the action tensor and metadata are preserved."
             )
 
         if self.image is not None:
@@ -209,7 +219,7 @@ class VisualGenOutput:
 
         raise ValueError(
             f"Cannot save output: request {self.request_id} carries no media "
-            "(image/video/audio are all None)."
+            "(image/video/audio/action are all None)."
         )
 
     def _save_tensor_payload(

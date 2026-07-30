@@ -164,6 +164,12 @@ def parse_visual_gen_params(
                 with open(ref_path, "wb") as f:
                     shutil.copyfileobj(request.input_reference.file, f)
             params.image = ref_path
+        if request.extra_params and request.extra_params.get("video") is not None:
+            raise ValueError(
+                "extra_params['video'] is not accepted over trtllm-serve because it would "
+                "reference server-local paths. Use input_reference for uploaded conditioning "
+                "media, or call the offline VisualGen API for frame-sequence inputs."
+            )
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)

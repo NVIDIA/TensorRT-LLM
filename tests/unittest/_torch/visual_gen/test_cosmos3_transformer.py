@@ -398,6 +398,173 @@ class TestCosmos3Audio:
 
 
 @pytest.mark.integration
+class TestCosmos3Action:
+    """Action modality — Nano architecture, random weights, action_gen on."""
+
+    ACTION_DIM = 64
+    T_ACTION = 4
+    NUM_DOMAINS = 32
+
+    @pytest.fixture(autouse=True)
+    def _require_cuda(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+    @pytest.fixture
+    def action_model_config(self):
+        checkpoint_dir = _require_checkpoint()
+        model_config = _load_model_config(checkpoint_dir)
+        cfg = model_config.pretrained_config
+        cfg.action_gen = True
+        cfg.action_dim = self.ACTION_DIM
+        cfg.num_embodiment_domains = self.NUM_DOMAINS
+        cfg.sound_gen = False
+        return model_config
+
+    @pytest.fixture
+    def cosmos3_model_config_noaction(self):
+        checkpoint_dir = _require_checkpoint()
+        model_config = _load_model_config(checkpoint_dir)
+        model_config.pretrained_config.action_gen = False
+        model_config.pretrained_config.sound_gen = False
+        return model_config
+
+    def test_action_model_structure(self, action_model_config):
+        model = Cosmos3VFMTransformer(model_config=action_model_config)
+        assert model.action_gen is True
+        assert model.action_dim == self.ACTION_DIM
+        assert hasattr(model, "action_proj_in")
+        assert hasattr(model, "action_proj_out")
+        assert hasattr(model, "action_modality_embed")
+        assert model.action_modality_embed.shape == (model.hidden_size,)
+
+    def test_video_only_model_has_no_action_heads(self, cosmos3_model_config_noaction):
+        model = Cosmos3VFMTransformer(model_config=cosmos3_model_config_noaction)
+        assert model.action_gen is False
+        assert not hasattr(model, "action_proj_in")
+        assert not hasattr(model, "action_proj_out")
+        assert not hasattr(model, "action_modality_embed")
+
+    def test_pack_action_rejects_wrong_last_dim(self, action_model_config):
+        model = Cosmos3VFMTransformer(model_config=action_model_config)
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim - 1)
+        with pytest.raises(ValueError, match="action latent dimension mismatch"):
+            model.pack_action(action_latents)
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_action(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                action_latents=action_latents,
+                action_domain_ids=domain_ids,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        assert out.action is not None
+        _assert_finite_output(out.action, torch.Size([1, self.T_ACTION, model.action_dim]))
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_action_domain_id_out_of_range_raises(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([self.NUM_DOMAINS], dtype=torch.long, device=DEVICE)
+        with torch.inference_mode(), pytest.raises(ValueError, match="domain_id"):
+            model(
+                hidden_states=hs,
+                timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                action_latents=action_latents,
+                action_domain_ids=domain_ids,
+            )
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_without_action_latents_returns_none(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        assert out.action is None
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_action_noisy_mask(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel, t=2
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        noisy_mask = torch.ones(1, self.T_ACTION, 1, device=DEVICE, dtype=DTYPE)
+        noisy_mask[:, 0, :] = 0.0
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                action_latents=action_latents,
+                action_domain_ids=domain_ids,
+                action_noisy_mask=noisy_mask,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        _assert_finite_output(out.action, torch.Size([1, self.T_ACTION, model.action_dim]))
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_action_multiframe(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel, t=3
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+        with torch.inference_mode():
+            out = model(
+                hidden_states=hs,
+                timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                action_latents=action_latents,
+                action_domain_ids=domain_ids,
+            )
+        _assert_finite_output(out.video, hs.shape)
+        _assert_finite_output(out.action, torch.Size([1, self.T_ACTION, model.action_dim]))
+
+
+@pytest.mark.integration
 class TestCosmos3TransformerCheckpoint:
     """Load Cosmos3-Nano transformer weights and run a single forward step."""
 

@@ -798,6 +798,21 @@ class TestVideoGenerationSync:
         assert params.frame_rate == 8
         assert params.num_frames == int(2.0 * 8)
 
+    def test_sync_video_rejects_extra_params_video_path(self, video_client):
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "reject raw path",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "extra_params": {"video": "/server/local/path.mp4"},
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+        _assert_llm_envelope(resp.json(), code=400, message_contains="server-local paths")
+
     def test_sync_video_generation_multipart(self, video_client, tmp_path):
         """Multipart sync request with a real ``input_reference`` file."""
         ref_path = tmp_path / "ref.png"

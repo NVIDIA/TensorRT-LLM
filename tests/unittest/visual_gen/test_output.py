@@ -32,8 +32,12 @@ def test_visual_gen_output_is_dataclass():
         "image",
         "video",
         "audio",
+        "action",
         "frame_rate",
         "audio_sample_rate",
+        "raw_action_dim",
+        "action_mode",
+        "domain_id",
         "error",
         "metrics",
     }
@@ -60,6 +64,10 @@ def test_minimal_construction_defaults():
     assert out.image is not None
     assert out.video is None
     assert out.audio is None
+    assert out.action is None
+    assert out.raw_action_dim is None
+    assert out.action_mode is None
+    assert out.domain_id is None
     assert out.frame_rate is None
     assert out.audio_sample_rate is None
     assert out.error is None
@@ -321,6 +329,18 @@ def test_save_no_media_raises(tmp_path):
     out = VisualGenOutput(request_id=5)
     with pytest.raises(ValueError, match="no media"):
         out.save(tmp_path / "x.png")
+
+
+def test_save_action_with_non_tensor_format_raises(tmp_path):
+    """Action-bearing outputs require safetensors/pt to preserve action data."""
+    out = VisualGenOutput(
+        request_id=6,
+        video=torch.zeros(4, 8, 8, 3, dtype=torch.uint8),
+        action=torch.zeros(4, 7),
+        frame_rate=16.0,
+    )
+    with pytest.raises(NotImplementedError, match="tensor payload"):
+        out.save(tmp_path / "x.mp4")
 
 
 # ---------------------------------------------------------------------------
@@ -753,15 +773,19 @@ def test_encoding_not_top_level_reexport():
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_output_has_eight_fields():
-    """PipelineOutput has the eight expected fields."""
+def test_pipeline_output_has_twelve_fields():
+    """PipelineOutput has the twelve expected fields."""
     field_names = {f.name for f in fields(PipelineOutput)}
     assert field_names == {
         "image",
         "video",
         "audio",
+        "action",
         "frame_rate",
         "audio_sample_rate",
+        "raw_action_dim",
+        "action_mode",
+        "domain_id",
         "pre_denoise",
         "denoise",
         "post_denoise",
