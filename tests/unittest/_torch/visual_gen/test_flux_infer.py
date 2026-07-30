@@ -19,6 +19,7 @@ def test_infer_forwards_num_images_per_prompt(
     pipeline.forward = Mock(return_value="image")
     request = SimpleNamespace(
         prompt="a cat",
+        prepared_inputs={},
         params=SimpleNamespace(
             height=256,
             width=256,
