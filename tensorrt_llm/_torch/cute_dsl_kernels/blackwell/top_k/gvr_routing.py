@@ -52,16 +52,20 @@ SKIP_MIN_N_COUNTS = 65536  # va: attach block_max unconditionally here up
 SKIP_MIN_N_RUNGS_FLASH = 131072  # vb (flash): bm pays from here
 SKIP_CS_MIN_N_RUNGS = 196608  # vb: cluster split on top of bm from here
 
-# The emission tax is a fraction of the indexer's own time (list ~9-14%,
-# counts ~2%), so in absolute terms it grows with B*N while the top-k
-# saving does not. That gives three regimes, measured over the 126-cell
-# worst-step grid and checked at both ends of the tax range:
-#   long rows, small batch  -> the list repays its tax several times over
-#   large batch             -> emit nothing; the rungs tier has no tax
-#   otherwise               -> counts, whose tax is small either way
-LIST_EMIT_MAX_B = 16
+# Emission tax measured on the FP4 indexer itself (ctx 256k and 1M,
+# batch 1..128), as the wall delta of the same kernel with the emission
+# outputs attached:
+#
+#   batch    1      2      4      8     32     128
+#   list  +13.8% +64.3% +60.7% +62.0% +122.9% +150.7%
+#   counts +9.4%  +3.5%  +0.9%  +1.1%   +0.9%   +2.6%
+#
+# The list tier only clears its own tax at batch 1; from batch 2 the tax
+# is tens of microseconds against a top-k saving of a few. The counts
+# tax stays inside ~2.6us throughout, and at large batch even that is
+# not repaid, so the zero-emission rungs tier takes over.
+LIST_EMIT_MAX_B = 1
 LIST_EMIT_MIN_N = 32768
-# Above this batch even the counts tax outruns what it buys.
 RUNGS_MIN_B = 32
 
 # rungs-tier block_max pays only at small K: with K=1024 the tight-line
