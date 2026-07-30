@@ -4930,7 +4930,17 @@ class TorchLlmArgs(BaseLlmArgs):
             "encoder-decoder model. Use `cuda_graph_config` for the decoder "
             "and this field for the encoder. Encoder CUDA graphs require "
             "`encoder_max_batch_size` to be set."),
-        status="prototype")
+        status="beta")
+
+    enable_encoder_decoder_mixed_cuda_graph: bool = Field(
+        default=True,
+        description=(
+            "Enable the mixed-batch CUDA graph performance optimization for "
+            "encoder-decoder models. The graph handles decoder iterations "
+            "containing both context and generation requests. It is enabled "
+            "by default when both `cuda_graph_config` and "
+            "`encoder_cuda_graph_config` produce usable graph shapes."),
+        status="beta")
 
     @field_validator('cuda_graph_config', mode='before')
     @classmethod

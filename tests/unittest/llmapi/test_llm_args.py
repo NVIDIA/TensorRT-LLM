@@ -1766,6 +1766,22 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.encoder_cuda_graph_config.batch_sizes == [1, 4]
         assert args.encoder_cuda_graph_config.num_tokens == [16, 64]
         assert args.encoder_cuda_graph_config.seq_lens == [8, 32]
+        assert args.enable_encoder_decoder_mixed_cuda_graph
+
+    def test_encoder_decoder_mixed_cuda_graph_can_be_disabled(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            encoder_cuda_graph_config=EncodeCudaGraphConfig(
+                batch_sizes=[1, 4],
+                num_tokens=[16, 64],
+                seq_lens=[8, 32],
+                enable_padding=True,
+            ),
+            enable_encoder_decoder_mixed_cuda_graph=False,
+        )
+
+        assert not args.enable_encoder_decoder_mixed_cuda_graph
 
     def test_encoder_cuda_graph_config_requires_encoder_max_batch_size(self):
         with pytest.raises(ValidationError,

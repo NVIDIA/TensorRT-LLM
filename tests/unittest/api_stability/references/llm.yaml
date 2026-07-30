@@ -94,7 +94,11 @@ methods:
       encoder_cuda_graph_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig]
         default: null
-        status: prototype
+        status: beta
+      enable_encoder_decoder_mixed_cuda_graph:
+        annotation: bool
+        default: True
+        status: beta
       multimodal_config:
         annotation: tensorrt_llm.llmapi.llm_args.MultimodalConfig
         default: null

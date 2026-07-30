@@ -257,17 +257,6 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
     return result
 
 
-def _build_encoder_decoder_cuda_graph_keys(
-        batch_sizes: Sequence[int], num_tokens: Sequence[int],
-        seq_lens: Sequence[int]) -> List[Tuple[int, int, int]]:
-    """Build all geometrically valid encoder graph bucket combinations."""
-    return sorted({(batch_size, total_tokens, max_seq_len)
-                   for batch_size in batch_sizes
-                   for total_tokens in num_tokens
-                   for max_seq_len in seq_lens
-                   if batch_size <= total_tokens <= batch_size * max_seq_len})
-
-
 _DEEP_GEMM_PDL_CONFIGURED = False
 
 
@@ -729,38 +718,13 @@ class PyTorchModelEngine(ModelEngine):
         self._max_cuda_graph_seq_len = (self._cuda_graph_seq_lens[-1]
                                         if self._cuda_graph_seq_lens else 0)
 
-        encoder_max_batch_size = self.llm_args.encoder_max_batch_size
-        encoder_decoder_microbatch_cuda_graph_enabled = (os.environ.get(
-            "TLLM_ENCODER_DECODER_MICROBATCH_CUDA_GRAPH_ENABLED", "1") == "1")
-        self._enable_encoder_decoder_microbatch_cuda_graph = (
-            self._is_encoder_decoder_model()
-            and encoder_max_batch_size is not None
-            and self.encoder_cuda_graph_config is not None
-            and bool(self._cuda_graph_num_tokens)
-            and bool(self._cuda_graph_seq_lens)
-            and encoder_decoder_microbatch_cuda_graph_enabled)
-        encoder_decoder_graph_batch_sizes = (
-            self._encoder_cuda_graph_batch_sizes
-            if self._enable_encoder_decoder_microbatch_cuda_graph else [])
-        encoder_decoder_graph_keys = _build_encoder_decoder_cuda_graph_keys(
-            encoder_decoder_graph_batch_sizes,
-            self._cuda_graph_num_tokens,
-            self._cuda_graph_seq_lens,
-        )
-        encoder_decoder_graph_keys = [
-            key for key in encoder_decoder_graph_keys
-            if key[0] in encoder_decoder_graph_batch_sizes and key[1] <=
-            self.encoder_max_num_tokens and key[2] in self._cuda_graph_seq_lens
-        ]
-        mixed_graph_encoder_batch_size = (encoder_decoder_graph_batch_sizes[-1]
-                                          if encoder_decoder_graph_batch_sizes
-                                          else 0)
-        mixed_graph_encoder_token_counts = tuple(
-            sorted({
-                total_tokens
-                for batch_size, total_tokens, _ in encoder_decoder_graph_keys
-                if batch_size == mixed_graph_encoder_batch_size
-            }))
+        # Encoder CUDA graph detection for encoder-decoder models and encoder-only models.
+        # Decode configs do not define these encoder-specific bucket fields.
+        use_encoder_cuda_graph = ((self._is_encoder_decoder_model()
+                                   or self._is_encode_only())
+                                  and self.encoder_cuda_graph_config is not None
+                                  and bool(self._cuda_graph_num_tokens)
+                                  and bool(self._cuda_graph_seq_lens))
 
         self._dynamic_draft_len_mapping = self._compute_dynamic_draft_len_mapping(
         )
@@ -837,15 +801,41 @@ class PyTorchModelEngine(ModelEngine):
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._trtllm_gen_jit_warmup = False
 
-        use_encoder_decoder_graph = (
-            self._enable_encoder_decoder_microbatch_cuda_graph
-            and bool(encoder_decoder_graph_batch_sizes))
-        enable_encoder_decoder_mixed_cuda_graph = (
-            use_encoder_decoder_graph
-            and self.cuda_graph_config is not None and os.environ.get(
-                "TLLM_ENCODER_DECODER_MIXED_CUDA_GRAPH_ENABLED", "1") == "1")
+        # Create the encoder runner first. For encoder-decoder models it derives
+        # every reachable startup capture key through get_graph_key().
+        encoder_graph_batch_sizes = self._encoder_cuda_graph_batch_sizes
+        encoder_graph_max_batch_size = (encoder_graph_batch_sizes[-1]
+                                        if encoder_graph_batch_sizes else 0)
+        encoder_graph_max_num_tokens = self._max_cuda_graph_num_tokens
+        encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
+            use_cuda_graph=use_encoder_cuda_graph,
+            cuda_graph_padding_enabled=(
+                self._encoder_cuda_graph_padding_enabled),
+            cuda_graph_batch_sizes=encoder_graph_batch_sizes,
+            cuda_graph_num_tokens=self._cuda_graph_num_tokens,
+            cuda_graph_seq_lens=self._cuda_graph_seq_lens,
+            max_cuda_graph_batch_size=encoder_graph_max_batch_size,
+            max_cuda_graph_num_tokens=encoder_graph_max_num_tokens,
+            max_num_tokens=self.encoder_max_num_tokens,
+            max_seq_len=self.max_seq_len,
+            cuda_graph_mem_pool=self._cuda_graph_mem_pool,
+            is_encoder_decoder=self._is_encoder_decoder_model(),
+        )
+        self.encoder_cuda_graph_runner = EncoderCUDAGraphRunner(
+            encoder_cuda_graph_runner_config)
 
-        # Create config and runner
+        # Once encoder CUDA graphs are usable, enable mixed decoder graphs by
+        # default unless the user explicitly opts out.
+        encoder_decoder_cuda_graph_enabled = (
+            self.encoder_cuda_graph_runner.enabled
+            and self.encoder_cuda_graph_runner.is_encoder_decoder
+            and bool(self.encoder_cuda_graph_runner.capture_keys))
+        enable_encoder_decoder_mixed_cuda_graph = (
+            encoder_decoder_cuda_graph_enabled
+            and self.cuda_graph_config is not None
+            and self.llm_args.enable_encoder_decoder_mixed_cuda_graph)
+
+        # Create decoder CUDA graph config and runner.
         cuda_graph_runner_config = CUDAGraphRunnerConfig(
             use_cuda_graph=(not self._is_encode_only
                             and self.cuda_graph_config is not None),
@@ -871,42 +861,8 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attention_config=self.sparse_attention_config,
             enable_encoder_decoder_mixed_cuda_graph=(
                 enable_encoder_decoder_mixed_cuda_graph),
-            encoder_hidden_size=(self._get_enc_dec_hidden_size()
-                                 if enable_encoder_decoder_mixed_cuda_graph else
-                                 0),
-            dtype=(self.dtype
-                   if enable_encoder_decoder_mixed_cuda_graph else None),
-            encoder_decoder_mixed_cuda_graph_encoder_token_counts=(
-                mixed_graph_encoder_token_counts),
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
-
-        # Create Encoder CUDA graph config and runner.
-        encoder_graph_batch_sizes = self._encoder_cuda_graph_batch_sizes
-        encoder_graph_max_batch_size = (encoder_graph_batch_sizes[-1]
-                                        if encoder_graph_batch_sizes else 0)
-        encoder_graph_max_num_tokens = self._max_cuda_graph_num_tokens
-        encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
-            use_cuda_graph=(use_encoder_decoder_graph
-                            or (self._is_encode_only
-                                and self.encoder_cuda_graph_config is not None
-                                and bool(self._cuda_graph_num_tokens)
-                                and bool(self._cuda_graph_seq_lens))),
-            cuda_graph_padding_enabled=(
-                self._encoder_cuda_graph_padding_enabled),
-            cuda_graph_batch_sizes=encoder_graph_batch_sizes,
-            cuda_graph_num_tokens=self._cuda_graph_num_tokens,
-            cuda_graph_seq_lens=self._cuda_graph_seq_lens,
-            max_cuda_graph_batch_size=encoder_graph_max_batch_size,
-            max_cuda_graph_num_tokens=encoder_graph_max_num_tokens,
-            max_num_tokens=self.encoder_max_num_tokens,
-            max_seq_len=self.max_seq_len,
-            cuda_graph_mem_pool=self._cuda_graph_mem_pool,
-            encoder_decoder_capture_keys=(encoder_decoder_graph_keys if
-                                          use_encoder_decoder_graph else None),
-        )
-        self.encoder_cuda_graph_runner = EncoderCUDAGraphRunner(
-            encoder_cuda_graph_runner_config)
 
         # Initialize CUDA Graph LoRA manager if LoRA is enabled
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
@@ -2181,23 +2137,35 @@ class PyTorchModelEngine(ModelEngine):
 
         max_encoder_output_len = self._get_max_encoder_output_len(
             resource_manager)
-        encoder_token_counts = (
-            runner.config.encoder_decoder_mixed_cuda_graph_encoder_token_counts
-            or (8 * max_encoder_output_len, ))
-        context_shapes = [(8, token_count)
-                          for token_count in encoder_token_counts]
-        if runner.max_supported_batch_size > 16:
-            paired_token_counts = sorted({
+        context_shapes = {(batch_size, total_tokens)
+                          for batch_size, total_tokens, _ in
+                          self.encoder_cuda_graph_runner.capture_keys}
+        if not context_shapes:
+            logger.warning("Skipping mixed encoder-decoder CUDA graph capture: "
+                           "no encoder CUDA graph shapes were captured.")
+            return
+
+        max_encoder_batch_size = max(batch_size
+                                     for batch_size, _ in context_shapes)
+        max_batch_token_counts = {
+            total_tokens
+            for batch_size, total_tokens in context_shapes
+            if batch_size == max_encoder_batch_size
+        }
+        paired_context_count = 2 * max_encoder_batch_size
+        if runner.max_supported_batch_size > paired_context_count:
+            paired_token_counts = {
                 first + second
-                for first in encoder_token_counts
-                for second in encoder_token_counts
-            })
-            context_shapes.extend(
-                (16, token_count) for token_count in paired_token_counts)
+                for first in max_batch_token_counts
+                for second in max_batch_token_counts
+            }
+            context_shapes.update((paired_context_count, token_count)
+                                  for token_count in paired_token_counts)
 
         operation = ("warmup" if runner.is_warmup_only else "capture")
         hidden_size = self._get_enc_dec_hidden_size()
-        for num_contexts, total_encoder_tokens in context_shapes:
+        for num_contexts, total_encoder_tokens in sorted(
+                context_shapes, key=lambda shape: shape[1], reverse=True):
             if total_encoder_tokens > num_contexts * max_encoder_output_len:
                 continue
             base_encoder_len, remainder = divmod(total_encoder_tokens,
@@ -6417,43 +6385,16 @@ class PyTorchModelEngine(ModelEngine):
         """Synthesize an inputs dict that will bucket exactly at
         (batch_size, num_tokens, max_seq_len).
 
-        Uses two distribution strategies:
-        - Case A: `total >= max_seq_len + (batch_size - 1)` — one request at
-          `max_seq_len` tokens, remaining tokens distributed evenly across
-          the other `batch_size - 1` requests.
-        - Case B: `total < max_seq_len + (batch_size - 1)` — one request of
-          `total - (batch_size - 1)` tokens, the rest at 1 token each.
-
         Returns None for infeasible combinations (e.g., batch_size <= 0).
         """
-        if batch_size <= 0 or num_tokens <= 0 or max_seq_len <= 0:
+        lengths = (
+            self.encoder_cuda_graph_runner.build_capture_sequence_lengths(
+                batch_size, num_tokens, max_seq_len))
+        if lengths is None:
             return None
-
-        total = min(num_tokens, batch_size * max_seq_len)
-
-        if batch_size == 1:
-            lengths = [total]
-        elif total >= max_seq_len + batch_size - 1:
-            # Case A
-            remaining = total - max_seq_len
-            base = remaining // (batch_size - 1)
-            extra = remaining % (batch_size - 1)
-            lengths = [max_seq_len]
-            lengths += [base + 1] * extra + [base] * (batch_size - 1 - extra)
-        else:
-            # Case B
-            first_len = total - (batch_size - 1)
-            lengths = [first_len] + [1] * (batch_size - 1)
-
-        # Sanity: every length must be >= 1.
-        if any(length <= 0 for length in lengths):
-            return None
-
-        actual_num_tokens = sum(lengths)
-        input_ids = [0] * actual_num_tokens
 
         inputs: Dict[str, Any] = {
-            'input_ids': input_ids,
+            'input_ids': [0] * sum(lengths),
             'seq_lens': lengths,
         }
         return inputs

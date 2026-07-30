@@ -1,11 +1,8 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 import bisect
 import contextlib
 from dataclasses import dataclass
-from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
-                    Tuple, TypeAlias)
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Tuple,
+                    TypeAlias)
 
 import torch
 
@@ -116,9 +113,6 @@ class CUDAGraphRunnerConfig:
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
     enable_encoder_decoder_mixed_cuda_graph: bool = False
-    encoder_hidden_size: int = 0
-    dtype: Optional[torch.dtype] = None
-    encoder_decoder_mixed_cuda_graph_encoder_token_counts: Tuple[int, ...] = ()
 
 
 class CUDAGraphRunner:
@@ -192,15 +186,33 @@ class CUDAGraphRunner:
             self.shared_static_tensors[
                 "mrope_delta_read_seq_slots"] = torch.zeros(
                     (max_total_tokens, ), device="cuda", dtype=torch.long)
-        if self.enable_encoder_decoder_mixed_cuda_graph:
-            if self.config.encoder_hidden_size <= 0 or self.config.dtype is None:
-                raise ValueError("Mixed encoder-decoder CUDA graphs require "
-                                 "encoder_hidden_size and dtype.")
-            self.shared_static_tensors["encoder_hidden_states"] = torch.empty(
-                (self.config.max_num_tokens, self.config.encoder_hidden_size),
-                device="cuda",
-                dtype=self.config.dtype,
-            )
+
+    def _get_static_encoder_hidden_states(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        num_encoder_tokens: int,
+        *,
+        allow_allocate: bool,
+    ) -> torch.Tensor:
+        """Return the stable mixed-graph encoder input, allocating at warmup."""
+        if encoder_hidden_states.ndim != 2:
+            raise RuntimeError(
+                "Mixed encoder-decoder CUDA graphs require rank-2 packed "
+                "encoder hidden states.")
+
+        static_encoder_hidden_states = self.shared_static_tensors.get(
+            "encoder_hidden_states")
+        if static_encoder_hidden_states is None:
+            if not allow_allocate:
+                raise RuntimeError(
+                    "Mixed encoder-decoder CUDA graph replay requires the "
+                    "encoder hidden-state buffer initialized during warmup.")
+            static_encoder_hidden_states = encoder_hidden_states.new_empty(
+                (num_encoder_tokens, encoder_hidden_states.shape[1]))
+            self.shared_static_tensors[
+                "encoder_hidden_states"] = static_encoder_hidden_states
+
+        return static_encoder_hidden_states[:num_encoder_tokens]
 
     def _is_mixed_encoder_decoder_batch(self, batch: ScheduledRequests) -> bool:
         return (self.enable_encoder_decoder_mixed_cuda_graph
@@ -517,8 +529,12 @@ class CUDAGraphRunner:
             if encoder_hidden_states is None:
                 raise RuntimeError("Mixed encoder-decoder CUDA graph capture "
                                    "requires encoder hidden states.")
-            static_encoder_hidden_states = self.shared_static_tensors[
-                "encoder_hidden_states"][:num_encoder_tokens]
+            static_encoder_hidden_states = (
+                self._get_static_encoder_hidden_states(
+                    encoder_hidden_states,
+                    num_encoder_tokens,
+                    allow_allocate=True,
+                ))
             actual_num_encoder_tokens = encoder_hidden_states.shape[0]
             if actual_num_encoder_tokens > num_encoder_tokens:
                 raise RuntimeError(
@@ -622,8 +638,12 @@ class CUDAGraphRunner:
                     "Mixed encoder-decoder CUDA graph replay received "
                     f"{actual_num_encoder_tokens} encoder tokens for a "
                     f"{num_encoder_tokens}-token graph.")
-            static_encoder_hidden_states = static_tensors[
-                "encoder_hidden_states"][:num_encoder_tokens]
+            static_encoder_hidden_states = (
+                self._get_static_encoder_hidden_states(
+                    encoder_hidden_states,
+                    num_encoder_tokens,
+                    allow_allocate=False,
+                ))
             static_encoder_hidden_states[:actual_num_encoder_tokens].copy_(
                 encoder_hidden_states)
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
@@ -847,7 +867,7 @@ class EncoderCUDAGraphRunnerConfig:
     max_num_tokens: int
     max_seq_len: int
     cuda_graph_mem_pool: Any
-    encoder_decoder_capture_keys: Optional[Sequence[EncoderKeyType]] = None
+    is_encoder_decoder: bool = False
 
 
 class EncoderCUDAGraphRunner:
@@ -874,8 +894,13 @@ class EncoderCUDAGraphRunner:
         self.supported_num_tokens = sorted(config.cuda_graph_num_tokens)
         self.max_supported_num_tokens = config.max_cuda_graph_num_tokens
         self.supported_seq_lens = sorted(config.cuda_graph_seq_lens)
-        self.is_encoder_decoder = config.encoder_decoder_capture_keys is not None
-        self.capture_keys = frozenset(config.encoder_decoder_capture_keys or ())
+        self.is_encoder_decoder = config.is_encoder_decoder
+        self.capture_keys: frozenset[EncoderKeyType] = frozenset()
+        self._capture_sequence_lengths: Dict[EncoderKeyType, List[int]] = {}
+        if self.is_encoder_decoder:
+            self._capture_sequence_lengths = (
+                self._build_encoder_decoder_capture_layouts())
+            self.capture_keys = frozenset(self._capture_sequence_lengths)
         self._capture_keys_by_batch_size: Dict[int, List[EncoderKeyType]] = {}
         for key in sorted(self.capture_keys):
             self._capture_keys_by_batch_size.setdefault(key[0], []).append(key)
@@ -950,6 +975,44 @@ class EncoderCUDAGraphRunner:
             return 0
         return supported[idx]
 
+    @staticmethod
+    def build_capture_sequence_lengths(batch_size: int, num_tokens: int,
+                                       max_seq_len: int) -> Optional[List[int]]:
+        """Build a real sequence layout for a configured encoder bucket."""
+        if (batch_size <= 0 or num_tokens < batch_size
+                or num_tokens > batch_size * max_seq_len):
+            return None
+
+        if batch_size == 1:
+            return [num_tokens]
+
+        if num_tokens >= max_seq_len + batch_size - 1:
+            remaining_tokens = num_tokens - max_seq_len
+            base, extra = divmod(remaining_tokens, batch_size - 1)
+            return ([max_seq_len] + [base + 1] * extra + [base] *
+                    (batch_size - 1 - extra))
+
+        return [num_tokens - batch_size + 1] + [1] * (batch_size - 1)
+
+    def _build_encoder_decoder_capture_layouts(
+            self) -> Dict[EncoderKeyType, List[int]]:
+        """Derive reachable encoder-decoder capture keys via get_graph_key."""
+        capture_layouts: Dict[EncoderKeyType, List[int]] = {}
+        for batch_size in self.supported_batch_sizes:
+            for num_tokens in self.supported_num_tokens:
+                for max_seq_len in self.supported_seq_lens:
+                    sequence_lengths = self.build_capture_sequence_lengths(
+                        batch_size, num_tokens, max_seq_len)
+                    if sequence_lengths is None:
+                        continue
+
+                    key, _, is_valid = self.get_graph_key(
+                        {"seq_lens": sequence_lengths})
+                    if is_valid:
+                        capture_layouts.setdefault(key, sequence_lengths)
+
+        return capture_layouts
+
     def _get_dynamic_capture_key(
         self,
         batch_size: int,
@@ -981,44 +1044,9 @@ class EncoderCUDAGraphRunner:
 
     def get_capture_warmup_sequence_lengths(
             self, key: EncoderKeyType) -> Optional[List[int]]:
-        """Build a real sequence layout whose padded graph key is ``key``.
-
-        A larger max-sequence bucket can be dominated by a smaller bucket at
-        the same batch size and token count. Such keys can never be selected
-        for a real batch and return ``None``.
-        """
-        if key not in self.capture_keys:
-            return None
-
-        batch_size, num_tokens, max_seq_len = key
-        previous_max_seq_len = max(
-            (candidate[2] for candidate in self._capture_keys_by_batch_size.get(
-                batch_size, [])
-             if candidate[1] == num_tokens and candidate[2] < max_seq_len),
-            default=0,
-        )
-        actual_max_seq_len = max(
-            (num_tokens + batch_size - 1) // batch_size,
-            previous_max_seq_len + 1,
-        )
-        if (actual_max_seq_len > max_seq_len
-                or actual_max_seq_len + batch_size - 1 > num_tokens):
-            return None
-
-        if batch_size == 1:
-            sequence_lengths = [num_tokens]
-        else:
-            remaining_tokens = num_tokens - actual_max_seq_len
-            base, extra = divmod(remaining_tokens, batch_size - 1)
-            sequence_lengths = [actual_max_seq_len]
-            sequence_lengths.extend([base + 1] * extra)
-            sequence_lengths.extend([base] * (batch_size - 1 - extra))
-
-        selected_key, _, is_valid = self.get_graph_key(
-            {"seq_lens": sequence_lengths})
-        if not is_valid or selected_key != key:
-            return None
-        return sequence_lengths
+        """Return the representative sequence layout for a capture key."""
+        sequence_lengths = self._capture_sequence_lengths.get(key)
+        return list(sequence_lengths) if sequence_lengths is not None else None
 
     def _get_valid_graph_key(self, batch_size: int, num_tokens: int,
                              max_seq_len: int) -> EncoderKeyType:

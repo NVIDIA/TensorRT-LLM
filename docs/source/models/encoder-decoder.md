@@ -421,6 +421,7 @@ llm = LLM(
         seq_lens=[128, 256, 512, 1024],
         enable_padding=True,
     ),
+    enable_encoder_decoder_mixed_cuda_graph=True,
     kv_cache_config=KvCacheConfig(
         free_gpu_memory_fraction=0.8,
         cross_kv_cache_fraction=0.5,
@@ -434,6 +435,13 @@ size, total packed tokens, and maximum sequence length. The
 `encoder_max_batch_size` value is the hard encoder capacity and admission
 limit. With beam search, decoder graph batch sizes must cover the active
 decoder sequences after beam expansion.
+
+`enable_encoder_decoder_mixed_cuda_graph` is primarily a performance option. It
+reduces CPU launch overhead for decoder iterations that mix newly admitted
+context requests with ongoing generation requests. The option defaults to
+`True`, but becomes effective only when the encoder and decoder graph
+configurations produce usable capture shapes. Set it to `False` to disable
+mixed graphs while retaining the separate encoder and decoder CUDA graphs.
 
 Passing `EncodeCudaGraphConfig` through `cuda_graph_config` remains unsupported
 for encoder-decoder models; pass it through `encoder_cuda_graph_config`
