@@ -268,6 +268,121 @@ async def test_coordinator_expires_stale_reservation():
     assert coordinator._reservation_tasks == {}
 
 
+@pytest.mark.asyncio
+async def test_coordinator_early_finish_releases_later_select():
+    config = _make_config([], ["gen:8000"], "round_robin", "conversation")
+    coordinator = DisaggCoordinatorService(config, _client_factory)
+    router = coordinator.gen_router
+    select_started = asyncio.Event()
+    allow_select = asyncio.Event()
+    original_select = router.get_next_server_by_key
+
+    async def blocked_select(*args, **kwargs):
+        select_started.set()
+        await allow_select.wait()
+        return await original_select(*args, **kwargs)
+
+    router.get_next_server_by_key = blocked_select
+    select_task = asyncio.create_task(coordinator.select("generation", "conversation", 123, None))
+    await asyncio.wait_for(select_started.wait(), timeout=1)
+
+    await coordinator.finish("generation", 123, False)
+    allow_select.set()
+    await asyncio.wait_for(select_task, timeout=1)
+
+    assert router._server_content_load["gen:8000"] == 0
+    assert coordinator._reservation_tasks == {}
+    assert coordinator._finish_tombstone_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_coordinator_finish_failure_retains_expiry_fallback():
+    config = _make_config([], ["gen:8000"], "round_robin", "conversation")
+    coordinator = DisaggCoordinatorService(
+        config,
+        _client_factory,
+        reservation_timeout_secs=0.01,
+    )
+    router = coordinator.gen_router
+    original_finish = router.finish_request_by_id
+    finish_attempts = 0
+
+    async def fail_once(*args, **kwargs):
+        nonlocal finish_attempts
+        finish_attempts += 1
+        if finish_attempts == 1:
+            raise RuntimeError("release failed")
+        return await original_finish(*args, **kwargs)
+
+    router.finish_request_by_id = fail_once
+    await coordinator.select("generation", "conversation", 123, None)
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        await coordinator.finish("generation", 123, False)
+
+    assert ("generation", 123) in coordinator._reservation_tasks
+    await asyncio.sleep(0.02)
+    assert router._server_content_load["gen:8000"] == 0
+    assert coordinator._reservation_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_coordinator_late_select_failure_retains_expiry_fallback():
+    config = _make_config([], ["gen:8000"], "round_robin", "conversation")
+    coordinator = DisaggCoordinatorService(
+        config,
+        _client_factory,
+        reservation_timeout_secs=0.01,
+    )
+    router = coordinator.gen_router
+    select_started = asyncio.Event()
+    allow_select = asyncio.Event()
+    original_select = router.get_next_server_by_key
+    original_finish = router.finish_request_by_id
+    finish_attempts = 0
+
+    async def blocked_select(*args, **kwargs):
+        select_started.set()
+        await allow_select.wait()
+        return await original_select(*args, **kwargs)
+
+    async def fail_second_finish(*args, **kwargs):
+        nonlocal finish_attempts
+        finish_attempts += 1
+        if finish_attempts == 2:
+            raise RuntimeError("late release failed")
+        return await original_finish(*args, **kwargs)
+
+    router.get_next_server_by_key = blocked_select
+    router.finish_request_by_id = fail_second_finish
+    select_task = asyncio.create_task(coordinator.select("generation", "conversation", 123, None))
+    await asyncio.wait_for(select_started.wait(), timeout=1)
+    await coordinator.finish("generation", 123, False)
+
+    allow_select.set()
+    with pytest.raises(RuntimeError, match="late release failed"):
+        await asyncio.wait_for(select_task, timeout=1)
+
+    assert ("generation", 123) in coordinator._reservation_tasks
+    await asyncio.sleep(0.02)
+    assert router._server_content_load["gen:8000"] == 0
+    assert coordinator._reservation_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_coordinator_stop_releases_live_reservations():
+    config = _make_config([], ["gen:8000"], "round_robin", "conversation")
+    coordinator = DisaggCoordinatorService(config, _client_factory)
+
+    await coordinator.select("generation", "conversation", 123, None)
+    assert coordinator.gen_router._server_content_load["gen:8000"] == 1
+
+    await coordinator.stop()
+
+    assert coordinator.gen_router._server_content_load["gen:8000"] == 0
+    assert coordinator._reservation_tasks == {}
+
+
 def test_coordinator_compacts_route_info():
     compact = DisaggCoordinatorService._compact_route_info(
         {

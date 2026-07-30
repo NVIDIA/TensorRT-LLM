@@ -42,6 +42,70 @@ from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareR
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
 
 
+class _RouterReservation:
+    """Track a router reservation until a client accepts its ownership."""
+
+    def __init__(
+        self,
+        request: Optional[UCompletionRequest] = None,
+        pending: bool = False,
+        req_id: Optional[int] = None,
+    ):
+        self.request = request
+        self.pending = pending
+        self.req_id = req_id
+
+    def mark_pending(self, request: UCompletionRequest, req_id: Optional[int] = None) -> None:
+        self.request = request
+        self.pending = True
+        self.req_id = req_id
+
+    def clear(self) -> None:
+        self.pending = False
+
+
+class _QueuedResponseStream:
+    """Own a background response consumer even before first iteration."""
+
+    def __init__(self, queue: asyncio.Queue, consume_task: asyncio.Task, upstream_stream):
+        self._queue = queue
+        self._consume_task = consume_task
+        self._upstream_stream = upstream_stream
+        self._cleanup_lock = asyncio.Lock()
+        self._closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            item = await self._queue.get()
+        except asyncio.CancelledError:
+            await self.aclose()
+            raise
+        if item is None:
+            await self.aclose()
+            raise StopAsyncIteration
+        if isinstance(item, Exception):
+            await self.aclose()
+            raise item
+        return item
+
+    async def aclose(self) -> None:
+        async with self._cleanup_lock:
+            if self._closed:
+                return
+            try:
+                if not self._consume_task.done():
+                    self._consume_task.cancel()
+                await asyncio.gather(self._consume_task, return_exceptions=True)
+                await self._upstream_stream.aclose()
+            finally:
+                self._closed = True
+
+
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
         self,
@@ -116,6 +180,32 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
+        ctx_reservation = _RouterReservation()
+        gen_reservation = _RouterReservation()
+        try:
+            return await self._send_disagg_request_ctx_first_impl(
+                request, hooks, ctx_reservation, gen_reservation
+            )
+        except asyncio.CancelledError:
+            await self._release_router_reservations(
+                (self._ctx_router, ctx_reservation),
+                (self._gen_router, gen_reservation),
+            )
+            raise
+        except Exception:
+            await self._release_router_reservations(
+                (self._ctx_router, ctx_reservation),
+                (self._gen_router, gen_reservation),
+            )
+            raise
+
+    async def _send_disagg_request_ctx_first_impl(
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks],
+        ctx_reservation: _RouterReservation,
+        gen_reservation: _RouterReservation,
+    ) -> UCompletionResponseOrGenerator:
         # ctx_response contains a http response with ContextPhaseParams attached after prefill compute is done
 
         if hooks:
@@ -124,7 +214,13 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_server = None
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         # reserve a gen_server if conditional disagg is needed
-        gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
+        gen_server, need_ctx = await self._check_conditional_disagg(
+            request, disagg_request_id, gen_reservation
+        )
+        if gen_server:
+            gen_reservation.mark_pending(request, req_id=disagg_request_id)
+        else:
+            gen_reservation.clear()
         # Context retries may replace disagg_request_id for the KV-transfer
         # handshake. Keep the ID used to reserve the generation server separate
         # so its coordinator-side load is released under the original key.
@@ -140,9 +236,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                     hooks.on_ctx_dispatch(request)
                 ctx_req = self._get_ctx_request(request, disagg_request_id)
                 # ctx generator is empty
+                ctx_reservation.mark_pending(ctx_req, req_id=disagg_request_id)
                 ctx_server, _ = await self._ctx_router.get_next_server(
                     ctx_req, exclude_server=gen_server, req_id=disagg_request_id
                 )
+                ctx_reservation.clear()
                 ctx_response = await self._ctx_client.send_request(
                     ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
@@ -152,10 +250,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                     disagg_request_id = ctx_response_disagg_params.disagg_request_id
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
             except Exception:
-                if gen_server:
-                    await self._gen_router.finish_request(
-                        request, success=False, req_id=gen_reservation_id
-                    )
+                await self._release_router_reservations(
+                    (self._gen_router, gen_reservation),
+                )
                 raise
         else:
             # When need_ctx=False the gen server handles full generation and
@@ -169,17 +266,18 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_req.disaggregated_params = None
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
+                gen_reservation.mark_pending(gen_req, req_id=disagg_request_id)
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server, req_id=disagg_request_id
                 )
                 gen_reservation_id = disagg_request_id
+            gen_reservation.clear()
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
             )
             return gen_response
         else:
-            if gen_server:
-                await self._gen_router.finish_request(request, req_id=gen_reservation_id)
+            await self._release_router_reservation(self._gen_router, gen_reservation)
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator
@@ -278,7 +376,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         request.disaggregated_params.disagg_request_id = disagg_request_id
         return request
 
-    async def _check_conditional_disagg(self, request: UCompletionRequest, req_id: int) -> bool:
+    async def _check_conditional_disagg(
+        self,
+        request: UCompletionRequest,
+        req_id: int,
+        reservation: Optional[_RouterReservation] = None,
+    ) -> tuple[Optional[str], bool]:
         if self.conditional_disagg_config:
             local_gen_router = (
                 self._gen_router._local
@@ -291,6 +394,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
             # Query kv cache status and select a best gen_server.
             # The server is reserved for generation request
+            if reservation is not None:
+                reservation.mark_pending(request, req_id=req_id)
             gen_server, info = await self._gen_router.get_next_server(request, req_id=req_id)
             match_length = info["match_length"]
             total_length = info["num_tokens"]
@@ -348,9 +453,20 @@ class OpenAIDisaggregatedService(OpenAIService):
         await self._coordinator.start()
 
     async def teardown(self) -> None:
-        await self._ctx_client.shutdown()
-        await self._gen_client.shutdown()
-        await self._coordinator.stop()
+        results = await asyncio.gather(
+            self._ctx_client.shutdown(),
+            self._gen_client.shutdown(),
+            return_exceptions=True,
+        )
+        try:
+            await self._coordinator.stop()
+        except Exception as error:
+            results.append(error)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        for error in errors:
+            logger.warning(f"Disaggregated service teardown failed: {error}")
+        if errors:
+            raise errors[0]
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
         if ctx_response:
@@ -382,6 +498,26 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _send_disagg_request_gen_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponse:
+        ctx_reservation = _RouterReservation()
+        try:
+            return await self._send_disagg_request_gen_first_impl(request, hooks, ctx_reservation)
+        except asyncio.CancelledError:
+            await self._release_router_reservations(
+                (self._ctx_router, ctx_reservation),
+            )
+            raise
+        except Exception:
+            await self._release_router_reservations(
+                (self._ctx_router, ctx_reservation),
+            )
+            raise
+
+    async def _send_disagg_request_gen_first_impl(
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks],
+        ctx_reservation: _RouterReservation,
+    ) -> UCompletionResponse:
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
@@ -396,10 +532,11 @@ class OpenAIDisaggregatedService(OpenAIService):
             # arrival->here = pre-ctx wait in the orchestrator/fleet.
             if hooks:
                 hooks.on_ctx_dispatch(request)
-            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
-                request, req_id=disagg_request_id
-            )
             ctx_req = self._get_ctx_request(request, disagg_request_id)
+            ctx_reservation.mark_pending(ctx_req, req_id=disagg_request_id)
+            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
+                ctx_req, req_id=disagg_request_id
+            )
         gen_req = self._get_gen_request(
             request,
             ctx_response=None,
@@ -432,56 +569,40 @@ class OpenAIDisaggregatedService(OpenAIService):
                 await queue.put(None)  # sentinel
 
             consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
+            response_stream = _QueuedResponseStream(queue, consume_task, gen_response)
 
             # Now send ctx request — gen server has received its request
             try:
+                ctx_reservation.clear()
                 await self._ctx_client.send_request(
                     ctx_req,
                     server=ctx_server,
                     hooks=hooks,
                     req_id=disagg_request_id,
                 )
-            except Exception:
-                consume_task.cancel()
-                try:
-                    await consume_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            except asyncio.CancelledError:
+                await response_stream.aclose()
                 raise
-
-            async def _yield_from_queue():
-                try:
-                    while True:
-                        item = await queue.get()
-                        if item is None:
-                            break
-                        if isinstance(item, Exception):
-                            raise item
-                        yield item
-                finally:
-                    if not consume_task.done():
-                        consume_task.cancel()
-                    try:
-                        await consume_task
-                    except asyncio.CancelledError:
-                        pass
-
-            return _yield_from_queue()
+            except Exception:
+                await response_stream.aclose()
+                raise
+            return response_stream
         else:
             # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
             # through generator consumption, so asyncio.gather works fine.
             tasks = []
             if need_ctx:
-                tasks.append(
-                    asyncio.create_task(
-                        self._ctx_client.send_request(
-                            ctx_req,
-                            server=ctx_server,
-                            hooks=hooks,
-                            req_id=disagg_request_id,
-                        )
+
+                async def _send_ctx_request():
+                    ctx_reservation.clear()
+                    return await self._ctx_client.send_request(
+                        ctx_req,
+                        server=ctx_server,
+                        hooks=hooks,
+                        req_id=disagg_request_id,
                     )
-                )
+
+                tasks.append(asyncio.create_task(_send_ctx_request()))
             tasks.append(
                 asyncio.create_task(
                     self._gen_client.send_request(
@@ -492,5 +613,45 @@ class OpenAIDisaggregatedService(OpenAIService):
                     )
                 )
             )
-            responses = await asyncio.gather(*tasks)
+            try:
+                responses = await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                await self._cancel_tasks(*tasks)
+                raise
+            except Exception:
+                await self._cancel_tasks(*tasks)
+                raise
             return responses[-1]
+
+    @staticmethod
+    async def _release_router_reservation(router: Router, reservation: _RouterReservation) -> None:
+        if reservation.pending and reservation.request is not None:
+            try:
+                await router.finish_request(
+                    reservation.request,
+                    success=False,
+                    req_id=reservation.req_id,
+                )
+            finally:
+                reservation.clear()
+
+    @classmethod
+    async def _release_router_reservations(cls, *reservations) -> None:
+        results = await asyncio.gather(
+            *(
+                cls._release_router_reservation(router, reservation)
+                for router, reservation in reservations
+            ),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning(f"Failed to release router reservation: {result}")
+
+    @staticmethod
+    async def _cancel_tasks(*tasks: asyncio.Task) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

@@ -128,9 +128,10 @@ class TestFCFSWaitingQueue:
         queue.add_requests(items)
 
         # Remove items 1 and 3
-        queue.remove_by_ids({1, 3})
+        removed = queue.remove_by_ids({1, 3})
 
         assert len(queue) == 3
+        assert [item.id for item in removed] == [1, 3]
         remaining_ids = [item.id for item in queue]
         assert remaining_ids == [0, 2, 4]
 
@@ -141,8 +142,9 @@ class TestFCFSWaitingQueue:
         queue.add_requests(items)
 
         # Remove IDs that don't exist
-        queue.remove_by_ids({10, 20})
+        removed = queue.remove_by_ids({10, 20})
 
+        assert removed == []
         assert len(queue) == 3
 
     def test_bool_empty_queue(self):
@@ -447,9 +449,10 @@ class TestPriorityWaitingQueue:
         for i, p in enumerate([0.9, 0.7, 0.5, 0.3, 0.1]):
             q.add_request(create_priority_request_item(i, priority=p))
 
-        q.remove_by_ids({1, 3})
+        removed = q.remove_by_ids({1, 3})
 
         assert len(q) == 3
+        assert {item.id for item in removed} == {1, 3}
         remaining = [q.pop_request().id for _ in range(3)]
         assert remaining == [0, 2, 4]
 
@@ -459,8 +462,9 @@ class TestPriorityWaitingQueue:
         q.add_request(create_priority_request_item(1, priority=0.8))
         q.add_request(create_priority_request_item(2, priority=0.4))
 
-        q.remove_by_ids({99, 100})
+        removed = q.remove_by_ids({99, 100})
 
+        assert removed == []
         assert len(q) == 2
 
     def test_remove_all_ids_leaves_empty_queue(self):

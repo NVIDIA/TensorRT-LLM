@@ -173,6 +173,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
             else reservation_timeout_secs
         )
         self._reservation_tasks: dict[tuple[str, int], asyncio.Task] = {}
+        # A worker can be canceled while its /select request is still running.
+        # Remember an early /finish so a later select commit cannot recreate a
+        # reservation after cleanup has already passed through the coordinator.
+        self._finish_tombstone_tasks: dict[tuple[str, int], asyncio.Task] = {}
 
         self._ctx_client: Optional[OpenAIClient] = None
         self._gen_client: Optional[OpenAIClient] = None
@@ -223,9 +227,22 @@ class DisaggCoordinatorService(DisaggCoordinator):
         server, info, request_id = await router.get_next_server_by_key(
             routing_key, req_id=req_id, exclude_server=exclude_server
         )
-        self._reservation_tasks[reservation_key] = asyncio.create_task(
-            self._expire_reservation(reservation_key, router)
-        )
+        finish_tombstone = self._finish_tombstone_tasks.pop(reservation_key, None)
+        if finish_tombstone is not None:
+            finish_tombstone.cancel()
+            # Register the normal expiry fallback before attempting immediate
+            # cleanup. If router release fails, the reservation must not lose
+            # its last recovery path.
+            reservation = asyncio.create_task(self._expire_reservation(reservation_key, router))
+            self._reservation_tasks[reservation_key] = reservation
+            await router.finish_request_by_id(req_id, False)
+            if self._reservation_tasks.get(reservation_key) is reservation:
+                self._reservation_tasks.pop(reservation_key, None)
+                reservation.cancel()
+        else:
+            self._reservation_tasks[reservation_key] = asyncio.create_task(
+                self._expire_reservation(reservation_key, router)
+            )
         self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
         return server, self._compact_route_info(info), request_id
 
@@ -242,11 +259,24 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def finish(self, role: str, req_id, success: bool = True) -> None:
         _t0 = time.monotonic()
-        reservation = self._reservation_tasks.pop((self._normalize_role(role), req_id), None)
-        if reservation is not None:
-            reservation.cancel()
+        reservation_key = (self._normalize_role(role), req_id)
+        reservation = self._reservation_tasks.get(reservation_key)
+        if reservation is None and reservation_key not in self._finish_tombstone_tasks:
+            self._finish_tombstone_tasks[reservation_key] = asyncio.create_task(
+                self._expire_finish_tombstone(reservation_key)
+            )
         await self._router_for_role(role).finish_request_by_id(req_id, success)
+        if reservation is not None and self._reservation_tasks.get(reservation_key) is reservation:
+            self._reservation_tasks.pop(reservation_key, None)
+            reservation.cancel()
         self._api_lat(f"finish[{role}]").record(time.monotonic() - _t0)
+
+    async def _expire_finish_tombstone(self, key: tuple[str, int]) -> None:
+        try:
+            await asyncio.sleep(self._reservation_timeout_secs)
+        finally:
+            if self._finish_tombstone_tasks.get(key) is asyncio.current_task():
+                self._finish_tombstone_tasks.pop(key, None)
 
     async def _expire_reservation(self, key: tuple[str, int], router: Router) -> None:
         try:
@@ -306,12 +336,25 @@ class DisaggCoordinatorService(DisaggCoordinator):
             await self._wait_for_all_servers_ready()
 
     async def stop(self) -> None:
-        reservations = list(self._reservation_tasks.values())
+        reservation_items = list(self._reservation_tasks.items())
         self._reservation_tasks.clear()
-        for reservation in reservations:
-            reservation.cancel()
-        if reservations:
-            await asyncio.gather(*reservations, return_exceptions=True)
+        finish_tombstones = list(self._finish_tombstone_tasks.values())
+        self._finish_tombstone_tasks.clear()
+        cleanup_tasks = [task for _, task in reservation_items] + finish_tombstones
+        for task in cleanup_tasks:
+            task.cancel()
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        release_results = await asyncio.gather(
+            *(
+                self._router_for_role(role).finish_request_by_id(req_id, False)
+                for (role, req_id), _ in reservation_items
+            ),
+            return_exceptions=True,
+        )
+        for result in release_results:
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to release coordinator reservation during stop: {result}")
         if self._disagg_cluster_manager:
             await self._disagg_cluster_manager.stop()
         if self._metadata_server:

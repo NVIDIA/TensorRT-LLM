@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for ExecutorRequestQueue class.
 
 This module tests the ExecutorRequestQueue class functionality including:
@@ -11,7 +13,7 @@ import datetime
 import queue
 import threading
 import time
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -210,6 +212,31 @@ def test_get_from_request_queue_with_timeout(executor_queue):
 
     assert len(items) == 0
     assert elapsed < 0.2  # Should finish within timeout
+
+
+def test_transfer_poll_timeout_caps_batch_wait(executor_queue):
+    executor_queue.batch_wait_timeout_ms = 1000
+    timeout = datetime.timedelta(milliseconds=50)
+    item = RequestQueueItem(1, Mock())
+
+    with (
+            patch.object(executor_queue.request_queue,
+                         "empty",
+                         return_value=True),
+            patch.object(executor_queue.request_queue,
+                         "get",
+                         side_effect=[item, queue.Empty]) as get,
+            patch(
+                "tensorrt_llm._torch.pyexecutor.executor_request_queue.time.monotonic",
+                side_effect=[100.0, 100.04, 100.04],
+            ),
+    ):
+        items = executor_queue.get_from_request_queue(
+            timeout, cap_batch_wait_to_timeout=True)
+
+    assert items == [item]
+    assert get.call_args_list[0] == call(timeout=0.05)
+    assert get.call_args_list[1].kwargs["timeout"] == pytest.approx(0.01)
 
 
 def test_get_from_request_queue_async_behavior(executor_queue):

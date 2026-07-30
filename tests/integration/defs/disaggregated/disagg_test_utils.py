@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -208,7 +208,9 @@ def run_gen_worker(
     )
 
 
-def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None):
+def run_disagg_server(
+    disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None, request_timeout=180
+):
     """Launch the disaggregated server.
 
     Args:
@@ -217,6 +219,8 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
         port: Port number
         save_log: Whether to save logs to file
         env: Environment variables for the subprocess
+        cwd: Working directory for the subprocess
+        request_timeout: End-to-end request timeout in seconds
 
     Returns:
         ProcessWrapper: Wrapped subprocess
@@ -225,7 +229,14 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
     disagg_cluster_config["port"] = port
     with open(disagg_server_config_path, "w+") as f:
         yaml.dump(disagg_cluster_config, f)
-    cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
+    cmds = [
+        "trtllm-serve",
+        "disaggregated",
+        "-c",
+        disagg_server_config_path,
+        "--request_timeout",
+        str(request_timeout),
+    ]
     log_file = None
     log_path = None
     # See WAR rationale in _run_worker above (nvbugs/5821433).
