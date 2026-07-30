@@ -263,19 +263,26 @@ class DupUp3D(nn.Module):
         self.repeats = out_channels * self.factor // in_channels
 
     def forward(self, x: torch.Tensor, first_chunk: bool = False) -> torch.Tensor:
+        # The fused Triton implementation is CUDA-only; CPU retains the eager path.
         if x.is_cuda:
-            from .dup_up3d import dup_up3d
+            from .dup_up3d import can_implement_dup_up3d, dup_up3d
 
-            output = dup_up3d(
+            if can_implement_dup_up3d(
                 x,
                 output_channels=self.out_channels,
                 repeats=self.repeats,
                 factor_t=self.factor_t,
                 factor_s=self.factor_s,
                 first_chunk=first_chunk,
-            )
-            if output is not None:
-                return output
+            ):
+                return dup_up3d(
+                    x,
+                    output_channels=self.out_channels,
+                    repeats=self.repeats,
+                    factor_t=self.factor_t,
+                    factor_s=self.factor_s,
+                    first_chunk=first_chunk,
+                )
         x = x if self.repeats == 1 else x.repeat_interleave(self.repeats, dim=1)
         x = x.reshape(
             x.size(0),

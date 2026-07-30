@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -19,6 +21,85 @@ _MAX_TRITON_INDEXED_ELEMENTS = 1 << 31
 def _supports_triton_indexing(output_elements: int) -> bool:
     """Return whether the output fits the kernel's signed 32-bit offsets."""
     return output_elements <= _MAX_TRITON_INDEXED_ELEMENTS
+
+
+def _validate_dup_up3d_contract(
+    x: torch.Tensor,
+    output_channels: int,
+    repeats: int,
+    factor_t: int,
+    factor_s: int,
+) -> None:
+    """Assert invariants supplied by the internal ``DupUp3D`` caller."""
+    assert x.dim() == 5, f"DupUp3D expects NCTHW input, got shape {x.shape}"
+    assert min(output_channels, repeats, factor_t, factor_s) >= 1
+    input_channels = x.shape[1]
+    factor = factor_t * factor_s * factor_s
+    assert input_channels * repeats == output_channels * factor
+
+
+def _dup_up3d_output_shape(
+    x: torch.Tensor,
+    output_channels: int,
+    factor_t: int,
+    factor_s: int,
+    first_chunk: bool,
+) -> tuple[int, int, int, int, int]:
+    batch, _, input_frames, input_height, input_width = x.shape
+    temporal_crop = factor_t - 1 if first_chunk else 0
+    return (
+        batch,
+        output_channels,
+        input_frames * factor_t - temporal_crop,
+        input_height * factor_s,
+        input_width * factor_s,
+    )
+
+
+def can_implement_dup_up3d(
+    x: torch.Tensor,
+    *,
+    output_channels: int,
+    repeats: int,
+    factor_t: int,
+    factor_s: int,
+    first_chunk: bool,
+) -> bool:
+    """Return whether the fused kernel supports this internal invocation.
+
+    Args:
+        x: Logical NCTHW input tensor.
+        output_channels: Number of logical output channels.
+        repeats: Number of channel copies before pixel shuffle.
+        factor_t: Temporal pixel-shuffle factor.
+        factor_s: Height and width pixel-shuffle factor.
+        first_chunk: Whether the cache-initializing temporal crop is required.
+
+    Returns:
+        ``True`` for a non-empty CUDA invocation whose output fits the kernel's
+        signed 32-bit indexing range; otherwise ``False``.
+    """
+    _validate_dup_up3d_contract(x, output_channels, repeats, factor_t, factor_s)
+    if not x.is_cuda or 0 in x.shape:
+        return False
+
+    output_shape = _dup_up3d_output_shape(
+        x,
+        output_channels,
+        factor_t,
+        factor_s,
+        first_chunk,
+    )
+    output_elements = math.prod(output_shape)
+    supported = _supports_triton_indexing(output_elements)
+    if not supported:
+        logger.warning_once(
+            "Fused DupUp3D output has %d elements, exceeding the Triton "
+            "signed 32-bit indexing limit; falling back to the eager implementation.",
+            output_elements,
+            key="wan_dup_up3d_int32_index_fallback",
+        )
+    return supported
 
 
 @triton.jit
@@ -85,12 +166,12 @@ def dup_up3d(
     factor_t: int,
     factor_s: int,
     first_chunk: bool,
-) -> torch.Tensor | None:
-    """Write the shuffled output directly in channels-last-3d format.
+) -> torch.Tensor:
+    """Write the shuffled logical NCTHW output in physical NTHWC order.
 
     Args:
-        x: Five-dimensional CUDA tensor with shape ``[N, C, T, H, W]``.
-            The output preserves its dtype.
+        x: Logical NCTHW CUDA tensor with shape ``[N, C, T, H, W]``. It may
+            have arbitrary non-overlapping strides, and its dtype is preserved.
         output_channels: Number of channels in the shuffled output.
         repeats: Number of copies of each input channel before shuffling.
         factor_t: Temporal pixel-shuffle factor.
@@ -99,48 +180,28 @@ def dup_up3d(
             produced by the cache-initializing temporal chunk.
 
     Returns:
-        The shuffled CUDA tensor, or ``None`` when its size exceeds Triton's
-        signed 32-bit indexing limit and the caller must use the eager path.
-
-    Raises:
-        ValueError: If ``x`` is not a five-dimensional CUDA tensor or the
-            channel and shuffle factors are invalid.
+        A logical NCTHW tensor stored in PyTorch ``channels_last_3d`` physical
+        order, which corresponds to NTHWC.
     """
-    if x.dim() != 5:
-        raise ValueError(f"DupUp3D expects a five-dimensional tensor, got shape {x.shape}")
-    if not x.is_cuda:
-        raise ValueError("Fused DupUp3D requires a CUDA tensor")
-    if min(output_channels, repeats, factor_t, factor_s) < 1:
-        raise ValueError("DupUp3D channels, repeats, and factors must be positive")
-
-    batch, input_channels, input_frames, input_height, input_width = x.shape
-    factor = factor_t * factor_s * factor_s
-    if input_channels * repeats != output_channels * factor:
-        raise ValueError(
-            "DupUp3D channel mapping is inconsistent: "
-            f"{input_channels=} * {repeats=} != {output_channels=} * {factor=}"
-        )
+    assert can_implement_dup_up3d(
+        x,
+        output_channels=output_channels,
+        repeats=repeats,
+        factor_t=factor_t,
+        factor_s=factor_s,
+        first_chunk=first_chunk,
+    )
 
     temporal_crop = factor_t - 1 if first_chunk else 0
-    output_frames = input_frames * factor_t - temporal_crop
-    output_height = input_height * factor_s
-    output_width = input_width * factor_s
-    output_shape = (
-        batch,
+    output_shape = _dup_up3d_output_shape(
+        x,
         output_channels,
-        output_frames,
-        output_height,
-        output_width,
+        factor_t,
+        factor_s,
+        first_chunk,
     )
-    output_elements = batch * output_channels * output_frames * output_height * output_width
-    if not _supports_triton_indexing(output_elements):
-        logger.warning_once(
-            "Fused DupUp3D output has %d elements, exceeding the Triton "
-            "signed 32-bit indexing limit; falling back to the eager implementation.",
-            output_elements,
-            key="wan_dup_up3d_int32_index_fallback",
-        )
-        return None
+    _, _, output_frames, output_height, output_width = output_shape
+    output_elements = math.prod(output_shape)
 
     output = torch.empty(
         output_shape,
