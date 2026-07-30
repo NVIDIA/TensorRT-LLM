@@ -132,7 +132,17 @@ def _prepare(
     return x, local_x
 
 
-def _gather_and_check(local_out, ref_out, chunk_dim, world_size, rank, atol=0.01):
+def _gather_and_check(
+    local_out,
+    ref_out,
+    chunk_dim,
+    world_size,
+    rank,
+    memory_format=None,
+    atol=0.01,
+):
+    if memory_format in (torch.channels_last, torch.channels_last_3d):
+        assert local_out.is_contiguous(memory_format=memory_format)
     local_out = local_out.contiguous()
     gathered = [torch.empty_like(local_out) for _ in range(world_size)]
     dist.all_gather(gathered, local_out)
@@ -176,7 +186,14 @@ def _logic_halo_conv3d(rank: int, world_size: int) -> None:
             par = WanCausalConvHalo(conv, chunk_dim, adj, rank, world_size)
             local_out = par(local_x, local_cache)
 
-            _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
+            _gather_and_check(
+                local_out,
+                ref,
+                chunk_dim,
+                world_size,
+                rank,
+                memory_format,
+            )
 
 
 def _logic_halo_conv2d(rank: int, world_size: int) -> None:
@@ -202,7 +219,14 @@ def _logic_halo_conv2d(rank: int, world_size: int) -> None:
             par = HaloExchangeConv(conv, chunk_dim, adj, rank, world_size)
             local_out = par(local_x)
 
-            _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
+            _gather_and_check(
+                local_out,
+                ref,
+                chunk_dim,
+                world_size,
+                rank,
+                memory_format,
+            )
 
 
 def _logic_halo_conv2d_stride2(rank: int, world_size: int) -> None:
@@ -237,7 +261,14 @@ def _logic_halo_conv2d_stride2(rank: int, world_size: int) -> None:
             )
             local_out = par(local_x)
 
-            _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
+            _gather_and_check(
+                local_out,
+                ref,
+                chunk_dim,
+                world_size,
+                rank,
+                memory_format,
+            )
 
 
 def _logic_halo_conv2d_stride2_offset_group(rank: int, world_size: int) -> None:

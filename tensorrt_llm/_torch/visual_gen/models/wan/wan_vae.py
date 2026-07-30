@@ -332,6 +332,12 @@ class WanCausalConv3d(nn.Conv3d):
         *,
         spatial_padding: tuple[int, int] | None = None,
     ) -> torch.Tensor:
+        """Apply causal temporal padding and optionally override H/W padding.
+
+        Spatial halo exchange uses the override to suppress padding on the
+        split axis. Temporal padding remains explicitly causal through
+        ``self._padding``.
+        """
         x = _channels_last_3d_if_needed(x)
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:

@@ -92,10 +92,16 @@ class WanCausalConvHalo(HaloExchangeConv):
         self._local_output_spatial_padding = self._get_local_output_spatial_padding()
 
     def _get_local_output_spatial_padding(self) -> tuple[int, int] | None:
-        """Return padding that emits only this rank's output, when supported."""
+        """Return spatial padding that avoids computing halo outputs.
+
+        After exchanging ``p`` samples on both sides, a centered ``2p + 1``
+        stride-1 convolution emits the original local extent when padding on
+        the split axis is zero. Other geometries retain pad-then-strip.
+        """
         if not isinstance(self.module, wan_vae.WanCausalConv3d):
             return None
 
+        # ``chunk_dim`` indexes NCTHW, while ``spatial_padding`` indexes HW.
         conv_axis = self.chunk_dim - 2
         spatial_axis = self.chunk_dim - 3
         if (

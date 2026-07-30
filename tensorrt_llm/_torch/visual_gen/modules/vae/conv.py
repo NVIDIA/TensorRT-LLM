@@ -39,7 +39,11 @@ def _cat_spatial_halos(
     dim: int,
     memory_format: Optional[torch.memory_format],
 ) -> torch.Tensor:
-    """Concatenate halos while preserving a channels-last physical layout."""
+    """Concatenate halos while preserving a channels-last physical layout.
+
+    Moving channels from logical dimension 1 to the final physical dimension
+    shifts each spatial dimension down by one, hence ``dim - 1`` below.
+    """
     if memory_format is torch.channels_last_3d:
         physical = [tensor.permute(0, 2, 3, 4, 1) for tensor in tensors]
         return torch.cat(physical, dim=dim - 1).permute(0, 4, 1, 2, 3)
@@ -74,6 +78,11 @@ def _pack_spatial_halo(
     length: int,
     physical_wire: bool,
 ) -> torch.Tensor:
+    """Pack a logical halo into the wire layout selected by both peers.
+
+    Adjacent ranks must make the same ``physical_wire`` choice because
+    NHWC/NDHWC changes the communication buffer's physical shape.
+    """
     halo = torch.narrow(x, dim, start, length)
     if physical_wire:
         return _logical_to_physical_channels_last(halo)
@@ -344,6 +353,8 @@ class HaloExchangeConv2dStride2(nn.Module):
         )
 
         right_context = None
+        # P2P src/dst are global ranks even when a process group is passed;
+        # group ranks 1 and 0 identify the right and left peers, respectively.
         if self.rank != self.world_size - 1:
             right_context = torch.zeros_like(send_left)
             right_group = self._adj_group(self.rank)
