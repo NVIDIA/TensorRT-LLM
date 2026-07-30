@@ -16,6 +16,7 @@
 
 import importlib.util
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import yaml
@@ -29,10 +30,13 @@ DISAGG_CONFIG_DIR = REPO_ROOT / "tests" / "scripts" / "perf-sanity" / "disaggreg
 
 
 @pytest.fixture(params=SUBMIT_PATHS, ids=("ci", "local"))
-def submit_module(request):
+def submit_module(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    monkeypatch.syspath_prepend(str(request.param.parent))
     spec = importlib.util.spec_from_file_location(
         f"perf_submit_{request.param.parent.name}", request.param
     )
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
