@@ -109,7 +109,6 @@ class IdentityReasoningParser(BaseReasoningParser):
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
-@register_reasoning_parser("laguna")
 @register_reasoning_parser("qwen3")
 # Qwen3.5 (and forced-thinking Qwen3 variants) use a chat template that
 # pre-injects `<think>\n` into the assistant prompt prefix, so the model
@@ -247,6 +246,28 @@ class DeepSeekV4ReasoningParser(BaseReasoningParser):
         return self._parser.finish()
 
 
+@register_reasoning_parser("poolside_v1")
+@register_reasoning_parser("laguna")
+class PoolsideV1ReasoningParser(DeepSeekV4ReasoningParser):
+    """Poolside parser selected by thinking-mode chat template kwargs.
+
+    Same behavior as Deepseek-V4's, except that reasoning defaults to true
+    to respect the official documentation.
+    """
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        chat_template_kwargs = dict(chat_template_kwargs or {})
+        if chat_template_kwargs.get(
+                "thinking") is None and chat_template_kwargs.get(
+                    "enable_thinking") is None:
+            chat_template_kwargs["enable_thinking"] = True
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+
+
 @register_reasoning_parser("minimax_m3")
 class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for MiniMax-M3.
@@ -302,7 +323,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
-    "laguna": "laguna",
+    "laguna": "poolside_v1",
     "deepseek_v4": "deepseek_v4",
     "nemotron_h": "nemotron-v3",
     "nemotron_h_puzzle": "nemotron-v3",

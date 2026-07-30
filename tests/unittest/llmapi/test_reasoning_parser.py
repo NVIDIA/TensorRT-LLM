@@ -19,6 +19,7 @@ import os
 import pytest
 
 from tensorrt_llm.llmapi.reasoning_parser import (NemotronV3ReasoningParser,
+                                                  PoolsideV1ReasoningParser,
                                                   ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 
@@ -79,6 +80,48 @@ def test_deepseek_v4_reasoning_parser_extracts_when_thinking(
 def test_deepseek_v4_reasoning_parser_streams_when_thinking():
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         "deepseek_v4", {"enable_thinking": True})
+
+    deltas = ["hid", f"den{R1_END}visible", " tail"]
+    results = [reasoning_parser.parse_delta(delta) for delta in deltas]
+
+    assert [result.content for result in results] == ["", "visible", " tail"]
+    assert [result.reasoning_content
+            for result in results] == ["hid", "den", ""]
+
+
+@pytest.mark.parametrize("chat_template_kwargs", [{
+    "thinking": True
+}, {
+    "enable_thinking": True
+}, None, {}, {
+    "random_key": "random_value"
+}])
+def test_poolside_v1_reasoning_parser_extracts_when_thinking(
+        chat_template_kwargs: dict):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "poolside_v1", chat_template_kwargs)
+
+    result = reasoning_parser.parse(f"hidden{R1_END}visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == "hidden"
+
+
+@pytest.mark.parametrize("chat_template_kwargs", [{"enable_thinking": False}])
+def test_poolside_v1_reasoning_parser_extracts_when_not_thinking(
+        chat_template_kwargs: dict):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "poolside_v1", chat_template_kwargs)
+
+    result = reasoning_parser.parse(f"visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == ""
+
+
+def test_poolside_v1_reasoning_parser_streams_when_thinking():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "poolside_v1", {"enable_thinking": True})
 
     deltas = ["hid", f"den{R1_END}visible", " tail"]
     results = [reasoning_parser.parse_delta(delta) for delta in deltas]
@@ -278,32 +321,30 @@ def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
 
 
 @pytest.mark.parametrize(("text", "content", "reasoning_context"), [
-    ("a<think>b</think>c", "c", "b"),
-    ("<think>a</think>b", "b", "a"),
-    ("<think>a", "", "a"),
-    ("a", "a", ""),
-    ("<think>", "", ""),
+    ("hidden</think>visible", "visible", "hidden"),
+    ("</think>visible", "visible", ""),
+    ("</think>", "", ""),
 ])
-def test_laguna_reasoning_parser(text: str, content: str,
-                                 reasoning_context: str):
-    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("laguna")
+def test_poolside_v1_reasoning_parser(text: str, content: str,
+                                      reasoning_context: str):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "poolside_v1")
     result = reasoning_parser.parse(text)
     assert result.content == content
     assert result.reasoning_content == reasoning_context
 
 
 @pytest.mark.parametrize(("delta_texts", "content", "reasoning_context"), [
-    (["<think>a", "l</think>r", "b"], ["", "r", "b"], ["a", "l", ""]),
-    (["<th", "ink>a</think>b"], ["", "b"], ["", "a"]),
-    (["<think>a</th", "ink>b"], ["", "b"], ["a", ""]),
-    (["<think>", "a</think>b"], ["", "b"], ["", "a"]),
-    (["<think>a</think>", "b"], ["", "b"], ["a", ""]),
-    (["<think>a</th", "ank></th", "ink>b"], ["", "", "b"
-                                             ], ["a", "</thank>", ""]),
+    (["a", "l</think>r", "b"], ["", "r", "b"], ["a", "l", ""]),
+    (["a</th", "ink>b"], ["", "b"], ["a", ""]),
+    (["", "a</think>b"], ["", "b"], ["", "a"]),
+    (["a</think>", "b"], ["", "b"], ["a", ""]),
+    (["a</th", "ank></th", "ink>b"], ["", "", "b"], ["a", "</thank>", ""]),
 ])
-def test_laguna_reasoning_parser_stream(delta_texts: list, content: list,
-                                        reasoning_context: list):
-    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("laguna")
+def test_poolside_v1_reasoning_parser_stream(delta_texts: list, content: list,
+                                             reasoning_context: list):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "poolside_v1")
     for i, delta_text in enumerate(delta_texts):
         result = reasoning_parser.parse_delta(delta_text)
         assert result.content == content[i]
@@ -681,7 +722,7 @@ def test_auto_detect_laguna(tmp_path):
     _write_config(model_dir, "laguna")
 
     result = resolve_auto_reasoning_parser(model_dir)
-    assert result == "laguna"
+    assert result == "poolside_v1"
 
 
 @pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_puzzle"])
@@ -693,6 +734,14 @@ def test_auto_detect_nemotron_h(tmp_path, model_type):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "nemotron-v3"
+
+
+def test_poolside_v1_alias_same_parser():
+    """'Poolside_v1' and its alias 'laguna' resolve to the same parser."""
+    Poolside_v1 = ReasoningParserFactory.create_reasoning_parser("poolside_v1")
+    laguna = ReasoningParserFactory.create_reasoning_parser("laguna")
+    assert isinstance(Poolside_v1, PoolsideV1ReasoningParser)
+    assert isinstance(laguna, PoolsideV1ReasoningParser)
 
 
 def test_nemotron_v3_alias_same_parser():

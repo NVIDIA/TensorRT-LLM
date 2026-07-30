@@ -4481,8 +4481,9 @@ class BaseLlmArgs(StrictBaseModel):
         default=None,
         description="The parser to separate reasoning content from output.",
         status="prototype",
-        telemetry=TelemetryField.categorical('auto', 'deepseek-r1', 'laguna',
-                                             'qwen3', 'qwen3_5', 'minimax_m2',
+        telemetry=TelemetryField.categorical('auto', 'deepseek-r1',
+                                             'poolside_v1', 'laguna', 'qwen3',
+                                             'qwen3_5', 'minimax_m2',
                                              'minimax_m2_append_think',
                                              'nano-v3', 'gemma4', 'kimi_k2',
                                              'kimi_k25'))
