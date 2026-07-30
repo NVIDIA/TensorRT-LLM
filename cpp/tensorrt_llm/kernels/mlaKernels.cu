@@ -1643,13 +1643,20 @@ void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_c
     auto* bmm2_scale = params.precomputed_fmha_scheduler ? nullptr : params.bmm2_scale;
 
     // One warp owns one latent row, so the block size decides how many rows a block
-    // retires and therefore the grid size. Generation is tiny -- one row per token,
-    // e.g. 128 rows for batch 32 with MTP3 -- so a fat block leaves most of the GPU
-    // idle (128 rows / 8 rows-per-block = 16 blocks on 148 SMs) and the kernel is
-    // pure launch latency. Shrink the block until the grid covers the SMs.
-    // `TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK` pins it for tuning.
-    int const sm_count = std::max(1, tensorrt_llm::common::getMultiProcessorCount());
-    int rows_per_block = static_cast<int>(tensorrt_llm::common::divUp(params.acc_q_len, sm_count));
+    // retires and therefore the grid size. 4 warps (128 threads) measured best or
+    // tied-best with ncu at both ends of the decode range on GB200 -- 128 rows
+    // (batch 32, MTP3) and 896 rows (batch 224, MTP3):
+    //
+    //   rows/block   block   b32 kernel   b224 kernel
+    //     1            32      6688 ns      7168 ns
+    //     4           128      6432 ns      6784 ns   <-- default
+    //     8           256      7328 ns      6960 ns
+    //
+    // Sizing the grid to cover the SMs instead (divUp(rows, sm_count)) picks 1 at
+    // batch 32 and 8 at batch 224, i.e. the slower option at both ends: the kernel
+    // is latency-bound, not occupancy-bound, so SM coverage is the wrong knob.
+    // `TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK` pins it for re-tuning.
+    int rows_per_block = 4;
     if (auto const env_rows = tensorrt_llm::common::getIntEnv("TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK"))
     {
         rows_per_block = env_rows.value();
