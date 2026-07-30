@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Direct tests for :mod:`tensorrt_llm._torch.visual_gen.media_decode`.
+"""Direct tests for :mod:`tensorrt_llm.media.decoding`, plus the rank
+convergence protocol that guards it
+(``tensorrt_llm._torch.visual_gen.utils.synchronize_media_prepare_status``).
 
 The decode tests run on the checked-in H.264 fixtures (see
 ``test_data/README.md`` for provenance). Each fixture frame encodes its own
@@ -23,11 +25,11 @@ import pytest
 import torch
 from PIL import Image
 
-from tensorrt_llm._torch.visual_gen.media_decode import (
+from tensorrt_llm._torch.visual_gen.utils import synchronize_media_prepare_status
+from tensorrt_llm.media.decoding import (
     _lanczos_taps,
     decode_video_reference_window,
     resize_center_crop_uint8,
-    synchronize_media_prepare_status,
 )
 
 _TEST_DATA = Path(__file__).parent / "test_data"
@@ -96,7 +98,7 @@ class TestImportIsolation:
         decode module itself) must not load it — only an actual decode may."""
         code = (
             "import sys; import tensorrt_llm; "
-            "import tensorrt_llm._torch.visual_gen.media_decode; "
+            "import tensorrt_llm.media.decoding; "
             "assert 'PyNvVideoCodec' not in sys.modules, "
             "'driver-linked PyNvVideoCodec loaded at import time'"
         )
@@ -114,7 +116,7 @@ def _status_protocol_rank(rank: int, world_size: int, init_file: str, results_di
 
     import torch.distributed as dist
 
-    from tensorrt_llm._torch.visual_gen.media_decode import synchronize_media_prepare_status
+    from tensorrt_llm._torch.visual_gen.utils import synchronize_media_prepare_status
 
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size

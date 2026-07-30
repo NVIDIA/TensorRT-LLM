@@ -26,17 +26,17 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
-from tensorrt_llm._torch.visual_gen.media_decode import (
-    decode_video_reference_window,
-    synchronize_media_prepare_status,
-)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import (
+    postprocess_video_tensor,
+    synchronize_media_prepare_status,
+)
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
+from tensorrt_llm.media.decoding import decode_video_reference_window
 
 from .defaults import (
     COSMOS3_720P_PARAMS,

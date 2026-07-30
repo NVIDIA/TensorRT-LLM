@@ -15,9 +15,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
 
-from tensorrt_llm._torch.visual_gen.media_decode import classify_worker_error
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.utils import classify_worker_error
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
 from tensorrt_llm.logger import logger

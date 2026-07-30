@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Worker-side video-reference decoding on NVDEC (PyNvVideoCodec).
+"""Video-reference decoding on NVDEC (PyNvVideoCodec).
 
-Encoded reference bytes arrive from the coordinator; each worker rank demuxes
-them from memory, decodes on NVDEC, and retains only the conditioning window,
-resized to the request's output resolution — so retained memory is bounded by
-the request's own output shape and at any instant only one source-resolution
-frame is alive.
+Encoded bytes are demuxed from memory, decoded on NVDEC, and only the
+requested window is retained, resized to the caller's target resolution — so
+retained memory is bounded by that target and at any instant only one
+source-resolution frame is alive.
+
+Counterpart to :mod:`tensorrt_llm.media.encoding`.
 
 PyNvVideoCodec is imported function-locally: ``import tensorrt_llm`` on a
 CPU-only host must never load the driver-linked extension.
@@ -28,67 +29,6 @@ import functools
 import math
 
 import torch
-
-
-def classify_worker_error(exc: BaseException) -> str | None:
-    """Failure class for the response channel: "client", "capacity", or None.
-
-    Keyed off built-in exception types rather than a VisualGen-specific
-    hierarchy: ``ValueError`` means the request's content was unusable
-    (400), ``MemoryError`` means a valid request did not fit (503), and
-    anything else is an unclassified runtime failure (500). Detail travels
-    in the message. ``torch.cuda.OutOfMemoryError`` is spelled out because
-    it derives from ``RuntimeError``, not ``MemoryError``.
-    """
-    if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
-        return "capacity"
-    if isinstance(exc, ValueError):
-        return "client"
-    return None
-
-
-def synchronize_media_prepare_status(exc: Exception | None) -> None:
-    """All-rank convergence point between media prepare and model collectives.
-
-    Every rank decodes/prepares its media independently; a rank that failed
-    while others proceed into the transformer's collectives would hang the
-    job. All ranks call this with their local outcome; if any failed, the
-    lowest failing rank's error class + message is broadcast, the failing
-    rank(s) re-raise their own exception, and every healthy rank raises a
-    reconstructed equivalent in lockstep. Runs on CPU tensors so
-    the hybrid (``cpu:gloo``) process group carries it even when the failure
-    was CUDA/NVDEC initialization. Converges *caught* failures only — a fatal
-    process or context death is beyond its reach.
-    """
-    import torch.distributed as dist
-
-    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
-        if exc is not None:
-            raise exc
-        return
-
-    healthy_sentinel = 2**31 - 1
-    rank = dist.get_rank()
-    flag = torch.tensor([rank if exc is not None else healthy_sentinel], dtype=torch.int64)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
-    failing_rank = int(flag.item())
-    if failing_rank == healthy_sentinel:
-        return
-
-    payload = [None]
-    if rank == failing_rank:
-        payload = [(classify_worker_error(exc), str(exc))]
-    dist.broadcast_object_list(payload, src=failing_rank)
-
-    if exc is not None:
-        raise exc
-    kind, message = payload[0]
-    message = f"[rank {failing_rank}] {message}"
-    if kind == "client":
-        raise ValueError(message)
-    if kind == "capacity":
-        raise MemoryError(message)
-    raise RuntimeError(message)
 
 
 @functools.lru_cache(maxsize=32)
@@ -135,7 +75,7 @@ def _resample_last_dim(x: torch.Tensor, weights: torch.Tensor, taps: torch.Tenso
 def resize_center_crop_uint8(frames: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
     """Resize + center-crop uint8 ``[T, H, W, C]`` frames to the target size.
 
-    Applied to the worker-decoded reference frames before retention.
+    Applied to the decoded reference frames before retention.
     Semantics mirror the reference implementation's PIL path (cover-scale by
     ``max(target/source)``, ceil-rounded resize with Lanczos-3, center crop),
     implemented as separable local-tap resampling: per output pixel only the
