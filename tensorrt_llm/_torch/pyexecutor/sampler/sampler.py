@@ -811,7 +811,7 @@ class _BatchedSamplingResult:
 
     # Processed and raw logprobs buffer. The tensor is sized to accommodate logprobs for all requests currently being
     # processed by the sampler and slice(0, processed_logprobs_end) contains processed logprobs, ordered consistently
-    # with processed_logprobs_reqs.
+    # with processed_logprobs_reqs. Excludes beam search requests, which have a separate path for logprobs handling.
     logprobs_cuda: torch.Tensor | None = None
 
     # Requests requesting processed logprobs, same ordering as req_indices
@@ -821,7 +821,8 @@ class _BatchedSamplingResult:
 
     # Requests requesting raw logprobs, ordered consistently with original (unpermuted) requests
     raw_logprobs_reqs_indices: list[int] = field(default_factory=list)
-    # Indices into logits tensor, ordered consistently with raw_logprobs_reqs_indices
+    # Indices into logits tensor, ordered consistently with raw_logprobs_reqs_indices.
+    # Excludes beam search requests, which have a separate path for logprobs handling.
     raw_logprobs_logit_indices_cuda: torch.Tensor | None = None
 
 
@@ -4498,7 +4499,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 group_req_indices
             )
 
-            group_logits_cuda_indices = logits_cuda_indexer[group_req_indices]
             # NB: Assuming that group_req_indices are sorted
             group_req_1st_index = cast(int, group_req_indices[0].item())
             group_req_last_index = cast(int, group_req_indices[-1].item())
@@ -4514,6 +4514,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 group_logits_cuda = logits_cuda[group_logits_cuda_indices_cuda]
                 logit_indices_for_sampler = None
             else:
+                group_logits_cuda_indices = logits_cuda_indexer[group_req_indices]
                 group_logits_cuda_indices_cuda = group_logits_cuda_indices.to(
                     device=logits_cuda.device, non_blocking=True
                 )
@@ -4556,15 +4557,49 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     need_processed_logprobs_req_indices.size(0)
                 )
                 if group_num_requests_needing_processed_logprobs > 0:
-                    reqs_indices_needing_processed_logprobs += (
+                    need_processed_logprobs_req_indices_list = (
                         need_processed_logprobs_req_indices.tolist()
                     )
+                    reqs_indices_needing_processed_logprobs += (
+                        need_processed_logprobs_req_indices_list
+                    )
+
+                    # Gather logprobs only for non-beam search requests
+                    if self._use_beam_search:
+                        gather_processed_logprobs_group_req_indices_list = [
+                            grp_idx
+                            for grp_idx, req_idx in enumerate(
+                                need_processed_logprobs_req_indices_list
+                            )
+                            if requests[req_idx].py_beam_width == 1
+                        ]
+
+                        # repurpose group_need_processed_logprobs
+                        group_gather_processed_logprobs = group_need_processed_logprobs
+                        del group_need_processed_logprobs
+                        gather_processed_logprobs_group_req_indices = torch.tensor(
+                            gather_processed_logprobs_group_req_indices_list,
+                            dtype=need_processed_logprobs_req_indices.dtype,
+                        )
+                        group_gather_processed_logprobs[
+                            gather_processed_logprobs_group_req_indices
+                        ] = False
+                        num_gather_processed_logprobs_req_indices = len(
+                            gather_processed_logprobs_group_req_indices_list
+                        )
+                    else:
+                        # repurpose group_need_processed_logprobs
+                        group_gather_processed_logprobs = group_need_processed_logprobs
+                        del group_need_processed_logprobs
+                        num_gather_processed_logprobs_req_indices = len(
+                            need_processed_logprobs_req_indices_list
+                        )
 
                     # Gather relevant logits and probs; using prefix 'proc_lp' for subset of
                     # requests in current sampling requests group which require processed logprobs.
                     assert group_softmax_cuda is not None
                     assert batch_processed_logprobs_cuda is not None
-                    if group_num_requests_needing_processed_logprobs == group_req_indices.size(0):
+                    if num_gather_processed_logprobs_req_indices == group_req_indices.size(0):
                         if logit_indices_for_sampler is None:
                             proc_lp_logits_cuda = group_logits_cuda
                         else:
@@ -4576,32 +4611,53 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     else:
                         proc_lp_group_steps = req_num_generated_tokens[group_req_indices]
                         proc_lp_step_mask_cuda = torch.repeat_interleave(
-                            group_need_processed_logprobs.to(
+                            group_gather_processed_logprobs.to(
                                 device=logits_cuda.device, non_blocking=True
                             ),
                             proc_lp_group_steps.to(device=logits_cuda.device, non_blocking=True),
                             output_size=cast(int, proc_lp_group_steps.sum().item()),
-                        )
+                        ).unsqueeze(-1)
                         proc_lp_steps_num_selected = cast(
                             int,
                             (
-                                group_need_processed_logprobs.to(dtype=proc_lp_group_steps.dtype)
+                                group_gather_processed_logprobs.to(dtype=proc_lp_group_steps.dtype)
                                 * proc_lp_group_steps
                             )
                             .sum()
                             .item(),
                         )
-                        proc_lp_logits_cuda = group_logits_cuda.new_empty(
-                            (proc_lp_steps_num_selected, *group_logits_cuda.shape[1:]),
-                        )
-                        torch.masked_select(
-                            group_logits_cuda, proc_lp_step_mask_cuda, out=proc_lp_logits_cuda
-                        )
+                        if logit_indices_for_sampler is None:
+                            proc_lp_logits_cuda = group_logits_cuda.new_empty(
+                                (proc_lp_steps_num_selected, *group_logits_cuda.shape[1:]),
+                            )
+                            torch.masked_select(
+                                group_logits_cuda,
+                                proc_lp_step_mask_cuda,
+                                out=proc_lp_logits_cuda.view(-1),
+                            )
+                        else:
+                            logit_indices_for_sampler_cuda = logit_indices_for_sampler.to(
+                                device=logits_cuda.device, non_blocking=True
+                            )
+                            proc_lp_logits_indices_cuda = logit_indices_for_sampler_cuda.new_empty(
+                                (
+                                    proc_lp_steps_num_selected,
+                                    *logit_indices_for_sampler_cuda.shape[1:],
+                                ),
+                            )
+                            torch.masked_select(
+                                logit_indices_for_sampler_cuda,
+                                proc_lp_step_mask_cuda.squeeze(-1),
+                                out=proc_lp_logits_indices_cuda.view(-1),
+                            )
+                            proc_lp_logits_cuda = group_logits_cuda[proc_lp_logits_indices_cuda]
                         proc_lp_softmax_cuda = group_softmax_cuda.new_empty(
                             (proc_lp_steps_num_selected, *group_softmax_cuda.shape[1:]),
                         )
                         torch.masked_select(
-                            group_softmax_cuda, proc_lp_step_mask_cuda, out=proc_lp_softmax_cuda
+                            group_softmax_cuda,
+                            proc_lp_step_mask_cuda,
+                            out=proc_lp_softmax_cuda.view(-1),
                         )
                         if isinstance(group_temperature_cuda, torch.Tensor):
                             proc_lp_temperature_cuda = group_temperature_cuda.new_empty(
@@ -4609,8 +4665,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                             )
                             torch.masked_select(
                                 group_temperature_cuda,
-                                proc_lp_step_mask_cuda,
-                                out=proc_lp_temperature_cuda,
+                                proc_lp_step_mask_cuda.squeeze(-1),
+                                out=proc_lp_temperature_cuda.view(-1),
                             )
                             proc_lp_temperature_cuda = proc_lp_temperature_cuda.unsqueeze(-1)
                         else:
@@ -4683,12 +4739,29 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             reqs_indices_needing_raw_logprobs_tensor = torch.nonzero(need_raw_logprobs).view(-1)
             num_requests_needing_raw_logprobs = reqs_indices_needing_raw_logprobs_tensor.size(0)
             if num_requests_needing_raw_logprobs > 0:
+                # Gather logprobs only for non-beam search requests
+                if self._use_beam_search:
+                    gather_raw_logprobs_req_indices_list = [
+                        idx
+                        for idx in reqs_indices_needing_raw_logprobs_tensor.tolist()
+                        if requests[idx].py_beam_width == 1
+                    ]
+                    gather_raw_logprobs_req_indices_tensor = torch.tensor(
+                        gather_raw_logprobs_req_indices_list,
+                        dtype=reqs_indices_needing_raw_logprobs_tensor.dtype,
+                    )
+                else:
+                    gather_raw_logprobs_req_indices_tensor = (
+                        reqs_indices_needing_raw_logprobs_tensor
+                    )
+                    gather_raw_logprobs_req_indices_list = (
+                        gather_raw_logprobs_req_indices_tensor.tolist()
+                    )
+
                 batch_raw_logprob_indices_cuda = logits_cuda_indexer[
-                    reqs_indices_needing_raw_logprobs_tensor
+                    gather_raw_logprobs_req_indices_tensor
                 ].to(device=logits_cuda.device, non_blocking=True)
-                reqs_indices_needing_raw_logprobs = (
-                    reqs_indices_needing_raw_logprobs_tensor.tolist()
-                )
+                reqs_indices_needing_raw_logprobs = gather_raw_logprobs_req_indices_list
 
         # NB: 'd2t' contains offsets for transforming draft vocab token IDs into
         #     the target vocab. This is used by Eagle3ForCausalLM, whose input domain
@@ -5075,6 +5148,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
 
                 # Get the sampled logprobs
+                # NB: logprobs_cuda contains logprobs only for the single-beam requests, since beam search handles
+                #     logprobs elsewhere.
                 sampled_vals_cuda = torch.gather(
                     logprobs_cuda, dim=1, index=sampled_indices_cuda.unsqueeze(-1)
                 ).squeeze(-1)  # flattened (step, slot)
