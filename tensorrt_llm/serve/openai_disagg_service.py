@@ -372,10 +372,14 @@ class OpenAIDisaggregatedService(OpenAIService):
                             f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
                         )
                     if choice.disaggregated_params.disagg_request_id is None:
-                        raise ValueError(
-                            f"Invalid disaggregated params: disagg_request_id is None for choice {idx}."
-                            f" finish_reason={choice.finish_reason!r},"
-                            f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
+                        logger.warning(
+                            "Context server choice %d is missing disagg_request_id; "
+                            "falling back to ctx_request_id=%s.",
+                            idx,
+                            choice.disaggregated_params.ctx_request_id,
+                        )
+                        choice.disaggregated_params.disagg_request_id = (
+                            choice.disaggregated_params.ctx_request_id
                         )
             return ctx_response
 

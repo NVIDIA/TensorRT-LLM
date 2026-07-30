@@ -588,13 +588,22 @@ class TestVerifyCtxResponseDiagnostics:
             await svc._verify_ctx_response(resp)
 
     @pytest.mark.asyncio
-    async def test_missing_disagg_request_id_includes_ctx_id(self):
+    async def test_missing_disagg_request_id_falls_back_to_ctx_request_id(self):
         svc = _make_service("context_first")
         resp = _make_completion_response("", finish_reason="length", disagg_request_id=555)
         resp.choices[0].disaggregated_params.disagg_request_id = None
         resp.choices[0].disaggregated_params.ctx_request_id = 555
-        with pytest.raises(ValueError, match=r"disagg_request_id is None.*555"):
-            await svc._verify_ctx_response(resp)
+        with mock.patch("tensorrt_llm.serve.openai_disagg_service.logger.warning") as warning:
+            result = await svc._verify_ctx_response(resp)
+
+        assert result is resp
+        assert resp.choices[0].disaggregated_params.disagg_request_id == 555
+        warning.assert_called_once_with(
+            "Context server choice %d is missing disagg_request_id; "
+            "falling back to ctx_request_id=%s.",
+            0,
+            555,
+        )
 
     @pytest.mark.asyncio
     async def test_valid_response_passes(self):
