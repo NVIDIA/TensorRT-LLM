@@ -112,10 +112,35 @@ def render_mmmu_prompt(question: str, options: Optional[Sequence[str]]) -> Tuple
 # (simple_eval_mmmu_vlm.py:337-475). These are the SHARED scorer both stacks
 # must use for the numbers to be comparable.
 # ===========================================================================
+# HUMAN FEEDBACK #5 Directive 2 (2026-07-26): the verbatim SGLang reference regex
+# r"[Aa]nswer\s*:\s*\*?\*?\s*\(?([A-Z])\)?" misses a LaTeX/markdown-wrapped final
+# answer -- "Answer: $B$", "Answer: \(B\)", "Answer: $\text{B}$", "Answer:
+# \boxed{B}" -- because the wrapper sits between the colon and the letter. On a miss
+# it falls through to the positional heuristics below, which pick up an incidental
+# letter (a FALSE NEGATIVE when the model actually answered correctly, e.g.
+# validation_Math_14 "Answer: $C$" scored 0.0). The MMMU prompt itself instructs
+# "Answer: $LETTER" (see MULTI_CHOICE_PROMPT), so the dollar-wrapped form is the
+# EXPECTED output, and the miss rate is asymmetric across stacks (SGLang ~8.6% vs
+# TRT ~37.5% on the P0 sample) -- an asymmetric scoring defect that manufactures a
+# spurious TRT-vs-SGLang delta. We DELIBERATELY DIVERGE from the verbatim port here
+# to tolerate the wrapper tokens ($ \ ( ) { } * and the LaTeX words text/boxed)
+# between the colon and the letter, keeping "last occurrence wins" and every
+# existing fallback below. BOTH arms use this fixed parser (the offline SGLang
+# re-score too), so the comparison stays fair.
+# The trailing ``(?![A-Za-z])`` keeps the capture to an ISOLATED letter, so a
+# prompt echo like ``Answer: $LETTER`` or a stray word like ``Answer: See ...``
+# does not get mined for its first capital (the old regex relied on the
+# ``candidate in all_choices`` guard for that; this is stricter and cheaper).
+_ANSWER_RE = re.compile(r"[Aa]nswer\s*:\s*(?:[\$\\(){}*]|text|boxed|\s)*([A-Z])(?![A-Za-z])")
+
+
 def parse_multi_choice_response(response: str, all_choices: List[str], index2ans: dict) -> str:
-    """Verbatim port of ``_parse_multi_choice_response`` (lines 337-381)."""
-    # First, look for explicit "Answer: X" pattern (last occurrence)
-    answer_matches = re.findall(r"[Aa]nswer\s*:\s*\*?\*?\s*\(?([A-Z])\)?", response)
+    """Extract the MC answer letter. SGLang-aligned (``_parse_multi_choice_response``
+    lines 337-381) EXCEPT the explicit-answer regex, widened per HUMAN FEEDBACK #5
+    Directive 2 to tolerate LaTeX/markdown wrapping -- see ``_ANSWER_RE`` above."""
+    # First, look for explicit "Answer: X" pattern (last occurrence), tolerating
+    # LaTeX/markdown wrapping around the letter (``_ANSWER_RE``).
+    answer_matches = _ANSWER_RE.findall(response)
     if answer_matches:
         candidate = answer_matches[-1]
         if candidate in all_choices:

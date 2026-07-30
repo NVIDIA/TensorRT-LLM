@@ -96,7 +96,16 @@ NODE_COUNT = int(os.environ.get("SLURM_NNODES", "1"))
 # number; without it the long MMMU reasoning decode collapses non-deterministically.
 DETERMINISTIC = os.environ.get("INKLING_DETERMINISTIC", "0") == "1"
 ENABLE_AUTOTUNER = not DETERMINISTIC
-if DETERMINISTIC:
+# HUMAN FEEDBACK #17 Task 1 (larger-batch discriminator): re-score the SAME 197
+# items changing ONLY the batch size vs the accepted deterministic bs=1 baseline.
+# The determinism-hygiene knobs (enable_autotuner=False + TLLM_DISABLE_ALLREDUCE_
+# AUTOTUNE=1) stay in effect, but the forced BS=1 is lifted so the larger-batch path
+# is actually exercised. Default unset => byte-identical to the accepted bs=1
+# measurement. When set, the sole changed variable vs the baseline is the batch size
+# (the cross-row batched-MoE atomic non-determinism this normally guards against is
+# exactly the batch-sensitivity signal the discriminator is meant to surface).
+ALLOW_BS_UNDER_DET = os.environ.get("INKLING_MMMU_ALLOW_BS_UNDER_DET", "0") == "1"
+if DETERMINISTIC and not ALLOW_BS_UNDER_DET:
     BS = 1  # cross-row batched-MoE atomic non-determinism is a bs>1 effect
 # P0-C repeatability gate (Stage-3 S3-C7 / feedback #3): dump the FULL generated
 # token-id list per item so the offline verifier can prove bitwise-identical
@@ -232,6 +241,8 @@ def main() -> int:
         "bs": BS,
         "maxtok": MAXTOK,
         "deterministic": DETERMINISTIC,
+        "enable_autotuner": ENABLE_AUTOTUNER,
+        "allow_bs_under_det": ALLOW_BS_UNDER_DET,
         "cuda_graph": CUDA_GRAPH,
         "overlap": OVERLAP,
         "moe_backend": moe_backend,

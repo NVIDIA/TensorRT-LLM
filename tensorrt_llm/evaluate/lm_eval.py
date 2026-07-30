@@ -44,7 +44,7 @@ from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .interface import (Evaluator, dump_inference_results,
-                        get_chat_template_kwargs)
+                        get_chat_template_kwargs, log_generation_stats)
 
 # NOTE: lm_eval uses "<image>" as the default image placeholder
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
@@ -193,6 +193,11 @@ class LmEvalWrapper(TemplateLM):
         if self.output_dir:
             dump_inference_results(self.output_dir, outputs,
                                    getattr(self.llm, 'tokenizer', None))
+
+        # Record finish_reason + generated-token counts so a runaway/no-EOS
+        # regression is visible in the log instead of being masked by a
+        # parseable answer buried in a wall of repeated text.
+        log_generation_stats(outputs, label="lm_eval")
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")

@@ -66,6 +66,63 @@ def get_model_context(llm: Any) -> tuple[str, str]:
     return str(model_dir), str(model_type)
 
 
+def summarize_generation_stats(results: List[Any]) -> dict:
+    """Summarize finish_reason and generated-token counts over a batch of
+    ``RequestOutput`` objects.
+
+    An exact-match eval (GSM8K, MMLU, ...) can score a correct answer that was
+    parsed out of a runaway, never-terminating generation
+    (``finish_reason='length'`` with ``n_gen == max_tokens``) and thereby hide a
+    broken-EOS / ignored-stop-token runtime. Recording the finish_reason mix and
+    the generated-token-count distribution makes that failure mode visible in the
+    eval artifact instead of silently passing. Purely observational -- it never
+    changes what is scored, and it never raises on a malformed output object.
+    """
+    from collections import Counter
+    finish = Counter()
+    n_gen: List[int] = []
+    for r in results:
+        try:
+            completion = r.outputs[0]
+        except (AttributeError, IndexError, TypeError):
+            continue
+        finish[str(getattr(completion, "finish_reason", None))] += 1
+        length = getattr(completion, "length", None)
+        if length is None:
+            tok = getattr(completion, "token_ids", None)
+            length = len(tok) if tok is not None else None
+        if length is not None:
+            n_gen.append(int(length))
+    n = sum(finish.values())
+    n_length = finish.get("length", 0)
+    stats: dict = {
+        "n_samples": n,
+        "finish_reason": dict(finish),
+        "n_finish_length": n_length,
+        "frac_finish_length": (round(n_length / n, 4) if n else None),
+    }
+    if n_gen:
+        stats["n_gen_min"] = min(n_gen)
+        stats["n_gen_max"] = max(n_gen)
+        stats["n_gen_mean"] = round(sum(n_gen) / len(n_gen), 2)
+    return stats
+
+
+def log_generation_stats(results: List[Any], label: str = "") -> dict:
+    """Compute + log a greppable ``GEN_STATS`` marker for a batch of outputs.
+
+    Never raises: observability must not be able to fail an eval run.
+    """
+    try:
+        stats = summarize_generation_stats(results)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"GEN_STATS unavailable: {type(e).__name__}: {e}")
+        return {}
+    tag = f"GEN_STATS[{label}] " if label else "GEN_STATS "
+    logger.info(tag + json.dumps(stats, sort_keys=True))
+    return stats
+
+
 class Evaluator(ABC):
 
     def __init__(self,
@@ -150,6 +207,11 @@ class Evaluator(ABC):
         if self.output_dir:
             dump_inference_results(self.output_dir, results,
                                    getattr(llm, 'tokenizer', None))
+
+        # Record finish_reason + generated-token counts so a runaway/no-EOS
+        # regression is visible in the log instead of being masked by a
+        # parseable answer buried in a wall of repeated text.
+        log_generation_stats(results, label=type(self).__name__)
 
         profiler.stop("trtllm exec")
         elapsed_time = profiler.elapsed_time_in_sec("trtllm exec")
