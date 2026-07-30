@@ -476,12 +476,6 @@ def sniff_media_kind(data) -> Optional[str]:
     return None
 
 
-# Longest video, in frames, a client may request as *output* (the serve's
-# ``num_frames`` cap in ``openai_protocol``) and the most reference frames a
-# worker will decode from a video reference before raising.
-MAX_VIDEO_FRAMES = 7200
-
-
 def _select_cv2_stream_buffered_backend() -> Optional[int]:
     """Return a VideoCapture backend that can read from a Python `BytesIO`.
 

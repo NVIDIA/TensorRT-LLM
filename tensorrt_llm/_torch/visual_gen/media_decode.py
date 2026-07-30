@@ -26,7 +26,6 @@ CPU-only host must never load the driver-linked extension.
 
 import functools
 import math
-import os
 
 import torch
 
@@ -90,27 +89,6 @@ def synchronize_media_prepare_status(exc: Exception | None) -> None:
     if kind == "capacity":
         raise MemoryError(message)
     raise RuntimeError(message)
-
-
-# Decode-work default: 5 min @ 24 fps, far above the canonical ~8 s reference.
-# Deliberately its own constant — the serve's output cap (``MAX_VIDEO_FRAMES``)
-# is a different policy that happens to share the value today.
-DEFAULT_MAX_REFERENCE_DECODE_FRAMES = 7200
-
-
-def max_reference_decode_frames() -> int | None:
-    """Decode-work limit for a video reference, or ``None`` when disabled.
-
-    Bounds serial worker occupancy for forward-only ``keep="last"`` decoding
-    (encoded size cannot: hours of low-bitrate video are small on disk). The
-    default sits far above the canonical ~8 s reference; trusted deployments
-    may raise it or disable it with ``TRTLLM_MAX_REFERENCE_DECODE_FRAMES=0``.
-    """
-    raw = os.environ.get("TRTLLM_MAX_REFERENCE_DECODE_FRAMES")
-    if raw is None:
-        return DEFAULT_MAX_REFERENCE_DECODE_FRAMES
-    limit = int(raw)
-    return None if limit <= 0 else limit
 
 
 @functools.lru_cache(maxsize=32)
@@ -192,22 +170,39 @@ def resize_center_crop_uint8(frames: torch.Tensor, target_h: int, target_w: int)
 def decode_video_reference_window(
     data: bytes,
     *,
-    window: int,
-    keep: str,
+    first_frame: int,
+    last_frame: int,
     target_h: int,
     target_w: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Decode encoded reference bytes into the conditioning window on device.
+    """Decode frames ``[first_frame, last_frame]`` of a reference on device.
 
-    Returns a uint8 ``[T, target_h, target_w, 3]`` tensor, ``T <= window``:
-    the first ``window`` frames (``keep="first"``, decode stops early) or the
-    last ``window`` (``keep="last"``, sequential decode to EOS through a
-    preallocated ring — the memory-buffer demuxer is a forward-only feeder,
-    seeking is not assumed). Shorter-than-window clips return what exists;
-    the pipeline right-pads. Frames are resized to the target resolution
-    before retention, so a high-resolution source never dominates memory.
+    Returns uint8 ``[T, target_h, target_w, 3]``. Indices are Python-style:
+    non-negative counts from the start, negative from the end, so ``-1`` is
+    the last frame and ``(-8, -1)`` the final eight. Both ends are inclusive.
+
+    A negative index costs a decode to EOS — the memory-buffer demuxer is a
+    forward-only feeder, seeking is not assumed — so the caller pays for the
+    whole clip when asking from the end. Non-negative ranges stop as soon as
+    the range is filled. Frames are resized to the target resolution before
+    retention, so a high-resolution source never dominates memory. Clips
+    shorter than the range return what exists; the caller pads.
+
+    This decodes what it is asked for and imposes no policy of its own: any
+    bound on range size belongs to the model that knows what it can use.
     """
+    if (first_frame < 0) != (last_frame < 0):
+        raise ValueError(
+            f"first_frame and last_frame must both count from the start or "
+            f"both from the end, got ({first_frame}, {last_frame})."
+        )
+    if first_frame > last_frame:
+        raise ValueError(
+            f"first_frame must not exceed last_frame, got ({first_frame}, {last_frame})."
+        )
+    window = last_frame - first_frame + 1
+    from_end = first_frame < 0
     try:
         import PyNvVideoCodec as nvc
     except ImportError as exc:
@@ -215,13 +210,6 @@ def decode_video_reference_window(
             "PyNvVideoCodec is required for video-reference decoding; "
             "install the declared dependency (pip install PyNvVideoCodec)."
         ) from exc
-
-    frame_cap = max_reference_decode_frames()
-    if frame_cap is not None and keep == "first" and window > frame_cap:
-        raise ValueError(
-            f"Conditioning window of {window} frames exceeds the reference "
-            f"decode limit of {frame_cap} (TRTLLM_MAX_REFERENCE_DECODE_FRAMES)."
-        )
 
     position = 0
 
@@ -264,28 +252,30 @@ def decode_video_reference_window(
                 f"decoder session could not be created: {exc}"
             ) from exc
 
-        ring = torch.empty(window, target_h, target_w, 3, dtype=torch.uint8, device=device)
-        count = 0
+        # Non-negative ranges retain exactly the requested slice, so the ring
+        # is filled once; negative ranges cannot know the length up front, so
+        # it wraps and holds the trailing `tail` frames until EOS.
+        tail = -first_frame if from_end else window
+        ring = torch.empty(tail, target_h, target_w, 3, dtype=torch.uint8, device=device)
+        count = 0  # frames decoded so far, i.e. the index of the next frame
+        kept = 0  # frames written into the ring
         try:
             for packet in demuxer:
+                done = False
                 for frame in decoder.Decode(packet):
-                    if frame_cap is not None and count >= frame_cap:
-                        raise ValueError(
-                            f"Video reference exceeds the decode limit of "
-                            f"{frame_cap} frames "
-                            f"(TRTLLM_MAX_REFERENCE_DECODE_FRAMES); trim the "
-                            f"clip{' or use condition_video_keep=first' if keep == 'last' else ''}."
-                        )
-                    decoded = torch.from_dlpack(frame)
-                    # Ownership copy off the NVDEC surface (recycled by the
-                    # decoder) and resize-before-retain in one step.
-                    ring[count % window].copy_(
-                        resize_center_crop_uint8(decoded.unsqueeze(0), target_h, target_w)[0]
-                    )
-                    count += 1
-                    if keep == "first" and count >= window:
+                    if not from_end and count > last_frame:
+                        done = True
                         break
-                if keep == "first" and count >= window:
+                    if from_end or count >= first_frame:
+                        decoded = torch.from_dlpack(frame)
+                        # Ownership copy off the NVDEC surface (recycled by
+                        # the decoder) and resize-before-retain in one step.
+                        ring[kept % tail].copy_(
+                            resize_center_crop_uint8(decoded.unsqueeze(0), target_h, target_w)[0]
+                        )
+                        kept += 1
+                    count += 1
+                if done:
                     break
         except torch.cuda.OutOfMemoryError as exc:
             raise MemoryError(
@@ -303,12 +293,14 @@ def decode_video_reference_window(
                 "Video reference contains no decodable frames; the payload "
                 "may be corrupt or use an unsupported codec."
             )
-        if count <= window:
-            return ring[:count]
-        start = count % window
-        if start == 0:
-            return ring
-        return torch.cat([ring[start:], ring[:start]])
+        if kept < tail:
+            frames = ring[:kept]
+        else:
+            start = kept % tail
+            frames = ring if start == 0 else torch.cat([ring[start:], ring[:start]])
+        # `frames` now holds the trailing `tail` frames in order; a negative
+        # last_frame other than -1 drops the ones after it.
+        return frames[:window] if from_end else frames
     finally:
         del decoder
         del demuxer

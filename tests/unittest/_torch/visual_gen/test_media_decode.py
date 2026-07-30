@@ -26,7 +26,6 @@ from PIL import Image
 from tensorrt_llm._torch.visual_gen.media_decode import (
     _lanczos_taps,
     decode_video_reference_window,
-    max_reference_decode_frames,
     resize_center_crop_uint8,
     synchronize_media_prepare_status,
 )
@@ -176,24 +175,18 @@ class TestPrepareStatusProtocol:
         assert healthy == "client:[rank 1] rank-local decode failure"
 
 
-class TestDecodeFrameLimit:
-    def test_default_and_env_override(self, monkeypatch):
-        monkeypatch.delenv("TRTLLM_MAX_REFERENCE_DECODE_FRAMES", raising=False)
-        assert max_reference_decode_frames() == 7200
-        monkeypatch.setenv("TRTLLM_MAX_REFERENCE_DECODE_FRAMES", "12")
-        assert max_reference_decode_frames() == 12
-        monkeypatch.setenv("TRTLLM_MAX_REFERENCE_DECODE_FRAMES", "0")
-        assert max_reference_decode_frames() is None
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestDecodeVideoReferenceWindow:
     _DEVICE = torch.device("cuda:0")
 
-    def _decode(self, data: bytes, **kwargs):
-        defaults = dict(window=5, keep="first", target_h=64, target_w=64, device=self._DEVICE)
+    def _decode(self, data: bytes, *, window=5, keep="first", **kwargs):
+        """Express a (window, keep) request as the decoder's frame range."""
+        span = (0, window - 1) if keep == "first" else (-window, -1)
+        defaults = dict(target_h=64, target_w=64, device=self._DEVICE)
         defaults.update(kwargs)
-        return decode_video_reference_window(data, **defaults)
+        return decode_video_reference_window(
+            data, first_frame=span[0], last_frame=span[1], **defaults
+        )
 
     @pytest.mark.parametrize("fixture", [_MP4, _AVI], ids=["mp4", "avi"])
     def test_keep_first_display_order(self, fixture):
@@ -242,15 +235,47 @@ class TestDecodeVideoReferenceWindow:
         with pytest.raises(ValueError):
             self._decode(payload)
 
-    def test_frame_limit_trips_on_emitted_frames(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_MAX_REFERENCE_DECODE_FRAMES", "4")
-        with pytest.raises(ValueError, match="decode limit"):
-            self._decode(_MP4.read_bytes(), keep="last")
-
-    def test_frame_limit_disabled(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_MAX_REFERENCE_DECODE_FRAMES", "0")
+    def test_decoder_imposes_no_frame_limit(self):
+        # The decoder returns what it is asked for; bounding the request is
+        # the caller's business (Cosmos3 derives it from the output length).
         window = self._decode(_MP4.read_bytes(), window=20, keep="last")
         assert window.shape[0] == 9
+
+    def test_interior_range(self):
+        window = decode_video_reference_window(
+            _MP4.read_bytes(),
+            first_frame=3,
+            last_frame=5,
+            target_h=64,
+            target_w=64,
+            device=self._DEVICE,
+        )
+        assert _frame_indices(window) == [3, 4, 5]
+
+    def test_negative_range_excluding_final_frames(self):
+        window = decode_video_reference_window(
+            _MP4.read_bytes(),
+            first_frame=-4,
+            last_frame=-3,
+            target_h=64,
+            target_w=64,
+            device=self._DEVICE,
+        )
+        assert _frame_indices(window) == [5, 6]
+
+    @pytest.mark.parametrize(
+        "span", [(0, -1), (-1, 0), (5, 2)], ids=["mixed", "mixed-rev", "reversed"]
+    )
+    def test_malformed_range_rejected(self, span):
+        with pytest.raises(ValueError):
+            decode_video_reference_window(
+                _MP4.read_bytes(),
+                first_frame=span[0],
+                last_frame=span[1],
+                target_h=64,
+                target_w=64,
+                device=self._DEVICE,
+            )
 
     def test_resize_perf_representative(self):
         # Representative evidence for the local-tap resample: a 1080p frame

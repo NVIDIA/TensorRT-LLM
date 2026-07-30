@@ -972,10 +972,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     window = _condition_pixel_frame_count(
                         condition_video_latent_indexes, self.vae_scale_factor_temporal
                     )
+                    # The conditioning window is a Cosmos3 constraint: it is
+                    # derived from indexes into the *output* latent timeline,
+                    # already bound-checked above. The decoder just returns
+                    # the frames asked for. "last" is a negative range, which
+                    # costs a decode to EOS -- the caller's choice to make.
+                    if _normalize_condition_video_keep(condition_video_keep) == "first":
+                        first_frame, last_frame = 0, window - 1
+                    else:
+                        first_frame, last_frame = -window, -1
                     frames_u8 = decode_video_reference_window(
                         video,
-                        window=window,
-                        keep=_normalize_condition_video_keep(condition_video_keep),
+                        first_frame=first_frame,
+                        last_frame=last_frame,
                         target_h=height,
                         target_w=width,
                         device=self.device,
