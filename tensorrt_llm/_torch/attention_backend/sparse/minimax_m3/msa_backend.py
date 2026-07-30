@@ -45,6 +45,7 @@ from .msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
+    msa_triton_sparse_decode_active,
     per_token_valid_blocks,
     require_msa_module,
 )
@@ -1214,7 +1215,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         num_tokens = int(idx_q.shape[0])
         head_major_output = (
             int(metadata.num_contexts or 0) > 0 and int(metadata.num_generations or 0) == 0
-        )
+        ) or msa_triton_sparse_decode_active(metadata)
         # idx_q and idx_k may be strided column-views of a fused buffer, so
         # reshape to keep them zero-copy. The proxy fmha_sm100 and the index-K
         # scatter below both honor the source strides.

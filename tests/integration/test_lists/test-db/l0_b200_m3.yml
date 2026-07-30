@@ -16,5 +16,6 @@ l0_b200_m3:
   - unittest/_torch/attention/sparse/test_minimax_m3_index_decode_score.py
   - unittest/_torch/attention/sparse/test_minimax_m3_msa_backend.py
   - unittest/_torch/attention/sparse/test_minimax_m3_msa_selector.py
+  - unittest/_torch/attention/sparse/test_minimax_m3_sparse_attn_decode.py
   - unittest/_torch/models/test_minimax_m3.py
   - unittest/_torch/models/checkpoints/hf/test_minimaxm3_weight_mapper.py

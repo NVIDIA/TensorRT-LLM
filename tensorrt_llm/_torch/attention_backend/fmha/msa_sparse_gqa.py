@@ -127,6 +127,7 @@ def run_msa_paged_gqa(
     """
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_paged_kv,
+        msa_triton_sparse_decode_active,
         write_msa_main_kv,
     )
 
@@ -154,6 +155,33 @@ def run_msa_paged_gqa(
     out_view = output.view(num_tokens, attn.num_heads, head_dim)
     k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
     sm_scale = (head_dim**-0.5) / float(attn.q_scaling)
+
+    if kv_block_indexes is not None and msa_triton_sparse_decode_active(metadata):
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
+            minimax_m3_sparse_attn_decode,
+        )
+
+        decode_query_len = int(metadata.msa_decode_query_len)
+        batch = num_tokens // decode_query_len
+        # The Triton kernel dequantizes the FP8 cache into q's dtype, so q stays
+        # wide here. An already-E4M3 q from the fused producer widens exactly,
+        # leaving the same values the fmha_sm100 path would have used.
+        if q_view.dtype != out_view.dtype:
+            q_view = q_view.to(out_view.dtype)
+        minimax_m3_sparse_attn_decode(
+            q_view,
+            k_paged,
+            v_paged,
+            # [total_q, num_kv_heads, topk] -> head-major, contiguous when the
+            # indexer emitted a head-major table (see msa_triton_sparse_decode_active).
+            kv_block_indexes.permute(1, 0, 2),
+            metadata.msa_block_table[:batch],
+            metadata.msa_seq_lens_cuda[:batch],
+            sm_scale=sm_scale,
+            output=out_view,
+            decode_query_len=decode_query_len,
+        )
+        return
 
     # The fmha_sm100 variant is chosen from q.dtype and shares one dtype across
     # q/k/v, so q must be FP8 to match an FP8 paged K/V. MiniMax-M3 has no
