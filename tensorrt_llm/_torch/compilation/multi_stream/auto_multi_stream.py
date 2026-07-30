@@ -53,6 +53,7 @@ def estimate_time(node: Node) -> int:
         torch.ops.trtllm.cublas_mm.default,
         torch.ops.trtllm.dsv3_router_gemm_op.default,
         torch.ops.trtllm.dsv3_fused_a_gemm_op.default,
+        torch.ops.trtllm.dsv3_fused_a_gemm_add_op.default,
         torch.ops.trtllm.fp4_gemm.default,
         torch.ops.trtllm.fp4_bmm.default,
         torch.ops.trtllm.fp8_block_scaling_gemm.default,

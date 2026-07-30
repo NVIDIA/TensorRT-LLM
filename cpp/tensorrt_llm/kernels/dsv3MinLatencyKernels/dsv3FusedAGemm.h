@@ -29,7 +29,8 @@ namespace kernels::dsv3MinLatencyKernels
 {
 
 template <typename T, int kHdIn, int kHdOut, int kTileN>
-void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens, cudaStream_t const stream);
+void invokeFusedAGemm(
+    T* output, T const* mat_a, T const* mat_b, T const* residual, int num_tokens, cudaStream_t const stream);
 
 template <typename T, int kHdIn, int kHdOut, int kTileN>
 void invokeFusedAGemmMxFp8(
