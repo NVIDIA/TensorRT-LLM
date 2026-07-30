@@ -56,6 +56,65 @@ from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
+# Fallbacks for pre-release K-EXAONE2 checkpoints whose config predates the
+# explicit `swiglu_limits` / `sliding_windows` lists. They reproduce the same
+# values the released config encodes.
+_K_EXAONE2_LEGACY_SWIGLU_LIMIT = 7.0
+_K_EXAONE2_LEGACY_SWIGLU_FIRST_LAYER = 62
+_K_EXAONE2_LEGACY_WIDE_WINDOW_LAYER = 1
+_K_EXAONE2_LEGACY_WIDE_WINDOW = 4096
+
+
+def is_k_exaone2(config: ExaoneMoeConfig) -> bool:
+    """Return whether the checkpoint uses the K-EXAONE2 architecture contract."""
+    return "ExaoneMoeForCausalLM" in (getattr(config, "architectures", None) or [])
+
+
+def _per_layer_list(config: ExaoneMoeConfig, name: str, layer_idx: int):
+    """Return `config.<name>` when it is a list long enough to cover `layer_idx`.
+
+    K-EXAONE2 encodes its per-layer contracts as plain lists in config.json.
+    When such a list is present it is authoritative for every layer it covers;
+    a 0 entry is the config's spelling of "not enabled on this layer".
+    """
+    values = getattr(config, name, None)
+    if values is None or layer_idx >= len(values):
+        return None
+    return values
+
+
+def get_exaone_swiglu_limit(config: ExaoneMoeConfig, layer_idx: int) -> Optional[float]:
+    """Return the per-layer SwiGLU clamp used by K-EXAONE2."""
+    limits = _per_layer_list(config, "swiglu_limits", layer_idx)
+    if limits is not None:
+        return float(limits[layer_idx]) or None
+    if is_k_exaone2(config) and layer_idx >= _K_EXAONE2_LEGACY_SWIGLU_FIRST_LAYER:
+        return _K_EXAONE2_LEGACY_SWIGLU_LIMIT
+    return None
+
+
+def get_exaone_attention_window(
+    config: ExaoneMoeConfig, layer_idx: int, is_mtp_layer: bool
+) -> Optional[int]:
+    """Return the effective attention window for an EXAONE-MoE layer."""
+    if is_mtp_layer:
+        # K-EXAONE2's MTP block is sliding; earlier EXAONE-MoE MTP is global.
+        mtp_layer_types = getattr(config, "mtp_layer_types", None)
+        if mtp_layer_types:
+            if mtp_layer_types[0] != "sliding_attention":
+                return None
+        elif not is_k_exaone2(config):
+            return None
+        return config.sliding_window
+    if config.layer_types[layer_idx] != "sliding_attention":
+        return None
+    windows = _per_layer_list(config, "sliding_windows", layer_idx)
+    if windows is not None:
+        return int(windows[layer_idx]) or None
+    if is_k_exaone2(config) and layer_idx == _K_EXAONE2_LEGACY_WIDE_WINDOW_LAYER:
+        return _K_EXAONE2_LEGACY_WIDE_WINDOW
+    return config.sliding_window
+
 
 def check_is_moe(config: ExaoneMoeConfig, layer_idx: int, is_mtp_layer: bool = False) -> bool:
     """
@@ -93,14 +152,12 @@ class ExaoneMoeAttention(QKNormRoPEAttention):
     ):
         config = model_config.pretrained_config
 
-        self.attention_window_size = None
-        # A MTP layer uses the global attention.
-        self.is_sliding = not is_mtp_layer and config.layer_types[layer_idx] == "sliding_attention"
+        self.attention_window_size = get_exaone_attention_window(config, layer_idx, is_mtp_layer)
+        self.is_sliding = self.attention_window_size is not None
 
         # NOTE: In ExaoneMoe, only sliding layers apply rope.
         pos_embd_params = None
         if self.is_sliding:
-            self.attention_window_size = config.sliding_window
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
                 rope=RopeParams.from_config(config),
@@ -207,6 +264,9 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         is_mtp_layer = False
         if layer_idx >= config.num_hidden_layers:
             is_mtp_layer = True
+        # The MTP block is dense but follows its own head contract; the K2
+        # late-layer clamp applies only to main decoder layers.
+        swiglu_limit = None if is_mtp_layer else get_exaone_swiglu_limit(config, layer_idx)
         self.self_attn = ExaoneMoeAttention(
             model_config, layer_idx=layer_idx, is_mtp_layer=is_mtp_layer
         )
@@ -228,6 +288,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 override_quant_config=quant_config,
                 aux_stream_dict=aux_stream_dict,
                 layer_idx=layer_idx,
+                swiglu_limit_scalar=swiglu_limit,
             )
         else:
             block_size = 1
@@ -250,6 +311,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
                 overridden_tp_size=self.mlp_tp_size,
                 layer_idx=layer_idx,
                 reduce_output=has_mlp_tp,
+                swiglu_limit=swiglu_limit,
             )
 
         self.disable_attn_allreduce = (
@@ -649,6 +711,7 @@ class ExaoneMoeModel(DecoderModel):
         return hidden_states
 
 
+@register_auto_model("ExaoneMoeForCausalLM")
 @register_auto_model("ExaoneMoEForCausalLM")
 class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoeConfig]):
     def __init__(

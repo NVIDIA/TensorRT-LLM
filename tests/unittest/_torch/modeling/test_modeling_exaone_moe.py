@@ -11,7 +11,13 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.exaone_moe_weight_mapper import ExaoneMoeWeightMapper
-from tensorrt_llm._torch.models.modeling_exaone_moe import ExaoneMoeForCausalLM
+from tensorrt_llm._torch.models.modeling_exaone_moe import (
+    ExaoneMoeForCausalLM,
+    get_exaone_attention_window,
+    get_exaone_swiglu_limit,
+    is_k_exaone2,
+)
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -90,6 +96,53 @@ class Scenario:
 
 
 class TestExaoneMoe(unittest.TestCase):
+    def test_k_exaone2_contract_overrides(self):
+        config_dict = deepcopy(EXAONE_MOE_CONFIG)
+        config_dict["architectures"] = ["ExaoneMoeForCausalLM"]
+        config = ExaoneMoeConfig.from_dict(config_dict)
+
+        self.assertIs(MODEL_CLASS_MAPPING["ExaoneMoeForCausalLM"], ExaoneMoeForCausalLM)
+        self.assertIs(MODEL_CLASS_MAPPING["ExaoneMoEForCausalLM"], ExaoneMoeForCausalLM)
+        self.assertTrue(is_k_exaone2(config))
+        self.assertEqual(get_exaone_attention_window(config, 0, False), WINDOW_SIZE)
+        self.assertEqual(get_exaone_attention_window(config, 1, False), 4096)
+        self.assertIsNone(get_exaone_attention_window(config, 3, False))
+        self.assertEqual(get_exaone_attention_window(config, 4, True), WINDOW_SIZE)
+        self.assertIsNone(get_exaone_swiglu_limit(config, 61))
+        self.assertEqual(get_exaone_swiglu_limit(config, 62), 7.0)
+
+        config.architectures = ["ExaoneMoEForCausalLM"]
+        self.assertFalse(is_k_exaone2(config))
+        self.assertEqual(get_exaone_attention_window(config, 1, False), WINDOW_SIZE)
+        self.assertIsNone(get_exaone_attention_window(config, 4, True))
+        self.assertIsNone(get_exaone_swiglu_limit(config, 62))
+
+    def test_k_exaone2_per_layer_config_lists(self):
+        """Released K-EXAONE2 configs carry the contracts as explicit lists."""
+        config_dict = deepcopy(EXAONE_MOE_CONFIG)
+        config_dict["architectures"] = ["ExaoneMoeForCausalLM"]
+        # 0 is the config's spelling of "not enabled for this layer".
+        config_dict["sliding_windows"] = [4096, 8192, WINDOW_SIZE, 0]
+        config_dict["swiglu_limits"] = [0.0, 0.0, 7.0, 5.0]
+        config_dict["mtp_layer_types"] = ["sliding_attention"]
+        config = ExaoneMoeConfig.from_dict(config_dict)
+
+        # The lists win over both `sliding_window` and the legacy fallbacks.
+        self.assertEqual(get_exaone_attention_window(config, 0, False), 4096)
+        self.assertEqual(get_exaone_attention_window(config, 1, False), 8192)
+        self.assertEqual(get_exaone_attention_window(config, 2, False), WINDOW_SIZE)
+        # Layer 3 is full attention, so its window stays unset.
+        self.assertIsNone(get_exaone_attention_window(config, 3, False))
+        self.assertEqual(get_exaone_attention_window(config, 0, True), WINDOW_SIZE)
+
+        self.assertIsNone(get_exaone_swiglu_limit(config, 0))
+        self.assertIsNone(get_exaone_swiglu_limit(config, 1))
+        self.assertEqual(get_exaone_swiglu_limit(config, 2), 7.0)
+        self.assertEqual(get_exaone_swiglu_limit(config, 3), 5.0)
+
+        config.mtp_layer_types = ["full_attention"]
+        self.assertIsNone(get_exaone_attention_window(config, 0, True))
+
     @parameterized.expand([None, "FP8"])
     def test_exaone_moe_sanity(self, quant_algo):
         """Test basic EXAONE-MoE model forward pass with optional quantization."""

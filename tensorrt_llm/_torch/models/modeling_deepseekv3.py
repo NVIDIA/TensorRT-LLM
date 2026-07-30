@@ -74,8 +74,8 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata
-from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
-                     create_lm_head_tp_mapping)
+from ..utils import (ActivationType, AuxStreamType, EventType,
+                     Fp4QuantizedTensor, create_lm_head_tp_mapping)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
@@ -957,7 +957,8 @@ class Deepseekv3MoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
                  override_quant_config: Optional[QuantConfig] = None,
-                 layer_idx: Optional[int] = None):
+                 layer_idx: Optional[int] = None,
+                 swiglu_limit_scalar: Optional[float] = None):
         from ..distributed import AllReduce
 
         super().__init__()
@@ -1000,6 +1001,15 @@ class Deepseekv3MoE(nn.Module):
                     model_config,
                     layer_idx).layer_quant_mode.is_int4_weight_only_per_group()
                 else MoEWeightLoadingMode.VANILLA),
+            swiglu_limit_scalar=swiglu_limit_scalar,
+            # The CUTLASS-family fused MoE only honors a SwiGLU clamp through
+            # `SwigluBiasAdaptor`, which is selected by `SwigluBias`. Plain
+            # `Swiglu` dispatches `GLUAdaptor`, whose `limit` field is declared
+            # but never read, so the clamp would be silently dropped. With no
+            # alpha/beta tensors that adaptor uses alpha=1.0 and beta=0.0, i.e.
+            # exactly silu(min(gate, limit)) * clamp(linear, -limit, limit).
+            activation_type=(ActivationType.SwigluBias if swiglu_limit_scalar
+                             is not None else ActivationType.Swiglu),
         )
 
         self.mapping = model_config.mapping
@@ -1030,6 +1040,7 @@ class Deepseekv3MoE(nn.Module):
             overridden_tp_size=self.shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            swiglu_limit=swiglu_limit_scalar,
         )
         self.shared_experts_use_fp4 = (
             shared_quant_config is not None
