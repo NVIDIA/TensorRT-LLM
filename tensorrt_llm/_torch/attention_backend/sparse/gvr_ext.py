@@ -52,12 +52,7 @@ class GvrExtState:
     """Per-attention-backend emission state (persistent buffers)."""
 
     def __init__(
-        self,
-        max_rows: int,
-        top_k: int,
-        device: torch.device,
-        enable_list_tier: bool = True,
-        enable_fused_handshake: bool = False,
+        self, max_rows: int, top_k: int, device: torch.device, enable_list_tier: bool = True
     ):
         self.max_rows = max_rows
         self.top_k = top_k
@@ -85,12 +80,6 @@ class GvrExtState:
         # tier the PREVIOUS indexer call emitted (what this step's
         # top-k may consume); "rungs" until the first emission lands
         self.emitted_tier = "rungs"
-        # fused-handshake arrival counters (zero-once: the consumer
-        # resets each row right after gating on it, so steady-state
-        # layer-to-layer reuse needs no host-side zeroing)
-        self.arrival: Optional[torch.Tensor] = None
-        if enable_fused_handshake:
-            self.arrival = torch.zeros((max_rows,), dtype=torch.int32, device=device)
 
     def ensure_block_max(self, max_seq_len: int) -> torch.Tensor:
         nb4 = ((max_seq_len + 255) // 256 * 256) // 128 * 4
