@@ -3605,9 +3605,9 @@ class PyTorchModelEngine(ModelEngine):
         self.input_processor_with_hash = None
 
         ub_buffers = getattr(self, 'ub_buffers', None)
+        ub_errors = []
         if ub_buffers:
             remaining_ub_buffers = []
-            ub_errors = []
             for u in ub_buffers:
                 try:
                     ub.ub_deallocate(u.addr)
@@ -3618,10 +3618,6 @@ class PyTorchModelEngine(ModelEngine):
                     remaining_ub_buffers.append(u)
                     ub_errors.append(e)
             self.ub_buffers = remaining_ub_buffers or None
-            if ub_errors:
-                raise RuntimeError(
-                    "Failed to deallocate one or more userbuffers during "
-                    "PyTorchModelEngine cleanup") from ub_errors[0]
 
         # Release model weights and tensor-owned userbuffers before shutting
         # down the engine-scoped userbuffer manager.
@@ -3629,6 +3625,11 @@ class PyTorchModelEngine(ModelEngine):
         if self._userbuffers_manager_initialized:
             ub.shutdown_userbuffers_manager()
             self._userbuffers_manager_initialized = False
+
+        if ub_errors:
+            raise RuntimeError(
+                "Failed to deallocate one or more userbuffers during "
+                "PyTorchModelEngine cleanup") from ub_errors[0]
         self._cleanup_done = True
 
     def __del__(self) -> None:

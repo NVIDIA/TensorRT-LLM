@@ -1237,6 +1237,35 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
         torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
+    def test_cleanup_shuts_down_manager_after_legacy_userbuffer_error(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine._cleanup_done = False
+        engine.model_loader = None
+        engine.model = Mock()
+        engine._release_cuda_graphs = Mock()
+        engine.input_processor = Mock()
+        engine.input_processor_with_hash = Mock()
+        engine.ub_buffers = [Mock(addr=123)]
+        engine._userbuffers_manager_initialized = True
+
+        legacy_error = RuntimeError("legacy userbuffer cleanup failed")
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.ub.ub_deallocate",
+                side_effect=legacy_error), patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine."
+                    "ub.shutdown_userbuffers_manager") as shutdown_manager, \
+                patch("tensorrt_llm._torch.pyexecutor.model_engine.release_gc"):
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Failed to deallocate one or more userbuffers"):
+                engine.cleanup()
+
+        shutdown_manager.assert_called_once_with()
+        self.assertFalse(engine._userbuffers_manager_initialized)
+        self.assertEqual(len(engine.ub_buffers), 1)
+        self.assertFalse(engine._cleanup_done)
+
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
         request = LlmRequest(
