@@ -1,0 +1,201 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""POC: constrain LLVM BOLT instrumentation profiles to steady state.
+
+When TensorRT-LLM libraries are BOLT-instrumented, the profile counters
+accumulate from process start, so a single workload run produces `.fdata`
+dominated by one-time startup (weight load, NVRTC/jitify compiles, autotuning,
+CUDA-graph capture) rather than steady-state serving. BOLT's instrumentation
+runtime exposes ``__bolt_instr_clear_counters()`` to reset counters and begin a
+fresh profiling phase (see llvm ``bolt/runtime/instr.cpp``).
+
+This module calls that function, once, at the end of engine warmup -- after all
+JIT / autotune / graph-capture has happened but before the measured requests --
+so the resulting profile reflects steady state only.
+
+Key facts driving the design:
+  * The runtime (and thus the symbol) is embedded *into each instrumented .so*
+    at instrument time. Nothing is downloaded or dlopen'd at runtime; we only
+    resolve + call a symbol that already lives in the loaded libraries.
+  * A single BOLT run instruments MULTIPLE objects (libtensorrt_llm.so,
+    libnvinfer_plugin_tensorrt_llm.so, libth_common.so, the Python bindings,
+    libtriton_tensorrtllm.so). Each embeds its own runtime and its own copy of
+    the symbol + counters, so we must clear EVERY instrumented lib loaded in the
+    process, not just one.
+  * The symbol may be hidden-visibility (not in .dynsym), so a plain dlsym can
+    fail; we fall back to resolving its address from the ELF symbol table plus
+    the library's load base in /proc/self/maps.
+
+Entirely gated by ``TLLM_BOLT_CLEAR_COUNTERS=1`` -- a complete no-op otherwise,
+so it is inert on every normal (non-instrumented) build.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import re
+import subprocess
+from typing import Dict, List, Optional
+
+from tensorrt_llm.logger import logger
+
+#: CI sets this to "1" only in the BOLT profile-generation job.
+CLEAR_COUNTERS_ENV = "TLLM_BOLT_CLEAR_COUNTERS"
+
+#: The BOLT runtime entry point that zeroes all instrumentation counters.
+CLEAR_SYMBOL = "__bolt_instr_clear_counters"
+
+#: Basenames (substring match) of the objects we BOLT-instrument. Mirrors the
+#: target set in scripts/bolt/bolt_lib.sh (P0 native libs + P1 bindings/triton).
+_TARGET_LIB_SUBSTRINGS = (
+    "libtensorrt_llm.so",
+    "libnvinfer_plugin_tensorrt_llm.so",
+    "libth_common.so",
+    "libtriton_tensorrtllm.so",
+    "bindings",  # bindings.cpython-<ver>-<arch>.so
+)
+
+# One-shot latch: warmup can be re-entered in some paths; only clear once.
+_already_cleared = False
+
+
+def _is_enabled() -> bool:
+    return os.environ.get(CLEAR_COUNTERS_ENV, "").strip() == "1"
+
+
+def _iter_loaded_target_libs() -> Dict[str, int]:
+    """Map {realpath: load_base} for loaded libs matching the instrument set.
+
+    load_base is the lowest mapped address for the file in /proc/self/maps,
+    which for a shared object is what a symbol's ELF st_value is relative to.
+    """
+    libs: Dict[str, int] = {}
+    try:
+        with open("/proc/self/maps", "r") as f:
+            maps = f.read()
+    except OSError as e:
+        logger.warning(f"[bolt] cannot read /proc/self/maps: {e}")
+        return libs
+
+    for line in maps.splitlines():
+        # Format: <start>-<end> perms offset dev inode  pathname
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        path = parts[-1]
+        if not path.startswith("/"):
+            continue
+        base_name = os.path.basename(path)
+        if not any(s in base_name for s in _TARGET_LIB_SUBSTRINGS):
+            continue
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            real = path
+        start = int(line.split("-", 1)[0], 16)
+        # Keep the lowest start seen for this file == load base.
+        if real not in libs or start < libs[real]:
+            libs[real] = start
+    return libs
+
+
+def _call_via_dlsym(path: str) -> bool:
+    """Try to resolve + call the symbol via a per-lib handle (dynsym path)."""
+    try:
+        # RTLD_NOLOAD: get a handle to the already-loaded lib, don't reload it.
+        handle = ctypes.CDLL(path, mode=os.RTLD_NOLOAD)
+    except OSError:
+        return False
+    try:
+        fn = getattr(handle, CLEAR_SYMBOL)
+    except AttributeError:
+        return False  # hidden visibility -> not in .dynsym
+    fn.restype = None
+    fn.argtypes = []
+    fn()
+    return True
+
+
+def _symbol_offset(path: str) -> Optional[int]:
+    """Read st_value for CLEAR_SYMBOL from the ELF symbol table via readelf."""
+    try:
+        out = subprocess.check_output(
+            ["readelf", "-sW", path],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    # readelf -sW rows: Num: Value Size Type Bind Vis Ndx Name
+    for line in out.splitlines():
+        if CLEAR_SYMBOL not in line:
+            continue
+        m = re.match(r"\s*\d+:\s+([0-9a-fA-F]+)\s+\d+\s+FUNC", line)
+        if m:
+            return int(m.group(1), 16)
+    return None
+
+
+def _call_via_address(path: str, load_base: int) -> bool:
+    """Fallback: compute the symbol's runtime address and call it directly."""
+    offset = _symbol_offset(path)
+    if offset is None:
+        return False
+    addr = load_base + offset
+    proto = ctypes.CFUNCTYPE(None)
+    try:
+        proto(addr)()
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def maybe_bolt_clear_counters() -> int:
+    """Clear BOLT counters for every instrumented lib in this process (once).
+
+    Returns the number of libraries successfully cleared (0 when disabled or on
+    a non-instrumented build). Safe no-op unless ``TLLM_BOLT_CLEAR_COUNTERS=1``.
+    """
+    global _already_cleared
+    if _already_cleared or not _is_enabled():
+        return 0
+
+    libs = _iter_loaded_target_libs()
+    if not libs:
+        logger.info(
+            "[bolt] TLLM_BOLT_CLEAR_COUNTERS set but no instrumented target "
+            "libs found in /proc/self/maps (non-instrumented build?)"
+        )
+        _already_cleared = True
+        return 0
+
+    cleared: List[str] = []
+    for path, load_base in libs.items():
+        if _call_via_dlsym(path) or _call_via_address(path, load_base):
+            cleared.append(os.path.basename(path))
+        else:
+            logger.warning(
+                f"[bolt] could not resolve {CLEAR_SYMBOL} in {path} "
+                "(not instrumented, or symbol stripped)"
+            )
+
+    _already_cleared = True
+    if cleared:
+        logger.info(
+            f"[bolt] cleared instrumentation counters after warmup for "
+            f"{len(cleared)} lib(s): {', '.join(sorted(cleared))}"
+        )
+    return len(cleared)
