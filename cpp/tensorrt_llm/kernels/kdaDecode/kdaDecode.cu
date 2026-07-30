@@ -1609,7 +1609,22 @@ void launch_kda_decode_compact_heads_cuda(void const* x_q, void const* x_k, void
     KdaDecodeLaunchParams const params{x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v,
         a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, state_slot_stride, out, B,
         H, HV, update_conv_cache, lower_bound, scale, onorm_eps, stream};
-    dispatch_kda_decode_layout<true, 2>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid);
+    switch (H)
+    {
+    case 1: dispatch_kda_decode_layout<true, 1>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 2: dispatch_kda_decode_layout<true, 2>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 3: dispatch_kda_decode_layout<true, 3>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 4: dispatch_kda_decode_layout<true, 4>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 6: dispatch_kda_decode_layout<true, 6>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 8: dispatch_kda_decode_layout<true, 8>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 12: dispatch_kda_decode_layout<true, 12>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 16: dispatch_kda_decode_layout<true, 16>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 24: dispatch_kda_decode_layout<true, 24>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 32: dispatch_kda_decode_layout<true, 32>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 48: dispatch_kda_decode_layout<true, 48>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    case 96: dispatch_kda_decode_layout<true, 96>(params, apply_onorm, use_lower_bound, apply_beta_sigmoid); break;
+    default: TLLM_CHECK_WITH_INFO(false, "KDA compact-heads decode does not support numHeads=%d", H);
+    }
 }
 
 void launch_kda_decode_many_heads_cuda(void const* x_q, void const* x_k, void const* x_v, void const* w_q_t,
@@ -1645,7 +1660,7 @@ void launch_kda_decode_many_heads_cuda(void const* x_q, void const* x_k, void co
 void invokeKdaDecode(KdaDecodeParams const& params, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(params.numHeads == params.numValueHeads, "KDA decode requires numHeads == numValueHeads");
-    bool const useCompactHeads = params.numHeads == 2 && params.numValueHeads == 2;
+    bool const useCompactHeads = shouldUseCompactHeads(params.batchSize, params.numHeads, params.numValueHeads);
     if (useCompactHeads)
     {
         launch_kda_decode_compact_heads_cuda(params.xQ, params.xK, params.xV, params.wQT, params.wKT, params.wVT,
