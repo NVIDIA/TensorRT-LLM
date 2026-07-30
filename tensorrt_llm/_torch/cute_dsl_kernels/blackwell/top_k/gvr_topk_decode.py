@@ -296,6 +296,7 @@ class GvrTopKKernel:
         p4_exact_tail: Optional[bool] = None,
         p4_tail_fast: Optional[bool] = None,  # [p4tt]
         p4_tail_v3: bool = False,
+        p1r_rescue: bool = True,
         p4_warp_redundant: bool = True,
         p2_warp_redundant: bool = True,
         enable_block_skip: bool = False,
@@ -751,6 +752,12 @@ class GvrTopKKernel:
         # select. Off by default - the stock body is what upstream
         # emits, and this rewrite only pays at K>=1024.
         self.p4_tail_v3 = bool(p4_tail_v3)
+        # p1r_rescue: rebuild the refine bracket from the row when the
+        # seed bracket is degenerate. ON by default - upstream's identity
+        # shortcut is wrong on real data (every request's first decode
+        # step feeds a zero-init prev_topk). The knob exists to measure
+        # its cost, not to ship it off.
+        self.p1r_rescue = bool(p1r_rescue)
 
     # ------------------------------------------------------------------
     # SMEM slice cache loader. Streams this CTA's slice GMEM → SMEM via
@@ -6069,22 +6076,23 @@ class GvrTopKKernel:
         # If the bracket is STILL degenerate after the rescue, every
         # in-range value is identical (or N <= K), and identity output is
         # then exact — keep the shortcut for exactly those rows.
-        v_lo = s_thr[1]
-        v_hi = s_thr[2]
-        if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
-            if N > cutlass.Int32(self.top_k):
-                self.phase1r_data_reseed(
-                    input_row,
-                    N,
-                    smem_wmin,
-                    smem_wmax,
-                    s_thr,
-                    s_iscalars,
-                    s_mt_thr,
-                    tidx,
-                    warp_id,
-                    lane,
-                )
+        if cutlass.const_expr(self.p1r_rescue):
+            v_lo = s_thr[1]
+            v_hi = s_thr[2]
+            if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
+                if N > cutlass.Int32(self.top_k):
+                    self.phase1r_data_reseed(
+                        input_row,
+                        N,
+                        smem_wmin,
+                        smem_wmax,
+                        s_thr,
+                        s_iscalars,
+                        s_mt_thr,
+                        tidx,
+                        warp_id,
+                        lane,
+                    )
         v_lo = s_thr[1]
         v_hi = s_thr[2]
         if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
