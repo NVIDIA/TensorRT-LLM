@@ -254,16 +254,13 @@ def reuse_match_pages(
                 pages.append((slot_id, None if num_tokens_in_block < 0 else num_tokens_in_block))
         return num_tokens, pages
 
-    from ._utils import unwrap_rawref
-
     match = manager._radix_tree.match(reuse_scope, list(tokens), enable_partial)
     py_pages: list[tuple[int, int | None] | None] = []
     for block in match.blocks:
-        ref = block.storage[lc_id]
-        if ref is None:
+        page = block.get_page(lc_id)
+        if page is None:
             py_pages.append(None)
         else:
-            page = unwrap_rawref(ref)
             py_pages.append((page.slot_id, getattr(page, "num_tokens_in_block", None)))
     return match.num_tokens, py_pages
 
@@ -286,13 +283,11 @@ def reuse_match_planned_drop_counts(
             manager, reuse_scope, list(tokens), lc_id, enable_partial
         )
 
-    from ._utils import unwrap_rawref
-
     match = manager._radix_tree.match(reuse_scope, list(tokens), enable_partial)
     counts: list[int | None] = []
     for block in match.blocks:
-        ref = block.storage[lc_id]
-        counts.append(None if ref is None else unwrap_rawref(ref).planned_drop_count)
+        page = block.get_page(lc_id)
+        counts.append(None if page is None else page.planned_drop_count)
     return match.num_tokens, counts
 
 

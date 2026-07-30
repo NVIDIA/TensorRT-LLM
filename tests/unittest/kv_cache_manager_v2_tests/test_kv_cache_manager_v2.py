@@ -745,6 +745,39 @@ class TestNoBatching(TestKVCacheManagerV2):
         with self.assertRaisesRegex(ValueError, "already been dropped"):
             long_handle.drop()
 
+    def test_planned_drop_handle_rejects_partial_coverage(self) -> None:
+        window_size = 8
+        tokens_per_block = 8
+        self.prepare(16 << 20, 0, 0, 2, window_size, 0, tokens_per_block=tokens_per_block)
+        tokens = [self.next_token() for _ in range(3 * tokens_per_block)]
+
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            kv_cache = self.manager.create_kv_cache(None, tokens)
+            self.assertTrue(kv_cache.resume(stream))
+            self.assertTrue(kv_cache.resize(len(tokens)))
+            kv_cache.commit(tokens)
+            kv_cache.stop_committing()
+
+            swa_lc_id = next(
+                lc_id
+                for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
+                if lc.window_size is not None
+            )
+            tree_block = kv_cache._blocks[2].tree_block
+            assert tree_block is not None
+            page = tree_block.get_page(swa_lc_id)
+            assert page is not None
+            self.assertEqual(page.num_tokens_in_block, len(tree_block.tokens))
+
+            page.num_tokens_in_block -= 1
+            try:
+                self.assertIsNone(kv_cache.plan_committed_block_drop())
+            finally:
+                page.num_tokens_in_block += 1
+                kv_cache.close()
+        stream_holder.take_finish_event().synchronize()
+
     def test_reuse_scope_isolates_reuse(self) -> None:
         self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)
         tokens = [TokenId(i) for i in range(64)]
@@ -2497,6 +2530,45 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(ssm_page[0], ssm_slot)
         self.assertEqual(ssm_page[1], 16)
 
+    def test_ssm_snapshot_moves_to_covering_block(self) -> None:
+        """A snapshot on a partial block survives the full sibling that replaces it."""
+        tokens_per_block = 32
+        cfg = self._make_ssm_config(tokens_per_block=tokens_per_block, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(96)]
+        assert self.manager._life_cycles.ssm_life_cycle_id is not None
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+
+        # Turn 1 ends at 48 tokens, i.e. 16 tokens into block 1.
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = 48
+        kv1.history_length = 48
+        kv1.commit(prompt[:48])
+        kv1.close()
+
+        # Turn 2 fills blocks 0..2. Block 1 becomes a full 32-token block that replaces the
+        # 16-token one, and its own SSM snapshot is taken on block 2, not block 1 -- so
+        # without moving the pages over, the 48-token endpoint would be lost.
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        kv2.resume(stream)
+        kv2.capacity = len(prompt)
+        kv2.history_length = len(prompt)
+        kv2.commit(prompt[kv2.num_committed_tokens :])
+        kv2.close()
+
+        match = self.manager._radix_tree.match(ReuseScope(), prompt[:48], True)
+        self.assertEqual(match.num_tokens, 48)
+        block = match.blocks[-1]
+        self.assertEqual(len(block.tokens), tokens_per_block)
+        self.assertEqual(block.page_coverage(ssm_lc_id), 16)
+
+        del match, block, kv1, kv2
+        gc.collect()
+        stream_holder.synchronize()
+
     def test_commit_min_snapshot_requires_history_alignment(self) -> None:
         """commit_min_snapshot requires commit() to start or end at history length."""
         cfg = self._make_ssm_config(tokens_per_block=32)
@@ -3778,6 +3850,193 @@ class TestScratchReuse(TestKVCacheManagerV2):
             kv2.close()
         s.take_finish_event().synchronize()
         self.manager.clear_reusable_blocks()
+
+
+class TestPartialCoverageReuse(TestKVCacheManagerV2):
+    """Pages that cover fewer tokens than their block spans.
+
+    A rewind endpoint (a partial trailing block, e.g. 16 tokens of a 32-token block) used
+    to be destroyed when a longer sibling was created, or refused when it was created
+    second. The covering block may not have a committable page for every life cycle at
+    that boundary. For SWA, commit_min_snapshot releases out-of-window
+    pages, while scratch reuse uses temporary shared storage that is not preserved as a
+    per-block page. Moving the partial sibling's pages into the covering block keeps the
+    endpoint reusable, with each page tagged by its recorded token count.
+    """
+
+    TOKENS_PER_BLOCK = 32
+    WINDOW_SIZE = 16
+
+    def prepare_partial(self, gpu_quota: int = 64 << 20, window_size: int | None = None) -> None:
+        kv_buf_size = 8192
+        window_size = self.WINDOW_SIZE if window_size is None else window_size
+        self.cfg = KVCacheManagerConfig(
+            tokens_per_block=self.TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=kv_buf_size),
+                        BufferConfig(role=Role.VALUE, size=kv_buf_size),
+                    ],
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=kv_buf_size),
+                        BufferConfig(role=Role.VALUE, size=kv_buf_size),
+                    ],
+                    sliding_window_size=window_size,
+                ),
+            ],
+            enable_partial_reuse=True,
+            commit_min_snapshot=True,
+        )
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+
+    @property
+    def _full_attn_lc_id(self) -> LayerGroupId:
+        return next(
+            lc_id
+            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
+            if lc.window_size is None
+        )
+
+    @property
+    def _swa_lc_id(self) -> LayerGroupId:
+        return next(
+            lc_id
+            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
+            if lc.window_size is not None
+        )
+
+    def run_turn(self, prompt: list[TokenIdExt], refcheck: bool = False) -> int:
+        """Reuse what we can, prefill the rest, commit, close. Returns the reused count.
+
+        `refcheck` runs FakeEngine, which validates the reused history KV against the
+        expected values for every layer group, so a clean run proves the reused pages hold
+        real data rather than uninitialized memory. It requires `resize()` to declare the
+        pre-prefill history length so that every block the engine writes is in the SWA
+        window; without it the manager is told the final length up front and skips
+        allocating out-of-window blocks -- which is exactly the situation that leaves a
+        partial page behind, so the two cannot be combined in the same turn.
+        """
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            kv_cache = self.manager.create_kv_cache(input_tokens=prompt)
+            num_reused = kv_cache.num_committed_tokens
+            self.assertTrue(kv_cache.resume(stream))
+            self.assertTrue(kv_cache.resize(len(prompt), num_reused if refcheck else len(prompt)))
+            history = list(prompt[:num_reused])
+            inp = list(prompt[num_reused:])
+            if refcheck:
+                self.engine.execute([Step(kv_cache, inp, history)], stream)
+            kv_cache.commit(inp)
+            kv_cache.close()
+        s.take_finish_event().synchronize()
+        return num_reused
+
+    def _partial_block(self, prompt: list[TokenIdExt]):
+        """The tree block holding the tail of `prompt` (block 2 in these tests)."""
+        match = self.manager._radix_tree.match(ReuseScope(), prompt, True)
+        return match.blocks[-1]
+
+    def test_rewind_endpoint_survives_longer_sibling_created_after(self) -> None:
+        self.prepare_partial()
+        base = [TokenId(i) for i in range(80)]
+        extended = base + [TokenId(i) for i in range(1000, 1080)]
+        rewind = base + [TokenId(2000)]
+
+        self.assertEqual(self.run_turn(base), 0)
+        self.assertEqual(self.run_turn(extended), len(base))
+        # The 16-token endpoint block is gone, but its SWA page moved into the full
+        # 32-token sibling and still covers the first 16 tokens.
+        block = self._partial_block(rewind)
+        self.assertEqual(len(block.tokens), self.TOKENS_PER_BLOCK)
+        self.assertEqual(block.page_coverage(self._full_attn_lc_id), self.TOKENS_PER_BLOCK)
+        self.assertEqual(block.page_coverage(self._swa_lc_id), len(base) % self.TOKENS_PER_BLOCK)
+        del block
+        self.assertEqual(self.manager.probe_reuse(input_tokens=rewind), len(base))
+        # The partial SWA page is stale at the longer endpoint and must not constrain
+        # the full-attention lifecycle's reusable prefix.
+        self.assertEqual(self.manager.probe_reuse(input_tokens=extended), len(extended))
+
+    def test_rewind_endpoint_attaches_to_longer_sibling_created_before(self) -> None:
+        self.prepare_partial()
+        base = [TokenId(i) for i in range(80)]
+        extended = base + [TokenId(i) for i in range(1000, 1080)]
+        rewind = base + [TokenId(2000)]
+
+        self.assertEqual(self.run_turn(extended), 0)
+        # Block 2 already spans 32 tokens, so the 80-token prompt cannot create its own
+        # 16-token endpoint block; its partial pages are attached to the longer sibling.
+        self.assertEqual(self.run_turn(base), 0)
+        self.assertEqual(self.manager.probe_reuse(input_tokens=rewind), len(base))
+
+    def test_reused_partial_coverage_kv_is_correct(self) -> None:
+        """The salvaged endpoint must hold real KV, not uninitialized memory."""
+        self.prepare_partial()
+        base = [TokenId(i) for i in range(80)]
+        extended = base + [TokenId(i) for i in range(1000, 1080)]
+        rewind = base + [TokenId(3000 + i) for i in range(40)]
+
+        self.run_turn(base, refcheck=True)
+        self.run_turn(extended)
+        # FakeEngine checks every reused history token of both layer groups, including the
+        # 16 tokens of block 2 that only the salvaged partial SWA page covers.
+        self.assertEqual(self.run_turn(rewind, refcheck=True), len(base))
+
+    def test_exact_boundary_ignores_stale_last_block_partial_coverage(self) -> None:
+        self.prepare_partial(window_size=1)
+        base = [TokenId(i) for i in range(80)]
+        boundary = base + [TokenId(i) for i in range(1000, 1016)]
+
+        self.assertEqual(self.run_turn(base), 0)
+        self.assertEqual(self.run_turn(boundary), len(base))
+
+        block = self._partial_block(boundary)
+        self.assertEqual(block.page_coverage(self._full_attn_lc_id), self.TOKENS_PER_BLOCK)
+        self.assertEqual(block.page_coverage(self._swa_lc_id), 16)
+        del block
+        # At the 96-token boundary the input token is the entire size-1 SWA window, so no
+        # historical SWA block is active. The partial SWA page must not constrain the full
+        # attention lifecycle's reusable prefix.
+        self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), len(boundary))
+
+    def test_page_coverage_only_grows(self) -> None:
+        self.prepare_partial()
+        base = [TokenId(i) for i in range(80)]
+        longer_partial = base + [TokenId(i) for i in range(1000, 1008)]  # 88 tokens
+        rewind = base + [TokenId(2000)]
+
+        self.run_turn(base)
+        block = self._partial_block(rewind)
+        self.assertEqual(block.page_coverage(self._swa_lc_id), 16)
+        del block
+
+        self.run_turn(longer_partial)
+        block = self._partial_block(rewind)
+        # A slot keeps only the widest page. The 24-token snapshot supersedes the 16-token
+        # one, and it still covers the shorter rewind endpoint.
+        self.assertEqual(block.page_coverage(self._swa_lc_id), 24)
+        del block
+        self.assertEqual(self.manager.probe_reuse(input_tokens=rewind), len(base))
+        self.assertEqual(
+            self.manager.probe_reuse(input_tokens=longer_partial + [TokenId(2000)]),
+            len(longer_partial),
+        )
+
+        # A later shorter snapshot cannot replace the wider page.
+        self.assertEqual(self.run_turn(base), len(base))
+        block = self._partial_block(rewind)
+        self.assertEqual(block.page_coverage(self._swa_lc_id), 24)
+        del block
+        self.assertEqual(
+            self.manager.probe_reuse(input_tokens=longer_partial + [TokenId(2000)]),
+            len(longer_partial),
+        )
 
 
 class TestSlotAllocatorShrink(unittest.TestCase):
