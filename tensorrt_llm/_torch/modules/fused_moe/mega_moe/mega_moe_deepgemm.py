@@ -564,8 +564,9 @@ class MegaMoEDeepGemm(MoE):
                 self.routing_method.experts_per_token,
                 self.hidden_size,
                 self.intermediate_size,
-                True,
-                self.activation,
+                num_shared_experts=0,
+                mma_type="fp8xfp4",
+                activation=self.activation,
             )
             _MEGA_MOE_SYMM_BUFFER_CACHE[key] = cached
             # Log only on the first layer; deeper layers reuse the cache

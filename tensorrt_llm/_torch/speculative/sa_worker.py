@@ -31,6 +31,7 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
+from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecMetadata, SpecWorkerBase
 from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
@@ -179,6 +180,20 @@ class SAWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata
         )
+
+        # Hybrid (SSM/recurrent) models: promote the accepted step's
+        # recurrent state from the verification scratch buffers into the
+        # live pools — verification never writes the pools in place (a
+        # rejected draft would corrupt them). Same call site as the other
+        # one-engine workers (dflash/eagle3); no-op for pure-attention
+        # models via the isinstance gate.
+        num_gens = batch_size - num_contexts
+        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
 
         # Step 3-4: Extend SA and generate next draft tokens using GPU kernel
         next_draft_tokens = self._generate_draft_tokens(
