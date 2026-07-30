@@ -656,6 +656,26 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
 
+def test_kimi_defaults_to_v2(monkeypatch):
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+    model_defaults = KimiLinearForCausalLM.get_model_defaults(llm_args)
+    apply_model_defaults_to_llm_args(llm_args, model_defaults)
+    _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults, original_setting="auto")
+
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+    assert llm_args.kv_cache_config.enable_block_reuse is False
+    assert llm_args.kv_cache_config.tokens_per_block == 64
+    assert (
+        get_kv_cache_manager_cls(_hybrid_model_config(), llm_args.kv_cache_config)
+        is MambaHybridCacheManagerV2
+    )
+
+
 def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 0
