@@ -77,7 +77,7 @@ def test_fused_dup_up3d_empty_input_uses_eager(
     module = DupUp3D(4, 4, factor_t=2, factor_s=2)
     expected = module(x.cpu(), first_chunk=first_chunk).cuda()
 
-    def fail_if_launched(*args, **kwargs):
+    def fail_if_launched(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Empty inputs must bypass the fused DupUp3D kernel")
 
     monkeypatch.setattr(dup_up3d_module, "dup_up3d", fail_if_launched)
