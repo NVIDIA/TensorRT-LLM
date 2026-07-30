@@ -27,6 +27,40 @@ SUBMIT_PATHS = (
     REPO_ROOT / "jenkins" / "scripts" / "perf" / "local" / "submit.py",
 )
 DISAGG_CONFIG_DIR = REPO_ROOT / "tests" / "scripts" / "perf-sanity" / "disaggregated"
+PR16645_MAIN_AB_CONFIG = (
+    DISAGG_CONFIG_DIR
+    / "gb300_deepseek-r1-fp4_128k8k_con256_ctx1_pp4_gen1_dep8_eplb0_mtp1_ccb-NIXL.yaml"
+)
+
+
+def test_pr16645_main_ab_config_holds_common_python_context_first_workload():
+    with open(PR16645_MAIN_AB_CONFIG) as config_file:
+        config = yaml.safe_load(config_file)
+
+    benchmark = config["benchmark"]
+    worker_config = config["worker_config"]
+    ctx_env = dict(
+        item.split("=", 1)
+        for item in config["environment"]["ctx_worker_env_var"].split()
+        if "=" in item
+    )
+
+    assert config["server_config_extra"] == {"schedule_style": "context_first"}
+    assert benchmark["multi_round"] == 1
+    assert benchmark["post_benchmark_drain_seconds"] == 60
+    assert benchmark["concurrency_list"] == "256"
+    assert {
+        role: worker_config[role]["cache_transceiver_config"]["transceiver_runtime"]
+        for role in ("ctx", "gen")
+    } == {"ctx": "PYTHON", "gen": "PYTHON"}
+    assert {
+        role: worker_config[role]["cache_transceiver_config"]["max_tokens_in_buffer"]
+        for role in ("ctx", "gen")
+    } == {"ctx": 131104, "gen": 131104}
+    assert ctx_env == {
+        "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS": "1",
+        "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_PEER_READY_CONSENSUS": "1",
+    }
 
 
 @pytest.fixture(params=SUBMIT_PATHS, ids=("ci", "local"))

@@ -35,6 +35,7 @@ from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
+from .disagg_server_config import build_disagg_server_config
 from .perf_regression_utils import process_and_upload_test_results
 
 # Sanity-side path differs from test_perf for this key; preserve historical value.
@@ -1069,6 +1070,8 @@ class DisaggConfig:
         model_name: str,
         hardware: dict,
         server_env_var: str,
+        post_benchmark_drain_seconds: float = 0.0,
+        server_config_extra: Optional[Dict] = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1079,6 +1082,8 @@ class DisaggConfig:
         self.model_name = model_name
         self.hardware = hardware
         self.server_env_var = server_env_var
+        self.post_benchmark_drain_seconds = post_benchmark_drain_seconds
+        self.server_config_extra = dict(server_config_extra or {})
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -1210,6 +1215,7 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    post_benchmark_drain_seconds: float = 0.0
     client_configs: Dict[int, List["ClientConfig"]] = {}
     # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
     # Used by run_cmd() to merge per-config env vars into the appropriate
@@ -1270,19 +1276,18 @@ class DisaggTestCmds(NamedTuple):
         # where another process on the same node grabs the port.
         disagg_server_port = get_free_port()
 
-        server_config = {
-            "hostname": self.hostname,
-            "port": disagg_server_port,
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": self.num_ctx_servers,
-                "urls": ctx_hostnames,
-            },
-            "generation_servers": {
-                "num_instances": self.num_gen_servers,
-                "urls": gen_hostnames,
-            },
-        }
+        server_config_extra = {}
+        if server_idx < len(self.server_configs):
+            server_config_extra = self.server_configs[server_idx][2].server_config_extra
+        server_config = build_disagg_server_config(
+            hostname=self.hostname,
+            port=disagg_server_port,
+            num_ctx_servers=self.num_ctx_servers,
+            num_gen_servers=self.num_gen_servers,
+            ctx_hostnames=ctx_hostnames,
+            gen_hostnames=gen_hostnames,
+            server_config_extra=server_config_extra,
+        )
         config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         with open(config_path, "w") as f:
             yaml.dump(server_config, f)
@@ -1504,6 +1509,7 @@ class DisaggTestCmds(NamedTuple):
             # the loop (as before) could read a truncated / not-yet-flushed log
             # and report a wrong mean (nvbugs 6487036 / 6487040).
             pending_device_step_time: List[dict] = []
+            benchmark_completed = False
             try:
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
@@ -1592,8 +1598,16 @@ class DisaggTestCmds(NamedTuple):
                         output_dir=self.test_output_dir,
                         server_idx=server_idx,
                     )
+                benchmark_completed = True
 
             finally:
+                if benchmark_completed and self.post_benchmark_drain_seconds > 0:
+                    print_info(
+                        "Benchmark clients completed; keeping services alive for "
+                        f"{self.post_benchmark_drain_seconds:g}s so post-client "
+                        "transfer consensus can drain"
+                    )
+                    time.sleep(self.post_benchmark_drain_seconds)
                 with open(benchmark_status_file, "w") as status_file:
                     status_file.write("Done")
 
@@ -1892,6 +1906,11 @@ class PerfSanityTestConfig:
         )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
+        post_benchmark_drain_seconds = float(
+            benchmark.get("post_benchmark_drain_seconds", 0.0) if benchmark_mode == "e2e" else 0.0
+        )
+        if post_benchmark_drain_seconds < 0:
+            raise ValueError("post_benchmark_drain_seconds must be non-negative")
 
         # Parse concurrency_list - can be string or list
         concurrency_str = benchmark.get("concurrency_list", "1")
@@ -1963,6 +1982,8 @@ class PerfSanityTestConfig:
                 model_name=model_name,
                 hardware=hardware,
                 server_env_var=server_env_var,
+                post_benchmark_drain_seconds=post_benchmark_drain_seconds,
+                server_config_extra=config.get("server_config_extra", {}),
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
@@ -2126,6 +2147,7 @@ class PerfSanityTestConfig:
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
+            post_benchmark_drain_seconds=disagg_config.post_benchmark_drain_seconds,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
         )
