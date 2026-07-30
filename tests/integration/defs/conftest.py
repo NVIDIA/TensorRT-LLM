@@ -17,6 +17,7 @@
 import datetime
 import gc
 import importlib
+import importlib.util
 import logging
 import os
 import platform
@@ -449,6 +450,26 @@ def llm_venv(request, llm_root, custom_user_workspace):
         else:
             print(f"Cleaning up workspace: {workspace_dir}")
             shutil.rmtree(workspace_dir, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _auto_install_media_deps(llm_venv):
+    """Ensure OpenCV is available for video multimodal tests.
+
+    Uses ``opencv-python-headless`` already on the system when present. Otherwise
+    set ``TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1`` to install it.
+    """
+    if importlib.util.find_spec("cv2") is not None:
+        return
+    if os.environ.get("TRTLLM_AUTO_INSTALL_MEDIA_DEPS", "0") != "1":
+        # TODO remove autouse once callers that need OpenCV depend on this
+        # fixture explicitly, and replace this warning with an error.
+        print_warning(
+            "OpenCV (cv2) is not installed, which is required for some tests.\n"
+            "You may need to install opencv-python-headless manually, or set "
+            "TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1 to auto-install.")
+        return
+    llm_venv.run_cmd(["-m", "pip", "install", "opencv-python-headless"])
 
 
 @pytest.fixture(scope="session")

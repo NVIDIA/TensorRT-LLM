@@ -1590,6 +1590,8 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " NCCL_DEBUG=INFO"
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
+    extraInternalEnv += " TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1"
     // Persist the AutoTuner profiling cache to a CONTAINER-LOCAL, volatile path so
     // that repeated tactic profiling is reused across testcases within one stage.
     // /tmp lives on the container overlay (srun --no-container-mount-home / fresh
@@ -4978,7 +4980,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             } else {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
             }
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: """
