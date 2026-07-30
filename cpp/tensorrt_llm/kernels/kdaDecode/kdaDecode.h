@@ -42,6 +42,32 @@ constexpr bool shouldUseCompactHeads(int smVersion, int batchSize, int numHeads,
         && batchSize <= kCompactHeadsWorkThreshold / numHeads;
 }
 
+//! How the decode step's per-token inputs and conv-state pool are addressed.
+//!
+//! The row strides are the element distance between consecutive batch rows.
+//! Each is the packed value (``numHeads * 128``, or ``numHeads`` for beta)
+//! when the tensor was materialized for the kernel; passing the strides of a
+//! fused in-projection's output instead lets the kernel read its column
+//! slices where they already are, with no repacking pass.
+struct KdaDecodeIoLayout
+{
+    int xQRowStride;
+    int xKRowStride;
+    int xVRowStride;
+    int gateRowStride;
+    int betaRowStride;
+    int outputNormGateRowStride;
+    //! Element distance between conv-pool slots. Only read when
+    //! ``rollConvPool`` is set.
+    int64_t convPoolSlotStride;
+    //! Take each request's conv window straight out of the layer's
+    //! ``[slots, sections * dim, W]`` pool (``W`` contiguous, addressed by
+    //! ``ssmStateIndices``) and store it back rolled forward by this token,
+    //! instead of reading a batch-row-dense staged copy. ``convStateQ/K/V``
+    //! then point at the pool's three section views.
+    bool rollConvPool;
+};
+
 //! Parameters for the fused, single-token KDA decode kernel.
 struct KdaDecodeParams
 {
@@ -78,6 +104,7 @@ struct KdaDecodeParams
     float lowerBound;
     float scale;
     float outputNormEps;
+    KdaDecodeIoLayout layout;
 };
 
 //! Launches the tuned KDA decode kernel on the supplied CUDA stream.

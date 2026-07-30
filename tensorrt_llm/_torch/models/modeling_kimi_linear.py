@@ -146,8 +146,9 @@ _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_
 
 KIMI_K3_FUSED_KDA_CONV_STATE_ENV = "KIMI_K3_FUSED_KDA_CONV_STATE"
 """Set to ``0`` to stage and roll the KDA decode conv windows with the ATen
-gather / repack / concat / scatter sequence instead of the single fused
-Triton pass. Default: fused with fallback."""
+gather / repack / concat / scatter sequence, instead of letting the decode
+kernel own the pool (or, where it cannot, staging and rolling in one fused
+Triton pass). Default: fused with fallback."""
 
 _FUSED_KDA_CONV_STATE_ENABLED = os.environ.get(KIMI_K3_FUSED_KDA_CONV_STATE_ENV, "1") == "1"
 
@@ -1355,18 +1356,22 @@ class KimiKDARuntime(nn.Module):
         copies, per-call torch.arange defaults, and redundant dtype
         casts):
 
-        * one fused in-projection GEMV (``finalize_decode_weights``);
-        * conv windows staged into a persistent dense per-section buffer
-          and the pool rolled forward in one indexed pass
-          (``kda_conv_state_decode_step``; ``KIMI_K3_FUSED_KDA_CONV_STATE=0``
-          restores the ATen gather/repack/concat/scatter sequence);
+        * one fused in-projection GEMV (``finalize_decode_weights``), whose
+          q/k/v/gate column slices go to the kernel as views — it reads
+          them through the projection's row stride, so nothing is repacked;
+        * the conv windows read from, and rolled back into, the layer's
+          pool by the decode kernel itself, so neither staging nor the roll
+          costs a pass (``kda_conv_state_decode_step`` stages and rolls in
+          one indexed pass where the kernel cannot own the pool, and
+          ``KIMI_K3_FUSED_KDA_CONV_STATE=0`` restores the ATen
+          gather/repack/concat/scatter sequence);
         * constant tensors (transposed conv weights, fp32 A_log/dt_bias/
           o_norm weight) reused instead of rebuilt per step.
 
-        The conv windows remain gathered batch-row-dense. When stable
-        int32 slot indices are supplied, the recurrent-state pool is passed
-        directly and the CUDA wrapper selects its indexed-state launch;
-        otherwise the state uses the batch-row-dense static layout.
+        When stable int32 slot indices are supplied, both pools are passed
+        to the kernel directly and it resolves each request's rows itself;
+        otherwise the recurrent state uses the batch-row-dense static
+        layout and the conv windows are staged batch-row-dense.
         """
         mixer = self.mixer
         if mixer.decode_kernel_path != "optimized" or mixer.wrong_state_layout:
@@ -1395,24 +1400,6 @@ class KimiKDARuntime(nn.Module):
         B = x2d.shape[0]
         W = mixer.conv_size
 
-        # Allocated ONCE at the pool slot count (== per-rank max batch on
-        # the Mixed manager) and never reallocated: captured CUDA graphs
-        # hold this pointer, so a later realloc would leave earlier graphs
-        # writing into freed memory. Footprint: slots x ~9(H=6)..222(H=96)
-        # KB per layer.
-        buf = self._cs_dense
-        if buf is None or buf.shape[1] < B:
-            if torch.cuda.is_current_stream_capturing():
-                # Never allocate inside CUDA graph capture; the reference
-                # path is capture-safe (just slower).
-                return self._forward_decode_ref(
-                    x2d, conv_pool, ssm_pool, slot_indices, layer_cache, ssm_state_indices
-                )
-            buf = torch.empty(
-                3, max(conv_pool.shape[0], B), d, W - 1, dtype=torch.bfloat16, device=x2d.device
-            )
-            self._cs_dense = buf
-
         if self._in_proj_weight is not None:
             # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
             proj = torch.nn.functional.linear(x2d, self._in_proj_weight)
@@ -1429,58 +1416,88 @@ class KimiKDARuntime(nn.Module):
             f_a = small[:, :hd]
             beta = small[:, hd : hd + H]
         x_qkv = x_qkvg[:, : 3 * d]
-        # The decode kernel takes q, k, v and the o-norm gate as four packed
-        # [1, B, H, head_dim] tensors, but the fused in-projection writes them
-        # side by side, so each column slice carries a 4*d row stride. Repack
-        # all four in one strided copy here; slicing the leading dim of the
-        # result yields the packed tensors the kernel wants, which is four
-        # fewer copies per layer than passing the column slices down.
-        qkvg_packed = x_qkvg.unflatten(-1, (4, H, hd)).permute(1, 0, 2, 3).contiguous()
+        # The fused in-projection writes q, k, v and the o-norm gate side by
+        # side, so each is a column slice carrying the projection's row
+        # stride. The decode kernel reads its per-token inputs through that
+        # stride, so all four go down as views of the GEMV output.
+        qkvg = x_qkvg.unflatten(-1, (4, H, hd)).permute(1, 0, 2, 3)
         g = mixer.f_b_proj(f_a)  # [B, d]
 
-        # Stage the historical W-1 columns of each request's window in the
-        # kernel's dense per-section [B, d, W-1] layout and roll the pool
-        # forward by this token. The fused op does both in one indexed pass
-        # over the windows; the ATen fallback below needs four (gather,
-        # repack, concat, scatter) and materializes ``cs`` for the write-back
-        # further down. The pool is not read again this step -- the decode
-        # kernel takes the staged copy -- so rolling it here is equivalent to
-        # rolling it after the kernel call.
-        cs_dense = buf[:, :B]
+        # Hand each request's conv window to the kernel, and roll the pool
+        # forward by this token. Cheapest first: the kernel can take the
+        # window straight out of the layer's pool and store it back rolled,
+        # which needs neither a staged copy nor a pass of its own. The
+        # ``kda_conv_state_decode_step`` tier stages and rolls in one indexed
+        # pass for the cases the kernel cannot own the pool -- spec-decoding
+        # replay caches need the materialized window to sync against, and the
+        # kernel roll needs stable slot indices. The ATen tier below needs
+        # four passes (gather, repack, concat, scatter) and materializes
+        # ``cs`` for the write-back further down.
         cs = None
-        if (
-            self._fused_conv_state_step is not None
+        roll_conv_pool = (
+            _FUSED_KDA_CONV_STATE_ENABLED
+            and ssm_state_indices is not None
             and conv_pool.dtype is x_qkv.dtype
             and not self._has_kda_replay_caches(layer_cache)
-        ):
-            self._fused_conv_state_step(conv_pool, slot_indices, x_qkv, cs_dense)
+        )
+        if roll_conv_pool:
+            cs_q = conv_pool[:, :d]
+            cs_k = conv_pool[:, d : 2 * d]
+            cs_v = conv_pool[:, 2 * d :]
         else:
-            cs = conv_pool.index_select(0, slot_indices)  # [B, 3d, W]
-            cs_dense.copy_(cs.view(B, 3, d, W)[:, :, :, 1:].permute(1, 0, 2, 3))
+            # Staging is allocated ONCE at the pool slot count (== per-rank
+            # max batch on the Mixed manager) and never reallocated:
+            # captured CUDA graphs hold this pointer, so a later realloc
+            # would leave earlier graphs writing into freed memory.
+            # Footprint: slots x ~9(H=6)..222(H=96) KB per layer, which is
+            # why the kernel-owned roll above skips it entirely.
+            buf = self._cs_dense
+            if buf is None or buf.shape[1] < B:
+                if torch.cuda.is_current_stream_capturing():
+                    # Never allocate inside CUDA graph capture; the
+                    # reference path is capture-safe (just slower).
+                    return self._forward_decode_ref(
+                        x2d, conv_pool, ssm_pool, slot_indices, layer_cache, ssm_state_indices
+                    )
+                buf = torch.empty(
+                    3, max(conv_pool.shape[0], B), d, W - 1, dtype=torch.bfloat16, device=x2d.device
+                )
+                self._cs_dense = buf
+            cs_dense = buf[:, :B]
+            if (
+                self._fused_conv_state_step is not None
+                and conv_pool.dtype is x_qkv.dtype
+                and not self._has_kda_replay_caches(layer_cache)
+            ):
+                self._fused_conv_state_step(conv_pool, slot_indices, x_qkv, cs_dense)
+            else:
+                cs = conv_pool.index_select(0, slot_indices)  # [B, 3d, W]
+                cs_dense.copy_(cs.view(B, 3, d, W)[:, :, :, 1:].permute(1, 0, 2, 3))
+            cs_q, cs_k, cs_v = cs_dense[0], cs_dense[1], cs_dense[2]
 
         state = (
             ssm_pool if ssm_state_indices is not None else ssm_pool.index_select(0, slot_indices)
         )
 
         o = mixer._dispatch.decode_kda(
-            x_q=qkvg_packed[0:1],
-            x_k=qkvg_packed[1:2],
-            x_v=qkvg_packed[2:3],
+            x_q=qkvg[0:1],
+            x_k=qkvg[1:2],
+            x_v=qkvg[2:3],
             w_q_t=self._w_q_t,
             w_k_t=self._w_k_t,
             w_v_t=self._w_v_t,
             bias_q=None,
             bias_k=None,
             bias_v=None,
-            cs_q=cs_dense[0],
-            cs_k=cs_dense[1],
-            cs_v=cs_dense[2],
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
             A_log=self._A_log_f32,
             g=g.unflatten(-1, (H, hd)).unsqueeze(0),
             dt_bias=self._dt_bias_f32,
             beta=beta.unsqueeze(0),
             state=state,
-            onorm_g=qkvg_packed[3:4],
+            onorm_g=qkvg[3:4],
             onorm_weight=self._onorm_w_f32,
             out=None,
             ssm_state_indices=ssm_state_indices,
@@ -1491,6 +1508,7 @@ class KimiKDARuntime(nn.Module):
             use_beta_sigmoid_in_kernel=True,
             verbose=False,
             update_conv_cache=False,
+            roll_conv_pool=roll_conv_pool,
         )
         if ssm_state_indices is None:
             ssm_pool.index_copy_(0, slot_indices, state)

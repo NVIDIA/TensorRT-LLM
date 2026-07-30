@@ -45,6 +45,9 @@ l0_gb300_multi_gpus:
   # sequential two-round replay parity.
   - unittest/_torch/modeling -k "kda_mtp_decode_cute_parity"
   - unittest/_torch/modeling -k "kimi_kda_fused_verify"
+  # Plain-decode conv-state tiers: the decode kernel's in-place pool roll
+  # must match the staged Triton pass and the ATen sequence exactly.
+  - unittest/_torch/modeling -k "kimi_kda_decode_conv_tiers"
   - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (30)
   # Kimi K3 op parity tests (random weights, no checkpoint; SM100/SM103).
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
