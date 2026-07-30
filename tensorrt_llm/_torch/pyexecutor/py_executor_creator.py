@@ -437,8 +437,9 @@ def create_py_executor(
         tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
         kv_cache_config.tokens_per_block = tokens_per_block
 
-    if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
-        # Workaround for flashinfer and star attention
+    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION":
+        # Star attention still derives its page table from every allocated block,
+        # which is incompatible with blocks allocated ahead for reuse.
         if kv_cache_config.enable_block_reuse:
             logger.warning(
                 f"Disabling block reuse for {llm_args.attn_backend} backend")
