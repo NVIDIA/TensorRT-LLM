@@ -266,7 +266,7 @@ class DupUp3D(nn.Module):
         if x.is_cuda:
             from .dup_up3d import dup_up3d
 
-            return dup_up3d(
+            output = dup_up3d(
                 x,
                 output_channels=self.out_channels,
                 repeats=self.repeats,
@@ -274,6 +274,8 @@ class DupUp3D(nn.Module):
                 factor_s=self.factor_s,
                 first_chunk=first_chunk,
             )
+            if output is not None:
+                return output
         x = x if self.repeats == 1 else x.repeat_interleave(self.repeats, dim=1)
         x = x.reshape(
             x.size(0),

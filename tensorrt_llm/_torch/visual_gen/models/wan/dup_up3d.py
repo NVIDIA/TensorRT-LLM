@@ -9,8 +9,16 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm.logger import logger
+
 _BLOCK_SIZE = 256
 _NUM_WARPS = 8
+_MAX_TRITON_INDEXED_ELEMENTS = 1 << 31
+
+
+def _supports_triton_indexing(output_elements: int) -> bool:
+    """Return whether the output fits the kernel's signed 32-bit offsets."""
+    return output_elements <= _MAX_TRITON_INDEXED_ELEMENTS
 
 
 @triton.jit
@@ -77,8 +85,8 @@ def dup_up3d(
     factor_t: int,
     factor_s: int,
     first_chunk: bool,
-) -> torch.Tensor:
-    """Write repeated-and-shuffled ``x`` directly in final channels-last layout."""
+) -> torch.Tensor | None:
+    """Write the shuffled output, or return ``None`` when Triton cannot index it."""
     if x.dim() != 5:
         raise ValueError(f"DupUp3D expects a five-dimensional tensor, got shape {x.shape}")
     if not x.is_cuda:
@@ -98,14 +106,30 @@ def dup_up3d(
     output_frames = input_frames * factor_t - temporal_crop
     output_height = input_height * factor_s
     output_width = input_width * factor_s
+    output_shape = (
+        batch,
+        output_channels,
+        output_frames,
+        output_height,
+        output_width,
+    )
+    output_elements = batch * output_channels * output_frames * output_height * output_width
+    if not _supports_triton_indexing(output_elements):
+        logger.warning_once(
+            "Fused DupUp3D output has %d elements, exceeding the Triton "
+            "signed 32-bit indexing limit; falling back to the eager implementation.",
+            output_elements,
+            key="wan_dup_up3d_int32_index_fallback",
+        )
+        return None
+
     output = torch.empty(
-        (batch, output_channels, output_frames, output_height, output_width),
+        output_shape,
         dtype=x.dtype,
         device=x.device,
         memory_format=torch.channels_last_3d,
     )
 
-    output_elements = output.numel()
     _dup_up3d_kernel[(triton.cdiv(output_elements, _BLOCK_SIZE),)](
         x,
         output,

@@ -6,6 +6,7 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.visual_gen.models.wan import dup_up3d as dup_up3d_module
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import DupUp3D
 
 
@@ -47,3 +48,32 @@ def test_fused_dup_up3d_matches_eager(
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert actual.is_contiguous(memory_format=torch.channels_last_3d)
+
+
+def test_fused_dup_up3d_int32_index_limit() -> None:
+    assert dup_up3d_module._supports_triton_indexing(1 << 31)
+    assert not dup_up3d_module._supports_triton_indexing((1 << 31) + 1)
+
+
+def test_fused_dup_up3d_falls_back_above_index_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to exercise the fused DupUp3D dispatch")
+
+    x = torch.randn(
+        1,
+        4,
+        2,
+        3,
+        4,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    module = DupUp3D(4, 4, factor_t=2, factor_s=2)
+    expected = module(x.cpu(), first_chunk=True).cuda()
+
+    monkeypatch.setattr(dup_up3d_module, "_MAX_TRITON_INDEXED_ELEMENTS", 0)
+    actual = module(x, first_chunk=True)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
