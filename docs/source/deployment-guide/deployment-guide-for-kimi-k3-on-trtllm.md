@@ -56,13 +56,12 @@ Kimi K3 additionally depends on `fla` and `einops`, installed into the same in-p
 To use the optimized CuTeDSL MLA kernel, install the FlashInfer revision used by the Kimi K3 example into the same in-place environment:
 
 ```bash
-.venv-3.12/bin/python -m pip install -U 'packaging>=24.2'  # required by the FlashInfer source build
 .venv-3.12/bin/python -u -m pip install --force-reinstall --no-deps \
     --no-build-isolation \
     "flashinfer-python[cu13] @ git+https://github.com/PerkzZheng/flashinfer-k3.git@b6cc594918baf76c40c3a6236fd53f0f8fb9d2dc"
 ```
 
-The TensorRT LLM environment already provides FlashInfer's runtime dependencies. The `--no-deps` option prevents `pip` from replacing the pinned PyTorch, Triton, CUDA, and CuTeDSL packages. Install FlashInfer after TensorRT LLM because a later dependency-resolving TensorRT LLM installation can replace this source revision with the currently pinned `flashinfer-python==0.6.14`.
+The `packaging>=24.2` requirement of this source build is already satisfied by `requirements.txt`. The TensorRT LLM environment already provides FlashInfer's runtime dependencies. The `--no-deps` option prevents `pip` from replacing the pinned PyTorch, Triton, CUDA, and CuTeDSL packages. Install FlashInfer after TensorRT LLM because a later dependency-resolving TensorRT LLM installation can replace this source revision with the currently pinned `flashinfer-python==0.6.14`.
 
 For general build-from-source instructions see [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html).
 
