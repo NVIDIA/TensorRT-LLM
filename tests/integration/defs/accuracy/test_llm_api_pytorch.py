@@ -7115,6 +7115,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
                     free_gpu_memory_fraction=0.5,
+                    use_kv_cache_manager_v2=False,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=4,
