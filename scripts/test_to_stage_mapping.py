@@ -13,7 +13,10 @@ Example usage::
        "unittest/_torch/sampler/test_beam_search.py"
    python scripts/test_to_stage_mapping.py --tests test_beam_search
    python scripts/test_to_stage_mapping.py --stages \\
-       A100X-Triton-Post-Merge-1
+       A100X-PyTorch-Post-Merge-1
+
+Stage names passed to ``--stages`` must exactly match a key of the stage map in
+``jenkins/L0_Test.groovy``. Unrecognized names are reported on stderr.
 
 Tests can also be provided via ``--test-list`` pointing to either a plain text
 file or a YAML list file. Quote individual test names on the command line so
@@ -21,8 +24,10 @@ the shell does not interpret ``[`` and ``]`` characters.
 """
 
 import argparse
+import difflib
 import os
 import re
+import sys
 from collections import defaultdict
 from glob import glob
 from typing import List
@@ -189,6 +194,10 @@ class StageQuery:
                     result.add(s)
         return sorted(result)
 
+    def suggest_stages(self, stage):
+        """Return live stage names spelled similarly to an unknown one."""
+        return difflib.get_close_matches(stage, self.stage_to_yaml)
+
     def stages_to_tests(self, stages):
         result = set()
         for s in stages:
@@ -261,9 +270,18 @@ def main():
         for s in stages:
             print(s)
     else:
+        unknown = [s for s in args.stages if s not in query.stage_to_yaml]
+        for s in unknown:
+            sys.stderr.write(f'unknown stage: {s}\n')
+            for hint in query.suggest_stages(s):
+                sys.stderr.write(f'  did you mean: {hint}\n')
         tests = query.stages_to_tests(args.stages)
         for t in tests:
             print(t)
+        # Distinguish a stage that legitimately runs no tests from a stage name
+        # that does not exist, instead of both printing nothing at all.
+        if not tests and not unknown:
+            sys.stderr.write(f'no tests mapped to: {", ".join(args.stages)}\n')
 
 
 if __name__ == '__main__':

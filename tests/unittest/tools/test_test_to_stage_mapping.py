@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -107,6 +108,55 @@ def test_s3_stdout_echo_requires_explicit_opt_in():
         context = lines[max(0, idx - 3):idx]
         assert any('if (ENABLE_UPLOAD_TEST_RESULTS)' in line
                    for line in context)
+
+
+def test_documented_stage_examples_are_live(stage_query):
+    """Documented --stages examples must name stages that still exist in CI."""
+    sources = [
+        os.path.join(REPO_ROOT, 'docs', 'source', 'developer-guide',
+                     'ci-overview.md'),
+        os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py'),
+    ]
+
+    checked = 0
+    for path in sources:
+        with open(path, 'r') as f:
+            text = f.read()
+
+        # Unwrap backslash continuations so wrapped commands read as one line,
+        # then take the stage names each documented invocation passes.
+        unwrapped = re.sub(r'\\+\s*\n\s*', ' ', text)
+        for example in re.findall(r'test_to_stage_mapping\.py.*?--stages(.*)',
+                                  unwrapped):
+            # Brackets are matched, not skipped, so a stale ``[Post-Merge]``
+            # spelling fails here instead of slipping through as two tokens.
+            for name in re.findall(r'[\w\[\].-]+', example):
+                if name.startswith('-'):
+                    break  # start of the next option, not a stage name
+                why = (f'{os.path.basename(path)} documents --stages {name}, '
+                       'which ')
+                assert name in stage_query.stage_to_yaml, \
+                    why + f'is not a stage in {os.path.basename(GROOVY)}'
+                assert stage_query.stages_to_tests([name]), \
+                    why + 'maps to no tests'
+                checked += 1
+
+    assert checked, 'Found no documented --stages examples to validate'
+
+
+def test_unknown_stage_reports_a_diagnostic(stage_query):
+    """An unresolvable stage name must not be silently swallowed."""
+    bogus = 'A100X-Triton-Post-Merge-1'
+    assert bogus not in stage_query.stage_to_yaml
+    assert 'A100X-PyTorch-Post-Merge-1' in stage_query.suggest_stages(bogus), \
+        f"Expected the live A100X stage to be suggested for '{bogus}'"
+
+    script = os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py')
+    proc = subprocess.run([sys.executable, script, '--stages', bogus],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    assert not proc.stdout.strip(), 'Unknown stage should map to no tests'
+    assert f'unknown stage: {bogus}' in proc.stderr.decode()
 
 
 @pytest.mark.skip(reason="https://nvbugs/5547275")

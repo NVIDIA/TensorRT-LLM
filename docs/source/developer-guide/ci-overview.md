@@ -22,7 +22,7 @@ Pull requests do not start testing by themselves. Developers trigger the CI by c
 Integration tests are listed under `tests/integration/test_lists/test-db/`. Most YAML files are named after the GPU or configuration they run on (for example `l0_a100.yml`). Some files, like `l0_sanity_check.yml`, use wildcards and can run on multiple hardware types. Entries contain conditions and a list of tests. Two important terms in each entry are:
 
 - `stage`: either `pre_merge` or `post_merge`.
-- `backend`: `pytorch`, `tensorrt` or `triton`.
+- `backend`: for example `pytorch`, `autodeploy`, `cpp` or `fmha`. Grep the YAML files for `backend:` to see the values currently in use.
 
 Example from `l0_a30.yml`:
 
@@ -43,16 +43,18 @@ Unit tests live under `tests/unittest/` and run during the merge-request pipelin
 `jenkins/L0_Test.groovy` maps stage names to these YAML files.  For A100 the mapping includes:
 
 ```groovy
-    "A100X-Triton-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
-    "A100X-Triton-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
+    "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
+    "A100X-PyTorch-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
 ```
 
 The array elements are: GPU type, YAML file (without extension), shard index, and total number of shards. Only tests with `stage: post_merge` from that YAML file are selected when a `Post-Merge` stage runs.
 
+Stage names are unbracketed, with `Post-Merge` embedded directly in the name. Copy the name exactly as it appears in the Groovy map for both `--stages` below and `--stage-list`: a name without a `*` wildcard is matched exactly, so a stale spelling such as `A100X-Triton-[Post-Merge]-1` silently selects nothing.
+
 ## Finding the stage for a test
 
 1. Locate the test in the appropriate YAML file under `tests/integration/test_lists/test-db/` and note its `stage` and `backend` values.
-2. Search `jenkins/L0_Test.groovy` for a stage whose YAML file matches (for example `l0_a100`) and whose name contains `[Post-Merge]` if the YAML entry uses `stage: post_merge`.
+2. Search `jenkins/L0_Test.groovy` for a stage whose YAML file matches (for example `l0_a100`) and whose name contains `Post-Merge` if the YAML entry uses `stage: post_merge`.
 3. The resulting stage name(s) are what you pass to Jenkins via the `stage_list` parameter when triggering a job.
 
 ### Using `test_to_stage_mapping.py`
@@ -63,7 +65,7 @@ Manually searching YAML and Groovy files can be tedious.  The helper script
 ```bash
 python scripts/test_to_stage_mapping.py --tests "unittest/_torch/sampler/test_beam_search.py"
 python scripts/test_to_stage_mapping.py --tests test_beam_search
-python scripts/test_to_stage_mapping.py --stages A100X-Triton-Post-Merge-1
+python scripts/test_to_stage_mapping.py --stages A100X-PyTorch-Post-Merge-1
 python scripts/test_to_stage_mapping.py --test-list my_tests.txt
 python scripts/test_to_stage_mapping.py --test-list my_tests.yml
 ```
@@ -80,7 +82,7 @@ tests in a newline‑separated text file or a YAML list and supply it with
 To run the same tests on your pull request, comment:
 
 ```bash
-/bot run --stage-list "A100X-Triton-[Post-Merge]-1,A100X-Triton-[Post-Merge]-2"
+/bot run --stage-list "A100X-PyTorch-Post-Merge-1"
 ```
 
 This executes the same tests that run post-merge for this hardware/backend.
