@@ -318,6 +318,14 @@ def autotune(tune_mode: bool = True,
         autotuner.skip_dynamic_tuning_buckets = old_skip
         if autotune_enabled:
             logger.info("[Autotuner] Autotuning process ends")
+            # Flush any JSONL buckets left open by an exception before their
+            # selection. Only the outermost session flushes (autotune_enabled),
+            # and completed buckets are already popped, so this never
+            # double-writes. Best-effort: never perturb the tuning run.
+            try:
+                autotuner._jsonl_profiler.flush_open_buckets()
+            except Exception:
+                pass
 
         try:
             # Merge tactics across ranks in one collective before the cache is
@@ -888,13 +896,34 @@ def _spec_in_bounds(spec, shapes_list) -> bool:
 class _AutotunerJsonlProfiler:
     """Best-effort structured JSONL sink for autotuner device-time measurements.
 
-    Writes one JSON object per line (JSONL) capturing, for every profiled
-    ``(custom_op, opt_shape, tactic)`` combination, the measured device time in
-    milliseconds — plus one ``selection`` record per ``(custom_op, opt_shape)``
-    naming the winning tactic. The intended consumer is a disaggregated-serving
-    sweep where **each rank of each worker (gen / ctx) emits its own file**, so
-    the identity of the emitting rank and worker role is stamped on every line
-    and the files can be concatenated and grouped with ``cat *.jsonl | jq``.
+    Emits, for every profiled ``(custom_op, opt_shapes)``, **one bucketed
+    ``tuning`` record** (JSONL, one JSON object per line) that carries every
+    profiled tactic's device time, the winning tactic, and the shape / dtype /
+    runner metadata shared across the bucket. One ``meta`` record is written
+    first per file with the emitting rank's identity. The intended consumer is a
+    disaggregated-serving sweep where **each rank of each worker (gen / ctx)
+    emits its own file**; concatenate and group by ``(custom_op, opt_shapes)``.
+
+    Record shape (schema_version 2)::
+
+        {"type":"tuning", "custom_op":str, "opt_shapes":[[int,...],...],
+         "input_dtypes":[str,...],
+         "runners":{"<rid>":{"name":cls,"uid":uid}, ...},
+         "tactics":[[rid, tactic_repr, device_time_ms], ...],  # ok: 3-elem
+                                                               # untimed: [rid,repr,None,"not_measured"]
+         "failed":[[rid, tactic_repr, error], ...],   # omitted if empty;
+                                                      # untimed single-pair fail: +4th elem "not_measured"
+         "input_shapes":[[int,...],...],  # only if != opt_shapes; else omitted
+         "best":[rid, best_tactic_repr, best_device_time_ms] | null,
+         "num_considered":int, "num_failed":int, "cache_key":str|null}
+
+    Records are written in **completion order** (a re-entrant inner op finishes
+    before its outer op), so consumers must group by ``(custom_op, opt_shapes)``
+    and never rely on line order. A ``(custom_op, opt_shapes)`` re-tuned in one
+    session (``exclude_from_cache`` / after ``clear_cache``) yields more than one
+    ``tuning`` record for that key; consumers keep the last (or all). This
+    bucketed layout is ~89% smaller than the earlier one-line-per-tactic format
+    with no loss of per-tactic timings.
 
     Activation is env-gated and entirely opt-in: unless
     ``TLLM_AUTOTUNER_PROFILE_JSONL_DIR`` is set the profiler is a no-op with
@@ -915,9 +944,19 @@ class _AutotunerJsonlProfiler:
     first emitted record, NOT at construction: ``AutoTuner.mapping`` is a
     rank-0 default until ``setup_distributed_state()`` runs, so opening the file
     eagerly would mislabel every rank as rank 0.
+
+    Buffering: per-tactic ``measurement`` rows are accumulated in ``_buckets``
+    keyed on ``(custom_op, opt_shapes)`` and flushed as one ``tuning`` record
+    when the matching ``selection`` arrives (which pops the key, so a re-tune of
+    the same key starts fresh). Any bucket still open at the outermost
+    ``autotune()`` exit — e.g. an exception escaped before selection — is
+    flushed by ``flush_open_buckets()`` with ``best=null`` + ``incomplete=true``.
+    A hard crash between measurement and selection loses that one in-flight
+    bucket (bounded to autotune stack depth); an incomplete bucket has no winner
+    anyway.
     """
 
-    _SCHEMA_VERSION = 1
+    _SCHEMA_VERSION = 2
 
     def __init__(self, tuner: "AutoTuner"):
         self._tuner = tuner
@@ -929,7 +968,9 @@ class _AutotunerJsonlProfiler:
                         or os.getenv("SLURM_JOB_ID", "").strip() or "local")
         self._fh = None
         self._opened = False
-        self._seq = 0
+        # Open buckets keyed on (custom_op, hashable opt_shapes): each holds the
+        # per-tactic rows accumulated since the last selection for that key.
+        self._buckets: Dict[Any, Dict[str, Any]] = {}
         # Identity fields, populated on first emit.
         self._ident: Dict[str, Any] = {}
 
@@ -1041,10 +1082,6 @@ class _AutotunerJsonlProfiler:
         self._fh.write(json.dumps(record, default=str))
         self._fh.write("\n")
 
-    def _next_seq(self) -> int:
-        self._seq += 1
-        return self._seq
-
     @staticmethod
     def _finite_ms(value: Any) -> Optional[float]:
         """Return a JSON-safe float, or None for inf/nan/non-numeric."""
@@ -1072,13 +1109,48 @@ class _AutotunerJsonlProfiler:
         except Exception:
             return "<unrepr-able>"
 
-    def _base(self, custom_op: str) -> Dict[str, Any]:
+    @staticmethod
+    def _shapes_key(shapes) -> tuple:
+        """Hashable analog of ``_shapes_to_lists`` for use as a bucket key."""
+        out = []
+        for s in shapes:
+            try:
+                out.append(tuple(int(d) for d in s))
+            except Exception:
+                out.append(tuple())
+        return tuple(out)
+
+    def _new_bucket(self, custom_op: str, opt_shapes) -> Dict[str, Any]:
         return {
-            "run_id": self._ident["run_id"],
-            "role": self._ident["role"],
-            "global_rank": self._ident["global_rank"],
             "custom_op": custom_op,
+            "opt_shapes": self._shapes_to_lists(opt_shapes),
+            "input_dtypes": None,
+            "input_shapes": None,
+            "runners": {},
+            "tactics": [],
+            "failed": [],
         }
+
+    def _bucket_record(self, bucket: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the common ``tuning`` record body from an accumulated bucket.
+
+        Caller attaches the selection-derived fields (``best`` /
+        ``num_considered`` / ``num_failed`` / ``cache_key``) or the orphan
+        markers (``best=None`` / ``incomplete=True``).
+        """
+        rec = {
+            "type": "tuning",
+            "custom_op": bucket["custom_op"],
+            "opt_shapes": bucket["opt_shapes"],
+            "input_dtypes": bucket["input_dtypes"],
+            "runners": bucket["runners"],
+            "tactics": bucket["tactics"],
+        }
+        if bucket["input_shapes"] is not None:
+            rec["input_shapes"] = bucket["input_shapes"]
+        if bucket["failed"]:
+            rec["failed"] = bucket["failed"]
+        return rec
 
     # ---- public API ------------------------------------------------------
 
@@ -1096,50 +1168,60 @@ class _AutotunerJsonlProfiler:
         status: str,
         error: Optional[str] = None,
     ) -> None:
-        """Emit one ``measurement`` line for a single profiled tactic."""
+        """Accumulate one profiled tactic into its ``(op, opt_shapes)`` bucket.
+
+        Nothing is written here; the bucket is flushed as a single ``tuning``
+        record when the matching :meth:`record_selection` arrives.
+        """
         if not self.enabled or not self._ensure_open():
             return
         try:
-            sizes = self._tuner._get_input_sizes(input_tensors)
-            dtypes = []
-            for t in input_tensors:
-                dtypes.append(
-                    str(t.dtype).replace("torch.", "") if isinstance(
-                        t, torch.Tensor) else None)
-            record = self._base(custom_op)
-            record.update({
-                "type":
-                "measurement",
-                "runner":
-                runner.__class__.__name__,
-                "runner_id":
-                int(runner_id),
-                "runner_uid":
-                self._safe_uid(runner),
-                "opt_shapes":
-                self._shapes_to_lists(opt_shapes),
-                "input_shapes":
-                self._shapes_to_lists(sizes),
-                "input_dtypes":
-                dtypes,
-                "tactic":
-                tactic if isinstance(tactic, (int, float, str, bool)) else None,
-                "tactic_repr":
-                self._tactic_repr(tactic),
-                "is_fallback":
-                tactic == -1,
-                "device_time_ms":
-                self._finite_ms(device_time_ms),
-                "measured":
-                bool(measured),
-                "status":
-                status,
-                "error":
-                error,
-                "seq":
-                self._next_seq(),
-            })
-            self._write(record)
+            key = (custom_op, self._shapes_key(opt_shapes))
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = self._new_bucket(custom_op, opt_shapes)
+                self._buckets[key] = bucket
+
+            # Shape/dtype are fixed within one _profile_runners call (input
+            # tensors are constant), so record them once per bucket.
+            if bucket["input_dtypes"] is None:
+                dtypes = []
+                for t in input_tensors:
+                    dtypes.append(
+                        str(t.dtype).replace("torch.", "") if isinstance(
+                            t, torch.Tensor) else None)
+                bucket["input_dtypes"] = dtypes
+            if bucket["input_shapes"] is None:
+                input_shapes = self._shapes_to_lists(
+                    self._tuner._get_input_sizes(input_tensors))
+                # Only carry input_shapes when it actually differs from
+                # opt_shapes (the single-pair path); otherwise it is redundant.
+                if input_shapes != bucket["opt_shapes"]:
+                    bucket["input_shapes"] = input_shapes
+
+            rid = int(runner_id)
+            skey = str(rid)
+            if skey not in bucket["runners"]:
+                bucket["runners"][skey] = {
+                    "name": runner.__class__.__name__,
+                    "uid": self._safe_uid(runner),
+                }
+
+            rep = self._tactic_repr(tactic)
+            if status == "failed":
+                # measured==False marks the untimed single-pair failure; the
+                # 4th element preserves that distinction from a timed failure.
+                row = [rid, rep, error]
+                if not measured:
+                    row.append("not_measured")
+                bucket["failed"].append(row)
+            elif status == "ok":
+                bucket["tactics"].append(
+                    [rid, rep, self._finite_ms(device_time_ms)])
+            else:
+                # Untimed single-pair winner: null time + explicit status tag.
+                bucket["tactics"].append(
+                    [rid, rep, self._finite_ms(device_time_ms), status])
         except Exception as e:
             self._disable(e, "record_measurement")
 
@@ -1156,42 +1238,60 @@ class _AutotunerJsonlProfiler:
         num_failed: int,
         cache_key: Any,
     ) -> None:
-        """Emit one ``selection`` line naming the winner for an (op, shape)."""
+        """Finalize the ``(op, opt_shapes)`` bucket into one ``tuning`` record.
+
+        Pops the bucket (so a re-tune of the same key starts fresh) and writes
+        exactly one line combining the accumulated tactics with this winner.
+        """
         if not self.enabled or not self._ensure_open():
             return
         try:
-            record = self._base(custom_op)
-            record.update({
-                "type":
-                "selection",
-                "runner":
-                runner.__class__.__name__ if runner is not None else None,
-                "runner_id":
+            key = (custom_op, self._shapes_key(opt_shapes))
+            bucket = self._buckets.pop(key, None)
+            if bucket is None:
+                # No measurement preceded this selection — only reachable on the
+                # no-valid-tactic path (num_considered may be 0). Emit an empty
+                # bucket so the (op, opt_shapes) is still represented.
+                bucket = self._new_bucket(custom_op, opt_shapes)
+
+            record = self._bucket_record(bucket)
+            record["best"] = ([
                 int(runner_id) if runner_id is not None else None,
-                "runner_uid":
-                self._safe_uid(runner) if runner is not None else None,
-                "opt_shapes":
-                self._shapes_to_lists(opt_shapes),
-                "best_tactic":
-                best_tactic if isinstance(best_tactic,
-                                          (int, float, str, bool)) else None,
-                "best_tactic_repr":
-                self._tactic_repr(best_tactic)
-                if best_tactic is not None else None,
-                "best_device_time_ms":
+                self._tactic_repr(best_tactic),
                 self._finite_ms(best_device_time_ms),
-                "num_tactics_considered":
-                int(num_considered),
-                "num_tactics_failed":
-                int(num_failed),
-                "cache_key":
-                str(cache_key),
-                "seq":
-                self._next_seq(),
-            })
+            ] if best_tactic is not None else None)
+            record["num_considered"] = int(num_considered)
+            record["num_failed"] = int(num_failed)
+            record["cache_key"] = None if cache_key is None else str(cache_key)
             self._write(record)
         except Exception as e:
             self._disable(e, "record_selection")
+
+    def flush_open_buckets(self) -> None:
+        """Flush buckets left open at the outermost ``autotune()`` exit.
+
+        In the normal flow every bucket is popped by :meth:`record_selection`;
+        a bucket survives only if an exception escaped ``_profile_runners``
+        before its selection. Such orphans are written with ``best=null`` and
+        ``incomplete=true`` (the selection-derived counts are unknown). Called
+        once at the end of the outermost tuning session.
+        """
+        if not self.enabled or not self._buckets:
+            # Skip _ensure_open when there is nothing to flush so an all-cache-
+            # hit session never creates a spurious meta-only file.
+            return
+        if not self._ensure_open():
+            return
+        try:
+            for bucket in list(self._buckets.values()):
+                record = self._bucket_record(bucket)
+                record["best"] = None
+                record["incomplete"] = True
+                self._write(record)
+        except Exception as e:
+            self._disable(e, "flush_open_buckets")
+        finally:
+            self._buckets.clear()
 
     def _safe_uid(self, runner: "TunableRunner") -> Optional[str]:
         try:
