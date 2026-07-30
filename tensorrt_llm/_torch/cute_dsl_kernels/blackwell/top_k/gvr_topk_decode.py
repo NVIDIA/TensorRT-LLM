@@ -295,7 +295,7 @@ class GvrTopKKernel:
         enable_p4_rank_scatter_exact: Optional[bool] = None,
         p4_exact_tail: Optional[bool] = None,
         p4_tail_fast: Optional[bool] = None,  # [p4tt]
-        p4_tail_v3: bool = False,
+        p4_tail_v3: Optional[bool] = None,
         p1r_rescue: bool = True,
         p4_warp_redundant: bool = True,
         p2_warp_redundant: bool = True,
@@ -749,8 +749,12 @@ class GvrTopKKernel:
         self.p4_tail_fast = bool(p4_tail_fast) and self.p4_exact_tail  # [p4tt]
         # p4_tail_v3: compacted-class repair (block-parallel radix +
         # pure-tie pre-check) in place of the stock thread0 serial
-        # select. Off by default - the stock body is what upstream
-        # emits, and this rewrite only pays at K>=1024.
+        # select. Default follows the configuration: a stock kernel gets
+        # upstream's body, any emission-assisted one gets the rewrite.
+        if p4_tail_v3 is None:
+            p4_tail_v3 = bool(
+                use_ext_counts or use_ext_cand or ext_rungs or self_scan or enable_block_skip
+            )
         self.p4_tail_v3 = bool(p4_tail_v3)
         # p1r_rescue: rebuild the refine bracket from the row when the
         # seed bracket is degenerate. ON by default - upstream's identity
