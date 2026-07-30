@@ -14,36 +14,26 @@
 
 """FlashInfer-accelerated sampling kernels.
 
-These ops depend on flashinfer; the import is guarded so the module stays
-importable without it (sampling_utils imports it unconditionally, and the
-vanilla/TRTLLM sampler paths must keep working without flashinfer). Without
-flashinfer, calling any op raises an ImportError with installation guidance.
-Components that will invoke these ops are expected to fail fast at startup
-instead of relying on that call-time error: TorchSampler enforces flashinfer
+The flashinfer import is guarded so this module stays importable without it;
+each op then raises an ImportError when called. ``TorchSampler`` checks
 availability in its constructor.
 
-Randomness can be supplied either way (flashinfer accepts both in one
-signature; explicit ``seed``/``offset`` take precedence over ``generator``):
+Randomness is supplied either as a ``generator`` (host-side ``torch.Generator``,
+for eager paths) or as stateless ``seed``/``offset`` device tensors, which are
+required under CUDA graph capture. Explicit ``seed``/``offset`` take precedence.
 
-- ``generator``: stateful host-side ``torch.Generator``, for eager paths.
-- ``seed``/``offset``: stateless device tensors, required under CUDA graph
-  capture (a ``torch.Generator`` advances host-side at launch time, so its
-  state would be frozen into the graph and every replay would reuse the same
-  random values).
-
-Every op is ``@_compiler_disable``d: nothing inside flashinfer is opaque to
-Dynamo (its kernels sit behind a ``functools.cache``-d lazy JIT bootstrap and
-its own custom-op registration is a no-op), so tracing in turns each
-untraceable builtin of the bootstrap into a warn-once plus a permanent
-per-call graph break. Disabling keeps one clean graph break per op and
-preserves the bootstrap's cache fast path.
+Every op is ``@_compiler_disable``d to keep one clean Dynamo graph break per op
+instead of a per-call break from tracing flashinfer's lazy JIT bootstrap.
 """
 
-from typing import Any, Callable, Optional, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, Union, cast
 
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 _OpT = TypeVar("_OpT", bound=Callable[..., Any])
 
@@ -238,3 +228,99 @@ def compute_probs_from_logits_op(
     if top_p is not None:
         probs = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
     return probs
+
+
+# ---------------------------------------------------------------------------
+# Speculative-decoding samplers (per-request tensor params). These build on the
+# flashinfer ops above, sharing only vanilla's greedy-temperature threshold;
+# used by the speculative-decoding paths (one-model draft sampling, rejection
+# sampling).
+# ---------------------------------------------------------------------------
+
+
+def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Map ``top_k`` into a backend-safe range before top-k filtering.
+
+    Per ``SamplingParams``, ``top_k == 0`` means "all logits" (top-k disabled),
+    but the flashinfer top-k kernels (``top_k_mask_logits``) break on a literal
+    0 — they mask the entire row (all-zero probs). Map any non-positive value
+    (and any oversized disable sentinel such as ``INT32_MAX``) to
+    ``vocab_size`` (== keep all tokens), leaving genuine top_k values
+    untouched.
+    """
+    return top_k.clamp(max=vocab_size).masked_fill_(top_k <= 0, vocab_size)
+
+
+@torch.compile(options={"max-autotune": True})
+def compute_probs_from_logits(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Compute filtered+normalized probs via flashinfer (hard dependency).
+
+    ``temperatures``, ``top_k``, ``top_p`` are per-request tensors matching the
+    spec-decoding call site in interface.py. A ``None`` top_k / top_p skips that
+    filter's kernel.
+    """
+    if top_k is not None:
+        top_k = sanitize_top_k(top_k, logits.shape[-1])
+
+    return compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+
+
+def resolve_advanced_sampling_filters(
+    advanced_sampling_mode: "AdvancedSamplingMode",
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Resolve advanced_sampling_mode to effective (top_k, top_p) tensors.
+
+    A filter the mode disables (via ``skips_top_k`` / ``skips_top_p``), or one already
+    None, becomes None so the downstream op skips that kernel; kept filters pass through
+    unchanged (the op sanitizes top_k internally).
+    """
+    eff_top_k = None if advanced_sampling_mode.skips_top_k or top_k is None else top_k
+    eff_top_p = None if advanced_sampling_mode.skips_top_p or top_p is None else top_p
+    return eff_top_k, eff_top_p
+
+
+@torch.compile(options={"max-autotune": True})
+def sample_from_logits_op(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: Optional[torch.Tensor] = None,
+    top_p: Optional[torch.Tensor] = None,
+    seed: Optional[torch.Tensor] = None,
+    offset: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """CUDA-graph compatible one-model sampler; returns sampled tokens.
+
+    ``top_k`` / ``top_p`` are None when the caller's advanced_sampling_mode disables that
+    filter.
+    """
+    if top_k is not None:
+        top_k = sanitize_top_k(top_k, logits.shape[-1])
+        logits = top_k_mask_logits_op(logits, top_k)
+    probs = softmax_op(logits, temperatures)
+    if top_p is not None:
+        return top_p_sampling_from_probs_op(probs, top_p, seed=seed, offset=offset)
+    return sampling_from_probs_op(probs, seed=seed, offset=offset)
+
+
+@torch.compile(options={"max-autotune": True})
+def sampling_batch_spec_dec_one_model_for_rejection(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
+    seed: Optional[torch.Tensor] = None,
+    offset: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Draft sampler returning tokens AND probs for the downstream rejection-sampling path."""
+    # Rejection sampling relies on flashinfer's seed/offset support for
+    # determinism and cross-rank consistency.
+    probs = compute_probs_from_logits(logits, temperatures, top_k, top_p)
+    tokens = sampling_from_probs_op(probs, seed=seed, offset=offset)
+    return tokens, probs
