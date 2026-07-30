@@ -12,7 +12,7 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from ..interface import AttentionForwardArgs, AttentionInputType
 from . import inline_scale_kv
 from .dsa import DSAtrtllmAttentionMetadata
-from .flashinfer_utils import get_sparse_mla_op, get_sparse_mla_workspace
+from .flashinfer_utils import get_sparse_mla_op
 
 _KV_SPLIT_TILE = 64  # BLOCK_SIZE_N of the SM120 kernels; sizes split-K scratch
 
@@ -157,19 +157,23 @@ def run_flashinfer_sparse_mla(
     topk = topk_indices_global.shape[-1]
 
     out_view = output.view(num_tokens, attn.num_heads, kv_lora_rank)
+    out_lse = torch.empty(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
     if num_tokens <= 64:
         num_splits = (topk + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE
-        out_lse, mid_out, mid_lse = get_sparse_mla_workspace(
-            metadata,
-            q.device,
+        mid_out = torch.empty(
             num_tokens,
             attn.num_heads,
             num_splits,
             kv_lora_rank,
-            attn.layer_idx,
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        mid_lse = torch.empty(
+            (num_tokens, attn.num_heads, num_splits),
+            dtype=torch.float32,
+            device=q.device,
         )
     else:
-        out_lse = torch.empty(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
         mid_out = None
         mid_lse = None
 

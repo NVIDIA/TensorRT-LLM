@@ -12,7 +12,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 
 from ...interface import AttentionForwardArgs, AttentionInputType
-from ..flashinfer_utils import get_sparse_mla_op, get_sparse_mla_workspace
+from ..flashinfer_utils import get_sparse_mla_op
 from ..kernel import deepseek_v4_local_to_global_indices
 from . import footer_scale_kv
 from .deepseek_v4 import DeepseekV4AttentionType, DeepseekV4TrtllmAttentionMetadata, get_token_bytes
@@ -213,18 +213,22 @@ def run_flashinfer_sparse_mla(
         num_splits = (window + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE
 
     out_view = output.view(num_tokens, attn.num_heads, attn.head_dim)
+    out_lse = torch.empty(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
     if num_tokens <= 64:
-        out_lse, mid_out, mid_lse = get_sparse_mla_workspace(
-            metadata,
-            q.device,
+        mid_out = torch.empty(
             num_tokens,
             attn.num_heads,
             num_splits,
             attn.head_dim,
-            attn.layer_idx,
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        mid_lse = torch.empty(
+            (num_tokens, attn.num_heads, num_splits),
+            dtype=torch.float32,
+            device=q.device,
         )
     else:
-        out_lse = torch.empty(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
         mid_out = None
         mid_lse = None
 

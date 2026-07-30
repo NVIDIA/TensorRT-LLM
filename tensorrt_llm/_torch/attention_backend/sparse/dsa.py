@@ -587,6 +587,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
     sparse_metadata_params: Optional[DSAMetadataParams] = None
+    use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
     indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
@@ -675,6 +676,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             assert has_deepseek_v4_cache_interface, (
                 "DSAtrtllmAttentionMetadata requires DSACacheManager-compatible "
                 f"cache manager, got {type(self.kv_cache_manager)}")
+        self.use_fp8_ds_mla = self.kv_cache_manager.use_fp8_ds_mla
 
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -845,8 +847,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64) - seq_starts[req_indices]
 
             global_positions = start_positions[req_indices] + token_offsets
-            self.token_positions_cuda[:self.num_tokens] = global_positions.to(
-                torch.int32)
+            if self.use_fp8_ds_mla:
+                self.token_positions_cuda[:self.num_tokens] = (
+                    global_positions.to(torch.int32))
             # Honor MXFP4 indexer K cache layout (½ byte per value vs FP8's
             # 1 byte) when the cache manager exposes a use_fp4 flag.
             index_head_dim = self.kv_cache_manager.index_head_dim
@@ -1093,13 +1096,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             pin_memory=prefer_pinned(),
         )
-        self.token_positions_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_tokens, ),
-            cache_name="token_positions_cuda",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
+        self.token_positions_cuda = None
+        if self.use_fp8_ds_mla:
+            self.token_positions_cuda = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens, ),
+                cache_name="token_positions_cuda",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
         # These buffers will be allocated dynamically in Indexer.prepare() based on actual total_kv_len to save memory.
         if self.enable_context_mla_with_cached_kv:
