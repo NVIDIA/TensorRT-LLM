@@ -270,9 +270,11 @@ The FMHA package is split by role:
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
 Use `PhasedFmha` for libraries that need separate context/generation or MHA/MLA
-entry points. Its no-argument `is_*_supported()` methods report implemented
-phases. Use `Fmha` directly for libraries that already own the full request
-shape.
+entry points. The dispatcher calls `is_supported(..., phase=...)` independently
+for each required phase while keeping the original request tensors and
+arguments. A phased library must accept only phases implemented by its matching
+`run_*()` entry point. Use `Fmha` directly for libraries that already own the
+full request shape.
 
 #### 3.2.3 MLA cached-context semantics
 

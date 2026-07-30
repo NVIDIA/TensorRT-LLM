@@ -111,22 +111,6 @@ class PhasedFmha(Fmha):
             return 0
         return int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * self.kv_factor
 
-    def is_context_supported(self) -> bool:
-        """Return whether this library implements context attention."""
-        return type(self).run_context is not PhasedFmha.run_context
-
-    def is_generation_supported(self) -> bool:
-        """Return whether this library implements generation attention."""
-        return type(self).run_generation is not PhasedFmha.run_generation
-
-    def is_mla_context_supported(self) -> bool:
-        """Return whether this library implements MLA context attention."""
-        return type(self).run_mla_context is not PhasedFmha.run_mla_context
-
-    def is_mla_generation_supported(self) -> bool:
-        """Return whether this library implements MLA generation attention."""
-        return type(self).run_mla_generation is not PhasedFmha.run_mla_generation
-
     def get_fp8_context_fmha(
         self,
         q: torch.Tensor,

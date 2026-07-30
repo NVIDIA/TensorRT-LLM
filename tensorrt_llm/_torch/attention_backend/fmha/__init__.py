@@ -16,7 +16,7 @@
 from .combined import CombinedFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
-from .interface import Fmha
+from .interface import Fmha, FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
 from .triton_custom_mask import TritonCustomMaskFmha
@@ -30,6 +30,7 @@ __all__ = [
     "Fmha",
     "FmhaCls",
     "FmhaParams",
+    "FmhaPhase",
     "PhasedFmha",
     "TritonCustomMaskFmha",
     "get_enabled_fmha_lib_classes",

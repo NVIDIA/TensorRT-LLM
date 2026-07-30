@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention_backend import trtllm as trtllm_module
 from tensorrt_llm._torch.attention_backend.fmha import flashinfer_trtllm_gen as trtllm_gen_module
 from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from tensorrt_llm._torch.attention_backend.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention_backend.fmha.phased import PhasedFmha
 from tensorrt_llm._torch.attention_backend.fmha.registry import DEFAULT_FMHA_LIBS
 from tensorrt_llm._torch.attention_backend.fmha.triton_custom_mask import TritonCustomMaskFmha
@@ -45,29 +46,11 @@ def test_triton_custom_mask_precedes_general_fmha_libraries() -> None:
     )
 
 
-def test_triton_custom_mask_implements_only_context_phase() -> None:
+def test_triton_custom_mask_implements_only_context_runner() -> None:
     assert TritonCustomMaskFmha.__bases__ == (PhasedFmha,)
-    fmha = object.__new__(TritonCustomMaskFmha)
-    assert fmha.is_context_supported()
-    assert not fmha.is_generation_supported()
-    assert not fmha.is_mla_context_supported()
-    assert not fmha.is_mla_generation_supported()
+    assert "run_context" in TritonCustomMaskFmha.__dict__
     assert "run_generation" not in TritonCustomMaskFmha.__dict__
     assert "_run_preprocessed_context" not in TritonCustomMaskFmha.__dict__
-
-
-def test_phase_capabilities_follow_overridden_run_methods() -> None:
-    flashinfer_fmha = object.__new__(FlashInferTrtllmGenFmha)
-    assert flashinfer_fmha.is_context_supported()
-    assert flashinfer_fmha.is_generation_supported()
-    assert not flashinfer_fmha.is_mla_context_supported()
-    assert flashinfer_fmha.is_mla_generation_supported()
-
-    combined_fmha = object.__new__(CombinedFmha)
-    assert combined_fmha.is_context_supported()
-    assert combined_fmha.is_generation_supported()
-    assert not combined_fmha.is_mla_context_supported()
-    assert not combined_fmha.is_mla_generation_supported()
 
 
 def test_trtllm_metadata_does_not_add_custom_mask_buffers() -> None:
@@ -95,7 +78,71 @@ def test_custom_mask_context_skips_trtllm_gen_context_checks() -> None:
         is_fused_qkv=True,
     )
 
-    assert fmha.is_supported(q, None, None, metadata, forward_args)
+    assert fmha.is_supported(
+        q,
+        None,
+        None,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.CONTEXT,
+    )
+    assert not fmha.is_supported(
+        q,
+        None,
+        None,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.GENERATION,
+    )
+
+
+def test_flashinfer_custom_mask_support_is_phase_specific() -> None:
+    attn = SimpleNamespace(
+        is_mla_enable=False,
+        sparse_params=None,
+        head_dim=128,
+        num_heads=2,
+        num_kv_heads=1,
+        position_embedding_type=int(PositionEmbeddingType.learned_absolute),
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._attn_ref = lambda: attn
+    metadata = SimpleNamespace(
+        helix_position_offsets=None,
+        num_sparse_topk=0,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        kv_cache_block_offsets=object(),
+        kv_cache_manager=None,
+        tokens_per_block=32,
+        is_cross=False,
+        beam_width=1,
+    )
+    q = torch.empty((3, 512), dtype=torch.bfloat16)
+    forward_args = AttentionForwardArgs(
+        output=torch.empty((3, 256), dtype=torch.bfloat16),
+        attention_mask=CustomAttentionMask.CUSTOM,
+        attention_mask_data=torch.ones((4,), dtype=torch.bool),
+        attention_input_type=AttentionInputType.mixed,
+        is_fused_qkv=True,
+    )
+
+    assert not fmha.is_supported(
+        q,
+        None,
+        None,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.CONTEXT,
+    )
+    assert fmha.is_supported(
+        q,
+        None,
+        None,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.GENERATION,
+    )
 
 
 def test_custom_mask_mixed_batch_uses_generation_followup(monkeypatch) -> None:
@@ -122,25 +169,59 @@ def test_custom_mask_mixed_batch_uses_generation_followup(monkeypatch) -> None:
         attention_input_type=AttentionInputType.mixed,
         is_fused_qkv=True,
     )
-    checked_anchor_args = None
+    checked_calls = []
 
-    def _accept_context_request(self, q, k, v, metadata, forward_args):
-        nonlocal checked_anchor_args
-        checked_anchor_args = forward_args
-        return True
+    def _check_context_request(
+        self,
+        checked_q,
+        k,
+        v,
+        checked_metadata,
+        checked_forward_args,
+        *,
+        phase,
+    ):
+        checked_calls.append(
+            (
+                self,
+                phase,
+                checked_q,
+                checked_metadata,
+                checked_forward_args,
+            )
+        )
+        return phase == FmhaPhase.CONTEXT
 
-    def _unexpected_generation_request_check(*args):
-        raise AssertionError("A structural follow-up must not re-check the full request.")
+    def _check_generation_request(
+        self,
+        checked_q,
+        k,
+        v,
+        checked_metadata,
+        checked_forward_args,
+        *,
+        phase,
+    ):
+        checked_calls.append(
+            (
+                self,
+                phase,
+                checked_q,
+                checked_metadata,
+                checked_forward_args,
+            )
+        )
+        return phase == FmhaPhase.GENERATION
 
     monkeypatch.setattr(
         TritonCustomMaskFmha,
         "is_supported",
-        _accept_context_request,
+        _check_context_request,
     )
     monkeypatch.setattr(
         FlashInferTrtllmGenFmha,
         "is_supported",
-        _unexpected_generation_request_check,
+        _check_generation_request,
     )
     selected_fmha = TrtllmAttention._select_non_mla_phased_fmha(
         backend,
@@ -151,7 +232,14 @@ def test_custom_mask_mixed_batch_uses_generation_followup(monkeypatch) -> None:
         forward_args,
     )
     assert selected_fmha is combined_fmha
-    assert checked_anchor_args is forward_args
+    assert [(call[0], call[1]) for call in checked_calls] == [
+        (fmha, FmhaPhase.CONTEXT),
+        (fmha, FmhaPhase.GENERATION),
+        (generation_fmha, FmhaPhase.GENERATION),
+    ]
+    assert all(call[2] is q for call in checked_calls)
+    assert all(call[3] is metadata for call in checked_calls)
+    assert all(call[4] is forward_args for call in checked_calls)
     assert forward_args.attention_mask == CustomAttentionMask.CUSTOM
     assert forward_args.attention_mask_data is attention_mask_data
     assert forward_args.attention_input_type == AttentionInputType.mixed
@@ -161,10 +249,16 @@ def test_mixed_batch_reuses_one_phased_fmha_when_it_supports_both_phases(
     monkeypatch,
 ) -> None:
     fmha = object.__new__(FlashInferTrtllmGenFmha)
+    checked_phases = []
+
+    def _accept_phase(self, q, k, v, metadata, forward_args, *, phase):
+        checked_phases.append(phase)
+        return True
+
     monkeypatch.setattr(
         FlashInferTrtllmGenFmha,
         "is_supported",
-        lambda *args: True,
+        _accept_phase,
     )
     combined_fmha = object.__new__(CombinedFmha)
     backend = SimpleNamespace(
@@ -188,17 +282,34 @@ def test_mixed_batch_reuses_one_phased_fmha_when_it_supports_both_phases(
     )
 
     assert selected_fmha is fmha
+    assert checked_phases == [
+        FmhaPhase.CONTEXT,
+        FmhaPhase.GENERATION,
+    ]
 
 
-def test_mixed_batch_requires_both_phased_implementations(monkeypatch) -> None:
+def test_mixed_batch_checks_followup_fmha_support(monkeypatch) -> None:
     context_fmha = object.__new__(TritonCustomMaskFmha)
+    followup_fmha = object.__new__(FlashInferTrtllmGenFmha)
+    checked_followup_phases = []
+
     monkeypatch.setattr(
         TritonCustomMaskFmha,
         "is_supported",
-        lambda *args: True,
+        lambda self, q, k, v, metadata, forward_args, *, phase: (phase == FmhaPhase.CONTEXT),
+    )
+
+    def _reject_followup(self, q, k, v, metadata, forward_args, *, phase):
+        checked_followup_phases.append(phase)
+        return False
+
+    monkeypatch.setattr(
+        FlashInferTrtllmGenFmha,
+        "is_supported",
+        _reject_followup,
     )
     backend = SimpleNamespace(
-        phased_fmha_libs=[context_fmha],
+        phased_fmha_libs=[context_fmha, followup_fmha],
         combined_fmha=object.__new__(CombinedFmha),
     )
     metadata = SimpleNamespace(
@@ -218,6 +329,7 @@ def test_mixed_batch_requires_both_phased_implementations(monkeypatch) -> None:
     )
 
     assert selected_fmha is None
+    assert checked_followup_phases == [FmhaPhase.GENERATION]
 
 
 def test_non_custom_request_uses_flashinfer_anchor(
@@ -228,12 +340,12 @@ def test_non_custom_request_uses_flashinfer_anchor(
     monkeypatch.setattr(
         TritonCustomMaskFmha,
         "is_supported",
-        lambda *args: False,
+        lambda self, q, k, v, metadata, forward_args, *, phase: False,
     )
     monkeypatch.setattr(
         FlashInferTrtllmGenFmha,
         "is_supported",
-        lambda *args: True,
+        lambda self, q, k, v, metadata, forward_args, *, phase: True,
     )
     backend = SimpleNamespace(
         phased_fmha_libs=[context_fmha, generation_fmha],
@@ -258,15 +370,17 @@ def test_non_custom_request_uses_flashinfer_anchor(
     assert selected_fmha is generation_fmha
 
 
-def test_mla_selection_uses_capability_then_request_support(
+def test_mla_selection_passes_generation_phase_to_request_support(
     monkeypatch,
 ) -> None:
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     checked_args = None
+    checked_phase = None
 
-    def _accept_request(self, q, k, v, metadata, forward_args):
-        nonlocal checked_args
+    def _accept_request(self, q, k, v, metadata, forward_args, *, phase):
+        nonlocal checked_args, checked_phase
         checked_args = forward_args
+        checked_phase = phase
         return True
 
     monkeypatch.setattr(
@@ -288,6 +402,7 @@ def test_mla_selection_uses_capability_then_request_support(
 
     assert selected_fmha is fmha
     assert checked_args is forward_args
+    assert checked_phase == FmhaPhase.GENERATION
 
 
 @pytest.mark.parametrize("is_mla_enable", [False, True])
@@ -705,7 +820,14 @@ def test_large_head_context_requires_module_side_rope() -> None:
         is_fused_qkv=True,
     )
 
-    assert not fmha.is_supported(q, None, None, metadata, forward_args)
+    assert not fmha.is_supported(
+        q,
+        None,
+        None,
+        metadata,
+        forward_args,
+        phase=FmhaPhase.CONTEXT,
+    )
 
 
 def test_triton_prefill_accepts_separate_kv_page_tables() -> None:

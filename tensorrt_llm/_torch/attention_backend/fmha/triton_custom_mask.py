@@ -30,6 +30,7 @@ from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 from .trtllm_gen_utils import get_trtllm_gen_context_workspace_size
 
@@ -75,6 +76,8 @@ class TritonCustomMaskFmha(PhasedFmha):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: FmhaPhase,
     ) -> bool:
         supported, reason = self._check_support_with_reason(
             q,
@@ -82,6 +85,7 @@ class TritonCustomMaskFmha(PhasedFmha):
             v,
             metadata,
             forward_args,
+            phase=phase,
         )
         if not supported:
             logger.debug(f"Triton custom-mask FMHA does not support request: {reason}")
@@ -94,7 +98,11 @@ class TritonCustomMaskFmha(PhasedFmha):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: FmhaPhase,
     ) -> tuple[bool, str]:
+        if phase != FmhaPhase.CONTEXT:
+            return False, "Only context attention is supported."
         if forward_args.attention_mask != CustomAttentionMask.CUSTOM:
             return False, "Request does not use a custom attention mask."
         if forward_args.attention_mask_data is None:

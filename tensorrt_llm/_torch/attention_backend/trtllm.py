@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend.fmha import (
-    CombinedFmha, Fmha, PhasedFmha, get_enabled_fmha_lib_classes)
+    CombinedFmha, Fmha, FmhaPhase, PhasedFmha, get_enabled_fmha_lib_classes)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -1485,37 +1485,48 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Optional[PhasedFmha]:
         has_context = metadata.num_contexts > 0
         has_generation = metadata.num_generations > 0
-        for index, fmha in enumerate(self.phased_fmha_libs):
-            if not fmha.is_supported(q, k, v, metadata, forward_args):
-                continue
-
-            context_fmha = (fmha if has_context and fmha.is_context_supported()
-                            else None)
-            generation_fmha = (fmha if has_generation
-                               and fmha.is_generation_supported() else None)
-            for followup_fmha in self.phased_fmha_libs[index + 1:]:
-                if (has_context and context_fmha is None
-                        and followup_fmha.is_context_supported()):
-                    context_fmha = followup_fmha
-                if (has_generation and generation_fmha is None
-                        and followup_fmha.is_generation_supported()):
-                    generation_fmha = followup_fmha
-
-            if (has_context
-                    and context_fmha is None) or (has_generation
-                                                  and generation_fmha is None):
-                continue
-            if context_fmha is None:
-                return generation_fmha
-            if generation_fmha is None or context_fmha is generation_fmha:
-                return context_fmha
-
-            self.combined_fmha.set_fmha_impls(
-                context_fmha,
-                generation_fmha,
+        context_fmha = None
+        if has_context:
+            context_fmha = next(
+                (fmha for fmha in self.phased_fmha_libs if fmha.is_supported(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    phase=FmhaPhase.CONTEXT,
+                )),
+                None,
             )
-            return self.combined_fmha
-        return None
+
+        generation_fmha = None
+        if has_generation:
+            generation_fmha = next(
+                (fmha for fmha in self.phased_fmha_libs if fmha.is_supported(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    phase=FmhaPhase.GENERATION,
+                )),
+                None,
+            )
+
+        if (has_context
+                and context_fmha is None) or (has_generation
+                                              and generation_fmha is None):
+            return None
+        if context_fmha is None:
+            return generation_fmha
+        if generation_fmha is None or context_fmha is generation_fmha:
+            return context_fmha
+
+        self.combined_fmha.set_fmha_impls(
+            context_fmha,
+            generation_fmha,
+        )
+        return self.combined_fmha
 
     def _select_mla_fmha(
         self,
@@ -1526,17 +1537,25 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         forward_args: AttentionForwardArgs,
     ) -> Optional[Fmha]:
         if forward_args.attention_input_type == AttentionInputType.context_only:
-            is_phase_supported = "is_mla_context_supported"
+            phase = FmhaPhase.CONTEXT
         elif forward_args.attention_input_type == AttentionInputType.generation_only:
-            is_phase_supported = "is_mla_generation_supported"
+            phase = FmhaPhase.GENERATION
         else:
             return None
 
         for fmha in self.fmha_libs:
             if isinstance(fmha, PhasedFmha):
-                if not getattr(fmha, is_phase_supported)():
-                    continue
-            if fmha.is_supported(q, k, v, metadata, forward_args):
+                supported = fmha.is_supported(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    phase=phase,
+                )
+            else:
+                supported = fmha.is_supported(q, k, v, metadata, forward_args)
+            if supported:
                 return fmha
         return None
 

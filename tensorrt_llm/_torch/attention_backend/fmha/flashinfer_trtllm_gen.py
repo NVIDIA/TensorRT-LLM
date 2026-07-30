@@ -34,7 +34,9 @@ Entry points:
 
 Example:
     fmha = FlashInferTrtllmGenFmha(attn=...)
-    if fmha.is_supported(q, k, v, metadata, forward_args):
+    if fmha.is_supported(
+        q, k, v, metadata, forward_args, phase=FmhaPhase.CONTEXT
+    ):
         fmha.forward(q, k, v, metadata, forward_args)
 """
 
@@ -58,6 +60,7 @@ from tensorrt_llm.functional import AttentionMaskType, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 from .trtllm_gen_utils import get_trtllm_gen_context_workspace_size
 
@@ -515,6 +518,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: FmhaPhase,
     ) -> bool:
         supported, reason = self._is_supported_with_reason(
             q,
@@ -523,6 +528,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             self.attn,
             metadata,
             forward_args,
+            phase=phase,
         )
         if not supported:
             logger.debug(f"FlashInfer trtllm-gen fmha library does not support request: {reason}")
@@ -536,8 +542,19 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attn: "TrtllmAttention",
         meta: "TrtllmAttentionMetadata",
         fwd: AttentionForwardArgs,
+        *,
+        phase: FmhaPhase,
     ) -> Tuple[bool, str]:
         is_mla_enable = attn.is_mla_enable
+        if phase == FmhaPhase.CONTEXT:
+            has_context_phase = True
+            has_generation_phase = False
+        elif phase == FmhaPhase.GENERATION:
+            has_context_phase = False
+            has_generation_phase = True
+        else:
+            return False, f"invalid FMHA phase: {phase}."
+
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
@@ -566,8 +583,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "relative attention bias."
         if meta.use_spec_decoding and meta.is_spec_dec_tree:
             return False, "spec-dec tree/custom masks."
-        if is_mla_enable and fwd.attention_input_type != AttentionInputType.generation_only:
-            return False, "MLA with non-generation-only attention."
+        if is_mla_enable and has_context_phase:
+            return False, "MLA context attention."
 
         if meta.kv_cache_block_offsets is None:
             return False, "non-paged KV cache; paged KV cache is required."
@@ -587,9 +604,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if tokens_per_block is None:
             tokens_per_block = 0
 
-        attn_input_type = fwd.attention_input_type
-        has_context_phase = attn_input_type != AttentionInputType.generation_only
-        has_generation_phase = attn_input_type != AttentionInputType.context_only
         has_separate_qkv = not fwd.is_fused_qkv and k is not None and v is not None
         has_q_only = k is None and v is None and q.size(-1) == attn.num_heads * attn.head_dim
         needs_preprocessed_generation = (
@@ -659,7 +673,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             try:
                 mask_type = AttentionMaskType(fwd.mask_type)
             except ValueError:
-                return False, f"[Context] invalid mask_type: {fwd.mask_type}."
+                return False, f"[Context] invalid attention mask: {fwd.attention_mask}."
             if mask_type == AttentionMaskType.custom_mask:
                 return False, "[Context] custom mask."
             if has_alibi:
