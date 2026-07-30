@@ -113,13 +113,14 @@ BEAM_SEARCH_PAD_TOKEN = vanilla.BEAM_SEARCH_PAD_TOKEN
 
 @dataclass(kw_only=True)
 class TopPDecayMetadata(StrategyMetadata):
-    """Per-group runtime top-p override for Top-P Decay (attached to top_p /
-    top_k_top_p groups via the ``StrategyMetadata`` mechanism).
+    """Per-group runtime top-p override for Top-P Decay (attached to the
+    top-p-carrying groups -- top_p, top_k_top_p and min_p -- via the
+    ``StrategyMetadata`` mechanism).
 
     ``slots`` maps each per-step group row to its sequence slot; the decayed
     per-row top-p is gathered on-device from the per-slot ``runtime_top_p``
     store, gated by ``is_decay_slot`` (non-decay rows keep their static top-p).
-    Consumed by the TopP*/TopKTopP* strategy impls in ``sample()``. See
+    Consumed by the TopP*/TopKTopP*/MinP* strategy impls in ``sample()``. See
     ``top_p_decay.TopPDecayStore`` for the feature-level semantics.
     """
 
@@ -422,7 +423,7 @@ class _StrategyImpls:
             return new_tokens, probs
 
     class TopPDecayMixin:
-        """Mixed into the TopP*/TopKTopP* impls (the owners of a per-row
+        """Mixed into the TopP*/TopKTopP*/MinP* impls (the owners of a per-row
         ``_top_p`` tensor) to consume ``TopPDecayMetadata``."""
 
         _top_p: torch.Tensor
@@ -613,7 +614,7 @@ class _StrategyImpls:
                 generator=generator,
             )
 
-    class MinPWithProbs(StrategyImplWithProbs):
+    class MinPWithProbs(TopPDecayMixin, StrategyImplWithProbs):
         def __init__(
             self,
             top_k: torch.Tensor,
@@ -647,6 +648,7 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             return self._sample_with_probs(
                 logits,
                 group_logit_indices=group_logit_indices,
@@ -825,7 +827,7 @@ class _StrategyImpls:
             )
             return new_tokens, None
 
-    class MinPSampleOnly(StrategyImplSampleOnly):
+    class MinPSampleOnly(TopPDecayMixin, StrategyImplSampleOnly):
         def __init__(
             self,
             top_k: torch.Tensor,
@@ -859,6 +861,7 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self._maybe_apply_top_p_decay(group_metadata)
             # With min_p applied first, nothing has to run after top_k/top_p, so
             # the fused kernel can filter and sample in one pass instead of two
             # renorms plus a separate sampling step.
@@ -966,7 +969,7 @@ class FlashInferGroupedStrategySampler:
         match strategy_key:
             case ("beam_search", _, _):
                 return BeamSearchMetadata
-            case "top_p" | "top_k_top_p":
+            case "top_p" | "top_k_top_p" | "min_p":
                 return TopPDecayMetadata
             case _:
                 return None

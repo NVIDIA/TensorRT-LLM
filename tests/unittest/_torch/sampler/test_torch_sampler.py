@@ -62,6 +62,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     TopK,
     TopKTopP,
     TopP,
+    TopPDecayMetadata,
     resolve_sampling_strategy,
     sample,
 )
@@ -2933,6 +2934,75 @@ class TestTopPDecay:
             self._params(top_p_decay=0.5, top_k=1), vocab_size=self.VOCAB_SIZE
         )
         assert s is GREEDY
+        # min_p wins the strategy choice, but the request keeps carrying top_p,
+        # so decay stays applicable (see test_decay_metadata_dispatch).
+        s = resolve_sampling_strategy(
+            self._params(min_p=0.1, top_p=0.9, top_p_decay=0.8), vocab_size=self.VOCAB_SIZE
+        )
+        assert s[0] == "min_p"
+
+    # Every strategy a decay-active request can resolve to carries a per-row
+    # top-p, so all of them must be offered the decay metadata. A strategy
+    # missing from the dispatch silently drops decay: the request is still
+    # admitted and its runtime top-p still decays, but sampling keeps reading
+    # the static initial value.
+    @pytest.mark.parametrize(
+        "params",
+        [
+            pytest.param(dict(top_p_decay=0.8), id="top_p"),
+            pytest.param(dict(top_k=50, top_p=0.9, top_p_decay=0.8), id="top_k_top_p"),
+            pytest.param(dict(min_p=0.1, top_p=0.9, top_p_decay=0.8), id="min_p"),
+        ],
+    )
+    def test_decay_metadata_dispatch(self, params):
+        strategy = resolve_sampling_strategy(self._params(**params), vocab_size=self.VOCAB_SIZE)
+        group_key = FlashInferGroupedStrategySampler.strategy_grouping_key(strategy)
+        assert (
+            FlashInferGroupedStrategySampler.get_metadata_type_for_group(group_key)
+            is TopPDecayMetadata
+        )
+
+    # Companion to the dispatch test: the metadata must not just be handed over
+    # but actually override the per-row top-p. Logits are chosen so the static
+    # top_p=1.0 leaves every token samplable (min_p=0.1 keeps them all too),
+    # while the decayed runtime top-p of 0.3 is below the argmax's own
+    # probability and collapses the nucleus onto it.
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            pytest.param(("top_p", 1.0, 1.0), id="top_p"),
+            pytest.param(("top_k_top_p", 5, 1.0, 1.0), id="top_k_top_p"),
+            pytest.param(("min_p", 0, 1.0, 0.1, 1.0), id="min_p"),
+        ],
+    )
+    @pytest.mark.parametrize("return_probs", [True, False], ids=["with_probs", "sample_only"])
+    def test_decay_override_reaches_sampling(self, strategy, return_probs):
+        num_rows, vocab, decayed_top_p = 64, 5, 0.3
+        logits = torch.zeros(num_rows, vocab, device="cuda")
+        logits[:, 0] = 1.0
+        argmax = 0
+
+        def run(is_decay_slot: bool) -> set[int]:
+            metadata = TopPDecayMetadata(
+                # All rows share slot 0, so a single store entry gates them all.
+                slots=torch.zeros(num_rows, dtype=torch.int64, device="cuda"),
+                runtime_top_p=torch.tensor([decayed_top_p], dtype=torch.float32, device="cuda"),
+                is_decay_slot=torch.tensor([is_decay_slot], dtype=torch.bool, device="cuda"),
+            )
+            tokens, _, _ = FlashInferGroupedStrategySampler.sample_grouped_strategies(
+                FlashInferGroupedStrategySampler.strategy_grouping_key(strategy),
+                [cast(Strategy, strategy)] * num_rows,
+                logits,
+                generator=torch.Generator(device="cuda").manual_seed(0),
+                return_probs=return_probs,
+                group_metadata=metadata,
+            )
+            return set(tokens.flatten().tolist())
+
+        # Gate off: the static top-p applies and sampling spreads over the vocab.
+        assert len(run(is_decay_slot=False)) > 1
+        # Gate on: the decayed runtime top-p replaces it and only the argmax survives.
+        assert run(is_decay_slot=True) == {argmax}
 
     def test_runtime_update_parity(self):
         # Post-sample update parity with the C++ computeToppDecay recurrence
