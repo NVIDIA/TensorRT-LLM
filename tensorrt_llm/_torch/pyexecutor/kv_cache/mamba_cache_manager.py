@@ -3438,8 +3438,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 LayerId(first_mamba_local_layer), MambaRole.SSM_STATE)
             num_ssm_slots = ((num_ssm_pages + self._ssm_page_index_scale - 1) //
                              self._ssm_page_index_scale)
-            required_live_slots = (self._max_resident_sequences() +
-                                   self._num_reserved_dummy_slots)
+            required_live_slots = self._num_required_state_slots()
             if num_ssm_slots < required_live_slots:
                 KVCacheManagerV2.shutdown(self)
                 raise ValueError(
@@ -4043,6 +4042,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _max_resident_sequences(self) -> int:
         return self.max_batch_size * self.mapping.pp_size
 
+    def _num_required_state_slots(self) -> int:
+        """Return the SSM slots that must always be live: one per resident
+        request lineage plus every reserved dummy slot."""
+        return self._max_resident_sequences() + self._num_reserved_dummy_slots
+
     def _kda_draft_records_shape(self) -> Tuple[int, int, int, int]:
         """One SSM slot's shape in a layer of ``kda_state_tok``: per draft,
         the row innovations vn, then beta * k and the decay, each [H, K] (the
@@ -4191,9 +4195,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Return the minimum quota for live states and one attention page."""
         attention_block_quota = (self._attention_cache_bytes_per_token() *
                                  self.tokens_per_block)
-        num_state_slots = (self._max_resident_sequences() +
-                           self._num_reserved_dummy_slots)
-        state_quota = num_state_slots * self._mamba_state_bytes_per_slot()
+        state_quota = (self._num_required_state_slots() *
+                       self._mamba_state_bytes_per_slot())
         return max(
             self._get_quota_from_max_tokens(0),
             state_quota + attention_block_quota,
@@ -4253,10 +4256,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     buffers=buffers,
                 )
 
-        dummy_requests = [
-            KVCacheDesc(capacity=0, history_length=0)
-            for _ in range(self._num_reserved_dummy_slots)
-        ]
+        empty_desc = KVCacheDesc(capacity=0, history_length=0)
+        dummy_requests = [empty_desc] * self._num_reserved_dummy_slots
         constraints = [
             replace(
                 batch,
@@ -4283,14 +4284,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # / __init__). Add a min-slots constraint of zero-capacity requests:
         # these cost no attention pages but reserve one SSM slot each.
         if any(isinstance(layer, SsmLayerConfig) for layer in layers):
-            ssm_floor_slots = (self._max_resident_sequences() +
-                               self._num_reserved_dummy_slots)
             constraints = [
                 *constraints,
-                BatchDesc([
-                    KVCacheDesc(capacity=0, history_length=0)
-                    for _ in range(ssm_floor_slots)
-                ]),
+                BatchDesc([empty_desc] * self._num_required_state_slots()),
             ]
         return replace(
             config,
