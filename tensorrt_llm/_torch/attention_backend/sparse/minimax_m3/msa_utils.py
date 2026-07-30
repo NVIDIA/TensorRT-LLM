@@ -27,6 +27,56 @@ MSA_REQUIRED_HEAD_DIM = 128
 _MSA_PYTHON_RELPATH = Path("3rdparty") / "MSA" / "python"
 
 
+def msa_ported_decode_active(metadata) -> bool:
+    """Whether this step's generation rows run on the ported decode kernels.
+
+    They always do, when the step has generation rows at all: the Triton sparse
+    kernel, the trtllm-gen dense kernel and the CuTe DSL indexer scorer own the
+    generation span together (the whole of a pure-decode batch, or the row and
+    token suffix of a mixed one) and fmha_sm100 is left with the context prefix.
+    There is no per-kernel switch and no fallback for a generation row: a
+    geometry the span's kernels cannot serve raises in prepare() instead of
+    being routed back to fmha_sm100 at several times the decode cost. See
+    _resolve_decode_kernels.
+
+    So False means only that this step has no span: a pure-prefill step, or one
+    that opted out by leaving the query length or the buffers the ported kernels
+    address unset, which the standalone kernel tests do since their metadata
+    never runs prepare().
+
+    One predicate serves every site that has to agree on the span: both
+    attention branches and the indexer, which additionally orients its top-k
+    table for whichever of them consumes it.
+    """
+    return (
+        getattr(metadata, "msa_decode_query_len", None) is not None
+        and getattr(metadata, "msa_block_table", None) is not None
+        and getattr(metadata, "msa_seq_lens_cuda", None) is not None
+    )
+
+
+def msa_decode_span_bounds(metadata, num_tokens: int) -> Tuple[int, int, int, int]:
+    """Bounds of the generation span, as (token_first, row_first, row_last, query_len).
+
+    The span is what the ported decode kernels own this step; see
+    _MsaDecodeSpan in msa_backend. Reading it through getattr keeps this module
+    free of an import back into the backend, and covers the standalone kernel
+    tests, whose metadata never ran prepare() and so carries no span: there the
+    whole batch is the span, derived from the query length alone.
+
+    Returns zeros when no query length is resolved either, in which case every
+    caller is on the fmha_sm100 path and ignores these bounds.
+    """
+    span = getattr(metadata, "msa_decode_span", None)
+    if span is not None:
+        return span.token_first, span.row_first, span.row_last, span.query_len
+    query_len = getattr(metadata, "msa_decode_query_len", None)
+    if query_len is None:
+        return 0, 0, 0, 0
+    query_len = int(query_len)
+    return 0, 0, num_tokens // query_len, query_len
+
+
 @functools.lru_cache(maxsize=1)
 def _find_msa_python_dir() -> Optional[Path]:
     """Locate the fmha_sm100 package dir by walking up from this file.
@@ -233,9 +283,8 @@ def select_blocks_from_maxscore(
     Applies init and local forced blocks and per-query valid-block masking
     on the amax-reduced scores [num_kv_heads, n_blocks, total_q]. Returns
     [total_q, num_kv_heads, topk] int32 ascending block ids with -1 tail
-    padding. When ``head_major_output`` is set, the logical result uses a
-    head-major backing so ``result.permute(1, 0, 2)`` is contiguous without a
-    copy.
+    padding. head_major_output backs that result head-major instead, so
+    result.permute(1, 0, 2) is contiguous without a copy.
     """
     nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
     return torch.ops.trtllm.minimax_m3_select_blocks(
@@ -252,8 +301,10 @@ __all__ = [
     "MSA_REQUIRED_HEAD_DIM",
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
+    "msa_decode_span_bounds",
     "msa_package_available",
     "msa_paged_kv",
+    "msa_ported_decode_active",
     "per_token_valid_blocks",
     "require_msa_module",
     "select_blocks_from_maxscore",

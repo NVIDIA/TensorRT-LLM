@@ -19,6 +19,9 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import write
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_scatter import (
     fused_write_layer_caches,
 )
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+    msa_ported_decode_active,
+)
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
@@ -149,6 +152,116 @@ def test_msa_metadata_rejects_undersized_max_score_buffer():
         )
 
 
+MAX_NUM_SEQUENCES = 8
+MAX_BLOCKS_PER_SEQ = 64
+
+
+class _RecordingBuffers:
+    """The graph buffer pool, recording what each buffer was reserved as."""
+
+    def __init__(self):
+        self.requested = {}
+
+    def get_buffer(self, tensor_shape, dtype, cache_name, capture_graph):
+        self.requested[cache_name] = (tuple(tensor_shape), dtype, capture_graph)
+        return torch.zeros(tensor_shape, device="cuda", dtype=dtype)
+
+
+def _buffer_metadata(**manager_fields):
+    """Metadata ready for _create_msa_buffers, under capture."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = SimpleNamespace(
+        max_blocks_per_seq=MAX_BLOCKS_PER_SEQ,
+        tokens_per_block=128,
+        get_index_k_buffer=lambda layer_idx, kv_layout=None: None,
+        **manager_fields,
+    )
+    metadata.is_cuda_graph = True
+    metadata.cuda_graph_buffers = _RecordingBuffers()
+    metadata.max_num_sequences = MAX_NUM_SEQUENCES
+    metadata.max_num_tokens = 512
+    # No sparse params, so the fmha_sm100 proxy scratch is skipped and this
+    # exercises only the layer-invariant buffers.
+    metadata._msa_params = None
+    return metadata
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_msa_buffers_include_graph_stable_block_table():
+    """The 2-D page table and per-request length the ported decode kernels take
+    must come from the graph buffer pool at the manager's worst-case geometry,
+    so their addresses survive capture."""
+    metadata = _buffer_metadata()
+
+    metadata._create_msa_buffers()
+
+    assert metadata._msa_buffers_ready
+    assert metadata.msa_block_table.shape == (MAX_NUM_SEQUENCES, MAX_BLOCKS_PER_SEQ)
+    assert metadata.msa_seq_lens_cuda.shape == (MAX_NUM_SEQUENCES,)
+    # Reserved from the graph pool at the worst-case geometry, alongside the
+    # flat page table the fmha_sm100 path uses.
+    requested = metadata.cuda_graph_buffers.requested
+    assert requested["msa_block_table"] == (
+        (MAX_NUM_SEQUENCES, MAX_BLOCKS_PER_SEQ),
+        torch.int32,
+        True,
+    )
+    assert requested["msa_seq_lens_cuda"] == ((MAX_NUM_SEQUENCES,), torch.int32, True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    ("factors", "expected"),
+    [((9, 9, 9), 9), ((9, 4, 9), 0)],
+    ids=["uniform-pool", "groups-disagree"],
+)
+def test_msa_buffers_stage_the_subpage_table_only_for_a_uniform_pool(factors, expected):
+    """The sub-page expansion is hoisted out of the dense layers into prepare(),
+    which runs before any layer is named. That is sound only where every layer
+    of the pool packs the same number of sub-pages per slot; where they
+    disagree, no table is staged and each dense layer expands its own.
+    """
+    metadata = _buffer_metadata(
+        layer_offsets=dict.fromkeys(range(len(factors)), 0),
+        get_kv_subpage_pool=lambda layer_idx, kv_layout="HND": (None, factors[layer_idx]),
+    )
+
+    metadata._create_msa_buffers()
+
+    assert metadata._msa_subpages_per_slot == expected
+    if expected == 0:
+        assert metadata.msa_subpage_block_table is None
+        assert "msa_subpage_block_table" not in metadata.cuda_graph_buffers.requested
+    else:
+        # One K row and one V row per slot, at the same worst-case geometry as
+        # the slot table it expands.
+        assert metadata.cuda_graph_buffers.requested["msa_subpage_block_table"] == (
+            (MAX_NUM_SEQUENCES, 2, MAX_BLOCKS_PER_SEQ),
+            torch.int32,
+            True,
+        )
+
+
+def test_msa_subpage_rows_slice_the_generation_span():
+    """A mixed step hands the dense kernel only the span's rows, and its block
+    table has to be sliced the same way the slot table is. The factor travels
+    with it so the kernel can tell a stale staging from its own geometry."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.msa_subpage_block_table = torch.arange(4 * 2 * 3, dtype=torch.int32).reshape(4, 2, 3)
+    metadata._msa_subpages_per_slot = 9
+
+    table, factor = metadata.msa_subpage_rows(2, 4)
+    assert factor == 9
+    assert torch.equal(table, metadata.msa_subpage_block_table[2:4])
+
+    # Nothing staged: the caller expands its own layer's table, and the 0
+    # factor is what tells it to.
+    metadata.msa_subpage_block_table = None
+    assert metadata.msa_subpage_rows(2, 4) == (None, 0)
+
+
 def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
     """The proxy view fed to fmha_sm100 must be contiguous in the exact
     [num_index_heads, plan_max_k_tiles, num_tokens] shape the kernel writes,
@@ -171,6 +284,11 @@ def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
     # Oversized requests are rejected rather than silently corrupting memory.
     with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata.msa_proxy_max_score_view(num_index_heads, worst_k, max_batch + 1)
+
+    # So is an empty one. Both writers address the view by block id, so a zero
+    # extent is not a small view but writes past the end of one.
+    with pytest.raises(ValueError, match=r"no block extent"):
+        metadata.msa_proxy_max_score_view(num_index_heads, 0, max_batch)
 
 
 def test_msa_index_k_uses_hnd_cache_view_and_writer():
@@ -482,6 +600,364 @@ def test_msa_scratch_sizing_covers_spec_verify_tokens():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lazily_allocated_scratch_publishes_the_bound_it_used(monkeypatch):
+    """The scratch is normally sized in _create_msa_buffers, but a metadata
+    built without sparse params allocates it here on first use. Either way the
+    worst-case bound has to be published: msa_proxy_max_score_view shapes the
+    view from it, including on a step that skips the proxy plan and so never
+    computes a bound of its own.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import msa_backend
+
+    # Both stand in for the fmha_sm100 submodule, which need not be built to
+    # test what is done with the number it returns.
+    monkeypatch.setattr(msa_backend, "require_msa_module", lambda: None)
+    monkeypatch.setattr(msa_backend, "_worst_case_proxy_max_k_tiles", lambda *a, **kw: 32)
+
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = SimpleNamespace()
+    metadata.cuda_graph_buffers = None
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 8
+    metadata.msa_max_score = None
+    metadata._msa_worst_case_max_k_tiles = 0
+
+    metadata._ensure_msa_decode_scratch_buffers(
+        num_index_heads=4,
+        max_batch=2,
+        capture_graph=False,
+        required_max_k_tiles=16,
+    )
+
+    assert metadata.msa_worst_case_max_k_tiles == 32
+    # The store was sized against that bound, so a view shaped by it fits.
+    assert metadata.msa_proxy_max_score_view(4, 32, 8).shape == (4, 32, 8)
+
+
+def _resolution_metadata(
+    *, num_contexts=0, qo_lens=(1, 1), kv_lens=(9, 11), is_cuda_graph=False, page_size=128
+):
+    """Metadata with just enough state for _resolve_decode_kernels.
+
+    The resolver reads only host-side facts, so seq_lens/kv_lens are enough to
+    drive the real msa_*_cpu length properties; no cache pool is needed.
+    """
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_params = MiniMaxM3SparseAttentionConfig(
+        implementation="msa"
+    ).to_sparse_metadata_params()
+    metadata.mapping = None
+    # Assigned behind the seq_lens property, whose setter would stage a device
+    # copy the resolver never reads; num_seqs derives from it. The num_contexts
+    # setter then runs on_update() over both, as it does in a real step.
+    metadata._seq_lens = torch.tensor(qo_lens, dtype=torch.int32)
+    metadata.num_contexts = num_contexts
+    metadata.kv_lens = torch.tensor(kv_lens, dtype=torch.int32)
+    metadata.kv_cache_params = None
+    metadata.is_cuda_graph = is_cuda_graph
+    metadata._msa_captured_resolution = None
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=page_size,
+        indexer_kv_dtype="bf16",
+        # Present, so the trtllm-gen dense support check passes.
+        get_kv_subpage_pool=lambda: None,
+    )
+    metadata.msa_block_table = torch.zeros(len(qo_lens), 4, dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(len(qo_lens), dtype=torch.int32)
+    return metadata
+
+
+def _force_cutedsl_supported(monkeypatch):
+    """Force the CuTe DSL geometry verdict, which otherwise needs an SM100 host.
+
+    The resolver raises on an unsupported geometry, so without this every
+    resolution test would be a test of the runner's availability.
+    """
+    monkeypatch.setattr(
+        MiniMaxM3MsaSparseAttention.Metadata,
+        "_cutedsl_indexer_supported",
+        lambda self, **kw: True,
+    )
+
+
+def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
+    """A uniform pure-decode step resolves a span over the whole batch, which is
+    what lets prepare() skip the fmha_sm100 plans entirely."""
+    _force_cutedsl_supported(monkeypatch)
+    metadata = _resolution_metadata()
+
+    metadata._resolve_decode_kernels()
+
+    assert msa_ported_decode_active(metadata) is True
+    assert metadata._msa_runs_no_fmha() is True
+    assert metadata.msa_decode_query_len == 1
+    assert metadata.msa_max_kv_len == 11
+    # The whole batch is the span, so nothing is left for fmha_sm100.
+    span = metadata.msa_decode_span
+    assert (span.row_first, span.row_last) == (0, 2)
+    assert (span.token_first, span.token_last) == (0, 2)
+    assert span.is_mixed is False
+
+
+def test_resolve_decode_kernels_commits_the_generation_span_of_a_mixed_step(monkeypatch):
+    """A context request does not disqualify the step.
+
+    The generation requests are the batch's row and token suffix, so the ported
+    kernels take that span and fmha_sm100 keeps the context prefix.
+    """
+    _force_cutedsl_supported(monkeypatch)
+    # Two context requests (7 and 5 query tokens, the first a chunk of a long
+    # prompt) ahead of two decode rows.
+    metadata = _resolution_metadata(num_contexts=2, qo_lens=(7, 5, 1, 1), kv_lens=(4096, 5, 40, 33))
+
+    metadata._resolve_decode_kernels()
+
+    span = metadata.msa_decode_span
+    assert (span.row_first, span.row_last) == (2, 4)
+    assert (span.token_first, span.token_last) == (12, 14)
+    assert span.query_len == 1
+    assert span.is_mixed is True
+    assert msa_ported_decode_active(metadata) is True
+    # fmha_sm100 still runs the context prefix, so its page table stays live.
+    assert metadata._msa_runs_no_fmha() is False
+    # The trtllm-gen scheduling bound must come from the span's own rows: the
+    # 4096-token context row here would inflate a whole-batch maximum by 100x.
+    assert metadata.msa_max_kv_len == 40
+
+
+def test_resolve_decode_kernels_resolves_no_span_for_a_pure_prefill(monkeypatch):
+    """A step with no generation row has nothing for the ported kernels, and
+    fmha_sm100 keeps every plan and the page table they read."""
+    _force_cutedsl_supported(monkeypatch)
+    metadata = _resolution_metadata(num_contexts=2, qo_lens=(5, 7), kv_lens=(5, 7))
+
+    metadata._resolve_decode_kernels()
+
+    assert metadata.msa_decode_span is None
+    assert metadata.msa_decode_query_len is None
+    assert msa_ported_decode_active(metadata) is False
+    assert metadata._msa_runs_no_fmha() is False
+
+
+def test_a_span_without_its_buffers_is_not_active():
+    """The ported kernels address the page table and per-request lengths
+    directly, so a metadata carrying a query length but neither (the standalone
+    kernel tests, which never run prepare()) has not resolved a span."""
+    metadata = SimpleNamespace(
+        msa_decode_query_len=1, msa_block_table=None, msa_seq_lens_cuda=torch.zeros(1)
+    )
+    assert msa_ported_decode_active(metadata) is False
+
+    metadata.msa_block_table = torch.zeros(1)
+    assert msa_ported_decode_active(metadata) is True
+
+    metadata.msa_seq_lens_cuda = None
+    assert msa_ported_decode_active(metadata) is False
+
+
+@pytest.mark.parametrize(
+    ("num_contexts", "qo_lens", "kv_lens"),
+    [
+        # Ragged decode: the ported kernels' token -> request mapping breaks.
+        (0, (1, 3), (9, 11)),
+        # Ragged generation rows behind a context request. The context request
+        # is fine, but these rows still have no single query length.
+        (1, (5, 1, 2), (5, 9, 11)),
+    ],
+    ids=["ragged-decode", "ragged-mixed"],
+)
+def test_resolve_decode_kernels_raises_on_ragged_generation_rows(
+    monkeypatch, num_contexts, qo_lens, kv_lens
+):
+    """There is no fmha_sm100 decode path left to fall back to, so a span the
+    ported kernels cannot serve has to surface rather than cost the step its
+    decode throughput silently."""
+    _force_cutedsl_supported(monkeypatch)
+    metadata = _resolution_metadata(num_contexts=num_contexts, qo_lens=qo_lens, kv_lens=kv_lens)
+
+    with pytest.raises(NotImplementedError, match=r"one query length"):
+        metadata._resolve_decode_kernels()
+
+    assert metadata.msa_decode_span is None
+
+
+def test_resolve_decode_kernels_raises_without_the_dense_subpage_pool(monkeypatch):
+    """trtllm-gen needs the flat sub-page pool, and its dense plan is gone, so a
+    manager without one cannot serve the dense layers at all."""
+    _force_cutedsl_supported(monkeypatch)
+    metadata = _resolution_metadata()
+    del metadata.kv_cache_manager.get_kv_subpage_pool
+
+    with pytest.raises(NotImplementedError, match=r"sub-page pool"):
+        metadata._resolve_decode_kernels()
+
+
+def test_resolve_decode_kernels_raises_when_the_scorer_declines_the_geometry(monkeypatch):
+    """Same for the indexer: the proxy pass over the span is gone with it."""
+    monkeypatch.setattr(
+        MiniMaxM3MsaSparseAttention.Metadata,
+        "_cutedsl_indexer_supported",
+        lambda self, **kw: False,
+    )
+    metadata = _resolution_metadata()
+
+    with pytest.raises(NotImplementedError, match=r"CuTe DSL indexer scorer"):
+        metadata._resolve_decode_kernels()
+
+
+def test_fmha_plan_rows_narrow_to_the_context_prefix(monkeypatch):
+    """The plans must cover exactly the rows fmha_sm100 still runs.
+
+    on_update_kv_lens patches a plan's length mirrors against the requests it
+    was built from, so a plan that claimed the whole batch while only the
+    context prefix ran would write the wrong lengths into the kernel.
+    """
+    _force_cutedsl_supported(monkeypatch)
+
+    mixed = _resolution_metadata(num_contexts=2, qo_lens=(7, 5, 1, 1), kv_lens=(4096, 5, 40, 33))
+    mixed._msa_live_batch = 4
+    mixed._resolve_decode_kernels()
+    # The span took the generation suffix, so the plans cover the prefix.
+    assert mixed._msa_fmha_plan_rows() == (0, 2)
+
+    decode = _resolution_metadata()
+    decode._msa_live_batch = 2
+    decode._resolve_decode_kernels()
+    # Nothing is left to plan on a pure-decode step the kernels fully own.
+    assert decode._msa_fmha_plan_rows() is None
+
+    prefill = _resolution_metadata(num_contexts=2, qo_lens=(5, 7), kv_lens=(5, 7))
+    prefill._msa_live_batch = 2
+    prefill._resolve_decode_kernels()
+    # No span, so fmha_sm100 runs every row and is planned over all of them.
+    assert prefill._msa_fmha_plan_rows() == (0, 2)
+
+
+def test_resolution_must_not_change_under_a_captured_graph(monkeypatch):
+    """The kernels inside a captured graph are fixed, so a later step that
+    resolves differently would stage inputs for a kernel that never runs."""
+    _force_cutedsl_supported(monkeypatch)
+    metadata = _resolution_metadata(is_cuda_graph=True)
+
+    def _step():
+        metadata._resolve_decode_kernels()
+        metadata._check_capture_stable_resolution()
+
+    _step()
+    # Same inputs: the replay agrees with the capture.
+    _step()
+
+    # A replay whose batch turned mixed. The graph was captured with no
+    # fmha_sm100 plans at all, so the context prefix this step resolves has
+    # nothing to run under.
+    metadata._seq_lens = torch.tensor([5, 1, 1], dtype=torch.int32)
+    metadata.kv_lens = torch.tensor([5, 9, 11], dtype=torch.int32)
+    metadata.num_contexts = 1
+    metadata.msa_block_table = torch.zeros(3, 4, dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(3, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match=r"changed under a captured CUDA graph"):
+        _step()
+
+
+def test_indexer_raises_when_a_committed_cutedsl_scorer_declines():
+    """prepare() left the proxy plan covering nothing but this step's context
+    prefix, so a decline has no fallback for the generation span and must
+    surface instead of silently reading a stale page table."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import MsaIndexer
+
+    indexer = MsaIndexer(
+        MiniMaxM3SparseConfig(
+            num_q_heads=8,
+            num_kv_heads=1,
+            head_dim=128,
+            num_index_heads=4,
+            sparse_index_dim=128,
+            block_size=128,
+            topk=16,
+        )
+    )
+    # block_table/seq_lens left None, so the scorer cannot even be attempted.
+    with pytest.raises(RuntimeError, match=r"CuTe DSL indexer scorer declined the span"):
+        indexer.select_blocks(
+            torch.zeros(2, 4, 128),
+            torch.zeros(4, 1, 128, 128),
+            idx_sm_scale=1.0,
+            kv_indices=torch.zeros(4, dtype=torch.int32),
+            max_score=torch.zeros(4, 8, 2),
+            require_cutedsl=True,
+        )
+
+
+@pytest.mark.parametrize("head_major", [False, True])
+def test_combined_topk_table_preserves_the_requested_backing(head_major):
+    """Joining the two halves of a mixed step's table must not change its layout.
+
+    The Triton sparse decode kernel reads the top-k table head-major, so a
+    joined table has to permute to a contiguous [num_kv_heads, total_q, topk]
+    exactly as the selector's own output does; a token-major join would silently
+    hand the kernel a strided view where production hands it a dense one.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import (
+        _combined_topk_table,
+    )
+
+    num_kv_heads, topk = 2, 16
+    ctx = torch.arange(5 * num_kv_heads * topk, dtype=torch.int32).reshape(5, num_kv_heads, topk)
+    gen = -ctx[:3] - 1
+
+    combined = _combined_topk_table(ctx, gen, head_major=head_major)
+
+    assert combined.shape == (8, num_kv_heads, topk)
+    assert torch.equal(combined[:5], ctx)
+    assert torch.equal(combined[5:], gen)
+    assert combined.permute(1, 0, 2).is_contiguous() is head_major
+    assert combined.is_contiguous() is not head_major
+
+
+def test_paged_gqa_raises_when_a_committed_dense_step_declines():
+    """The mirror of the indexer guard on the attention side. The step resolved
+    a span and dropped the dense plan, so a call site that finds the geometry
+    unsupported has nothing left to fall back to."""
+    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
+
+    num_heads, head_dim, num_pages, page_size = 8, 128, 4, 16
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 3
+    attention.head_dim = head_dim
+    attention.num_heads = num_heads
+    attention.q_scaling = 1.0
+
+    metadata = SimpleNamespace(
+        # No get_kv_subpage_pool, so trtllm-gen declines at the call site.
+        kv_cache_manager=SimpleNamespace(
+            get_buffers=lambda layer_idx, kv_layout=None: torch.zeros(
+                num_pages, 2, 1, page_size, head_dim
+            )
+        ),
+        # A resolved pure-decode span, so the decline is the only thing that
+        # can send this call to fmha_sm100.
+        msa_decode_query_len=1,
+        msa_block_table=torch.zeros(2, 1, dtype=torch.int32),
+        msa_seq_lens_cuda=torch.zeros(2, dtype=torch.int32),
+    )
+
+    with pytest.raises(RuntimeError, match=r"skipped the fmha_sm100 dense plan"):
+        run_msa_paged_gqa(
+            attention,
+            torch.zeros(2, num_heads * head_dim),
+            None,
+            None,
+            metadata,
+            torch.zeros(2, num_heads * head_dim),
+            kv_block_indexes=None,
+            plan=None,
+        )
+
+
 def test_per_token_valid_blocks_multi_token_decode():
     """Spec-verify decode rows expose one entry per query TOKEN, walking the
     causal ladder within the verify window."""
@@ -615,8 +1091,8 @@ def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("with_idx", [True, False])
 def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
-    """The fused per-layer cache scatter must match the legacy write_kv_slots
-    path exactly on production-shaped inputs: non-contiguous HND cache views
+    """The fused per-layer cache scatter must match the per-cache write_kv_slots
+    writes exactly on production-shaped inputs: non-contiguous HND cache views
     carved from a pooled allocation and strided source rows sliced from a fused
     projection, including the bf16 -> fp8 cache cast. Asserting on the whole
     pool also catches stray writes outside the targeted slots."""
@@ -656,3 +1132,160 @@ def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
 
     torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
     torch.testing.assert_close(idx_pool, ref_idx_pool)
+
+
+def _mixed_batch_sparse_gqa_case(*, page_size, head_dim, num_kv_heads, group, topk, seed):
+    """A one-context-plus-three-decode batch for run_msa_paged_gqa.
+
+    Returns the attention stub, the metadata fields both runs share, q, the
+    per-query top-k table, and the batch's context token count. Pages are
+    shuffled so a kernel that ignored the block table and indexed the cache by
+    logical block would not pass.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        build_kv_page_indices,
+        per_token_valid_blocks,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    num_heads = num_kv_heads * group
+    # Row 0 prefills a fresh 260-token prompt; rows 1-3 decode one token each.
+    qo_lens_cpu = torch.tensor([260, 1, 1, 1], dtype=torch.int32)
+    kv_lens_cpu = torch.tensor([260, 300, 1500, 129], dtype=torch.int32)
+    qo_offset_cpu = kv_lens_cpu - qo_lens_cpu
+    batch = int(qo_lens_cpu.shape[0])
+    total_q = int(qo_lens_cpu.sum())
+    max_blocks = int((kv_lens_cpu.max().item() + page_size - 1) // page_size)
+    num_pages = batch * max_blocks
+
+    block_table = (
+        torch.randperm(num_pages, device="cuda", generator=generator)
+        .to(torch.int32)
+        .reshape(batch, max_blocks)
+    )
+    pool = torch.randn(
+        num_pages,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        device="cuda",
+        generator=generator,
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+
+    q = torch.randn(
+        total_q, num_heads * head_dim, device="cuda", generator=generator, dtype=torch.float32
+    ).to(torch.bfloat16)
+
+    # Select each token's earliest valid blocks, ascending with a -1 tail, as
+    # the indexer emits them. Deterministic, and valid for the context rows,
+    # whose causal extent grows token by token.
+    n_valid = per_token_valid_blocks(
+        qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
+    )
+    table = torch.full((total_q, num_kv_heads, topk), -1, dtype=torch.int32)
+    for token, valid in enumerate(n_valid.tolist()):
+        real = min(topk, max(int(valid), 0))
+        table[token, :, :real] = torch.arange(real, dtype=torch.int32)
+    # Head-major backing, so the .permute(1, 0, 2) in run_msa_paged_gqa is the
+    # zero-copy view it is in production.
+    head_major = table.permute(1, 0, 2).contiguous().cuda()
+
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 0
+    attention.head_dim = head_dim
+    attention.num_heads = num_heads
+    attention.q_scaling = 1.0
+
+    fields = dict(
+        kv_cache_manager=SimpleNamespace(
+            tokens_per_block=page_size,
+            get_buffers=lambda layer_idx, kv_layout=None: pool,
+        ),
+        msa_block_table=block_table,
+        msa_seq_lens_cuda=kv_lens_cpu.cuda(),
+        msa_kv_indices=build_kv_page_indices(block_table.cpu(), kv_lens_cpu, page_size).cuda(),
+        msa_qo_lens_cpu=qo_lens_cpu,
+        msa_kv_lens_cpu=kv_lens_cpu,
+        msa_qo_offset_cpu=qo_offset_cpu,
+        msa_max_kv_len=int(kv_lens_cpu[1:].max()),
+        max_num_requests=batch,
+    )
+    return attention, fields, q, head_major.permute(1, 0, 2), int(qo_lens_cpu[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mixed_batch_generation_span_matches_the_whole_batch_msa_path():
+    """Splitting a mixed batch by phase must not change any row's answer.
+
+    The generation rows move off fmha_sm100 and onto the Triton sparse decode
+    kernel while the context rows stay behind under a context-only plan, so the
+    correctness gate is that both halves still agree with a whole-batch
+    fmha_sm100 run, which a metadata carrying no span still takes. This is the
+    only test that covers which kernel produced which output rows.
+    """
+    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        MSA_REQUIRED_TOPK,
+        msa_package_available,
+    )
+    from tensorrt_llm._utils import get_sm_version
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA submodule) required")
+    if get_sm_version() not in (100, 103):
+        pytest.skip("fmha_sm100 requires SM100/SM103")
+
+    page_size, head_dim = 128, 128
+    attention, fields, q, kv_block_indexes, num_ctx_tokens = _mixed_batch_sparse_gqa_case(
+        page_size=page_size,
+        head_dim=head_dim,
+        num_kv_heads=1,
+        group=8,
+        topk=MSA_REQUIRED_TOPK,
+        seed=61,
+    )
+    total_q = int(q.shape[0])
+
+    def run(**resolution):
+        output = torch.zeros_like(q)
+        run_msa_paged_gqa(
+            attention,
+            q,
+            None,
+            None,
+            SimpleNamespace(**fields, **resolution),
+            output,
+            kv_block_indexes=kv_block_indexes,
+            plan=None,
+        )
+        torch.cuda.synchronize()
+        return output.view(total_q, attention.num_heads, head_dim).float()
+
+    reference = run(msa_decode_span=None)
+    split = run(
+        # A property of the span on real metadata, and what
+        # msa_ported_decode_active reads; this fake carries both.
+        msa_decode_query_len=1,
+        msa_decode_span=_MsaDecodeSpan(
+            row_first=1,
+            row_last=4,
+            token_first=num_ctx_tokens,
+            token_last=total_q,
+            query_len=1,
+        ),
+    )
+
+    assert torch.isfinite(split).all()
+    # The context prefix runs on fmha_sm100 either way, but under a 1-row plan
+    # rather than a 4-row one, so its work partitioning differs.
+    torch.testing.assert_close(
+        split[:num_ctx_tokens], reference[:num_ctx_tokens], rtol=1e-2, atol=1e-2
+    )
+    # The generation rows change kernel outright, so they carry the wider
+    # tolerance the Triton-vs-fmha_sm100 A/B uses elsewhere.
+    torch.testing.assert_close(
+        split[num_ctx_tokens:], reference[num_ctx_tokens:], rtol=6e-2, atol=6e-2
+    )

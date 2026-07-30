@@ -4,11 +4,11 @@
 
 One Triton launch writes a layer's new-token main K, main V, and (sparse
 layers) index-K into their paged HND caches at the step's write slots.
-The legacy path costs three aten advanced-indexing writes per layer plus
-their index preprocessing; at 60 layers per forward step, all captured
-into decode CUDA graphs, the launch count dominates the cost. The kernel
-derives each token's (page, within-page) split from ``out_cache_loc``
-in-register, so it needs no precomputed index tensors at all.
+Writing them separately costs three aten advanced-indexing writes per
+layer plus their index preprocessing; at 60 layers per forward step, all
+captured into decode CUDA graphs, the launch count dominates the cost.
+The kernel derives each token's (page, within-page) split from
+out_cache_loc in-register, so it needs no precomputed index tensors.
 
 Sources may be strided row views (slices of the fused QKV projection);
 only the innermost [num_heads * head_dim] extent must be contiguous.
