@@ -40,7 +40,8 @@ constexpr int kChunkV = 32;
 constexpr int kNumChunks = kDimV / kChunkV;
 constexpr int kRowsPerWarp = kChunkV / kWarps;
 
-__device__ __forceinline__ float bf16_load(__nv_bfloat16 const* ptr, int idx)
+template <typename Index>
+__device__ __forceinline__ float bf16_load(__nv_bfloat16 const* ptr, Index idx)
 {
     return __bfloat162float(ptr[idx]);
 }
@@ -422,6 +423,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
     int const hkv_dim = h_count * kDimK;
     int const hvv_dim = hv_count * kDimV;
     int const conv_slot = kUpdateConvState ? slot : i_n;
+    int64_t const qk_input_head = static_cast<int64_t>(bos) * h_count + i_h;
+    int64_t const value_input_head = static_cast<int64_t>(bos) * hv_count + i_hv;
+    int64_t const output_head = static_cast<int64_t>(i_n) * hv_count + i_hv;
 
     constexpr int kStageChunkV = 32;
     constexpr int kStageCount = 3;
@@ -446,8 +450,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
         {
             int const k = tid;
             int const hk = hk_off + k;
-            int const cs_base = slot * hkv_dim * kConvStateWidth + hk;
-            int const xq_idx = (bos * h_count + i_h) * kDimK + k;
+            int64_t const cs_base = static_cast<int64_t>(slot) * hkv_dim * kConvStateWidth + hk;
+            int64_t const xq_idx = qk_input_head * kDimK + k;
             float const exp_a = __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[i_h]) : 0.0f, 0);
 
             float q_acc = bf16_load(bias_q, hk);
@@ -489,7 +493,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
             s_q[k] = silu_fast(q_acc);
             s_k[k] = silu_fast(k_acc);
 
-            float const g_raw = bf16_load(g, (bos * hv_count + i_hv) * kDimK + k) + dt_bias[hk];
+            float const g_raw = bf16_load(g, value_input_head * kDimK + k) + dt_bias[hk];
             if constexpr (kUseLowerBound)
             {
                 s_decay[k] = __expf(lower_bound * sigmoid_fast(exp_a * g_raw));
@@ -513,19 +517,17 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
 #pragma unroll
             for (int w = 0; w < kConvStateWidth; ++w)
             {
-                int const cs_idx = (conv_slot * hkv_dim + hk) * kConvStateWidth + w;
+                int64_t const cs_idx = (static_cast<int64_t>(conv_slot) * hkv_dim + hk) * kConvStateWidth + w;
                 q_acc += bf16_load(cs_q, cs_idx) * bf16_load(w_q_t, w * hkv_dim + hk);
                 k_acc += bf16_load(cs_k, cs_idx) * bf16_load(w_k_t, w * hkv_dim + hk);
             }
-            q_acc += bf16_load(x_q, (bos * h_count + i_h) * kDimK + k)
-                * bf16_load(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
-            k_acc += bf16_load(x_k, (bos * h_count + i_h) * kDimK + k)
-                * bf16_load(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
+            q_acc += bf16_load(x_q, qk_input_head * kDimK + k) * bf16_load(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
+            k_acc += bf16_load(x_k, qk_input_head * kDimK + k) * bf16_load(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
 
             s_q[k] = silu_fast(q_acc);
             s_k[k] = silu_fast(k_acc);
 
-            float const g_raw = bf16_load(g, (bos * hv_count + i_hv) * kDimK + k) + dt_bias[hk];
+            float const g_raw = bf16_load(g, value_input_head * kDimK + k) + dt_bias[hk];
             if constexpr (kUseLowerBound)
             {
                 s_decay[k] = __expf(lower_bound * sigmoid_fast(exp_a * g_raw));
@@ -543,8 +545,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
         {
             int const v = tid;
             int const hvv = hv_off + v;
-            int const cs_base = slot * hvv_dim * kConvStateWidth + hvv;
-            int const xv_idx = (bos * hv_count + i_hv) * kDimV + v;
+            int64_t const cs_base = static_cast<int64_t>(slot) * hvv_dim * kConvStateWidth + hvv;
+            int64_t const xv_idx = value_input_head * kDimV + v;
 
             float v_acc = bf16_load(bias_v, hvv);
             __nv_bfloat16 v_shift0 = __float2bfloat16(0.0f);
@@ -572,7 +574,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
 
             if constexpr (kApplyOnorm && kPreloadOnormParams)
             {
-                int const out_idx = (i_n * hv_count + i_hv) * kDimV + v;
+                int64_t const out_idx = output_head * kDimV + v;
                 pre_onorm_gate = sigmoid_fast(bf16_load(onorm_g, out_idx));
                 pre_onorm_weight = onorm_weight[v];
             }
@@ -589,16 +591,16 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
 #pragma unroll
             for (int w = 0; w < kConvStateWidth; ++w)
             {
-                int const cs_idx = (conv_slot * hvv_dim + hvv) * kConvStateWidth + w;
+                int64_t const cs_idx = (static_cast<int64_t>(conv_slot) * hvv_dim + hvv) * kConvStateWidth + w;
                 v_acc += bf16_load(cs_v, cs_idx) * bf16_load(w_v_t, w * hvv_dim + hvv);
             }
-            v_acc += bf16_load(x_v, (bos * hv_count + i_hv) * kDimV + v)
-                * bf16_load(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
+            v_acc
+                += bf16_load(x_v, value_input_head * kDimV + v) * bf16_load(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
             s_v[v] = silu_fast(v_acc);
 
             if constexpr (kApplyOnorm && kPreloadOnormParams)
             {
-                int const out_idx = (i_n * hv_count + i_hv) * kDimV + v;
+                int64_t const out_idx = output_head * kDimV + v;
                 pre_onorm_gate = sigmoid_fast(bf16_load(onorm_g, out_idx));
                 pre_onorm_weight = onorm_weight[v];
             }
@@ -607,7 +609,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
 
     if (tid == 0)
     {
-        float const beta_raw = bf16_load(beta, bos * hv_count + i_hv);
+        float const beta_raw = bf16_load(beta, value_input_head);
         if constexpr (kApplyBetaSigmoid)
         {
             s_beta = sigmoid_fast(beta_raw);
@@ -837,7 +839,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
 
             if (tid < kDimV)
             {
-                int const out_idx = (i_n * hv_count + i_hv) * kDimV + tid;
+                int64_t const out_idx = output_head * kDimV + tid;
                 float const raw_o = s_o[tid];
                 float const rstd = rsqrtf(s_reduce[0] / static_cast<float>(kDimV) + onorm_eps);
                 float gate;
@@ -864,7 +866,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
 
             if (tid < kDimV)
             {
-                int const out_idx = (i_n * hv_count + i_hv) * kDimV + tid;
+                int64_t const out_idx = output_head * kDimV + tid;
                 float const rstd = rsqrtf(sumsq / static_cast<float>(kDimV) + onorm_eps);
                 float gate;
                 float weight;
@@ -887,7 +889,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
     {
         if (tid < kDimV)
         {
-            int const out_idx = (i_n * hv_count + i_hv) * kDimV + tid;
+            int64_t const out_idx = output_head * kDimV + tid;
             out[out_idx] = bf16_store(s_o[tid]);
         }
     }
@@ -959,6 +961,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     int const hkv_dim = h_count * kDimK;
     int const hvv_dim = hv_count * kDimV;
     int const conv_slot = kUpdateConvState ? slot : i_n;
+    int64_t const qk_input_head = static_cast<int64_t>(bos) * h_count + i_h;
+    int64_t const value_input_head = static_cast<int64_t>(bos) * hv_count + i_hv;
+    int64_t const output_head = static_cast<int64_t>(i_n) * hv_count + i_hv;
 
     __shared__ float s_state[2][kChunkV][kDimK];
     __shared__ float s_q[kDimK];
@@ -979,8 +984,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         {
             int const k = tid;
             int const hk = hk_off + k;
-            int const cs_base = slot * hkv_dim * kConvStateWidth + hk;
-            int const xq_idx = (bos * h_count + i_h) * kDimK + k;
+            int64_t const cs_base = static_cast<int64_t>(slot) * hkv_dim * kConvStateWidth + hk;
+            int64_t const xq_idx = qk_input_head * kDimK + k;
             float const exp_a = __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[i_h]) : 0.0f, 0);
 
             float q_acc = bf16_load(bias_q, hk);
@@ -1022,7 +1027,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
             s_q[k] = silu_fast(q_acc);
             s_k[k] = silu_fast(k_acc);
 
-            float const g_raw = bf16_load(g, (bos * hv_count + i_hv) * kDimK + k) + dt_bias[hk];
+            float const g_raw = bf16_load(g, value_input_head * kDimK + k) + dt_bias[hk];
             if constexpr (kUseLowerBound)
             {
                 s_decay[k] = __expf(lower_bound * sigmoid_fast(exp_a * g_raw));
@@ -1046,19 +1051,17 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 #pragma unroll
             for (int w = 0; w < kConvStateWidth; ++w)
             {
-                int const cs_idx = (conv_slot * hkv_dim + hk) * kConvStateWidth + w;
+                int64_t const cs_idx = (static_cast<int64_t>(conv_slot) * hkv_dim + hk) * kConvStateWidth + w;
                 q_acc += bf16_load(cs_q, cs_idx) * bf16_load(w_q_t, w * hkv_dim + hk);
                 k_acc += bf16_load(cs_k, cs_idx) * bf16_load(w_k_t, w * hkv_dim + hk);
             }
-            q_acc += bf16_load(x_q, (bos * h_count + i_h) * kDimK + k)
-                * bf16_load(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
-            k_acc += bf16_load(x_k, (bos * h_count + i_h) * kDimK + k)
-                * bf16_load(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
+            q_acc += bf16_load(x_q, qk_input_head * kDimK + k) * bf16_load(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
+            k_acc += bf16_load(x_k, qk_input_head * kDimK + k) * bf16_load(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
 
             s_q[k] = silu_fast(q_acc);
             s_k[k] = silu_fast(k_acc);
 
-            float const g_raw = bf16_load(g, (bos * hv_count + i_hv) * kDimK + k) + dt_bias[hk];
+            float const g_raw = bf16_load(g, value_input_head * kDimK + k) + dt_bias[hk];
             if constexpr (kUseLowerBound)
             {
                 s_decay[k] = __expf(lower_bound * sigmoid_fast(exp_a * g_raw));
@@ -1076,8 +1079,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
         {
             int const v = tid;
             int const hvv = hv_off + v;
-            int const cs_base = slot * hvv_dim * kConvStateWidth + hvv;
-            int const xv_idx = (bos * hv_count + i_hv) * kDimV + v;
+            int64_t const cs_base = static_cast<int64_t>(slot) * hvv_dim * kConvStateWidth + hvv;
+            int64_t const xv_idx = value_input_head * kDimV + v;
 
             float v_acc = bf16_load(bias_v, hvv);
             __nv_bfloat16 v_shift0 = __float2bfloat16(0.0f);
@@ -1105,7 +1108,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
             if constexpr (kApplyOnorm && kPreloadOnormParams)
             {
-                int const out_idx = (i_n * hv_count + i_hv) * kDimV + v;
+                int64_t const out_idx = output_head * kDimV + v;
                 pre_onorm_gate = sigmoid_fast(bf16_load(onorm_g, out_idx));
                 pre_onorm_weight = onorm_weight[v];
             }
@@ -1122,16 +1125,16 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 #pragma unroll
             for (int w = 0; w < kConvStateWidth; ++w)
             {
-                int const cs_idx = (conv_slot * hvv_dim + hvv) * kConvStateWidth + w;
+                int64_t const cs_idx = (static_cast<int64_t>(conv_slot) * hvv_dim + hvv) * kConvStateWidth + w;
                 v_acc += bf16_load(cs_v, cs_idx) * bf16_load(w_v_t, w * hvv_dim + hvv);
             }
-            v_acc += bf16_load(x_v, (bos * hv_count + i_hv) * kDimV + v)
-                * bf16_load(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
+            v_acc
+                += bf16_load(x_v, value_input_head * kDimV + v) * bf16_load(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
             s_v[v] = silu_fast(v_acc);
 
             if constexpr (kApplyOnorm && kPreloadOnormParams)
             {
-                int const out_idx = (i_n * hv_count + i_hv) * kDimV + v;
+                int64_t const out_idx = output_head * kDimV + v;
                 pre_onorm_gate = sigmoid_fast(bf16_load(onorm_g, out_idx));
                 pre_onorm_weight = onorm_weight[v];
             }
@@ -1140,7 +1143,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
     if (tid == 0)
     {
-        float const beta_raw = bf16_load(beta, bos * hv_count + i_hv);
+        float const beta_raw = bf16_load(beta, value_input_head);
         if constexpr (kApplyBetaSigmoid)
         {
             s_beta = sigmoid_fast(beta_raw);
@@ -1319,7 +1322,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
             if (tid < kDimV)
             {
-                int const out_idx = (i_n * hv_count + i_hv) * kDimV + tid;
+                int64_t const out_idx = output_head * kDimV + tid;
                 float const raw_o = s_o[tid];
                 float const rstd = rsqrtf(s_reduce[0] / static_cast<float>(kDimV) + onorm_eps);
                 float gate;
@@ -1354,7 +1357,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
             if (tid < kDimV)
             {
-                int const out_idx = (i_n * hv_count + i_hv) * kDimV + tid;
+                int64_t const out_idx = output_head * kDimV + tid;
                 float const rstd = rsqrtf(sumsq / static_cast<float>(kDimV) + onorm_eps);
                 float gate;
                 float weight;
@@ -1377,7 +1380,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     {
         if (tid < kDimV)
         {
-            int const out_idx = (i_n * hv_count + i_hv) * kDimV + tid;
+            int64_t const out_idx = output_head * kDimV + tid;
             out[out_idx] = bf16_store(s_o[tid]);
         }
     }
