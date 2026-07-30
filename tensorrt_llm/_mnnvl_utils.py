@@ -323,14 +323,14 @@ class MnnvlMemory:
             for rank_ptr in reversed(mapped_rank_ptrs):
                 try:
                     _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
-                except Exception as e:
+                except RuntimeError as e:
                     logger.warning("cuMemUnmap failed during error cleanup: %s", e)
             for mem_handle in mem_handles:
                 if mem_handle is None:
                     continue
                 try:
                     _check_cu_result(cuda.cuMemRelease(mem_handle))
-                except Exception as e:
+                except RuntimeError as e:
                     logger.warning("cuMemRelease failed during error cleanup: %s", e)
             if reserved_new_address:
                 try:
@@ -338,7 +338,7 @@ class MnnvlMemory:
                     _check_cu_result(
                         cuda.cuMemAddressFree(device_ptr, comm_size * cls.current_rank_stride)
                     )
-                except Exception as e:
+                except RuntimeError as e:
                     logger.warning("cuMemAddressFree failed during error cleanup: %s", e)
                 else:
                     (

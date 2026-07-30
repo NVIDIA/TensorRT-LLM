@@ -1483,7 +1483,7 @@ class PyTorchModelEngine(ModelEngine):
 
         model_type = getattr(self.model.model_config.pretrained_config,
                              "model_type", None)
-        if model_type in ("kimi_k3", "kimi_linear"):
+        if can_run_general_warmup and model_type in ("kimi_k3", "kimi_linear"):
             # Kimi's one-token context takes the NT < 4 FLA fallback and does
             # not compile the optimized single-sequence K123 variant. A
             # non-aligned five-chunk context enters the pure K123 path.
