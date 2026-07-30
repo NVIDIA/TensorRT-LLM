@@ -19,6 +19,11 @@ from pathlib import Path
 
 import pytest
 import yaml
+from test_common.perf_sanity_agreement import (
+    expected_disagg_lifecycle_roles,
+    extract_agreement_arm_log,
+    format_agreement_arm_marker,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SUBMIT_PATHS = (
@@ -26,6 +31,133 @@ SUBMIT_PATHS = (
     REPO_ROOT / "jenkins" / "scripts" / "perf" / "local" / "submit.py",
 )
 DISAGG_CONFIG_DIR = REPO_ROOT / "tests" / "scripts" / "perf-sanity" / "disaggregated"
+AGREEMENT_AB_CONFIG = (
+    DISAGG_CONFIG_DIR
+    / "gb300_deepseek-r1-fp4_128k8k_con256_ctx1_pp4_gen1_dep8_eplb0_mtp1_ccb-NIXL.yaml"
+)
+
+
+def test_extract_agreement_arm_log_scopes_cumulative_log_to_requested_arm():
+    async_lines = [
+        f"{rank}: {format_agreement_arm_marker('START', 0, 'CTX_0', str(rank))}"
+        for rank in range(4)
+    ]
+    async_lines.extend(
+        (f"PYTHON_ASYNC_CONSENSUS transition=mode_active rank={rank} terminal=1 peer_ready=1")
+        for rank in range(4)
+    )
+    async_lines.extend(
+        f"{rank}: {format_agreement_arm_marker('END', 0, 'CTX_0', str(rank))}" for rank in range(4)
+    )
+    sync_lines = [
+        f"{rank}: {format_agreement_arm_marker('START', 1, 'CTX_0', str(rank))}"
+        for rank in range(4)
+    ]
+    sync_lines.extend(
+        (f"PYTHON_ASYNC_CONSENSUS transition=mode_active rank={rank} terminal=0 peer_ready=1")
+        for rank in range(4)
+    )
+    sync_lines.extend(
+        f"{rank}: {format_agreement_arm_marker('END', 1, 'CTX_0', str(rank))}" for rank in range(4)
+    )
+
+    scoped_log = extract_agreement_arm_log(
+        "\n".join((*async_lines, *sync_lines)),
+        server_idx=1,
+        expected_ctx_roles=4,
+    )
+
+    assert scoped_log is not None
+    assert "terminal=0 peer_ready=1" in scoped_log
+    assert "terminal=1 peer_ready=1" not in scoped_log
+
+
+def test_extract_agreement_arm_log_waits_for_every_ctx_role():
+    log_lines = [format_agreement_arm_marker("START", 0, "CTX_0", str(rank)) for rank in range(4)]
+    log_lines.extend(format_agreement_arm_marker("END", 0, "CTX_0", str(rank)) for rank in range(3))
+
+    assert (
+        extract_agreement_arm_log(
+            "\n".join(log_lines),
+            server_idx=0,
+            expected_ctx_roles=4,
+        )
+        is None
+    )
+
+
+def test_extract_agreement_arm_log_includes_late_evidence_before_next_arm():
+    first_arm = [
+        *(format_agreement_arm_marker("START", 0, "CTX_0", str(rank)) for rank in range(4)),
+        *(format_agreement_arm_marker("END", 0, "CTX_0", str(rank)) for rank in range(4)),
+        "PYTHON_CONTEXT_ACTIVATION_SEQUENCE rank=3 count=256 digest=abc123",
+    ]
+    second_arm = [
+        *(format_agreement_arm_marker("START", 1, "CTX_0", str(rank)) for rank in range(4)),
+    ]
+
+    scoped_log = extract_agreement_arm_log(
+        "\n".join((*first_arm, *second_arm)),
+        server_idx=0,
+        expected_ctx_roles=4,
+    )
+
+    assert scoped_log is not None
+    assert "count=256 digest=abc123" in scoped_log
+
+
+def test_expected_disagg_lifecycle_roles_matches_three_node_topology():
+    assert expected_disagg_lifecycle_roles(
+        num_ctx_servers=1,
+        ctx_world_size=4,
+        num_gen_servers=1,
+        gen_world_size=8,
+    ) == {
+        "CTX_0.0",
+        "CTX_0.1",
+        "CTX_0.2",
+        "CTX_0.3",
+        "GEN_0.0",
+        "GEN_0.1",
+        "GEN_0.2",
+        "GEN_0.3",
+        "GEN_0.4",
+        "GEN_0.5",
+        "GEN_0.6",
+        "GEN_0.7",
+        "DISAGG_SERVER.0",
+        "BENCHMARK.0",
+    }
+
+
+def test_python_consensus_ab_config_changes_only_terminal_mode():
+    with open(AGREEMENT_AB_CONFIG) as config_file:
+        config = yaml.safe_load(config_file)
+
+    benchmark = config["benchmark"]
+    base_env = {
+        item.split("=", 1)[0]: item.split("=", 1)[1]
+        for item in config["environment"]["ctx_worker_env_var"].split()
+        if "=" in item
+    }
+    arms = benchmark["agreement_ab_arms"]
+    effective_envs = []
+    for arm in arms:
+        effective_env = dict(base_env)
+        effective_env.update(
+            item.split("=", 1) for item in arm.get("ctx_worker_env_var", "").split() if "=" in item
+        )
+        effective_envs.append(effective_env)
+
+    assert [arm["name"] for arm in arms] == ["async-terminal", "sync-terminal"]
+    assert [
+        env["TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS"] for env in effective_envs
+    ] == ["1", "0"]
+    assert [
+        env["TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_PEER_READY_CONSENSUS"] for env in effective_envs
+    ] == ["1", "1"]
+    assert benchmark["multi_round"] == 1
+    assert benchmark["concurrency_list"] == "256"
 
 
 @pytest.fixture(params=SUBMIT_PATHS, ids=("ci", "local"))

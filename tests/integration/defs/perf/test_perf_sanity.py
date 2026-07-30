@@ -14,6 +14,7 @@
 # limitations under the License.
 """TensorRT LLM perf sanity tests."""
 
+import ast
 import copy
 import fcntl
 import glob
@@ -29,6 +30,11 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
+from test_common.perf_sanity_agreement import (
+    expected_disagg_lifecycle_roles,
+    extract_agreement_arm_log,
+    format_agreement_arm_marker,
+)
 
 from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
@@ -1033,6 +1039,11 @@ class DisaggConfig:
         model_name: str,
         hardware: dict,
         server_env_var: str,
+        post_benchmark_drain_seconds: float = 0.0,
+        expected_context_activations: Optional[int] = None,
+        expected_async_terminal_commits: Optional[int] = None,
+        expected_terminal_mode: Optional[int] = None,
+        expected_peer_ready_mode: Optional[int] = None,
         server_config_extra: Optional[Dict] = None,
     ):
         self.name = name
@@ -1044,6 +1055,11 @@ class DisaggConfig:
         self.model_name = model_name
         self.hardware = hardware
         self.server_env_var = server_env_var
+        self.post_benchmark_drain_seconds = post_benchmark_drain_seconds
+        self.expected_context_activations = expected_context_activations
+        self.expected_async_terminal_commits = expected_async_terminal_commits
+        self.expected_terminal_mode = expected_terminal_mode
+        self.expected_peer_ready_mode = expected_peer_ready_mode
         self.server_config_extra = dict(server_config_extra or {})
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
@@ -1174,6 +1190,7 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    post_benchmark_drain_seconds: float = 0.0
     client_configs: Dict[int, List["ClientConfig"]] = {}
     # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
     # Used by run_cmd() to merge per-config env vars into the appropriate
@@ -1289,6 +1306,193 @@ class DisaggTestCmds(NamedTuple):
                 )
             time.sleep(10)
 
+    def _wait_for_paired_arm_barrier(self, server_idx: int, barrier_name: str) -> None:
+        """Wait until every disaggregated pytest role reaches one arm barrier."""
+        if len(self.server_configs) < 2:
+            return
+        marker_dir = os.path.join(self.test_output_dir, f"{barrier_name}.{server_idx}")
+        os.makedirs(marker_dir, exist_ok=True)
+        marker_name = f"{self.disagg_serving_type}.{os.getenv('SLURM_PROCID', '0')}"
+        marker_path = os.path.join(marker_dir, marker_name)
+        with open(marker_path, "w") as marker:
+            marker.write("Done")
+
+        ctx_config, gen_config, _ = self.server_configs[server_idx]
+        expected_roles = expected_disagg_lifecycle_roles(
+            self.num_ctx_servers,
+            ctx_config.gpus,
+            self.num_gen_servers,
+            gen_config.gpus,
+        )
+        start_time = time.time()
+        while True:
+            observed_roles = set(os.listdir(marker_dir))
+            missing_roles = expected_roles.difference(observed_roles)
+            if not missing_roles:
+                break
+            elapsed_time = time.time() - start_time
+            if elapsed_time > self.timeout:
+                raise RuntimeError(
+                    f"Timed out waiting for paired-arm {barrier_name}: "
+                    f"server_idx={server_idx}, observed={sorted(observed_roles)}, "
+                    f"missing={sorted(missing_roles)}"
+                )
+            time.sleep(1)
+
+    def wait_for_lifecycle_teardown(self, server_idx: int) -> None:
+        """Keep paired arms ordered until every role has stopped its services."""
+        self._wait_for_paired_arm_barrier(server_idx, "lifecycle_teardown")
+
+    def wait_for_evidence_verification(self, server_idx: int) -> None:
+        """Prevent a later arm from entering the cumulative log during parsing."""
+        self._wait_for_paired_arm_barrier(server_idx, "evidence_verified")
+
+    def verify_context_consensus_evidence(self, server_idx: int) -> None:
+        """Validate post-teardown rank evidence for a configured paired arm."""
+        ctx_config, _, disagg_config = self.server_configs[server_idx]
+        expected_activations = disagg_config.expected_context_activations
+        expected_terminal_commits = disagg_config.expected_async_terminal_commits
+        expected_terminal_mode = disagg_config.expected_terminal_mode
+        expected_peer_ready_mode = disagg_config.expected_peer_ready_mode
+        if (
+            expected_activations is None
+            and expected_terminal_commits is None
+            and expected_terminal_mode is None
+            and expected_peer_ready_mode is None
+        ):
+            return
+
+        log_path = os.path.join(self.test_output_dir, "ctx_server_0.log")
+        poll_timeout = min(self.timeout, 60)
+        expected_ranks = set(range(ctx_config.pp))
+        start_time = time.time()
+        pending_evidence = ["paired-arm markers"]
+        while True:
+            log_text = None
+            if os.path.isfile(log_path):
+                with open(log_path, "r", errors="replace") as log_file:
+                    cumulative_log_text = log_file.read()
+                try:
+                    log_text = extract_agreement_arm_log(
+                        cumulative_log_text,
+                        server_idx,
+                        expected_ctx_roles=ctx_config.gpus,
+                    )
+                except ValueError as error:
+                    raise RuntimeError(str(error)) from error
+            if log_text is not None:
+                pending_evidence = []
+                if expected_terminal_mode is not None or expected_peer_ready_mode is not None:
+                    mode_by_rank = {}
+                    for rank_text, terminal_text, peer_ready_text in re.findall(
+                        r"PYTHON_ASYNC_CONSENSUS transition=mode_active "
+                        r"[^\n]*?rank=(\d+) terminal=(\d+) peer_ready=(\d+)",
+                        log_text,
+                    ):
+                        mode_by_rank[int(rank_text)] = (
+                            int(terminal_text),
+                            int(peer_ready_text),
+                        )
+                    if set(mode_by_rank) != expected_ranks:
+                        pending_evidence.append(f"agreement mode ranks={sorted(mode_by_rank)}")
+                    else:
+                        expected_mode = (expected_terminal_mode, expected_peer_ready_mode)
+                        observed_modes = set(mode_by_rank.values())
+                        if observed_modes != {expected_mode}:
+                            raise RuntimeError(
+                                "Agreement mode does not match the configured A/B arm: "
+                                f"observed={sorted(observed_modes)}, expected={expected_mode}"
+                            )
+
+                if expected_activations is not None:
+                    activation_by_rank = {}
+                    for rank_text, count_text, digest in re.findall(
+                        r"PYTHON_CONTEXT_ACTIVATION_SEQUENCE "
+                        r"rank=(\d+) count=(\d+) digest=([0-9a-f]+)",
+                        log_text,
+                    ):
+                        activation_by_rank[int(rank_text)] = (int(count_text), digest)
+                    activation_counts = {count for count, _ in activation_by_rank.values()}
+                    activation_digests = {digest for _, digest in activation_by_rank.values()}
+                    if (
+                        set(activation_by_rank) != expected_ranks
+                        or activation_counts != {expected_activations}
+                        or len(activation_digests) != 1
+                    ):
+                        pending_evidence.append(
+                            "context activations="
+                            f"{sorted(activation_by_rank)} counts={sorted(activation_counts)} "
+                            f"digests={sorted(activation_digests)}"
+                        )
+
+                if expected_terminal_commits is not None:
+                    counters_by_rank = {}
+                    for rank_text, counters_text in re.findall(
+                        r"PYTHON_ASYNC_CONSENSUS transition=shutdown_summary "
+                        r"rank=(\d+) counters=(\{[^\n]*\})",
+                        log_text,
+                    ):
+                        counters_by_rank[int(rank_text)] = ast.literal_eval(counters_text)
+                    terminal_counts = {
+                        int(counters.get("terminal_commit", 0))
+                        for counters in counters_by_rank.values()
+                    }
+                    if set(counters_by_rank) != expected_ranks or terminal_counts != {
+                        expected_terminal_commits
+                    }:
+                        pending_evidence.append(
+                            "terminal commits="
+                            f"{sorted(counters_by_rank)} counts={sorted(terminal_counts)}"
+                        )
+                if not pending_evidence:
+                    break
+            elapsed_time = time.time() - start_time
+            if elapsed_time > poll_timeout:
+                raise RuntimeError(
+                    "Timed out waiting for exact paired-arm CTX evidence: "
+                    f"server_idx={server_idx}, timeout={poll_timeout}s, "
+                    f"pending={pending_evidence}"
+                )
+            time.sleep(1)
+        if self.disagg_serving_type == "BENCHMARK":
+            arm_log_path = os.path.join(
+                self.test_output_dir,
+                f"ctx_server_0.{server_idx}.log",
+            )
+            with open(arm_log_path, "w") as arm_log_file:
+                arm_log_file.write(log_text)
+
+        if expected_activations is not None and server_idx > 0:
+            baseline_log_path = os.path.join(
+                self.test_output_dir,
+                "ctx_server_0.0.log",
+            )
+            baseline_start_time = time.time()
+            while not os.path.isfile(baseline_log_path):
+                elapsed_time = time.time() - baseline_start_time
+                if elapsed_time > poll_timeout:
+                    raise RuntimeError(
+                        "Timed out waiting for the first paired-arm evidence artifact: "
+                        f"path={baseline_log_path}, timeout={poll_timeout}s"
+                    )
+                time.sleep(1)
+            with open(baseline_log_path, "r", errors="replace") as baseline_log_file:
+                baseline_log_text = baseline_log_file.read()
+            baseline_activation_by_rank = {}
+            for rank_text, _, digest in re.findall(
+                r"PYTHON_CONTEXT_ACTIVATION_SEQUENCE "
+                r"rank=(\d+) count=(\d+) digest=([0-9a-f]+)",
+                baseline_log_text,
+            ):
+                baseline_activation_by_rank[int(rank_text)] = digest
+            baseline_digests = set(baseline_activation_by_rank.values())
+            if baseline_digests != activation_digests:
+                raise RuntimeError(
+                    "Context activation order differs between paired A/B arms: "
+                    f"baseline={sorted(baseline_digests)}, "
+                    f"current={sorted(activation_digests)}"
+                )
+
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
         for i in range(self.num_ctx_servers):
@@ -1330,6 +1534,19 @@ class DisaggTestCmds(NamedTuple):
         configs_for_idx = (
             self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
         )
+        paired_ctx_role = len(self.server_configs) >= 2 and self.disagg_serving_type.startswith(
+            "CTX_"
+        )
+        if paired_ctx_role:
+            print(
+                format_agreement_arm_marker(
+                    "START",
+                    server_idx,
+                    self.disagg_serving_type,
+                    os.getenv("SLURM_PROCID", "0"),
+                ),
+                flush=True,
+            )
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
             port = get_free_port()
             self._generate_hostname_file(server_idx, port)
@@ -1393,6 +1610,7 @@ class DisaggTestCmds(NamedTuple):
                 disagg_server_proc.wait()
 
         elif self.disagg_serving_type == "BENCHMARK":
+            benchmark_completed = False
             try:
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
@@ -1482,11 +1700,32 @@ class DisaggTestCmds(NamedTuple):
                         output_dir=self.test_output_dir,
                         server_idx=server_idx,
                     )
+                benchmark_completed = True
 
             finally:
+                if benchmark_completed and self.post_benchmark_drain_seconds > 0:
+                    print_info(
+                        "Benchmark clients completed; keeping services alive for "
+                        f"{self.post_benchmark_drain_seconds:g}s so post-client "
+                        "transfer consensus can drain"
+                    )
+                    time.sleep(self.post_benchmark_drain_seconds)
                 with open(benchmark_status_file, "w") as status_file:
                     status_file.write("Done")
 
+        if paired_ctx_role:
+            print(
+                format_agreement_arm_marker(
+                    "END",
+                    server_idx,
+                    self.disagg_serving_type,
+                    os.getenv("SLURM_PROCID", "0"),
+                ),
+                flush=True,
+            )
+        self.wait_for_lifecycle_teardown(server_idx)
+        self.verify_context_consensus_evidence(server_idx)
+        self.wait_for_evidence_verification(server_idx)
         return outputs
 
     def get_cmd_str(self, server_idx: int) -> List[str]:
@@ -1758,6 +1997,25 @@ class PerfSanityTestConfig:
         )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
+        post_benchmark_drain_seconds = float(
+            benchmark.get("post_benchmark_drain_seconds", 0.0) if benchmark_mode == "e2e" else 0.0
+        )
+        if post_benchmark_drain_seconds < 0:
+            raise ValueError("post_benchmark_drain_seconds must be non-negative")
+        expected_context_activations = (
+            benchmark.get("expected_context_activations") if benchmark_mode == "e2e" else None
+        )
+        if expected_context_activations is not None:
+            expected_context_activations = int(expected_context_activations)
+            if expected_context_activations < 0:
+                raise ValueError("expected_context_activations must be non-negative")
+        expected_peer_ready_mode = (
+            benchmark.get("expected_peer_ready_mode") if benchmark_mode == "e2e" else None
+        )
+        if expected_peer_ready_mode is not None:
+            expected_peer_ready_mode = int(expected_peer_ready_mode)
+            if expected_peer_ready_mode not in (0, 1):
+                raise ValueError("expected_peer_ready_mode must be 0 or 1")
 
         # Parse concurrency_list - can be string or list
         concurrency_str = benchmark.get("concurrency_list", "1")
@@ -1797,43 +2055,98 @@ class PerfSanityTestConfig:
             ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
             self.server_configs = [ctx_server_config]
         else:
-            # For e2e and gen_only modes - create ctx and gen server configs
-            ctx_server_config_data = {
-                "concurrency": concurrency_values[0],
-                "name": f"{benchmark_mode}-{config_file_base_name}",
-                "model_name": model_name,
-                "gpus_per_node": gpus_per_node,
-                "disagg_run_type": "ctx",
-                **worker_config.get("ctx", {}),
-            }
-
-            gen_server_config_data = {
-                "concurrency": concurrency_values[0],
-                "name": f"{benchmark_mode}-{config_file_base_name}",
-                "model_name": model_name,
-                "gpus_per_node": gpus_per_node,
-                "disagg_run_type": "gen",
-                **worker_config.get("gen", {}),
-            }
-
-            ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
-            gen_server_config = ServerConfig(gen_server_config_data, gen_worker_env_var)
-
-            disagg_config = DisaggConfig(
-                name=f"{benchmark_mode}-{config_file_base_name}",
-                disagg_serving_type=disagg_serving_type,
-                hostname=socket.gethostname(),
-                numa_bind=numa_bind,
-                timeout=timeout,
-                benchmark_mode=benchmark_mode,
-                model_name=model_name,
-                hardware=hardware,
-                server_env_var=server_env_var,
-                server_config_extra=config.get("server_config_extra", {}),
+            agreement_arms = (
+                benchmark.get("agreement_ab_arms", [{}]) if benchmark_mode == "e2e" else [{}]
             )
+            if not isinstance(agreement_arms, list) or not agreement_arms:
+                raise ValueError("agreement_ab_arms must be a non-empty list")
+            self.server_configs = []
+            arm_names = set()
+            for arm in agreement_arms:
+                if not isinstance(arm, dict):
+                    raise ValueError("each agreement_ab_arms entry must be a mapping")
+                unexpected_keys = set(arm).difference(
+                    {
+                        "name",
+                        "ctx_worker_env_var",
+                        "expected_async_terminal_commits",
+                        "expected_terminal_mode",
+                    }
+                )
+                if unexpected_keys:
+                    raise ValueError(
+                        f"agreement_ab_arms contains unsupported keys: {sorted(unexpected_keys)}"
+                    )
+                arm_name = str(arm.get("name", "")).strip()
+                if len(agreement_arms) > 1 and not arm_name:
+                    raise ValueError("paired agreement arms require unique non-empty names")
+                if arm_name in arm_names:
+                    raise ValueError(f"duplicate agreement arm name: {arm_name}")
+                arm_names.add(arm_name)
+                expected_async_terminal_commits = arm.get("expected_async_terminal_commits")
+                if expected_async_terminal_commits is not None:
+                    expected_async_terminal_commits = int(expected_async_terminal_commits)
+                    if expected_async_terminal_commits < 0:
+                        raise ValueError("expected_async_terminal_commits must be non-negative")
+                expected_terminal_mode = arm.get("expected_terminal_mode")
+                if expected_terminal_mode is not None:
+                    expected_terminal_mode = int(expected_terminal_mode)
+                    if expected_terminal_mode not in (0, 1):
+                        raise ValueError("expected_terminal_mode must be 0 or 1")
+                if (expected_terminal_mode is None) != (expected_peer_ready_mode is None):
+                    raise ValueError(
+                        "expected_terminal_mode and expected_peer_ready_mode "
+                        "must be configured together"
+                    )
+                config_name = f"{benchmark_mode}-{config_file_base_name}"
+                if arm_name:
+                    config_name = f"{config_name}-{arm_name}"
+                arm_ctx_worker_env_var = " ".join(
+                    part
+                    for part in (
+                        ctx_worker_env_var,
+                        arm.get("ctx_worker_env_var", ""),
+                    )
+                    if part
+                )
 
-            # server_configs is a list with one element (tuple of ctx, gen, disagg config)
-            self.server_configs = [(ctx_server_config, gen_server_config, disagg_config)]
+                ctx_server_config_data = {
+                    "concurrency": concurrency_values[0],
+                    "name": config_name,
+                    "model_name": model_name,
+                    "gpus_per_node": gpus_per_node,
+                    "disagg_run_type": "ctx",
+                    **worker_config.get("ctx", {}),
+                }
+                gen_server_config_data = {
+                    "concurrency": concurrency_values[0],
+                    "name": config_name,
+                    "model_name": model_name,
+                    "gpus_per_node": gpus_per_node,
+                    "disagg_run_type": "gen",
+                    **worker_config.get("gen", {}),
+                }
+
+                ctx_server_config = ServerConfig(ctx_server_config_data, arm_ctx_worker_env_var)
+                gen_server_config = ServerConfig(gen_server_config_data, gen_worker_env_var)
+                disagg_config = DisaggConfig(
+                    name=config_name,
+                    disagg_serving_type=disagg_serving_type,
+                    hostname=socket.gethostname(),
+                    numa_bind=numa_bind,
+                    timeout=timeout,
+                    benchmark_mode=benchmark_mode,
+                    model_name=model_name,
+                    hardware=hardware,
+                    server_env_var=server_env_var,
+                    post_benchmark_drain_seconds=post_benchmark_drain_seconds,
+                    expected_context_activations=expected_context_activations,
+                    expected_async_terminal_commits=expected_async_terminal_commits,
+                    expected_terminal_mode=expected_terminal_mode,
+                    expected_peer_ready_mode=expected_peer_ready_mode,
+                    server_config_extra=config.get("server_config_extra", {}),
+                )
+                self.server_configs.append((ctx_server_config, gen_server_config, disagg_config))
 
         # Create client configs for each concurrency value
         # For ctx_only: OSL is set to 1 and dataset_file is empty
@@ -1841,45 +2154,46 @@ class PerfSanityTestConfig:
         dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
         use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
 
-        if benchmark_mode == "ctx_only":
-            spec_decoding = bool(ctx_server_config.spec_decoding_type)
-        else:
-            spec_decoding = bool(ctx_server_config.spec_decoding_type) or bool(
-                gen_server_config.spec_decoding_type
-            )
-
         # Accuracy lives at the top of disagg yamls; only_run_accuracy lives inside
         # benchmark: (since `benchmark` is what becomes the disagg ClientConfig).
         accuracy_data = config.get("accuracy") or None
         only_run_accuracy = bool(benchmark.get("only_run_accuracy", False))
 
-        client_configs = []
-        for concurrency in concurrency_values:
-            client_config_data = {
-                "concurrency": concurrency,
-                "iterations": 1
-                if benchmark_mode == "gen_only"
-                else benchmark.get("multi_round", 1),
-                "isl": benchmark.get("input_length", 1024),
-                "osl": osl,
-                "random_range_ratio": benchmark.get("benchmark_ratio", 0.0),
-                "backend": "openai",
-                "use_chat_template": False,
-                "streaming": benchmark.get("streaming", True),
-                "dataset_file": dataset_file,
-                "use_nv_sa_benchmark": use_nv_sa_benchmark,
-                "accuracy_config": accuracy_data,
-                "only_run_accuracy": only_run_accuracy,
-            }
-            client_config = ClientConfig(
-                client_config_data,
-                model_name,
-                env_vars=client_env_var,
-                spec_decoding=spec_decoding,
-            )
-            client_configs.append(client_config)
-
-        self.server_client_configs = {0: client_configs}
+        self.server_client_configs = {}
+        for server_idx, server_config in enumerate(self.server_configs):
+            if benchmark_mode == "ctx_only":
+                spec_decoding = bool(server_config.spec_decoding_type)
+            else:
+                ctx_server_config, gen_server_config, _ = server_config
+                spec_decoding = bool(ctx_server_config.spec_decoding_type) or bool(
+                    gen_server_config.spec_decoding_type
+                )
+            client_configs = []
+            for concurrency in concurrency_values:
+                client_config_data = {
+                    "concurrency": concurrency,
+                    "iterations": 1
+                    if benchmark_mode == "gen_only"
+                    else benchmark.get("multi_round", 1),
+                    "isl": benchmark.get("input_length", 1024),
+                    "osl": osl,
+                    "random_range_ratio": benchmark.get("benchmark_ratio", 0.0),
+                    "backend": "openai",
+                    "use_chat_template": False,
+                    "streaming": benchmark.get("streaming", True),
+                    "dataset_file": dataset_file,
+                    "use_nv_sa_benchmark": use_nv_sa_benchmark,
+                    "accuracy_config": accuracy_data,
+                    "only_run_accuracy": only_run_accuracy,
+                }
+                client_config = ClientConfig(
+                    client_config_data,
+                    model_name,
+                    env_vars=client_env_var,
+                    spec_decoding=spec_decoding,
+                )
+                client_configs.append(client_config)
+            self.server_client_configs[server_idx] = client_configs
 
     def get_commands(self):
         """Get commands based on runtime and benchmark_mode."""
@@ -1993,6 +2307,7 @@ class PerfSanityTestConfig:
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
+            post_benchmark_drain_seconds=disagg_config.post_benchmark_drain_seconds,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
         )

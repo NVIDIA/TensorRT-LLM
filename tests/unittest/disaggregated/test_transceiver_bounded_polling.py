@@ -771,6 +771,32 @@ def test_context_transfer_status_bounded_poll_reaps_completion(monkeypatch) -> N
     assert 14 not in transceiver._send_reqs
 
 
+def test_async_peer_ready_with_legacy_terminal_uses_blocking_pp_consensus() -> None:
+    session = _FakeSession(rid=17, wait_result=WaitResult.COMPLETED)
+    req = _FakeRequest()
+    transceiver = _make_transceiver({17: session}, {17: req})
+    coordinator = _enable_fake_async_consensus(
+        transceiver,
+        terminal=False,
+        peer_ready=True,
+    )
+    transceiver._ctx_consensus = Mock(return_value=[17])
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], [], [17], []))
+
+    completed, failed = transceiver.check_context_transfer_status(
+        at_least_request_num=None,
+        mark_complete=True,
+    )
+
+    assert completed == [17]
+    assert failed == []
+    transceiver._ctx_consensus.assert_called_once_with([17])
+    transceiver._ctx_consensus_outcome.assert_called_once()
+    assert coordinator.poll_count > 0
+    assert coordinator.terminal_votes == []
+    assert req.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
+
+
 def test_legacy_context_cancel_retains_request_until_native_transfer_is_quiescent() -> None:
     session = _FakeSession(
         rid=14,
