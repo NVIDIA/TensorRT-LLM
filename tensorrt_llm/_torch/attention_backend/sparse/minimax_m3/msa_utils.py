@@ -27,23 +27,27 @@ MSA_REQUIRED_HEAD_DIM = 128
 _MSA_PYTHON_RELPATH = Path("3rdparty") / "MSA" / "python"
 
 # Per-kernel implementation switches for the M3 decode path. The first entry of
-# each tuple is the default. These are env vars rather than
-# MiniMaxM3SparseAttentionConfig fields because the config is user-facing
-# Pydantic: adding fields there would need a golden-manifest regeneration plus
-# telemetry CODEOWNER review, which is disproportionate for a kill switch.
+# each tuple is the default: the dedicated decode kernel, which the gating below
+# then narrows to uniform pure-decode steps, leaving every mixed or prefill step
+# on fmha_sm100. Setting a variable to "msa" is the kill switch. These are env
+# vars rather than MiniMaxM3SparseAttentionConfig fields because the config is
+# user-facing Pydantic: adding fields there would need a golden-manifest
+# regeneration plus telemetry CODEOWNER review, which is disproportionate for a
+# kill switch.
 # Read per call, like TLLM_FMHA_LIBS, so tests can flip them with monkeypatch.
 _M3_KERNEL_CHOICES = {
-    "TLLM_M3_INDEXER_SCORE": ("msa", "cutedsl"),
-    "TLLM_M3_SPARSE_DECODE": ("msa", "triton"),
-    "TLLM_M3_DENSE_DECODE": ("msa", "trtllm_gen"),
+    "TLLM_M3_INDEXER_SCORE": ("cutedsl", "msa"),
+    "TLLM_M3_SPARSE_DECODE": ("triton", "msa"),
+    "TLLM_M3_DENSE_DECODE": ("trtllm_gen", "msa"),
 }
 
 
 def msa_kernel_choice(env_var: str) -> str:
     """Return the selected implementation for one of the M3 decode kernels.
 
-    Selecting a fast path is only a request: each call site still checks that
-    the geometry is supported and silently falls back to MSA when it is not.
+    A dedicated kernel is only a request, whether it came from the default or
+    from the environment: each call site still checks that the geometry is
+    supported and silently falls back to MSA when it is not.
     """
     choices = _M3_KERNEL_CHOICES[env_var]
     value = os.environ.get(env_var)
@@ -69,19 +73,57 @@ def _uniform_decode_step(metadata) -> bool:
     )
 
 
+def _resolved_kernel_flag(metadata, attr: str, recompute) -> bool:
+    """Read a prepare()-resolved kernel flag, recomputing only if unresolved.
+
+    prepare() decides once per step and then skips the fmha_sm100 preparation
+    the chosen kernel replaces, so where it resolved a value that value is the
+    only admissible answer: recomputing here could pick a kernel whose inputs
+    were never staged, or decline one whose plan was never built. ``None``
+    means prepare() never ran (the standalone kernel tests build metadata
+    directly), and nothing was skipped, so recomputing is safe there.
+    """
+    resolved = getattr(metadata, attr, None)
+    if resolved is not None:
+        return bool(resolved)
+    return recompute()
+
+
+def msa_cutedsl_indexer_active(metadata) -> bool:
+    """Whether this step's indexer should run the CuTe DSL scorer.
+
+    When True, prepare() skipped the fmha_sm100 proxy plan, so the scorer is
+    the only way to fill max_score and a decline is a hard error.
+    """
+    return _resolved_kernel_flag(
+        metadata,
+        "_msa_use_cutedsl_indexer",
+        lambda: msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
+        and _uniform_decode_step(metadata),
+    )
+
+
 def msa_triton_sparse_decode_active(metadata) -> bool:
     """Whether this step's sparse layers should run the Triton decode kernel.
 
     Both the indexer (which orients its top-k table) and the attention call
     consult this, so they can never disagree about the layout within a step.
     """
-    return msa_kernel_choice("TLLM_M3_SPARSE_DECODE") == "triton" and _uniform_decode_step(metadata)
+    return _resolved_kernel_flag(
+        metadata,
+        "_msa_use_triton_sparse",
+        lambda: msa_kernel_choice("TLLM_M3_SPARSE_DECODE") == "triton"
+        and _uniform_decode_step(metadata),
+    )
 
 
 def msa_trtllm_gen_dense_decode_active(metadata) -> bool:
     """Whether this step's dense layers should run trtllm-gen decode."""
-    return msa_kernel_choice("TLLM_M3_DENSE_DECODE") == "trtllm_gen" and _uniform_decode_step(
-        metadata
+    return _resolved_kernel_flag(
+        metadata,
+        "_msa_use_trtllm_gen_dense",
+        lambda: msa_kernel_choice("TLLM_M3_DENSE_DECODE") == "trtllm_gen"
+        and _uniform_decode_step(metadata),
     )
 
 
@@ -308,6 +350,7 @@ __all__ = [
     "MSA_REQUIRED_HEAD_DIM",
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
+    "msa_cutedsl_indexer_active",
     "msa_kernel_choice",
     "msa_package_available",
     "msa_paged_kv",

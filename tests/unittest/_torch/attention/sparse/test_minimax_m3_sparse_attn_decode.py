@@ -369,12 +369,13 @@ class _FakeMetadata:
 @pytest.mark.parametrize(
     ("env", "decode_query_len", "expected"),
     [
-        (None, 1, False),
+        (None, 1, True),
         ("msa", 1, False),
         ("triton", 1, True),
         # A ragged step has no uniform query length, so the kernel's
         # token -> request mapping does not hold and MSA must run.
         ("triton", None, False),
+        (None, None, False),
     ],
 )
 def test_triton_sparse_decode_gating(monkeypatch, env, decode_query_len, expected):

@@ -378,16 +378,20 @@ def test_cutedsl_score_helper_falls_back_on_unsupported_geometry():
 
 def test_msa_kernel_choice_defaults_and_overrides(monkeypatch):
     monkeypatch.delenv("TLLM_M3_INDEXER_SCORE", raising=False)
-    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "msa"
+    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
 
     monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "cutedsl")
     assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
 
-    monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "  CuteDSL ")
-    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
+    # The kill switch, and that it survives the same normalization.
+    monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "msa")
+    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "msa"
+
+    monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "  MSA ")
+    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "msa"
 
     monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "")
-    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "msa"
+    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
 
     monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "nope")
     with pytest.raises(ValueError, match="TLLM_M3_INDEXER_SCORE"):

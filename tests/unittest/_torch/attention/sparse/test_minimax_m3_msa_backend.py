@@ -163,6 +163,7 @@ def test_msa_buffers_include_graph_stable_block_table():
         tokens_per_block=128,
         get_index_k_buffer=lambda layer_idx, kv_layout=None: None,
     )
+
     class RecordingBuffers:
         def __init__(self):
             self.requested = {}
@@ -529,6 +530,201 @@ def test_msa_scratch_sizing_covers_spec_verify_tokens():
             max_batch=2,
             capture_graph=False,
             required_max_k_tiles=16,
+        )
+
+
+def _resolution_metadata(
+    *, num_contexts=0, qo_lens=(1, 1), kv_lens=(9, 11), is_cuda_graph=False, page_size=128
+):
+    """Metadata with just enough state for _resolve_decode_kernels.
+
+    The resolver reads only host-side facts, so seq_lens/kv_lens are enough to
+    drive the real msa_*_cpu length properties; no cache pool is needed.
+    """
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_params = MiniMaxM3SparseAttentionConfig(
+        implementation="msa"
+    ).to_sparse_metadata_params()
+    metadata.mapping = None
+    metadata.num_contexts = num_contexts
+    metadata.num_seqs = len(qo_lens)
+    metadata.seq_lens = torch.tensor(qo_lens, dtype=torch.int32)
+    metadata.kv_lens = torch.tensor(kv_lens, dtype=torch.int32)
+    metadata.kv_cache_params = None
+    metadata.is_cuda_graph = is_cuda_graph
+    metadata._msa_captured_resolution = None
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=page_size,
+        indexer_kv_dtype="bf16",
+        # Present, so the trtllm-gen dense support check passes.
+        get_kv_subpage_pool=lambda: None,
+    )
+    metadata.msa_block_table = torch.zeros(len(qo_lens), 4, dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(len(qo_lens), dtype=torch.int32)
+    return metadata
+
+
+def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
+    """A uniform pure-decode step under the defaults hands every site to a
+    ported kernel, which is what lets prepare() skip the fmha_sm100 plans."""
+    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
+        monkeypatch.delenv(var, raising=False)
+    metadata = _resolution_metadata()
+    # The CuTe DSL runner needs SM100; force the geometry verdict so the test
+    # covers the resolution logic on any host.
+    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
+
+    metadata._resolve_decode_kernels()
+
+    assert metadata._msa_use_cutedsl_indexer is True
+    assert metadata._msa_use_triton_sparse is True
+    assert metadata._msa_use_trtllm_gen_dense is True
+    assert metadata._msa_runs_no_fmha() is True
+    assert metadata.msa_decode_query_len == 1
+    assert metadata.msa_max_kv_len == 11
+
+
+@pytest.mark.parametrize(
+    ("num_contexts", "qo_lens"),
+    [
+        # A context request in the batch: not a decode step at all.
+        (1, (5, 1)),
+        # Ragged decode: the ported kernels' token -> request mapping breaks.
+        (0, (1, 3)),
+    ],
+)
+def test_resolve_decode_kernels_declines_non_uniform_steps(monkeypatch, num_contexts, qo_lens):
+    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
+        monkeypatch.delenv(var, raising=False)
+    metadata = _resolution_metadata(num_contexts=num_contexts, qo_lens=qo_lens)
+    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
+
+    metadata._resolve_decode_kernels()
+
+    assert metadata._msa_use_cutedsl_indexer is False
+    assert metadata._msa_use_triton_sparse is False
+    assert metadata._msa_use_trtllm_gen_dense is False
+    # Every fmha_sm100 plan is still built, so the page table is still needed.
+    assert metadata._msa_runs_no_fmha() is False
+
+
+def test_resolve_decode_kernels_honors_the_msa_kill_switch(monkeypatch):
+    """TLLM_M3_*=msa must put the plans back, since it is the only way to
+    recover the fmha_sm100 path once prepare() has learned to skip it."""
+    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
+        monkeypatch.setenv(var, "msa")
+    metadata = _resolution_metadata()
+    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
+
+    metadata._resolve_decode_kernels()
+
+    assert metadata._msa_use_cutedsl_indexer is False
+    assert metadata._msa_use_triton_sparse is False
+    assert metadata._msa_use_trtllm_gen_dense is False
+    assert metadata._msa_runs_no_fmha() is False
+
+
+def test_resolve_decode_kernels_declines_dense_without_subpage_pool(monkeypatch):
+    """trtllm-gen needs the flat sub-page pool, and a manager without one must
+    keep its dense plan even though the other two sites are ported."""
+    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
+        monkeypatch.delenv(var, raising=False)
+    metadata = _resolution_metadata()
+    del metadata.kv_cache_manager.get_kv_subpage_pool
+    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
+
+    metadata._resolve_decode_kernels()
+
+    assert metadata._msa_use_trtllm_gen_dense is False
+    # One site still on fmha_sm100 keeps the shared page table alive.
+    assert metadata._msa_runs_no_fmha() is False
+
+
+def test_resolution_must_not_change_under_a_captured_graph(monkeypatch):
+    """The kernels inside a captured graph are fixed, so a later step that
+    resolves differently would stage inputs for a kernel that never runs."""
+    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
+        monkeypatch.delenv(var, raising=False)
+    metadata = _resolution_metadata(is_cuda_graph=True)
+    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
+
+    def _step():
+        metadata._resolve_decode_kernels()
+        metadata._check_capture_stable_resolution()
+
+    _step()
+    # Same inputs: the replay agrees with the capture.
+    _step()
+
+    monkeypatch.setenv("TLLM_M3_SPARSE_DECODE", "msa")
+    with pytest.raises(RuntimeError, match=r"changed under a captured CUDA graph"):
+        _step()
+
+
+def test_indexer_raises_when_a_committed_cutedsl_scorer_declines():
+    """prepare() skipped the proxy plan on this step, so a decline has no
+    fallback and must surface instead of silently reading a stale page table."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import MsaIndexer
+
+    indexer = MsaIndexer(
+        MiniMaxM3SparseConfig(
+            num_q_heads=8,
+            num_kv_heads=1,
+            head_dim=128,
+            num_index_heads=4,
+            sparse_index_dim=128,
+            block_size=128,
+            topk=16,
+        )
+    )
+    # block_table/seq_lens left None, so the scorer cannot even be attempted.
+    with pytest.raises(RuntimeError, match=r"resolved this step to the CuTe DSL"):
+        indexer.select_blocks(
+            torch.zeros(2, 4, 128),
+            torch.zeros(4, 1, 128, 128),
+            idx_sm_scale=1.0,
+            kv_indices=torch.zeros(4, dtype=torch.int32),
+            max_score=torch.zeros(4, 8, 2),
+            require_cutedsl=True,
+        )
+
+
+def test_paged_gqa_raises_when_a_committed_dense_step_declines():
+    """The mirror of the indexer guard on the attention side. prepare()
+    promised trtllm-gen and dropped the dense plan, so a call site that finds
+    the geometry unsupported has nothing left to fall back to."""
+    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
+
+    num_heads, head_dim, num_pages, page_size = 8, 128, 4, 16
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 3
+    attention.head_dim = head_dim
+    attention.num_heads = num_heads
+    attention.q_scaling = 1.0
+
+    metadata = SimpleNamespace(
+        # No get_kv_subpage_pool, so trtllm-gen declines at the call site.
+        kv_cache_manager=SimpleNamespace(
+            get_buffers=lambda layer_idx, kv_layout=None: torch.zeros(
+                num_pages, 2, 1, page_size, head_dim
+            )
+        ),
+        _msa_use_trtllm_gen_dense=True,
+        _msa_decode_query_len=1,
+    )
+
+    with pytest.raises(RuntimeError, match=r"skipped the fmha_sm100 dense plan"):
+        run_msa_paged_gqa(
+            attention,
+            torch.zeros(2, num_heads * head_dim),
+            None,
+            None,
+            metadata,
+            torch.zeros(2, num_heads * head_dim),
+            kv_block_indexes=None,
+            plan=None,
         )
 
 

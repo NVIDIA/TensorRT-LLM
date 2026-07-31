@@ -192,6 +192,13 @@ def run_msa_paged_gqa(
         )
 
         unsupported = dense_decode_supported(kv_cache_manager, q_view)
+        if unsupported is not None and getattr(metadata, "_msa_use_trtllm_gen_dense", None):
+            raise RuntimeError(
+                "MiniMax-M3 prepare() resolved this step's dense layers to "
+                f"trtllm-gen and skipped the fmha_sm100 dense plan, but {unsupported} "
+                "The two must agree; see _resolve_decode_kernels. Set "
+                "TLLM_M3_DENSE_DECODE=msa to keep the plan."
+            )
         if unsupported is None:
             decode_query_len = int(metadata.msa_decode_query_len)
             batch = num_tokens // decode_query_len
@@ -208,6 +215,24 @@ def run_msa_paged_gqa(
                 max_num_requests=int(metadata.max_num_requests),
             )
             return
+
+    # Reaching fmha_sm100 for a layer prepare() promised to a ported kernel
+    # means the branch above declined after prepare had already skipped that
+    # layer's plan and, on a fully ported step, the flattened page table the
+    # call below reads. Fail loudly: running on with a stale msa_kv_indices
+    # would silently attend the wrong pages. The flag is absent on metadata
+    # built without prepare(), where nothing was skipped.
+    committed = (
+        "_msa_use_triton_sparse" if kv_block_indexes is not None else "_msa_use_trtllm_gen_dense"
+    )
+    if getattr(metadata, committed, None):
+        raise RuntimeError(
+            "MiniMax-M3 paged GQA reached fmha_sm100 with no plan for a "
+            f"{'sparse' if kv_block_indexes is not None else 'dense'} layer. "
+            "prepare() resolved this step to the ported decode kernels; see "
+            "_resolve_decode_kernels. Set TLLM_M3_SPARSE_DECODE=msa and "
+            "TLLM_M3_DENSE_DECODE=msa to keep the fmha_sm100 plans."
+        )
 
     # The fmha_sm100 variant is chosen from q.dtype and shares one dtype across
     # q/k/v, so q must be FP8 to match an FP8 paged K/V. MiniMax-M3 has no

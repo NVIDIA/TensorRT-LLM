@@ -348,11 +348,13 @@ class _FakeMeta:
 @pytest.mark.parametrize(
     "value,decode_query_len,expected",
     [
-        (None, 1, False),
+        (None, 1, True),
         ("msa", 1, False),
         ("trtllm_gen", 1, True),
         ("TRTLLM_GEN", 2, True),
         ("trtllm_gen", None, False),
+        # A ragged step declines on the default too, not just when asked for.
+        (None, None, False),
     ],
 )
 def test_gating(monkeypatch, value, decode_query_len, expected):

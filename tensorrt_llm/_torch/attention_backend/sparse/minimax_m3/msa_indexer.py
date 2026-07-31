@@ -29,11 +29,13 @@ if TYPE_CHECKING:
     from .common import MiniMaxM3SparseConfig
 
 
-def _cutedsl_score_runner():
+def cutedsl_score_runner():
     """Return the CuTe DSL indexer scoring runner, or None if unavailable.
 
     The CuTe DSL ops are registered only when the nvidia-cutlass-dsl package is
-    importable, so this stays a soft dependency.
+    importable, so this stays a soft dependency. prepare() consults the same
+    runner to decide whether to skip the fmha_sm100 proxy plan, so the answer
+    here and there must come from one place.
     """
     try:
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
@@ -64,7 +66,7 @@ def _cutedsl_score(
     same count for every token including the shorter ones in a multi-token
     speculative step. So every entry the selector reads has just been written.
     """
-    runner = _cutedsl_score_runner()
+    runner = cutedsl_score_runner()
     if runner is None:
         return False
 
@@ -202,25 +204,30 @@ class MsaIndexer:
         block_table: Optional[torch.Tensor] = None,
         seq_lens_cuda: Optional[torch.Tensor] = None,
         decode_query_len: Optional[int] = None,
+        require_cutedsl: bool = False,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
         Plan/run split, mirroring the sparse GQA. Both production paths pass a
-        prebuilt `proxy_plan` and a precomputed device `n_valid_blocks` (decode
-        from the graph-safe scratch, eager from the step-level device buffer);
-        decode additionally runs into the preallocated `max_score` buffer inside
-        the captured region.
+        precomputed device `n_valid_blocks` (decode from the graph-safe
+        scratch, eager from the step-level device buffer) and, unless the step
+        resolved to the CuTe DSL scorer, a prebuilt `proxy_plan`; decode
+        additionally runs into the preallocated `max_score` buffer inside the
+        captured region.
 
         Pure-decode steps with a uniform per-request query length additionally
         pass `block_table`, `seq_lens_cuda` and `decode_query_len`, which lets
-        the dedicated CuTe DSL scorer replace the fmha_sm100 proxy pass when
-        TLLM_M3_INDEXER_SCORE selects it.
+        the dedicated CuTe DSL scorer replace the fmha_sm100 proxy pass. That
+        is the default; TLLM_M3_INDEXER_SCORE=msa forces the proxy back.
+
+        `require_cutedsl` says prepare() committed to the scorer and skipped
+        the proxy plan, so declining is no longer an option and raises.
         """
         config = self.config
 
         scored = False
         if (
-            msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
+            (require_cutedsl or msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl")
             and max_score is not None
             and block_table is not None
             and seq_lens_cuda is not None
@@ -239,6 +246,15 @@ class MsaIndexer:
                 block_table=block_table,
                 seq_lens_cuda=seq_lens_cuda,
                 decode_query_len=decode_query_len,
+            )
+
+        if require_cutedsl and not scored:
+            raise RuntimeError(
+                "MiniMax-M3 prepare() resolved this step to the CuTe DSL "
+                "indexer scorer and skipped the fmha_sm100 proxy plan, but the "
+                "scorer declined. The two must agree; see "
+                "_resolve_decode_kernels. Set TLLM_M3_INDEXER_SCORE=msa to "
+                "keep the proxy."
             )
 
         if not scored:
@@ -302,4 +318,4 @@ class MsaIndexer:
         )
 
 
-__all__ = ["MsaIndexer"]
+__all__ = ["MsaIndexer", "cutedsl_score_runner"]

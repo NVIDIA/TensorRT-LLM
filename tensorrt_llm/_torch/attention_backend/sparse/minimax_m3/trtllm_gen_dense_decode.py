@@ -161,12 +161,16 @@ def dense_decode_sm_scale(head_dim: int, q_scaling: float) -> float:
     return 1.0 / (math.sqrt(head_dim) * q_scaling)
 
 
-def dense_decode_supported(kv_cache_manager, q: torch.Tensor) -> Optional[str]:
-    """Return None when the geometry is supported, else why it is not."""
+def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional[str]:
+    """Return None when the geometry is supported, else why it is not.
+
+    Takes head_dim rather than a query tensor so prepare() can reach the same
+    verdict as the call site without one, and so the two cannot drift.
+    """
     if not hasattr(kv_cache_manager, "get_kv_subpage_pool"):
         return "the KV cache manager does not expose a flat sub-page pool."
-    if q.shape[-1] != 128:
-        return f"head_dim {int(q.shape[-1])}; only 128 has trtllm-gen H128 cubins."
+    if int(head_dim) != 128:
+        return f"head_dim {int(head_dim)}; only 128 has trtllm-gen H128 cubins."
     try:
         import flashinfer  # noqa: F401
     except ImportError:
@@ -174,8 +178,14 @@ def dense_decode_supported(kv_cache_manager, q: torch.Tensor) -> Optional[str]:
     return None
 
 
+def dense_decode_supported(kv_cache_manager, q: torch.Tensor) -> Optional[str]:
+    """Return None when the geometry is supported, else why it is not."""
+    return dense_decode_unsupported_reason(kv_cache_manager, int(q.shape[-1]))
+
+
 __all__ = [
     "dense_decode_sm_scale",
     "dense_decode_supported",
+    "dense_decode_unsupported_reason",
     "minimax_m3_trtllm_gen_dense_decode",
 ]
