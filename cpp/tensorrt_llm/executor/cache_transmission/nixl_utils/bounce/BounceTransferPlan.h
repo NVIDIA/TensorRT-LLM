@@ -44,26 +44,30 @@ struct BounceChunk
     std::vector<BounceScatterRun> scatterRuns;
     std::uint64_t totalBytes{0};  // sum of desc sizes (payload only, excludes padding)
     std::uint64_t packedBytes{0}; // region extent to RDMA-write: last bounceOffset + its size
-    std::uint32_t dstDeviceId{0}; // receiver device id for this chunk (uniform per chunk)
+    std::uint32_t dstDeviceId{0}; // receiver device id (uniform across the entire request)
 };
 
 /// Pure bin-packing of a TransferRequest's (src,dst) descriptor pairs into chunks that each
-/// fit in one bounce region (<= maxChunkBytes). No CUDA / NIXL / threads — trivially unit-testable.
+/// fit in one bounce region (<= maxChunkSizeBytes). No CUDA / NIXL / threads — trivially
+/// unit-testable.
 ///
-/// Packing rules (a chunk is flushed when any holds):
-///   - adding the next desc would exceed `maxChunkBytes`,
-///   - the chunk already holds `maxDescsPerChunk` descs,
-///   - the next desc targets a different device id than the chunk.
+/// Source descriptors must all use one device id, and destination descriptors must all use one
+/// device id. Mixed-device requests are unsupported.
+///
+/// Packing rules (a chunk is flushed when either holds):
+///   - adding the next desc would exceed `maxChunkSizeBytes`,
+///   - the chunk already holds `maxDescsPerChunk` descs.
 class BounceTransferPlan
 {
 public:
-    /// @param maxChunkBytes        per-chunk byte cap (one region holds at most this)
-    /// @param maxDescsPerChunk  upper bound on descs per chunk (bounds scatter-plan size)
-    /// @param mergeScatterRuns  coalesce the scatter view into runs (default). false = one count==1
-    ///                          run per desc — DEBUG ONLY (large-message control-plane A/B).
-    /// Throws (TLLM_CHECK) on src/dst count or length mismatch, or a single desc > maxChunkBytes.
+    /// @param maxChunkSizeBytes Per-chunk byte cap (one transfer writes at most this many bytes).
+    /// @param maxDescsPerChunk Upper bound on descriptors per chunk (bounds scatter-plan size).
+    /// @param mergeScatterRuns Coalesce the scatter view into runs (default). false creates one
+    /// count==1 run per descriptor and is intended only for control-plane debugging.
+    /// Throws (TLLM_CHECK) on src/dst count, length, or device-id mismatch, or when a single desc is
+    /// larger than maxChunkSizeBytes.
     [[nodiscard]] static BounceTransferPlan build(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
-        std::size_t maxChunkBytes, std::size_t maxDescsPerChunk, bool mergeScatterRuns = true);
+        std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk, bool mergeScatterRuns = true);
 
     [[nodiscard]] std::vector<BounceChunk> const& chunks() const noexcept
     {

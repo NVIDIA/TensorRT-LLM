@@ -37,10 +37,11 @@ namespace
 constexpr std::uint64_t kBase = 0x100000ULL; // arena base device address (Grant.addr = kBase + offset)
 constexpr std::uint32_t kRegion = 0x1000ULL; // 4096B: one "slot"-sized region (== buddy min block)
 
-// Scheduler over an arena holding exactly `nRegions` regions of kRegion bytes, per-flow cap `window`.
-b::CreditScheduler makeSched(std::uint32_t nRegions, std::uint32_t window)
+// Scheduler over an arena holding exactly `nRegions` regions of kRegion bytes.
+b::CreditScheduler makeSched(std::uint32_t nRegions, std::uint32_t maxInflightChunksPerRequest)
 {
-    return b::CreditScheduler(kBase, static_cast<std::size_t>(nRegions) * kRegion, kRegion, window);
+    return b::CreditScheduler(
+        kBase, static_cast<std::size_t>(nRegions) * kRegion, kRegion, maxInflightChunksPerRequest);
 }
 
 // "want n one-region chunks" -> n equal chunks of kRegion bytes (FIFO order).
@@ -92,19 +93,19 @@ struct Mirror
 
 } // namespace
 
-TEST(CreditScheduler, SingleSenderGetsWindow)
+TEST(CreditScheduler, SingleSenderRespectsInflightLimit)
 {
-    auto s = makeSched(/*nRegions=*/8, /*window=*/4);
+    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/4);
     auto g = s.onWant("A", want(100)); // wants a lot
-    EXPECT_EQ(g.size(), 4u);           // capped by the per-flow window
+    EXPECT_EQ(g.size(), 4u);           // capped by the per-request limit
     EXPECT_EQ(s.heldCount("A"), 4u);
     EXPECT_EQ(freeRegions(s), 4u);
     checkConservation(s, {"A"}, 8);
 }
 
-TEST(CreditScheduler, SingleSenderFillsArenaWhenWindowLarge)
+TEST(CreditScheduler, SingleSenderFillsArenaWhenInflightLimitIsLarge)
 {
-    auto s = makeSched(/*nRegions=*/8, /*window=*/16); // window > N -> arena is the only bound
+    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/16);
     auto g = s.onWant("A", want(100));
     EXPECT_EQ(g.size(), 8u);
     EXPECT_EQ(freeRegions(s), 0u);
@@ -113,7 +114,7 @@ TEST(CreditScheduler, SingleSenderFillsArenaWhenWindowLarge)
 
 TEST(CreditScheduler, RecyclingOnScatterDone)
 {
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     Mirror m;
     m.grant(s.onWant("A", want(10))); // K=10 > N=4 -> gets 4
     EXPECT_EQ(s.heldCount("A"), 4u);
@@ -123,22 +124,22 @@ TEST(CreditScheduler, RecyclingOnScatterDone)
     auto re = s.onScatterDone("A", firstOff);
     m.grant(re);
     EXPECT_EQ(re.size(), 1u);
-    EXPECT_EQ(s.heldCount("A"), 4u); // window stays full
+    EXPECT_EQ(s.heldCount("A"), 4u); // in-flight allocation count stays at its cap
     checkConservation(s, {"A"}, 4);
 }
 
 TEST(CreditScheduler, HugeWantNeverOverGrantsOrLoops)
 {
-    auto s = makeSched(/*nRegions=*/8, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/16);
     auto g = s.onWant("A", want(2000)); // far more than the arena can hold
     EXPECT_EQ(g.size(), 8u);            // exactly N, no more, no hang
     checkConservation(s, {"A"}, 8);
 }
 
-TEST(CreditScheduler, BoundedWindowGivesFairSplit)
+TEST(CreditScheduler, BoundedInflightLimitGivesFairSplit)
 {
-    // With a bounded window (W=4) on an 8-region arena, two senders each cap at 4 -> instant fair.
-    auto s = makeSched(/*nRegions=*/8, /*window=*/4);
+    // With a per-request limit of four on an eight-region arena, two senders split it evenly.
+    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/4);
     Mirror m;
     m.grant(s.onWant("A", want(100)));
     m.grant(s.onWant("B", want(100)));
@@ -148,11 +149,10 @@ TEST(CreditScheduler, BoundedWindowGivesFairSplit)
     checkConservation(s, {"A", "B"}, 8);
 }
 
-TEST(CreditScheduler, WindowCapsPerFlowEvenWithArenaRoom)
+TEST(CreditScheduler, InflightLimitCapsRequestEvenWithArenaRoom)
 {
-    // The per-flow window bounds pipeline depth independently of arena capacity: a lone sender with
-    // W=2 holds at most 2 regions even though 6 sit free.
-    auto s = makeSched(/*nRegions=*/8, /*window=*/2);
+    // The per-request limit is independent of arena capacity.
+    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/2);
     auto g = s.onWant("A", want(100));
     EXPECT_EQ(g.size(), 2u);
     EXPECT_EQ(s.heldCount("A"), 2u);
@@ -162,7 +162,7 @@ TEST(CreditScheduler, WindowCapsPerFlowEvenWithArenaRoom)
 
 TEST(CreditScheduler, MoreSendersThanRegionsNoStarvation)
 {
-    auto s = makeSched(/*nRegions=*/2, /*window=*/16); // N=2, 3 senders, arena is the bound
+    auto s = makeSched(/*nRegions=*/2, /*maxInflightChunksPerRequest=*/16);
     Mirror m;
     m.grant(s.onWant("A", want(5)));
     m.grant(s.onWant("B", want(5)));
@@ -196,7 +196,7 @@ TEST(CreditScheduler, MoreSendersThanRegionsNoStarvation)
 
 TEST(CreditScheduler, PeerGoneReclaimsNoDoubleFree)
 {
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     (void) s.onWant("A", want(2));
     (void) s.onWant("B", want(2));
     checkConservation(s, {"A", "B"}, 4);
@@ -211,7 +211,7 @@ TEST(CreditScheduler, PeerGoneMidRecycleHandsRegionsToWaiter)
 {
     // A holds the whole arena; B is waiting. A disappears mid-flight -> its regions must be reclaimed
     // AND immediately re-granted to the starved waiter B, with no double-free and no region lost.
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     Mirror m;
     m.grant(s.onWant("A", want(100))); // A grabs all 4
     EXPECT_EQ(s.heldCount("A"), 4u);
@@ -247,7 +247,7 @@ TEST(CreditScheduler, ReclaimByPrefixDropsAllFlowsOfPeer)
     std::string const p1a = std::string("p1") + sep + "1";
     std::string const p1b = std::string("p1") + sep + "2";
     std::string const p2 = std::string("p2") + sep + "1";
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     Mirror m;
     m.grant(s.onWant(p1a, want(2)));
     m.grant(s.onWant(p1b, want(2))); // p1 now holds all 4 across two flows
@@ -291,7 +291,7 @@ TEST(CreditScheduler, CompletedFlowsReclaimedNoTombstoneLeak)
     // The transport keys each request as "peer\x1f rid" with a monotonic, never-reused rid.
     // A long-running server runs many flows; completed flows MUST be reclaimed, else mFlows/mOrder
     // grow without bound and schedule() degrades to O(historical requests).
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     for (int rid = 0; rid < 1000; ++rid)
     {
         std::string const key = std::string("peerA\x1f") + std::to_string(rid);
@@ -312,7 +312,7 @@ TEST(CreditScheduler, LastFlowLeavingRingResetsCursorAndRingRefills)
     // element -> modulo by zero (UB; a deterministic SIGFPE in -O0 builds). Any normal completion
     // of the only active flow hits it. Drain a single flow to empty the ring, then refill and
     // verify scheduling still rotates fairly from a sane cursor.
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     std::string const k1 = std::string("p\x1f") + "1";
     auto g = s.onWant(k1, want(1));
     ASSERT_EQ(g.size(), 1u);
@@ -343,7 +343,7 @@ TEST(CreditScheduler, LastFlowLeavingRingResetsCursorAndRingRefills)
 
 TEST(CreditScheduler, CancelledFlowReclaimed)
 {
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     std::string const k1 = std::string("p\x1f") + "1";
     std::string const k2 = std::string("p\x1f") + "2";
     // Empty WANT with nothing in flight -> no tombstone created.
@@ -365,7 +365,7 @@ TEST(CreditScheduler, ReclaimDefersBusyRegionThenFreeOrphan)
     // A region whose scatter is still running on the receiver must NOT be freed/re-granted when the
     // peer is reclaimed (forgetPeer) — else another sender's RDMA write races the worker's read.
     // reclaimByPrefix defers such "busy" regions; freeOrphanRegion releases them once scatter is done.
-    auto s = makeSched(/*nRegions=*/2, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/2, /*maxInflightChunksPerRequest=*/16);
     std::string const keyA = std::string("A\x1f") + "1";
     std::string const prefixA = std::string("A\x1f");
     std::string const keyB = std::string("B\x1f") + "1";
@@ -409,7 +409,7 @@ TEST(CreditScheduler, FreeOrphanRegionIgnoresNonOrphan)
 {
     // freeOrphanRegion must only free regions actually deferred as orphans; a call for a LIVE,
     // never-deferred region is a no-op (defense in depth against a stray caller).
-    auto s = makeSched(/*nRegions=*/2, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/2, /*maxInflightChunksPerRequest=*/16);
     std::string const flow = std::string("A\x1f") + "1";
     auto g = s.onWant(flow, want(1));
     ASSERT_EQ(g.size(), 1u);
@@ -430,14 +430,17 @@ TEST(CreditScheduler, ReclaimFlowFreesHeldDefersBusyAndHeldByFlow)
 {
     // Explicit cancel of one flow (empty WANT path): free its granted-but-unwritten regions now,
     // defer any whose scatter is still running; heldByFlow lets the transport drop late DATA.
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     std::string const flow = std::string("p\x1f") + "1";
     auto g = s.onWant(flow, want(3));
     ASSERT_EQ(g.size(), 3u); // 3 held, 1 free
 
     EXPECT_TRUE(s.heldByFlow(flow, g[0].offset));
-    EXPECT_FALSE(s.heldByFlow(flow, 0x999999));          // not a held offset
-    EXPECT_FALSE(s.heldByFlow("p\x1f2", g[0].offset));   // held by a different flow key
+    EXPECT_FALSE(s.heldByFlow(flow, 0x999999)); // not a held offset
+    EXPECT_FALSE(
+        s.heldByFlow("p\x1f"
+                     "2",
+            g[0].offset));                               // held by a different flow key
 
     std::unordered_set<std::uint64_t> busy{g[1].offset}; // a scatter is still reading g[1]
     std::vector<std::uint64_t> deferred;
@@ -463,7 +466,7 @@ TEST(CreditScheduler, SharedArenaLocalAndRemoteShareOneAllocator)
     // Shared single arena: the local sender (gather staging, acquireLocal) and remote flows (grants)
     // draw from the SAME allocator. Conservation holds across {free, remote-held, local-held}; a
     // released local region flows to a waiting remote flow.
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     std::string const flow = std::string("p\x1f") + "1";
 
     auto a0 = s.acquireLocal(kRegion);
@@ -504,7 +507,7 @@ TEST(CreditScheduler, SharedArenaLocalAndRemoteShareOneAllocator)
 
 TEST(CreditScheduler, ScatterDoneIdempotentForUnknownRegion)
 {
-    auto s = makeSched(/*nRegions=*/4, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);
     (void) s.onWant("A", want(1));            // A holds 1, 3 free
     auto before = freeRegions(s);
     auto re = s.onScatterDone("A", 0x999000); // an offset A never held
@@ -515,7 +518,7 @@ TEST(CreditScheduler, ScatterDoneIdempotentForUnknownRegion)
 
 TEST(CreditScheduler, WantEmptyStopsGranting)
 {
-    auto s = makeSched(/*nRegions=*/8, /*window=*/16);
+    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/16);
     (void) s.onWant("A", want(4));
     EXPECT_EQ(s.heldCount("A"), 4u);
     auto g = s.onWant("A", want(0)); // cancel further grants
@@ -529,7 +532,7 @@ TEST(CreditScheduler, VariableSizeRegionsPackAndBackpressure)
     // of exactly that size, packed densely. A chunk that cannot fit right now is parked (no grant)
     // while smaller following chunks are NOT reordered ahead of it (FIFO per flow).
     constexpr std::size_t kArena = 8 * kRegion; // 32 KiB, min block kRegion
-    b::CreditScheduler s(kBase, kArena, kRegion, /*window=*/16);
+    b::CreditScheduler s(kBase, kArena, kRegion, /*maxInflightChunksPerRequest=*/16);
 
     // Chunk sizes: 1, 2, 4, 1 regions (total 8 -> exactly fills the arena).
     std::vector<std::uint32_t> sizes{kRegion, 2 * kRegion, 4 * kRegion, kRegion};

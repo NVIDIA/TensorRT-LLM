@@ -222,3 +222,51 @@ TEST(BounceMessageCodec, CrossTypeDecodeMismatchRejected)
     std::vector<b::BounceCreditEntry> wrong;
     EXPECT_FALSE(b::decodeCredits(blob, h, wrong));
 }
+
+// ---- capability handshake (travels in AgentDesc, serialize_utils-based — not a control message) ----
+
+TEST(BounceMessageCodec, HandshakeRoundTrip)
+{
+    b::BounceHandshake in;
+    in.wireVersion = b::kBounceVersion;
+    in.controlKind = b::BounceControlKind::kNIXL_NOTIF;
+    in.arenaUsableCapacityBytes = 256ULL << 20;
+    in.maxChunkSizeBytes = 32ULL << 20;
+    in.endpoint = "tcp://10.0.0.1:5555";
+    b::BounceHandshake out;
+    ASSERT_TRUE(b::decodeHandshake(b::encodeHandshake(in), out));
+    EXPECT_EQ(out.wireVersion, in.wireVersion);
+    EXPECT_EQ(out.controlKind, in.controlKind);
+    EXPECT_EQ(out.arenaUsableCapacityBytes, in.arenaUsableCapacityBytes);
+    EXPECT_EQ(out.maxChunkSizeBytes, in.maxChunkSizeBytes);
+    EXPECT_EQ(out.endpoint, in.endpoint);
+}
+
+TEST(BounceMessageCodec, HandshakeEmptyEndpointRoundTrip)
+{
+    b::BounceHandshake in; // defaults; empty endpoint stays empty
+    b::BounceHandshake out;
+    ASSERT_TRUE(b::decodeHandshake(b::encodeHandshake(in), out));
+    EXPECT_TRUE(out.endpoint.empty());
+}
+
+TEST(BounceMessageCodec, HandshakeGarbageRejected)
+{
+    b::BounceHandshake out;
+    EXPECT_FALSE(b::decodeHandshake("", out));
+    EXPECT_FALSE(b::decodeHandshake("tcp://10.0.0.1:5555", out)); // legacy raw endpoint, no magic
+    EXPECT_FALSE(b::decodeHandshake(std::string(3, '\0'), out));  // shorter than the magic
+    auto blob = b::encodeHandshake(b::BounceHandshake{});
+    blob[0] ^= 0x5A;                                              // corrupt magic
+    EXPECT_FALSE(b::decodeHandshake(blob, out));
+}
+
+TEST(BounceMessageCodec, HandshakeTruncatedRejected)
+{
+    b::BounceHandshake in;
+    in.endpoint = "tcp://10.0.0.1:5555";
+    auto blob = b::encodeHandshake(in);
+    b::BounceHandshake out;
+    EXPECT_FALSE(b::decodeHandshake(blob.substr(0, blob.size() - 4), out)); // endpoint cut short
+    EXPECT_FALSE(b::decodeHandshake(blob.substr(0, 10), out));              // fixed part cut short
+}

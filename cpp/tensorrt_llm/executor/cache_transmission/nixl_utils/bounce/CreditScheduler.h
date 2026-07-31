@@ -31,26 +31,26 @@
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
-/// A credit handed to a flow: exclusive write permission for one variable-size receiver region.
+/// A credit handed to a flow: exclusive write permission for one receiver arena allocation.
 /// `offset` is the region's arena offset (its opaque handle), `addr = baseAddr + offset` the
-/// absolute device address, `len` its byte size (the chunk's packed bytes).
+/// absolute device address, and `len` the chunk's packed transfer length. The buddy allocation
+/// backing the region may be larger than `len`.
 struct Grant
 {
     std::string flow;       // flow id ("peer<sep>rid") the grant belongs to (NOT a bare agent name)
     std::uint64_t offset{}; // arena offset (region handle)
     std::uint64_t addr{};   // baseAddr + offset (what the sender RDMA-writes to)
-    std::uint32_t len{};    // region size = the chunk's packed bytes
+    std::uint32_t len{};    // transfer length = the chunk's packed bytes
 };
 
-/// Receiver-side credit allocator + fair scheduler (R3) over a single shared arena — pure logic,
+/// Receiver-side credit allocator + fair scheduler over a single shared arena — pure logic,
 /// no threads / IO / CUDA (the GPU buffer lives in the transport; this owns only a BuddyAllocator
 /// over byte offsets + the base address for computing absolute addrs).
 ///
-/// VARIABLE REGIONS: instead of fixed full slots, each chunk gets a region sized to its actual
-/// bytes, so MANY small requests fit (high concurrency, no waste) AND a request larger than the
-/// whole arena streams through (its chunks are each ≤ maxChunkBytes and recycled per ACK). The
-/// per-flow window cap is in REGION COUNT (pipeline depth W); the arena capacity bounds aggregate
-/// concurrency (alloc fails -> backpressure, never deadlock).
+/// VARIABLE REGIONS: instead of fixed full slots, each chunk requests only its packed byte extent;
+/// the buddy allocator rounds that request to its allocation granularity. This reduces waste for
+/// small requests, while a request larger than the whole arena streams through chunk by chunk. The
+/// per-flow cap is in allocation count; arena capacity bounds aggregate concurrency.
 ///
 /// TERMINOLOGY: the string identifying a client is an opaque **flow id** ("peerName<sep>rid"), NOT
 /// an agent name (cf. `peer` in ControlChannel/TransferEngine). reclaimByPrefix() is the only
@@ -64,10 +64,12 @@ struct Grant
 class CreditScheduler
 {
 public:
-    /// @param baseAddr   device address of arena offset 0 (Grant.addr = baseAddr + offset).
-    /// @param arenaBytes total arena size; @param minBlock buddy min block; @param maxWindow per-flow
-    ///                   in-flight region cap W (pipeline depth; must be > 0).
-    CreditScheduler(std::uint64_t baseAddr, std::size_t arenaBytes, std::size_t minBlock, std::uint32_t maxWindow);
+    /// @param baseAddr Device address of arena offset 0 (Grant.addr = baseAddr + offset).
+    /// @param arenaSizeBytes Total arena size.
+    /// @param arenaAllocationGranularityBytes Smallest requested buddy allocation size.
+    /// @param maxInflightChunksPerRequest Per-request in-flight allocation cap.
+    CreditScheduler(std::uint64_t baseAddr, std::size_t arenaSizeBytes, std::size_t arenaAllocationGranularityBytes,
+        std::uint32_t maxInflightChunksPerRequest);
 
     /// Flow announces the per-chunk byte sizes it wants to write (in order). EMPTY = cancel.
     [[nodiscard]] std::vector<Grant> onWant(std::string const& flow, std::vector<std::uint32_t> const& chunkBytes);
@@ -127,8 +129,8 @@ public:
     }
 
     /// Largest region a fully-drained arena can ever hand out (the buddy allocator's usable capacity,
-    /// rounded DOWN to minBlock<<maxOrder). A chunk larger than this can never be granted, so callers
-    /// clamp maxChunkBytes to it.
+    /// rounded down to one buddy block). A chunk larger than this can never be granted, so callers
+    /// clamp maxChunkSizeBytes to it.
     [[nodiscard]] std::size_t arenaCapacity() const noexcept
     {
         return mArena.capacity();
@@ -156,7 +158,7 @@ private:
     struct FlowState
     {
         std::deque<std::uint32_t> pending;      // per-chunk byte sizes still wanting a grant (FIFO)
-        std::unordered_set<std::uint64_t> held; // region offsets currently leased to this flow
+        std::unordered_set<std::uint64_t> held; // region offsets currently granted to this flow
     };
 
     std::vector<Grant> schedule();              // grant while the arena has room and eligible flows exist
@@ -174,7 +176,7 @@ private:
 
     BuddyAllocator mArena;                             // the single shared region allocator (byte offsets)
     std::uint64_t mBaseAddr{};                         // device addr of offset 0
-    std::uint32_t mMaxWindow{};                        // per-flow in-flight region cap (W)
+    std::uint32_t mMaxInflightChunksPerRequest{};      // per-request in-flight allocation cap
 
     std::unordered_map<std::string, FlowState> mFlows; // per-flow state (opaque flow id, NOT agent name)
     std::unordered_set<std::uint64_t> mLocalHeld;      // regions taken for local gather staging
@@ -185,7 +187,7 @@ private:
     std::size_t mEagerHeldBytes{0};
     std::size_t mEagerBudgetBytes{0};
     std::unordered_set<std::uint64_t>
-        mOrphans; // regions deferred by reclaimByPrefix (busy scatter), awaiting freeOrphanRegion
+        mOrphans; // regions deferred by flow/peer reclamation (busy scatter), awaiting freeOrphanRegion
     // Round-robin ring of active flow keys (insertion order). NOTE: "ring" not "order" — distinct
     // from BuddyAllocator's size `order` (mArena), which is the power-of-two block exponent.
     std::vector<std::string> mRing;

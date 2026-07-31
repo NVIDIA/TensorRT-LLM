@@ -29,17 +29,17 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // Role
 //   Carries the small control messages of the credit protocol between agents:
 //   WANT / GRANT / DATA / ACK (encoded by BounceMessage). It is a named-peer,
-//   message-oriented, *one-way* async pipe: sendTo(peer, blob) fire-and-forget;
-//   recv() pulls the next inbound (peer, blob). There is no handshake message —
-//   WANT carries the sender's endpoint so the receiver self-bootstraps the reverse
-//   path (addPeer), and an empty WANT cancels (no separate RETURN message).
+//   asynchronous message channel: sendTo(peer, blob) is fire-and-forget and recv()
+//   pulls the next inbound (peer, blob). The capability handshake is exchanged
+//   out-of-band in AgentDesc, not as a ControlChannel message. WANT still carries
+//   the sender's endpoint so the receiver can self-bootstrap the reverse path;
+//   an empty WANT cancels a request (there is no separate RETURN message).
 //
 // Why it is abstract
 //   The data plane (bulk RDMA) is always NIXL. The control plane is pluggable so
 //   we can pick the transport without touching the reactor / credit logic:
 //     - ZmqControlChannel        (default) — dedicated, event-driven zmq sockets.
-//     - NixlGenNotifControlChannel (fallback) — reuse NIXL genNotif/getNotifs when
-//       no zmq endpoint can be bootstrapped (no extra port).
+//     - NixlNotifControlChannel — reuse NIXL genNotif/getNotifs (no extra port).
 //   Crucially, NEITHER uses NIXL's postXferReq notifMsg — v2 abandons it entirely
 //   (data-landed is detected by the sender polling getXferStatus, which already
 //   includes NIXL's ucp_ep_flush_nbx).
@@ -48,23 +48,25 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   The channel need NOT order messages w.r.t. the RDMA data plane: the only
 //   message with a data dependency is DATA ("go scatter"), and the sender emits
 //   DATA *after* observing getXferStatus==SUCCESS, so the data is already landed
-//   at the remote regardless of which transport carries DATA. Per-peer FIFO of
-//   control messages is desirable but the credit protocol tolerates reordering
-//   (GRANT/ACK are idempotent against the scheduler/Request state).
+//   at the remote regardless of which transport carries DATA. Messages sent from
+//   one peer MUST be delivered FIFO: GRANT entries are associated with chunks by
+//   order and do not carry an explicit chunk index.
 //
 // Threading contract
 //   recv() is called only by the single IO-reactor thread. sendTo()/addPeer() may
-//   be called concurrently (reactor + app threads issuing WANT). Implementations
-//   must make sendTo()/addPeer() mutually thread-safe; recv() runs lock-free on
-//   the reactor thread.
+//   be called concurrently (reactor, app threads issuing WANT, and scatter workers
+//   issuing ACK). Implementations must make sendTo()/addPeer() mutually thread-safe.
+//   Only the reactor calls recv(), so implementations need not support concurrent
+//   receivers.
 // ============================================================================
 class ControlChannel
 {
 public:
     virtual ~ControlChannel() = default;
 
-    /// The endpoint other agents must connect to in order to reach us (e.g.
-    /// "tcp://10.0.0.3:517"). Advertised out-of-band via NIXL agent metadata.
+    /// The endpoint other agents need to reach us: a ZMQ address or serialized NIXL metadata,
+    /// depending on the implementation. Advertised in the AgentDesc capability handshake and in
+    /// WANT for reverse-path bootstrap.
     [[nodiscard]] virtual std::string localEndpoint() const = 0;
 
     /// Register where to reach `peer` (its localEndpoint()). Must be called before

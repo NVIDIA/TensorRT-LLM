@@ -50,7 +50,7 @@ std::string NixlNotifControlChannel::localEndpoint() const
         {
             TLLM_LOG_WARNING(
                 "NixlNotifControlChannel(%s): getLocalMD failed: %s (reverse control path will not "
-                "bootstrap; requests to us will lease-timeout)",
+                "bootstrap; requests to us will reach requestTimeoutMs)",
                 mSelfName.c_str(), nixlEnumStrings::statusStr(st).c_str());
             return {};
         }
@@ -109,9 +109,16 @@ void NixlNotifControlChannel::removePeer(std::string const& peer)
 void NixlNotifControlChannel::sendTo(std::string const& peer, std::string const& blob)
 {
     // Same fire-and-forget semantics as the zmq channel: a failed send is DROPPED (warned) and the
-    // affected request degrades to a leaseTimeout FAILURE — never a hang. genNotif is safe from any
+    // affected request degrades to a request-timeout FAILURE. genNotif is safe from any
     // thread (the agent is created with thread-safe sync; the data plane already relies on this).
     BounceNvtxScope sendScope(kNvtxZmqSend, "notifSend bytes=%zu", blob.size());
+    std::lock_guard<std::mutex> lk(mMu);
+    if (mPeers.find(peer) == mPeers.end())
+    {
+        TLLM_LOG_WARNING("NixlNotifControlChannel(%s): sendTo unknown peer %s (call addPeer first)", mSelfName.c_str(),
+            peer.c_str());
+        return;
+    }
     nixl_status_t const st = mAgent->genNotif(peer, blob);
     if (st != NIXL_SUCCESS)
     {
@@ -122,6 +129,7 @@ void NixlNotifControlChannel::sendTo(std::string const& peer, std::string const&
 
 bool NixlNotifControlChannel::drainNotifs()
 {
+    std::lock_guard<std::mutex> drainLk(mDrainMu);
     nixl_notifs_t notifs;
     nixl_status_t const st = mAgent->getNotifs(notifs);
     if (st != NIXL_SUCCESS)
@@ -143,16 +151,20 @@ bool NixlNotifControlChannel::drainNotifs()
             }
             else
             {
-                // getNotifs is a per-agent singleton queue; this channel owns it while enabled. A
-                // foreign notification means some other component (e.g. the C++ transceiver's sync
-                // messages) also uses agent notifications — that combination is unsupported with
-                // TRTLLM_NIXL_BOUNCE_NIXL_CONTROL and the message cannot be re-queued; drop loudly.
-                TLLM_LOG_WARNING("NixlNotifControlChannel(%s): dropping non-bounce notification from %s (%zu B)",
-                    mSelfName.c_str(), peer.c_str(), blob.size());
+                mNonBounceInbox[peer].emplace_back(std::move(blob));
             }
         }
     }
     return any;
+}
+
+std::unordered_map<std::string, std::vector<std::string>> NixlNotifControlChannel::takeNonBounceNotifications()
+{
+    (void) drainNotifs();
+    std::lock_guard<std::mutex> lk(mMu);
+    auto notifications = std::move(mNonBounceInbox);
+    mNonBounceInbox.clear();
+    return notifications;
 }
 
 bool NixlNotifControlChannel::recv(std::string& outPeer, std::string& outBlob, int timeoutMs)
@@ -172,7 +184,7 @@ bool NixlNotifControlChannel::recv(std::string& outPeer, std::string& outBlob, i
         }
         if (drainNotifs())
         {
-            continue; // something arrived; loop back to pop (may have been a dropped foreign blob)
+            continue; // something arrived; loop back to pop (it may have been a non-bounce message)
         }
         if (timeoutMs <= 0 || std::chrono::steady_clock::now() >= deadline)
         {

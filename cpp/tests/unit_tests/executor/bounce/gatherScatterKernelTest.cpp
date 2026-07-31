@@ -44,7 +44,7 @@ unsigned char pattern(std::size_t buf, std::size_t idx)
 }
 } // namespace
 
-// Gather scattered src buffers into a packed slot, then scatter the slot back out to fresh
+// Gather scattered source buffers into a packed arena region, then scatter that region into fresh
 // dst buffers; verify every byte survives the round trip. Mixes 16B-aligned sizes (uint4 path)
 // and unaligned sizes (byte path).
 TEST(GatherScatterKernel, GatherThenScatterRoundTrip)
@@ -80,23 +80,23 @@ TEST(GatherScatterKernel, GatherThenScatterRoundTrip)
         }
     }
 
-    // Device buffers: src region, packed slot, dst region.
-    void *dSrc = nullptr, *dSlot = nullptr, *dDst = nullptr;
+    // Device buffers: source region, packed arena region, destination region.
+    void *dSrc = nullptr, *dPackedRegion = nullptr, *dDst = nullptr;
     CUDA_OK(cudaMalloc(&dSrc, totalAligned));
-    CUDA_OK(cudaMalloc(&dSlot, totalAligned));
+    CUDA_OK(cudaMalloc(&dPackedRegion, totalAligned));
     CUDA_OK(cudaMalloc(&dDst, totalAligned));
     CUDA_OK(cudaMemcpy(dSrc, srcHost.data(), totalAligned, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemset(dDst, 0, totalAligned));
 
     auto base = [](void* p, std::uint64_t o) { return reinterpret_cast<std::uint64_t>(static_cast<char*>(p) + o); };
 
-    // Plan arrays (host) -> device. Gather: src region -> slot. Scatter: slot -> dst region.
+    // Plan arrays (host) -> device. Gather into the packed region, then scatter to destinations.
     std::vector<std::uint64_t> gatherSrc(n), gatherDst(n), scatterSrc(n), scatterDst(n);
     for (std::uint32_t i = 0; i < n; ++i)
     {
         gatherSrc[i] = base(dSrc, off[i]);
-        gatherDst[i] = base(dSlot, off[i]);
-        scatterSrc[i] = base(dSlot, off[i]);
+        gatherDst[i] = base(dPackedRegion, off[i]);
+        scatterSrc[i] = base(dPackedRegion, off[i]);
         scatterDst[i] = base(dDst, off[i]);
     }
 
@@ -133,7 +133,7 @@ TEST(GatherScatterKernel, GatherThenScatterRoundTrip)
     }
 
     cudaFree(dSrc);
-    cudaFree(dSlot);
+    cudaFree(dPackedRegion);
     cudaFree(dDst);
     cudaFree(dGatherSrc);
     cudaFree(dGatherDst);
@@ -154,7 +154,7 @@ TEST(GatherScatterKernel, ZeroBuffersIsNoop)
 
 namespace
 {
-// Driver for the two opt-in copy backends: gather (src->slot) + scatter (slot->dst) over n buffers
+// Driver for the two opt-in copy backends: gather into and scatter from one packed arena region
 // of mixed sizes, asserting byte-exact. `useCub` selects cub::DeviceMemcpy::Batched over the custom
 // kernel; `mappedPlan` puts the [srcs|dsts|sizes] plan arrays in MAPPED host memory (the zero-copy-
 // args path) instead of device memory. Same round trip as GatherThenScatterRoundTrip.
@@ -181,9 +181,9 @@ void runBackendRoundTrip(bool useCub, bool mappedPlan)
         for (std::uint32_t j = 0; j < sizes[i]; ++j)
             srcHost[off[i] + j] = pattern(i, j);
 
-    void *dSrc = nullptr, *dSlot = nullptr, *dDst = nullptr;
+    void *dSrc = nullptr, *dPackedRegion = nullptr, *dDst = nullptr;
     CUDA_OK(cudaMalloc(&dSrc, total));
-    CUDA_OK(cudaMalloc(&dSlot, total));
+    CUDA_OK(cudaMalloc(&dPackedRegion, total));
     CUDA_OK(cudaMalloc(&dDst, total));
     CUDA_OK(cudaMemcpy(dSrc, srcHost.data(), total, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemset(dDst, 0, total));
@@ -192,8 +192,8 @@ void runBackendRoundTrip(bool useCub, bool mappedPlan)
     for (std::uint32_t i = 0; i < n; ++i)
     {
         gSrc[i] = base(dSrc, off[i]);
-        gDst[i] = base(dSlot, off[i]);
-        sSrc[i] = base(dSlot, off[i]);
+        gDst[i] = base(dPackedRegion, off[i]);
+        sSrc[i] = base(dPackedRegion, off[i]);
         sDst[i] = base(dDst, off[i]);
     }
 
@@ -257,7 +257,7 @@ void runBackendRoundTrip(bool useCub, bool mappedPlan)
             ASSERT_EQ(dstHost[off[i] + j], pattern(i, j)) << "mismatch buf=" << i << " byte=" << j;
 
     cudaFree(dSrc);
-    cudaFree(dSlot);
+    cudaFree(dPackedRegion);
     cudaFree(dDst);
     for (void* p : devBufs)
         cudaFree(p);
@@ -269,13 +269,14 @@ void runBackendRoundTrip(bool useCub, bool mappedPlan)
 }
 } // namespace
 
-// cub::DeviceMemcpy::Batched backend (TRTLLM_NIXL_BOUNCE_CUB_COPY).
+// cub::DeviceMemcpy::Batched backend (TRTLLM_NIXL_BOUNCE_USE_CUB_COPY).
 TEST(GatherScatterKernel, CubBatchedCopyRoundTrip)
 {
     runBackendRoundTrip(/*useCub=*/true, /*mappedPlan=*/false);
 }
 
-// Zero-copy plan args: kernel reads [srcs|dsts|sizes] from mapped host (TRTLLM_NIXL_BOUNCE_ZEROCOPY_ARGS).
+// Zero-copy plan args: kernel reads [srcs|dsts|sizes] from mapped host
+// (TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS).
 TEST(GatherScatterKernel, ZeroCopyPlanArgsRoundTrip)
 {
     runBackendRoundTrip(/*useCub=*/false, /*mappedPlan=*/true);

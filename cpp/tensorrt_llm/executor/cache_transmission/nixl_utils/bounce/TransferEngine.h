@@ -29,9 +29,9 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // TransferEngine — abstract bulk-write transport for the bounce data plane
 // ----------------------------------------------------------------------------
 // Role
-//   The ONE operation the bounce data plane needs: "write `bytes` from my local slot
-//   buffer to a peer's slot buffer, and let me know (by polling) when it has landed
-//   at the remote". The bounce reactor gates the DATA control message on poll()==Done,
+//   The one operation the bounce data plane needs: write `bytes` from a local arena region to a
+//   peer's granted arena region, and report through polling when it has landed remotely. The bounce
+//   reactor gates the DATA control message on poll()==Done,
 //   which (for the real NIXL engine) already implies remote landing via NIXL's
 //   ucp_ep_flush_nbx — so v2 needs NO notifMsg.
 //
@@ -45,8 +45,9 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   failure-injection test share one code path.
 //
 // Threading
-//   Used only by the IO-reactor thread (post + poll + release). Implementations need
-//   not be internally locked for cross-thread use.
+//   Normal progress calls post / poll / release on the IO-reactor thread. Shutdown cleanup may
+//   release handles after that thread has joined, so implementations need not support concurrent
+//   calls unless they document otherwise.
 // ============================================================================
 
 enum class XferState
@@ -71,8 +72,8 @@ public:
     /// GPU `remoteDevId` (carried in the credit; do NOT assume it equals the local device index).
     /// `stream` is advisory and may be null: the reactor posts a write only AFTER the gather event
     /// has signalled (postXferReq is not stream-ordered anyway), so implementations need no stream
-    /// ordering. Returns an opaque handle to poll. The handle owns no slot — slot lifetime is the
-    /// caller's.
+    /// ordering. Returns an opaque handle to poll. The handle does not own either arena allocation;
+    /// their lifetimes remain the caller's responsibility.
     [[nodiscard]] virtual std::uint64_t postWrite(std::string const& peer, void const* src, std::uint64_t dstAddr,
         std::uint32_t remoteDevId, std::uint32_t bytes, cudaStream_t stream)
         = 0;

@@ -39,9 +39,10 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   Pure STORAGE: a single contiguous `bytes`-byte device buffer registered ONCE with NIXL and
 //   shared by BOTH roles. CreditScheduler (its BuddyAllocator) carves variable-size regions out of
 //   it by byte offset — receiver grants (remote senders' RDMA-write targets) and the local sender's
-//   gather staging both draw from the same arena. Unlike the old fixed-slot pool, a chunk gets a
-//   region sized to its actual bytes, so many small requests pack densely (high concurrency, no
-//   per-slot waste) while a request larger than the arena streams through chunk-by-chunk.
+//   gather staging both draw from the same arena. Unlike the old fixed-slot pool, each chunk requests
+//   only its packed extent; the scheduler rounds that extent to a buddy block. Small requests
+//   therefore use much less space than a full-size slot, while requests larger than the arena stream
+//   through chunk by chunk.
 //
 // Allocation
 //   On MNNVL parts (GH200/GB200) the buffer must be fabric memory (cuMemCreate +

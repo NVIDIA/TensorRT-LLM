@@ -22,8 +22,10 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 class nixlAgent;
 
@@ -38,17 +40,18 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // scatter plan compressed to a handful of runs, the remaining ackWait cost is per-hop latency of
 // SMALL control messages — a ZMQ/TCP hop costs tens of microseconds while a UCX AM hop is a few.
 //
-// Reverse-path bootstrap: the disagg metadata exchange is one-directional (the KV sender loads the
-// receiver's agent metadata, never vice versa), so the receiver initially CANNOT genNotif back.
-// localEndpoint() therefore returns this agent's serialized NIXL metadata; the WANT carries it and
-// the receiver's onWant self-bootstrap (addPeer) does loadRemoteMD — after which GRANT/ACK flow
-// back over the fabric. Mirrors the ZMQ channel's endpoint-in-WANT bootstrap, so mixed channel
-// types across peers are NOT supported: enable TRTLLM_NIXL_BOUNCE_NIXL_CONTROL on both sides.
+// Reverse-path bootstrap: disaggregated serving supports one-directional metadata exchange (the KV
+// sender may load the receiver's agent metadata without the reverse), so the receiver might not be
+// able to genNotif back initially. localEndpoint() therefore returns this agent's serialized NIXL
+// metadata; the WANT carries it and the receiver's onWant self-bootstrap (addPeer) does loadRemoteMD
+// — after which GRANT/ACK flow back over the fabric. This mirrors the ZMQ channel's
+// endpoint-in-WANT bootstrap. Mixed channel types across peers are NOT supported: enable
+// TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS on both sides.
 //
-// Notification ownership: this channel drains the agent's getNotifs() queue, which is a
-// process-wide singleton per agent. Blobs without the bounce magic are dropped (with a warning) —
-// the PYTHON transceiver runtime never consumes agent notifications, but the C++ runtime's
-// DataSender does, so this channel must NOT be enabled under transceiver_runtime=CPP.
+// Notification ownership: this channel is the sole getNotifs() consumer while enabled because the
+// queue is shared by all notification users of that agent. Bounce messages and ordinary sync
+// messages are demultiplexed into separate inboxes; takeNonBounceNotifications() exposes the latter
+// to NixlTransferAgent::getNotifiedSyncMessages().
 //
 // recv() poll model: getNotifs() is a non-blocking poll (no fd to select on), so recv() spins
 // getNotifs with a short sleep until the deadline. The reactor already calls recv(timeout 0) when
@@ -66,9 +69,13 @@ public:
     void sendTo(std::string const& peer, std::string const& blob) override;
     [[nodiscard]] bool recv(std::string& outPeer, std::string& outBlob, int timeoutMs) override;
 
+    /// Drain and return ordinary (non-bounce) agent notifications without exposing bounce control
+    /// messages to the transfer-agent sync-message API.
+    [[nodiscard]] std::unordered_map<std::string, std::vector<std::string>> takeNonBounceNotifications();
+
 private:
-    /// Drain the agent's notification queue into mInbox (bounce-magic blobs only). Returns true if
-    /// anything (bounce or not) was drained. Caller must NOT hold mMu.
+    /// Drain the agent's notification queue into the bounce and non-bounce inboxes. Returns true if
+    /// anything was drained. Caller must NOT hold mDrainMu or mMu.
     bool drainNotifs();
 
     nixlAgent* mAgent; // codespell:ignore
@@ -79,9 +86,11 @@ private:
     mutable std::mutex mMdMu;
     mutable std::string mLocalMd;
 
-    std::mutex mMu;                                         // guards mPeers + mInbox
+    std::mutex mDrainMu; // serializes access to the agent's shared notification queue
+    std::mutex mMu;      // guards mPeers and both inboxes
     std::unordered_set<std::string> mPeers;
     std::deque<std::pair<std::string, std::string>> mInbox; // (peer, blob), FIFO
+    std::unordered_map<std::string, std::vector<std::string>> mNonBounceInbox;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

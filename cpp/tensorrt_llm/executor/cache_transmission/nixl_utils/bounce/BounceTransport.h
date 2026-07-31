@@ -47,14 +47,12 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // ============================================================================
 // Bounce v2 reactor
 // ----------------------------------------------------------------------------
-// One BounceTransport per agent. Concurrency is collapsed onto ONE IO thread +
-// M scatter workers, so the credit/request state needs almost no
-// locking. The reactor is decomposed into three collaborators that all live on
-// (and are owned by) that single IO thread:
+// One BounceTransport per agent. Protocol progress is driven by ONE IO thread plus M scatter
+// workers. submit() may also prepare eager gathers on application threads, so the sender request
+// table, scheduler and shared resource pools provide their own synchronization.
 //
-//   BounceContext  — the shared, single-IO-thread-owned dependencies both roles
-//                    operate on: the injected channel/engine/arena/exec, the one
-//                    CreditScheduler (region allocator), and sendGrants().
+//   BounceContext  — shared dependencies used by both roles: the injected
+//                    channel/engine/arena/exec, one CreditScheduler, and sendGrants().
 //   BounceSender   — the [S] role: submit() -> WANT, GRANT -> gather+write, ACK
 //                    -> resolve. Owns the request table + sender-side orphan state.
 //   BounceReceiver — the [R] role: WANT -> grant regions, DATA -> scatter, ACK.
@@ -62,40 +60,41 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //   BounceTransport— the thin reactor: owns the three above + the IO thread, and
 //                    routes control messages / drains to sender vs receiver.
 //
-// IO thread loop (single-threaded owner of scheduler + sender request table):
+// IO thread loop (primary owner of scheduler + sender request table; submit() may access both
+// through their locks):
 //   1. recv() one control message (short timeout) and dispatch it:
-//        [S] GRANT(rid, credits)  -> per credit: acquireLocal(bytes) a shared-arena region + borrow
-//                                    an ExecCtx, launch gather + cudaEventRecord (NO sync); postWrite
-//                                    is deferred to drainGatherReady() once the gather event signals
-//                                    (so a gather delayed behind other GPU work never blocks IO).
+//        [S] GRANT(rid, credits)  -> attach credits to eager-gathered chunks or acquire a local
+//                                    arena region + ExecCtx and launch gather. postWrite is deferred
+//                                    to drainGatherReady() until both gather completion and credit
+//                                    availability have been observed.
 //        [S] ACK(rid, chunk, h)   -> releaseLocal() that chunk's region; acked++;
 //                                    all acked -> resolve the request's future SUCCESS.
 //        [R] WANT(rid, sizes[])   -> scheduler.onWant(peer:rid, sizes) -> send GRANT(s).
 //        [R] DATA(rid, chunk, h, plan) -> enqueue a scatter job over region `h`.
 //   2. poll TransferEngine on every in-flight write; on Done send DATA (data has
 //      landed at the remote) and mark on-wire. THIS is why no notifMsg is needed.
-//   3. drain scatter completions posted by workers: scheduler.onScatterDone -> re-GRANT,
-//      and send ACK back to the sender.
+//   3. drain scatter completions posted by workers: release receiver regions and re-GRANT.
 //
-// Scatter workers (receiver): pop a job, scatter region->dst via the kernel, sync, then
-// post a completion back to the IO thread.
+// Scatter workers (receiver): pop a job, scatter region->dst via the kernel, synchronize the
+// stream, send ACK immediately on success, then post bookkeeping completion to the IO thread.
 //
 // Sender requests are keyed by a monotonic rid; the receiver-side scheduler is keyed by
 // "peer\x1f rid" so multiple concurrent requests from one peer are independent flows.
 //
-// Lifetime: submit() returns a shared_future<TransferState>; the IO thread resolves it
-// SUCCESS on full ACK, FAILURE on transfer error / shutdown — never hangs.
+// Lifetime: submit() returns a shared_future<TransferState>; it resolves SUCCESS on full ACK and
+// FAILURE on transfer error, peer invalidation, shutdown, or request timeout. Setting
+// requestTimeoutMs to 0 intentionally disables timeout-based failure.
 //
 // TransferEngine & ControlChannel are injected (not owned) so the same reactor runs
 // unchanged in tests and production (both over the real NIXL/zmq stack; tests may inject a
 // fault-injecting engine to exercise the failure path).
 // ============================================================================
 
-/// Shared, single-IO-thread-owned dependencies both roles operate on. Holds the injected
-/// channel/engine/arena/exec (borrowed, not owned), the one CreditScheduler that carves the shared
-/// arena for BOTH roles, and sendGrants(). Owned by value by BounceTransport; referenced by the
-/// sender and receiver. Not thread-safe by itself — every member is touched only on the IO thread
-/// (the scheduler) or is itself internally synchronized (channel/engine/exec/arena).
+/// Shared dependencies used by both roles. Holds the injected channel/engine/arena/exec (borrowed,
+/// not owned), the one CreditScheduler that carves the shared arena for both roles, and
+/// sendGrants(). Owned by value by BounceTransport and referenced by the sender and receiver.
+/// Individual mutable collaborators provide their own synchronization; the immutable arena lookup
+/// helpers require none.
 class BounceContext
 {
 public:
@@ -108,7 +107,8 @@ public:
         , engine(engine)
         , arena(arena)
         , exec(exec)
-        , scheduler(arena->baseAddr(), cfg.arenaBytes, cfg.minBlock, cfg.effectiveWindow())
+        , scheduler(arena->baseAddr(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes,
+              cfg.maxInflightChunksPerRequest)
     {
     }
 
@@ -127,12 +127,13 @@ public:
     TransferEngine* engine{};
     BounceArena* arena{};      // ONE shared data buffer: receiver grants + local gather both carve regions from it
     ExecPool* exec{};          // gather/scatter exec contexts (streams/scratch), borrowed per kernel
-    CreditScheduler scheduler; // the single region allocator; touched only by the IO thread
+    CreditScheduler scheduler; // shared region allocator; internally synchronized
     std::atomic<bool> stop{false};
 };
 
 /// Receiver role ([R]): WANT -> grant regions, DATA -> scatter into the caller's KV, then ACK. Owns
-/// the M scatter workers and the IO<->worker job/done queues. All public methods run on the IO thread.
+/// the M scatter workers and the IO<->worker job/done queues. Protocol handlers run on the IO
+/// thread; start/wake/join are lifecycle calls made by the owner.
 class BounceReceiver
 {
 public:
@@ -147,7 +148,8 @@ public:
 
     void onWant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
     void onData(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
-    /// Drain scatter completions posted by workers (ACK + free region). Returns true if any.
+    /// Drain scatter bookkeeping completions posted by workers, release regions, and re-grant newly
+    /// available space. Successful workers have already sent ACK. Returns true if any were drained.
     bool drainScatterDone();
     /// A peer is gone: reclaim every receiver-side flow of that peer (deferring regions a worker is
     /// still reading) and drop its not-yet-started scatter jobs.
@@ -175,11 +177,7 @@ private:
     struct ScatterDone
     {
         std::string key;
-        std::string peer;
-        std::uint64_t rid{};
-        std::uint32_t chunkIdx{};
         std::uint64_t offset{}; // receiver arena region offset freed once scattered
-        bool ok{true};          // scatter kernel succeeded -> ACK; false -> skip ACK (sender times out)
     };
 
     /// The set of incoming regions currently scattering — the `busy` set passed to the scheduler's
@@ -218,7 +216,9 @@ public:
     explicit BounceSender(BounceContext& ctx);
 
     /// Submit a WRITE of (src -> dst) descriptors to `peer`. Returns a future that resolves
-    /// kSUCCESS once every chunk is scattered+ACKed, or kFAILURE on error/shutdown.
+    /// kSUCCESS once every chunk is scattered+ACKed, or kFAILURE on error/shutdown. Chunks are cut
+    /// to cfg.maxChunkSizeBytes. NixlTransferAgent validates peer compatibility before calling this;
+    /// direct users of BounceTransport must establish the same invariant themselves.
     [[nodiscard]] std::shared_future<TransferState> submit(
         TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer);
 
@@ -234,7 +234,7 @@ public:
     bool drainOrphanLocal();
     /// Retry parked credits for every request (called on the IO loop after ACKs free regions).
     void drainPendingPosts();
-    /// Fail requests that have made no progress within leaseTimeoutMs (e.g. peer never granted).
+    /// Fail requests that have made no progress within requestTimeoutMs (e.g. peer never granted).
     void checkTimeouts();
     /// A peer is gone: fail any in-flight request targeting it so its wait() returns.
     void forget(std::string const& peer);
@@ -310,7 +310,7 @@ private:
         std::deque<BounceCreditEntry> pendingCredits;
         std::shared_ptr<std::promise<TransferState>> promise;
         // Last time this request made forward progress (granted+posted a chunk, or got an ACK).
-        // A request stuck with no progress for leaseTimeoutMs (e.g. the peer never GRANTs because
+        // A request stuck with no progress for requestTimeoutMs (e.g. the peer never GRANTs because
         // it is unreachable / not bounce-ready) is failed rather than hanging wait() forever.
         std::chrono::steady_clock::time_point lastProgress;
         // Cross-thread NVTX spans (0 == none; ended on failure paths too).
@@ -339,8 +339,9 @@ private:
     /// Caller MUST hold mReqMu.
     void attachCredits(std::uint64_t rid, Request& req);
     /// Launch gathers for as many not-yet-posted chunks as resources allow (non-blocking): with a
-    /// parked credit when available, else eagerly (cfg.eagerGather, capped by the per-flow window +
-    /// the scheduler's eager budget). Stops when the arena/ExecPool is empty (rest parked/retried).
+    /// parked credit when available, else eagerly (cfg.enableEagerGather, capped by the per-request
+    /// in-flight limit and the scheduler's eager budget). Stops when the arena/ExecPool is empty
+    /// (rest parked/retried).
     /// Caller MUST hold mReqMu. Runs attachCredits() first so credit pairing stays in chunk order.
     void pumpRequest(std::uint64_t rid, Request& req);
     void failRequest(std::uint64_t rid, Request& req);
@@ -383,9 +384,28 @@ public:
     /// Register where to reach `peer` (its ControlChannel endpoint).
     void addPeer(std::string const& peer, std::string const& endpoint);
 
-    /// A peer is gone (NixlTransferAgent::invalidateRemoteAgent). Reclaim its receiver-side
-    /// credits and fail any in-flight sender requests to it. Thread-safe: queued and applied on
-    /// the IO thread so the scheduler stays single-threaded.
+    /// This agent's capability handshake, encoded for AgentDesc: control endpoint plus the fields a
+    /// peer validates before engaging bounce (wire version, control kind and effective chunk cap).
+    /// Usable arena capacity is included for diagnostics. Thread-safe because post-construction
+    /// state is immutable.
+    [[nodiscard]] std::string localHandshakeBlob() const;
+
+    /// Validate a peer's handshake blob (from its AgentDesc) and, when compatible, register the
+    /// peer: control channel (addPeer) + the bounce-capable peer set. Compatibility is STRICT
+    /// equality of wireVersion, controlKind and the effective maxChunkSizeBytes — both sides
+    /// advertise post-clamp values, so equality also guarantees every chunk fits the peer's arena
+    /// and scatter scratch. Registration replaces any previous result for the same peer; an empty,
+    /// incompatible or unparsable replacement clears the old route/capability and returns false, so
+    /// the caller keeps that peer on the standard per-desc NIXL path. Thread-safe.
+    bool registerPeerHandshake(std::string const& peer, std::string const& blob);
+
+    /// Did `peer` pass registerPeerHandshake (and not get forgotten since)? Gates the agent's
+    /// bounce fast path so we never WANT a peer that cannot answer. Thread-safe.
+    [[nodiscard]] bool hasPeerHandshake(std::string const& peer) const;
+
+    /// A peer is gone (NixlTransferAgent::invalidateRemoteAgent). Remove its channel endpoint and
+    /// compatibility record synchronously, then queue receiver-credit reclamation and sender-request
+    /// failure for the IO thread. A fresh loadRemoteAgent must validate a new handshake.
     void forgetPeer(std::string const& peer);
 
     /// Submit a WRITE of (src -> dst) descriptors to `peer`. Returns a future that resolves
@@ -396,7 +416,24 @@ public:
         return mSender.submit(srcDescs, dstDescs, peer);
     }
 
-    /// Stop threads, fail any in-flight requests, join. Safe to call once.
+    /// The largest single region a fully-drained arena can grant (buddy-rounded usable capacity).
+    /// Advertised in the capability handshake for diagnostics. maxChunkSizeBytes() is clamped to
+    /// this value before the handshake is generated.
+    [[nodiscard]] std::size_t arenaCapacity() const
+    {
+        return mCtx.scheduler.arenaCapacity();
+    }
+
+    /// This side's EFFECTIVE per-chunk cap: cfg.maxChunkSizeBytes AFTER the constructor's clamp to
+    /// the usable arena capacity. Advertised in the capability handshake; bounce engages toward a
+    /// peer only when both sides advertise the SAME value (see NixlTransferAgent::loadRemoteAgent),
+    /// which also guarantees our chunks fit the peer's arena and scatter scratch.
+    [[nodiscard]] std::size_t maxChunkSizeBytes() const
+    {
+        return mCtx.cfg.maxChunkSizeBytes;
+    }
+
+    /// Stop threads, fail any in-flight requests, and join. Idempotent.
     void shutdown();
 
 private:
@@ -420,6 +457,12 @@ private:
     // forgetPeer() requests queued from app threads -> applied on the IO thread
     std::mutex mForgetMu;
     std::vector<std::string> mForgetPeers;
+
+    // Peers whose capability handshake matched ours (registerPeerHandshake); the agent engages
+    // bounce only toward these. Touched from app threads (loadRemoteAgent / shouldUseBounce /
+    // invalidateRemoteAgent) -> own mutex.
+    mutable std::mutex mPeerMu;
+    std::unordered_set<std::string> mHandshakedPeers;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce
