@@ -133,7 +133,9 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=click.IntRange(min=1),
     default=None,
     help=
-    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration).",
+    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration). "
+    "Requests dropped at the deadline are excluded from the report, so the statistics cover the requests that "
+    "completed rather than the whole dataset.",
 )
 @optgroup.option(
     "--warmup",
