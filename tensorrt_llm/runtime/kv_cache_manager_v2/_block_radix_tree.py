@@ -195,10 +195,6 @@ def detach_next(parent: "Block | RootBlock", key: BlockKey) -> "Block | None":
 def remove_subtree(root: "Block") -> None:
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
-    # Each block's pages are reclaimed eagerly via _release_pages() while the
-    # StorageManager is still alive, rather than deferring to ~Block()/__del__().
-    # An external reference (e.g. a caller holding a matched Block) can keep a Block
-    # alive past StorageManager teardown, after which page.manager would be dangling.
     removed_block_hashes: list[BlockKey] = []
     tree = try_get_tree(root)
     event_manager = tree.event_manager if tree is not None else None
@@ -207,7 +203,6 @@ def remove_subtree(root: "Block") -> None:
         if block.next:
             block = next(iter(block.next.values()))
         else:
-            block._release_pages()
             removed_block_hashes.append(block.key)
             if block._prev() is None:
                 assert block is root

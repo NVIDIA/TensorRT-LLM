@@ -330,8 +330,8 @@ private:
     KVCacheManagerConfig mConfig;
     LifeCycleRegistry mLifeCycles;
     std::shared_ptr<EventSink> mEventSink;
-    std::shared_ptr<BlockRadixTree> mRadixTree;
     std::shared_ptr<StorageManager> mStorage;
+    std::shared_ptr<BlockRadixTree> mRadixTree;
 
     // Weak references to all living KvCaches.
     std::set<KvCache*> mLivingKvCaches;

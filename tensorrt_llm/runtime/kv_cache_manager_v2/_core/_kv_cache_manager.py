@@ -196,8 +196,8 @@ class KVCacheManager:
     __slots__ = (
         "_init_config",
         "_life_cycles",
-        "_radix_tree",
         "_storage",
+        "_radix_tree",
         "_living_kv_caches",
         "_avg_reused_length",
         "_avg_sqr_capacity",
@@ -219,8 +219,8 @@ class KVCacheManager:
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
-    _radix_tree: BlockRadixTree
     _storage: StorageManager
+    _radix_tree: BlockRadixTree
     _living_kv_caches: set[rawref.ref[_KVCache]]
     # Eventually we should let the eviction controller evict associated pages together, i.e.
     # when a page eviction makes other pages in the same cache level useless, it should also
@@ -258,7 +258,6 @@ class KVCacheManager:
         config = deepcopy(config)
         self._init_config = config
         self._life_cycles = LifeCycleRegistry(config)
-        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         storage_config = create_storage_config(config)
         self._storage = StorageManager(
             self._life_cycles,
@@ -271,6 +270,7 @@ class KVCacheManager:
             event_manager=event_manager,
             max_util_for_resume=config.max_util_for_resume,
         )
+        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
