@@ -3734,7 +3734,14 @@ class PyExecutor:
         # Re-validate the per-step token budget and shed deferrable work here,
         # before the batch is measured, voted on by _can_queue, or allocated
         # against. See ResourceManager.maybe_fit_token_budget.
-        self.resource_manager.maybe_fit_token_budget(scheduled_batch)
+        #
+        # resource_manager is guarded for the same reason model_engine is above:
+        # unit tests drive this method on partially-constructed executors
+        # (object.__new__) that set only the attributes under test. A real
+        # executor always has one -- __init__ assigns it unconditionally.
+        resource_manager = getattr(self, "resource_manager", None)
+        if resource_manager is not None:
+            resource_manager.maybe_fit_token_budget(scheduled_batch)
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
