@@ -112,7 +112,21 @@ static inline bool skipQuirks(BatchedGemmConfig const& config)
         && strstr(config.mFunctionName, "Bfloat16_MxE2m1MxE4m3") != nullptr
         && strstr(config.mFunctionName, "splitK") != nullptr;
 
-    return hang_c2x1_bM || hang_schedS_tmaOob_tileN64 || corrupt_splitk_fc2;
+    // FC1 flavor of the same MxE2m1MxE4m3 splitK family. The filter above
+    // catches only FC2 (bf16 output); the gated FC1 emits the fp8
+    // intermediate, so its output dtype is MxE4m3 and its kernel names start
+    // bmm_MxE4m3_MxE2m1MxE4m3_..._splitK2 - they escaped the FC2 filter.
+    // Instrumented Kimi K3 disagg GEN decode runs (M=2-4 microbatches)
+    // reproduced the identical single-rank whole-local-output corruption with
+    // these FC1 splitK2 cubins dispatched at the failing shapes, after all
+    // transfer/reuse/quant/routing suspects were eliminated by direct
+    // experiment. Same cross-CTA split-K reduction scheme, same skip
+    // rationale, same removal note as the FC2 family above.
+    bool const corrupt_splitk_fc1 = config.mFunctionName != nullptr
+        && strstr(config.mFunctionName, "MxE4m3_MxE2m1MxE4m3") != nullptr
+        && strstr(config.mFunctionName, "splitK") != nullptr;
+
+    return hang_c2x1_bM || hang_schedS_tmaOob_tileN64 || corrupt_splitk_fc2 || corrupt_splitk_fc1;
 }
 
 void setProblemDimensions(BatchedGemmData& gemmData, bool transposeMmaOutput, int32_t m, int32_t n, int32_t k,
