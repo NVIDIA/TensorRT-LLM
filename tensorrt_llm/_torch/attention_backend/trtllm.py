@@ -330,6 +330,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                      pin_memory=prefer_pinned())
         self.mla_cu_kv_seqlens_cpu = torch.empty_like(
             self.mla_cu_kv_seqlens, device='cpu', pin_memory=prefer_pinned())
+        # Token-wise cumulative Q seqlens over the CONTEXT sequences, for folding the
+        # Q RoPE into q_b_layernorm. `ctx_uncached_token_indptr` holds the same values
+        # but only exists when `enable_context_mla_with_cached_kv` is set (kv reuse /
+        # chunked context), so this path keeps its own copy and works either way.
+        # Note these count TOKENS, unlike `mla_cu_q_seqlens` which counts Q rows.
+        self.mla_ctx_cu_q_seqlens = self.get_empty(
+            buffers,
+            (self.max_num_sequences + 1, ),
+            cache_name="mla_ctx_cu_q_seqlens",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
+        self.mla_ctx_cu_q_seqlens_cpu = torch.empty_like(
+            self.mla_ctx_cu_q_seqlens, device='cpu', pin_memory=prefer_pinned())
+        self.mla_ctx_cu_seqlens_valid = False
         # Filled lazily by `mla_prepare_scheduler_buffers`, which needs num_heads
         # from the attention layer.
         self.mla_scheduler_buffers_valid = False
@@ -580,10 +595,30 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return (self.mla_cu_q_seqlens[:n_gen + 1],
                 self.mla_cu_kv_seqlens[:n_gen + 1])
 
+    def mla_prepare_ctx_cu_seqlens(self) -> Optional[torch.Tensor]:
+        """Token-wise cumulative Q seqlens over the context sequences.
+
+        Layer-invariant, so it is built once per iteration into a fixed-address
+        buffer, on the host from tensors already present (no device readback).
+        Returns None when the batch has no context sequences.
+        """
+        num_ctx = self.num_contexts
+        if num_ctx <= 0:
+            return None
+        if not self.mla_ctx_cu_seqlens_valid:
+            self.mla_ctx_cu_q_seqlens_cpu[0] = 0
+            self.mla_ctx_cu_q_seqlens_cpu[1:num_ctx + 1] = torch.cumsum(
+                self.seq_lens[:num_ctx].to(torch.int64), 0).to(torch.int)
+            self.mla_ctx_cu_q_seqlens[:num_ctx + 1].copy_(
+                self.mla_ctx_cu_q_seqlens_cpu[:num_ctx + 1], non_blocking=True)
+            self.mla_ctx_cu_seqlens_valid = True
+        return self.mla_ctx_cu_q_seqlens[:num_ctx + 1]
+
     def prepare(self) -> None:
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self.mla_scheduler_buffers_valid = False
+        self.mla_ctx_cu_seqlens_valid = False
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:

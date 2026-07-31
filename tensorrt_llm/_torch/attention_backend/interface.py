@@ -965,6 +965,9 @@ class AttentionForwardArgs:
     # `concat([compressed_kv, k_pe])` that only re-materializes the same bytes.
     kv_norm_weight: Optional[torch.Tensor] = None
     kv_norm_eps: float = 1e-6
+    # q_b_layernorm already applied the Q RoPE; the context RoPE kernel must skip
+    # its Q region rather than rotate the stale bf16 q_pe over the FP8 rope slots.
+    q_rope_done: bool = False
 
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0

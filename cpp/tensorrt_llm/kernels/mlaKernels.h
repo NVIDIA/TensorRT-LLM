@@ -137,6 +137,11 @@ struct MlaParams
     // skipped. Nope segment must be pre-filled (see deepseek_v4_q_norm_fused_fp8).
     bool fuse_q_fp8_in_rope = false;
 
+    // q_b_layernorm already applied the Q RoPE and wrote the rotated rope segment
+    // as FP8, so the context RoPE kernel must skip its Q region entirely -- the
+    // bf16 `q_pe` it would rotate is stale on that path.
+    bool q_rope_done = false;
+
     // Fused kv_a_layernorm in the absorption-mode context RoPE kernel. When set,
     // `latent_cache` holds the RAW (un-normalized) kv_a_proj output and the kernel
     // applies RMSNorm over kv_lora_rank + qk_rope_head_dim with `kv_norm_weight`

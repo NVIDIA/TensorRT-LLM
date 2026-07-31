@@ -384,7 +384,7 @@ public:
         std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
         std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt,
         bool enable_dsv4_epilogue_fusion = false, std::optional<torch::Tensor> kv_norm_weight = std::nullopt,
-        double kv_norm_eps = 1e-6) const
+        double kv_norm_eps = 1e-6, bool q_rope_done = false) const
         = 0;
 };
 
@@ -455,7 +455,7 @@ public:
         std::optional<int64_t> compressed_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
         std::optional<torch::Tensor> relative_attention_bias, std::optional<torch::Tensor> quant_scale_qkv,
         std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-        std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps) const override
+        std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, bool q_rope_done) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -547,6 +547,10 @@ public:
                     mla_params.kv_norm_eps = static_cast<float>(kv_norm_eps);
                     mla_params.fuse_kv_norm_in_rope = true;
                 }
+                // q_b_layernorm already applied the Q RoPE and wrote the rotated
+                // rope segment as FP8, so the kernel must not rotate the stale bf16
+                // q_pe over it.
+                mla_params.q_rope_done = q_rope_done;
             }
             else if (is_context)
             {
@@ -1141,7 +1145,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps)
+    bool const force_prepare_spec_dec_tree_mask, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
+    bool const q_rope_done)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1427,7 +1432,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, compressed_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias,
-            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, kv_norm_weight, kv_norm_eps);
+            quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, kv_norm_weight, kv_norm_eps,
+            q_rope_done);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1453,7 +1459,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             quant_scale_qkv, dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion,
             // the attention op's kv-norm fusion is context-only; generation gets it from
             // the standalone mla_rope_generation op instead.
-            /*kv_norm_weight=*/std::nullopt, kv_norm_eps);
+            /*kv_norm_weight=*/std::nullopt, kv_norm_eps, /*q_rope_done=*/false);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

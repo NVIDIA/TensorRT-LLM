@@ -119,7 +119,7 @@ void deepseekV4QNormFusedFp8(torch::Tensor q, torch::Tensor quantQOut, torch::Te
     // only the generation path can supply.
     void const* cosSinPtr = nullptr;
     int const* cacheSeqLensPtr = nullptr;
-    int64_t const* cuQSeqLensPtr = nullptr;
+    int const* cuQSeqLensPtr = nullptr;
     int numSeqs = 0;
     if (rotaryCosSin.has_value() && cacheSeqLens.has_value())
     {
@@ -131,9 +131,9 @@ void deepseekV4QNormFusedFp8(torch::Tensor q, torch::Tensor quantQOut, torch::Te
         if (cuQSeqLens.has_value())
         {
             // Ragged context form: positions come from cu_q_seqlens (in tokens).
-            TORCH_CHECK(cuQSeqLens->scalar_type() == torch::kInt64, "cu_q_seqlens must be int64");
+            TORCH_CHECK(cuQSeqLens->scalar_type() == torch::kInt32, "cu_q_seqlens must be int32");
             TORCH_CHECK(cuQSeqLens->numel() >= 2, "cu_q_seqlens must hold num_seqs + 1 entries");
-            cuQSeqLensPtr = cuQSeqLens->data_ptr<int64_t>();
+            cuQSeqLensPtr = cuQSeqLens->data_ptr<int>();
             numSeqs = static_cast<int>(cuQSeqLens->numel()) - 1;
             TORCH_CHECK(cacheSeqLens->numel() >= numSeqs, "cache_seq_lens shorter than cu_q_seqlens implies");
         }

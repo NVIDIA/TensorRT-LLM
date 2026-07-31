@@ -164,7 +164,7 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
     T* __restrict__ q_pe_out, float const* __restrict__ quant_scale_qkv_ptr, int totalRows,
     int quantQNopeRowStrideBytes, float eps, float2 const* __restrict__ cos_sin_cache = nullptr,
     int const* __restrict__ cache_seq_lens = nullptr, int num_heads = 0, int seq_len = 0,
-    int64_t const* __restrict__ cu_q_seqlens = nullptr, int num_seqs = 0)
+    int const* __restrict__ cu_q_seqlens = nullptr, int num_seqs = 0)
 {
     static_assert(kHeadDim % (2 * kWarpSize) == 0);
     static_assert(kNopeDim > 0 && kNopeDim < kHeadDim);
@@ -250,8 +250,8 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
                         hi = mid - 1;
                     }
                 }
-                int const seqBegin = static_cast<int>(cu_q_seqlens[lo]);
-                int const currentSeqLen = static_cast<int>(cu_q_seqlens[lo + 1]) - seqBegin;
+                int const seqBegin = cu_q_seqlens[lo];
+                int const currentSeqLen = cu_q_seqlens[lo + 1] - seqBegin;
                 positionId = (token - seqBegin) + (cache_seq_lens[lo] - currentSeqLen);
             }
             else
@@ -281,7 +281,7 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
 template <typename T>
 void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q_pe_out,
     void const* quant_scale_qkv_ptr, int totalRows, int headDim, int nopeDim, int quantQNopeRowStrideBytes, float eps,
-    void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len, int64_t const* cu_q_seqlens,
+    void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len, int const* cu_q_seqlens,
     int num_seqs, cudaStream_t stream)
 {
     assert(headDim == 512);
@@ -336,7 +336,7 @@ void invokeDeepseekV4QNorm(
 void invokeDeepseekV4QNormFusedFp8(void const* input, void* quant_q_nope, void* q_pe_out,
     void const* quant_scale_qkv_ptr, int totalRows, int headDim, int nopeDim, int quantQNopeRowStrideBytes,
     bool isBfloat16, float eps, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len,
-    int64_t const* cu_q_seqlens, int num_seqs, cudaStream_t stream)
+    int const* cu_q_seqlens, int num_seqs, cudaStream_t stream)
 {
     if (totalRows == 0)
     {

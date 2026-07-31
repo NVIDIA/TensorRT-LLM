@@ -1102,23 +1102,23 @@ class MLA(nn.Module):
             seq_len = num_gen_tokens // num_generations
             cache_lens = cache_lens[num_contexts:]
         else:
-            # NOT YET SAFE TO ENABLE. In kFuseRope mode the kernel writes the rotated
-            # rope segment as FP8 and leaves bf16 `q_pe` stale. The context RoPE
-            # kernel's Q region would then rotate that stale q_pe and overwrite the
-            # correct FP8 rope slots. Enabling this needs the matching skip in
-            # `applyMLARopeAndAssignQKVKernelOptContext` (MlaParams::q_rope_done),
-            # which is not plumbed yet -- so keep context on the existing path.
-            if os.environ.get("TRTLLM_ENABLE_FUSED_Q_ROPE_CTX", "0") != "1":
-                return None, None, 0, None
+            # The matching skip lives in `applyMLARopeAndAssignQKVKernelOptContext`
+            # via MlaParams::q_rope_done: without it that kernel's Q region would
+            # rotate the stale bf16 q_pe over the FP8 rope slots written here.
             # Context is ragged, so positions come from a token-wise cumsum rather
-            # than a uniform seq_len. `ctx_uncached_token_indptr` is exactly
-            # cumsum(seq_lens[:num_contexts]) and is already maintained per
-            # iteration; the kernel pairs it with the cache lengths to recover each
-            # row's cached offset, which is what makes chunked prefill work.
-            cu_q_seqlens = getattr(attn_metadata, "ctx_uncached_token_indptr", None)
+            # than a uniform seq_len. Deliberately NOT `ctx_uncached_token_indptr`,
+            # which holds the same values but only exists when
+            # `enable_context_mla_with_cached_kv` is set -- without chunked prefill
+            # or block reuse it is absent, and this path then silently no-ops. The
+            # metadata builds its own copy once per iteration instead. The kernel
+            # pairs it with the cache lengths to recover each row's cached offset,
+            # which is what keeps chunked prefill correct.
+            prep_ctx = getattr(attn_metadata, "mla_prepare_ctx_cu_seqlens", None)
+            if prep_ctx is None:
+                return None, None, 0, None
+            cu_q_seqlens = prep_ctx()
             if cu_q_seqlens is None:
                 return None, None, 0, None
-            cu_q_seqlens = cu_q_seqlens[: num_contexts + 1]
             cache_lens = cache_lens[:num_contexts]
 
         # The table must already cover every position these rows will read.
@@ -3227,6 +3227,10 @@ class MLA(nn.Module):
             q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
             quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
             quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
+            # q_b_layernorm already rotated the rope segment into quant_q_buffer, so
+            # the context RoPE kernel must skip its Q region -- the bf16 q_pe it
+            # would otherwise rotate was left stale by that kernel.
+            q_rope_done=getattr(self, "_fused_q_rope_done", False),
             topk_indices=topk_indices,  # used by DSA attention
             dsv4_inv_rope_cos_sin_cache=dsv4_cos_sin_cache,
             enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,

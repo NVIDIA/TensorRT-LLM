@@ -207,7 +207,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
     __nv_fp8_e4m3* quant_q_buf = nullptr, float const* quant_scale_qkv = nullptr, float* bmm1_scale_out = nullptr,
     float* bmm2_scale_out = nullptr, float const* dequant_scale_q = nullptr, float const* dequant_scale_kv = nullptr,
     float const* quant_scale_o = nullptr, float host_bmm1_scale = 1.0f, T const* kv_norm_weight = nullptr,
-    float kv_norm_eps = 1e-6f, int latent_row_stride = 0)
+    float kv_norm_eps = 1e-6f, int latent_row_stride = 0, bool q_rope_done = false)
 {
     // bmm scales — single thread emits them when we skip quantizeCopyInputToFp8Kernel.
     if constexpr (kOutputFp8Q)
@@ -257,6 +257,14 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
 
     if (head_idx < head_num)
     {
+        // `deepseekV4QNormFusedKernel` already rotated the rope segment and wrote it
+        // FP8 into `quant_q_buf`. The bf16 `q_pe` this region would rotate was left
+        // stale by that kernel, so rotating it here would overwrite good data. The
+        // bmm-scale prologue above still runs -- it is outside this branch.
+        if (q_rope_done)
+        {
+            return;
+        }
         size_t const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
         size_t const head_dim_idx = head_dim_vec_idx * ELTS_PER_VEC;
 
@@ -1451,7 +1459,7 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
                     params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
                     params.absorption_mode, quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
                     params.dequant_scale_q, params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale,
-                    kv_norm_w, params.kv_norm_eps, params.latent_row_stride);
+                    kv_norm_w, params.kv_norm_eps, params.latent_row_stride, params.q_rope_done);
         }
         else if (useFusedKvNorm)
         {
@@ -1461,7 +1469,7 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
                     head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens,
                     params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
                     params.absorption_mode, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1.0f,
-                    kv_norm_w, params.kv_norm_eps, params.latent_row_stride);
+                    kv_norm_w, params.kv_norm_eps, params.latent_row_stride, params.q_rope_done);
         }
         else if (useFusedFp8Q)
         {
