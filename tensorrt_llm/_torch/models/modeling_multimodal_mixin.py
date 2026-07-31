@@ -316,19 +316,27 @@ class EncoderCachePartition:
     `hits` maps item index to its cached embedding row-block; `miss_indices` lists item
     indices that still require encoder work; `keys` is aligned to item order so miss
     embeddings can be written back after they are computed.
+
+    `keys` always spans every item in the request -- `assemble_full_embedding` needs the
+    total item count, and misses are written back by item index. `hits` and `miss_indices`
+    instead cover only `looked_up`, the indices the caller asked about. The item scheduler
+    passes the subset it picked for this iteration, so items it has no budget for yet are
+    not touched: an LRU `get` refreshes recency, and probing an item the caller cannot
+    encode would reorder eviction against items that are actually in flight.
     """
 
     hits: Dict[int, torch.Tensor]
     miss_indices: list[int]
     keys: list[Hashable]
+    looked_up: list[int]
 
     @property
     def is_full_hit(self) -> bool:
-        return bool(self.keys) and not self.miss_indices
+        return bool(self.looked_up) and not self.miss_indices
 
     @property
     def is_full_miss(self) -> bool:
-        return bool(self.keys) and not self.hits
+        return bool(self.looked_up) and not self.hits
 
 
 class MultimodalModelMixin:
@@ -396,66 +404,6 @@ class MultimodalModelMixin:
         """
         raise NotImplementedError
 
-    @staticmethod
-    def _build_multimodal_encoder_input(
-        multimodal_param: MultimodalParams,
-        item_idx: int,
-    ) -> MultimodalParams:
-        """Build encoder inputs for one canonical original MM item."""
-        multimodal_data = multimodal_param.multimodal_data or {}
-        item_metadata = get_multimodal_encoder_item_metadata(multimodal_data)
-        if item_metadata is None:
-            raise ValueError(f"Missing multimodal item reference for index {item_idx}")
-        item_refs = item_metadata.item_refs
-        if item_idx >= len(item_refs):
-            raise ValueError(f"Missing multimodal item reference for index {item_idx}")
-        modality, local_idx = item_refs[item_idx]
-        modality_data = multimodal_data.get(modality)
-        if not isinstance(modality_data, dict):
-            raise ValueError(
-                f"Missing or malformed {modality} encoder data for item "
-                f"{item_idx}: expected a dict, got {type(modality_data).__name__}"
-            )
-
-        selected_data: Dict[str, Any] = {}
-        grid_key = (
-            "image_grid_thw"
-            if modality == "image"
-            else "video_grid_thw"
-            if modality == "video"
-            else None
-        )
-        pixel_key = (
-            "pixel_values"
-            if modality == "image"
-            else "pixel_values_videos"
-            if modality == "video"
-            else None
-        )
-        if (
-            grid_key is not None
-            and pixel_key is not None
-            and grid_key in modality_data
-            and pixel_key in modality_data
-        ):
-            grids = modality_data[grid_key]
-            if local_idx >= len(grids):
-                raise ValueError(f"Invalid {modality} item index {local_idx}")
-            patch_counts = torch.prod(grids, dim=1).tolist()
-            patch_start = sum(int(count) for count in patch_counts[:local_idx])
-            patch_end = patch_start + int(patch_counts[local_idx])
-            selected_data[pixel_key] = modality_data[pixel_key][patch_start:patch_end]
-            selected_data[grid_key] = grids[local_idx : local_idx + 1]
-        elif modality == "image" and "image_sizes" in modality_data:
-            image_sizes = modality_data["image_sizes"]
-            pixel_values = modality_data["pixel_values"]
-            selected_data["image_sizes"] = image_sizes[local_idx : local_idx + 1]
-            selected_data["pixel_values"] = pixel_values[local_idx : local_idx + 1]
-        else:
-            raise TypeError(f"Unsupported multimodal item layout for {modality}")
-
-        return MultimodalParams(multimodal_data={modality: selected_data})
-
     def prepare_multimodal_encoder_inputs(
         self,
         selected_items: Sequence[tuple[MultimodalParams, int]],
@@ -478,14 +426,22 @@ class MultimodalModelMixin:
                 raise ValueError("MM item metadata is required for item encoding")
             item_refs = item_metadata.item_refs
             embedding_lengths = item_metadata.output_embedding_lengths
-            modality = item_refs[item_idx][0]
-            encoder_inputs.append(
-                (
-                    self._build_multimodal_encoder_input(multimodal_param, item_idx),
-                    embedding_lengths[item_idx],
-                    modality,
-                )
+            modality, local_idx = item_refs[item_idx]
+            # `build_multimodal_encoder_input` slices the raw modality tensors and
+            # `_apply_metadata_slice` re-slices the parallel per-item metadata
+            # (`multimodal_embedding_lengths`, `multimodal_hashes`) to match. Both
+            # are needed: `encode_multimodal_by_groups` splits the encoder output
+            # using those lengths, so a slice without them yields zero rows.
+            #
+            # The two take different index spaces. The slicer indexes the
+            # modality's own payload, so it gets `local_idx` plus the modality
+            # (which also lets it slice out of an interleaved request); the
+            # metadata is prompt-ordered across modalities, so it gets `item_idx`.
+            residual = self.build_multimodal_encoder_input(
+                multimodal_param, [local_idx], modality=modality
             )
+            self._apply_metadata_slice(residual, multimodal_param, [item_idx])
+            encoder_inputs.append((residual, embedding_lengths[item_idx], modality))
         return encoder_inputs
 
     def forward_multimodal_encoder_items(
@@ -739,9 +695,18 @@ class MultimodalModelMixin:
         self,
         param: MultimodalParams,
         item_indices: Sequence[int],
+        modality: Optional[str] = None,
     ) -> MultimodalParams:
         """Return a `MultimodalParams` whose raw modality inputs contain only
         `item_indices` from `param`, in that order.
+
+        `item_indices` are indices into `modality`'s own payload. When `modality`
+        is None it is inferred from `param`, which requires the request to hold a
+        single modality -- the full-request path's case, where an item's global
+        index and its index within its modality coincide. Callers that already
+        know an item's modality (item scheduling reads it from `item_refs`) pass
+        it explicitly along with the modality-local indices, which is what lets
+        a single item be sliced out of an interleaved image+video request.
 
         Default handles three common single-modality layouts:
 
@@ -765,11 +730,13 @@ class MultimodalModelMixin:
         re-sliced by the mixin after this returns, so overrides need only handle the
         modality-specific raw data.
         """
-        modality = self._encoder_cache_modality(param)
+        if modality is None:
+            modality = self._encoder_cache_modality(param)
         if modality is None:
             raise NotImplementedError(
-                "Default `build_multimodal_encoder_input` only supports single-modality "
-                "params. Override for other layouts."
+                "Default `build_multimodal_encoder_input` cannot infer the modality of a "
+                "mixed-modality param. Pass `modality` with modality-local indices, or "
+                "override for other layouts."
             )
         modality_data = param.multimodal_data[modality]
         if not isinstance(modality_data, dict):
@@ -847,8 +814,19 @@ class MultimodalModelMixin:
         residual_input = (
             copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
         )
+        # Carry the source's other entries through, but keep only the sliced
+        # modality's raw payload: leaving a sibling modality's unsliced tensors
+        # on the residual would make it look mixed-modality to the encoder
+        # (`_lengths_by_modality` rejects that without an `mm_item_order`
+        # manifest) while its rows were never requested.
+        residual_data = {
+            key: value
+            for key, value in param.multimodal_data.items()
+            if key not in _MM_DATA_INPUT_MODALITY_KEYS or key == modality
+        }
+        residual_data[modality] = sliced
         return MultimodalParams(
-            multimodal_data={**param.multimodal_data, modality: sliced},
+            multimodal_data=residual_data,
             multimodal_input=residual_input,
         )
 
@@ -1087,13 +1065,15 @@ class MultimodalModelMixin:
         cls,
         param: MultimodalParams,
     ) -> Optional[list[Hashable]]:
-        """Build per-item encoder cache keys for single-modality params.
+        """Build per-item encoder cache keys for `param`.
 
         The returned keys split one request's concatenated encoder output by
-        `multimodal_embedding_lengths`, using the same modality for every item.
+        `multimodal_embedding_lengths`.
 
-        Mixed-modality params are not cacheable until runtime metadata carries a
-        modality per item alongside `multimodal_hashes` and embedding lengths.
+        When the request carries atomic-item metadata, each key takes its modality from
+        that item's `item_refs` entry, so mixed-modality requests are keyable per item.
+        Without that metadata the whole param must resolve to one modality, since there
+        is nothing else that says which item is which.
         """
         mm_input = param.multimodal_input
         mm_data = param.multimodal_data or {}
@@ -1102,6 +1082,15 @@ class MultimodalModelMixin:
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping params without multimodal hashes."
             )
             return None
+
+        item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+        if item_metadata is not None:
+            return cls.build_encoder_cache_item_keys(
+                mm_input.multimodal_hashes,
+                item_metadata.item_refs,
+                item_metadata.output_embedding_lengths,
+                mm_data.get("mm_processor_kwargs_hash"),
+            )
 
         modality = cls._encoder_cache_modality(param)
         embedding_lengths = mm_data.get("multimodal_embedding_lengths")
@@ -1187,12 +1176,24 @@ class MultimodalModelMixin:
         cls,
         param: MultimodalParams,
         encoder_cache: TensorLRUCache,
+        item_indices: Optional[Sequence[int]] = None,
+        keys: Optional[Sequence[Hashable]] = None,
     ) -> Optional[EncoderCachePartition]:
-        """Look up every item of `param` and return the per-item partition.
+        """Look up `param`'s items in the cache and return the per-item partition.
 
-        Returns `None` when the param is not cacheable (mixed modality, missing metadata,
-        request-local embedding already attached); the caller should treat that as a
-        full miss.
+        Args:
+            item_indices: restrict the lookup to these items. `None` looks up every item,
+                which is what the full-request path wants. The item scheduler passes the
+                subset it selected for this iteration so unscheduled items keep their LRU
+                recency -- see `EncoderCachePartition`.
+            keys: precomputed per-item keys. `None` derives them from `param`, which needs
+                `multimodal_input` to carry the content hashes. The executor builds params
+                from `LlmRequest.py_multimodal_data` alone -- the hashes live on the
+                request, not the params -- so it derives keys there and passes them in.
+
+        Returns `None` when the param is not keyable (missing item metadata, content
+        hashes or processor-kwargs hash, or a request-local embedding is already
+        attached); the caller should treat that as a full miss.
         """
         if param.multimodal_data.get("multimodal_embedding") is not None:
             logger.debug(
@@ -1201,14 +1202,19 @@ class MultimodalModelMixin:
             )
             return None
 
-        keys = cls._encoder_cache_keys(param)
+        keys = list(keys) if keys is not None else cls._encoder_cache_keys(param)
         if not keys:
             return None
 
+        looked_up = list(range(len(keys))) if item_indices is None else list(item_indices)
+        out_of_range = [i for i in looked_up if not 0 <= i < len(keys)]
+        if out_of_range:
+            raise IndexError(f"item_indices {out_of_range} out of range for {len(keys)} cache keys")
+
         hits: Dict[int, torch.Tensor] = {}
         miss_indices: list[int] = []
-        for i, key in enumerate(keys):
-            cached = encoder_cache.get(key)
+        for i in looked_up:
+            cached = encoder_cache.get(keys[i])
             if cached is None:
                 miss_indices.append(i)
             else:
@@ -1216,9 +1222,12 @@ class MultimodalModelMixin:
 
         logger.debug(
             f"{_MM_ENCODER_CACHE_LOG_NAME}: partition hit_items={len(hits)}, "
-            f"miss_items={len(miss_indices)}, total_items={len(keys)}."
+            f"miss_items={len(miss_indices)}, looked_up={len(looked_up)}, "
+            f"total_items={len(keys)}."
         )
-        return EncoderCachePartition(hits=hits, miss_indices=miss_indices, keys=keys)
+        return EncoderCachePartition(
+            hits=hits, miss_indices=miss_indices, keys=keys, looked_up=looked_up
+        )
 
     @staticmethod
     def assemble_full_embedding(
