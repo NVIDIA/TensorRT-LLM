@@ -584,10 +584,6 @@ SharedPtr<Block> removeSubtree(Block& root)
 
     // Post-order traversal using prev/next links — O(1) extra space.
     // Descend to leaves first, remove on the way back up.
-    // Each block's pages are reclaimed eagerly via releasePages() while the
-    // StorageManager is still alive, rather than deferring to ~Block(): an external
-    // reference can keep a Block alive past StorageManager teardown, after which
-    // page->manager would be dangling. Mirrors Python's remove_subtree().
     while (true)
     {
         // Descend: if the current block has children, go to the first child.
@@ -597,10 +593,7 @@ SharedPtr<Block> removeSubtree(Block& root)
         }
         else
         {
-            current->releasePages();
-            // Remove this block from its parent's next map.
-            // Null prev to detach — the block may outlive the tree if held
-            // externally (e.g., by nanobind/Python shared_ptr).
+            // Remove this block from its parent.s next map and null prev to detach it.
             NodeBase* parent = current->prev;
             BlockKey const currentKey = current->key;
             auto detached = parent->detachNext(currentKey);
