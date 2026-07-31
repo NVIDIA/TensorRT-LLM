@@ -66,7 +66,7 @@ def main() -> None:
     params.image = args.image
 
     output = visual_gen.generate(inputs=args.prompt, params=params)
-    if output.image is not None and output.image.dim() == 4:
+    if output.image is not None and output.image.shape[0] > 1:
         output_path = Path(args.output_path)
         paths = [
             output_path.with_name(f"{output_path.stem}_layer_{i}{output_path.suffix}")

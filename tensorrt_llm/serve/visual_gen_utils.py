@@ -15,6 +15,11 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
+IMAGE_EDIT_MAX_IMAGES = 16
+IMAGE_EDIT_MAX_IMAGE_BYTES = 50 * 1024 * 1024
+IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES = 256 * 1024 * 1024
+IMAGE_EDIT_MAX_OUTPUT_IMAGES = 64
+
 # Per-field warnings for OpenAI-shaped knobs that the engine has no
 # semantic for. Each entry maps the request attribute to the message
 # logged when the client sends a non-None value.
@@ -120,33 +125,116 @@ def _decode_base64_media(value: str) -> Optional[bytes]:
         return None
 
 
+def _write_bytes_with_limit(value: bytes, path: str) -> int:
+    size = len(value)
+    if size > IMAGE_EDIT_MAX_IMAGE_BYTES:
+        raise ValueError(
+            "Image edit input exceeds the per-image byte limit "
+            f"({size} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
+        )
+    with open(path, "wb") as f:
+        f.write(value)
+    return size
+
+
+def _copy_upload_with_limit(value: Any, path: str) -> int:
+    total = 0
+    if hasattr(value.file, "seek"):
+        value.file.seek(0)
+    with open(path, "wb") as f:
+        while True:
+            chunk = value.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > IMAGE_EDIT_MAX_IMAGE_BYTES:
+                raise ValueError(
+                    "Image edit input exceeds the per-image byte limit "
+                    f"({total} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
+                )
+            f.write(chunk)
+    return total
+
+
 def _materialize_conditioning_input(
     value: Any,
     path: str,
-) -> str:
-    """Return a file path for upload/base64 inputs or pass paths/URLs through."""
-    if isinstance(value, str):
-        parsed = urlparse(value)
-        if os.path.exists(value) or parsed.scheme in ("http", "https", "file"):
-            return value
-        decoded = _decode_base64_media(value)
-        if decoded is None:
-            return value
-        with open(path, "wb") as f:
-            f.write(decoded)
-        return path
+) -> tuple[str, int]:
+    """Return a server-owned file path for upload or base64 inputs."""
+    try:
+        if isinstance(value, str):
+            decoded = _decode_base64_media(value)
+            if decoded is None:
+                parsed = urlparse(value)
+                if parsed.scheme in ("file", "http", "https"):
+                    raise ValueError(
+                        "Image edit inputs must be uploaded files or base64-encoded images; "
+                        "local paths and URLs are not supported."
+                    )
+                raise ValueError("String image edit inputs must be base64-encoded image data.")
+            return path, _write_bytes_with_limit(decoded, path)
 
-    if isinstance(value, bytes):
-        with open(path, "wb") as f:
-            f.write(value)
-        return path
+        if isinstance(value, bytes):
+            return path, _write_bytes_with_limit(value, path)
 
-    if hasattr(value, "file"):
-        with open(path, "wb") as f:
-            shutil.copyfileobj(value.file, f)
-        return path
+        if hasattr(value, "file"):
+            return path, _copy_upload_with_limit(value, path)
+    except Exception:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        raise
 
     raise ValueError(f"Unsupported conditioning input type: {type(value)}")
+
+
+def _resolve_image_edit_layer_multiplier(
+    request: ImageEditRequest,
+    generator: VisualGen,
+) -> int:
+    extra = request.extra_params or {}
+    save_layers_to_grid = extra.get("save_layers_to_grid", False)
+    if save_layers_to_grid is True:
+        return 1
+    if save_layers_to_grid not in (False, None):
+        raise ValueError(
+            "extra_params.save_layers_to_grid must be a bool when estimating image edit output count."
+        )
+
+    layer_spec = generator.extra_param_specs.get("layers")
+    if layer_spec is None:
+        return 1
+
+    layers = extra.get("layers", getattr(layer_spec, "default", 1))
+    if layers is None:
+        return 1
+    if isinstance(layers, bool) or not isinstance(layers, int):
+        raise ValueError(
+            "extra_params.layers must be an int when estimating image edit output count."
+        )
+    return layers
+
+
+def _validate_image_edit_request_limits(
+    request: ImageEditRequest,
+    generator: VisualGen,
+) -> int:
+    image_count = len(request.image) if isinstance(request.image, list) else 1
+    if image_count > IMAGE_EDIT_MAX_IMAGES:
+        raise ValueError(
+            f"Image edit accepts at most {IMAGE_EDIT_MAX_IMAGES} input images, got {image_count}."
+        )
+
+    output_count = (
+        image_count * (request.n or 1) * _resolve_image_edit_layer_multiplier(request, generator)
+    )
+    if output_count > IMAGE_EDIT_MAX_OUTPUT_IMAGES:
+        raise ValueError(
+            "Image edit request can produce at most "
+            f"{IMAGE_EDIT_MAX_OUTPUT_IMAGES} output images, got {output_count}."
+        )
+    return image_count
 
 
 def _materialize_conditioning_inputs(
@@ -157,14 +245,38 @@ def _materialize_conditioning_inputs(
     media_storage_path: str,
 ) -> str | List[str]:
     values = value if isinstance(value, list) else [value]
-    paths = [
-        _materialize_conditioning_input(
-            item,
-            os.path.join(media_storage_path, f"{id}_{field_name}_{i}.png"),
-        )
-        for i, item in enumerate(values)
-    ]
+    paths = []
+    total_bytes = 0
+    try:
+        for i, item in enumerate(values):
+            path, size = _materialize_conditioning_input(
+                item,
+                os.path.join(media_storage_path, f"{id}_{field_name}_{i}.png"),
+            )
+            paths.append(path)
+            total_bytes += size
+            if total_bytes > IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES:
+                raise ValueError(
+                    "Image edit inputs exceed the total byte limit "
+                    f"({total_bytes} > {IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES})."
+                )
+    except Exception:
+        cleanup_materialized_conditioning_inputs(paths)
+        raise
     return paths if isinstance(value, list) else paths[0]
+
+
+def cleanup_materialized_conditioning_inputs(value: Any) -> None:
+    paths = value if isinstance(value, list) else [value]
+    for path in paths:
+        if not isinstance(path, str):
+            continue
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Failed to remove temporary image edit input %r: %s", path, exc)
 
 
 def parse_visual_gen_params(
@@ -212,8 +324,13 @@ def parse_visual_gen_params(
             params.num_images_per_prompt = request.n
 
     elif isinstance(request, ImageEditRequest):
+        if request.mask is not None:
+            raise ValueError("Image edit mask input is not supported yet.")
+        if request.n is not None:
+            params.num_images_per_prompt = request.n
         if media_storage_path is None:
             raise ValueError("media_storage_path is required when image edit inputs are provided")
+        _validate_image_edit_request_limits(request, generator)
         params.image = _materialize_conditioning_inputs(
             request.image,
             id=id,
