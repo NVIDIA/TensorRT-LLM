@@ -156,7 +156,6 @@ class DenseGEMMFusedMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type=None,
     ):
         # DenseGEMM CuTe DSL kernels only support SM100 and SM103.
@@ -200,9 +199,9 @@ class DenseGEMMFusedMoE(MoE):
         )
 
         # Call MoE base class directly (not CutlassFusedMoE).
-        # Note: `without_comm` and `apply_router_weight_on_input` are accepted
-        # for API compatibility with create_moe_backend() but are not passed to
-        # MoE.__init__() since DenseGEMM does not use alltoall communication.
+        # Note: `apply_router_weight_on_input` is accepted for API
+        # compatibility with create_moe_backend() but is not passed to
+        # MoE.__init__().
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
