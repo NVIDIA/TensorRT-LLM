@@ -11,8 +11,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from concurrent.futures import (FIRST_COMPLETED, Future, ThreadPoolExecutor,
-                                as_completed)
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
@@ -247,6 +246,21 @@ _BOOTSTRAP_POLL_INTERVAL = 1.0
 _IDENTITY_GATE_MARKER = "[mpi-identity-gate]"
 
 
+class _IdentityGateFailure(RuntimeError):
+    """Raised by the identity gate once it has already torn the pool down.
+
+    A distinct type, not bare ``RuntimeError``: both ``mpi4py.MPI.Exception``
+    and ``concurrent.futures.BrokenExecutor`` inherit from ``RuntimeError``,
+    and both can come out of the gate's own ``submit()``/``result()`` calls.
+    Catching the base class to re-raise would let those two escape *without*
+    the teardown, leaving ``self.mpi_pool`` dangling on an object whose
+    ``__init__`` never completed — so ``__del__`` would then run a blocking
+    ``shutdown()`` on a broken pool, and its abort watchdog would itself fail
+    on the ``self.comm`` that the raising ``__init__`` never got to assign.
+    Callers still see a ``RuntimeError``.
+    """
+
+
 def _identity_bootstrap_timeout() -> float:
     """Deadline for the ``wait_shutdown`` worker *bootstrap*, in seconds.
 
@@ -278,10 +292,6 @@ def _identity_bootstrap_timeout() -> float:
     return _DEFAULT_IDENTITY_TIMEOUT
 
 
-# Back-compat alias: the previous name for the (then single) gate deadline.
-_identity_barrier_timeout = _identity_bootstrap_timeout
-
-
 def identity_gate_budget() -> float:
     """Worst-case wall time of the whole ``wait_shutdown`` identity gate.
 
@@ -299,6 +309,15 @@ def _worker_hello():
     interpreter is up and the module defining it (hence ``tensorrt_llm``) is
     imported, so it measures bootstrap and nothing else. Its identity is also
     the only handle on a worker whose later barrier never completes.
+
+    Dropping the collective costs a guarantee that ``_worker_identity_barrier``
+    keeps: with no barrier to pin one task per worker, mpi4py is free to send
+    two probes to the same rank. (Its free-worker container is a LIFO stack,
+    so it demonstrably will, given the chance.) That is why the caller submits
+    ``n_workers`` probes and only requires that they *all* return before moving
+    on, rather than treating each returned identity as a distinct worker — the
+    identity barrier is still what establishes one-per-worker, and the
+    uniqueness check on its results is still what enforces it.
     """
     pid = os.getpid()
     return (pid, _process_start_time(pid))
@@ -424,11 +443,17 @@ class MpiPoolSession(MpiSession):
         hundreds of seconds — which leaves the guard unable to tell a slow
         bootstrap from a dead pool without burning that whole budget first. So
         this runs in two phases: a generous, liveness-aware *bootstrap* wait
-        that ends as soon as one worker has run any task, then the identity
-        barrier under a tight, fixed deadline that is now sized against what it
+        that ends once EVERY worker has run a task, then the identity barrier
+        under a tight, fixed deadline that is now sized against what it
         actually measures. Each phase names itself in its failure message, so
         "never bootstrapped" and "bootstrapped but the barrier stalled" stop
         being the same log line.
+
+        The bootstrap phase waits for all ``n_workers`` probes, not the first:
+        ranks do not finish ``import tensorrt_llm`` together, and returning on
+        the first one would leave the remaining ranks' bootstrap skew to be
+        absorbed by the barrier's tight budget — turning an absolute bound into
+        a skew bound that tears down perfectly healthy pools.
         """
         warm_futures: List[Future] = []
         bootstrap_timeout = _identity_bootstrap_timeout()
@@ -440,15 +465,15 @@ class MpiPoolSession(MpiSession):
             warm_done = self._wait_worker_bootstrap(warm_futures,
                                                     bootstrap_timeout)
             if not warm_done:
-                self._teardown_unidentified_pool(
-                    _completed_identities(warm_futures))
-                raise RuntimeError(
-                    f"{_IDENTITY_GATE_MARKER} phase=bootstrap: no worker of "
-                    f"{self.n_workers} ran a task within {bootstrap_timeout}s; "
-                    "pool torn down. The workers never finished spawning and "
-                    "importing tensorrt_llm — raise "
-                    "TRTLLM_MPI_IDENTITY_TIMEOUT only if bootstrap on this "
-                    "node is genuinely that slow")
+                warm_identities = _completed_identities(warm_futures)
+                self._teardown_unidentified_pool(warm_identities)
+                raise _IdentityGateFailure(
+                    f"{_IDENTITY_GATE_MARKER} phase=bootstrap: only "
+                    f"{len(warm_identities)}/{self.n_workers} workers ran a "
+                    f"task within {bootstrap_timeout}s; pool torn down. Those "
+                    "workers never finished spawning and importing "
+                    "tensorrt_llm — raise TRTLLM_MPI_IDENTITY_TIMEOUT only if "
+                    "bootstrap on this node is genuinely that slow")
             futures = [
                 self.mpi_pool.submit(_worker_identity_barrier)
                 for _ in range(self.n_workers)
@@ -456,26 +481,31 @@ class MpiPoolSession(MpiSession):
             done, not_done = futures_wait(futures,
                                           timeout=_IDENTITY_BARRIER_TIMEOUT)
             identities = tuple(f.result() for f in done)
-        except RuntimeError:
+        except _IdentityGateFailure:
+            # Already torn down above; anything else still needs the teardown.
             raise
         except Exception as e:
             self._teardown_unidentified_pool(
                 _completed_identities(warm_futures))
-            raise RuntimeError(
+            raise _IdentityGateFailure(
                 f"{_IDENTITY_GATE_MARKER} phase=bootstrap: worker identity "
                 f"collection failed ({e}); pool torn down") from e
         if (not_done or len(identities) != self.n_workers
                 or len({pid
                         for pid, _ in identities}) != self.n_workers
                 or any(start is None for _, start in identities)):
-            # The barrier stalled on a pool that had already proved it was
-            # warm, so this is a wedged worker, not a slow one. Reap with the
-            # identities the warm-up collected: they are the only handle on
-            # workers now parked in an unfinished collective, and without them
-            # the teardown below is a no-op that leaks them until job end.
+            # Every worker had already proved it was warm, so this is a wedged
+            # worker, not a slow one. Reap the union of both phases: the
+            # warm-up identities are the only handle on workers now parked in
+            # an unfinished collective, and on a partial barrier the two sets
+            # differ — taking either alone leaves someone unreaped, which is
+            # how the pre-existing teardown became a no-op that leaked workers
+            # until job end.
             self._teardown_unidentified_pool(
-                identities or _completed_identities(warm_futures))
-            raise RuntimeError(
+                tuple(
+                    dict.fromkeys(
+                        (*identities, *_completed_identities(warm_futures)))))
+            raise _IdentityGateFailure(
                 f"{_IDENTITY_GATE_MARKER} phase=barrier: worker identity "
                 f"collection incomplete ({len(identities)}/{self.n_workers} "
                 f"valid identities) within {_IDENTITY_BARRIER_TIMEOUT}s of a "
@@ -504,27 +534,36 @@ class MpiPoolSession(MpiSession):
 
     def _wait_worker_bootstrap(self, futures: List[Future],
                                timeout: float) -> bool:
-        """Wait for the first worker to run a task; True if one did.
+        """Wait for EVERY probe to come back; True if they all did.
+
+        All of them, not the first: ranks finish ``import tensorrt_llm``
+        seconds to tens of seconds apart, and any skew left over here is paid
+        by the barrier phase out of its tight fixed budget. Waiting for the
+        whole set is what keeps that budget a measure of the barrier rather
+        than of bootstrap skew.
 
         Polls instead of a single blocking wait so a pool that provably cannot
         make progress fails in ~a second rather than at the full deadline.
         """
+        if not futures:
+            return True
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return bool(futures_wait(futures, timeout=0).done)
+                return len(futures_wait(futures,
+                                        timeout=0).done) == len(futures)
             done, _ = futures_wait(futures,
                                    timeout=min(_BOOTSTRAP_POLL_INTERVAL,
-                                               remaining),
-                                   return_when=FIRST_COMPLETED)
-            if done:
+                                               remaining))
+            if len(done) == len(futures):
                 return True
             if not self._pool_can_make_progress():
                 # Re-check: a task may have landed between the wait and here,
                 # and a manager thread that exited after finishing its work is
                 # not a failure.
-                return bool(futures_wait(futures, timeout=0).done)
+                return len(futures_wait(futures,
+                                        timeout=0).done) == len(futures)
 
     def _teardown_unidentified_pool(self, partial_identities: Tuple) -> None:
         """Dispose of a pool whose identity collection failed.

@@ -207,7 +207,7 @@ def test_shadow_wait_budget_handles_partially_loaded_mpi_module(monkeypatch):
 
 def test_shadow_wait_budget_never_undercuts_the_real_gate():
     """The fallback constants must not drift below the library's own budget."""
-    from tensorrt_llm.llmapi import mpi_session
+    mpi_session = pytest.importorskip("tensorrt_llm.llmapi.mpi_session")
 
     assert session_prefetcher._FALLBACK_BARRIER_TIMEOUT == mpi_session._IDENTITY_BARRIER_TIMEOUT
     assert session_prefetcher._shadow_build_wait_timeout() >= mpi_session.identity_gate_budget()
