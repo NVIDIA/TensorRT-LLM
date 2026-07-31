@@ -541,6 +541,33 @@ static kv::ReuseScope castReuseScope(nb::object reuseScope)
         "reuse_scope must be None, ReuseScope, an int lora_task_id, or an object with lora_id and salt");
 }
 
+class EventManagerTestBlock
+{
+public:
+    EventManagerTestBlock(kv::SharedPtr<kv::Block> block_, std::vector<kv::SharedPtr<kv::CommittedPage>> pages_)
+        : block(std::move(block_))
+        , pages(std::move(pages_))
+    {
+    }
+
+    ~EventManagerTestBlock()
+    {
+        close();
+    }
+
+    void close()
+    {
+        for (auto const& page : pages)
+        {
+            block->unlinkPage(page->lifeCycle, page.get());
+        }
+        pages.clear();
+    }
+
+    kv::SharedPtr<kv::Block> block;
+    std::vector<kv::SharedPtr<kv::CommittedPage>> pages;
+};
+
 // Lazy Python iterator over a token sequence's blockchain keys. Each __next__ pulls
 // one key from the C++ generator (one SHA-256 hash), so a caller that stops early
 // (e.g. on the first cache-key mismatch) skips the remaining hashing. Yields
@@ -1607,6 +1634,88 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- Introspection -------------------------------------------------------
     auto mIntrospection = m.def_submodule("_introspection", "KV cache manager v2 introspection helpers");
+
+    nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
+    mIntrospection.def(
+        "make_test_block",
+        [](kv::KvCacheManager& manager, nb::object tokenObject, std::vector<int> coveragePerLc, nb::object parentObject,
+            nb::object reuseScopeObject)
+        {
+            auto [tokens, knownNoDigest] = castTokenIterable(tokenObject);
+            if (tokens.empty())
+            {
+                throw std::invalid_argument("make_test_block requires at least one token");
+            }
+            if (coveragePerLc.size() != static_cast<size_t>(manager.lifeCycles().size().value()))
+            {
+                throw std::invalid_argument("coverage_per_lc length must match the manager lifecycle count");
+            }
+            for (int coverage : coveragePerLc)
+            {
+                if (coverage < 0 || coverage > static_cast<int>(tokens.size()))
+                {
+                    throw std::invalid_argument("lifecycle coverage must be between zero and the block token count");
+                }
+            }
+
+            kv::NodeBase* parent = nullptr;
+            if (parentObject.is_none())
+            {
+                parent = &manager.radixTree().addOrGetExisting(castReuseScope(std::move(reuseScopeObject)));
+            }
+            else
+            {
+                parent = nb::cast<EventManagerTestBlock&>(parentObject).block.get();
+            }
+            auto block = kv::addOrGetExistingBlock(parent, std::move(tokens), knownNoDigest);
+
+            kv::TypedVec<kv::LifeCycleId, kv::SlotCount> counts(manager.lifeCycles().size(), 0);
+            for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
+            {
+                counts[lifeCycle] = coveragePerLc.at(lifeCycle.value()) > 0 ? 1 : 0;
+            }
+            auto slots = manager.storage().newGpuSlots(counts);
+            std::vector<kv::SharedPtr<kv::CommittedPage>> pages;
+            pages.reserve(coveragePerLc.size());
+            for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
+            {
+                int const coverage = coveragePerLc.at(lifeCycle.value());
+                if (coverage == 0)
+                {
+                    continue;
+                }
+                kv::SharedPtr<kv::CommittedPage> page;
+                if (coverage < static_cast<int>(block->tokens.size()))
+                {
+                    page = kv::makeShared<kv::SsmCommittedPage>(
+                        &manager.storage(), block, lifeCycle, kv::kGpuLevel, kv::kPriorityDefault, coverage);
+                }
+                else
+                {
+                    page = kv::makeShared<kv::CommittedPage>(
+                        &manager.storage(), block, lifeCycle, kv::kGpuLevel, kv::kPriorityDefault);
+                }
+                page->setSlot(slots[lifeCycle].front());
+                block->storage[lifeCycle] = page.get();
+                pages.push_back(std::move(page));
+            }
+            return std::make_unique<EventManagerTestBlock>(std::move(block), std::move(pages));
+        },
+        nb::arg("manager"), nb::arg("tokens"), nb::arg("coverage_per_lc"), nb::arg("parent").none() = nb::none(),
+        nb::arg("reuse_scope").none() = nb::none(), nb::keep_alive<0, 1>(), nb::keep_alive<0, 4>());
+    mIntrospection.def(
+        "test_block_key", [](EventManagerTestBlock const& block) { return digestBytes(block.block->key); },
+        nb::arg("block"));
+    mIntrospection.def(
+        "event_manager_add_stored_block",
+        [](kv::EventManager& eventManager, EventManagerTestBlock const& block)
+        { eventManager.addStoredBlock(*block.block); },
+        nb::arg("event_manager"), nb::arg("block"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "event_manager_add_stored_life_cycle",
+        [](kv::EventManager& eventManager, EventManagerTestBlock const& block, int lifeCycleId)
+        { eventManager.addStoredLifeCycle(*block.block, kv::LifeCycleId{lifeCycleId}); },
+        nb::arg("event_manager"), nb::arg("block"), nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>());
     nb::class_<kv::StorageStatistics>(mIntrospection, "StorageStatistics")
         .def_prop_ro("slot_sizes", [](kv::StorageStatistics const& self) { return self.slotSizes.raw(); })
         .def_ro("total", &kv::StorageStatistics::total)
