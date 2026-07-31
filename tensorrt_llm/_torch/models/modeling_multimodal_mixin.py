@@ -37,6 +37,7 @@ from typing import (
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import MultimodalEncoderRequestState
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
@@ -947,8 +948,10 @@ class MultimodalModelMixin:
                     cache_misses.append(param)
                     continue
                 if partition.is_full_hit:
-                    param.multimodal_data["multimodal_embedding"] = self.assemble_full_embedding(
-                        partition.hits, len(partition.keys)
+                    param.multimodal_data["multimodal_embedding"] = (
+                        MultimodalEncoderRequestState.assemble_full_embedding(
+                            partition.hits, len(partition.keys)
+                        )
                     )
                     continue
                 partial_hits.append((param, partition))
@@ -1230,36 +1233,6 @@ class MultimodalModelMixin:
         )
 
     @staticmethod
-    def assemble_full_embedding(
-        item_tensors: Dict[int, torch.Tensor],
-        total_items: int,
-    ) -> torch.Tensor:
-        """Copy per-item embedding tensors into a single contiguous buffer in
-        item-index order.
-
-        `item_tensors` must contain every index in `[0, total_items)`. Sizes the
-        buffer from the item row counts and `copy_`s each item into its row range:
-        one predictable allocation of the exact final size, with no `torch.cat`
-        temporary competing with the sources for peak memory.
-        """
-        if total_items == 1:
-            return item_tensors[0]
-        first = item_tensors[0]
-        total_rows = sum(item_tensors[i].shape[0] for i in range(total_items))
-        buffer = torch.empty(
-            (total_rows, *first.shape[1:]),
-            dtype=first.dtype,
-            device=first.device,
-        )
-        offset = 0
-        for i in range(total_items):
-            item = item_tensors[i]
-            rows = item.shape[0]
-            buffer[offset : offset + rows].copy_(item)
-            offset += rows
-        return buffer
-
-    @staticmethod
     def _apply_metadata_slice(
         residual: MultimodalParams,
         source: MultimodalParams,
@@ -1330,8 +1303,8 @@ class MultimodalModelMixin:
             by_item: Dict[int, torch.Tensor] = dict(partition.hits)
             for miss_idx, tensor in zip(partition.miss_indices, miss_tensors, strict=True):
                 by_item[miss_idx] = tensor
-            param.multimodal_data["multimodal_embedding"] = self.assemble_full_embedding(
-                by_item, len(partition.keys)
+            param.multimodal_data["multimodal_embedding"] = (
+                MultimodalEncoderRequestState.assemble_full_embedding(by_item, len(partition.keys))
             )
 
             inserted = 0
