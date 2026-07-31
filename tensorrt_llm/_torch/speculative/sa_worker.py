@@ -188,9 +188,7 @@ class SAWorker(SpecWorkerBase):
         # one-engine workers (dflash/eagle3); no-op for pure-attention
         # models via the isinstance gate.
         num_gens = batch_size - num_contexts
-        if num_gens > 0 and isinstance(
-            attn_metadata.kv_cache_manager, MambaHybridCacheManager
-        ):
+        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
