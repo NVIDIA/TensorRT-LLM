@@ -14,12 +14,14 @@
 # limitations under the License.
 """HangDetector timer behavior and the hard-kill propagation mechanism (no GPU)."""
 
+import asyncio
 import os
 import signal
 import subprocess
 import sys
 import time
 
+from tensorrt_llm._torch.pyexecutor import hang_detector as hang_detector_module
 from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 
 
@@ -62,6 +64,39 @@ def test_pause_suppresses_detection():
             time.sleep(2.0)  # would have fired if not paused
         assert fired == []
         assert hd.detected() is False
+
+
+def test_status_provider_errors_are_logged(monkeypatch):
+    events = []
+
+    async def no_sleep(_timeout):
+        pass
+
+    def failing_provider():
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(hang_detector_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        hang_detector_module,
+        "_best_effort_log_error",
+        lambda message: events.append(("log", message)),
+    )
+    monkeypatch.setattr(
+        hang_detector_module,
+        "print_all_stacks",
+        lambda: events.append(("stacks", None)),
+    )
+
+    detector = HangDetector(timeout=1, on_detected=lambda: events.append(("detected", None)))
+    detector.register_status_provider(failing_provider)
+    detector.register_status_provider(lambda: "transceiver status")
+
+    asyncio.run(detector._detect_hang())
+
+    messages = "\n".join(message for kind, message in events if kind == "log")
+    assert "provider failed" in messages
+    assert "transceiver status" in messages
+    assert events[-2:] == [("stacks", None), ("detected", None)]
 
 
 def test_propagate_hard_kill_self_sigkills_without_mpi():

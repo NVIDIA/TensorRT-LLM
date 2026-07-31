@@ -260,6 +260,14 @@ class BasePipeline(nn.Module):
         """
         return (height, width, num_frames)
 
+    def request_warmup_cache_key(self, req: Any) -> tuple:
+        """Return the warmup cache key for a prepared inference request."""
+        return self.warmup_cache_key(
+            req.params.height,
+            req.params.width,
+            num_frames=req.params.num_frames,
+        )
+
     @property
     def default_warmup_resolutions(self) -> List[Tuple[int, int]]:
         """Model-specific default warmup resolutions (height, width).
@@ -376,6 +384,14 @@ class BasePipeline(nn.Module):
         merges these into ``request.params`` before calling ``infer()``.
         """
         return {}
+
+    def prepare_request(self, req: Any) -> None:
+        """Prepare model-specific inputs before warmup bookkeeping.
+
+        Subclasses may mutate internal request state and resolve request
+        parameters needed by :meth:`request_warmup_cache_key`. The default
+        implementation is a no-op.
+        """
 
     def infer(self, req: Any):
         raise NotImplementedError
