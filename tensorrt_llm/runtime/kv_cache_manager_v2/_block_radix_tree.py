@@ -13,17 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
-from array import array
 from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
-from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
+from ._cache_key import (  # noqa: F401
+    BlockKey,
+    Hasher,
+    TokenBlock,
+    gen_multimodal_cache_key_tokens,
+    reuse_scope_to_bytes,
+    sequence_to_blockchain_keys,
+)
+from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
 from ._utils import (
     TypedIndexList,
-    chunked,
-    div_up,
     expect_type,
     filled_list,
     find_index,
@@ -36,8 +40,6 @@ if TYPE_CHECKING:
     from ._event_manager import KVCacheEventManager
     from ._page import CommittedPage
 
-BlockKey = bytes
-
 
 class ReuseScope(NamedTuple):
     """Per-request namespace for prefix reuse."""
@@ -45,21 +47,8 @@ class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
 
-    def _mask(self) -> bytes:
-        return sum((value is not None) << i for i, value in enumerate(self)).to_bytes(
-            div_up(len(self), 8), "little", signed=False
-        )
-
     def to_bytes(self) -> bytes:
-        ret = self._mask()
-        for value in self:
-            if type(value) is int:
-                ret += value.to_bytes(8, "little", signed=False)
-            else:
-                assert value is None, (
-                    "Did you forget to update to_bytes() when adding new non-int fields to ReuseScope?"
-                )
-        return ret
+        return reuse_scope_to_bytes(self)
 
 
 class ReuseMatch(NamedTuple):
@@ -67,74 +56,7 @@ class ReuseMatch(NamedTuple):
 
     blocks: list["Block"]
     num_tokens: int
-
-
-# id_offset is usually vocab_size
-def gen_multimodal_cache_key_tokens(
-    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
-) -> list[TokenIdExt]:
-    """Create synthetic tokens used only when building multimodal KV-cache keys.
-
-    Item-local token 0 carries the content digest; later offsets use deterministic IDs above the vocab.
-    """
-    assert num_tokens > 0
-    assert token_offset >= 0
-    return [
-        multi_modal_data_digest if token_offset + i == 0 else TokenId(id_offset + token_offset + i)
-        for i in range(num_tokens)
-    ]
-
-
-class Hasher:
-    __slots__ = "_hasher"
-    _hasher: "hashlib._Hash"
-
-    def __init__(self, data: int | bytes | None | Sequence[int | bytes] = None) -> None:
-        self._hasher = hashlib.sha256()
-        if data is not None:
-            self.update(data)
-
-    # This function is perf-critical. Expect compromised code quality.
-    def update(self, data: int | bytes | Sequence[int | bytes]) -> "Hasher":
-        if type(data) is int:
-            assert NDEBUG or (data >= 0 and data < (1 << 64))
-            self._hasher.update(data.to_bytes(8, "little"))
-        elif type(data) is bytes:
-            self._hasher.update(data)
-        else:
-            # Hash the whole token block in one C call instead of one per token.
-            # array("Q", data).tobytes() packs each int as 8 native-endian bytes;
-            # all NVIDIA GPU host platforms (x86_64, aarch64/Grace) are little-endian
-            # so this is byte-identical to the per-token to_bytes(8, "little") loop.
-            # Falls back to that loop for multimodal blocks (which contain bytes items).
-            try:
-                self._hasher.update(array("Q", data).tobytes())  # type: ignore
-            except (TypeError, OverflowError):
-                for item in data:  # type: ignore
-                    assert (
-                        NDEBUG
-                        or (type(item) is int and (0 <= item < (1 << 64)))
-                        or type(item) is bytes
-                    )
-                    self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
-        return self
-
-    @property
-    def digest(self) -> bytes:
-        return self._hasher.digest()
-
-
-TokenBlock = list[TokenIdExt]
-
-
-def sequence_to_blockchain_keys(
-    tokens_per_block: int, reuse_scope: ReuseScope, tokens: Sequence[TokenIdExt]
-) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(reuse_scope.to_bytes()).digest
-    yield [], digest
-    for token_block in chunked(tokens, tokens_per_block):
-        digest = Hasher(digest).update(token_block).digest
-        yield token_block, digest
+    num_lookup_tokens: int
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -361,6 +283,10 @@ class Block:
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
                 to_remove.append(k)
         event_manager = get_tree(prev).event_manager if to_remove else None
+        # Keep RootBlock attached while covered children are replaced.  Adding
+        # the replacement first prevents detach_next() from pruning an
+        # otherwise-empty root before this block becomes its new child.
+        prev.next[self.key] = self
         for k in to_remove:
             b = detach_next(prev, k)
             assert isinstance(b, Block)
@@ -368,7 +294,6 @@ class Block:
                 event_manager.add_removed_event(b.key)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
-        prev.next[self.key] = self
 
     def _release_pages(self) -> None:
         """Reclaim every page held by this block.
@@ -412,6 +337,9 @@ class Block:
     @property
     def prev(self) -> "Block | RootBlock":
         return unwrap_rawref(self._prev)
+
+    def get_page(self, lc_idx: LifeCycleId) -> "CommittedPage | None":
+        return map_optional(self.storage[lc_idx], lambda f: f())
 
     def unlink_page(
         self, lc_idx: LifeCycleId, expected_page: "CommittedPage | None" = None
@@ -675,7 +603,11 @@ class BlockRadixTree:
         matched = self._prune_match(
             list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         )
-        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
+        return ReuseMatch(
+            [block for block, _ in matched],
+            self._num_matched_tokens(matched),
+            len(tokens),
+        )
 
     def _check_sanity(self) -> bool:
         raise NotImplementedError(

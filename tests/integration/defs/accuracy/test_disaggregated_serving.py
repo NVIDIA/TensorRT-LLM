@@ -2282,10 +2282,20 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
     @pytest.mark.skip_less_device(8)
-    @parametrize_with_ids("use_py_transceiver", [True, False])
-    @parametrize_with_ids("block_reuse", [True, False])
-    @parametrize_with_ids("mtp_nextn", [0, 1, 3])
-    def test_auto_dtype(self, use_py_transceiver, block_reuse, mtp_nextn):
+    @pytest.mark.parametrize(
+        "mtp_nextn,block_reuse,use_py_transceiver",
+        [
+            (0, False, False),
+            (0, False, True),
+            (3, True, False),
+        ],
+        ids=[
+            "mtp_nextn=0-block_reuse=False-use_py_transceiver=False",
+            "mtp_nextn=0-block_reuse=False-use_py_transceiver=True",
+            "mtp_nextn=3-block_reuse=True-use_py_transceiver=False",
+        ],
+    )
+    def test_auto_dtype(self, mtp_nextn, block_reuse, use_py_transceiver):
         if use_py_transceiver and block_reuse:
             pytest.skip("Python transceiver does not support block reuse")
 

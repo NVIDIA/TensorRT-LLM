@@ -15,6 +15,8 @@ l0_a10:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/sampler/test_torch_sampler.py
+  - unittest/_torch/sampler/test_penalties.py
+  - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_torch_multi_arange.py
   - unittest/utils/test_util.py
   - unittest/utils/test_logger.py
@@ -28,8 +30,10 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/modeling/test_modeling_radio.py
   - unittest/_torch/modeling/test_modeling_step3p7.py
+  - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
+  - unittest/_torch/sampler/test_token_ban.py
   - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
   - unittest/_torch/executor/test_kv_cache_estimation.py
@@ -53,7 +57,10 @@ l0_a10:
   - unittest/inputs/test_multimodal.py
   - unittest/inputs/test_multimodal_input_processor.py
   - unittest/inputs/test_video_decode.py
+  - unittest/others/test_cache_transceiver_precheck_config.py
+  - unittest/others/test_cache_transceiver_precheck_run.py
   - unittest/others/test_convert_utils.py
+  - unittest/others/test_lm_eval.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_lora_module_count.py
   - unittest/others/test_time_breakdown.py

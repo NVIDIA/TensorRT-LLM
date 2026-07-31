@@ -676,12 +676,33 @@ class MiniMaxM3MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
             output_dtype=output_dtype,
         )
         self.routed_scaling_factor = float(routed_scaling_factor)
+        self.routing_impl = Deepseekv3RoutingImpl(
+            top_k=top_k,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
 
     def apply(
         self,
         router_logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # M3 produces contiguous FP32 logits and bias. Keep the eager path for
+        # alternate dtype, device, shape, or layout contracts because the native
+        # op consumes raw contiguous CUDA buffers and emits FP32 weights.
+        if (router_logits.is_cuda and router_logits.dtype == torch.float32
+                and router_logits.ndim == 2 and router_logits.is_contiguous()
+                and self.output_dtype == torch.float32):
+            routing_bias = self.e_score_correction_bias
+            if (routing_bias.is_cuda
+                    and routing_bias.device == router_logits.device
+                    and routing_bias.dtype == torch.float32
+                    and routing_bias.ndim == 1
+                    and routing_bias.numel() == router_logits.shape[1]
+                    and routing_bias.is_contiguous()):
+                return self.routing_impl.apply(router_logits, routing_bias)
+
         # ``moe_scheduler.MoEScheduler`` calls ``routing_method.apply(router_logits,
         # input_ids)`` positionally; mirror the parent's signature so the
         # MiniMax-M3 routing accepts (but ignores) the optional ``input_ids``

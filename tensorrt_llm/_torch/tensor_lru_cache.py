@@ -32,6 +32,10 @@ K = TypeVar("K", bound=Hashable)
 class _Entry(NamedTuple):
     value: torch.Tensor
     size_bytes: int
+    # CUDA event recorded on the producing stream right after the clone in `put`. Consumers on a
+    # different stream wait on it before reading `value`. `None` for CPU tensors or when the cache
+    # is not stream-aware.
+    producer_event: torch.cuda.Event | None
 
 
 class TensorLRUCacheStats(NamedTuple):
@@ -77,9 +81,16 @@ class TensorLRUCache(Generic[K]):
     temporarily needs both the source tensor and its copy and may exceed the cache limit until
     eviction completes.
 
+    In CUDA-stream-aware mode, each entry owns the event recorded after its clone. Replacement,
+    eviction, and clear drop that event with the entry; events are not reused because an evicted
+    tensor may still have outstanding consumers on another stream.
+
     Args:
         max_bytes: Maximum logical tensor bytes held by this cache.
         name: Short label used in debug log messages.
+        cuda_stream_aware: When enabled, synchronize CUDA tensor producers and consumers across
+            streams and extend allocation lifetime through every consuming stream. CPU tensors are
+            unaffected.
     """
 
     def __init__(
@@ -87,12 +98,14 @@ class TensorLRUCache(Generic[K]):
         max_bytes: int,
         *,
         name: str = "tensor_lru_cache",
+        cuda_stream_aware: bool = False,
     ) -> None:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
 
         self._max_bytes = max_bytes
         self._name = name
+        self._cuda_stream_aware = cuda_stream_aware
         self._current_bytes = 0
         self._items: OrderedDict[K, _Entry] = OrderedDict()
         self._lock = RLock()
@@ -124,6 +137,7 @@ class TensorLRUCache(Generic[K]):
 
             self._counters.hits += 1
             self._items.move_to_end(key)
+            self._prepare_for_current_stream(entry)
             return entry.value
 
     def put(self, key: K, value: torch.Tensor) -> bool:
@@ -144,6 +158,10 @@ class TensorLRUCache(Generic[K]):
             return False
 
         stored_value = value.detach().clone()
+        producer_event = None
+        if self._cuda_stream_aware and stored_value.is_cuda:
+            producer_event = torch.cuda.Event()
+            producer_event.record(torch.cuda.current_stream(stored_value.device))
 
         with self._lock:
             old_entry = self._items.pop(key, None)
@@ -153,7 +171,11 @@ class TensorLRUCache(Generic[K]):
             else:
                 self._counters.insertions += 1
 
-            self._items[key] = _Entry(value=stored_value, size_bytes=size_bytes)
+            self._items[key] = _Entry(
+                value=stored_value,
+                size_bytes=size_bytes,
+                producer_event=producer_event,
+            )
             self._current_bytes += size_bytes
 
             evicted_count, evicted_bytes = self._evict_until_within_limit()
@@ -174,6 +196,7 @@ class TensorLRUCache(Generic[K]):
                 return None
 
             self._current_bytes -= entry.size_bytes
+            self._prepare_for_current_stream(entry)
             return entry.value
 
     def clear(self) -> None:
@@ -209,6 +232,25 @@ class TensorLRUCache(Generic[K]):
     @staticmethod
     def _tensor_size_bytes(tensor: torch.Tensor) -> int:
         return tensor.numel() * tensor.element_size()
+
+    def _prepare_for_current_stream(self, entry: _Entry) -> None:
+        """Order and anchor a cached tensor for consumption on the current stream.
+
+        Called from `get` / `pop` before returning an entry it:
+        * makes the current (consuming) stream wait on the entry's producer event, so a cross-stream
+          read observes fully-written data
+        * calls `record_stream` on the consuming stream so the caching allocator will not reuse
+          the storage while consumer-stream work is still pending, even if a later replacement or
+          eviction drops the cache's own reference.
+        """
+        if not self._cuda_stream_aware or not entry.value.is_cuda:
+            return
+
+        consumer_stream = torch.cuda.current_stream(entry.value.device)
+        # The producer event orders the data dependency; `record_stream` separately guards lifetime.
+        if entry.producer_event is not None:
+            consumer_stream.wait_event(entry.producer_event)
+        entry.value.record_stream(consumer_stream)
 
     def _evict_until_within_limit(self) -> tuple[int, int]:
         evicted_count = 0
