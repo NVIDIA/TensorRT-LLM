@@ -229,9 +229,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         weights_preloaded: bool = False,
         source_identity: Optional[SourceIdentity] = None,
     ) -> None:
-        """Publish a native-loaded source after TRT-LLM post-load processing."""
-        if weights_preloaded:
-            return
+        """Publish final post-transform weights after any successful load path."""
         self.publish_as_source(
             model,
             checkpoint_dir=checkpoint_dir,

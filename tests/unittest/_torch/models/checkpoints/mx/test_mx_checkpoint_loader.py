@@ -299,7 +299,7 @@ def test_incompatible_transfer_protocol_fails_closed(monkeypatch):
     assert not loader.is_post_transform_weights_preloaded()
 
 
-def test_p2p_receiver_does_not_republish_after_trt_post_load(monkeypatch):
+def test_p2p_receiver_republishes_after_trt_post_load(monkeypatch):
     instances = _install_fake_mx(
         monkeypatch,
         p2p_succeeded=True,
@@ -317,7 +317,7 @@ def test_p2p_receiver_does_not_republish_after_trt_post_load(monkeypatch):
         source_identity=kwargs["source_identity"],
     )
 
-    instances[0].publish_model.assert_not_called()
+    instances[0].publish_model.assert_called_once_with(model)
 
 
 def test_native_source_publishes_after_trt_post_load(monkeypatch):

@@ -1002,12 +1002,9 @@ class ModelLoader:
                         # RO path: weights are coming from a GMS donor that
                         # has already committed the post-post_load layout, so
                         # the receiver flags `weights_preloaded=True` on the
-                        # checkpoint-loader hooks. `MXCheckpointLoader.post_load_publish`
-                        # (and any other format-aware loader) honors this flag
-                        # to early-return and not re-publish, while still
-                        # letting `post_load_apply` perform any
-                        # receiver-side per-format work (e.g., marking
-                        # presharded modules).
+                        # checkpoint-loader hooks. This prevents duplicate
+                        # transforms while leaving any receiver-side publication
+                        # policy to the format-specific hook.
                         #
                         # Hook order:
                         #   1. `post_load_apply`: format-specific apply
@@ -1023,8 +1020,8 @@ class ModelLoader:
                         #   5. Per-module `cache_derived_state`: recompute
                         #      Python-side state from real, materialized
                         #      tensors without re-running one-shot transforms.
-                        #   6. `post_load_publish`: any receiver-side
-                        #      publish (no-op via the receiver guard).
+                        #   6. `post_load_publish`: apply the format-specific
+                        #      receiver publication policy.
                         with timing_metric(
                                 ModelLoaderMetricNames.
                                 POST_LOAD_PROCESSING_SECONDS.value,
