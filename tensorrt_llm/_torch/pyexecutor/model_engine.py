@@ -3309,21 +3309,35 @@ class PyTorchModelEngine(ModelEngine):
                     f"Scheduled MM request {request_id} has no encoder "
                     "item state")
             touched_requests[request_id] = request
-            # Only build cache keys when a cache exists to consult; item
-            # models without the cache (e.g. Qwen) skip the hashing entirely.
-            item_keys = (self.get_mm_encoder_item_keys(request)
-                         if encoder_cache is not None else None)
             multimodal_param = MultimodalParams(
                 multimodal_data=request.py_multimodal_data)
-            for item_idx in item_indices:
-                key = item_keys[item_idx] if item_keys is not None else None
-                cached = (encoder_cache.get(key) if encoder_cache is not None
-                          and key is not None else None)
-                if cached is not None:
-                    state.record(item_idx, cached)
-                else:
+            # Scope the lookup to this iteration's items: probing an item the
+            # budget cannot encode yet would still refresh its LRU recency and
+            # reorder eviction against items actually in flight.
+            # Keys come from the request: the executor's params carry
+            # `py_multimodal_data` only, while the content hashes live on the
+            # `LlmRequest`.
+            item_keys = (self.get_mm_encoder_item_keys(request)
+                         if encoder_cache is not None else None)
+            partition = (self.model.partition_encoder_cache(
+                multimodal_param,
+                encoder_cache,
+                item_indices=item_indices,
+                keys=item_keys) if item_keys is not None else None)
+            if partition is None:
+                # No cache, or the request cannot build stable content keys:
+                # every scheduled item is a miss and its output lives only on
+                # the request.
+                for item_idx in item_indices:
                     miss_items.append((multimodal_param, item_idx))
-                    miss_owners.append((request, item_idx, key))
+                    miss_owners.append((request, item_idx, None))
+                continue
+            for item_idx, cached in partition.hits.items():
+                state.record(item_idx, cached)
+            for item_idx in partition.miss_indices:
+                miss_items.append((multimodal_param, item_idx))
+                miss_owners.append(
+                    (request, item_idx, partition.keys[item_idx]))
 
         if miss_items:
             encoder_inputs = self.model.prepare_multimodal_encoder_inputs(

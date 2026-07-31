@@ -717,7 +717,7 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
     "mm_data, expected_match",
     [
         # `_encoder_cache_modality` returns None -> single-modality guard fires.
-        ({}, "only supports single-modality"),
+        ({}, "cannot infer the modality"),
         # Modality present but layout is neither pattern A (image_sizes) nor pattern B
         # (grid_thw); default has nothing to dispatch on.
         ({"image": {"pixel_values": torch.zeros(2)}}, "cannot slice image layout"),
