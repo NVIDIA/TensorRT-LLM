@@ -126,11 +126,13 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
    setup MPI collectives. Not an MPI/pmix or V2 code bug; with
    `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` V2 NIXL passes multi-node
    with no code change.
-2. **SA runs eager.** SA speculative decoding in disagg is validated for
-   accuracy (GSM8K parity with aggregated serving) with CUDA graphs
-   disabled, as configured in `gen_config.yaml`. Do not enable CUDA
-   graphs together with SA: it currently degrades output quality.
-   Start with `gen_config_no_sa.yaml` for the first
+2. **SA ships eager here.** SA speculative decoding in disagg is
+   validated for accuracy (GSM8K parity with aggregated serving) with
+   CUDA graphs disabled, as configured in `gen_config.yaml`. SA with
+   CUDA graphs is functional (the MLA latent-cache append under CUDA
+   graphs handles spec-dec verification), but the disagg SA + graphs
+   perf points have not been re-measured yet, so `gen_config.yaml`
+   keeps graphs off. Start with `gen_config_no_sa.yaml` for the first
    bring-up on a new cluster, then switch to `gen_config.yaml`.
 3. **Matched-DP only.** Keep ctx and gen at identical DEP16 with
    attention-DP on both sides; heterogeneous parallelism with
