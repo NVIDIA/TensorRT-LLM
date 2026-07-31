@@ -29,6 +29,7 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
+from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 
 from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
@@ -621,36 +622,7 @@ class ServerConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        if self.match_mode == "scenario":
-            return [
-                "s_model_name",
-                "l_gpus",
-            ]
-
-        return [
-            "s_model_name",
-            "l_tp",
-            "l_ep",
-            "l_pp",
-            "l_cp",
-            "l_gpus_per_node",
-            "l_max_batch_size",
-            "b_enable_attention_dp",
-            "s_serving_backend",
-            # kv_cache_config
-            "s_kv_cache_dtype",
-            # cache_transceiver_config
-            "s_cache_transceiver_backend",
-            # speculative_config
-            # Keep baseline matching on the legacy key during DB migration.
-            # l_max_draft_len is written to DB but not used for matching until
-            # backfill completes.
-            "s_spec_decoding_type",
-            "l_num_nextn_predict_layers",
-            "l_force_num_accepted_tokens",
-            # moe_config
-            "l_load_balancer_num_slots",
-        ]
+        return get_server_match_keys(self.match_mode)
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to database data."""
@@ -1018,18 +990,7 @@ class ClientConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        return [
-            "l_concurrency",
-            "l_iterations",
-            "l_isl",
-            "l_osl",
-            "d_random_range_ratio",
-            "s_backend",
-            "b_use_chat_template",
-            "b_streaming",
-            "b_use_nv_sa_benchmark",
-            "b_eos",
-        ]
+        return get_client_match_keys()
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
