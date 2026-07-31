@@ -68,6 +68,18 @@ class RequestFuncOutput:
     error: str = ""
     avg_decoded_tokens_per_iter: float = 0.0  # Average tokens decoded per iteration
     exception_type: str = None  # unset
+    # --- Perf time-events (client send timeline) ---
+    # Absolute POST-send timestamps. ``send_time`` is a process-local monotonic
+    # ``time.perf_counter()`` reading (the same epoch ttft/itl/latency are
+    # relative to); ``send_wall_time`` is the ``time.time()`` wall-clock anchor a
+    # post-script uses to align this client timeline against server-side steady
+    # -clock records (there is no shared request id, so alignment is best-effort).
+    send_time: float = 0.0
+    send_wall_time: float = 0.0
+    # Server response id (``cmpl-...``/``chatcmpl-...`` uuid). Captured for
+    # reference/dedup; it is minted fresh per response and does NOT equal the
+    # worker's internal request id, so it is not a worker-join key.
+    response_id: str = ""
 
 
 async def async_request_trt_llm(
@@ -203,6 +215,12 @@ async def async_request_openai_completions(
 
     generated_text = ""
     st = time.perf_counter()
+    # Record the send timeline for the perf-time-events client file. ``st`` is
+    # process-local monotonic (matches ttft/itl); ``send_wall_time`` is the
+    # wall-clock anchor a post-script uses to align against server steady-clock
+    # records. Best-effort: there is no shared request id across the boundary.
+    output.send_time = st
+    output.send_wall_time = time.time()
     most_recent_timestamp = st
     try:
         async with request_session.post(url=api_url,
@@ -213,6 +231,11 @@ async def async_request_openai_completions(
                     first_chunk_received = False
                     async for chunk in _iter_sse_data(response.content):
                         data = json.loads(chunk)
+
+                        # Capture the server response id once (reference/dedup;
+                        # not a worker-join key -- see RequestFuncOutput).
+                        if not output.response_id and data.get("id"):
+                            output.response_id = data["id"]
 
                         # NOTE: Some completion API might have a last
                         # usage summary response without a token so we
@@ -255,6 +278,8 @@ async def async_request_openai_completions(
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
+                    if data.get("id"):
+                        output.response_id = data["id"]
                     generated_text = data["choices"][0]["text"]
                     output.success = True
                     output.generated_text = generated_text
@@ -341,6 +366,13 @@ async def async_request_openai_chat_completions(
     generated_text = ""
     ttft = 0.0
     st = time.perf_counter()
+    # Record the send timeline for the perf-time-events client file, mirroring
+    # the completions path. ``st`` is process-local monotonic (matches
+    # ttft/itl); ``send_wall_time`` is the wall-clock anchor a post-script uses
+    # to align against server steady-clock records. Best-effort: there is no
+    # shared request id across the boundary.
+    output.send_time = st
+    output.send_wall_time = time.time()
     most_recent_timestamp = st
     try:
         async with request_session.post(url=api_url,
@@ -352,6 +384,11 @@ async def async_request_openai_chat_completions(
                     async for chunk in _iter_sse_data(response.content):
                         timestamp = time.perf_counter()
                         data = json.loads(chunk)
+
+                        # Capture the server response id once (reference/dedup;
+                        # not a worker-join key -- see RequestFuncOutput).
+                        if not output.response_id and data.get("id"):
+                            output.response_id = data["id"]
 
                         if choices := data.get("choices"):
                             content = choices[0]["delta"].get("content")
@@ -388,6 +425,8 @@ async def async_request_openai_chat_completions(
                     output.itl = []
                     output.latency = time.perf_counter() - st
                     output.ttft = -1
+                    if data.get("id"):
+                        output.response_id = data["id"]
 
                     # Extract avg_decoded_tokens_per_iter if available
                     choice = data["choices"][0]

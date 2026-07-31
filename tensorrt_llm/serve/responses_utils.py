@@ -888,7 +888,8 @@ async def request_preprocess(
     prev_response_id = request.previous_response_id
 
     # TODO: better way to enable metrics
-    if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+    if (len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0
+            or len(os.getenv("TRTLLM_PERF_TIME_EVENTS_PATH", "")) > 0):
         sampling_params.return_perf_metrics = True
 
     prev_msgs = []
@@ -2041,6 +2042,14 @@ class ResponseHooks(ABC):
 
         Arrival to this point measures the pre-context wait in the orchestrator
         or fleet. The default is a no-op for non-instrumented implementations.
+        """
+
+    def on_gen_dispatch(self, request: UCompletionRequest):
+        """Record when the disaggregated service starts generation placement.
+
+        Fires just before the router picks + sends to the gen server, i.e. after
+        the ctx round-trip (or immediately, on the gen-only / no-ctx path). The
+        default is a no-op for non-instrumented implementations.
         """
 
     @abstractmethod

@@ -64,6 +64,8 @@ l0_a10:
   - unittest/others/test_lm_eval.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_lora_module_count.py
+  - unittest/others/test_perf_time_events.py
+  - unittest/others/test_perf_time_events_writer.py
   - unittest/others/test_time_breakdown.py
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py

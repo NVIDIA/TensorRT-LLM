@@ -46,6 +46,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, CompletionRequest, UCompletionRequest,
     UCompletionResponse, ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
+from tensorrt_llm.serve.perf_time_events_writer import (ROUTER_EVENTS_PATH_ENV,
+                                                        make_env_writer)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import Router
@@ -58,6 +60,15 @@ _LOG_CONTROL_CHARACTERS = {
     for code in (*range(32), 127)
 }
 
+# Per-process router dispatch-timeline writer. Inert unless
+# TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH names an output directory; then each router
+# process appends one JSONL record per finished request into
+# ``disagg_router_pid{P}.jsonl`` (off the event loop, on a daemon thread). The
+# record's steady-clock stamps share the server clock with the worker's per-rank
+# ``time_events_*.jsonl``; the offline aggregator joins them on ``ctx_request_id``.
+_ROUTER_EVENTS_WRITER = make_env_writer(ROUTER_EVENTS_PATH_ENV, "disagg_router")
+
+
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, perf_metrics_collector: DisaggPerfMetricsCollector):
         self.raw_req = raw_req
@@ -66,6 +77,7 @@ class RawRequestResponseHooks(ResponseHooks):
         self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
         self.ctx_dispatch_time = 0
+        self.gen_dispatch_time = 0
         self.perf_metrics_collector = perf_metrics_collector
 
     def on_req_begin(self, request: UCompletionRequest):
@@ -73,6 +85,9 @@ class RawRequestResponseHooks(ResponseHooks):
 
     def on_ctx_dispatch(self, request: UCompletionRequest):
         self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
+
+    def on_gen_dispatch(self, request: UCompletionRequest):
+        self.gen_dispatch_time = get_steady_clock_now_in_seconds()
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
@@ -97,6 +112,35 @@ class RawRequestResponseHooks(ResponseHooks):
             background_tasks = self.perf_metrics_collector._background_tasks
             background_tasks.add(task)
             task.add_done_callback(background_tasks.discard)
+        self._maybe_write_router_event(gen_server, request)
+
+    def _maybe_write_router_event(self, gen_server: str, request: UCompletionRequest):
+        """Emit one dispatch-timeline JSONL record for this request (best-effort).
+
+        No-op unless TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH is set. Keyed on BOTH the
+        router's ``disagg_request_id`` (its own dispatch timeline) and the
+        worker-assigned ``ctx_request_id`` (cross-process join key with the
+        per-rank worker files). ``ctx_request_id`` is only known after the ctx
+        round-trip; it is ``None`` on the gen-only / no-ctx path.
+        """
+        if not _ROUTER_EVENTS_WRITER.enabled:
+            return
+        disagg_params = getattr(request, "disaggregated_params", None)
+        ctx_request_id = getattr(disagg_params, "ctx_request_id", None)
+        disagg_request_id = getattr(disagg_params, "disagg_request_id", None)
+        _ROUTER_EVENTS_WRITER.write({
+            "source": "disagg_router",
+            "ctx_request_id": ctx_request_id,
+            "disagg_request_id": disagg_request_id,
+            "ctx_server": self.ctx_server,
+            "gen_server": gen_server,
+            # steady-clock seconds, shared with the worker per-rank files.
+            "arrival_time": self.request_arrival_time,
+            "ctx_dispatch_time": self.ctx_dispatch_time or None,
+            "gen_dispatch_time": self.gen_dispatch_time or None,
+            "first_token_time": self.server_first_token_time or None,
+            "resp_done_time": get_steady_clock_now_in_seconds(),
+        })
 
 
 class OpenAIDisaggServer:

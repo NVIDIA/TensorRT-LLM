@@ -5,6 +5,10 @@ and per-request metric bookkeeping.  Extracted from PyExecutor to improve
 readability and separation of concerns.
 """
 
+import json
+import os
+import queue
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Optional
@@ -14,7 +18,18 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
-from .llm_request import PerfTimingInfo
+from .llm_request import PerfTimingInfo, get_effective_draft_token_length
+
+# Master switch env var. When set to a directory, capture is forced on
+# (independent of ``LlmArgs.return_perf_metrics``), extended per-iteration
+# batch-context fields are recorded, and each rank writes its own
+# ``time_events_rank{N}_pid{P}.jsonl`` live into that directory. Symmetric
+# with ``TRTLLM_KVCACHE_TIME_OUTPUT_PATH`` used by the disaggregation perf
+# logger.
+PERF_TIME_EVENTS_PATH_ENV = "TRTLLM_PERF_TIME_EVENTS_PATH"
+
+# Sentinel enqueued by ``close()`` to stop the writer thread.
+_WRITER_STOP = object()
 
 
 class PerfMetricsManager:
@@ -23,13 +38,34 @@ class PerfMetricsManager:
     Args:
         enabled: Whether performance metrics collection is turned on
             (mirrors ``LlmArgs.return_perf_metrics``).
+        capture_extended: Whether to record extended per-iteration
+            batch-context / starvation fields and write per-rank time-event
+            files. ``None`` (default) derives it from the
+            ``TRTLLM_PERF_TIME_EVENTS_PATH`` env var, which also force-enables
+            ``enabled``. Pass an explicit bool in unit tests.
     """
 
-    def __init__(self, enabled: bool):
-        self.enabled = enabled
+    def __init__(self, enabled: bool, capture_extended: Optional[bool] = None):
+        events_dir = os.getenv(PERF_TIME_EVENTS_PATH_ENV, "")
+        env_on = len(events_dir) > 0
+        if capture_extended is None:
+            capture_extended = env_on
+        # The env var alone turns the whole capture path on, independent of
+        # LlmArgs.return_perf_metrics.
+        self.enabled = bool(enabled or env_on)
+        # Extended fields / per-rank writer only when capture is on AND
+        # extended capture was requested (env or explicit).
+        self.capture_extended = bool(self.enabled and capture_extended)
         self._perf_events = None
         self._perf_event_idx = 0
         self._forward_event_pool = []
+
+        # Per-rank live writer (off the executor critical path).
+        self._events_dir = events_dir or None
+        self._events_file = None  # opened lazily by the writer thread
+        self._writer_queue: Optional[queue.Queue] = None
+        self._writer_thread: Optional[threading.Thread] = None
+        self._writer_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # GPU event helpers
@@ -142,8 +178,17 @@ class PerfMetricsManager:
         forward_end_time,
         sample_start_time,
         sample_end_time,
+        iter_batch_context=None,
     ):
-        """Save current iteration's timing info to all requests in the batch."""
+        """Save current iteration's timing info to all requests in the batch.
+
+        ``iter_batch_context`` (when provided) is a dict of per-iteration
+        batch-context / starvation fields shared by every request scheduled
+        this iteration; it is merged into each request's per-iteration metric
+        dict by :meth:`append_step_metrics`. Callers pass it only when
+        ``capture_extended`` is on, so the default keeps the base timing path
+        untouched.
+        """
         for req in requests:
             # Lazily create PerfTimingInfo only when perf metrics are enabled
             if req.py_perf_timing is None:
@@ -155,6 +200,7 @@ class PerfMetricsManager:
             req.py_perf_timing.forward_end_time = forward_end_time
             req.py_perf_timing.sample_start_time = sample_start_time
             req.py_perf_timing.sample_end_time = sample_end_time
+            req.py_perf_timing.iter_batch_context = iter_batch_context
 
     def compute_batch_gpu_times(self, requests):
         """Compute GPU times once per batch for the last ctx chunk or gen step.
@@ -236,6 +282,11 @@ class PerfMetricsManager:
         For generation phase (``py_decoding_iter >= 1``): saves to
         ``step_metrics``.
 
+        When ``capture_extended`` is on, the shared per-iteration
+        ``iter_batch_context`` is merged into each entry, so batch-context and
+        the ``scheduled_time`` admission timestamp ride onto every ctx chunk and
+        every decode step without any per-request bookkeeping here.
+
         Args:
             request: The :class:`LlmRequest` to update.
             iter_counter: Current iteration number from ``PyExecutor``.
@@ -273,6 +324,29 @@ class PerfMetricsManager:
         step_token_time = batch_token_time or get_steady_clock_now_in_seconds()
         metric["token_time"] = step_token_time
 
+        # Extended per-iteration batch context (only when capture_extended is
+        # on and the executor stashed a context dict for this iteration).
+        # The batch-level fields ride inside each per-iteration metric dict, so
+        # they flow through create_response's existing .copy() into
+        # time_breakdown_metrics with no payload-shape change.
+        if self.capture_extended and perf.iter_batch_context is not None:
+            metric.update(perf.iter_batch_context)
+            if is_ctx:
+                # Tokens processed for THIS request in THIS ctx chunk.
+                try:
+                    metric["req_context_token_number"] = request.context_chunk_size
+                except RuntimeError:
+                    last_chunk = getattr(request, "py_last_context_chunk", None)
+                    if last_chunk is not None and last_chunk[0] is not None:
+                        metric["req_context_token_number"] = last_chunk[1] - last_chunk[0]
+            else:
+                # Tokens this request emits this gen step (1 target + effective
+                # speculative draft). Shares get_effective_draft_token_length with
+                # the batch-level generation_token_number so the per-request and
+                # per-iteration counts agree (both exclude padding zeros).
+                metric["req_generation_token_number"] = (
+                    1 + get_effective_draft_token_length(request))
+
         if is_ctx:
             # Mark complete when context is done (remaining == 0 after move_to_next_chunk)
             if request.context_remaining_length == 0:
@@ -281,3 +355,162 @@ class PerfMetricsManager:
         else:
             metric["iter"] = request.py_decoding_iter
             perf.step_metrics.append(metric)
+
+    # ------------------------------------------------------------------
+    # Per-rank live time-event writer (off the executor critical path)
+    # ------------------------------------------------------------------
+
+    def maybe_write_request_events(self, response, rank: int, ctx_request_id=None) -> None:
+        """Enqueue a finished request's time-event record for the writer thread.
+
+        Hard-gated by ``capture_extended`` and by the presence of
+        ``time_breakdown_metrics`` on the response result -- create_response
+        populates that field only on the FINAL response, so this fires exactly
+        once per request and naturally skips non-final (first-token / streaming)
+        responses.
+
+        ``ctx_request_id`` (the disagg context request id, when the caller has a
+        request with ``py_disaggregated_params``) is recorded to let the offline
+        aggregator correlate ctx-server and gen-server records. ``None`` on
+        non-disagg runs.
+
+        The record is also enriched with the request-level lifecycle scalars from
+        the C++ ``RequestPerfMetrics.timing_metrics`` (arrival / first-scheduled /
+        first-token / last-token / kv-cache-transfer start+end, and kv_cache_size)
+        via :func:`tensorrt_llm.executor.result.get_metrics_dict`. Those fields are
+        populated only when the request carried ``return_perf_metrics=True`` -- the
+        trtllm-serve entrypoints force that on whenever
+        ``TRTLLM_PERF_TIME_EVENTS_PATH`` is set, so on the serve/disagg path the
+        scalars are present; a raw ``LLM``-API run that leaves the flag off yields
+        an empty dict and the key is simply omitted. These scalars are the steady-
+        clock lifecycle anchors the per-iteration ``time_breakdown_metrics`` (a
+        relative interior view) cannot express, and they share the server steady
+        clock with the disagg-router dispatch file for cross-process joins.
+
+        The on-loop cost is only a dict build + a non-blocking
+        ``queue.Queue.put_nowait``; all file I/O (json.dumps + write + flush)
+        happens on a lazily-started daemon thread so the executor loop never
+        blocks on disk.
+        """
+        if not self.capture_extended or self._events_dir is None:
+            return
+        result = getattr(response, "result", None)
+        time_breakdown_metrics = getattr(result, "time_breakdown_metrics", None)
+        if time_breakdown_metrics is None:
+            return
+
+        record = {
+            "request_id": getattr(response, "request_id", None),
+            "rank": rank,
+            # Disagg context id when the runtime exposes one; enables ctx<->gen
+            # correlation in the offline aggregator. Absent on non-disagg runs.
+            "ctx_request_id": ctx_request_id,
+            "time_breakdown_metrics": time_breakdown_metrics,
+        }
+
+        # Request-level lifecycle timestamps (steady-clock seconds). Empty unless
+        # return_perf_metrics was on for the request (forced by the serve layer
+        # under TRTLLM_PERF_TIME_EVENTS_PATH). Lazily imported to avoid a module
+        # import cycle at load time. Enum keys are stringified to their stable
+        # ``.value`` (arrival_time, first_scheduled_time, ...).
+        timing_metrics = self._extract_request_timing_metrics(response)
+        if timing_metrics:
+            record["request_timing_metrics"] = timing_metrics
+
+        self._ensure_writer(rank)
+        try:
+            self._writer_queue.put_nowait(record)
+        except queue.Full:
+            # Bounded queue guards against unbounded memory growth if the
+            # writer thread stalls; dropping a record is preferable to
+            # blocking the executor loop.
+            logger.warning("perf time-events queue full; dropping one record")
+
+    @staticmethod
+    def _extract_request_timing_metrics(response) -> dict:
+        """Return the C++ request-lifecycle timestamps as a plain str->float dict.
+
+        Reuses ``executor.result.get_metrics_dict`` (which handles the
+        ``timedelta.total_seconds()`` conversion and returns ``{}`` when perf
+        metrics are absent). Keys are the ``RequestEventTiming`` enum's stable
+        ``.value`` strings. Any failure degrades to an empty dict -- this is an
+        enrichment, never load-bearing for the primary time-breakdown record.
+        """
+        try:
+            from tensorrt_llm.executor.result import get_metrics_dict
+
+            metrics = get_metrics_dict(response)
+        except Exception as e:  # noqa: BLE001 - enrichment must never crash the writer
+            logger.debug("perf time-events: request timing enrichment skipped: %s", e)
+            return {}
+        if not metrics:
+            return {}
+        return {(k.value if hasattr(k, "value") else str(k)): v for k, v in metrics.items()}
+
+    def _ensure_writer(self, rank: int) -> None:
+        """Lazily create the bounded queue + daemon writer thread (once)."""
+        if self._writer_thread is not None:
+            return
+        with self._writer_lock:
+            if self._writer_thread is not None:
+                return
+            self._writer_queue = queue.Queue(maxsize=100000)
+            thread = threading.Thread(
+                target=self._writer_loop,
+                args=(rank,),
+                name=f"perf-time-events-writer-rank{rank}",
+                daemon=True,
+            )
+            self._writer_thread = thread
+            thread.start()
+
+    def _writer_loop(self, rank: int) -> None:
+        """Daemon loop: drain the queue and append one JSON line per record."""
+        path = os.path.join(
+            self._events_dir,
+            f"time_events_rank{rank}_pid{os.getpid()}.jsonl",
+        )
+        try:
+            os.makedirs(self._events_dir, exist_ok=True)
+            self._events_file = open(path, "a", encoding="utf-8")
+        except OSError as e:
+            logger.warning("Failed to open perf time-events file %s: %s", path, e)
+            # Go permanently inert on open failure. Clearing ``_events_dir`` makes
+            # ``maybe_write_request_events`` short-circuit so no further records are
+            # enqueued -- otherwise the bounded queue would fill to ``maxsize`` and
+            # ``close()``'s ``put()`` would block forever on a consumer that has
+            # already exited. Dropping the thread handle lets ``close()`` early-return.
+            self._events_dir = None
+            self._writer_thread = None
+            return
+        while True:
+            record = self._writer_queue.get()
+            if record is _WRITER_STOP:
+                break
+            try:
+                self._events_file.write(json.dumps(record, default=str) + "\n")
+                self._events_file.flush()
+            except (OSError, TypeError) as e:
+                logger.warning("Failed to write perf time-event record: %s", e)
+        try:
+            self._events_file.close()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        """Flush and stop the writer thread; safe to call when disabled."""
+        thread = self._writer_thread
+        if thread is None:
+            return
+        try:
+            # Bounded put: if the writer thread already exited (e.g. it failed to
+            # open its output file) the queue may be full and never drain, so a
+            # blocking put() would hang teardown forever. The timeout plus the
+            # join() below bound close() regardless of the thread's state.
+            self._writer_queue.put(_WRITER_STOP, timeout=5)
+        except queue.Full:
+            pass
+        except Exception:  # noqa: BLE001 - best-effort on teardown
+            pass
+        thread.join(timeout=30)
+        self._writer_thread = None

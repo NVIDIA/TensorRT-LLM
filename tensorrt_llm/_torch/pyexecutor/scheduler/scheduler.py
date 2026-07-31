@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional, Set, TypeAlias, TypeVar
 from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
+from tensorrt_llm.bindings import steady_clock_now
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
@@ -426,6 +427,16 @@ class SimpleScheduler(RequestScheduler):
         super(SimpleScheduler, self).__init__()
         self.capacity_scheduler = capacity_scheduler
         self.micro_batch_scheduler = micro_batch_scheduler
+        # Extended perf time-events: when the executor turns this on (only under
+        # capture_extended), stamp the capacity-scheduler admission time each
+        # round. Off by default so the base scheduling path pays nothing.
+        self.capture_admit_time = False
+        # Steady-clock time (seconds) at which the capacity scheduler returned
+        # this round's fitting set -- the moment every fitting request was
+        # admitted by the capacity scheduler, before micro-batch scheduling.
+        # Same clock as py_executor's `scheduled_time`, so the gap
+        # `scheduled_time - capacity_scheduled_time` is the micro-batch stage.
+        self._last_capacity_admit_time = None
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -434,6 +445,10 @@ class SimpleScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.capacity_scheduler.schedule_request(active_requests)
         )
+        if self.capture_admit_time:
+            # One reading per round, shared by every request the capacity
+            # scheduler just admitted (per-round, mirrors `scheduled_time`).
+            self._last_capacity_admit_time = steady_clock_now().total_seconds()
 
         encoder_requests, context_requests, generation_requests = (
             self.micro_batch_scheduler.schedule(fitting_requests, inflight_request_ids)
