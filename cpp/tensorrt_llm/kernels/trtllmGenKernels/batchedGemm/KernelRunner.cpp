@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstring>
 #include <optional>
 #include <set>
 #include <unistd.h>
@@ -93,7 +94,25 @@ static inline bool skipQuirks(BatchedGemmConfig const& config)
     bool const hang_schedS_tmaOob_tileN64
         = options.mTileScheduler == TileScheduler::Static && options.mUseTmaOobOpt && options.mTileN == 64;
 
-    return hang_c2x1_bM || hang_schedS_tmaOob_tileN64;
+    // Bfloat16_MxE2m1MxE4m3 splitK2 (cga 1x1x2) MoE FC2 cubins intermittently
+    // emit corrupted output rows under concurrent serving load (non-finite /
+    // garbage-magnitude values with bit-identical clean inputs; reproduced on
+    // GB300 TEP16 small-M decode batches, and confirmed both ways by tactic
+    // A/B). Two payloads were caught in-situ, e.g.:
+    // bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x256u2_s6_et128x8_m128x8x32_c1x1x2_rM_splitK2_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f
+    // bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x512_s3_et128x8_m128x8x32_c1x1x2_rM_splitK2_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f
+    // Filtering only those two by hash moved the failure to the remaining
+    // siblings (identical signature with the re-tuned tactic selection), so
+    // all 8 splitK cubins of this dtype combination are skipped by name:
+    // they share the cross-CTA split-K reduction scheme. The kernels are
+    // workload-implicated, not proven intrinsically corrupt. NOTE: a fixed
+    // cubin rebuild keeps the same kernel name, so this filter must be
+    // removed manually once repaired payloads ship.
+    bool const corrupt_splitk_fc2 = config.mFunctionName != nullptr
+        && strstr(config.mFunctionName, "Bfloat16_MxE2m1MxE4m3") != nullptr
+        && strstr(config.mFunctionName, "splitK") != nullptr;
+
+    return hang_c2x1_bM || hang_schedS_tmaOob_tileN64 || corrupt_splitk_fc2;
 }
 
 void setProblemDimensions(BatchedGemmData& gemmData, bool transposeMmaOutput, int32_t m, int32_t n, int32_t k,
