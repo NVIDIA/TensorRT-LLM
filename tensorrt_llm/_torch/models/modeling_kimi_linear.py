@@ -29,13 +29,10 @@ SELFKONLY, exactly like DeepSeek MLA.
 
 MLA prefill routing
 -------------------
-The parity-tested in-tree ``KimiK3MLAAttention`` routes prefill through the
-MLA *generation* FMHA (the context FMHA cubin was found numerically wrong for
-the K3 head configuration; see the module docstring). That path requires
-generation-shaped metadata with one request, so the model builds one derived
-``TrtllmAttentionMetadata`` per context request per forward step (B=1 each)
-and runs the decode path on the whole generation batch at once using the
-executor-provided metadata with ``AttentionInputType.generation_only``.
+The in-tree ``KimiK3MLAAttention`` routes prefill through the normal
+unabsorbed MLA context FMHA. The model builds one packed, context-only
+``TrtllmAttentionMetadata`` per forward step and submits all context requests
+in one varlen FMHA call. Cached decode remains on the absorbed generation path.
 
 Parallelism
 -----------
@@ -78,7 +75,7 @@ from __future__ import annotations
 
 import copy
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -1756,9 +1753,7 @@ class KimiKDARuntime(nn.Module):
 @dataclass
 class _MLAStepRuntime:
     """Per-forward MLA runtime inputs shared by all MLA layers."""
-
-    ctx_rts: List["KimiK3MLARuntimeInputs"] = field(default_factory=list)
-    ctx_lens: List[int] = field(default_factory=list)
+    ctx_rt: Optional["KimiK3MLARuntimeInputs"] = None
     gen_rt: Optional["KimiK3MLARuntimeInputs"] = None
 
 
@@ -1771,43 +1766,41 @@ def _build_mla_step_runtime(attn_metadata: AttentionMetadata) -> _MLAStepRuntime
     num_cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
 
     if num_contexts > 0:
-        seq_lens = attn_metadata.seq_lens[:num_contexts].tolist()
-        for i in range(num_contexts):
-            ctx_len = int(seq_lens[i])
-            cached = int(num_cached[i])
-            # Present this context request as a single "generation" request
-            # with q_len = ctx_len: the MLA generation FMHA under a causal
-            # mask with kv_len == cached + q_len reproduces causal-prefill
-            # semantics exactly (see KimiK3MLAAttention.forward_prefill).
-            md = TrtllmAttentionMetadata(
-                seq_lens=torch.tensor([ctx_len], dtype=torch.int),
-                request_ids=[attn_metadata.request_ids[i]],
-                max_num_requests=1,
-                max_num_sequences=1,
-                num_contexts=0,
-                prompt_lens=[cached + ctx_len],
-                max_num_tokens=ctx_len,
-                kv_cache_manager=attn_metadata.kv_cache_manager,
-                kv_cache_params=KVCacheParams(
-                    use_cache=True,
-                    num_cached_tokens_per_seq=[cached],
-                ),
-                mapping=attn_metadata.mapping,
-                # KDA layers use the outer metadata's mamba_metadata; skip
-                # re-preparing it for the derived MLA-only metadata.
-                mamba_metadata=False,
-                enable_flash_mla=getattr(attn_metadata, "enable_flash_mla", False),
-            )
-            md.prepare()
-            rt.ctx_rts.append(
-                KimiK3MLARuntimeInputs(
-                    metadata=md,
-                    request_ids=[attn_metadata.request_ids[i]],
-                    seq_lens=[ctx_len],
-                    num_cached_tokens_per_seq=[cached],
-                )
-            )
-            rt.ctx_lens.append(ctx_len)
+        ctx_lens = attn_metadata.seq_lens[:num_contexts].tolist()
+        ctx_cached = list(num_cached[:num_contexts])
+        ctx_request_ids = list(attn_metadata.request_ids[:num_contexts])
+        ctx_prompt_lens = (
+            attn_metadata.seq_lens[:num_contexts]
+            + torch.as_tensor(ctx_cached, dtype=torch.int)).tolist()
+        # Strip the generation suffix from a mixed batch, but keep all
+        # context requests packed in one varlen FMHA submission.
+        md = TrtllmAttentionMetadata(
+            seq_lens=attn_metadata.seq_lens[:num_contexts],
+            request_ids=ctx_request_ids,
+            max_num_requests=num_contexts,
+            max_num_sequences=num_contexts,
+            num_contexts=num_contexts,
+            prompt_lens=ctx_prompt_lens,
+            max_num_tokens=sum(ctx_lens),
+            kv_cache_manager=attn_metadata.kv_cache_manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=ctx_cached,
+            ),
+            mapping=attn_metadata.mapping,
+            # KDA layers use the outer metadata's mamba_metadata; skip
+            # re-preparing it for the derived MLA-only metadata.
+            mamba_metadata=False,
+            enable_flash_mla=getattr(attn_metadata, "enable_flash_mla",
+                                     False),
+        )
+        md.prepare()
+        rt.ctx_rt = KimiK3MLARuntimeInputs(
+            metadata=md,
+            request_ids=ctx_request_ids,
+            seq_lens=ctx_lens,
+            num_cached_tokens_per_seq=ctx_cached,
+        )
 
     if batch_size - num_contexts > 0:
         rt.gen_rt = KimiK3MLARuntimeInputs(
@@ -1896,15 +1889,16 @@ class KimiMLARuntime(nn.Module):
     ) -> torch.Tensor:
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         outputs: List[torch.Tensor] = []
-        offset = 0
-        for ctx_rt, ctx_len in zip(mla_rt.ctx_rts, mla_rt.ctx_lens):
+        if num_ctx_tokens > 0:
+            assert mla_rt.ctx_rt is not None
             outputs.append(
-                self.mixer.forward_prefill(hidden_states[offset : offset + ctx_len], ctx_rt)
-            )
-            offset += ctx_len
-        assert offset == num_ctx_tokens, f"MLA context split mismatch: {offset} != {num_ctx_tokens}"
+                self.mixer.forward_prefill(
+                    hidden_states[:num_ctx_tokens], mla_rt.ctx_rt))
         if hidden_states.shape[0] > num_ctx_tokens:
-            outputs.append(self.mixer.forward_decode(hidden_states[num_ctx_tokens:], mla_rt.gen_rt))
+            assert mla_rt.gen_rt is not None
+            outputs.append(
+                self.mixer.forward_decode(hidden_states[num_ctx_tokens:],
+                                          mla_rt.gen_rt))
         out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
@@ -2307,6 +2301,18 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
         prefix = "language_model." if any(k.startswith("language_model.") for k in weights) else ""
 
+        # The checkpoint stores every MLA KV-B head as interleaved [K | V]
+        # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
+        # instead, so context can project directly into the FMHA layout and
+        # absorbed decode can take zero-copy K/V views. A repeated load first
+        # marks the incoming bytes as checkpoint-layout data again.
+        mla_mixers = [
+            layer.self_attn.mixer for layer in self.model.layers
+            if not getattr(layer, "is_kda", True)
+        ]
+        for mixer in mla_mixers:
+            mixer.pre_reload_weights()
+
         params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
 
@@ -2559,6 +2565,15 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
         param_jobs = [(name, params[name]) for name in name_map]
         run_concurrently(load_param, param_jobs, num_workers=8)
+
+        # Run after every MLA TP slice / 96-to-128 padded tensor has landed.
+        # The transform rewrites the existing Parameter storage in place and
+        # is guarded, matching the staged DeepSeek MLA loading lifecycle.
+        for mixer in mla_mixers:
+            mixer.transform_weights()
+        logger.info(
+            f"Kimi K3: transformed {len(mla_mixers)} MLA KV-B projections "
+            "to grouped runtime layout")
 
         # ---- backend expert slots: file-grouped streaming ----
         # The shared lazy ``weights`` dict keeps every shard mmapped for the

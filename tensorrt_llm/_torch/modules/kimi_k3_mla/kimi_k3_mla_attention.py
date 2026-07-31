@@ -303,9 +303,11 @@ class KimiK3MLAAttention(nn.Module):
     """Kimi K3 MLA module — in-tree production version.
 
     Wraps the existing ``TrtllmAttention`` MLA backend for both context
-    and cached-decode paths (two separate backend instances to match
-    the production ``_torch/modules/mla.py`` context/generation split)
-    and adds K3's NoPE + output-gate deltas at the module boundary.
+    and cached-decode paths. Normal prefill uses an unabsorbed context
+    backend; decode uses an absorbed generation backend, with a second
+    trtllm-gen absorbed instance retained for multi-token fallback and
+    prefill A/B diagnostics. K3's NoPE + output-gate deltas stay at the
+    module boundary.
     Parameter names mirror HF ``KimiMLAAttention`` exactly so a
     random-weight parity test can use identity name mapping.
     """
@@ -345,6 +347,10 @@ class KimiK3MLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.apply_rotary_mutation = apply_rotary_mutation
         self.omit_output_gate_mutation = omit_output_gate_mutation
+        # The checkpoint stores per-head interleaved KV-B rows. Weight
+        # loading rewrites them to the DeepSeek-style runtime layout
+        # [all-heads K | all-heads V].
+        self._weights_transformed = False
 
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
         self.q_a_layernorm = RMSNorm(hidden_size=q_lora_rank, eps=rms_norm_eps, dtype=dtype)
@@ -365,27 +371,10 @@ class KimiK3MLAAttention(nn.Module):
         # NoPE — matches HF ``KimiMLAAttention`` which sets ``rotary_emb = None``.
         self.rotary_emb = None
 
-        # ------------------------------------------------------------------
-        # Backend construction — two named ``TrtllmAttention`` MLA
-        # instances that both use the absorbed MQA config (``head_dim =
-        # kv_lora_rank + qk_rope_head_dim``, ``num_kv_heads=1``).
-        # ------------------------------------------------------------------
-        # The pre-built C++ MLA CONTEXT FMHA cubin produces wrong
-        # attention on the K3 configuration (num_heads=96, headSize=192,
-        # headSizeV=128, SEPARATE_Q_K_V, BF16, SM100): 13 iterations of
-        # Python-only diagnostics pinned the divergence inside the cubin
-        # while eager PyTorch attention on the exact q_flat/k_flat/v_flat
-        # matches HF at cos>=0.9999. The C++ MLA GENERATION FMHA cubin,
-        # however, is correct for K3 (single-token decode passes at
-        # cos>=0.9999 in every run). We therefore route prefill through
-        # the multi-token / MTP-style generation FMHA: absorbed Q of
-        # length T, KV cache of length T populated by the same
-        # ``append_mla_latent_cache`` helper, and the ``generation_only``
-        # attention-input-type triggers the C++ generation FMHA with a
-        # causal mask that reduces to prefill semantics when
-        # ``kv_len == q_len == T``. Both backends are constructed with
-        # the absorbed config so the workspace/cache sizing matches what
-        # the generation FMHA expects.
+        # Context uses the normal unabsorbed MLA geometry (per-head
+        # Q/K/V); generation uses the absorbed MQA geometry. Keep a
+        # separate trtllm-gen absorbed backend for the diagnostic
+        # prefill A/B path and multi-token generation fallback.
         mla_params = kimi_k3_mla_backend_params(
             num_heads=num_heads,
             q_lora_rank=q_lora_rank,
@@ -423,11 +412,20 @@ class KimiK3MLAAttention(nn.Module):
             )
             gen_mla_backend = "trtllm-gen"
 
-        # Context backend: absorbed MQA path, head_dim = kv_lora +
-        # qk_rope, num_kv_heads=1. Called by ``forward_prefill`` with
-        # ``attention_input_type=generation_only`` and a T-query MTP
-        # causal mask so the working MLA generation FMHA handles context
-        # attention.
+        # Normal context backend: per-head Q/K/V, matching the regular
+        # MLA context path in ``modules/mla.py``.
+        self._backend_prefill = TrtllmAttention(
+            layer_idx=layer_idx,
+            num_heads=num_heads,
+            head_dim=qk_nope_head_dim + qk_rope_head_dim,
+            num_kv_heads=num_heads,
+            quant_config=quant_config,
+            mla_params=mla_params,
+            pos_embd_params=ctx_pos_embd_params,
+            flashinfer_mla_backend="trtllm-gen",
+        )
+        # Absorbed trtllm-gen backend retained for the prefill A/B path
+        # and multi-token generation fallback.
         self._backend_ctx = TrtllmAttention(
             layer_idx=layer_idx,
             num_heads=num_heads,
@@ -460,6 +458,7 @@ class KimiK3MLAAttention(nn.Module):
         # K3 NoPE contract — overwrite the actual cos/sin values with
         # identity while keeping the tensor SHAPE that the C++ kernel
         # expects. Freeze via ``_ensure_rope_table_size`` no-op.
+        _install_identity_rope_table(self._backend_prefill)
         _install_identity_rope_table(self._backend_ctx)
         _install_identity_rope_table(self._backend_gen)
 
@@ -472,51 +471,68 @@ class KimiK3MLAAttention(nn.Module):
         self.register_buffer("_mutation_rot", rot, persistent=False)
 
     # ------------------------------------------------------------------
-    # Absorbed weight views.
+    # Runtime KV-B weight layout and absorbed views.
     # ------------------------------------------------------------------
 
-    def _kv_b_absorb_split(
-        self,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (k_absorb, v_absorb) views into ``kv_b_proj.weight``.
+    def pre_reload_weights(self) -> None:
+        """Mark incoming KV-B bytes as checkpoint-layout data."""
+        self._weights_transformed = False
 
-        ``kv_b_proj`` maps ``kv_lora_rank`` → ``num_heads * (qk_nope + v_head_dim)``.
-        Its weight has shape ``[num_heads * (qk_nope + v_head_dim), kv_lora_rank]``
-        laid out **per-head interleaved**: the output ``[num_tokens, H, qk_nope
-        + v_head_dim]`` from HF's ``k_pass.view(key_shape)`` (see
-        ``modeling_kimi.py:474-476``) means the first dim of the weight steps
-        head-first, then within each head steps qk_nope then v_head_dim. So
-        the correct split is:
+    @torch.no_grad()
+    def transform_weights(self) -> None:
+        """Rewrite KV-B from HF interleaved rows to ``[all K | all V]``.
 
-        - ``weight.view(H, qk_nope + v_head_dim, kv_lora_rank)``
-        - ``k_absorb = weight_view[:, :qk_nope, :]``
-        - ``v_absorb = weight_view[:, qk_nope:, :]``
-
-        The previous split (``first H*n rows for K, next H*v rows for V``)
-        was incorrect and produced the wrong absorb weights, which is why
-        the cached-decode cos was ~0 vs HF.
+        DeepSeek MLA performs this conversion during checkpoint loading.
+        Keeping the grouped representation in the parameter itself lets the
+        context GEMM write the required combined KV backing directly, while
+        absorbed decode uses zero-copy K/V views of the same storage.
         """
-        w = self.kv_b_proj.weight
-        # The absorb views are static after weight load but were being
-        # re-materialized (.contiguous() copies) on every prefill AND
-        # decode forward — ~2x12.6 MB per MLA layer per step. Memoize on
-        # first non-meta use (weight load precedes the first forward;
-        # keyed on the weight storage pointer so a re-allocated weight
-        # refreshes it). DeepSeek's mla.py pre-materializes the same
-        # tensors once for the same reason.
-        cache = getattr(self, "_absorb_cache", None)
-        if cache is not None and w.device.type != "meta" and cache[0] == w.data_ptr():
-            return cache[1], cache[2]
+        if self._weights_transformed:
+            return
+
+        weight = self.kv_b_proj.weight
+        if weight.device.type == "meta":
+            raise RuntimeError("Kimi K3 MLA KV-B layout transform requires materialized weights")
+
         H = self.num_heads
         n = self.qk_nope_head_dim
         v = self.v_head_dim
         kv = self.kv_lora_rank
-        w_view = w.view(H, n + v, kv)
-        k_absorb = w_view[:, :n, :].contiguous()
-        v_absorb = w_view[:, n:, :].contiguous()
-        if w.device.type != "meta":
-            self._absorb_cache = (w.data_ptr(), k_absorb, v_absorb)
-        return k_absorb, v_absorb
+        weight_view = weight.view(H, n + v, kv)
+        grouped = torch.cat(
+            [
+                weight_view[:, :n, :].reshape(H * n, kv),
+                weight_view[:, n:, :].reshape(H * v, kv),
+            ],
+            dim=0,
+        ).contiguous()
+        weight.data.copy_(grouped)
+        self._weights_transformed = True
+
+    def post_load_weights(self) -> None:
+        """Apply the runtime layout after checkpoint loading."""
+        self.transform_weights()
+
+    def cache_derived_state(self) -> None:
+        """The runtime layout has no separate Python-side cache."""
+
+    def _kv_b_absorb_split(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return zero-copy K/V absorb views of grouped ``kv_b_proj``."""
+        if not self._weights_transformed:
+            raise RuntimeError("Kimi K3 MLA weights must be transformed after checkpoint loading")
+
+        weight = self.kv_b_proj.weight
+        H = self.num_heads
+        n = self.qk_nope_head_dim
+        v = self.v_head_dim
+        kv = self.kv_lora_rank
+        k_weight, v_weight = weight.split(
+            [H * n, H * v],
+            dim=0,
+        )
+        return k_weight.view(H, n, kv), v_weight.view(H, v, kv)
 
     # ------------------------------------------------------------------
     # Introspection helpers.
@@ -542,6 +558,7 @@ class KimiK3MLAAttention(nn.Module):
         names are copied; any purely-internal buffer on the K3 side
         (e.g. ``_mutation_rot``) is ignored. Shape mismatches raise.
         """
+        self.pre_reload_weights()
         dst: "dict[str, torch.Tensor]" = {}
         for name, p in self.named_parameters(recurse=True):
             dst[name] = p.data
@@ -572,6 +589,7 @@ class KimiK3MLAAttention(nn.Module):
                 )
             dstt.copy_(src.to(dtype=dstt.dtype, device=dstt.device))
             provenance[name] = (tuple(src.shape), str(src.dtype))
+        self.transform_weights()
         return provenance
 
     # ------------------------------------------------------------------
@@ -630,6 +648,73 @@ class KimiK3MLAAttention(nn.Module):
     # ------------------------------------------------------------------
     # Prefill (context) path.
     # ------------------------------------------------------------------
+
+    def _project_context_qkv(
+        self,
+        hidden_states_2d: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project normal context Q/K/V plus the latent cache payload.
+
+        The returned V is deliberately a non-contiguous view into the
+        combined grouped-by-dim KV projection. For K3 H96 its 2D stride
+        is ``(24576, 1)``, not the compact ``(12288, 1)``.
+        """
+        num_tokens = hidden_states_2d.shape[0]
+        q_nope, q_rot = self._project_q_unabsorbed(hidden_states_2d)
+        normed_kv, k_pe, latent_cache = self._project_kv_and_latent(hidden_states_2d)
+        q_rot_use, k_pe_use = self._maybe_rotate_qk(q_rot, k_pe)
+        assert k_pe_use is not None
+
+        q = torch.cat([q_nope, q_rot_use], dim=-1).reshape(
+            num_tokens,
+            self.num_heads * self.q_head_dim,
+        )
+
+        if not self._weights_transformed:
+            raise RuntimeError("Kimi K3 MLA weights must be transformed after checkpoint loading")
+        kv = self.kv_b_proj(normed_kv)
+        k_nope, v = kv.split(
+            [
+                self.num_heads * self.qk_nope_head_dim,
+                self.num_heads * self.v_head_dim,
+            ],
+            dim=-1,
+        )
+        k = torch.cat(
+            [
+                k_nope.view(num_tokens, self.num_heads, self.qk_nope_head_dim),
+                k_pe_use[:, None, :].expand(-1, self.num_heads, -1),
+            ],
+            dim=-1,
+        ).reshape(num_tokens, self.num_heads * self.q_head_dim)
+        return q, k, v, latent_cache.contiguous()
+
+    def forward_prefill(
+        self,
+        hidden_states: torch.Tensor,
+        rt: KimiK3MLARuntimeInputs,
+    ) -> torch.Tensor:
+        """Run K3 prefill through the normal unabsorbed context FMHA."""
+        num_tokens = hidden_states.shape[0]
+        q, k, v, latent_cache = self._project_context_qkv(hidden_states)
+        attn_out = self._backend_prefill.forward(
+            q,
+            k,
+            v,
+            rt.metadata,
+            forward_args=AttentionForwardArgs(
+                latent_cache=latent_cache,
+                attention_input_type=AttentionInputType.context_only,
+                attention_mask=PredefinedAttentionMask.CAUSAL,
+            ),
+        )
+        if isinstance(attn_out, tuple):
+            attn_out = attn_out[0]
+        attn_out = attn_out[:num_tokens].reshape(
+            num_tokens,
+            self.num_heads * self.v_head_dim,
+        )
+        return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
 
     def _project_absorbed_q(
         self,
@@ -690,29 +775,20 @@ class KimiK3MLAAttention(nn.Module):
         q_pe_3d = q_rot_use.reshape(num_tokens, self.num_heads, self.qk_rope_head_dim).contiguous()
         return q_fused_flat, q_pe_3d, latent_cache.contiguous()
 
-    def forward_prefill(
+    def _forward_prefill_absorbed_generation(
         self,
         hidden_states: torch.Tensor,
         rt: KimiK3MLARuntimeInputs,
     ) -> torch.Tensor:
-        """Prefill (context) path for K3 MLA.
+        """Diagnostic prefill path through absorbed generation FMHA.
 
         ``hidden_states`` shape ``[num_tokens, hidden_size]``.
         Returns ``[num_tokens, hidden_size]``.
 
-        Executes context attention through ``_backend_ctx.forward`` with
+        Retains the former production implementation for numerical A/B.
+        Executes attention through ``_backend_ctx.forward`` with
         ``attention_input_type=generation_only`` and a multi-token /
-        MTP-style causal mask. This is a documented, evidence-forced
-        deviation from the plan's naive ``forward_context_default``
-        prescription: the pre-built C++ MLA CONTEXT FMHA cubin returns
-        wrong attention on the K3 config (13 iterations of Python-only
-        module tweaks all settled in the cos ~= 0.4 band vs HF), while
-        the pre-built C++ MLA GENERATION FMHA cubin is proven correct
-        for K3 dims. Both cubins are part of the ``TrtllmAttention`` MLA
-        backend infrastructure and both use ``KVCacheManagerV2``, so
-        this remains an in-backend fix and satisfies Stage 2 AC2's
-        "``TrtllmAttention`` MLA backend path with ``KVCacheManagerV2``"
-        requirement without invoking any eager Python attention kernel.
+        MTP-style causal mask.
 
         Under an MTP causal mask with ``kv_len == q_len == T``, the
         query at position ``i`` sees KV positions ``[0, i]`` — which
