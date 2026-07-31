@@ -48,7 +48,7 @@ enum class BounceMsgType : std::uint16_t
 struct BounceMsgHeader
 {
     std::uint32_t magic;     // kMagic
-    std::uint16_t version;   // kVersion
+    std::uint16_t version;   // kBounceVersion
     std::uint16_t msgType;   // BounceMsgType
     std::uint64_t requestId; // WANT/GRANT/DATA/ACK
     std::uint64_t
@@ -60,10 +60,10 @@ struct BounceMsgHeader
     std::uint32_t aux;          // WANT: numChunks; 0 elsewhere
 };
 
-/// Credit = one variable-size receiver region the sender may RDMA-write into. `addr` is its
-/// absolute remote address, `len` its size (the chunk's packed bytes), `devId` the RECEIVER's GPU
-/// (so it works under non-symmetric device indices), and `regionHandle` a 64-bit opaque id (the
-/// receiver's arena offset) the sender echoes back in DATA so the receiver locates + frees it.
+/// Credit = permission to RDMA-write one chunk into a receiver arena allocation. `addr` is its
+/// absolute remote address, `len` is the chunk's packed transfer length (the backing buddy block may
+/// be larger), `devId` is the RECEIVER's GPU, and `regionHandle` is the receiver arena offset that
+/// the sender echoes in DATA so the receiver can locate and release the allocation.
 struct BounceCreditEntry
 {
     std::uint64_t addr;
@@ -97,16 +97,17 @@ static_assert(sizeof(BounceCreditEntry) == 24, "BounceCreditEntry must be 24 byt
 static_assert(sizeof(BounceScatterRun) == 36, "BounceScatterRun must be 36 bytes");
 
 inline constexpr std::uint32_t kBounceMagic = 0x424E4332U; // 'B''N''C''2'
-// v2: DATA scatter entries became strided RUNS (BounceScatterRun). decodeHeader rejects mismatched
-// versions, so a mixed-version pair degrades to leaseTimeout (deploy sender+receiver together).
+// v2: DATA scatter entries became strided RUNS (BounceScatterRun). The out-of-band capability
+// handshake checks this version before bounce is selected; decodeHeader also rejects a mismatched
+// control message defensively.
 inline constexpr std::uint16_t kBounceVersion = 2U;
 
 // ---- encode (each returns a self-contained blob: header + payload) ----
 /// WANT carries the per-chunk byte sizes the sender will write (the receiver allocates a region of
 /// each size as it grants) AND the sender's own bounce control endpoint. An EMPTY size list cancels.
 /// The endpoint lets the receiver self-bootstrap the reverse control path (addPeer the sender) so
-/// GRANT/ACK can flow back even though the disagg metadata exchange is one-directional — the KV
-/// sender loads our metadata, but we never load the sender's. Payload layout:
+/// GRANT/ACK can flow back when disaggregated serving exchanges metadata only from this sender to
+/// the receiver. Payload layout:
 ///   [count * u32 chunkBytes][u32 endpointLen][endpointLen bytes endpoint]
 /// decode via decodeWant.
 [[nodiscard]] std::string encodeWant(
@@ -149,5 +150,42 @@ inline constexpr std::uint16_t kBounceVersion = 2U;
 {
     return chunkBytes.empty();
 }
+
+// ---- handshake (out-of-band, travels in AgentDesc — NOT a control-channel message) ----
+
+/// Which transport carries the bounce control messages. Peers MUST agree — the WANT bootstrap
+/// payload differs between the two (a zmq endpoint vs serialized NIXL metadata).
+enum class BounceControlKind : std::uint8_t
+{
+    kZMQ = 0,
+    kNIXL_NOTIF = 1,
+};
+
+/// Bounce capability handshake, advertised in this agent's AgentDesc metadata. A peer that loads
+/// the metadata validates compatibility (BounceTransport::registerPeerHandshake) BEFORE ever
+/// engaging bounce toward us: incompatible (or absent) handshake -> that peer transparently uses
+/// the standard per-desc NIXL path instead of waiting for requestTimeoutMs.
+/// Compatibility is strict equality of wireVersion, controlKind and effective maxChunkSizeBytes.
+/// Worker/stream counts, timeouts, copy backends, allocation granularity and configured arena size
+/// are local settings and are not compared. The usable arena capacity is carried for diagnostics.
+struct BounceHandshake
+{
+    std::uint16_t wireVersion{kBounceVersion};              // control-message codec version; must match exactly
+    BounceControlKind controlKind{BounceControlKind::kZMQ}; // must match exactly
+    // The largest single allocation this agent's buddy arena can ever grant. Informational only:
+    // maxChunkSizeBytes below is already clamped to it before the handshake is generated.
+    std::uint64_t arenaUsableCapacityBytes{0};
+    // This agent's effective per-chunk cap after the arena-capacity clamp. Peers compare this field
+    // exactly, which also keeps their scatter-plan capacities consistent.
+    std::uint64_t maxChunkSizeBytes{0};
+    // Control-channel address: a zmq endpoint (kZMQ) or serialized NIXL metadata (kNIXL_NOTIF).
+    std::string endpoint;
+};
+
+/// Encode/decode the handshake blob carried in AgentDesc. decode returns false on a short blob,
+/// bad magic, or unknown handshake-format version — the caller then treats the peer as
+/// non-bounce-capable (fallback), never as an error.
+[[nodiscard]] std::string encodeHandshake(BounceHandshake const& handshake);
+[[nodiscard]] bool decodeHandshake(std::string const& blob, BounceHandshake& out);
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

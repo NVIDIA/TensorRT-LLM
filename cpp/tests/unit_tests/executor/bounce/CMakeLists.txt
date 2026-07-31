@@ -100,7 +100,7 @@ if(NIXL_ROOT)
     target_include_directories(bounceTransportTest PRIVATE ${BOUNCE_TEST_INCS})
     target_link_libraries(bounceTransportTest PRIVATE ${BOUNCE_TEST_LIBS})
 
-    # Boundary / failure-path + concurrency tests (R4/R5).
+    # Boundary, failure-path, and concurrency tests.
     add_gtest(bounceTransportFailureTest bounceTransportFailureTest.cpp)
     target_sources(bounceTransportFailureTest PRIVATE ${BOUNCE_REACTOR_SRCS})
     target_include_directories(bounceTransportFailureTest

@@ -123,8 +123,8 @@ std::pair<std::string, std::uint64_t> splitKey(std::string const& key)
 // host buffer (via planBufs()/appendSplitInto(): [srcs(n)|dsts(n)|sizes(n)]). Direction-agnostic
 // (gather or scatter); the data region (arena offset) is encoded into the srcs/dsts by the caller.
 // Two opt-in knobs (default off):
-//   - zeroCopy: skip the H2D of the plan arrays — the kernel reads them straight from pinned host via
-//     ctx->hostPinnedDev (saves a small copy; likely a loss for large n — PCIe reads in-kernel).
+//   - zeroCopy (default on): skip the H2D of the plan arrays — the kernel reads them straight from
+//     pinned host via ctx->hostPinnedDev, removing the H2D-then-kernel serialization.
 //   - cub: use cub::DeviceMemcpy::Batched (ctx->cubTemp workspace) instead of the custom kernel.
 // The two compose: arg source (scratch H2D vs pinned) x copy backend (custom vs cub).
 cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy, bool cub)
@@ -217,7 +217,7 @@ BounceReceiver::BounceReceiver(BounceContext& ctx)
 
 void BounceReceiver::startWorkers()
 {
-    std::uint32_t const workers = mCtx.cfg.scatterWorkers > 0 ? mCtx.cfg.scatterWorkers : 1;
+    std::uint32_t const workers = mCtx.cfg.scatterWorkerCount > 0 ? mCtx.cfg.scatterWorkerCount : 1;
     mWorkers.reserve(workers);
     for (std::uint32_t i = 0; i < workers; ++i)
     {
@@ -256,10 +256,10 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     {
         return;
     }
-    // Self-bootstrap the reverse control path. The disagg metadata exchange is one-directional — the
-    // KV sender loads OUR agent metadata (so it can WANT us), but we never load the sender's, so we'd
-    // have no DEALER to send GRANT/ACK back and every transfer would stall to leaseTimeout. The WANT
-    // carries the sender's bounce endpoint; register it here (addPeer is idempotent).
+    // Self-bootstrap the reverse control path. Disaggregated serving supports one-directional
+    // metadata exchange: the KV sender may load our agent metadata without us loading the sender's.
+    // In that case we have no reverse route for GRANT/ACK, so register the sender endpoint carried
+    // by WANT here (addPeer is idempotent).
     if (!endpoint.empty())
     {
         mCtx.channel->addPeer(peer, endpoint);
@@ -269,8 +269,9 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     {
         // Explicit cancel/abort (the sender failed or retracted): precisely free this flow's
         // granted-but-unwritten regions now — otherwise they stay held until peer loss and a
-        // long-running receiver leaks a window's worth per failed rid. Any region whose scatter is
-        // still running is deferred (flagged orphaned in mScattering, freed on completion).
+        // long-running receiver leaks up to one request's in-flight allocation cap per failed rid.
+        // Any region whose scatter is still running is deferred (flagged orphaned in mScattering,
+        // freed on completion).
         std::vector<std::uint64_t> deferred;
         mCtx.sendGrants(mCtx.scheduler.reclaimFlow(key, scatteringRegions(), deferred));
         for (auto off : deferred)
@@ -459,12 +460,11 @@ void BounceReceiver::scatterWorkerLoop()
         // times out). regionBytes==0 means the region wasn't allocated (stale) -> reject the whole job.
         std::uint64_t const arenaLo = mCtx.arena->baseAddr();
         auto const regionBase = arenaLo + job.offset;
-        std::uint64_t const regionHi = regionBase + job.regionBytes;
         bool srcInBounds = (job.regionBytes > 0 && regionBase + job.regionBytes <= arenaLo + mCtx.arena->bytes());
         // Scatter into the final dst, then wait so the data is at dst before we ACK. A bad source, a
         // failed launch, OR a stream error must NOT produce an ACK — an ACK tells the sender its KV
-        // data landed, so a false ACK here is silent corruption. On error we still free the region
-        // (below) but mark !ok so drainScatterDone skips the ACK; the sender then times out -> FAILURE.
+        // data landed, so a false ACK here is silent corruption. On error the worker sends no ACK,
+        // but the done queue still releases the region; the sender then times out -> FAILURE.
         cudaError_t launchErr = cudaErrorInvalidValue;
         {
             // Prep leg: bounds-check + plan-array build + kernel launch (host-side cost).
@@ -475,7 +475,7 @@ void BounceReceiver::scatterWorkerLoop()
             // parallelism. Exact-count pass first (it also validates every run stays inside THIS
             // flow's granted region), then fill the pinned plan buffers DIRECTLY (no intermediate
             // vectors). Piece counts come from the peer's DATA message — a peer built with a larger
-            // maxChunkBytes can carry more pieces than our pinned/scratch hold; reject rather than
+            // maxChunkSizeBytes can carry more pieces than our pinned/scratch hold; reject rather than
             // overflow (no launch -> no ACK -> the sender times out, never a false ACK).
             std::size_t const maxEntries = maxPlanEntries(ctx);
             std::uint64_t rawPieces = 0;
@@ -519,7 +519,7 @@ void BounceReceiver::scatterWorkerLoop()
                             splitBudget(idx, static_cast<std::size_t>(rawPieces - seen), maxEntries));
                     }
                 }
-                launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.zeroCopyArgs, mCtx.cfg.cubCopy);
+                launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments, mCtx.cfg.useCubCopy);
             }
             else if (srcInBounds && nTotal == 0)
             {
@@ -557,7 +557,7 @@ void BounceReceiver::scatterWorkerLoop()
         }
         {
             std::lock_guard<std::mutex> lk(mDoneMu);
-            mDone.push_back(ScatterDone{job.key, job.peer, job.rid, job.chunkIdx, job.offset, ok});
+            mDone.push_back(ScatterDone{job.key, job.offset});
         }
     }
 }
@@ -577,8 +577,8 @@ std::shared_future<TransferState> BounceSender::submit(
     BounceTransferPlan plan;
     {
         BounceNvtxScope planScope(kNvtxBuildPlan, "buildPlan nDesc=%zu", srcDescs.getDescs().size());
-        plan = BounceTransferPlan::build(srcDescs, dstDescs, mCtx.cfg.maxChunkBytes,
-            std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkBytes / 256ULL), !mCtx.cfg.noRunMerge);
+        plan = BounceTransferPlan::build(srcDescs, dstDescs, mCtx.cfg.maxChunkSizeBytes,
+            std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkSizeBytes / 256ULL), !mCtx.cfg.disableScatterRunMerging);
     }
     auto const numChunks = static_cast<std::uint32_t>(plan.numChunks());
 
@@ -618,7 +618,7 @@ std::shared_future<TransferState> BounceSender::submit(
     // Ask the receiver to grant a region for each chunk of this request flow. The WANT carries our
     // own control endpoint so the receiver can addPeer us and send GRANT/ACK back (self-bootstrap).
     mCtx.channel->sendTo(peer, encodeWant(rid, chunkBytes, mCtx.channel->localEndpoint()));
-    if (mCtx.cfg.eagerGather)
+    if (mCtx.cfg.enableEagerGather)
     {
         // Overlap the WANT->GRANT control round-trip with the gather: launch this request's first
         // chunks NOW instead of waiting for the GRANT (they were measured back-to-back at roughly
@@ -738,22 +738,21 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         bool const haveCredit = !req.pendingCredits.empty();
         if (!haveCredit)
         {
-            if (!mCtx.cfg.eagerGather)
+            if (!mCtx.cfg.enableEagerGather)
             {
                 break; // classic path: a chunk's gather starts only once its GRANT arrived
             }
-            if (req.posted.size() >= mCtx.cfg.effectiveWindow())
+            if (req.posted.size() >= mCtx.cfg.maxInflightChunksPerRequest)
             {
-                break; // eager depth cap: mirror the receiver's per-flow window
+                break; // cap eager gathers by this request's configured in-flight chunk limit
             }
         }
-        // Defensive pairing check BEFORE committing resources. Credits pair with chunks by FIFO order,
-        // and the receiver sizes each granted region to the chunkBytes[chunkIdx] in the WANT, so packedBytes
-        // always fits. But the control channel does NOT guarantee GRANT ordering (a reconnect can
-        // reorder messages), and a mispaired credit would make us RDMA-write packedBytes into a
-        // smaller granted region — overflowing into an adjacent flow's region on the peer (silent
-        // cross-flow corruption). Detect the mispair and abandon the flow (it then fails via
-        // checkTimeouts) rather than corrupt the peer.
+        // Defensive pairing check BEFORE committing resources. Credits pair with chunks by FIFO
+        // order, and the receiver sizes each granted region to chunkBytes[chunkIdx] in WANT, so
+        // packedBytes always fits when the channel honors its FIFO contract. A malformed or
+        // misordered GRANT would make us RDMA-write packedBytes into a smaller region, overflowing
+        // into an adjacent flow's region on the peer. Detect that protocol violation and abandon the
+        // flow (it then fails via checkTimeouts) rather than corrupt the peer.
         if (haveCredit && chunk.packedBytes > req.pendingCredits.front().len)
         {
             TLLM_LOG_WARNING(
@@ -813,7 +812,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
                 splitBudget(idx, nDesc - 1 - i, maxEntries));
         }
         // gather into the region (cfg knobs select the H2D-vs-zero-copy arg path + custom-vs-cub copy)
-        cudaError_t const gatherErr = launchPrepared(ctx, nTotal, mCtx.cfg.zeroCopyArgs, mCtx.cfg.cubCopy);
+        cudaError_t const gatherErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments, mCtx.cfg.useCubCopy);
         // Record an event for gather completion and DEFER the write. The gather must finish before
         // NIXL reads the region, but on a shared GPU the gather can be delayed behind model kernels
         // — blocking the IO thread on cudaStreamSynchronize here would stall the whole reactor
@@ -887,7 +886,7 @@ void BounceSender::drainPendingPosts()
     {
         // Retry parked credits, and (with eager gather) chunks that couldn't start earlier because
         // the arena/ExecPool/eager budget was exhausted — ACKs may have freed resources since.
-        if (!req.pendingCredits.empty() || (mCtx.cfg.eagerGather && req.nextPost < req.numChunks))
+        if (!req.pendingCredits.empty() || (mCtx.cfg.enableEagerGather && req.nextPost < req.numChunks))
         {
             pumpRequest(rid, req);
         }
@@ -1084,12 +1083,12 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
 
 void BounceSender::checkTimeouts()
 {
-    if (mCtx.cfg.leaseTimeoutMs <= 0)
+    if (mCtx.cfg.requestTimeoutMs <= 0)
     {
         return; // timeout disabled (e.g. tests that intentionally wait forever)
     }
     auto const now = std::chrono::steady_clock::now();
-    auto const limit = std::chrono::milliseconds(mCtx.cfg.leaseTimeoutMs);
+    auto const limit = std::chrono::milliseconds(mCtx.cfg.requestTimeoutMs);
     std::vector<std::uint64_t> stuck;
     {
         std::lock_guard<std::mutex> lk(mReqMu);
@@ -1105,8 +1104,8 @@ void BounceSender::checkTimeouts()
             auto it = mRequests.find(rid);
             if (it != mRequests.end())
             {
-                // Peer never granted / stalled (unreachable / not bounce-ready / congested).
-                // Fail the request so wait() returns FAILURE instead of hanging (R5).
+                // Peer never granted or stopped making progress (unreachable / not bounce-ready /
+                // congested). Fail the request so wait() returns FAILURE instead of hanging.
                 failRequest(rid, it->second);
             }
         }
@@ -1305,16 +1304,17 @@ BounceTransport::BounceTransport(std::string selfName, BounceConfig cfg, int dev
     , mSender(mCtx)
 {
     // A bounce chunk must fit a fully-drained arena, or its GRANT can never succeed and the flow
-    // stalls to leaseTimeout. The buddy allocator rounds usable capacity DOWN (to minBlock<<maxOrder)
-    // and rounds each request UP to a power of two, so the naive "maxChunkBytes <= arenaBytes" is NOT
-    // sufficient (e.g. a 96 MiB arena has only 64 MiB usable, so a 65 MiB chunk never fits). Clamp to
-    // the largest block the drained arena can actually hand out.
+    // stalls until requestTimeoutMs. The buddy allocator rounds usable capacity down and each allocation up
+    // to a power of two, so comparing maxChunkSizeBytes directly with arenaSizeBytes is insufficient
+    // (e.g. a 96 MiB arena has only 64 MiB usable, so a 65 MiB chunk never fits). Clamp to the largest
+    // block the drained arena can actually hand out.
     std::size_t const cap = mCtx.scheduler.arenaCapacity();
-    if (mCtx.cfg.maxChunkBytes > cap)
+    if (mCtx.cfg.maxChunkSizeBytes > cap)
     {
-        TLLM_LOG_WARNING("BounceTransport(%s): maxChunkBytes=%zu exceeds usable arena capacity=%zu; clamping to %zu",
-            mCtx.selfName.c_str(), static_cast<std::size_t>(mCtx.cfg.maxChunkBytes), cap, cap);
-        mCtx.cfg.maxChunkBytes = cap;
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): maxChunkSizeBytes=%zu exceeds usable arena capacity=%zu; clamping to %zu",
+            mCtx.selfName.c_str(), static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes), cap, cap);
+        mCtx.cfg.maxChunkSizeBytes = cap;
     }
     mReceiver.startWorkers();
     mIoThread = std::thread(&BounceTransport::ioLoop, this);
@@ -1354,6 +1354,72 @@ void BounceTransport::addPeer(std::string const& peer, std::string const& endpoi
     mCtx.channel->addPeer(peer, endpoint);
 }
 
+std::string BounceTransport::localHandshakeBlob() const
+{
+    BounceHandshake handshake;
+    handshake.wireVersion = kBounceVersion;
+    handshake.controlKind = mCtx.cfg.useNixlNotifications ? BounceControlKind::kNIXL_NOTIF : BounceControlKind::kZMQ;
+    handshake.arenaUsableCapacityBytes = mCtx.scheduler.arenaCapacity();
+    handshake.maxChunkSizeBytes = mCtx.cfg.maxChunkSizeBytes; // post-ctor-clamp effective value
+    handshake.endpoint = mCtx.channel->localEndpoint();
+    return encodeHandshake(handshake);
+}
+
+bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string const& blob)
+{
+    // Treat registration as replacement, not an additive update. A peer may be reloaded under the
+    // same name with bounce disabled or with changed settings; clear the previously validated route
+    // first so any missing/malformed/incompatible replacement immediately falls back to NIXL.
+    mCtx.channel->removePeer(peer);
+    {
+        std::lock_guard<std::mutex> lk(mPeerMu);
+        mHandshakedPeers.erase(peer);
+    }
+    if (blob.empty())
+    {
+        return false; // bounce not advertised by this peer
+    }
+
+    BounceHandshake handshake;
+    if (!decodeHandshake(blob, handshake))
+    {
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): peer %s advertised an unparsable bounce handshake -> bounce disabled for "
+            "this peer (NIXL fallback)",
+            mCtx.selfName.c_str(), peer.c_str());
+        return false;
+    }
+    auto const localControlKind
+        = mCtx.cfg.useNixlNotifications ? BounceControlKind::kNIXL_NOTIF : BounceControlKind::kZMQ;
+    // STRICT equality. maxChunkSizeBytes is compared on the effective (post-clamp) values both
+    // sides advertise; each side already clamped its own value to its usable arena capacity, so
+    // equality also guarantees our chunks always fit the peer's arena and its scatter scratch
+    // (sized for its own maxChunkSizeBytes). Local-only knobs (worker/stream counts, timeouts,
+    // copy backends, granularity, arena size) intentionally do NOT have to match.
+    if (handshake.wireVersion != kBounceVersion || handshake.controlKind != localControlKind
+        || handshake.maxChunkSizeBytes != mCtx.cfg.maxChunkSizeBytes)
+    {
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): peer %s bounce handshake incompatible (wireVersion %u vs %u, controlKind "
+            "%u vs %u, maxChunkSizeBytes %llu vs %zu) -> bounce disabled for this peer (NIXL fallback)",
+            mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned>(handshake.wireVersion),
+            static_cast<unsigned>(kBounceVersion), static_cast<unsigned>(handshake.controlKind),
+            static_cast<unsigned>(localControlKind), static_cast<unsigned long long>(handshake.maxChunkSizeBytes),
+            static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes));
+        return false;
+    }
+    mCtx.channel->addPeer(peer, handshake.endpoint);
+    std::lock_guard<std::mutex> lk(mPeerMu);
+    mHandshakedPeers.insert(peer);
+    return true;
+}
+
+bool BounceTransport::hasPeerHandshake(std::string const& peer) const
+{
+    std::lock_guard<std::mutex> lk(mPeerMu);
+    return mHandshakedPeers.count(peer) > 0;
+}
+
 void BounceTransport::forgetPeer(std::string const& peer)
 {
     // Drop the control-channel DEALER to this peer SYNCHRONOUSLY here (ControlChannel::removePeer is
@@ -1364,6 +1430,12 @@ void BounceTransport::forgetPeer(std::string const& peer)
     // freshly re-added dealer. A pending send to the now-removed peer is dropped (it is being
     // invalidated), which degrades any in-flight request to a FAILURE — never corruption.
     mCtx.channel->removePeer(peer);
+    {
+        // Also drop it from the bounce-capable set so the fast path stops engaging it immediately;
+        // a fresh loadRemoteAgent must re-validate its handshake.
+        std::lock_guard<std::mutex> lk(mPeerMu);
+        mHandshakedPeers.erase(peer);
+    }
     // The scheduler / request-table reclaim still runs on the IO thread (drainForgets) so that state
     // stays owned by a single thread. Safe to call from invalidateRemoteAgent.
     std::lock_guard<std::mutex> lk(mForgetMu);
@@ -1406,7 +1478,7 @@ void BounceTransport::ioLoop()
         // latency on the critical path; also keeps UCX progress driven). When fully idle (only
         // waiting on a control message), sleep up to 1ms so the IO thread doesn't busy-spin a core.
         // A request merely waiting for a GRANT (nothing posted yet) is NOT "busy", so a stalled /
-        // unreachable peer won't spin a core until leaseTimeout. Both checks are IO-thread-only.
+        // unreachable peer won't spin a core until requestTimeoutMs. Both checks are IO-thread-only.
         bool const busy = mSender.busy() || mReceiver.busy();
         int const timeoutMs = busy ? 0 : 1;
         bool work = false;

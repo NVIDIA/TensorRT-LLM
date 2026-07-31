@@ -26,7 +26,8 @@
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
-ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool zeroCopyArgs, bool cubCopy)
+ExecPool::ExecPool(
+    std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool useZeroCopyArguments, bool useCubCopy)
     : mDeviceId(deviceId)
 {
     TLLM_CHECK_WITH_INFO(count > 0, "ExecPool: count must be > 0");
@@ -35,7 +36,7 @@ ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int device
     // cub workspace size depends only on the buffer count -> size it once for the worst case (maxDescs);
     // per-call we re-query for the actual n (<= maxDescs, so <= this) and validate it fits.
     std::size_t cubTempBytes = 0;
-    if (cubCopy)
+    if (useCubCopy)
     {
         TLLM_CUDA_CHECK(batchedCopyCubTempBytes(static_cast<std::uint32_t>(maxDescsPerChunk), cubTempBytes));
     }
@@ -53,15 +54,14 @@ ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int device
         c.id = i;
         c.scratchBytes = scratchBytes;
         TLLM_CUDA_CHECK(cudaMalloc(&c.scratch, scratchBytes));
-        // zeroCopyArgs: map the pinned buffer into the device address space so the kernel can read the
-        // plan arrays in place (no H2D). cudaHostAllocMapped is otherwise a normal pinned buffer.
-        TLLM_CUDA_CHECK(
-            cudaHostAlloc(&c.hostPinned, scratchBytes, zeroCopyArgs ? cudaHostAllocMapped : cudaHostAllocDefault));
-        if (zeroCopyArgs)
+        // Map the pinned buffer when kernels should read plan arrays in place without an H2D copy.
+        TLLM_CUDA_CHECK(cudaHostAlloc(
+            &c.hostPinned, scratchBytes, useZeroCopyArguments ? cudaHostAllocMapped : cudaHostAllocDefault));
+        if (useZeroCopyArguments)
         {
             TLLM_CUDA_CHECK(cudaHostGetDevicePointer(&c.hostPinnedDev, c.hostPinned, 0));
         }
-        if (cubCopy && cubTempBytes > 0)
+        if (useCubCopy && cubTempBytes > 0)
         {
             TLLM_CUDA_CHECK(cudaMalloc(&c.cubTemp, cubTempBytes));
             c.cubTempBytes = cubTempBytes;
@@ -74,11 +74,8 @@ ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int device
 
 ExecPool::~ExecPool()
 {
-    // Select the device the resources live on before freeing — otherwise on a multi-GPU process the
-    // cudaFree/cudaStreamDestroy/cudaEventDestroy target whatever device is current on this thread.
-    // Select the owning device before freeing (multi-GPU: otherwise these target the thread's current
-    // device). A dtor can't throw, so use the project's warn-only cleanup check on every teardown call
-    // rather than discarding the result (matches tllmBuffers / cudaMemPool).
+    // Select the owning device before freeing; otherwise CUDA teardown targets the current device of
+    // this thread. A destructor cannot throw, so every cleanup uses the warn-only check.
     TLLM_CUDA_CHECK_WARN(cudaSetDevice(mDeviceId));
     for (auto& c : mCtxs)
     {
