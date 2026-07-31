@@ -566,7 +566,19 @@ class LoraLayer(torch.nn.Module):
         layer_idx: int,
         split_k: int,
     ) -> Optional[torch.Tensor]:
-        """Run the complete CUDA-graph LoRA path with a fixed split-K."""
+        """
+        Run the complete CUDA-graph LoRA path with a fixed split-K.
+
+        Args:
+            x: Input tensor
+            lora_params: CUDA Graph compatible LoRA parameters
+            layer_idx: Current layer index
+            split_k: Fixed split-K value chosen by the autotuner
+
+        Returns:
+            LoRA output tensor or None
+        """
+
         cuda_graph_params: CudaGraphLoraParams = lora_params.get(
             'cuda_graph_params')
         # Get layer-specific parameters
@@ -831,12 +843,9 @@ class _LoraGroupedGemmRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
+        # input args are not needed to check valid tactics
         del inputs, profile, kwargs
-        k_tiles = max(1, self.input_hidden_size // 64)
-        return [
-            split_k for split_k in _LORA_SPLIT_K_CANDIDATES
-            if split_k <= k_tiles
-        ]
+        return list(_LORA_SPLIT_K_CANDIDATES)
 
     def prepare_inputs(
         self,
@@ -844,7 +853,21 @@ class _LoraGroupedGemmRunner(TunableRunner):
         lora_params: Dict,
         cuda_graph_params: CudaGraphLoraParams,
     ) -> List[torch.Tensor]:
-        """Copy the LoRA parameters and pack the autotuner tensor inputs."""
+        """
+        Copy the LoRA parameters and pack the auto-tuner tensor inputs.
+
+        Args:
+            x: Input tensor
+            lora_params: LoRA parameters for eager mode
+            cuda_graph_params: CUDA graph params (also in lora_params)
+
+        Returns:
+            List of tensor input arguments for runner
+
+        Note: this method is needed because the auto-tuning runner
+        expects a list of tensors as its input, but the LoRA layer
+        stores some of them in lora_params and cuda_graph_params.
+        """
         self.lora_params = copy(lora_params)
         self.cuda_graph_params = copy(cuda_graph_params)
 
@@ -862,7 +885,19 @@ class _LoraGroupedGemmRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
     ) -> List[torch.Tensor]:
-        """Build one active-adapter problem for the requested token bucket."""
+        """
+        Build one active-adapter problem for the requested token bucket.
+
+        Args:
+            inputs: Input tensor
+
+        Returns:
+            List of tensor input arguments for runner
+
+        This method uses the local copy of lora_params in order to
+        create the list of tensor input arguments to be used by the
+        auto-tuner's forward.
+        """
         assert self.cuda_graph_params is not None
         assert self.layer_params is not None
 
@@ -909,6 +944,16 @@ class _LoraGroupedGemmRunner(TunableRunner):
         tactic: int = -1,
         **kwargs,
     ) -> torch.Tensor:
+        """
+        Perform one auto-tuner LoraLayer forward pass.
+
+        Args:
+            inputs: list of tensor input arguments
+            tactic: split-K value to be evaluated
+
+        Returns:
+            LoRA output tensor
+        """
         del kwargs
         assert self.lora_params is not None
         assert self.cuda_graph_params is not None
@@ -920,6 +965,9 @@ class _LoraGroupedGemmRunner(TunableRunner):
         cuda_graph_params.layer_params = {self.layer_key: layer_params}
         lora_params['cuda_graph_params'] = cuda_graph_params
 
+        # The list of tensor input arguments is re-packed
+        # in the local copies of lora_params and cuda_graph_params
+        # such that we can invoke _forward_cuda_graph_mode_impl().
         x = inputs[0]
         if len(inputs) > 1:
             cuda_graph_params.slot_ranks_host = (
