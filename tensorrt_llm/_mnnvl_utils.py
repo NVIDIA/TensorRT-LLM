@@ -374,7 +374,7 @@ class MnnvlMemory:
                     is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
                     if is_active:
                         active_links += 1
-            except pynvml.NVMLError_NotSupported:
+            except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
                 continue
         return (
             active_links == available_links and available_links > 0

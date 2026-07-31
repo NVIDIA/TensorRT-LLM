@@ -24,7 +24,7 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
 from tensorrt_llm.bindings.internal import \
     batch_manager as batch_manager_bindings
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
@@ -56,7 +56,8 @@ from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
+                                                _build_request_multimodal_input)
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -163,25 +164,6 @@ def _filter_piecewise_capture_num_tokens(
         if max_capturable_num_tokens < i <= max_num_tokens
     })
     return kept, unrecordable
-
-
-def _build_request_multimodal_input(
-        request: LlmRequest, cache_enabled: bool) -> Optional[MultimodalInput]:
-    # Skip building this input (and its `from_components` validation) when the cache is disabled.
-    if not cache_enabled or request.multimodal_hashes is None:
-        return None
-    # `multimodal_input` is consumed only by the encoder-cache key path
-    # (`MultimodalModelMixin._encoder_cache_keys`), which uses UUID-aware multimodal hashes
-    # internally. Although the `multimodal_uuids` are not exposed as an attribute, they remain in
-    # the backing C++ request for KV-cache block keys and cache events.
-    return MultimodalInput.from_components(
-        request.multimodal_hashes,
-        request.multimodal_positions,
-        request.multimodal_lengths,
-        mm_item_run_cu_offsets=request.multimodal_item_run_cu_offsets,
-        mm_run_positions=request.multimodal_run_positions,
-        mm_run_lengths=request.multimodal_run_lengths,
-    )
 
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
@@ -966,9 +948,9 @@ class PyTorchModelEngine(ModelEngine):
     @functools.cached_property
     def _mm_encoder_cache_enabled(self) -> bool:
         """Whether the multimodal encoder cache is active for this model."""
-        multimodal_config = self.model.model_config.multimodal_config
-        return (multimodal_config is not None
-                and multimodal_config.encoder_cache_max_bytes > 0)
+        model = self.model
+        return (isinstance(model, MultimodalModelMixin)
+                and model.encoder_cache_active)
 
     @property
     def is_warmup(self):
@@ -2113,6 +2095,21 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
+                    # The base object is not the only holder of the flag: every
+                    # graph captured during this pass cached its own SHALLOW COPY
+                    # of spec_metadata (create_cuda_graph_metadata -> copy.copy),
+                    # which inherited the flag. Those copies are reseated as the
+                    # live spec_metadata on every later replay, so leaving the
+                    # flag set there makes _scan_one_model_sampling overwrite
+                    # every serving request's sampling params with the synthetic
+                    # capture values (0.7 / 50 / 0.9). Clear them here -- after
+                    # the pass has finished capturing, so the flag was still in
+                    # effect for every capture that needed it.
+                    cleared = self.cuda_graph_runner.clear_capture_only_spec_state(
+                    )
+                    logger.info(
+                        f"Cleared capture-only sampling override from {cleared} "
+                        "cached CUDA graph spec metadata object(s).")
 
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
@@ -3363,8 +3360,11 @@ class PyTorchModelEngine(ModelEngine):
     def _prepare_multimodal_indices(self, input_ids: list[int]):
         input_ids = torch.tensor(input_ids, dtype=torch.int, device="cpu")
         vocab_size = self.model.config.vocab_size
-        # TODO: unify naming of mm_token_ids across models
-        mm_token_ids = getattr(self.model, "mm_token_ids", None)
+        # `multimodal_token_ids` is the common wrapper-model contract. Keep the legacy name as a
+        # fallback for models not yet migrated to `MultimodalModelMixin`.
+        mm_token_ids = getattr(self.model, "multimodal_token_ids", None)
+        if mm_token_ids is None:
+            mm_token_ids = getattr(self.model, "mm_token_ids", None)
 
         text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
             input_ids, vocab_size=vocab_size, mm_token_ids=mm_token_ids)
@@ -4677,7 +4677,9 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_params.encoder_event = mm_encoder_event
                 request.py_mm_encoder_event = None
             if multimodal_params.has_content():
-                # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
+                # TODO(TRTLLM-14726): Check the persistent MM encoder cache before H2D and avoid
+                # transferring raw encoder inputs for full hits in both regular and
+                # side-stream-prefetched paths.
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
                                             pin_memory=prefer_pinned(),
@@ -5568,6 +5570,16 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_draft_tokens)]
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
+            # The capture-only sampling override must never be live outside CUDA
+            # graph warmup: it replaces every request's sampling params with
+            # synthetic capture values. It leaked here once already (inherited by
+            # the cached graph metadata shallow copies), so assert rather than
+            # trust the teardown.
+            assert self.is_warmup or not getattr(
+                spec_metadata, '_force_non_greedy_for_capture', False
+            ), ("capture-only sampling override (_force_non_greedy_for_capture) "
+                "is set outside CUDA graph warmup; serving requests would be "
+                "silently decoded with the synthetic capture sampling params")
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())
