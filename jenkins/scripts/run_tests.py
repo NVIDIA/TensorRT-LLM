@@ -20,6 +20,7 @@ SLURM (slurm_run.sh) execution paths.
 """
 
 import argparse
+import collections
 import os
 import re
 import shlex
@@ -234,24 +235,56 @@ def render_test_list(test_db_list, working_dir, splits, group, perf_mode, durati
 # ---------------------------------------------------------------------------
 # Core pytest execution
 # ---------------------------------------------------------------------------
-def run_pytest(pytest_cmd, working_dir):
+def run_pytest(pytest_cmd, working_dir, tail_lines=0):
     """Execute a pytest command and return the exit code and duration.
 
     Args:
         pytest_cmd: The full pytest command string.
         working_dir: Working directory for pytest execution.
+        tail_lines: When > 0, stream output line-by-line via Popen, keep the
+            last N lines in a buffer, and return them as the third tuple
+            element.  Use for isolation tests so collection errors that
+            disappear between the session header and the summary line are
+            captured and can be re-printed in the [FAST FAILURE] banner.
 
     Returns:
-        Tuple of (exit_code, duration_seconds).
+        Tuple of (exit_code, duration_seconds, captured_tail: list[str]).
+        captured_tail is an empty list when tail_lines == 0.
     """
     print(f"Running pytest: {pytest_cmd}")
+    sys.stdout.flush()
     t0 = time.monotonic()
-    # Merge stderr into stdout so collection errors and other stderr output
-    # appear in the SLURM job log (which is tailed via stdout only).
+
+    if tail_lines > 0:
+        buf = collections.deque(maxlen=tail_lines)
+        # PYTHONUNBUFFERED=1 prevents pytest from block-buffering stdout when
+        # it detects a pipe (non-tty), which would otherwise delay or lose
+        # collection-error output before the process exits.
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        proc = subprocess.Popen(
+            pytest_cmd,
+            shell=True,
+            cwd=working_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            buf.append(line.rstrip("\n"))
+        proc.wait()
+        rc = proc.returncode
+        elapsed = time.monotonic() - t0
+        print(f"Pytest finished with exit code {rc} ({format_duration(elapsed)})")
+        return rc, elapsed, list(buf)
+
     result = subprocess.run(pytest_cmd, shell=True, cwd=working_dir, stderr=subprocess.STDOUT)
     elapsed = time.monotonic() - t0
     print(f"Pytest finished with exit code {result.returncode} ({format_duration(elapsed)})")
-    return result.returncode, elapsed
+    return result.returncode, elapsed, []
 
 
 # Isolation tests that finish in under this many seconds almost certainly
@@ -259,14 +292,24 @@ def run_pytest(pytest_cmd, working_dir):
 _FAST_FAILURE_THRESHOLD_SECS = 120
 
 
-def print_xml_failure_summary(xml_path):
+def print_xml_failure_summary(xml_path, tail_lines=None):
     """Parse a pytest result XML and print failure/error messages.
 
     Called after a fast isolation-test failure to surface the root cause
     without requiring manual inspection of the SLURM job log.
+
+    Args:
+        xml_path: Path to the pytest JUnit XML result file.
+        tail_lines: Optional list of captured pytest output lines.  Printed
+            when no XML is found (collection error) so the error is visible
+            in the [FAST FAILURE] banner even without a result file.
     """
     if not os.path.exists(xml_path):
         print("  [No result XML — pytest exited before generating results]")
+        if tail_lines:
+            print("  [Last pytest output (collection error likely above):]")
+            for line in tail_lines:
+                print(f"    {line}")
         return
     try:
         root = ET.parse(xml_path).getroot()
@@ -474,7 +517,7 @@ def check_and_rerun(
         csv_file = os.path.join(rerun_dir, f"rerun_report_{times}.csv")
 
         rerun_cmd = build_rerun_command(base_cmd, rerun_list, xml_file, csv_file, times - 1)
-        rc, _ = run_pytest(rerun_cmd, working_dir)
+        rc, _, _tail = run_pytest(rerun_cmd, working_dir)
 
         if os.path.exists(xml_file):
             rerun_xml_files.append(xml_file)
@@ -518,7 +561,7 @@ def run_regular_tests(
     result_xml = os.path.join(output_dir, "results.xml")
     all_xml_files = [result_xml]
 
-    rc, elapsed = run_pytest(pytest_cmd, working_dir)
+    rc, elapsed, _tail = run_pytest(pytest_cmd, working_dir)
 
     if rc != 0:
         print_phase_summary("REGULAR TESTS", 0, 1, elapsed)
@@ -590,7 +633,7 @@ def run_isolated_tests(
         csv_path = os.path.join(output_dir, f"report_isolated_{i}.csv")
 
         isolated_cmd = build_isolated_command(pytest_cmd, single_test_file, xml_path, csv_path)
-        rc, elapsed = run_pytest(isolated_cmd, working_dir)
+        rc, elapsed, pytest_tail = run_pytest(isolated_cmd, working_dir, tail_lines=200)
         all_xml_files.append(xml_path)
 
         if rc != 0:
@@ -601,7 +644,7 @@ def run_isolated_tests(
                     f"Likely failed before the test body ran (server not ready, "
                     f"collection error, etc.)."
                 )
-                print_xml_failure_summary(xml_path)
+                print_xml_failure_summary(xml_path, tail_lines=pytest_tail)
             print_banner(
                 f"RERUN — isolated test {i + 1}/{len(isolate_tests)}: {test_name}",
                 char="-",
