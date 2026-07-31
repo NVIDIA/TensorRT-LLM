@@ -286,7 +286,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 "use_resolution_template",
                 COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
             ),
-            use_system_prompt=extra_params.get("use_system_prompt", self.default_use_system_prompt),
+            # None = unset; forward() resolves it to the checkpoint default.
+            use_system_prompt=extra_params.get("use_system_prompt"),
             use_guardrails=extra_params.get("use_guardrails", True),
             enable_audio=extra_params.get("enable_audio", False),
             output_type=output_type,
@@ -646,7 +647,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         frame_rate: float = COSMOS3_720P_PARAMS["frame_rate"],
         use_duration_template: bool = COSMOS3_EXTRA_SPECS["use_duration_template"].default,
         use_resolution_template: bool = COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
-        use_system_prompt: bool = COSMOS3_EXTRA_SPECS["use_system_prompt"].default,
+        use_system_prompt: Optional[bool] = None,
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
         enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
         output_type: str = COSMOS3_EXTRA_SPECS["output_type"].default,
@@ -659,10 +660,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         signature default from an explicit argument, so on distilled
         checkpoints (which fix steps/guidance and reject anything else) direct
         callers must pass checkpoint-valid sampling values.
+
+        ``use_system_prompt=None`` means "unset": it resolves to the
+        checkpoint-declared default, so warmup and other direct callers build
+        the same prompt as served requests.
         """
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
+
+        if use_system_prompt is None:
+            use_system_prompt = self.default_use_system_prompt
 
         use_guardrails = use_guardrails and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
 

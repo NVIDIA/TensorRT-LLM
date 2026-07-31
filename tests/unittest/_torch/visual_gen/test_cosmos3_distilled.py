@@ -698,6 +698,32 @@ class TestDistilledConditioningAnchor:
             assert torch.all(latent_input[:, :, 0:1] == self.CLEAN + step * 1.5)
 
 
+def _forward_ready_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
+    """A pipeline stubbed just enough for forward() to run end to end."""
+    defaults = dict(
+        sampling=_distilled_policy(),
+        pipeline_config=SimpleNamespace(torch_dtype=torch.float32, visual_gen_mapping=None),
+        transformer=SimpleNamespace(
+            latent_channel_size=4,
+            reset_cache=lambda: None,
+            device=torch.device("cpu"),
+        ),
+        vae_scale_factor_temporal=4,
+        vae_scale_factor_spatial=16,
+        scheduler=SimpleNamespace(
+            set_timesteps=lambda *args, **kwargs: None,
+            config=SimpleNamespace(num_train_timesteps=1000),
+        ),
+    )
+    defaults.update(attrs)
+    pipeline = _bare_pipeline(**defaults)
+    pipeline._tokenize_prompt = lambda *args, **kwargs: (
+        torch.ones(1, 4, dtype=torch.long),
+        torch.ones(1, 4, dtype=torch.long),
+    )
+    return pipeline
+
+
 class TestForwardConditioningWiring:
     """forward() must hand the denoise loop the anchor exactly when the
     checkpoint is distilled and the request carries image conditioning."""
@@ -705,26 +731,8 @@ class TestForwardConditioningWiring:
     T_LAT, H_LAT, W_LAT = 2, 2, 2  # from num_frames=5, 32x32, scale 4/16
     CLEAN = 7.0
 
-    def _forward_ready_pipeline(self):
-        pipeline = _bare_pipeline(
-            sampling=_distilled_policy(),
-            pipeline_config=SimpleNamespace(torch_dtype=torch.float32, visual_gen_mapping=None),
-            transformer=SimpleNamespace(
-                latent_channel_size=4,
-                reset_cache=lambda: None,
-                device=torch.device("cpu"),
-            ),
-            vae_scale_factor_temporal=4,
-            vae_scale_factor_spatial=16,
-            scheduler=SimpleNamespace(
-                set_timesteps=lambda *args, **kwargs: None,
-                config=SimpleNamespace(num_train_timesteps=1000),
-            ),
-        )
-        pipeline._tokenize_prompt = lambda *args, **kwargs: (
-            torch.ones(1, 4, dtype=torch.long),
-            torch.ones(1, 4, dtype=torch.long),
-        )
+    def _wiring_pipeline(self):
+        pipeline = _forward_ready_pipeline()
         pipeline._encode_conditioning_video = lambda *args, **kwargs: torch.full(
             (1, 4, self.T_LAT, self.H_LAT, self.W_LAT), self.CLEAN
         )
@@ -754,7 +762,7 @@ class TestForwardConditioningWiring:
         )
 
     def test_i2v_request_wires_anchor_and_seeded_steps(self):
-        pipeline, captured = self._forward_ready_pipeline()
+        pipeline, captured = self._wiring_pipeline()
         self._forward(pipeline, image=torch.zeros(3, 32, 32))
 
         post_step_fn = captured["post_step_fn"]
@@ -769,7 +777,7 @@ class TestForwardConditioningWiring:
         assert torch.all(captured["latents"][:, :, 0:1] == self.CLEAN)
 
     def test_t2v_request_wires_no_anchor(self):
-        pipeline, captured = self._forward_ready_pipeline()
+        pipeline, captured = self._wiring_pipeline()
         self._forward(pipeline, image=None)
         assert captured["post_step_fn"] is None
 
@@ -816,16 +824,67 @@ class TestSystemPromptDefault:
         pipeline.infer(_fake_request("video", extra_params=extra_params))
         return captured["use_system_prompt"]
 
-    def test_infer_unset_key_uses_checkpoint_default(self):
+    def test_infer_passes_unset_key_through_as_none(self):
+        """forward() owns the resolution, so infer() must forward "unset"
+        rather than pre-resolving it — otherwise the two entry points can
+        drift apart again."""
         pipeline = _bare_pipeline(default_use_system_prompt=True)
-        assert self._captured_use_system_prompt(pipeline, {"output_type": "video"}) is True
+        assert self._captured_use_system_prompt(pipeline, {"output_type": "video"}) is None
 
-    def test_infer_explicit_false_preserved(self):
+    def test_infer_passes_explicit_false_through(self):
         pipeline = _bare_pipeline(default_use_system_prompt=True)
         got = self._captured_use_system_prompt(
             pipeline, {"output_type": "video", "use_system_prompt": False}
         )
         assert got is False
+
+    def _tokenized_use_system_prompt(self, pipeline, **forward_kwargs):
+        """Run forward() far enough to observe what it hands the tokenizer."""
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def fake_tokenize(prompt, max_sequence_length, use_system_prompt, system_prompt=None):
+            seen["value"] = use_system_prompt
+            raise _Stop
+
+        pipeline._tokenize_prompt = fake_tokenize
+        with pytest.raises(_Stop):
+            pipeline.forward(
+                prompt="x",
+                seed=0,
+                use_guardrails=False,
+                num_inference_steps=4,
+                guidance_scale=DISTILLED_GUIDANCE_SCALE,
+                **forward_kwargs,
+            )
+        return seen["value"]
+
+    def test_forward_unset_resolves_to_checkpoint_default(self):
+        """Direct forward() callers (warmup included) must build the same
+        prompt as served requests."""
+        pipeline = _forward_ready_pipeline(default_use_system_prompt=True)
+        assert self._tokenized_use_system_prompt(pipeline) is True
+
+    def test_forward_explicit_false_overrides_checkpoint_default(self):
+        pipeline = _forward_ready_pipeline(default_use_system_prompt=True)
+        assert self._tokenized_use_system_prompt(pipeline, use_system_prompt=False) is False
+
+    def test_forward_default_false_checkpoint_unchanged(self):
+        pipeline = _forward_ready_pipeline(default_use_system_prompt=False)
+        assert self._tokenized_use_system_prompt(pipeline) is False
+
+    def test_warmup_leaves_system_prompt_unset(self):
+        """_run_warmup must not pin the historical False: leaving it unset is
+        what lets forward() resolve the checkpoint default."""
+        pipeline = _bare_pipeline(sampling=_distilled_policy(), default_use_system_prompt=True)
+        captured = {}
+        pipeline.forward = lambda **kwargs: captured.update(kwargs)
+
+        pipeline._run_warmup(height=720, width=1280, num_frames=9, steps=4)
+
+        assert captured.get("use_system_prompt") is None
 
 
 class TestAudioWeightPresenceGuard:
