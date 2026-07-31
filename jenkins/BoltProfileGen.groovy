@@ -399,7 +399,13 @@ CONF
         # excludes startup/JIT. Forwarded as an in-container export -> reaches the
         # ranks for single-node agg workloads; multi-node also needs a
         # --container-env passthrough (follow-up).
-        export EXTRA_CONTAINER_EXPORTS='BOLT_FDATA_DIR=${fdataRoot}/${wl.name};BOLT_LLVM_DIR=${ws}/builds/llvm;TLLM_BOLT_CLEAR_COUNTERS=1'
+        # TRITON_CACHE_DIR / CUDA_CACHE_PATH: aws-dfw containers ship a dangling
+        # ~/.triton symlink (oci-hsg pre-provisioned the node-local target; aws-dfw
+        # does not), so Triton's os.makedirs('/root/.triton/cache') raises
+        # FileNotFoundError and the worker dies during warmup. Point the JIT caches
+        # at node-local /tmp (always exists, not a broken symlink) so makedirs
+        # succeeds. Cold per job -> JIT still happens in warmup (good for BOLT).
+        export EXTRA_CONTAINER_EXPORTS='BOLT_FDATA_DIR=${fdataRoot}/${wl.name};BOLT_LLVM_DIR=${ws}/builds/llvm;TLLM_BOLT_CLEAR_COUNTERS=1;TRITON_CACHE_DIR=/tmp/bolt-triton-cache;CUDA_CACHE_PATH=/tmp/bolt-cuda-cache'
         bash ${runDisagg} -c ${conf}
         # run_disagg records '<jobid>|<test_id>' lines; emit the (single) job id.
         cut -d'|' -f1 ${workDir}/slurm_jobs.txt | head -1
