@@ -3603,6 +3603,13 @@ class PyTorchModelEngine(ModelEngine):
 
         if ub_errors or manager_error is not None:
             self._userbuffers_shutdown_failed = True
+        if ub_errors and manager_error is not None:
+            deallocation_details = "; ".join(str(error) for error in ub_errors)
+            raise RuntimeError(
+                "Failed to deallocate one or more userbuffers during "
+                f"PyTorchModelEngine shutdown ({deallocation_details}); "
+                "also failed to shut down the engine userbuffer manager "
+                f"({manager_error})") from ub_errors[0]
         if ub_errors:
             raise RuntimeError(
                 "Failed to deallocate one or more userbuffers during "
