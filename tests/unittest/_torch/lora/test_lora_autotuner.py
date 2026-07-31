@@ -56,10 +56,10 @@ def test_lora_split_k_runner_uses_token_buckets():
     assert profile[0][0] == 4
 
 
-def test_lora_split_k_runner_prunes_splits_larger_than_k_tiles():
+def test_lora_split_k_runner_returns_all_candidates():
     runner = _make_runner(input_hidden_size=256)
 
-    assert runner.get_valid_tactics([], None) == [1, 2, 4]
+    assert runner.get_valid_tactics([], None) == [1, 2, 4, 8, 16]
 
 
 def test_lora_layer_reuses_runner_across_cuda_graph_warmups(monkeypatch):
@@ -168,17 +168,20 @@ def test_lora_autotuner_hook_builds_single_active_slot():
         dtype=runner.dtype,
         device="cuda",
     )
-    runner.layer_params = SimpleNamespace(
+    layer_params = SimpleNamespace(
         d_b_ptrs=torch.zeros((2, 4), dtype=torch.int64, device="cuda"),
         d_b_prime_ptrs=torch.zeros((2, 4), dtype=torch.int64, device="cuda"),
         d_output_sizes=torch.tensor([128, 64], dtype=torch.int32, device="cuda"),
         d_output_sizes_offset=torch.tensor([0, 128], dtype=torch.int64, device="cuda"),
     )
-    runner.cuda_graph_params = SimpleNamespace(
+    cuda_graph_params = SimpleNamespace(
         slot_counts=torch.zeros(4, dtype=torch.int32, device="cuda"),
         slot_ranks=torch.zeros(4, dtype=torch.int32, device="cuda"),
         slot_offsets_full=torch.zeros(5, dtype=torch.int64, device="cuda"),
+        layer_params={runner.layer_key: layer_params},
     )
+    cuda_graph_params.get_layer_params = cuda_graph_params.layer_params.get
+    runner.lora_params = {"cuda_graph_params": cuda_graph_params}
 
     inputs = runner._prepare_synthetic_inputs([carrier])
     slot_counts, slot_ranks = inputs[1], inputs[2]
