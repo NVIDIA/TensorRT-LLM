@@ -958,17 +958,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
         torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
-    def test_cleanup_shuts_down_manager_after_legacy_userbuffer_error(
+    def test_shutdown_userbuffers_defers_legacy_error_until_manager_shutdown(
             self) -> None:
         engine = object.__new__(PyTorchModelEngine)
-        engine._cleanup_done = False
-        engine.model_loader = None
-        engine.model = Mock()
-        engine._release_cuda_graphs = Mock()
-        engine.input_processor = Mock()
-        engine.input_processor_with_hash = Mock()
         engine.ub_buffers = [Mock(addr=123)]
         engine._userbuffers_manager_initialized = True
+        engine._userbuffers_shutdown_failed = False
 
         legacy_error = RuntimeError("legacy userbuffer cleanup failed")
         with patch(
@@ -980,12 +975,41 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             with self.assertRaisesRegex(
                     RuntimeError,
                     "Failed to deallocate one or more userbuffers"):
-                engine.cleanup()
+                engine.shutdown_userbuffers()
 
         shutdown_manager.assert_called_once_with()
         self.assertFalse(engine._userbuffers_manager_initialized)
         self.assertEqual(len(engine.ub_buffers), 1)
-        self.assertFalse(engine._cleanup_done)
+        self.assertTrue(engine._userbuffers_shutdown_failed)
+        with self.assertRaisesRegex(RuntimeError, "cannot be retried safely"):
+            engine.shutdown_userbuffers()
+
+    def test_cleanup_does_not_enter_collective_userbuffer_shutdown(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine._cleanup_done = False
+        engine.model_loader = None
+        engine.model = Mock()
+        engine._release_cuda_graphs = Mock()
+        engine.input_processor = Mock()
+        engine.input_processor_with_hash = Mock()
+        engine.ub_buffers = [Mock(addr=123)]
+        engine._userbuffers_manager_initialized = True
+        engine._userbuffers_shutdown_failed = False
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.ub.ub_deallocate"
+        ) as deallocate, patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine."
+                "ub.shutdown_userbuffers_manager") as shutdown_manager, \
+                patch("tensorrt_llm._torch.pyexecutor.model_engine.release_gc"):
+            engine.cleanup()
+
+        deallocate.assert_not_called()
+        shutdown_manager.assert_not_called()
+        self.assertTrue(engine._userbuffers_manager_initialized)
+        self.assertEqual(len(engine.ub_buffers), 1)
+        self.assertTrue(engine._cleanup_done)
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:

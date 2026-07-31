@@ -324,6 +324,7 @@ class PyTorchModelEngine(ModelEngine):
         self.forward_pass_callable = None
         self.ub_buffers = None
         self._userbuffers_manager_initialized = False
+        self._userbuffers_shutdown_failed = False
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -2736,8 +2737,63 @@ class PyTorchModelEngine(ModelEngine):
             num_seq_slots=num_seq_slots)
         return self.spec_metadata
 
+    def shutdown_userbuffers(self) -> None:
+        """Collectively release userbuffers owned by this model engine.
+
+        This method must be called by a deterministic executor shutdown path
+        on every rank. It must never be called from ``__del__``, where Python
+        object destruction order is not rank-synchronous and MPI may already
+        be finalized.
+        """
+        if getattr(self, '_userbuffers_shutdown_failed', False):
+            raise RuntimeError(
+                "A previous userbuffer shutdown failed and cannot be retried "
+                "safely")
+
+        ub_buffers = getattr(self, 'ub_buffers', None)
+        manager_initialized = getattr(self, '_userbuffers_manager_initialized',
+                                      False)
+        if not ub_buffers and not manager_initialized:
+            return
+
+        ub_errors = []
+        if ub_buffers:
+            remaining_ub_buffers = []
+            for u in ub_buffers:
+                try:
+                    ub.ub_deallocate(u.addr)
+                except RuntimeError as e:
+                    # Retain the failed buffer for diagnostics. Physical VMM
+                    # teardown is not transactional and must not be retried.
+                    remaining_ub_buffers.append(u)
+                    ub_errors.append(e)
+            self.ub_buffers = remaining_ub_buffers or None
+
+        # CUDA graphs are released by the executor before this method. Collect
+        # their output tensors before checking that manager buffers are idle.
+        release_gc()
+        manager_error = None
+        if manager_initialized:
+            try:
+                ub.shutdown_userbuffers_manager()
+            except RuntimeError as error:
+                manager_error = error
+            else:
+                self._userbuffers_manager_initialized = False
+
+        if ub_errors or manager_error is not None:
+            self._userbuffers_shutdown_failed = True
+        if ub_errors:
+            raise RuntimeError(
+                "Failed to deallocate one or more userbuffers during "
+                "PyTorchModelEngine shutdown") from ub_errors[0]
+        if manager_error is not None:
+            raise RuntimeError(
+                "Failed to shut down the engine userbuffer manager"
+            ) from manager_error
+
     def cleanup(self) -> None:
-        """Release resources owned by this model engine.
+        """Release non-collective resources owned by this model engine.
 
         Tears down, in order:
 
@@ -2746,33 +2802,21 @@ class PyTorchModelEngine(ModelEngine):
         2. The model module reference.
         3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
         4. Input processors.
-        5. Legacy directly-owned userbuffers (``ub.ub_deallocate`` per
-           buffer), followed by the engine-scoped userbuffer manager pool.
-           Manager shutdown unregisters the pool's CUDA VMM regions.
 
         Idempotency:
             Subsequent calls are no-ops (guarded by ``_cleanup_done``).
-            The flag is set only at the end, so a partial cleanup that
-            raises mid-way will be retried on the next call.
-
-        Raises:
-            RuntimeError: If one or more userbuffer deallocations fail
-                (chained from the first error). All other steps are
-                best-effort and either succeed or leak silently with
-                their errors logged at warning level by callees.
 
         Called from:
-            - :meth:`PyExecutor.shutdown` (deterministic teardown).
             - :meth:`__del__` (best-effort fallback during garbage
               collection / interpreter shutdown).
+
+        Userbuffers are intentionally excluded because unregistering them
+        performs MPI collectives. Deterministic executor shutdown paths call
+        :meth:`shutdown_userbuffers` before dropping their engine references.
         """
         if getattr(self, "_cleanup_done", False):
             return
 
-        # Cleanup is not truly atomic: released CUDA/GMS resources cannot be
-        # rolled back.  Keep each handle live until its own release succeeds,
-        # so a failed cleanup can be retried without double-freeing resources
-        # that were already released.
         model_loader = getattr(self, "model_loader", None)
         if model_loader is not None:
             model_loader.cleanup()
@@ -2784,46 +2828,16 @@ class PyTorchModelEngine(ModelEngine):
         self.input_processor = None
         self.input_processor_with_hash = None
 
-        ub_buffers = getattr(self, 'ub_buffers', None)
-        ub_errors = []
-        if ub_buffers:
-            remaining_ub_buffers = []
-            for u in ub_buffers:
-                try:
-                    ub.ub_deallocate(u.addr)
-                except RuntimeError as e:
-                    # Keep failed buffers attached so a deterministic
-                    # cleanup() call can retry without double-freeing buffers
-                    # that were already deallocated successfully.
-                    remaining_ub_buffers.append(u)
-                    ub_errors.append(e)
-            self.ub_buffers = remaining_ub_buffers or None
-
-        # Release model weights and tensor-owned userbuffers before shutting
-        # down the engine-scoped userbuffer manager.
+        # Release model weights and other non-collective tensor resources.
         release_gc()
-        if self._userbuffers_manager_initialized:
-            ub.shutdown_userbuffers_manager()
-            self._userbuffers_manager_initialized = False
-
-        if ub_errors:
-            raise RuntimeError(
-                "Failed to deallocate one or more userbuffers during "
-                "PyTorchModelEngine cleanup") from ub_errors[0]
         self._cleanup_done = True
 
     def __del__(self) -> None:
         """Best-effort cleanup during garbage collection.
 
-        Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (raised
-        when one or more userbuffer deallocations fail) and
-        ``AttributeError`` (typical on partially-initialized engines
-        torn down during interpreter shutdown when module references
-        have already been cleared); both are logged and swallowed
-        because destructors cannot reliably surface exceptions.
-
-        Deterministic callers (``PyExecutor.shutdown``) should call
-        :meth:`cleanup` directly so they see any failure.
+        Delegates to the non-collective :meth:`cleanup`. Collective userbuffer
+        unregister is intentionally restricted to deterministic executor
+        shutdown paths.
         """
         try:
             self.cleanup()
