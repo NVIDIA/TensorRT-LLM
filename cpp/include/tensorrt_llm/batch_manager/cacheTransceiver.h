@@ -27,6 +27,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <atomic>
 #include <cstddef>
 #include <fstream>
 #include <future>
@@ -309,8 +310,39 @@ public:
     [[nodiscard]] std::vector<char> getSerializedDataTransceiverState() const override;
 
     [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
+    /// Return a human-readable dump of transceiver state for debugging hangs.
+    std::string getStatusDump() const;
 
 private:
+    struct StatusSnapshot
+    {
+        size_t senderAsyncActive{0};
+        size_t requesterAsyncActive{0};
+        size_t timedOutSenders{0};
+        size_t timedOutRequesters{0};
+        size_t cancelingSenders{0};
+        size_t cancelingRequesters{0};
+        size_t completedSenders{0};
+        size_t completedRequesters{0};
+        size_t failedSenders{0};
+        size_t failedRequesters{0};
+        size_t sendersAwaitingConsensus{0};
+        size_t requestersAwaitingConsensus{0};
+    };
+
+    class SyncRequesterStatusGuard
+    {
+    public:
+        explicit SyncRequesterStatusGuard(CacheTransceiver& transceiver);
+        ~SyncRequesterStatusGuard() noexcept;
+
+        SyncRequesterStatusGuard(SyncRequesterStatusGuard const&) = delete;
+        SyncRequesterStatusGuard& operator=(SyncRequesterStatusGuard const&) = delete;
+
+    private:
+        CacheTransceiver& mTransceiver;
+    };
+
     void initializeCommState();
 
     void setContextState(LlmRequest* llmRequest);
@@ -318,6 +350,7 @@ private:
     // Append one row per completed request to the gen-side transfer summary CSV. Opens the file
     // lazily on first use; expects timing to already be synced across ranks by the caller.
     void writeGenTransferSummary(std::vector<LlmRequest*> const& completedRequests);
+    void publishStatusSnapshot() noexcept;
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
@@ -338,6 +371,12 @@ private:
     std::unordered_set<LlmRequest::RequestIdType> mCompletedRequesterRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedRequesterRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mRequesterRequestsAwaitingConsensus;
+    std::atomic_size_t mSyncRequesterActive{0};
+    // Live transfer containers are owned by the executor worker thread. Synchronous receive threads update only the
+    // atomic count above. The executor publishes snapshots after state transitions, while the hang-detector thread only
+    // copies the snapshot under this short lock.
+    mutable std::mutex mStatusSnapshotMutex;
+    StatusSnapshot mStatusSnapshot;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;

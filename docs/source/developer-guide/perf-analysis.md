@@ -75,17 +75,16 @@ the complete request from text encoding through VAE decode. `predenoise`
 captures text encoding, latent preparation, and denoise-loop setup;
 `postdenoise` captures VAE decode and the remaining request work.
 
-Multi-stage pipelines (LTX-2 two-stage) run more than one denoise loop per
-request, which affects the per-loop modes. A numeric range captures the named
-steps of *every* stage, one trace file per stage. `postdenoise` arms after the
-**first** stage, so its window is a superset of VAE decode — on LTX-2 two-stage
-it also holds the spatial upsample and all of stage 2. No mode isolates decode
-alone there; `all` and `predenoise` behave normally.
+Two contracts worth knowing: a numeric range never extends past the denoise loop
+it selects (a stop index beyond the last step closes at the last step instead),
+and on a pipeline that runs more than one denoise loop per request, the per-loop
+modes apply to each loop — a numeric range writes one trace per loop, while
+`postdenoise` arms after the first loop rather than the last. All windows open at
+the pipeline's inference entry point, so executor-side request preparation falls
+outside them even though it counts toward the reported `generation` latency.
 
-A numeric range never extends past the denoise loop it selects. If its stop
-index is beyond the loop's last step — for example `0-4` against a stage that
-runs three steps — the window closes at the last step rather than running on
-into VAE decode. Use `postdenoise` or `all` to capture decode.
+For the per-mode specifics, see `parse_profile_range` in
+`tensorrt_llm/_torch/visual_gen/profiler.py`.
 
 ### Visualize the PyTorch profiler results
 

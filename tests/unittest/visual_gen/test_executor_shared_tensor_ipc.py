@@ -119,6 +119,12 @@ class _StubPipeline:
     def warmup_cache_key(self, height, width, num_frames):
         return (height, width, num_frames)
 
+    def prepare_request(self, req):
+        pass
+
+    def request_warmup_cache_key(self, req):
+        return (req.params.height, req.params.width, req.params.num_frames)
+
     def infer(self, req):
         return PipelineOutput(video=_expected_video(), frame_rate=24.0)
 

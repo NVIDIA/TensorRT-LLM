@@ -9,6 +9,8 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
+    MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -72,6 +74,30 @@ class DummyModel(torch.nn.Module):
         self.recorded_position_ids = kwargs["position_ids"]
         batch_size = input_ids.size(0)
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
+
+
+class DummyMultimodalIndexModel(torch.nn.Module):
+
+    class Config:
+        vocab_size = 100
+
+    config = Config()
+
+    @property
+    def multimodal_token_ids(self) -> torch.Tensor:
+        return torch.tensor([90, 91], dtype=torch.int32)
+
+
+class DummyLegacyMultimodalIndexModel(MultimodalModelMixin, torch.nn.Module):
+
+    class Config:
+        vocab_size = 100
+
+    config = Config()
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return torch.tensor([90, 91], dtype=torch.int32)
 
 
 class DummyModelEngine(PyTorchModelEngine):
@@ -149,6 +175,26 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
+
+    def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyMultimodalIndexModel()
+
+        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
+            [1, 90, 2, 91, 3])
+
+        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
+        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
+
+    def test_prepare_multimodal_indices_uses_legacy_token_ids(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+
+        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
+            [1, 90, 2, 91, 3])
+
+        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
+        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
