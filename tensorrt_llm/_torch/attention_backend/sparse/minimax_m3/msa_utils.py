@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ MSA_REQUIRED_HEAD_DIM = 128
 _MSA_PYTHON_RELPATH = Path("3rdparty") / "MSA" / "python"
 
 
+@functools.lru_cache(maxsize=1)
 def _find_msa_python_dir() -> Optional[Path]:
     """Locate the fmha_sm100 package dir by walking up from this file.
 
@@ -61,6 +63,7 @@ _MSA_PATCH_MARKERS = (
 )
 
 
+@functools.lru_cache(maxsize=1)
 def _require_msa_patch() -> None:
     """Fail fast if the loaded fmha_sm100 is missing the downstream patch.
 
