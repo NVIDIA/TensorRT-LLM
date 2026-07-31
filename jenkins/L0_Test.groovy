@@ -1196,7 +1196,14 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         // junit for the SAME typed failure the retry loop acts on. Deciding it only
         // here (after junit already ran) is what left retried-and-passed agent stages
         // UNSTABLE from an intermediate attempt's results.
+        // Classify each SLURM test-execution failure exactly once. The closure sets
+        // this when it runs (inside the task runner), so the outer catch reclassifies
+        // only failures that never reached it (image pull, node/agent bring-up) --
+        // avoiding a second querySlurmJobState round trip that could reach a different
+        // verdict as elapsed time and the job's state move on.
+        boolean slurmFailureClassified = false
         def classifySlurmFailure = { Throwable err ->
+            slurmFailureClassified = true
             // Measure elapsed from when the job was first observed RUNNING; fall back
             // to executeStartMs if the RUNNING stamp was never set.
             long timeoutBaselineMs = (jobRunningStartMs ?: executeStartMs) as long
@@ -1244,7 +1251,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             // failure -- just propagate it. Failures raised outside the task runner
             // (image pull, node/agent bring-up, etc.) were never labeled, so classify
             // them here on the agent.
-            throw (e instanceof TrtllmCiException ? e : classifySlurmFailure(e))
+            throw (slurmFailureClassified || e instanceof TrtllmCiException ? e : classifySlurmFailure(e))
         }
     } finally {
         // Resource cleanup must run even if SLURM metadata capture is interrupted.
