@@ -632,6 +632,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 draft_metadata.seq_lens = self.seq_lens
                 draft_metadata.num_contexts = self.num_contexts
             draft_metadata.seq_lens_kv = None
+            if not uses_shared_kv_cache:
+                for pool_id in set((self._vswa_layer_to_pool or {}).values()):
+                    setattr(draft_metadata, f"_vswa_pool_buf_{pool_id}", None)
             draft_metadata.__post_init__()
             if not uses_shared_kv_cache:
                 # Keep the existing speculative worker's backend-neutral

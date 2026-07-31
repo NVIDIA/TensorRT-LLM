@@ -1889,8 +1889,11 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif (model_config.spec_config._use_shared_kv_cache
-          and draft_config is not None):
+    elif model_config.spec_config._use_shared_kv_cache:
+        if draft_config is None:
+            raise ValueError(
+                "Shared-KV speculative decoding requires an external draft "
+                "model config.")
         return AutoModelForCausalLM.from_config(draft_config)
     elif spec_dec_mode.is_mtp_one_model():
         return MTPForCausalLM(model_config,

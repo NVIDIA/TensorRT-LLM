@@ -1652,7 +1652,7 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
         position_ids: torch.IntTensor,
         recurrent_hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        spec_metadata=None,
+        spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run one Q-only assistant step over a frozen target KV prefix."""
         if self.target_input_embeddings is None:
