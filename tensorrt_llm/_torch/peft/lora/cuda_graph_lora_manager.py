@@ -54,7 +54,7 @@ class CudaGraphLoraManager:
         self.max_tokens_per_seq = max_tokens_per_seq
         self.adapter_slot_manager = AdapterSlotManager(max_lora_size)
         self.lora_model_config = lora_model_config
-        self.overlap_lora_and_base = overlap_lora_and_base
+        self.lora_aux_stream = torch.cuda.Stream(device=device) if overlap_lora_and_base else None
         lora_target_modules = lora_model_config.lora_target_modules
         self.target_modules_ids: Optional[tuple[int, ...]] = (
             tuple(map(LoraManager.LORA_MODULE_IDS.__getitem__, lora_target_modules))
@@ -212,7 +212,7 @@ class CudaGraphLoraManager:
             "prompt_lens_cpu": attn_metadata.prompt_lens_cpu,
             "num_seqs": attn_metadata.num_seqs,
             "use_cuda_graph_mode": True,  # Flag to indicate new mode
-            "overlap_lora_and_base": self.overlap_lora_and_base,
+            "lora_aux_stream": self.lora_aux_stream,
         }
 
         return lora_params
