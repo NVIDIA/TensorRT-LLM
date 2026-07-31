@@ -125,6 +125,25 @@ class MultimodalEncoderRequestState:
         return cls(embedding_lengths=list(embedding_lengths),
                    recorded=[False] * len(embedding_lengths))
 
+    @classmethod
+    def assemble_full_embedding(cls, item_tensors: Dict[int, torch.Tensor],
+                                total_items: int) -> torch.Tensor:
+        """Assemble a request's complete per-item embeddings into one buffer.
+
+        For callers that already hold every item (the full-request encoder
+        path, where cache hits and freshly encoded misses are stitched at
+        once). Item scheduling instead builds the same buffer incrementally
+        through `record`, so both arrival patterns share one implementation
+        and one set of validation rules.
+
+        Every index in `[0, total_items)` must be present.
+        """
+        state = cls.from_embedding_lengths(
+            [item_tensors[i].shape[0] for i in range(total_items)])
+        for i in range(total_items):
+            state.record(i, item_tensors[i])
+        return state.embeddings
+
     def __post_init__(self) -> None:
         if len(self.embedding_lengths) != len(self.recorded):
             raise ValueError("MM encoder embedding lengths must have exactly "
