@@ -988,24 +988,24 @@ void oneshotMoeFinalizeAllreduceRMSNormOp(MoeFinalizeAllReduceRMSNormParams cons
 #undef LAUNCH_MNNVL_MOE_FINALIZE_KERNEL
 
     bool launched = false;
-    if (params.dType == nvinfer1::DataType::kBF16)
+    if (params.dType == tensorrt_llm::DataType::kBF16)
     {
-        if (params.scaleDType == nvinfer1::DataType::kFLOAT)
+        if (params.scaleDType == tensorrt_llm::DataType::kFLOAT)
         {
             launched = dispatchImpl((__nv_bfloat16*) nullptr, (float*) nullptr);
         }
-        else if (params.scaleDType == nvinfer1::DataType::kBF16)
+        else if (params.scaleDType == tensorrt_llm::DataType::kBF16)
         {
             launched = dispatchImpl((__nv_bfloat16*) nullptr, (__nv_bfloat16*) nullptr);
         }
     }
-    else if (params.dType == nvinfer1::DataType::kHALF)
+    else if (params.dType == tensorrt_llm::DataType::kHALF)
     {
-        if (params.scaleDType == nvinfer1::DataType::kFLOAT)
+        if (params.scaleDType == tensorrt_llm::DataType::kFLOAT)
         {
             launched = dispatchImpl((__nv_half*) nullptr, (float*) nullptr);
         }
-        else if (params.scaleDType == nvinfer1::DataType::kHALF)
+        else if (params.scaleDType == tensorrt_llm::DataType::kHALF)
         {
             launched = dispatchImpl((__nv_half*) nullptr, (__nv_half*) nullptr);
         }

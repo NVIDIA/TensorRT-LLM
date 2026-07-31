@@ -83,7 +83,7 @@ struct AllReduceFusionParams
 struct MoeFinalizeAllReduceRMSNormParams : public AllReduceFusionParams
 {
     int topK;                                //!< Number of selected routes per token
-    nvinfer1::DataType scaleDType;           //!< Data type of expertScaleFactor
+    tensorrt_llm::DataType scaleDType;       //!< Data type of expertScaleFactor
     void const* expertScaleFactor;           //!< Per-token route weights [numTokens, topK]
     int32_t const* expandedIdxToPermutedIdx; //!< Route-to-permuted-row map [numTokens, topK]
 };
