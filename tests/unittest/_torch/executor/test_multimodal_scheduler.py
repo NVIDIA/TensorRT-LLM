@@ -501,9 +501,9 @@ def test_prepare_multimodal_encoder_inputs_slices_before_device_transfer():
         MultimodalModelMixin(), [(multimodal_param, 1)]
     )
 
-    item_param, embedding_length, modality = encoder_inputs[0]
+    item_param, embedding_lengths, modality = encoder_inputs[0]
     assert modality == "image"
-    assert embedding_length == 3
+    assert embedding_lengths == [3]
     assert item_param.multimodal_data["image"]["pixel_values"].squeeze(1).tolist() == [2, 3, 4]
     assert multimodal_param.multimodal_data["image"]["pixel_values"].shape[0] == 5
 
@@ -542,7 +542,8 @@ def test_item_outputs_accumulate_on_request_and_release_raw_data(monkeypatch):
         def forward_multimodal_encoder_items(self, encoder_inputs):
             return [
                 torch.full((embedding_length, 2), float(embedding_length))
-                for _, embedding_length, _ in encoder_inputs
+                for _, embedding_lengths, _ in encoder_inputs
+                for embedding_length in embedding_lengths
             ]
 
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
@@ -642,10 +643,13 @@ def _cache_engine(cache, monkeypatch, *, supports_encoder_cache=True):
             return cache
 
         def forward_multimodal_encoder_items(self, encoder_inputs):
-            self.encoded_item_counts.append(len(encoder_inputs))
+            # Items, not input tuples: adjacent same-request same-modality
+            # items are sliced into one tuple.
+            self.encoded_item_counts.append(sum(len(lengths) for _, lengths, _ in encoder_inputs))
             return [
                 torch.full((embedding_length, 2), float(embedding_length))
-                for _, embedding_length, _ in encoder_inputs
+                for _, embedding_lengths, _ in encoder_inputs
+                for embedding_length in embedding_lengths
             ]
 
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
