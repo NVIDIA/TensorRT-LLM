@@ -114,6 +114,14 @@ if DETERMINISTIC and not ALLOW_BS_UNDER_DET:
 # deterministic mode; the big bs>1 measurement rounds leave it off to keep the
 # per-round JSON lean.
 DUMP_GENIDS = DETERMINISTIC or os.environ.get("INKLING_DUMP_GENIDS", "0") == "1"
+# feedback #24 §1.3 control: run the SAME items as a TEXT-ONLY prompt (strip the
+# single 200054 image placeholder + drop the image) so the shared decoder is
+# exercised at the identical bs / cap / overlap regime WITHOUT the vision path.
+# Purpose: settle whether the overlap-scheduler byte-divergence is vision-specific
+# (human's premise) or a modality-agnostic long-decode / bs>1 batch-composition
+# effect the short-generation text Gate-0 never exercised. Default-off: the vision
+# scoring path is byte-unchanged when unset.
+TEXT_ONLY = os.environ.get("INKLING_MMMU_TEXT_ONLY", "0") == "1"
 
 
 def _prov():
@@ -294,12 +302,24 @@ def main() -> int:
         # bs=1 for M1b: one generate call per item; batch for M1c (BS>1).
         batches = [recs[i : i + BS] for i in range(0, len(recs), BS)]
         for batch in batches:
-            prompts = [
-                TokensPrompt(
-                    prompt_token_ids=list(r["input_ids"]), multi_modal_data={"image": [_img(r)]}
-                )
-                for r in batch
-            ]
+            if TEXT_ONLY:
+                # Strip the single 200054 image placeholder and attach no image ->
+                # a pure text request. The mm model builds no MultimodalParams for a
+                # request without image data, so the fusion path is never entered and
+                # the shared text decoder runs (feedback #24 §1.3 modality control).
+                prompts = [
+                    TokensPrompt(
+                        prompt_token_ids=[t for t in r["input_ids"] if t != P.IMAGE_TOKEN_ID]
+                    )
+                    for r in batch
+                ]
+            else:
+                prompts = [
+                    TokensPrompt(
+                        prompt_token_ids=list(r["input_ids"]), multi_modal_data={"image": [_img(r)]}
+                    )
+                    for r in batch
+                ]
             outs = llm.generate(prompts, SamplingParams(max_tokens=MAXTOK, temperature=0.0))
             for r, out in zip(batch, outs):
                 it = items_by_id[r["id"]]
@@ -318,11 +338,17 @@ def main() -> int:
                 # certifies the image genuinely entered the fused stream. An item
                 # that produced 0 vision rows (image degraded to text-only) is a
                 # corrupted data point: it is flagged image_blind and fails the run.
-                num_patches = int(r.get("num_patches", 0))
-                n_ph = sum(1 for t in r["input_ids"] if t == P.IMAGE_TOKEN_ID)
-                image_used = (num_patches > 0) and (n_ph == 1)
-                if not image_used:
-                    n_image_blind += 1
+                if TEXT_ONLY:
+                    # No image is attached on purpose; the image-use assertion does
+                    # not apply. Mark the row text-only so it is never counted as a
+                    # corrupted image-blind data point.
+                    num_patches, n_ph, image_used = 0, 0, True
+                else:
+                    num_patches = int(r.get("num_patches", 0))
+                    n_ph = sum(1 for t in r["input_ids"] if t == P.IMAGE_TOKEN_ID)
+                    image_used = (num_patches > 0) and (n_ph == 1)
+                    if not image_used:
+                        n_image_blind += 1
                 finish_reason = getattr(out.outputs[0], "finish_reason", None)
                 gen_ids = [int(x) for x in out.outputs[0].token_ids]
                 text = tok.decode(gen_ids, skip_special_tokens=False)
@@ -420,6 +446,17 @@ def main() -> int:
         f"{'CLEAN' if n_image_blind == 0 else 'CORRUPTED'}",
         flush=True,
     )
+
+    if TEXT_ONLY:
+        # No SGLang MMMU reference exists for the text-only variant; the records
+        # (gen_ids per item) are already persisted above and are consumed by the
+        # fb27 overlap A/B comparator. Nothing else to score here.
+        print(
+            f"INKLING_MMMU_TEXT_ONLY_DONE n_items={len(trt_records)} "
+            f"n_gen_mean={sum(t['n_gen'] for t in trt_records) / max(len(trt_records), 1):.0f}",
+            flush=True,
+        )
+        return 0
 
     # ---- paired comparison vs the SGLang reference ------------------------
     # Two verdicts are computed and reported, kept deliberately separate:

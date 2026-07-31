@@ -108,6 +108,20 @@ _NON_LAYER_TEXT_KEYS: Tuple[str, ...] = (
     "model.llm.unembed.weight",
 )
 
+# MTP (Stage 9): each of the ``num_nextn_predict_layers`` next-N draft depths is
+# a ``model.mtp.layers.{d}`` block. Three draft-specific tensors (two RMSNorms +
+# the [2*hidden -> hidden] ``input_proj``) plus a ``transformer_block.`` that
+# reuses the decoder-layer attn/norm keys and the DENSE MLP keys (the MTP block
+# is always dense, never MoE). 20 keys/depth, all BF16 (built UNQUANTIZED -- the
+# tensors are absent from ``exclude_modules`` only because the quantizer never
+# touched them, so quant state must not be inferred from that list).
+INKLING_MTP_PREFIX = "model.mtp."
+_MTP_DRAFT_KEYS: Tuple[str, ...] = (
+    "embed_norm.weight",
+    "hidden_norm.weight",
+    "input_proj.weight",
+)
+
 
 def _experts_are_nvfp4(layer_idx: int, exclude_modules: Set[str]) -> bool:
     """Routed experts of an MoE layer are NVFP4 unless explicitly excluded."""
@@ -135,12 +149,44 @@ def inkling_expected_text_keys(config: InklingTextConfig,
     return keys
 
 
-def inkling_account_checkpoint(all_keys: Set[str], config: InklingTextConfig,
-                               exclude_modules: Set[str]) -> Dict[str, Set[str]]:
-    """Classify every checkpoint key into consumed-text / deferred / unaccounted.
+def inkling_expected_mtp_keys(mtp_config) -> Set[str]:
+    """Exact set of ``model.mtp.*`` checkpoint keys a full MTP loader consumes.
 
-    ``unaccounted`` and ``missing`` must both be empty for the text tower to be
-    fully and exactly consumed.
+    ``mtp_config.num_nextn_predict_layers`` draft depths, each 20 keys: the 3
+    draft-specific tensors (``embed_norm``/``hidden_norm``/``input_proj``) plus a
+    ``transformer_block.`` that reuses the decoder-layer attn/norm keys and the
+    DENSE MLP keys (the MTP block is always dense). ``mtp_config`` is an
+    :class:`InklingMTPConfig` (or ``None`` -> empty set). Every returned key is
+    BF16 in the checkpoint.
+    """
+    if mtp_config is None:
+        return set()
+    n = int(getattr(mtp_config, "num_nextn_predict_layers", 0))
+    keys: Set[str] = set()
+    for d in range(n):
+        pfx = f"{INKLING_MTP_PREFIX}layers.{d}."
+        for k in _MTP_DRAFT_KEYS:
+            keys.add(pfx + k)
+        for k in _ATTN_AND_NORM_KEYS:
+            keys.add(pfx + "transformer_block." + k)
+        for k in _DENSE_MLP_KEYS:
+            keys.add(pfx + "transformer_block." + k)
+    return keys
+
+
+def inkling_account_checkpoint(all_keys: Set[str], config: InklingTextConfig,
+                               exclude_modules: Set[str],
+                               mtp_config=None) -> Dict[str, Set[str]]:
+    """Classify every checkpoint key into consumed-text / consumed-mtp /
+    deferred / unaccounted.
+
+    ``unaccounted`` and ``missing`` must both be empty for the checkpoint to be
+    fully and exactly accounted. When ``mtp_config`` is supplied and ships draft
+    layers (Stage 9), the ``model.mtp.*`` keys are ACCOUNTED as ``consumed_mtp``
+    (and any missing MTP key is reported) rather than intentionally-deferred.
+    With the default ``mtp_config=None`` the behavior is unchanged -- MTP keys
+    stay in ``deferred`` and the text-tower accounting is identical -- so this
+    is a backward-compatible extension.
     """
     expected = inkling_expected_text_keys(config, exclude_modules)
     consumed_text = all_keys & expected
@@ -148,10 +194,20 @@ def inkling_account_checkpoint(all_keys: Set[str], config: InklingTextConfig,
         k
         for k in all_keys if k.startswith(INKLING_DEFERRED_PREFIXES)
     }
-    unaccounted = all_keys - consumed_text - deferred
     missing = expected - all_keys
+
+    expected_mtp = inkling_expected_mtp_keys(mtp_config)
+    if expected_mtp:
+        consumed_mtp = all_keys & expected_mtp
+        deferred = deferred - expected_mtp
+        missing = missing | (expected_mtp - all_keys)
+    else:
+        consumed_mtp: Set[str] = set()
+
+    unaccounted = all_keys - consumed_text - consumed_mtp - deferred
     return {
         "consumed_text": consumed_text,
+        "consumed_mtp": consumed_mtp,
         "deferred": deferred,
         "unaccounted": unaccounted,
         "missing": missing,

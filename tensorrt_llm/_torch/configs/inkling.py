@@ -184,6 +184,98 @@ class InklingTextConfig(PretrainedConfig):
         return [self.layer_num_kv_heads(i) for i in range(self.num_hidden_layers)]
 
 
+class InklingMTPConfig(PretrainedConfig):
+    """MTP (multi-token-prediction / next-N EAGLE draft) sub-config.
+
+    The checkpoint ships ``mtp_config = {num_nextn_predict_layers,
+    chain_hidden_post_norm, local_layer_ids}``. Each of the ``N`` draft depths is
+    one ``model.mtp.layers.{d}`` block: two RMSNorms (``embed_norm`` +
+    ``hidden_norm``), an ``input_proj`` Linear on ``concat(hidden_norm(hidden),
+    embed_norm(embed))`` (hidden ``2*hidden_size -> hidden_size``), and a
+    ``transformer_block`` that is an Inkling decoder layer forced to the DENSE MLP
+    (``w13_dn``/``w2_md``, never MoE).
+
+    Per-depth banded attention mirrors the trunk (SGLang ``mtp_swa_* ==`` trunk
+    ``swa_*``): draft depths listed in ``local_layer_ids`` are sliding-window
+    (SWA head geometry, window = ``mtp_local_extent`` default = trunk
+    ``sliding_window_size``); the other depths are full/global attention. All 160
+    MTP tensors are BF16 in the checkpoint and MUST be built UNQUANTIZED -- they
+    are absent from ``hf_quant_config.json`` ``exclude_modules`` only because the
+    quantizer never touched them, so quantization state must NOT be inferred from
+    the exclude list (mirrors SGLang forcing ``quant_config=None`` on the MTP
+    block). Geometry fields are injected from the sibling ``text_config`` by
+    :meth:`InklingConfig._as_mtp_config`.
+    """
+
+    model_type = "inkling_mtp"
+
+    def __init__(
+        self,
+        num_nextn_predict_layers: int = 8,
+        chain_hidden_post_norm: bool = False,
+        local_layer_ids: list[int] | None = None,
+        # geometry mirrored from the text tower (defaults are the real checkpoint
+        # values; InklingConfig injects the actual text_config geometry).
+        hidden_size: int = 6144,
+        num_attention_heads: int = 64,
+        num_key_value_heads: int = 8,
+        head_dim: int = 128,
+        swa_num_attention_heads: int = 64,
+        swa_num_key_value_heads: int = 16,
+        swa_head_dim: int = 128,
+        sliding_window_size: int = 512,
+        mtp_local_extent: int | None = None,
+        rms_norm_eps: float = 1e-6,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.num_nextn_predict_layers = int(num_nextn_predict_layers)
+        self.chain_hidden_post_norm = bool(chain_hidden_post_norm)
+        self.local_layer_ids = list(local_layer_ids) if local_layer_ids else []
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.swa_num_attention_heads = swa_num_attention_heads
+        self.swa_num_key_value_heads = swa_num_key_value_heads
+        self.swa_head_dim = swa_head_dim
+        self.sliding_window_size = sliding_window_size
+        self.mtp_local_extent = (
+            mtp_local_extent if mtp_local_extent is not None else sliding_window_size
+        )
+        self.rms_norm_eps = rms_norm_eps
+
+    # ---- per-depth banded-attention helpers (mirror InklingTextConfig) ----
+    @property
+    def _local_ids(self) -> set:
+        return set(self.local_layer_ids)
+
+    def is_local_depth(self, depth: int) -> bool:
+        """Draft depths in ``local_layer_ids`` are sliding-window (SWA)."""
+        return depth in self._local_ids
+
+    def depth_num_kv_heads(self, depth: int) -> int:
+        return (
+            self.swa_num_key_value_heads
+            if self.is_local_depth(depth)
+            else self.num_key_value_heads
+        )
+
+    def depth_num_heads(self, depth: int) -> int:
+        return (
+            self.swa_num_attention_heads
+            if self.is_local_depth(depth)
+            else self.num_attention_heads
+        )
+
+    def depth_head_dim(self, depth: int) -> int:
+        return self.swa_head_dim if self.is_local_depth(depth) else self.head_dim
+
+    def depth_window(self, depth: int) -> int | None:
+        """Sliding-window size for local draft depths; ``None`` for global depths."""
+        return self.mtp_local_extent if self.is_local_depth(depth) else None
+
+
 class InklingConfig(PretrainedConfig):
     """Top-level Inkling multimodal config (``inkling_mm_model``).
 
@@ -240,7 +332,19 @@ class InklingConfig(PretrainedConfig):
         # Retained verbatim; interpreted only in the Phase-3 multimodal stage.
         self.audio_config = self._as_config(audio_config)
         self.vision_config = self._as_config(vision_config)
-        self.mtp_config = self._as_config(mtp_config)
+        # MTP is surfaced as a typed InklingMTPConfig (Stage 9): the 3 checkpoint
+        # fields plus the per-depth banded-attention geometry pulled from the text
+        # tower (SGLang mtp_swa_* == trunk swa_*). ``None`` for a checkpoint with
+        # no mtp_config.
+        self.mtp_config = self._as_mtp_config(mtp_config, self.text_config)
+
+    @property
+    def has_mtp(self) -> bool:
+        """True iff the checkpoint ships MTP/next-N draft layers to load."""
+        return (
+            self.mtp_config is not None
+            and int(getattr(self.mtp_config, "num_nextn_predict_layers", 0)) > 0
+        )
 
     @staticmethod
     def _as_config(value):
@@ -252,3 +356,41 @@ class InklingConfig(PretrainedConfig):
                 setattr(cfg, k, v)
             return cfg
         return value
+
+    @staticmethod
+    def _as_mtp_config(value, text_config):
+        """Build a typed :class:`InklingMTPConfig`, injecting the text-tower
+        geometry the checkpoint's ``mtp_config`` blob omits (hidden size, head
+        counts, SWA geometry, window). Accepts the checkpoint dict, an existing
+        InklingMTPConfig (round-trip), or a plain blob; ``None`` stays ``None``.
+        """
+        if value is None or isinstance(value, InklingMTPConfig):
+            return value
+        if isinstance(value, dict):
+            blob = dict(value)
+        else:  # a PretrainedConfig / object blob
+            blob = {
+                k: v
+                for k, v in getattr(value, "__dict__", {}).items()
+                if not k.startswith("_")
+            }
+        geom = dict(
+            hidden_size=text_config.hidden_size,
+            num_attention_heads=text_config.num_attention_heads,
+            num_key_value_heads=text_config.num_key_value_heads,
+            head_dim=text_config.head_dim,
+            swa_num_attention_heads=text_config.swa_num_attention_heads,
+            swa_num_key_value_heads=text_config.swa_num_key_value_heads,
+            swa_head_dim=text_config.swa_head_dim,
+            sliding_window_size=text_config.sliding_window_size,
+            rms_norm_eps=text_config.rms_norm_eps,
+        )
+        # Only pass the MTP-defining fields from the blob; geometry always comes
+        # from the text tower so a partial round-trip cannot desync them.
+        mtp_fields = {
+            k: blob[k]
+            for k in ("num_nextn_predict_layers", "chain_hidden_post_norm",
+                      "local_layer_ids", "mtp_local_extent")
+            if k in blob
+        }
+        return InklingMTPConfig(**geom, **mtp_fields)

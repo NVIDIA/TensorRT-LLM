@@ -165,3 +165,118 @@ def test_checkpoint_tensor_shapes_match_geometry():
     # router weight covers routed + shared experts.
     shape, _ = _safetensors_shape(CHECKPOINT, "model.llm.layers.3.mlp.gate.weight")
     assert shape == [tc.n_routed_experts + tc.n_shared_experts, hidden]
+
+
+# --------------------------------------------------------------------------- #
+# Stage 9 MTP -- static-tier (validation_tier=static) load-accounting.         #
+# These pin the surfaced mtp_config + the exact consumed/deferred MTP weight    #
+# accounting against the REAL checkpoint index (no GPU), exactly mirroring the  #
+# text-tower accounting above. They are acceptance-criteria Stage 9 item 1:     #
+# all 8 draft depths load-accounted, dtypes recorded (BF16), the MTP block is   #
+# not silently quantized from exclude_modules, and the text weights remain      #
+# exactly accounted. The runtime module build + spec-decode wiring (criteria    #
+# 2-8, GPU tiers) are the next milestones and are NOT exercised here.           #
+# --------------------------------------------------------------------------- #
+
+
+def test_mtp_config_parses():
+    """InklingMTPConfig surfaces the checkpoint mtp_config + per-depth banding."""
+    from tensorrt_llm._torch.configs.inkling import (InklingConfig,
+                                                     InklingMTPConfig)
+    cfg = InklingConfig.from_pretrained(CHECKPOINT)
+    assert cfg.has_mtp is True
+    mtp = cfg.mtp_config
+    assert isinstance(mtp, InklingMTPConfig)
+    assert mtp.num_nextn_predict_layers == 8
+    assert mtp.chain_hidden_post_norm is False
+    assert mtp.local_layer_ids == [0, 2, 4, 5, 6, 7]
+    # Per-depth banded attention: depths in local_layer_ids are sliding-window
+    # (SWA: 16 kv-heads, window 512); depths 1 and 3 are full attention (8 kv).
+    tc = cfg.text_config
+    assert mtp.mtp_local_extent == tc.sliding_window_size == 512
+    for d in (0, 2, 4, 5, 6, 7):
+        assert mtp.is_local_depth(d) is True
+        assert mtp.depth_num_kv_heads(d) == tc.swa_num_key_value_heads == 16
+        assert mtp.depth_window(d) == 512
+    for d in (1, 3):
+        assert mtp.is_local_depth(d) is False
+        assert mtp.depth_num_kv_heads(d) == tc.num_key_value_heads == 8
+        assert mtp.depth_window(d) is None
+
+
+def test_mtp_weight_accounting():
+    """All 8 MTP draft depths (160 keys) are load-accounted; nothing missing or
+    unaccounted; the text tower stays exactly accounted."""
+    from tensorrt_llm._torch.configs.inkling import InklingConfig
+    from tensorrt_llm._torch.models.checkpoints.hf.inkling_weight_mapper import (
+        inkling_account_checkpoint, inkling_expected_mtp_keys)
+
+    cfg = InklingConfig.from_pretrained(CHECKPOINT)
+    tc = cfg.text_config
+    exclude = _load_exclude_modules(CHECKPOINT)
+    all_keys = _load_index_keys(CHECKPOINT)
+
+    # 8 depths x 20 keys/depth = 160 expected MTP keys.
+    expected_mtp = inkling_expected_mtp_keys(cfg.mtp_config)
+    assert len(expected_mtp) == 160
+    ckpt_mtp = {k for k in all_keys if k.startswith("model.mtp.")}
+    assert ckpt_mtp == expected_mtp  # exact match: none missing, none extra
+
+    acct = inkling_account_checkpoint(all_keys, tc, exclude,
+                                      mtp_config=cfg.mtp_config)
+    assert not acct["unaccounted"], sorted(acct["unaccounted"])[:10]
+    assert not acct["missing"], sorted(acct["missing"])[:10]
+    assert acct["consumed_mtp"] == expected_mtp
+    # With MTP accounted, `deferred` no longer holds any MTP key (audio/visual only).
+    assert all(k.startswith(("model.audio.", "model.visual."))
+               for k in acct["deferred"])
+    # Whole checkpoint is exactly partitioned: text + mtp + (audio/visual).
+    assert (len(acct["consumed_text"]) + len(acct["consumed_mtp"])
+            + len(acct["deferred"]) == len(all_keys))
+
+    # The text tower accounting is UNCHANGED by the MTP extension (backward-compat:
+    # calling without mtp_config keeps MTP in `deferred`, text identical).
+    acct_text = inkling_account_checkpoint(all_keys, tc, exclude)
+    assert acct_text["consumed_text"] == acct["consumed_text"]
+    assert not acct_text["unaccounted"] and not acct_text["missing"]
+
+
+def test_mtp_tensors_are_bf16_and_unquantized():
+    """Every MTP tensor is BF16 in the checkpoint and NONE is in exclude_modules
+    -- so the draft MUST be built UNQUANTIZED (quant state is not inferable from
+    the exclude list; the quantizer simply never touched the MTP block)."""
+    from tensorrt_llm._torch.configs.inkling import InklingConfig
+    from tensorrt_llm._torch.models.checkpoints.hf.inkling_weight_mapper import (
+        inkling_expected_mtp_keys)
+
+    cfg = InklingConfig.from_pretrained(CHECKPOINT)
+    exclude = _load_exclude_modules(CHECKPOINT)
+    expected_mtp = inkling_expected_mtp_keys(cfg.mtp_config)
+
+    # dtype recorded as loaded from the checkpoint: all 160 are BF16.
+    for key in sorted(expected_mtp):
+        _, dtype = _safetensors_shape(CHECKPOINT, key)
+        assert dtype == "BF16", f"{key} is {dtype}, expected BF16"
+
+    # not silently quantized: no MTP module path appears in exclude_modules
+    # (and, symmetrically, no exclude entry targets an mtp path).
+    assert not any("mtp" in e.lower() for e in exclude)
+
+
+def test_mtp_per_depth_banding_matches_checkpoint_shapes():
+    """The checkpoint tensor shapes encode the per-depth banding the surfaced
+    config derives: local depths carry 16 SWA kv-heads (wk_dv out = 2048), global
+    depths 1 and 3 carry 8 kv-heads (wk_dv out = 1024). input_proj is
+    [hidden, 2*hidden]."""
+    from tensorrt_llm._torch.configs.inkling import InklingConfig
+    cfg = InklingConfig.from_pretrained(CHECKPOINT)
+    mtp, hidden, hd = cfg.mtp_config, cfg.text_config.hidden_size, cfg.text_config.head_dim
+
+    for d in range(mtp.num_nextn_predict_layers):
+        wk = f"model.mtp.layers.{d}.transformer_block.attn.wk_dv.weight"
+        shape, _ = _safetensors_shape(CHECKPOINT, wk)
+        assert shape == [mtp.depth_num_kv_heads(d) * hd, hidden], (d, shape)
+        # input_proj consumes concat(hidden_norm(hidden), embed_norm(embed)).
+        ip = f"model.mtp.layers.{d}.input_proj.weight"
+        shape, _ = _safetensors_shape(CHECKPOINT, ip)
+        assert shape == [hidden, 2 * hidden], (d, shape)
