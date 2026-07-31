@@ -6428,7 +6428,8 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def test_nvfp4_dflash(self, mocker):
+    @pytest.mark.parametrize("dflash_attention_backend", ["VANILLA", "TRTLLM"])
+    def test_nvfp4_dflash(self, mocker, dflash_attention_backend):
         if get_sm_version() not in (100, 103):
             pytest.skip(
                 "Qwen3.6-35B-A3B NVFP4 DFlash test runs on SM100/SM103 only")
@@ -6448,8 +6449,10 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
         )
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=8)
-        spec_config = DFlashDecodingConfig(max_draft_len=7,
-                                           speculative_model=dflash_model_path)
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=7,
+            speculative_model=dflash_model_path,
+            attention_backend=dflash_attention_backend)
 
         with LLM(self.MODEL_PATH,
                  trust_remote_code=True,

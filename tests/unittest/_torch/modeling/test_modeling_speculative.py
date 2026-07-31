@@ -29,8 +29,10 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     DFlashForCausalLM,
     Eagle3ForCausalLM,
     SpecDecOneEngineForCausalLM,
+    get_draft_model,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.llmapi import DFlashDecodingConfig
 
 
 class _FakeDraftModel(nn.Module):
@@ -75,6 +77,30 @@ class _FakeEagle3Wrapper:
 
     def __init__(self, model):
         self.model = model
+
+
+@pytest.mark.parametrize(
+    ("architectures", "constructor_name"),
+    [
+        ([], "DFlashForCausalLM"),
+        (["LagunaForCausalLM"], "DFlashLagunaForCausalLM"),
+    ],
+)
+def test_get_draft_model_passes_dflash_attention_backend(architectures, constructor_name):
+    spec_config = DFlashDecodingConfig(max_draft_len=7, attention_backend="TRTLLM")
+    model_config = SimpleNamespace(spec_config=spec_config)
+    draft_config = SimpleNamespace(pretrained_config=SimpleNamespace(architectures=architectures))
+
+    with patch(
+        f"tensorrt_llm._torch.models.modeling_speculative.{constructor_name}"
+    ) as constructor:
+        result = get_draft_model(model_config, draft_config, None, None)
+
+    constructor.assert_called_once_with(
+        draft_config,
+        dflash_attention_backend="TRTLLM",
+    )
+    assert result is constructor.return_value
 
 
 @pytest.mark.parametrize("num_capture_layers", [2, 3], ids=["2_layers", "3_layers"])

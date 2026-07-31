@@ -37,6 +37,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
+                                          DFlashDecodingConfig,
                                           DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
@@ -328,6 +329,14 @@ def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
              max_draft_len=3,
              speculative_model="/path/to/draft/model"))
     assert isinstance(spec_cfg, Eagle3DecodingConfig)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("attention_backend", ["VANILLA", "TRTLLM"])
+def test_dflash_attention_backend_values(attention_backend):
+    spec_cfg = DFlashDecodingConfig(max_draft_len=7,
+                                    attention_backend=attention_backend)
+    assert spec_cfg.attention_backend == attention_backend
 
 
 @pytest.mark.cpu_only

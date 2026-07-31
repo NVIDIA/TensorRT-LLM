@@ -1794,6 +1794,16 @@
       "path": "speculative_config.allow_advanced_sampling"
     },
     {
+      "allowed_values": [
+        "VANILLA",
+        "TRTLLM"
+      ],
+      "annotation": "Literal['VANILLA', 'TRTLLM']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.attention_backend"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
