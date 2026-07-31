@@ -2778,7 +2778,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
     } finally {
         ensureStageResultNotUploaded(stageName + postTag)
         if (stageIsInterrupted) {
-            echo "Stage is interrupted, skip to upload test result."
+            recoverInterruptedStageResults(stageName, postTag)
         } else {
             // Temporarily disable to reduce the log size
             // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
@@ -2851,6 +2851,56 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         """
 
         echo "Finished test stage execution."
+    }
+}
+
+// Publish the test results that pytest had already written to disk before an
+// interrupt (fail-fast abort of a sibling stage, user abort or walltime timeout)
+// reached this stage.
+//
+// The pytest run writes ${stageName}/results.xml incrementally
+// (--periodic-junit), so at interrupt time that file already holds the real
+// pass/fail verdicts of every test that finished. Dropping it loses genuine
+// failures and coverage data from post-mortem triage for no benefit.
+//
+// Deliberately narrow: nothing is *generated* here. No "terminated unexpectedly"
+// testcase is synthesized for the test that was still in flight, and no
+// synthetic stage-fail XML is written. Only files that the normal, uninterrupted
+// code path had already produced are uploaded and reported. This mirrors what
+// uploadResults() (the multi-node SLURM path) already does for interrupted
+// stages, where the interrupt only gates synthetic XML generation and the real
+// results are still uploaded and passed to junit().
+//
+// Everything is best-effort. This runs inside the finally block of an in-flight
+// InterruptedException: an exception escaping here would replace that
+// InterruptedException and turn an aborted stage into a failed one, so the whole
+// body is bounded by a fresh timeout and wrapped in a catch-all.
+def recoverInterruptedStageResults(stageName, postTag)
+{
+    try {
+        timeout(time: 5, unit: 'MINUTES') {
+            def hasResults = sh(
+                script: "ls ${stageName}/results*.xml >/dev/null 2>&1",
+                returnStatus: true
+            ) == 0
+            if (!hasResults) {
+                echo "Stage is interrupted, no completed test result to recover."
+            } else {
+                // Attribute the recovered results to this stage, the same way
+                // finallyRunner() does for the uninterrupted path.
+                sh "cd ${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' results*.xml || true"
+                sh "ls -al ${stageName}/"
+                echo "Stage is interrupted, uploading the test results completed before the interrupt."
+                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
+                trtllm_utils.uploadArtifacts(
+                    "results-${stageName}${postTag}.tar.gz",
+                    "${UPLOAD_PATH}/test-results/"
+                )
+                junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+            }
+        }
+    } catch (Exception e) {
+        echo "Stage is interrupted, recovering completed test results failed and was ignored: ${e.getMessage()}"
     }
 }
 
