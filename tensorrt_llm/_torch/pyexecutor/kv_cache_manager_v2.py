@@ -60,13 +60,13 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerId,
-    LifeCycleId,
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
+    _introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -1217,24 +1217,39 @@ class KVCacheManagerV2(BaseResourceManager):
             for pool_id in range(self.num_pools):
                 layer_id = self.impl.layer_grouping[pool_id][0]
                 role_a, _ = self._get_pool_roles(pool_id)
-                kv_cache_pool_pointers_list.append(
-                    [
-                        self.impl.get_mem_pool_base_address(layer_id, role_a, PageIndexMode.SHARED),
-                        0,
-                    ]
+                key_base_addr = self.impl.get_mem_pool_base_address(
+                    layer_id, role_a, PageIndexMode.SHARED
                 )
+                kv_cache_pool_pointers_list.append([key_base_addr, 0])
                 if self.dtype == DataType.NVFP4:
+                    # The KEY/scale pointers are a (rep-layer, 0-offset) origin
+                    # against which each layer's kv_cache_pool_mapping offset is
+                    # resolved. The block-scale origin must reproduce the SAME
+                    # per-layer offset() as KEY, so mirror the KEY base for the
+                    # same representative layer and shift it back by that layer's
+                    # offset. For the base manager offset(rep) == 0, so this is
+                    # just the rep layer's scale base; for address-ranked
+                    # subclasses (MiniMax-M3) offset(rep) may be non-zero, and the
+                    # shift lands the origin on the pool's slot-0 scale address.
+                    # This keeps block_scale_offset == offset without depending on
+                    # the non-contractual layer_grouping order.
                     block_scale_role = self._get_block_scale_role(role_a)
-                    block_scale_pool_pointers_list.append(
-                        [
+                    if block_scale_role is not None:
+                        rep_offset = self._kv_pool_mapping_offset(layer_id, pool_id, key_base_addr)
+                        scale_stride = (
+                            self.get_layer_bytes_per_token(layer_id, block_scale_role)
+                            * self.kv_factor
+                            * self.tokens_per_block
+                        )
+                        scale_base_addr = (
                             self.impl.get_mem_pool_base_address(
                                 layer_id, block_scale_role, PageIndexMode.SHARED
                             )
-                            if block_scale_role is not None
-                            else 0,
-                            0,
-                        ]
-                    )
+                            - rep_offset * scale_stride
+                        )
+                    else:
+                        scale_base_addr = 0
+                    block_scale_pool_pointers_list.append([scale_base_addr, 0])
 
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 layer_group_id = self.impl.get_layer_group_id(layer_id)
@@ -1472,14 +1487,19 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
-        attr = self.impl._storage.get_buffer_attr(layer_id, role)
-        pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
-        lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
-        return (
-            f"role={str(role)}, pool_group_id={int(pool_group_id)}, "
-            f"lifecycle_id={int(attr.life_cycle_id)}, "
-            f"lifecycle={lifecycle}"
-        )
+        for pool_group in self.impl.pool_group_descs:
+            for variant in pool_group.slot_desc.variants:
+                for coalesced in variant.coalesced_buffers:
+                    for buffer_id in coalesced.buffer_ids:
+                        if int(buffer_id.layer_id) == int(layer_id) and str(buffer_id.role) == str(
+                            role
+                        ):
+                            return (
+                                f"role={role!s}, "
+                                f"pool_group_id={int(pool_group.pool_group_index)}, "
+                                f"layer_group_id={int(variant.layer_group_id)}"
+                            )
+        return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
@@ -1723,58 +1743,60 @@ class KVCacheManagerV2(BaseResourceManager):
         typical_step = None
         constraints = []
         if kv_cache_config.pool_ratio is None:
-            typical_seq_len = (
-                kv_cache_config.avg_seq_len
-                if kv_cache_config.avg_seq_len is not None
-                else self.max_seq_len
-            )
-            if typical_seq_len > self.max_seq_len:
+            typical_seq_len = self._get_typical_seq_len(kv_cache_config)
+            if typical_seq_len is not None and typical_seq_len > self.max_seq_len:
                 raise ValueError(
                     f"kv_cache_config.avg_seq_len ({typical_seq_len}) must be less than or "
                     f"equal to max_seq_len ({self.max_seq_len})"
                 )
 
-            # Model one context request and enough generation requests to fill
-            # max_batch_size without over-provisioning windowed cache pools.
-            context_capacity = (
-                self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
-            ) + self.num_extra_kv_tokens
-            generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
-            typical_step = BatchDesc(
-                [KVCacheDesc(capacity=context_capacity, history_length=0)]
-                + [
-                    KVCacheDesc(
-                        capacity=typical_seq_len,
-                        history_length=generation_history_length,
-                    )
-                ]
-                * (self.max_batch_size - 1)
-            )
-
-            # CUDA graph generation warmup uses one request at max_seq_len and
-            # enough minimal decode requests to fill max_batch_size.
-            min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
-            constraints.append(
-                BatchDesc(
-                    [KVCacheDesc(capacity=self.max_seq_len, history_length=self.max_seq_len - 1)]
-                    + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+            if typical_seq_len is not None:
+                # Model one context request and enough generation requests to fill
+                # max_batch_size without over-provisioning windowed cache pools.
+                context_capacity = (
+                    self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
+                ) + self.num_extra_kv_tokens
+                generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
+                typical_step = BatchDesc(
+                    [KVCacheDesc(capacity=context_capacity, history_length=0)]
+                    + [
+                        KVCacheDesc(
+                            capacity=typical_seq_len,
+                            history_length=generation_history_length,
+                        )
+                    ]
                     * (self.max_batch_size - 1)
                 )
-            )
 
-            # General and chunked-prefill warmup uses one fresh context request
-            # at the per-iteration token budget.
-            if self.max_num_tokens is not None:
+                # CUDA graph generation warmup uses one request at max_seq_len and
+                # enough minimal decode requests to fill max_batch_size.
+                min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
                 constraints.append(
                     BatchDesc(
                         [
                             KVCacheDesc(
-                                capacity=self.max_num_tokens + self.num_extra_kv_tokens,
-                                history_length=0,
+                                capacity=self.max_seq_len,
+                                history_length=self.max_seq_len - 1,
                             )
                         ]
+                        + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+                        * (self.max_batch_size - 1)
                     )
                 )
+
+                # General and chunked-prefill warmup uses one fresh context request
+                # at the per-iteration token budget.
+                if self.max_num_tokens is not None:
+                    constraints.append(
+                        BatchDesc(
+                            [
+                                KVCacheDesc(
+                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                                    history_length=0,
+                                )
+                            ]
+                        )
+                    )
 
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -1846,6 +1868,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
+        """Return the configured typical sequence length, if any."""
+        return kv_cache_config.avg_seq_len
 
     def _extra_buffers_per_layer(
         self, *, tokens_per_block: int
@@ -1956,18 +1982,19 @@ class KVCacheManagerV2(BaseResourceManager):
         num_heads: int = 1,
         head_dim: int,
         dtype: Union[torch.dtype, "DataType", str] = torch.bfloat16,
+        kv_layout: str = "NHD",
     ) -> Optional[torch.Tensor]:
         """Return a torch view over the V2-managed paged ``Role.INDEX_KEY``
         buffer for ``layer_idx``, or ``None`` when the layer has no
         INDEX_KEY buffer registered (e.g. dense layers in a sparse model,
         or non-local layers on the current PP rank).
 
-        The view has shape ``[num_pages, tokens_per_block, num_heads,
-        head_dim]`` where ``num_pages == impl.get_page_index_upper_bound(
-        layer_idx, Role.INDEX_KEY)``. Sparse modeling code addresses
-        entries by ``(page, within_page, head, dim)`` after decomposing
-        the per-token slot id used by the main paged K/V cache into
-        ``(page, within_page)``.
+        For ``kv_layout="NHD"``, the view has shape ``[num_pages,
+        tokens_per_block, num_heads, head_dim]``. For ``kv_layout="HND"``,
+        it has shape ``[num_pages, num_heads, tokens_per_block, head_dim]``.
+        Sparse modeling code decomposes the per-token slot id used by the
+        main paged K/V cache into ``(page, within_page)`` and indexes the
+        token axis selected by ``kv_layout``.
 
         Because :class:`BufferConfig` only carries an opaque byte ``size``
         per block, the dtype and head shape are caller-side contracts.
@@ -1986,20 +2013,30 @@ class KVCacheManagerV2(BaseResourceManager):
         propagate to the pool, and successive calls return views over
         the same backing storage.
         """
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(f"Unsupported kv_layout: {kv_layout}")
         if layer_idx not in self.layer_offsets:
             return None
         layer_offset = self.layer_offsets[layer_idx]
         try:
             addr = self.impl.get_mem_pool_base_address(layer_offset, Role.INDEX_KEY)
-            page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
-            page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
-            converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
-        except KeyError:
+        except (KeyError, IndexError):
             # INDEX_KEY not registered for this layer (default V2 manager
             # registers only K/V/scale; sparse subclasses register
             # INDEX_KEY only on sparse layers via
             # ``_extra_buffers_per_layer``).
+            #
+            # The python backend raises ``KeyError`` from the missing dict
+            # lookup; the C++ backend's ``getBufferAttr`` throws
+            # ``std::out_of_range`` for an unknown buffer id, which nanobind
+            # maps to ``IndexError``. Catch both so the "role not registered
+            # -> None" contract holds on either backend.
             return None
+        # INDEX_KEY is registered; the remaining lookups must succeed. Keep them
+        # outside the try so genuine failures surface instead of returning None.
+        page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
+        converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
 
         if isinstance(dtype, DataType):
             torch_dtype = binding_to_torch_dtype(dtype)
@@ -2040,21 +2077,21 @@ class KVCacheManagerV2(BaseResourceManager):
             f"{num_slots_total} is not divisible by scale = {scale}."
         )
         num_slots = num_slots_total // scale
+        if kv_layout == "NHD":
+            page_shape = [self.tokens_per_block, num_heads, head_dim]
+        else:
+            page_shape = [num_heads, self.tokens_per_block, head_dim]
 
         if scale == 1:
             # Non-coalesced INDEX_KEY pool: the per-buffer stride is
-            # the entire page, so ``[page_upper, tokens_per_block,
-            # num_heads, head_dim]`` is the correct contiguous view.
-            shape = [page_upper, self.tokens_per_block, num_heads, head_dim]
+            # the entire page, so either layout is a contiguous view.
+            shape = [page_upper, *page_shape]
             return convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, shape))
 
-        # Coalesced pool: build a ``[num_slots, scale, tokens_per_block,
-        # num_heads, head_dim]`` view at INDEX_KEY's base, then slice
-        # ``[:, 0]`` to extract this layer's INDEX_KEY data. The slice
-        # preserves dim-0 stride = ``scale * page_stride`` bytes, so
-        # ``view[s, w, h, d]`` lands on the correct byte for any
-        # ``s`` in [0, num_slots).
-        full_slot_shape = [num_slots, scale, self.tokens_per_block, num_heads, head_dim]
+        # Coalesced pool: include the buffers-per-slot dimension, then
+        # slice ``[:, 0]`` to extract this layer's INDEX_KEY data while
+        # preserving dim-0 stride = ``scale * page_stride`` bytes.
+        full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, full_slot_shape))
         return full_view[:, 0]
 
@@ -2549,13 +2586,16 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._stats_window_size(life_cycle.window_size)
 
     def _get_storage_statistics(self, cache_level: CacheLevel):
-        return self.impl._storage.get_statistics(cache_level)
+        return _introspection.storage_statistics(self.impl, cache_level)
 
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
-        pool_groups_by_life_cycle = [
-            self.impl._storage.get_pool_group_index(LifeCycleId(life_cycle_id))
-            for life_cycle_id in range(len(self.impl.layer_grouping))
-        ]
+        # life cycle (== layer group) -> pool group is static structure exposed by
+        # the public pool_group_descs API; no introspection needed.
+        pool_groups_by_life_cycle = {
+            int(variant.layer_group_id): int(pool_group.pool_group_index)
+            for pool_group in self.impl.pool_group_descs
+            for variant in pool_group.slot_desc.variants
+        }
 
         metadata: dict[int, tuple[int, Optional[int], str]] = {}
         for life_cycle_id, layer_ids in enumerate(self.impl.layer_grouping):

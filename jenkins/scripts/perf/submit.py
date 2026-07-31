@@ -21,8 +21,24 @@ import argparse
 import math
 import os
 import re
+import sys
 
 import yaml
+from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
+
+
+def _import_precheck_config(llm_src):
+    """Import the pure-stdlib precheck config module from the repo tree.
+
+    It is the single owner of the gate's enable policy and timeout formulas.
+    """
+    path = os.path.join(llm_src, "tests", "scripts", "perf-sanity", "cache_transceiver_precheck")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import precheck_config
+
+    return precheck_config
+
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
@@ -475,6 +491,13 @@ def main():
         help="1-indexed split group id. Selects the N-th test from the test list.",
     )
     parser.add_argument("--stage-name", default="", help="Stage name (for logging / GPU detect)")
+    parser.add_argument(
+        "--cluster-name",
+        default="",
+        help="Slurm cluster name as resolved by the Jenkins pipeline "
+        "(bloom SlurmPartition.clusterName, e.g. gcp-nrt, aws-cmh). "
+        "Used with the GPU type to pick UCX env settings.",
+    )
 
     args = parser.parse_args()
 
@@ -519,8 +542,7 @@ def main():
     ) = get_pytest_commands(script_prefix_lines, runtime_mode)
     test_output_dir = get_test_output_dir(script_prefix_lines, test_case_name)
 
-    is_gb300 = "GB300" in args.stage_name.upper()
-    is_b200 = "B200" in args.stage_name.upper() and "GB200" not in args.stage_name.upper()
+    gpu_type = gpu_type_from_stage_name(args.stage_name)
 
     if runtime_mode == "aggregated":
         # Aggregated (incl. ctx_only): single pytestCommand built from the
@@ -582,12 +604,8 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size} {gen_worker_env_vars}"
             )
 
-        if is_gb300:
-            ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        elif is_b200:
-            ucx_tls_cmd = "export UCX_TLS=^ib &&"
-        else:
-            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
+        ucx_tls_cmd = get_ucx_tls_cmd(args.cluster_name, gpu_type)
+        print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         ucx_tls_server_cmd = ucx_tls_cmd
 
         pytest_common_vars = ""
@@ -626,6 +644,27 @@ def main():
                 f"export testOutputDir={test_output_dir}",
             ]
         )
+
+        # Cache-transceiver network precheck: runs BEFORE the real ctx/gen
+        # servers with the same instance topology, and reuses the exact
+        # $ucx_tls_cmd / $CTX_WORKER_ENV_VARS / $GEN_WORKER_ENV_VARS strings
+        # of the worker steps so the UCX environment matches by construction.
+        # Enable/kill-switch policy and timeouts live in precheck_config
+        # (single owner, shared with the local flow).
+        pcfg = _import_precheck_config(args.llm_src)
+        script_prefix_lines.extend(
+            pcfg.precheck_prefix_lines(
+                config,
+                benchmark_mode,
+                config_path_expr=f"$llmSrcNode/{os.path.relpath(config_yaml, args.llm_src)}",
+                ucx_tls_cmd=ucx_tls_cmd,
+                max_world=max(
+                    hardware_config["gpus_per_ctx_server"],
+                    hardware_config["gpus_per_gen_server"],
+                ),
+                stage_name=args.stage_name,
+            )
+        )
         srun_args_lines.extend(
             [
                 "--container-env=DISAGG_SERVING_TYPE",
@@ -645,8 +684,14 @@ def main():
     draft_launch_lines = remove_whitespace_lines(draft_launch_content.split("\n"))
     draft_launch_content = "\n".join(draft_launch_lines)
 
+    # The disagg draft calls run_cache_transceiver_precheck; splice in the gate
+    # function library ahead of it (single owner: precheck_config).
+    gate_content = ""
+    if runtime_mode == "disaggregated":
+        gate_content = pcfg.gate_library_content(args.draft_launch_sh, args.llm_src)
+
     with open(args.launch_sh, "w") as f:
-        f.write(f"{script_prefix}\n{srun_args}\n{draft_launch_content}")
+        f.write(f"{script_prefix}\n{srun_args}\n{gate_content}{draft_launch_content}")
 
     print(f"Launch script generated at: {args.launch_sh}")
     print(f"Launch script:\n{script_prefix}\n{srun_args}\n{draft_launch_content}")

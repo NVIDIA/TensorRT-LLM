@@ -75,6 +75,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManagerConfig,
     LayerId,
     SsmLayerConfig,
+    _introspection,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
 
@@ -1432,19 +1433,32 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     config = mgr._build_cache_config(base_config)
 
     assert isinstance(config.layers[0], SsmLayerConfig)
-    assert config.layers[1] is base_layers[1]
+    assert isinstance(config.layers[1], AttentionLayerConfig)
+    assert int(config.layers[1].layer_id) == int(base_layers[1].layer_id)
     assert config.typical_step == BatchDesc(
         [KVCacheDesc(capacity=32, history_length=31)] * 6
         + [KVCacheDesc(capacity=0, history_length=0)]
     )
-    assert config.constraints == [
+    # The caller-provided constraint keeps its dummy-slot padding.
+    assert (
         BatchDesc(
             [
                 KVCacheDesc(capacity=64, history_length=0),
                 KVCacheDesc(capacity=0, history_length=0),
             ]
         )
-    ]
+        in config.constraints
+    )
+    # An explicit SSM floor constraint is always emitted so the recurrent pool
+    # can hold every live + reserved-dummy state slot even when the caller
+    # supplies no constraints (e.g. avg_seq_len unset). It is built from
+    # zero-capacity requests, so it costs no attention pages.
+    required_ssm_slots = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
+    assert any(
+        all(kv.capacity == 0 for kv in batch.kv_caches)
+        and len(batch.kv_caches) >= required_ssm_slots
+        for batch in config.constraints
+    )
     assert sum(kv.capacity for kv in config.typical_step.kv_caches) == 2 * 96
     assert not hasattr(config.typical_step.kv_caches[0], "num_ssm_slots")
 
@@ -1732,12 +1746,17 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         config = mgr._build_cache_config(base_config)
         runtime_manager = RuntimeKVCacheManager(config)
         try:
-            statistics = runtime_manager._storage.get_statistics()
+            statistics = _introspection.storage_statistics(runtime_manager)
+
+            def _slot_sizes(stat):
+                # cpp binding exposes `slot_sizes`; the Python backend `slot_size`.
+                return stat.slot_sizes if hasattr(stat, "slot_sizes") else stat.slot_size
+
             allocated_bytes = [
-                int(stats.total) * sum(int(size) for size in stats.slot_size)
+                int(stats.total) * sum(int(size) for size in _slot_sizes(stats))
                 for stats in statistics
             ]
-            return allocated_bytes, list(runtime_manager._current_gpu_ratio)
+            return allocated_bytes, _introspection.current_gpu_ratio(runtime_manager)
         finally:
             runtime_manager.shutdown()
 
@@ -2301,7 +2320,7 @@ def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
     try:
         page_table = build_page_table_from_manager(mgr)
 
-        assert len(page_table.layer_groups) == mgr.impl._storage.num_life_cycles
+        assert len(page_table.layer_groups) == len(mgr.impl.layer_grouping)
         assert isinstance(page_table.layer_groups[0], MambaLayerGroup)
         assert isinstance(page_table.layer_groups[1], AttentionLayerGroup)
 

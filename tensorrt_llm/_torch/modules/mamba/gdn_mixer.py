@@ -89,6 +89,70 @@ def _extract_gdn_extra_attrs(layer_idx: str):
     return metadata, gdn_layer, extra_attrs.get("spec_metadata", None)
 
 
+@triton.jit
+def _reset_gdn_states_kernel(
+    ssm_states,
+    conv_states,
+    state_indices,
+    has_initial_states,
+    ssm_state_stride,
+    conv_state_stride,
+    NUM_CACHE_LINES: tl.constexpr,
+    SSM_STATE_SIZE: tl.constexpr,
+    CONV_STATE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    request_idx = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    state_idx = tl.load(state_indices + request_idx).to(tl.int64)
+    needs_reset = ~tl.load(has_initial_states + request_idx).to(tl.int1)
+    valid_state = (state_idx >= 0) & (state_idx < NUM_CACHE_LINES)
+    ssm_row_offset = state_idx * ssm_state_stride.to(tl.int64)
+    conv_row_offset = state_idx * conv_state_stride.to(tl.int64)
+
+    tl.store(
+        ssm_states + ssm_row_offset + offsets,
+        0.0,
+        mask=needs_reset & valid_state & (offsets < SSM_STATE_SIZE),
+    )
+    tl.store(
+        conv_states + conv_row_offset + offsets,
+        0.0,
+        mask=needs_reset & valid_state & (offsets < CONV_STATE_SIZE),
+    )
+
+
+def _reset_gdn_states(
+    ssm_states: torch.Tensor,
+    conv_states: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_states: torch.Tensor,
+) -> None:
+    num_requests = state_indices.shape[0]
+    if num_requests == 0:
+        return
+
+    ssm_state_size = ssm_states.numel() // ssm_states.shape[0]
+    conv_state_size = conv_states.numel() // conv_states.shape[0]
+    block_size = 256
+    grid = (
+        num_requests,
+        triton.cdiv(max(ssm_state_size, conv_state_size), block_size),
+    )
+    _reset_gdn_states_kernel[grid](
+        ssm_states,
+        conv_states,
+        state_indices,
+        has_initial_states,
+        ssm_states.stride(0),
+        conv_states.stride(0),
+        ssm_states.shape[0],
+        ssm_state_size,
+        conv_state_size,
+        block_size,
+    )
+
+
 @torch.library.custom_op("trtllm::gdn_custom_op_inplace", mutates_args=("output",))
 def gdn_custom_op_inplace(
     mixed_qkv: torch.Tensor,
@@ -1038,11 +1102,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if num_prefills > 0:
             # PyExecutor guarantees prefill requests are placed before decode requests
             has_initial_states_p = has_initial_states[:num_prefills]
-            ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
-                (), dtype=ssm_states.dtype, device=ssm_states.device
-            )
-            conv_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
-                (), dtype=conv_states.dtype, device=conv_states.device
+            _reset_gdn_states(
+                ssm_states,
+                conv_states,
+                state_indices_p,
+                has_initial_states_p,
             )
 
         is_target_verify = (

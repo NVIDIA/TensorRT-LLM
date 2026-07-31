@@ -561,7 +561,7 @@ class MultimodalConfig(StrictBaseModel):
         ("Maximum number of pending multimodal requests whose encoder work can be prefetched "
          "on a side CUDA stream ahead of admission. 0 disables side-stream prefetch. "
          "Incompatible with encoder_cuda_graph because graph replay uses static buffers. "
-         "For the time being, this is also incompatible with encoder_cache_max_bytes > 0."
+         "Can be combined with encoder_cache_max_bytes; the two memory limits are additive."
          ),
         status="prototype",
     )
@@ -574,7 +574,7 @@ class MultimodalConfig(StrictBaseModel):
          "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
          "every item in the request must hit the cache before cached embeddings are reused. "
          "Only single-modality requests are cacheable for the time being. "
-         "For the time being, this is incompatible with encoder_side_stream_max_ahead > 0. "
+         "Can be combined with encoder_side_stream_max_ahead. "
          "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
          ),
         status="prototype",
@@ -605,14 +605,6 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
-        # TODO(TRTLLM-14034): Make encoder side-stream read and write from the cache.
-        if (self.encoder_cache_max_bytes > 0
-                and self.encoder_side_stream_max_ahead > 0):
-            raise ValueError(
-                "multimodal_config.encoder_cache_max_bytes > 0 and "
-                "multimodal_config.encoder_side_stream_max_ahead > 0 are "
-                "mutually exclusive. Disable side-stream MM prefetch or set "
-                "the MM encoder cache capacity to 0.")
         return self
 
 
@@ -1382,7 +1374,8 @@ class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM"] = Field(
+        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -1686,6 +1679,32 @@ class CalibConfig(StrictBaseModel):
         "The maximum sequence length to initialize tokenizer for calibration.")
 
 
+class AdvancedSamplingMode(StrEnum):
+    """Deploy-time specialization of the one-model advanced sampler.
+
+    FULL    - per-row tensor top_k/top_p (default; mixed per-request sampling).
+    NO_TOPK - top_k disabled, top_p honored. Skips the top_k mask kernel.
+    NO_TOPP - top_p disabled, top_k honored. Skips the top_p renorm kernel.
+    NO_TOPK_NO_TOPP - both disabled (pure temperature sampling). Skips both kernels.
+    """
+    FULL = "full"
+    NO_TOPK = "no_topk"
+    NO_TOPP = "no_topp"
+    NO_TOPK_NO_TOPP = "no_topk_no_topp"
+
+    @property
+    def skips_top_k(self) -> bool:
+        """Single source of truth: does this mode disable the top_k filter?"""
+        return self in (AdvancedSamplingMode.NO_TOPK,
+                        AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+
+    @property
+    def skips_top_p(self) -> bool:
+        """Single source of truth: does this mode disable the top_p filter?"""
+        return self in (AdvancedSamplingMode.NO_TOPP,
+                        AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+
+
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
         default=None, description="The maximum number of draft tokens.")
@@ -1766,6 +1785,13 @@ class DecodingBaseConfig(StrictBaseModel):
         "DEPRECATED: no-op kept for backward compatibility. Will be removed "
         "in a future release. Non-greedy sampling is now auto-detected per "
         "request; this flag no longer has any effect.")
+
+    advanced_sampling_mode: AdvancedSamplingMode = Field(
+        default=AdvancedSamplingMode.FULL,
+        description=
+        "Deploy-time specialization of the one-model advanced sampler that skips disabled "
+        "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
+        "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
 
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)

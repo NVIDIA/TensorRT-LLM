@@ -941,9 +941,10 @@
         "VANILLA",
         "TRITON",
         "MARLIN",
-        "MEGAMOE_DEEPGEMM"
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL"
       ],
-      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM']",
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
       "converter": "",
       "kind": "categorical",
       "path": "moe_config.backend"
@@ -1634,6 +1635,18 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.acceptance_rate_window_size"
+    },
+    {
+      "allowed_values": [
+        "full",
+        "no_topk",
+        "no_topp",
+        "no_topk_no_topp"
+      ],
+      "annotation": "<enum 'AdvancedSamplingMode'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.advanced_sampling_mode"
     },
     {
       "allowed_values": [],
