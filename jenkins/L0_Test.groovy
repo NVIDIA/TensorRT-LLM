@@ -247,6 +247,114 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
     }
 }
 
+// Bytes of the SLURM job output log kept for post-mortem when a multi-node
+// stage does not finish cleanly. Hang and crash signatures sit at the *end* of
+// the log, so a tail is the right shape; 4 MiB covers the last minutes of every
+// rank's output on the stages this runs on, and it lands compressed in the
+// results tarball rather than in the console log.
+SLURM_JOB_LOG_TAIL_BYTES = 4 * 1024 * 1024
+// Lines of the same log echoed into the Jenkins console. The console copy is
+// the fallback for the case where the tracker script's live `tail -f` was
+// killed (walltime kill, aborted stage) before the failure was printed.
+SLURM_JOB_LOG_ECHO_LINES = 500
+// Redaction applied to the job output log before it is written to disk.
+//
+// The batch script runs under `set -x` and there is no separate `#SBATCH
+// --error`, so xtrace lands in the job output log; the per-rank logs also open
+// with slurm_run.sh's `env | sort`. Jenkins credential masking is a console
+// filter only -- it does not touch archived artifacts -- so the scrub has to
+// happen before the bytes reach ${stageName}/.
+//
+// Anchored at ^, with optional xtrace depth (`+ `, `++ `, ...) and an optional
+// `export ` / `declare -x ` prefix, so only an assignment at the start of a line
+// is rewritten. Matching mid-line would truncate genuine diagnostics -- e.g.
+// `[TRT-LLM] [E] Assertion failed: KEY=missing in map (...)` -- which is exactly
+// the evidence this collection exists to preserve. The value side runs to end of
+// line because a secret can contain whitespace.
+//
+// Must stay byte-identical to DUMP_REDACT_RE in
+// jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh (that copy runs on the
+// cluster, where this constant is not reachable).
+SLURM_LOG_REDACT_CMD = "sed -E 's/^(\\++ )?(export |declare -x )?(HF_TOKEN|S3_SECRET_KEY|[A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|PASSWD|PSW|KEY))=.*/\\1\\2\\3=***REDACTED***/'"
+
+// Copy a bounded tail of the SLURM job output log into ${stageName}/ and echo a
+// shorter tail into the console log. Returns true if a non-empty log was
+// retrieved.
+//
+// Why this is needed: pytest runs with --timeout-method=thread, which
+// os._exit()s without writing a report, so on a hang the only record of what
+// the ranks did is this log on the cluster -- and cleanUpSlurmResources()
+// `rm -rf`s the job workspace holding it moments after this returns. The
+// perf launch scripts' own failure text ("See slurm-<jobid>.out") points at
+// exactly this file. Landing it in ${stageName}/ is deliberate: that directory
+// is already tarred and uploaded to Artifactory by the caller, so no new
+// artifact path is invented.
+//
+// Best-effort by construction. It runs from a finally block on a stage that has
+// already failed or been interrupted, so it must never throw: a failure here
+// would replace the real failure. The remote read gets its own fresh timeout
+// because the enclosing stage timeout may already have expired (a walltime kill
+// is the common case), and everything is wrapped in a catch-all.
+def collectSlurmJobLog(def pipeline, Map remote, String remoteLogPath, String stageName) {
+    def localLog = "${stageName}/slurm-job-output.log"
+    def collected = false
+    try {
+        timeout(time: 5, unit: 'MINUTES') {
+            // `tail -c` bounds the transfer at the source; the redirection is
+            // local, so no shell quoting has to survive the remote login shell.
+            // Routed through Utils.exec, matching the returnStatus idiom the
+            // other remote calls in this function already use.
+            def tailCmd = Utils.sshUserCmd(remote, "\"tail -c ${SLURM_JOB_LOG_TAIL_BYTES} -- ${remoteLogPath}\"")
+            // Redact on the way in, so no unredacted copy ever exists on disk.
+            // The console echo below reads this same scrubbed file, which covers
+            // that leg too -- uploadResults() runs from the outer finally, i.e.
+            // outside the withCredentials binding, so console masking would not
+            // apply there either.
+            //
+            // Note the returned status is `sed`'s, not `ssh`'s, because this is a
+            // pipeline. That is why it is discarded and `test -s` below is the
+            // success signal instead: a failed ssh still leaves sed exiting 0,
+            // but it leaves the file empty, which `test -s` correctly rejects.
+            Utils.exec(pipeline, script: "${tailCmd} | ${SLURM_LOG_REDACT_CMD} > ${localLog}", returnStatus: true, numRetries: 1)
+            collected = pipeline.sh(script: "test -s ${localLog}", returnStatus: true) == 0
+            if (collected) {
+                pipeline.echo("Collected SLURM job output log tail (<= ${SLURM_JOB_LOG_TAIL_BYTES} bytes) into ${localLog}.")
+                pipeline.echo("===== Last ${SLURM_JOB_LOG_ECHO_LINES} lines of ${remoteLogPath} =====")
+                pipeline.sh(script: "tail -n ${SLURM_JOB_LOG_ECHO_LINES} -- ${localLog} || true")
+                pipeline.echo("===== End of SLURM job output log =====")
+            } else {
+                pipeline.sh(script: "rm -f ${localLog}", returnStatus: true)
+            }
+        }
+    } catch (Exception e) {
+        pipeline.echo("Ignorable warning: could not collect ${remoteLogPath} from ${remote.host}: ${e.message}")
+    }
+    if (!collected) {
+        // The archive copy did not make it; still try to get the evidence into
+        // the console log, which is the surface triage actually reads. Needs its
+        // own catch, because this function's contract is that it never throws.
+        // Redacted the same way as the archived copy: this echo happens outside
+        // the withCredentials binding, so Jenkins console masking does not cover
+        // it. Deliberately not echoRemoteLogTail() -- that helper does not
+        // redact, and its first statement is a pipeline.echo outside its own try.
+        try {
+            def tailOut = Utils.exec(
+                pipeline,
+                script: Utils.sshUserCmd(remote, "\"tail -n ${SLURM_JOB_LOG_ECHO_LINES} -- ${remoteLogPath}\"") +
+                    " | ${SLURM_LOG_REDACT_CMD}",
+                returnStdout: true,
+                numRetries: 1,
+            )?.trim()
+            pipeline.echo("===== Last ${SLURM_JOB_LOG_ECHO_LINES} lines of ${remoteLogPath} (redacted) =====")
+            pipeline.echo(tailOut ?: "[no log content retrieved]")
+            pipeline.echo("===== End of SLURM job output log =====")
+        } catch (Exception e) {
+            pipeline.echo("Ignorable warning: could not echo ${remoteLogPath}: ${e.message}")
+        }
+    }
+    return collected
+}
+
 // Scrape the SLURM job output log for a device / driver / interconnect fault
 // signature and return the matched signature itself, or "" for no match.
 //
@@ -297,7 +405,12 @@ def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath)
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
-def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="", boolean suppressTestReporting=false) {
+//
+// `slurmJobLogPath` / `stageFailed` drive the post-mortem log collection: when
+// the stage did not finish cleanly, a bounded tail of the SLURM job output log
+// is pulled back before the job workspace is deleted. Callers that have no such
+// log (or that only ever run on the success path) can leave them at defaults.
+def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="", boolean suppressTestReporting=false, String slurmJobLogPath="", boolean stageFailed=false) {
     CloudManager.withSlurmSshCredentialRemotes(pipeline, clusterName, cluster) { remotes ->
         // Pin one reachable frontend for the whole collect: every download targets
         // the same node workspace (/home/svc_tensorrt/bloom/scripts/${nodeName}),
@@ -307,6 +420,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         def hasTimeoutTest = false
         def downloadResultSucceed = false
         def downloadPerfResultSucceed = false
+        def gotSlurmJobLog = false
 
         pipeline.stage('Submit Test Result') {
             sh "mkdir -p ${stageName}"
@@ -381,8 +495,23 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 }
             }
 
-            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
-            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
+            // Post-mortem evidence for a stage that did not finish cleanly. Must
+            // stay inside this stage: the caller deletes the job workspace that
+            // holds the log right after uploadResults() returns. Restricted to
+            // the failure path so a green run's console log is untouched.
+            //
+            // Scope, precisely: this collects whatever the job had already
+            // written. On a Jenkins-side abort it runs *before*
+            // cleanUpSlurmResources() issues the scancel, so the dump that
+            // scancel's SIGTERM triggers on the cluster is NOT in what we fetch.
+            // Reordering to collect after the scancel is not an option -- the
+            // same cleanup deletes the job workspace.
+            if (slurmJobLogPath && (stageFailed || stageIsInterrupted)) {
+                gotSlurmJobLog = collectSlurmJobLog(pipeline, remote, slurmJobLogPath, stageName)
+            }
+
+            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}, gotSlurmJobLog: ${gotSlurmJobLog}"
+            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed || gotSlurmJobLog) {
                 // On retry attempts, rename freshly-downloaded result XMLs so that
                 // (a) the tar for this attempt is distinguishable from prior attempts
                 //     already uploaded to Artifactory, and
@@ -1456,6 +1585,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
     def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
+    // Declared out here (not inside the frontend-failover closure) so the finally
+    // block can still name it when collecting post-mortem logs.
+    def slurmJobLogPath = "${jobWorkspace}/job-output.log"
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
     def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
 
@@ -1488,7 +1620,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
-            def slurmJobLogPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
             def scriptSubmitPathLocal = Utils.createTempLocation(pipeline, "./slurm_submit.sh")
@@ -1816,7 +1947,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    # Secrets must not be traced: xtrace goes to stderr, there is no
+                    # separate #SBATCH --error, so anything traced here lands in the
+                    # job output log that is streamed to the console and archived.
+                    # S3_SECRET_KEY was already fenced; HF_TOKEN and the credential
+                    # exports below need the same treatment.
+                    set +x
                     export HF_TOKEN=$HF_TOKEN
+                    set -x
                     if [ -f "${s3SecretKeyPathNode}" ]; then
                         set +x
                         export S3_SECRET_KEY="\$(cat "${s3SecretKeyPathNode}")"
@@ -1824,7 +1962,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     fi
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
+                    set +x
                     ${envExportStatements}
+                    set -x
 
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
@@ -2154,7 +2294,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             // failure classifies as UserFailure -> not suppressed -> reported.
             boolean suppressTestReporting = (caughtStageError != null && retryContext != null) &&
                 retryContextAllowsRetry(null, retryContext, caughtStageError, false)
-            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag, suppressTestReporting)
+            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag, suppressTestReporting, slurmJobLogPath, caughtStageError != null)
         } finally {
             stage("Clean Up Slurm Resource") {
                 // Workaround to handle the interruption during clean up SLURM resources

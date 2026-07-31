@@ -1,6 +1,112 @@
 
+# Bounded dump of the per-role worker logs into this batch script's stdout,
+# i.e. into the file `#SBATCH --output` points at (the "slurm-<jobid>.out" the
+# failure messages below refer to).
+#
+# Every ctx/gen/disagg-server srun redirects its output to a file under
+# $testOutputDir, so the rank-level [TRT-LLM] output never reaches the batch
+# stdout that the Jenkins tracker tails live. When the benchmark then fails or
+# the job is killed, that evidence stays on the cluster and is deleted with the
+# job workspace, leaving the Jenkins stage log with no record of what the ranks
+# were actually doing. Emitting the tails here is what makes such a run
+# diagnosable.
+#
+# Deliberately bounded: at most DUMP_MAX_FILES logs, DUMP_TAIL_LINES lines each,
+# and at most DUMP_MAX_INVOCATIONS times per job (<= 3200 lines total). A hang or
+# crash signature is at the end of a rank log, so the tail is the part worth
+# shipping. The invocation cap is 2 rather than 1 on purpose: an early SIGTERM
+# can dump near-empty role logs, and collapsing to a single dump would then
+# permanently suppress the informative one that cleanup_on_failure would emit.
+#
+# The tails are scrubbed: slurm_run.sh runs `env | sort`, so every role log opens
+# with a full environment dump. Without this, dumping them into the batch stdout
+# would push those values into a file that is streamed to the Jenkins console and
+# archived. Kept in sync with SLURM_LOG_REDACT_CMD in jenkins/L0_Test.groovy.
+#
+# Best-effort by construction: this only ever runs on a path that is already
+# failing, so every step is guarded and the function always returns 0. It must
+# not change the exit code that brought us here.
+DUMP_TAIL_LINES=${DUMP_TAIL_LINES:-100}
+DUMP_MAX_FILES=${DUMP_MAX_FILES:-16}
+DUMP_MAX_INVOCATIONS=${DUMP_MAX_INVOCATIONS:-2}
+# Anchored at ^ (with optional xtrace depth and export/declare prefix) so only an
+# assignment at the start of a line is rewritten -- matching mid-line would
+# truncate genuine diagnostics such as
+#   [TRT-LLM] [E] Assertion failed: KEY=missing in map (kvCacheManager.cpp:812)
+# Must stay byte-identical to SLURM_LOG_REDACT_CMD's regex in jenkins/L0_Test.groovy.
+DUMP_REDACT_RE='s/^(\++ )?(export |declare -x )?(HF_TOKEN|S3_SECRET_KEY|[A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|PASSWD|PSW|KEY))=.*/\1\2\3=***REDACTED***/'
+# Intentionally global: the invocation counter has to survive across calls.
+dumped_role_logs=0
+
+dump_role_logs() {
+    # The launch script runs under `set -x`; the dump is unreadable with the
+    # trace interleaved, so suppress it here and restore the caller's setting.
+    local xtraceWasOn=0
+    local count
+    local roleLog
+    case "$-" in
+        *x*) xtraceWasOn=1 ;;
+    esac
+    { set +x; } 2>/dev/null
+
+    if [ "$dumped_role_logs" -ge "$DUMP_MAX_INVOCATIONS" ]; then
+        if [ "$xtraceWasOn" -eq 1 ]; then set -x; fi
+        return 0
+    fi
+    dumped_role_logs=$((dumped_role_logs + 1))
+
+    echo "===== Per-role log tails (reason: ${1:-unspecified}) ====="
+    if [ -z "${testOutputDir:-}" ] || [ ! -d "${testOutputDir:-}" ]; then
+        echo "No per-role logs to dump (testOutputDir='${testOutputDir:-}')"
+    else
+        count=0
+        for roleLog in "${testOutputDir}"/*.log; do
+            [ -f "$roleLog" ] || continue
+            count=$((count + 1))
+            if [ "$count" -gt "$DUMP_MAX_FILES" ]; then
+                echo "===== More logs in ${testOutputDir} not dumped (cap ${DUMP_MAX_FILES}) ====="
+                break
+            fi
+            echo "===== Last ${DUMP_TAIL_LINES} lines of ${roleLog} (redacted) ====="
+            tail -n "$DUMP_TAIL_LINES" -- "$roleLog" 2>/dev/null | sed -E "$DUMP_REDACT_RE" || true
+        done
+        if [ "$count" -eq 0 ]; then
+            echo "No *.log files found under ${testOutputDir}"
+        fi
+    fi
+    echo "===== End of per-role log tails ====="
+
+    if [ "$xtraceWasOn" -eq 1 ]; then set -x; fi
+    return 0
+}
+
+# A walltime kill (SLURM job state TIMEOUT) sends SIGTERM to this batch script
+# before SIGKILL. Two things happen because of this trap, both measured:
+#
+#  1. Without any TERM handler, bash's default disposition kills the batch shell
+#     immediately, so cleanup_on_failure never runs and nothing is dumped at all.
+#     Installing a handler is what keeps the shell alive long enough to react.
+#  2. bash defers a trap until the running foreground command returns, so the
+#     benchmark srun below is started in the background and waited on: `wait` is
+#     interruptible, so the dump happens at once rather than whenever srun
+#     finally reaps.
+#
+# The dump has to finish inside SLURM's KillWait grace (default 30s, not
+# overridden anywhere under jenkins/) before SIGKILL. Measured at 47ms against
+# 16 x 20MB role logs (313MB total) -- `tail -n` seeks from the end, so log size
+# is nearly irrelevant. That is ~600x headroom; the dump is not the constraint,
+# and the background/`wait` form above removed the thing that was.
+#
+# No `#SBATCH --signal` is set to widen the window further, because the directive
+# lives in the shared script prefix, which also feeds the aggregated and plain
+# single-srun branches -- neither installs a TERM handler, so an early SIGTERM
+# would kill those jobs outright.
+trap 'dump_role_logs "SIGTERM (walltime kill or scancel)" || true' TERM
+
 cleanup_on_failure() {
     echo "Error: $1"
+    # Capture the worker evidence *before* scancel tears the allocation down.
+    dump_role_logs "$1" || true
     scancel ${SLURM_JOB_ID}
     exit 1
 }
@@ -119,12 +225,26 @@ sleep 5  # Wait for pyxis container namespace initialization to avoid race condi
 echo "Starting benchmark..."
 export DISAGG_SERVING_TYPE="BENCHMARK"
 export pytestCommand="$pytestCommandBenchmark"
-if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
+# Backgrounded and waited on rather than run in the foreground so the TERM trap
+# above can fire while the benchmark is still running (bash defers traps until a
+# foreground command returns). `wait` returns >128 when a trapped signal
+# interrupts it and the child is still alive, so resume waiting in that case --
+# otherwise a SIGTERM would make this look like a benchmark failure and scancel a
+# job that had not actually failed.
+srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
     -N 1 \
     --ntasks=1 \
     --ntasks-per-node=1 \
-    $runScript; then
-    cleanup_on_failure "Benchmark failed. See slurm-${SLURM_JOB_ID}.out"
+    $runScript &
+benchmarkPid=$!
+benchmarkRc=0
+wait "$benchmarkPid" || benchmarkRc=$?
+while [ "$benchmarkRc" -gt 128 ] && kill -0 "$benchmarkPid" 2>/dev/null; do
+    benchmarkRc=0
+    wait "$benchmarkPid" || benchmarkRc=$?
+done
+if [ "$benchmarkRc" -ne 0 ]; then
+    cleanup_on_failure "Benchmark failed (exit ${benchmarkRc}). See slurm-${SLURM_JOB_ID}.out"
 fi
 
 echo "Disagg server and benchmark completed successfully"
