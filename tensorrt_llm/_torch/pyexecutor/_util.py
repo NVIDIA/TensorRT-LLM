@@ -54,7 +54,9 @@ from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
-from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
+from .kv_cache_transceiver import (
+    AttentionTypeCpp, create_kv_cache_transceiver,
+    maybe_enable_fabric_memory_for_python_transceiver)
 from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
@@ -553,28 +555,8 @@ class KvCacheCreator:
         self._maybe_enable_fabric_memory_for_python_transceiver()
 
     def _maybe_enable_fabric_memory_for_python_transceiver(self) -> None:
-        """Default TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 for the Python
-        transceiver on the C++ V1 KV cache manager.
-
-        The Python transceiver (KvCacheTransceiverV2) transfers KV blocks
-        directly out of the C++ pool, so the pool should be allocated with
-        fabric memory to enable MNNVL transfers. This must run before any
-        pool allocation because the C++ env getter caches the value on first
-        read. Explicit user settings are respected, and platforms without
-        fabric memory support fall back to standard allocation in C++.
-        """
-        if (self._cache_transceiver_config is None
-                or self._cache_transceiver_config.backend is None or
-                self._cache_transceiver_config.transceiver_runtime != "PYTHON"):
-            return
-        if not issubclass(self._kv_cache_manager_cls, KVCacheManager):
-            return
-        if os.environ.get("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY") is None:
-            os.environ["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
-            logger.info(
-                "Python cache transceiver with C++ KV cache manager detected; "
-                "defaulting TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 (set it "
-                "to 0 explicitly to disable)")
+        maybe_enable_fabric_memory_for_python_transceiver(
+            self._cache_transceiver_config, self._kv_cache_manager_cls)
 
     def _get_model_kv_cache_manager_cls(
         self,

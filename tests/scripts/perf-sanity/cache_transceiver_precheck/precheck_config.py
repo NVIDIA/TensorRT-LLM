@@ -26,6 +26,7 @@ block, so config parity is by construction rather than by copying values.
 
 import json
 import os
+import shlex
 
 # Optional per-yaml overrides live under a `cache_transceiver_precheck:` block.
 PRECHECK_DEFAULTS = {
@@ -166,6 +167,7 @@ def precheck_prefix_lines(
         "--work-dir $testOutputDir/cache_transceiver_precheck "
         f"--benchmark-mode {benchmark_mode} --llm-src $llmSrcNode"
     )
+    model_root_env = f"LLM_MODELS_ROOT={shlex.quote(os.environ.get('LLM_MODELS_ROOT', ''))}"
     lines = [
         f"export ctPrecheckEnabled={int(enabled)}",
         # The external srun timeout must cover the driver's first-rep NIXL
@@ -175,8 +177,10 @@ def precheck_prefix_lines(
         f"{int(knobs.get('step_timeout_s', default_step_timeout_s(max_world)))}",
         "export precheckRunScript=$llmSrcNode/jenkins/scripts/perf/"
         "disaggregated/slurm_precheck_run.sh",
-        f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS {cmd} --role ctx"',
-        f'export pytestCommandGENPrecheck="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS {cmd} --role gen"',
+        f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} {model_root_env} '
+        f'$CTX_WORKER_ENV_VARS $PYTEST_COMMON_VARS {cmd} --role ctx"',
+        f'export pytestCommandGENPrecheck="{ucx_tls_cmd} {model_root_env} '
+        f'$GEN_WORKER_ENV_VARS $PYTEST_COMMON_VARS {cmd} --role gen"',
     ]
     if stage_name:
         # Suite name for the synthetic junit xml the gate writes on failure

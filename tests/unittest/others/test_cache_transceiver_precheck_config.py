@@ -359,6 +359,18 @@ def test_wireup_timeout_derivation():
     assert plan["wireup_timeout_s"] == 42
 
 
+def test_precheck_commands_propagate_model_root(monkeypatch):
+    monkeypatch.setenv("LLM_MODELS_ROOT", "/models with spaces")
+    lines = pcfg.precheck_prefix_lines({}, "e2e", "$config", "unset UCX_TLS &&", max_world=8)
+    commands = [line for line in lines if line.startswith("export pytestCommand")]
+
+    assert len(commands) == 2
+    for command in commands:
+        assert "LLM_MODELS_ROOT='/models with spaces'" in command
+        assert "$PYTEST_COMMON_VARS" in command
+        assert command.index("LLM_MODELS_ROOT=") < command.index("$PYTEST_COMMON_VARS")
+
+
 def _enabled_line(cfg):
     lines = pcfg.precheck_prefix_lines(cfg, "e2e", "$c", "unset &&", max_world=8)
     return next(x for x in lines if x.startswith("export ctPrecheckEnabled"))

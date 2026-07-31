@@ -204,7 +204,10 @@ def load_internal_apis():
     from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
     from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+        create_kv_cache_transceiver,
+        maybe_enable_fabric_memory_for_python_transceiver,
+    )
     from tensorrt_llm._torch.pyexecutor.llm_request import (
         LlmRequest,
         LlmRequestState,
@@ -237,6 +240,9 @@ def load_internal_apis():
         KVCacheManager=KVCacheManager,
         KVCacheManagerV2=KVCacheManagerV2,
         create_kv_cache_transceiver=create_kv_cache_transceiver,
+        maybe_enable_fabric_memory_for_python_transceiver=(
+            maybe_enable_fabric_memory_for_python_transceiver
+        ),
         LlmRequest=LlmRequest,
         LlmRequestState=LlmRequestState,
         LlmRequestType=LlmRequestType,
@@ -883,6 +889,8 @@ class PrecheckRunner:
                 "(the C++ transceiver only supports the V1 manager)"
             )
 
+        manager_cls = api.KVCacheManagerV2 if self.use_v2 else api.KVCacheManager
+        api.maybe_enable_fabric_memory_for_python_transceiver(cache_cfg, manager_cls)
         self.kvm = build_kv_cache_manager(
             kv_shape, self.plan, self.side, self.mapping, max_req_len, self.use_v2
         )
