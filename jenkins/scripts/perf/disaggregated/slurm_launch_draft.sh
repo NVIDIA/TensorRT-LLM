@@ -17,6 +17,12 @@ if ! srun "${srunArgs[@]}" $installScript &> $jobWorkspace/install.log; then
 fi
 echo "Installation completed on all nodes"
 
+# Namespace paired-run coordination files by this exact batch-script
+# invocation. SLURM_RESTART_COUNT distinguishes requeues, while the shell PID
+# keeps local reruns from consuming stale status or barrier files.
+export TRTLLM_PERF_RUN_TOKEN="${SLURM_JOB_ID:-local}.${SLURM_RESTART_COUNT:-0}.$$"
+srunArgs+=("--container-env=TRTLLM_PERF_RUN_TOKEN")
+
 # Deterministic node slices per server: gen servers take the first nodes,
 # then ctx servers (same order the steps are started in). Both the cache
 # transceiver precheck and the real server steps pin to these slices with

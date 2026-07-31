@@ -35,13 +35,17 @@ from test_common.perf_sanity_agreement import (
     BENCHMARK_STATUS_SUCCESS,
     expected_disagg_lifecycle_roles,
     extract_agreement_arm_log,
+    extract_log_after_offset,
+    extract_measured_context_lifecycle_log,
     find_backend_event_loop_fatal,
     format_agreement_arm_marker,
     is_paired_agreement_configuration,
+    parse_context_activation_sequences,
     read_coordination_text,
     run_polled_command,
     terminate_subprocess,
     validate_completed_benchmark_output,
+    validate_context_agreement_mode,
     write_atomic_coordination_text,
 )
 
@@ -1272,7 +1276,62 @@ class DisaggTestCmds(NamedTuple):
         return teardown_error
 
     def _paired_abort_path(self, server_idx: int) -> str:
-        return os.path.join(self.test_output_dir, f"paired_abort.{server_idx}.txt")
+        return self._paired_coordination_path("paired_abort", server_idx, suffix=".txt")
+
+    def _paired_run_token(self) -> str:
+        token = os.environ.get("TRTLLM_PERF_RUN_TOKEN")
+        if token is None or re.fullmatch(r"[A-Za-z0-9_.-]+", token) is None:
+            raise RuntimeError("Paired agreement run requires a safe TRTLLM_PERF_RUN_TOKEN")
+        return token
+
+    def _paired_coordination_path(
+        self,
+        name: str,
+        server_idx: int,
+        suffix: str = "",
+    ) -> str:
+        return os.path.join(
+            self.test_output_dir,
+            f"{name}.{server_idx}.{self._paired_run_token()}{suffix}",
+        )
+
+    def _paired_context_log_offset_path(self, server_idx: int) -> str:
+        return self._paired_coordination_path(
+            "paired_context_log_offset",
+            server_idx,
+            suffix=".txt",
+        )
+
+    def _hostnames_dir(self, server_idx: int) -> str:
+        if self._is_paired_agreement_run():
+            return self._paired_coordination_path("hostnames", server_idx)
+        return os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
+
+    def _server_config_path(self, server_idx: int) -> str:
+        if self._is_paired_agreement_run():
+            return self._paired_coordination_path("server_config", server_idx, suffix=".yaml")
+        return os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
+
+    def _extract_singleton_context_lifecycle_log(
+        self,
+        server_idx: int,
+        cumulative_log_bytes: bytes,
+    ) -> Optional[str]:
+        """Scope a split stage to the CTX log bytes written by its measured service."""
+        offset_text = read_coordination_text(self._paired_context_log_offset_path(server_idx))
+        if offset_text is None:
+            return None
+        try:
+            scoped_log_bytes = extract_log_after_offset(cumulative_log_bytes, offset_text)
+        except ValueError as error:
+            raise RuntimeError(
+                f"Invalid paired CTX log offset for server_idx={server_idx}: {error}"
+            ) from error
+        ctx_config, _, _ = self.server_configs[server_idx]
+        return extract_measured_context_lifecycle_log(
+            scoped_log_bytes.decode(errors="replace"),
+            set(range(ctx_config.pp)),
+        )
 
     def publish_paired_arm_abort(self, server_idx: int, error: Exception) -> None:
         """Wake every paired-arm role after any one role fails."""
@@ -1300,7 +1359,7 @@ class DisaggTestCmds(NamedTuple):
 
     def _generate_hostname_file(self, server_idx: int, port: int):
         """Create hostname file for coordination."""
-        hostnames_dir = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
+        hostnames_dir = self._hostnames_dir(server_idx)
         if not os.path.exists(hostnames_dir):
             os.makedirs(hostnames_dir, exist_ok=True)
         hostname_file = os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
@@ -1310,7 +1369,7 @@ class DisaggTestCmds(NamedTuple):
     def _generate_disagg_server_config(self, server_idx: int) -> str:
         """Generate disagg server config from hostname files."""
         print_info(f"Generating disagg server config for server index {server_idx}")
-        hostnames_folder = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
+        hostnames_folder = self._hostnames_dir(server_idx)
         expected_count = self.num_ctx_servers + self.num_gen_servers
         start_time = time.time()
         hostnames = []
@@ -1363,7 +1422,7 @@ class DisaggTestCmds(NamedTuple):
             gen_hostnames=gen_hostnames,
             server_config_extra=server_config_extra,
         )
-        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
+        config_path = self._server_config_path(server_idx)
         with open(config_path, "w") as f:
             yaml.dump(server_config, f)
         print_info(f"Server config file {config_path} generated")
@@ -1371,7 +1430,7 @@ class DisaggTestCmds(NamedTuple):
 
     def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
         """Wait for and read disagg server config."""
-        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
+        config_path = self._server_config_path(server_idx)
         start_time = time.time()
         while True:
             self._fail_if_paired_arm_aborted(server_idx)
@@ -1476,18 +1535,15 @@ class DisaggTestCmds(NamedTuple):
         if not self._is_paired_agreement_run():
             return
         self._fail_if_paired_arm_aborted(server_idx)
-        marker_dir = os.path.join(self.test_output_dir, f"{barrier_name}.{server_idx}")
+        marker_dir = self._paired_coordination_path(barrier_name, server_idx)
         os.makedirs(marker_dir, exist_ok=True)
         marker_name = f"{self.disagg_serving_type}.{os.getenv('SLURM_PROCID', '0')}"
         marker_path = os.path.join(marker_dir, marker_name)
         write_atomic_coordination_text(marker_path, "Done")
 
-        ctx_config, gen_config, _ = self.server_configs[server_idx]
         expected_roles = expected_disagg_lifecycle_roles(
             self.num_ctx_servers,
-            ctx_config.gpus,
             self.num_gen_servers,
-            gen_config.gpus,
         )
         start_time = time.time()
         while True:
@@ -1537,16 +1593,24 @@ class DisaggTestCmds(NamedTuple):
             self._fail_if_paired_arm_aborted(server_idx)
             log_text = None
             if os.path.isfile(log_path):
-                with open(log_path, "r", errors="replace") as log_file:
-                    cumulative_log_text = log_file.read()
-                try:
-                    log_text = extract_agreement_arm_log(
-                        cumulative_log_text,
+                if len(self.server_configs) == 1:
+                    with open(log_path, "rb") as log_file:
+                        cumulative_log_bytes = log_file.read()
+                    log_text = self._extract_singleton_context_lifecycle_log(
                         server_idx,
-                        expected_ctx_roles=ctx_config.gpus,
+                        cumulative_log_bytes,
                     )
-                except ValueError as error:
-                    raise RuntimeError(str(error)) from error
+                else:
+                    with open(log_path, "r", errors="replace") as log_file:
+                        cumulative_log_text = log_file.read()
+                    try:
+                        log_text = extract_agreement_arm_log(
+                            cumulative_log_text,
+                            server_idx,
+                            expected_ctx_roles=1,
+                        )
+                    except ValueError as error:
+                        raise RuntimeError(str(error)) from error
             if log_text is not None:
                 pending_evidence = []
                 if expected_terminal_mode is not None or expected_peer_ready_mode is not None:
@@ -1572,13 +1636,7 @@ class DisaggTestCmds(NamedTuple):
                             )
 
                 if expected_activations is not None:
-                    activation_by_rank = {}
-                    for rank_text, count_text, digest in re.findall(
-                        r"PYTHON_CONTEXT_ACTIVATION_SEQUENCE "
-                        r"rank=(\d+) count=(\d+) digest=([0-9a-f]+)",
-                        log_text,
-                    ):
-                        activation_by_rank[int(rank_text)] = (int(count_text), digest)
+                    activation_by_rank = parse_context_activation_sequences(log_text)
                     activation_counts = {count for count, _ in activation_by_rank.values()}
                     activation_digests = {digest for _, digest in activation_by_rank.values()}
                     if (
@@ -1645,13 +1703,12 @@ class DisaggTestCmds(NamedTuple):
                 time.sleep(1)
             with open(baseline_log_path, "r", errors="replace") as baseline_log_file:
                 baseline_log_text = baseline_log_file.read()
-            baseline_activation_by_rank = {}
-            for rank_text, _, digest in re.findall(
-                r"PYTHON_CONTEXT_ACTIVATION_SEQUENCE "
-                r"rank=(\d+) count=(\d+) digest=([0-9a-f]+)",
-                baseline_log_text,
-            ):
-                baseline_activation_by_rank[int(rank_text)] = digest
+            baseline_activation_by_rank = {
+                rank: digest
+                for rank, (_, digest) in parse_context_activation_sequences(
+                    baseline_log_text
+                ).items()
+            }
             baseline_digests = set(baseline_activation_by_rank.values())
             if baseline_digests != activation_digests:
                 raise RuntimeError(
@@ -1659,6 +1716,47 @@ class DisaggTestCmds(NamedTuple):
                     f"baseline={sorted(baseline_digests)}, "
                     f"current={sorted(activation_digests)}"
                 )
+
+    def wait_for_context_agreement_mode(self, server_idx: int) -> None:
+        """Fail before client launch unless every CTX rank has the configured mode."""
+        if not self._is_paired_agreement_run():
+            return
+        ctx_config, _, disagg_config = self.server_configs[server_idx]
+        expected_mode = (
+            disagg_config.expected_terminal_mode,
+            disagg_config.expected_peer_ready_mode,
+        )
+        expected_ranks = set(range(ctx_config.pp))
+        log_path = os.path.join(self.test_output_dir, "ctx_server_0.log")
+        start_time = time.time()
+        poll_timeout = min(self.timeout, 120)
+        while True:
+            self._fail_if_paired_arm_aborted(server_idx)
+            if os.path.isfile(log_path):
+                with open(log_path, "rb") as log_file:
+                    cumulative_log_bytes = log_file.read()
+                log_text = self._extract_singleton_context_lifecycle_log(
+                    server_idx,
+                    cumulative_log_bytes,
+                )
+                if log_text is not None:
+                    try:
+                        mode_ready = validate_context_agreement_mode(
+                            log_text,
+                            expected_ranks,
+                            expected_mode,
+                        )
+                    except ValueError as error:
+                        raise RuntimeError(f"{error} before benchmark launch") from error
+                    if mode_ready:
+                        return
+            elapsed_time = time.time() - start_time
+            if elapsed_time > poll_timeout:
+                raise RuntimeError(
+                    "Timed out waiting for configured agreement mode before benchmark launch: "
+                    f"server_idx={server_idx}, timeout={poll_timeout}s"
+                )
+            time.sleep(1)
 
     def wait_for_gen_log_sentinels(self, poll_interval: float = 2.0) -> bool:
         """Block until every gen worker signals that its log is fully written.
@@ -1735,16 +1833,27 @@ class DisaggTestCmds(NamedTuple):
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
         outputs = []
-        benchmark_status_file = os.path.join(
-            self.test_output_dir, f"benchmark_status.{server_idx}.txt"
-        )
         ctx_cmd, gen_cmd, disagg_cmd = self.server_cmds[server_idx]
         configs_for_idx = (
             self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
         )
         paired_agreement_run = self._is_paired_agreement_run()
+        benchmark_status_file = (
+            self._paired_coordination_path("benchmark_status", server_idx, suffix=".txt")
+            if paired_agreement_run
+            else os.path.join(self.test_output_dir, f"benchmark_status.{server_idx}.txt")
+        )
         paired_ctx_role = paired_agreement_run and self.disagg_serving_type.startswith("CTX_")
         if paired_ctx_role:
+            if self.disagg_serving_type == "CTX_0":
+                cumulative_ctx_log = os.path.join(self.test_output_dir, "ctx_server_0.log")
+                context_log_offset = 0
+                if os.path.isfile(cumulative_ctx_log):
+                    context_log_offset = os.path.getsize(cumulative_ctx_log)
+                write_atomic_coordination_text(
+                    self._paired_context_log_offset_path(server_idx),
+                    str(context_log_offset),
+                )
             print(
                 format_agreement_arm_marker(
                     "START",
@@ -1816,7 +1925,9 @@ class DisaggTestCmds(NamedTuple):
         elif self.disagg_serving_type == "DISAGG_SERVER":
             disagg_server_proc = None
             try:
-                self._generate_disagg_server_config(server_idx)
+                server_config_path = self._generate_disagg_server_config(server_idx)
+                disagg_cmd = list(disagg_cmd)
+                disagg_cmd[disagg_cmd.index("-c") + 1] = server_config_path
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
                 disagg_server_file_path = os.path.join(
                     self.test_output_dir,
@@ -1882,6 +1993,7 @@ class DisaggTestCmds(NamedTuple):
                     check_files=self.get_server_logs(server_idx),
                     abort_check=lambda: self._fail_if_paired_arm_aborted(server_idx),
                 )
+                self.wait_for_context_agreement_mode(server_idx)
 
                 client_configs = self.client_configs.get(server_idx, [])
 

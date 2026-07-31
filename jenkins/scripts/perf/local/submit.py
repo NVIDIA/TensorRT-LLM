@@ -273,6 +273,20 @@ def _join_env(*parts):
     return " ".join(p for p in parts if p)
 
 
+def _get_single_agreement_arm_ctx_env(config):
+    """Return the CTX env for one split agreement arm, when configured."""
+    agreement_arms = (config.get("benchmark", {}) or {}).get("agreement_ab_arms")
+    if agreement_arms is None:
+        return ""
+    if (
+        not isinstance(agreement_arms, list)
+        or len(agreement_arms) != 1
+        or not isinstance(agreement_arms[0], dict)
+    ):
+        raise ValueError("split agreement perf configs require exactly one agreement_ab_arms entry")
+    return agreement_arms[0].get("ctx_worker_env_var", "") or ""
+
+
 def get_env_config(config, runtime_mode, benchmark_mode=None, server_name=None):
     """Get worker / server / benchmark env vars from the yaml.
 
@@ -294,7 +308,12 @@ def get_env_config(config, runtime_mode, benchmark_mode=None, server_name=None):
     common = env.get("worker_env_var", "") or ""
     ctx_extra = env.get("ctx_worker_env_var", "") or ""
     gen_extra = env.get("gen_worker_env_var", "") or ""
-    ctx_env = _join_env(common, ctx_extra)
+    agreement_arm_ctx_extra = (
+        _get_single_agreement_arm_ctx_env(config)
+        if runtime_mode == "disaggregated" and benchmark_mode == "e2e"
+        else ""
+    )
+    ctx_env = _join_env(common, ctx_extra, agreement_arm_ctx_extra)
     gen_env = _join_env(common, gen_extra)
     if runtime_mode == "aggregated":
         if benchmark_mode == "ctx_only":

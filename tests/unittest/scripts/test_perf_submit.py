@@ -29,15 +29,20 @@ import yaml
 from test_common.perf_sanity_agreement import (
     BENCHMARK_STATUS_FAILED,
     BENCHMARK_STATUS_SUCCESS,
+    CONTEXT_ACTIVATION_DIGEST_ALGORITHM,
     expected_disagg_lifecycle_roles,
     extract_agreement_arm_log,
+    extract_log_after_offset,
+    extract_measured_context_lifecycle_log,
     find_backend_event_loop_fatal,
     format_agreement_arm_marker,
     is_paired_agreement_configuration,
+    parse_context_activation_sequences,
     read_coordination_text,
     run_polled_command,
     terminate_subprocess,
     validate_completed_benchmark_output,
+    validate_context_agreement_mode,
     write_atomic_coordination_text,
 )
 
@@ -67,36 +72,29 @@ AGREEMENT_AB_TEST_LIST = (
     / "test-db"
     / "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml"
 )
+SLURM_LAUNCH_DRAFT = (
+    REPO_ROOT / "jenkins" / "scripts" / "perf" / "disaggregated" / "slurm_launch_draft.sh"
+)
 
 
 def test_extract_agreement_arm_log_scopes_cumulative_log_to_requested_arm():
-    async_lines = [
-        f"{rank}: {format_agreement_arm_marker('START', 0, 'CTX_0', str(rank))}"
-        for rank in range(4)
-    ]
+    async_lines = [f"0: {format_agreement_arm_marker('START', 0, 'CTX_0', '0')}"]
     async_lines.extend(
         (f"PYTHON_ASYNC_CONSENSUS transition=mode_active rank={rank} terminal=1 peer_ready=1")
         for rank in range(4)
     )
-    async_lines.extend(
-        f"{rank}: {format_agreement_arm_marker('END', 0, 'CTX_0', str(rank))}" for rank in range(4)
-    )
-    sync_lines = [
-        f"{rank}: {format_agreement_arm_marker('START', 1, 'CTX_0', str(rank))}"
-        for rank in range(4)
-    ]
+    async_lines.extend([f"0: {format_agreement_arm_marker('END', 0, 'CTX_0', '0')}"])
+    sync_lines = [f"0: {format_agreement_arm_marker('START', 1, 'CTX_0', '0')}"]
     sync_lines.extend(
         (f"PYTHON_ASYNC_CONSENSUS transition=mode_active rank={rank} terminal=0 peer_ready=1")
         for rank in range(4)
     )
-    sync_lines.extend(
-        f"{rank}: {format_agreement_arm_marker('END', 1, 'CTX_0', str(rank))}" for rank in range(4)
-    )
+    sync_lines.extend([f"0: {format_agreement_arm_marker('END', 1, 'CTX_0', '0')}"])
 
     scoped_log = extract_agreement_arm_log(
         "\n".join((*async_lines, *sync_lines)),
         server_idx=1,
-        expected_ctx_roles=4,
+        expected_ctx_roles=1,
     )
 
     assert scoped_log is not None
@@ -104,15 +102,14 @@ def test_extract_agreement_arm_log_scopes_cumulative_log_to_requested_arm():
     assert "terminal=1 peer_ready=1" not in scoped_log
 
 
-def test_extract_agreement_arm_log_waits_for_every_ctx_role():
-    log_lines = [format_agreement_arm_marker("START", 0, "CTX_0", str(rank)) for rank in range(4)]
-    log_lines.extend(format_agreement_arm_marker("END", 0, "CTX_0", str(rank)) for rank in range(3))
+def test_extract_agreement_arm_log_waits_for_outer_ctx_controller_end():
+    log_lines = [format_agreement_arm_marker("START", 0, "CTX_0", "0")]
 
     assert (
         extract_agreement_arm_log(
             "\n".join(log_lines),
             server_idx=0,
-            expected_ctx_roles=4,
+            expected_ctx_roles=1,
         )
         is None
     )
@@ -120,18 +117,18 @@ def test_extract_agreement_arm_log_waits_for_every_ctx_role():
 
 def test_extract_agreement_arm_log_includes_late_evidence_before_next_arm():
     first_arm = [
-        *(format_agreement_arm_marker("START", 0, "CTX_0", str(rank)) for rank in range(4)),
-        *(format_agreement_arm_marker("END", 0, "CTX_0", str(rank)) for rank in range(4)),
+        format_agreement_arm_marker("START", 0, "CTX_0", "0"),
+        format_agreement_arm_marker("END", 0, "CTX_0", "0"),
         "PYTHON_CONTEXT_ACTIVATION_SEQUENCE rank=3 count=256 digest=abc123",
     ]
     second_arm = [
-        *(format_agreement_arm_marker("START", 1, "CTX_0", str(rank)) for rank in range(4)),
+        format_agreement_arm_marker("START", 1, "CTX_0", "0"),
     ]
 
     scoped_log = extract_agreement_arm_log(
         "\n".join((*first_arm, *second_arm)),
         server_idx=0,
-        expected_ctx_roles=4,
+        expected_ctx_roles=1,
     )
 
     assert scoped_log is not None
@@ -141,25 +138,105 @@ def test_extract_agreement_arm_log_includes_late_evidence_before_next_arm():
 def test_expected_disagg_lifecycle_roles_matches_three_node_topology():
     assert expected_disagg_lifecycle_roles(
         num_ctx_servers=1,
-        ctx_world_size=4,
         num_gen_servers=1,
-        gen_world_size=8,
     ) == {
         "CTX_0.0",
-        "CTX_0.1",
-        "CTX_0.2",
-        "CTX_0.3",
         "GEN_0.0",
-        "GEN_0.1",
-        "GEN_0.2",
-        "GEN_0.3",
-        "GEN_0.4",
-        "GEN_0.5",
-        "GEN_0.6",
-        "GEN_0.7",
         "DISAGG_SERVER.0",
         "BENCHMARK.0",
     }
+
+
+def _context_mode_lines(terminal_mode):
+    return [
+        (
+            "PYTHON_ASYNC_CONSENSUS transition=mode_active "
+            f"rank={rank} terminal={terminal_mode} peer_ready=1"
+        )
+        for rank in range(4)
+    ]
+
+
+def _context_shutdown_lines():
+    return [
+        f"PYTHON_ASYNC_CONSENSUS transition=shutdown_summary rank={rank} counters={{}}"
+        for rank in range(4)
+    ]
+
+
+def _context_activation_lines(count):
+    return [
+        (f"PYTHON_CONTEXT_ACTIVATION_SEQUENCE rank={rank} count={count} digest=abc{rank}")
+        for rank in range(4)
+    ]
+
+
+def test_measured_context_lifecycle_excludes_stale_and_profiling_modes():
+    stale_prefix = "stale previous run terminal=0\n"
+    current_run = "\n".join(
+        (
+            *_context_mode_lines(0),
+            *_context_shutdown_lines(),
+            *_context_activation_lines(0),
+            *_context_mode_lines(1),
+        )
+    )
+
+    cumulative_log = (stale_prefix + current_run).encode()
+    scoped_log = extract_log_after_offset(cumulative_log, str(len(stale_prefix.encode())))
+    measured_log = extract_measured_context_lifecycle_log(
+        scoped_log.decode(),
+        set(range(4)),
+    )
+
+    assert measured_log is not None
+    assert "terminal=0" not in measured_log
+    assert "count=0" not in measured_log
+    assert validate_context_agreement_mode(measured_log, set(range(4)), (1, 1))
+
+
+def test_measured_context_lifecycle_waits_for_complete_profiling_shutdown():
+    partial_log = "\n".join((*_context_shutdown_lines()[:-1], *_context_mode_lines(1)))
+
+    assert extract_measured_context_lifecycle_log(partial_log, set(range(4))) is None
+
+
+def test_measured_context_lifecycle_rejects_wrong_final_mode():
+    log_text = "\n".join((*_context_shutdown_lines(), *_context_mode_lines(0)))
+    measured_log = extract_measured_context_lifecycle_log(log_text, set(range(4)))
+
+    assert measured_log is not None
+    with pytest.raises(ValueError, match="does not match"):
+        validate_context_agreement_mode(measured_log, set(range(4)), (1, 1))
+
+
+def test_context_activation_evidence_requires_prompt_digest_algorithm():
+    digest = "a" * 64
+    valid_line = (
+        "PYTHON_CONTEXT_ACTIVATION_SEQUENCE "
+        f"rank=3 count=256 digest={digest} "
+        f"algorithm={CONTEXT_ACTIVATION_DIGEST_ALGORITHM}"
+    )
+    stale_id_algorithm_line = valid_line.replace(
+        CONTEXT_ACTIVATION_DIGEST_ALGORITHM,
+        "sha256-length-prefixed-decimal-v1",
+    )
+
+    assert parse_context_activation_sequences(valid_line) == {3: (256, digest)}
+    assert parse_context_activation_sequences(stale_id_algorithm_line) == {}
+
+
+@pytest.mark.parametrize("offset_text", ("invalid", "-1", "999"))
+def test_context_log_offset_rejects_invalid_or_out_of_range_values(offset_text):
+    with pytest.raises(ValueError):
+        extract_log_after_offset(b"short log", offset_text)
+
+
+def test_paired_coordination_files_are_namespaced_per_script_invocation():
+    launch_script = SLURM_LAUNCH_DRAFT.read_text()
+
+    assert "export TRTLLM_PERF_RUN_TOKEN=" in launch_script
+    assert 'srunArgs+=("--container-env=TRTLLM_PERF_RUN_TOKEN")' in launch_script
 
 
 @pytest.mark.parametrize(
@@ -248,6 +325,59 @@ def test_python_consensus_ab_config_changes_only_terminal_mode():
             "eplb0_mtp1_ccb-NIXL-sync-terminal] TIMEOUT (210)"
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    ("config_path", "expected_terminal_mode"),
+    zip(AGREEMENT_AB_CONFIGS, ("1", "0")),
+)
+def test_split_agreement_arm_mode_reaches_outer_ctx_worker_env(
+    submit_module,
+    config_path,
+    expected_terminal_mode,
+):
+    with open(config_path) as config_file:
+        config = yaml.safe_load(config_file)
+
+    env_config = submit_module.get_env_config(
+        config,
+        "disaggregated",
+        "e2e",
+        "",
+    )
+    ctx_env = dict(
+        item.split("=", 1) for item in env_config["ctx_worker_env_var"].split() if "=" in item
+    )
+    gen_env = dict(
+        item.split("=", 1) for item in env_config["gen_worker_env_var"].split() if "=" in item
+    )
+
+    assert ctx_env["TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS"] == (
+        expected_terminal_mode
+    )
+    assert ctx_env["TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_PEER_READY_CONSENSUS"] == "1"
+    assert "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS" not in gen_env
+
+
+@pytest.mark.parametrize("config_path", AGREEMENT_AB_CONFIGS)
+def test_split_agreement_arm_mode_is_not_applied_to_gen_only(
+    submit_module,
+    config_path,
+):
+    with open(config_path) as config_file:
+        config = yaml.safe_load(config_file)
+
+    env_config = submit_module.get_env_config(
+        config,
+        "disaggregated",
+        "gen_only",
+        "",
+    )
+    ctx_env = dict(
+        item.split("=", 1) for item in env_config["ctx_worker_env_var"].split() if "=" in item
+    )
+
+    assert "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS" not in ctx_env
 
 
 def test_completed_benchmark_output_requires_exact_requests_and_metrics():

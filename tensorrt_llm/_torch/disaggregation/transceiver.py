@@ -206,19 +206,48 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             os.getenv(_CONTEXT_ACTIVATION_DIGEST_ENV, "0"),
         )
         self._context_activation_digest = hashlib.sha256() if enabled else None
+        self._context_activation_fingerprints: Dict[int, bytes] = {}
         self._context_activation_count = 0
         self._context_activation_digest_logged = False
         self._context_readiness_last_snapshot: Optional[tuple[str, int, int, int, int, int]] = None
         self._context_readiness_last_probe_key: Optional[tuple[str, int, int]] = None
         self._context_readiness_last_probe_at = 0.0
 
-    def _record_context_activation_ids(self, request_ids: List[int]) -> None:
-        """Record an order-sensitive digest without logging request IDs."""
+    def _register_context_activation_requests(self, requests: List[LlmRequest]) -> None:
+        """Register stable prompt fingerprints for later activation ordering."""
         digest = getattr(self, "_context_activation_digest", None)
         if digest is None:
             return
+        fingerprints = getattr(self, "_context_activation_fingerprints", None)
+        if fingerprints is None:
+            fingerprints = {}
+            self._context_activation_fingerprints = fingerprints
+        for request in requests:
+            request_id = get_unique_rid(request)
+            if request_id is None:
+                raise RuntimeError("context request is missing a transfer identifier")
+            if request_id in fingerprints:
+                continue
+            prompt_len = int(request.py_orig_prompt_len)
+            prompt_tokens = np.asarray(
+                request.get_tokens(0)[:prompt_len],
+                dtype=">i4",
+            )
+            prompt_digest = hashlib.sha256()
+            prompt_digest.update(prompt_len.to_bytes(8, byteorder="big"))
+            prompt_digest.update(prompt_tokens.tobytes())
+            fingerprints[request_id] = prompt_digest.digest()
+
+    def _record_context_activation_ids(self, request_ids: List[int]) -> None:
+        """Record an order-sensitive prompt digest without hashing runtime IDs."""
+        digest = getattr(self, "_context_activation_digest", None)
+        if digest is None:
+            return
+        fingerprints = getattr(self, "_context_activation_fingerprints", {})
         for request_id in request_ids:
-            payload = str(int(request_id)).encode("ascii")
+            payload = fingerprints.pop(request_id, None)
+            if payload is None:
+                raise RuntimeError("context activation is missing its stable prompt fingerprint")
             digest.update(len(payload).to_bytes(4, byteorder="big"))
             digest.update(payload)
         self._context_activation_count += len(request_ids)
@@ -232,7 +261,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             f"rank={self._dist.rank} "
             f"count={self._context_activation_count} "
             f"digest={digest.hexdigest()} "
-            "algorithm=sha256-length-prefixed-decimal-v1"
+            "algorithm=sha256-length-prefixed-prompt-sha256-v1"
         )
         self._context_activation_digest_logged = True
 
@@ -2153,6 +2182,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     f"PREPARE ownership: request_id={rid}, epoch={epoch}"
                 )
             activations.append((rid, epoch, key, prepared_req))
+        self._register_context_activation_requests(
+            [prepared_req for _, _, _, prepared_req in activations]
+        )
         for rid, epoch, key, prepared_req in activations:
             prepared_req.state = LlmRequestState.CONTEXT_INIT
             del self._async_ready_prepared[key]
@@ -2280,6 +2312,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # Place new generation-first context requests into wait state, then
         # use allgather consensus to promote ready requests to CONTEXT_INIT.
+        self._register_context_activation_requests(requests)
         for req in requests:
             rid = get_unique_rid(req)
             if rid not in self._send_sessions:
