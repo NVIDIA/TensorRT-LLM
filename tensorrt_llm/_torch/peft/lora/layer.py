@@ -27,7 +27,7 @@ from ...modules.multi_stream_utils import (do_multi_stream,
                                            maybe_execute_in_parallel)
 from ...utils import (get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
-from .cuda_graph_lora_params import CudaGraphLoraParams, LoraLayerParams
+from .cuda_graph_lora_params import CudaGraphLoraParams
 
 _FP8_LORA_TMA_ALIGNMENT = 16
 
@@ -705,7 +705,8 @@ class LoraLayer(torch.nn.Module):
             )
 
         runner = self._split_k_runner
-        runner_inputs = runner.prepare_inputs(x, lora_params, cuda_graph_params)
+        runner.lora_params = runner.copy_lora_params(lora_params)
+        runner_inputs = [x]
         _, split_k = AutoTuner.get().choose_one(
             "trtllm::lora_grouped_gemm_cuda_graph",
             [runner],
@@ -811,8 +812,6 @@ class _LoraGroupedGemmRunner(TunableRunner):
             module_ids=tuple(layer.lora_module_types),
         )
         self.lora_params: Optional[Dict] = None
-        self.cuda_graph_params: Optional[CudaGraphLoraParams] = None
-        self.layer_params: Optional[LoraLayerParams] = None
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0,
@@ -847,39 +846,23 @@ class _LoraGroupedGemmRunner(TunableRunner):
         del inputs, profile, kwargs
         return list(_LORA_SPLIT_K_CANDIDATES)
 
-    def prepare_inputs(
-        self,
-        x: torch.Tensor,
-        lora_params: Dict,
-        cuda_graph_params: CudaGraphLoraParams,
-    ) -> List[torch.Tensor]:
+    def copy_lora_params(self, lora_params: Dict) -> Dict:
         """
-        Copy the LoRA parameters and pack the auto-tuner tensor inputs.
+        Copy the LoRA parameter hierarchy for this layer.
 
         Args:
-            x: Input tensor
-            lora_params: LoRA parameters for eager mode
-            cuda_graph_params: CUDA graph params (also in lora_params)
+            lora_params: dict to be copied
 
         Returns:
-            List of tensor input arguments for runner
-
-        Note: this method is needed because the auto-tuning runner
-        expects a list of tensors as its input, but the LoRA layer
-        stores some of them in lora_params and cuda_graph_params.
+            Copied lora_params instance
         """
-        self.lora_params = copy(lora_params)
-        self.cuda_graph_params = copy(cuda_graph_params)
-
+        copied_lora_params = copy(lora_params)
+        cuda_graph_params = copy(lora_params['cuda_graph_params'])
         layer_params = cuda_graph_params.get_layer_params(self.layer_key)
         assert layer_params is not None
-        self.layer_params = copy(layer_params)
-        self.cuda_graph_params.layer_params = {
-            self.layer_key: self.layer_params
-        }
-        self.lora_params['cuda_graph_params'] = self.cuda_graph_params
-
-        return [x]
+        cuda_graph_params.layer_params = {self.layer_key: copy(layer_params)}
+        copied_lora_params['cuda_graph_params'] = cuda_graph_params
+        return copied_lora_params
 
     def _prepare_synthetic_inputs(
         self,
@@ -898,14 +881,16 @@ class _LoraGroupedGemmRunner(TunableRunner):
         create the list of tensor input arguments to be used by the
         auto-tuner's forward.
         """
-        assert self.cuda_graph_params is not None
-        assert self.layer_params is not None
+        assert self.lora_params is not None
+        cuda_graph_params = self.lora_params['cuda_graph_params']
+        layer_params = cuda_graph_params.get_layer_params(self.layer_key)
+        assert layer_params is not None
 
         token_carrier = inputs[0]
         num_tokens = token_carrier.shape[0]
 
-        b_ptrs = torch.zeros_like(self.layer_params.d_b_ptrs)
-        b_prime_ptrs = torch.zeros_like(self.layer_params.d_b_prime_ptrs)
+        b_ptrs = torch.zeros_like(layer_params.d_b_ptrs)
+        b_prime_ptrs = torch.zeros_like(layer_params.d_b_prime_ptrs)
         keepalive = []
         for module_idx, output_size in enumerate(
                 self.layer.output_hidden_sizes):
@@ -916,12 +901,12 @@ class _LoraGroupedGemmRunner(TunableRunner):
             b_prime_ptrs[module_idx, 0] = lora_b.data_ptr()
             keepalive.extend((lora_a, lora_b))
 
-        slot_counts = torch.zeros_like(self.cuda_graph_params.slot_counts)
+        slot_counts = torch.zeros_like(cuda_graph_params.slot_counts)
         slot_counts[0] = num_tokens
-        slot_ranks = torch.zeros_like(self.cuda_graph_params.slot_ranks)
+        slot_ranks = torch.zeros_like(cuda_graph_params.slot_ranks)
         slot_ranks[0] = self.max_rank
         slot_offsets_full = torch.zeros_like(
-            self.cuda_graph_params.slot_offsets_full)
+            cuda_graph_params.slot_offsets_full)
         slot_offsets_full[1:] = num_tokens
 
         return [
@@ -932,8 +917,8 @@ class _LoraGroupedGemmRunner(TunableRunner):
             b_ptrs,
             b_prime_ptrs,
             torch.arange(num_tokens, device=token_carrier.device),
-            self.layer_params.d_output_sizes,
-            self.layer_params.d_output_sizes_offset,
+            layer_params.d_output_sizes,
+            layer_params.d_output_sizes_offset,
         ] + keepalive
 
     def forward(
@@ -956,18 +941,14 @@ class _LoraGroupedGemmRunner(TunableRunner):
         """
         del kwargs
         assert self.lora_params is not None
-        assert self.cuda_graph_params is not None
-        assert self.layer_params is not None
+        lora_params = self.copy_lora_params(self.lora_params)
+        cuda_graph_params = lora_params['cuda_graph_params']
+        layer_params = cuda_graph_params.get_layer_params(self.layer_key)
+        assert layer_params is not None
 
-        lora_params = copy(self.lora_params)
-        cuda_graph_params = copy(self.cuda_graph_params)
-        layer_params = copy(self.layer_params)
-        cuda_graph_params.layer_params = {self.layer_key: layer_params}
-        lora_params['cuda_graph_params'] = cuda_graph_params
-
-        # The list of tensor input arguments is re-packed
-        # in the local copies of lora_params and cuda_graph_params
-        # such that we can invoke _forward_cuda_graph_mode_impl().
+        # The list of tensor input arguments is re-packed into
+        # the local lora_params copy such that we can invoke
+        # LoraLayer's _forward_cuda_graph_mode_impl().
         x = inputs[0]
         if len(inputs) > 1:
             cuda_graph_params.slot_ranks_host = (
