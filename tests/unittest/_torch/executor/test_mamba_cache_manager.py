@@ -53,6 +53,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import (
+    BlockReuseConfig,
     CacheTransceiverConfig,
     KvCacheConfig,
     MambaStateConfig,
@@ -1680,7 +1681,7 @@ def _build_v2_hybrid_with_mamba_layer(
         max_tokens=512,
         enable_block_reuse=enable_block_reuse,
         enable_partial_reuse=enable_partial_reuse,
-        block_reuse_policy=block_reuse_policy,
+        block_reuse_config=BlockReuseConfig(block_reuse_policy=block_reuse_policy),
         enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=periodic_snapshot_interval,
