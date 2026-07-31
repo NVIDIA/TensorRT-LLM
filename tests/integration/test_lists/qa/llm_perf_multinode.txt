@@ -98,5 +98,12 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_stress-gpt-oss-120b-fp4_8k1k
 # aggregated multi-node (ctx_only and gen_only reuse disagg config yamls)
 
 # ctx_only
+perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-gb200_deepseek-r1-fp4_128k8k_con1_ctx1_pp8_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[aggr-ctx_only-gb200_deepseek-r1-fp4_8k1k_con1024_ctx1_dep4_gen1_dep32_eplb0_mtp3_ccb-NIXL]
 
 # gen_only
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_deepseek-r1-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_gpt-oss-120b-fp4_8k1k_con4_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_kimi-k25-thinking-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_wideep_deepseek-r1-fp4_8k1k_ctx2_gen1_dep32_bs128_eplb288_mtp3_con1024_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb300_glm-5-fp4_8k1k_con1024_ctx1_dep2_gen1_dep8_eplb256_mtp1_ccb-NIXL]
