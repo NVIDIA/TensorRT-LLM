@@ -59,6 +59,7 @@ from tensorrt_llm._torch.attention_backend.inkling_triton import (
     inkling_prefill_attention,
     write_kv_cache_hnd,
 )
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import (
     DecoderModel,
@@ -2857,6 +2858,56 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
             hidden_size=config.hidden_size,
             vocab_size=config.unpadded_vocab_size,
         )
+        self._apply_allreduce_strategy()
+
+    def _apply_allreduce_strategy(self) -> None:
+        """Keep Inkling's all-reduces off the NCCL_SYMMETRIC tactic (B2 defect).
+
+        Under CUDA-graph capture a symmetric all-reduce corrupts the run when its
+        send buffer is unregistered while its recv buffer is a registered NCCL
+        window, at a 12288 B message. Inkling meets that size exactly -- hidden
+        6144, bf16, one decode token -- so the first global-attention layer goes
+        non-finite and decode collapses to a repeated token 0.
+
+        The all-reduces that hit this are built by generic modules (attention
+        ``o_proj``, MoE ``down_proj``), not by this file, so the strategy cannot
+        be passed at construction without editing shared code. Rebuilding each
+        ``AllReduce`` after the fact keeps the whole mitigation model-local.
+        Pinning ONESHOT also drops the window requirement -- ``AllReduce`` only
+        takes an NCCL window under NCCL_SYMMETRIC/NCCL/AUTO -- so two of the five
+        trigger conditions go away, not just one.
+
+        Costs symmetric on every Inkling all-reduce, eager included: roughly a
+        third of captured decode all-reduces pick it today. Set
+        ``INKLING_ALLREDUCE_STRATEGY=AUTO`` to restore stock behaviour, and the
+        defect with it, for A/B runs.
+        """
+        name = os.environ.get("INKLING_ALLREDUCE_STRATEGY", "ONESHOT")
+        if name == "AUTO":
+            return
+        try:
+            strategy = AllReduceStrategy[name]
+        except KeyError:
+            raise ValueError(
+                f"INKLING_ALLREDUCE_STRATEGY={name!r} is not an AllReduceStrategy; "
+                f"expected one of {[s.name for s in AllReduceStrategy]}"
+            ) from None
+        swapped = 0
+        for mod in self.modules():
+            old = getattr(mod, "all_reduce", None)
+            # ``None`` means the module reduces nothing (no TP, or DP handles it);
+            # giving it an AllReduce would add a collective, not remove a tactic.
+            if not isinstance(old, AllReduce):
+                continue
+            # Carry the module's own mapping and dtype over so the rebuilt
+            # instance differs from the original in strategy alone.
+            mod.all_reduce = AllReduce(
+                mapping=old.mapping,
+                strategy=strategy,
+                dtype=getattr(mod, "dtype", None),
+            )
+            swapped += 1
+        logger.info(f"Inkling all_reduce strategy -> {name} on {swapped} modules")
 
     def prepare_inkling_attn_decode(self, attn_metadata) -> None:
         """Eagerly refresh every attention layer's stable decode-metadata buffers
