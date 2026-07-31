@@ -1769,9 +1769,7 @@ def _build_mla_step_runtime(attn_metadata: AttentionMetadata) -> _MLAStepRuntime
         ctx_lens = attn_metadata.seq_lens[:num_contexts].tolist()
         ctx_cached = list(num_cached[:num_contexts])
         ctx_request_ids = list(attn_metadata.request_ids[:num_contexts])
-        ctx_prompt_lens = (
-            attn_metadata.seq_lens[:num_contexts]
-            + torch.as_tensor(ctx_cached, dtype=torch.int)).tolist()
+        ctx_prompt_lens = ctx_lens
         # Strip the generation suffix from a mixed batch, but keep all
         # context requests packed in one varlen FMHA submission.
         md = TrtllmAttentionMetadata(
@@ -1788,6 +1786,11 @@ def _build_mla_step_runtime(attn_metadata: AttentionMetadata) -> _MLAStepRuntime
                 num_cached_tokens_per_seq=ctx_cached,
             ),
             mapping=attn_metadata.mapping,
+            kv_layout=attn_metadata.kv_layout,
+            runtime_features=attn_metadata.runtime_features,
+            enable_context_mla_with_cached_kv=(
+                attn_metadata.enable_context_mla_with_cached_kv),
+            workspace=attn_metadata.workspace,
             # KDA layers use the outer metadata's mamba_metadata; skip
             # re-preparing it for the derived MLA-only metadata.
             mamba_metadata=False,

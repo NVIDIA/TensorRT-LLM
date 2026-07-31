@@ -697,17 +697,34 @@ class KimiK3MLAAttention(nn.Module):
         """Run K3 prefill through the normal unabsorbed context FMHA."""
         num_tokens = hidden_states.shape[0]
         q, k, v, latent_cache = self._project_context_qkv(hidden_states)
-        attn_out = self._backend_prefill.forward(
-            q,
-            k,
-            v,
-            rt.metadata,
-            forward_args=AttentionForwardArgs(
-                latent_cache=latent_cache,
-                attention_input_type=AttentionInputType.context_only,
-                attention_mask=PredefinedAttentionMask.CAUSAL,
-            ),
-        )
+        metadata = rt.metadata
+        if self._backend_prefill.has_cached_kv_for_mla_context(metadata):
+            if metadata.runtime_features.chunked_prefill:
+                attn_out = self._forward_prefill_with_chunked_cache(
+                    q,
+                    k,
+                    v,
+                    latent_cache,
+                    metadata,
+                )
+            else:
+                attn_out = self._forward_prefill_with_cached_kv(
+                    q,
+                    latent_cache,
+                    metadata,
+                )
+        else:
+            attn_out = self._backend_prefill.forward(
+                q,
+                k,
+                v,
+                metadata,
+                forward_args=AttentionForwardArgs(
+                    latent_cache=latent_cache,
+                    attention_input_type=AttentionInputType.context_only,
+                    attention_mask=PredefinedAttentionMask.CAUSAL,
+                ),
+            )
         if isinstance(attn_out, tuple):
             attn_out = attn_out[0]
         attn_out = attn_out[:num_tokens].reshape(
@@ -715,6 +732,170 @@ class KimiK3MLAAttention(nn.Module):
             self.num_heads * self.v_head_dim,
         )
         return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
+
+    def _expand_context_kv(
+        self,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Up-project latent KV into the normal context FMHA layout."""
+        kv = self.kv_b_proj(compressed_kv)
+        k_nope, v = kv.split(
+            [
+                self.num_heads * self.qk_nope_head_dim,
+                self.num_heads * self.v_head_dim,
+            ],
+            dim=-1,
+        )
+        k = torch.cat(
+            [
+                k_nope.view(-1, self.num_heads, self.qk_nope_head_dim),
+                k_pe.view(-1, 1, self.qk_rope_head_dim).expand(
+                    -1, self.num_heads, -1
+                ),
+            ],
+            dim=-1,
+        ).view(-1, self.num_heads * self.q_head_dim)
+        return k, v
+
+    def _forward_prefill_with_cached_kv(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> torch.Tensor:
+        """Run a context chunk against the complete paged latent prefix."""
+        backend = self._backend_prefill
+        backend.mla_rope_append_paged_kv_assign_q(q, latent_cache, metadata)
+        compressed_kv, k_pe = backend.load_paged_kv_cache_for_mla(
+            metadata,
+            q.dtype,
+        )
+        k, v = self._expand_context_kv(compressed_kv, k_pe)
+        output = q.new_empty((q.shape[0], self.num_heads * self.v_head_dim))
+        return backend.forward(
+            q,
+            k,
+            v,
+            metadata,
+            forward_args=AttentionForwardArgs(
+                latent_cache=None,
+                attention_input_type=AttentionInputType.context_only,
+                attention_mask=PredefinedAttentionMask.CAUSAL,
+                output=output,
+            ),
+        )
+
+    def _forward_prefill_with_chunked_cache(
+        self,
+        q: torch.Tensor,
+        current_k: torch.Tensor,
+        current_v: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> torch.Tensor:
+        """Merge normal context FMHA over paged history chunks and current KV."""
+        backend = self._backend_prefill
+        backend.mla_rope_append_paged_kv_assign_q(q, latent_cache, metadata)
+
+        output = q.new_empty((q.shape[0], self.num_heads * self.v_head_dim))
+        temp_output = torch.empty_like(output)
+        softmax_stats = torch.empty(
+            (metadata.num_ctx_tokens, self.num_heads, 2),
+            dtype=torch.float,
+            device=q.device,
+        )
+        temp_softmax_stats = torch.empty_like(softmax_stats)
+
+        original_kv_lens_cuda = metadata.kv_lens_cuda_runtime
+        original_kv_lens = metadata.kv_lens_runtime
+        original_total_kv_len = metadata.host_total_kv_lens[0].item()
+        try:
+            for loop_idx in range(metadata.chunked_loop_num):
+                chunked_token_count = metadata.host_cu_chunked_seq_len[
+                    loop_idx, metadata.num_contexts
+                ].item()
+                compressed_kv, k_pe = backend.load_chunked_kv_cache_for_mla(
+                    metadata=metadata,
+                    num_ctx_cached_tokens=chunked_token_count,
+                    cu_chunked_seq_len=metadata.cu_chunked_seq_len[loop_idx],
+                    chunked_global_offset=metadata.chunked_global_offset[loop_idx],
+                    chunked_max_seq_len=metadata.max_chunk_len_per_loop[loop_idx],
+                    out_dtype=q.dtype,
+                )
+                chunked_k, chunked_v = self._expand_context_kv(
+                    compressed_kv,
+                    k_pe,
+                )
+
+                metadata.kv_lens_runtime = metadata.host_chunked_seq_len[
+                    loop_idx
+                ]
+                metadata.kv_lens_cuda_runtime = metadata.chunked_seq_len[
+                    loop_idx
+                ]
+                metadata.host_total_kv_lens[0] = chunked_token_count
+                chunk_output = backend.forward(
+                    q,
+                    chunked_k,
+                    chunked_v,
+                    metadata,
+                    forward_args=AttentionForwardArgs(
+                        latent_cache=None,
+                        attention_input_type=AttentionInputType.context_only,
+                        attention_mask=PredefinedAttentionMask.FULL,
+                        softmax_stats_tensor=temp_softmax_stats,
+                        chunked_prefill_buffer_batch_size=(
+                            metadata.runtime_features.chunked_prefill_buffer_batch_size
+                        ),
+                        output=temp_output,
+                    ),
+                )
+                if isinstance(chunk_output, tuple):
+                    chunk_output = chunk_output[0]
+                backend.merge_attention_for_mla(
+                    output,
+                    chunk_output,
+                    softmax_stats,
+                    temp_softmax_stats,
+                    metadata.merge_op_tensor[loop_idx],
+                    metadata,
+                )
+
+            metadata.kv_lens_runtime = metadata.prompt_lens_cpu_runtime
+            metadata.kv_lens_cuda_runtime = metadata.prompt_lens_cuda_runtime
+            metadata.host_total_kv_lens[0] = metadata.num_ctx_tokens
+            current_output = backend.forward(
+                q,
+                current_k,
+                current_v,
+                metadata,
+                forward_args=AttentionForwardArgs(
+                    latent_cache=None,
+                    attention_input_type=AttentionInputType.context_only,
+                    attention_mask=PredefinedAttentionMask.CAUSAL,
+                    softmax_stats_tensor=temp_softmax_stats,
+                    chunked_prefill_buffer_batch_size=(
+                        metadata.runtime_features.chunked_prefill_buffer_batch_size
+                    ),
+                    output=temp_output,
+                ),
+            )
+            if isinstance(current_output, tuple):
+                current_output = current_output[0]
+            backend.merge_attention_for_mla(
+                output,
+                current_output,
+                softmax_stats,
+                temp_softmax_stats,
+                metadata.merge_op_tensor[metadata.chunked_loop_num],
+                metadata,
+            )
+        finally:
+            metadata.kv_lens_runtime = original_kv_lens
+            metadata.kv_lens_cuda_runtime = original_kv_lens_cuda
+            metadata.host_total_kv_lens[0] = original_total_kv_len
+        return output
 
     def _project_absorbed_q(
         self,
