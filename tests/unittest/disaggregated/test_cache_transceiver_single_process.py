@@ -21,6 +21,8 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 """
 
 import os
+import subprocess
+import sys
 import threading
 import uuid
 from types import SimpleNamespace
@@ -1024,6 +1026,9 @@ def run_transfer_test(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
+        # Keep the Python-native bounce layer disabled. Dedicated C++ bounce
+        # coverage enables the NIXL agent's bounce v2 through its environment.
+        kv_cache_bounce_size_mb=0,
     )
     ctx_tcs = create_instance_transceivers(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
@@ -1545,6 +1550,88 @@ def test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp() -> None:
         enable_indexer_k_cache=True,
         indexer_k_cache_layer_mask=[False, False, True, True],
     )
+
+
+_NIXL_BOUNCE_SUBPROCESS_ENV = "TRTLLM_TEST_NIXL_BOUNCE_SUBPROCESS"
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.parametrize(
+    (
+        "ctx_tp",
+        "ctx_pp",
+        "gen_tp",
+        "gen_pp",
+        "is_mla",
+        "use_v2",
+        "enable_indexer_k_cache",
+    ),
+    [
+        pytest.param(1, 1, 1, 1, False, True, False, id="v2_mha"),
+        pytest.param(2, 1, 2, 1, True, True, False, id="v2_mla_tp2"),
+        pytest.param(1, 1, 1, 1, True, False, True, id="v1_dsa_indexer"),
+        pytest.param(2, 1, 1, 2, False, True, False, id="v2_ctx_tp2_gen_pp2"),
+    ],
+)
+def test_python_nixl_cache_transceiver_uses_cpp_bounce(
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    is_mla: bool,
+    use_v2: bool,
+    enable_indexer_k_cache: bool,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Exercise C++ bounce v2 through representative Python NIXL transceiver paths."""
+    if os.environ.get(_NIXL_BOUNCE_SUBPROCESS_ENV) == "1":
+        run_transfer_test(
+            ctx_tp=ctx_tp,
+            ctx_pp=ctx_pp,
+            gen_tp=gen_tp,
+            gen_pp=gen_pp,
+            ctx_enable_dp=False,
+            gen_enable_dp=False,
+            is_mla=is_mla,
+            use_v2=use_v2,
+            request_lengths=[30, 60],
+            enable_indexer_k_cache=enable_indexer_k_cache,
+        )
+        return
+
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("TRTLLM_NIXL_BOUNCE_"):
+            del env[name]
+    env.update(
+        {
+            _NIXL_BOUNCE_SUBPROCESS_ENV: "1",
+            "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
+            "TRTLLM_NIXL_BOUNCE_ENABLE": "1",
+            "TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES": "64MB",
+            "TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT": "1",
+            "TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES": "1MB",
+            "TLLM_LOG_LEVEL": "INFO",
+            "TLLM_LOG_LEVEL_BY_MODULE": "debug:executor",
+        }
+    )
+    # Do not override TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY: the test must
+    # exercise the production default, including automatic cudaMalloc fallback
+    # on devices without fabric-memory support.
+    env.pop("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", None)
+
+    node_id = f"{__file__}::{request.node.name}"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-s", "-q", node_id],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "bounce v2 enabled" in output, output
+    assert "bounce path engaged" in output, output
 
 
 if __name__ == "__main__":
