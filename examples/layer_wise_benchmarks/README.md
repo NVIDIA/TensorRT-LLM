@@ -255,21 +255,22 @@ Two E2E traces are required because the two pieces of information cannot be capt
           calibration_file_path: profiles/calibration_data.json
       ```
 
-   2. Set `TLLM_PROFILE_START_STOP` to a range that captures some iterations (typically tens of iterations) of the GEN phase. Ensure that every iteration has the same batch size. Capture 5 extra iterations at the beginning, because the first 5 iterations are treated as warm-ups and will be dropped by the parser by default.
+   2. Set `TLLM_PROFILE_START_STOP` to a range that captures some iterations (typically tens of iterations) of the GEN phase. Ensure that every iteration has the same batch size. Capture 5 extra iterations at the beginning, because the first 5 iterations are treated as warm-ups and will be dropped by the parser by default. Calibration data is collected for the iterations `[start, stop)`, i.e. the stop iteration itself is not collected.
 
    3. Capture per-rank nsys profiles; each rank should produce a separate file.
 
       Place `nsys profile` after `mpirun` or `srun`. To minimize profiling overhead and file size, there is no need to capture samples or GPU metrics.
+
+      Trace the whole process instead of gating the collection with `-c cudaProfilerApi`: recent nsys versions export kernels launched by CUDA graphs that were instantiated before the capture range opened without runtime correlation, which breaks `parse_e2e.py`, and stopping the collection mid-run can hang the executor (the engine captures its CUDA graphs during warmup, before any capture range can open). `parse_e2e.py` selects the analyzed iterations via `--start-iter`/`--stop-iter` instead.
 
       If you use `trtllm-serve` or `trtllm-bench`, use the following command order. If you use `examples/disaggregated/slurm/benchmark/submit.py`, setting `gen_profile_range` is sufficient.
 
       ```bash
       NP=$NP ./mpi_launch.sh middleware/mpi_env_from_ompi \
       nsys profile \
-          -t cuda,nvtx \
+          -t cuda,nvtx -s none \
           --cpuctxsw none --cuda-event-trace false \
           --cuda-graph-trace node \
-          -c cudaProfilerApi --capture-range-end stop \
           -o profiles/report_e2e_collect_rank%q{RANK}.nsys-rep \
           --force-overwrite true \
       trtllm-llmapi-launch \
@@ -306,7 +307,7 @@ Two E2E traces are required because the two pieces of information cannot be capt
        --balance-method NotModified \
        --replay-file-path profiles/calibration_data.json \
        --replay-start-iter 47 \
-       --replay-stop-iter 67
+       --replay-stop-iter 66
    ```
 
    Argument explanations:
@@ -320,7 +321,7 @@ Two E2E traces are required because the two pieces of information cannot be capt
    | `--seq-len-q 1` | Should match (1 + MTP) of the end-to-end run. |
    | `--seq-len-kv-cache 2090` | An estimate of the average context length for the captured iterations. The first 5 iterations should be excluded from this estimate because they will be dropped by the parser. |
    | `--replay-file-path` | The calibration file obtained from Step 1. |
-   | `--replay-start-iter` and `--replay-stop-iter` | Should match the end-to-end `TLLM_PROFILE_START_STOP`. Do not replay the first 5 iterations because they will be dropped by the parser. |
+   | `--replay-start-iter` and `--replay-stop-iter` | Both inclusive. The calibration file contains the end-to-end `TLLM_PROFILE_START_STOP` iterations `[start, stop)`. Do not replay the first 5 iterations because they will be dropped by the parser. |
 
 4. Parse end-to-end profiles with `parse_e2e.py`, and parse layer-wise benchmarks profiles with `parse.py`.
 
@@ -330,6 +331,8 @@ Two E2E traces are required because the two pieces of information cannot be capt
        --graph-trace profiles/report_e2e_collect_rank%.nsys-rep \
        --layer-indices 5,6,7 \
        --warmup-times 5 \
+       --start-iter 42 \
+       --stop-iter 66 \
        -o profiles/report_e2e_collect_rank%.json
    seq 0 $((NP - 1)) | xargs -I% python3 parse.py \
        --world-size $NP \

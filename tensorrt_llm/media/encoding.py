@@ -24,9 +24,16 @@ _VIDEO_ENCODER: Optional["_VideoEncoder"] = None
 
 
 def _check_ffmpeg_available() -> bool:
-    """Return True if ffmpeg CLI is installed; cache its path."""
+    """Return True if ffmpeg CLI is installed; cache its path.
+
+    Only a successful probe is cached. A negative result is re-probed on the
+    next call: ffmpeg may be installed after import (e.g. a test fixture or
+    deployment step running ``apt-get install ffmpeg``), and permanently
+    caching the miss silently downgrades every later video encode in the
+    process to the fallback encoder.
+    """
     global _FFMPEG_PATH
-    if _FFMPEG_PATH is None:
+    if not _FFMPEG_PATH:
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path is not None:
             try:
@@ -338,9 +345,15 @@ class _PurePythonEncoder(_VideoEncoder):
 
 
 def _get_video_encoder() -> _VideoEncoder:
-    """Return the best available video encoder (cached singleton)."""
+    """Return the best available video encoder (cached singleton).
+
+    The pure-Python fallback is not cached permanently: if ffmpeg becomes
+    available later in the process lifetime, upgrade to the ffmpeg encoder.
+    """
     global _VIDEO_ENCODER
-    if _VIDEO_ENCODER is None:
+    if _VIDEO_ENCODER is None or (
+        isinstance(_VIDEO_ENCODER, _PurePythonEncoder) and _check_ffmpeg_available()
+    ):
         _VIDEO_ENCODER = _FfmpegCliEncoder() if _check_ffmpeg_available() else _PurePythonEncoder()
         logger.info(f"Using {_VIDEO_ENCODER.__class__.__name__} for video encoding")
     return _VIDEO_ENCODER

@@ -17,7 +17,7 @@ import os
 import re
 from contextlib import contextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -553,7 +553,7 @@ class NemotronHLayer(DecoderLayer):
 
     def post_load_weights(self):
         """Post-process after loading weights."""
-        if self.norm.is_nvfp4 and not hasattr(self.norm, "nvfp4_scale"):
+        if self.norm.is_nvfp4 and self.norm.nvfp4_scale is None:
             self._try_attach_nvfp4_scale()
 
     def _try_attach_nvfp4_scale(self):
@@ -602,7 +602,7 @@ class NemotronHLayer(DecoderLayer):
 
         if hasattr(self, 'pre_allreduce'):
             norm = self.norm
-            has_nvfp4_scale = hasattr(norm, 'nvfp4_scale')
+            has_nvfp4_scale = norm.nvfp4_scale is not None
             if norm.is_nvfp4 and has_nvfp4_scale and norm.return_hp_output:
                 fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
             elif norm.is_nvfp4 and has_nvfp4_scale:
@@ -972,19 +972,35 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             if not hasattr(config, attr) or getattr(config, attr) is None:
                 setattr(config, attr, _bc_getattr(fallback, attr))
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
+    def load_weights(self,
+                     weights: dict,
+                     weight_mapper: BaseWeightMapper,
+                     allow_partial_loading: bool = False):
         new_weights = weight_mapper.preprocess_weights(weights)
-        super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
+        super().load_weights(weights=new_weights,
+                             weight_mapper=weight_mapper,
+                             allow_partial_loading=allow_partial_loading)
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Model-specific defaults for NemotronH.
 
-        Disables block reuse due to SSM/hybrid architecture constraints.
+        Uses KV cache manager V2 for the hybrid state layout. Block reuse
+        remains opt-in because it also requires a Mamba snapshot policy.
         """
-        # TODO: Remove enable_block_reuse=False once KV cache block reuse
-        # is supported for Mamba/SSM-based models
-        return {"kv_cache_config": {"enable_block_reuse": False}}
+        return {
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "use_kv_cache_manager_v2": True,
+            }
+        }
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls,
+                                          pretrained_config: object
+                                          | None = None) -> Literal["PYTHON"]:
+        """Use the Python transceiver for hybrid-state transfers."""
+        return "PYTHON"
 
     @staticmethod
     def lora_config(model_dir: str):
@@ -1270,6 +1286,8 @@ class NemotronHMTP(nn.Module):
                 residual=residual,
                 attn_metadata=attn_metadata,
                 all_rank_num_tokens=all_rank_num_tokens,
+                spec_metadata=spec_metadata,
+                mamba_metadata=attn_metadata.mamba_metadata,
                 lora_params=lora_params,
             )
         return hidden_states

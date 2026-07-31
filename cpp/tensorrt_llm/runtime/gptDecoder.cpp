@@ -21,7 +21,7 @@
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <memory>
 
@@ -121,7 +121,7 @@ void GptDecoder<T>::disableLookahead(
 
 template <typename T>
 void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
-    std::optional<DecodingOutput> const& output, std::optional<nvinfer1::DataType> explicitDraftTokensDType,
+    std::optional<DecodingOutput> const& output, std::optional<tensorrt_llm::DataType> explicitDraftTokensDType,
     std::optional<std::vector<TensorConstPtr>> const& lookaheadPrompt,
     std::optional<std::vector<tle::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs)
 {

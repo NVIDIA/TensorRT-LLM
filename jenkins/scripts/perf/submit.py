@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Generate the SLURM launch script for multi-node PerfSanity tests (CI mode).
 
 Unified replacement for jenkins/scripts/perf/aggregated/submit.py and
@@ -21,8 +36,25 @@ import argparse
 import math
 import os
 import re
+import sys
 
 import yaml
+from benchmark_utils import parse_positive_concurrency
+from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
+
+
+def _import_precheck_config(llm_src):
+    """Import the pure-stdlib precheck config module from the repo tree.
+
+    It is the single owner of the gate's enable policy and timeout formulas.
+    """
+    path = os.path.join(llm_src, "tests", "scripts", "perf-sanity", "cache_transceiver_precheck")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import precheck_config
+
+    return precheck_config
+
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
@@ -219,25 +251,43 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, server_name):
     }
 
 
+def _join_env(*parts):
+    """Space-join non-empty env-var strings (drops falsy entries)."""
+    return " ".join(p for p in parts if p)
+
+
 def get_env_config(config, runtime_mode, benchmark_mode, server_name):
     """Get worker / server / benchmark env vars from the yaml.
 
     Aggregated yaml stores env vars per server config under
     `server_configs[i].server_env_var`. Disaggregated yaml stores them at the
-    top-level `environment.{worker,server,benchmark}_env_var`.
+    top-level `environment.{worker,server,benchmark}_env_var`, plus optional
+    `environment.{ctx,gen}_worker_env_var` for role-specific extras (appended
+    to the shared `worker_env_var`).
 
     ctx_only is a hybrid: the launch path is aggregated, but the yaml is the
     disagg one, so the agg launch's "server_env_var" comes from
-    `environment.worker_env_var`.
+    `environment.worker_env_var` (merged with ctx-side extras when present).
 
-    Returns: {worker_env_var, server_env_var, benchmark_env_var}.
+    Returns: {worker_env_var (shared, back-compat),
+              ctx_worker_env_var, gen_worker_env_var,
+              server_env_var, benchmark_env_var}.
     """
     env = config.get("environment", {}) or {}
+    common = env.get("worker_env_var", "") or ""
+    ctx_extra = env.get("ctx_worker_env_var", "") or ""
+    gen_extra = env.get("gen_worker_env_var", "") or ""
+    ctx_env = _join_env(common, ctx_extra)
+    gen_env = _join_env(common, gen_extra)
     if runtime_mode == "aggregated":
         if benchmark_mode == "ctx_only":
             return {
-                "worker_env_var": env.get("worker_env_var", "") or "",
-                "server_env_var": env.get("worker_env_var", "") or "",
+                "worker_env_var": common,
+                "ctx_worker_env_var": ctx_env,
+                "gen_worker_env_var": gen_env,
+                # ctx_only launches through the aggregated single-pytest path;
+                # the ctx-merged env is what actually runs.
+                "server_env_var": ctx_env,
                 "benchmark_env_var": env.get("benchmark_env_var", "") or "",
             }
         agg_server_env_var = ""
@@ -247,11 +297,15 @@ def get_env_config(config, runtime_mode, benchmark_mode, server_name):
                 break
         return {
             "worker_env_var": "",
+            "ctx_worker_env_var": "",
+            "gen_worker_env_var": "",
             "server_env_var": agg_server_env_var,
             "benchmark_env_var": "",
         }
     return {
-        "worker_env_var": env.get("worker_env_var", "") or "",
+        "worker_env_var": common,
+        "ctx_worker_env_var": ctx_env,
+        "gen_worker_env_var": gen_env,
         "server_env_var": env.get("server_env_var", "") or "",
         "benchmark_env_var": env.get("benchmark_env_var", "") or "",
     }
@@ -259,8 +313,7 @@ def get_env_config(config, runtime_mode, benchmark_mode, server_name):
 
 def get_benchmark_config(config):
     benchmark = config.get("benchmark", {}) or {}
-    concurrency_str = benchmark.get("concurrency_list", "1")
-    concurrency = int(concurrency_str) if isinstance(concurrency_str, str) else concurrency_str
+    concurrency = parse_positive_concurrency(benchmark.get("concurrency_list", "1"))
     return {
         "mode": benchmark.get("mode", ""),
         "concurrency": concurrency,
@@ -434,6 +487,13 @@ def main():
         help="1-indexed split group id. Selects the N-th test from the test list.",
     )
     parser.add_argument("--stage-name", default="", help="Stage name (for logging / GPU detect)")
+    parser.add_argument(
+        "--cluster-name",
+        default="",
+        help="Slurm cluster name as resolved by the Jenkins pipeline "
+        "(bloom SlurmPartition.clusterName, e.g. gcp-nrt, aws-cmh). "
+        "Used with the GPU type to pick UCX env settings.",
+    )
 
     args = parser.parse_args()
 
@@ -478,8 +538,7 @@ def main():
     ) = get_pytest_commands(script_prefix_lines, runtime_mode)
     test_output_dir = get_test_output_dir(script_prefix_lines, test_case_name)
 
-    is_gb300 = "GB300" in args.stage_name.upper()
-    is_b200 = "B200" in args.stage_name.upper() and "GB200" not in args.stage_name.upper()
+    gpu_type = gpu_type_from_stage_name(args.stage_name)
 
     if runtime_mode == "aggregated":
         # Aggregated (incl. ctx_only): single pytestCommand built from the
@@ -513,13 +572,13 @@ def main():
         srun_args_lines.append("--container-env=pytestCommand")
     else:
         # Disaggregated (e2e or gen_only).
-        base_worker_env_vars = (
-            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
-            f"HF_HOME=/tmp/hf_home "
-            f"{env_config['worker_env_var']}"
+        base_prefix = (
+            "FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${SLURM_LOCALID} HF_HOME=/tmp/hf_home"
         )
-        ctx_worker_env_vars = base_worker_env_vars
-        gen_worker_env_vars = base_worker_env_vars
+        # ctx / gen env vars: shared worker_env_var + optional per-role extras
+        # from the yaml. get_env_config already merged them.
+        ctx_worker_env_vars = f"{base_prefix} {env_config['ctx_worker_env_var']}".rstrip()
+        gen_worker_env_vars = f"{base_prefix} {env_config['gen_worker_env_var']}".rstrip()
         server_env_vars = env_config["server_env_var"]
 
         # gen_only_no_context comes from yaml's benchmark.mode, not the test
@@ -540,12 +599,8 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
-        if is_gb300:
-            ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        elif is_b200:
-            ucx_tls_cmd = "export UCX_TLS=^ib &&"
-        else:
-            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
+        ucx_tls_cmd = get_ucx_tls_cmd(args.cluster_name, gpu_type)
+        print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         ucx_tls_server_cmd = ucx_tls_cmd
 
         pytest_common_vars = ""
@@ -584,6 +639,27 @@ def main():
                 f"export testOutputDir={test_output_dir}",
             ]
         )
+
+        # Cache-transceiver network precheck: runs BEFORE the real ctx/gen
+        # servers with the same instance topology, and reuses the exact
+        # $ucx_tls_cmd / $CTX_WORKER_ENV_VARS / $GEN_WORKER_ENV_VARS strings
+        # of the worker steps so the UCX environment matches by construction.
+        # Enable/kill-switch policy and timeouts live in precheck_config
+        # (single owner, shared with the local flow).
+        pcfg = _import_precheck_config(args.llm_src)
+        script_prefix_lines.extend(
+            pcfg.precheck_prefix_lines(
+                config,
+                benchmark_mode,
+                config_path_expr=f"$llmSrcNode/{os.path.relpath(config_yaml, args.llm_src)}",
+                ucx_tls_cmd=ucx_tls_cmd,
+                max_world=max(
+                    hardware_config["gpus_per_ctx_server"],
+                    hardware_config["gpus_per_gen_server"],
+                ),
+                stage_name=args.stage_name,
+            )
+        )
         srun_args_lines.extend(
             [
                 "--container-env=DISAGG_SERVING_TYPE",
@@ -603,8 +679,14 @@ def main():
     draft_launch_lines = remove_whitespace_lines(draft_launch_content.split("\n"))
     draft_launch_content = "\n".join(draft_launch_lines)
 
+    # The disagg draft calls run_cache_transceiver_precheck; splice in the gate
+    # function library ahead of it (single owner: precheck_config).
+    gate_content = ""
+    if runtime_mode == "disaggregated":
+        gate_content = pcfg.gate_library_content(args.draft_launch_sh, args.llm_src)
+
     with open(args.launch_sh, "w") as f:
-        f.write(f"{script_prefix}\n{srun_args}\n{draft_launch_content}")
+        f.write(f"{script_prefix}\n{srun_args}\n{gate_content}{draft_launch_content}")
 
     print(f"Launch script generated at: {args.launch_sh}")
     print(f"Launch script:\n{script_prefix}\n{srun_args}\n{draft_launch_content}")

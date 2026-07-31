@@ -73,7 +73,7 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 
 def create_attention_metadata_state() -> Dict[str, Any]:
     """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
-    return {"metadata": None, "capacity": (0, 0)}
+    return {"metadata_cache": {}}
 
 
 def _model_config_value(value: Any, *, deep_copy: bool = True) -> Any:

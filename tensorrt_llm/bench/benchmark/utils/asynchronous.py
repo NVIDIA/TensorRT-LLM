@@ -12,8 +12,7 @@ from transformers import PreTrainedTokenizer
 from zmq import PUSH
 from zmq.asyncio import Context
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper

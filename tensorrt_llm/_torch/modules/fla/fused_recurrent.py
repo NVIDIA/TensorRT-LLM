@@ -127,6 +127,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     output_final_state: bool,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -137,7 +138,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = q.new_empty(NK, *v.shape)
+    o = output.unsqueeze(0) if output is not None else q.new_empty(NK, *v.shape)
     if output_final_state:
         # Pool layout: [N, HV, V, K] (K innermost).
         final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
@@ -176,7 +177,7 @@ def fused_recurrent_gated_delta_rule_fwd(
 class FusedRecurrentFunction(torch.autograd.Function):
 
     @staticmethod
-    @input_guard
+    @input_guard(exclude_args=["output"])
     def forward(
         ctx,
         q: torch.Tensor,
@@ -189,6 +190,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
+        output: Optional[torch.Tensor] = None,
     ):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q,
@@ -201,6 +203,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
+            output=output,
         )
 
         return o, final_state
@@ -225,6 +228,7 @@ def fused_recurrent_gated_delta_rule(
     output_final_state: bool = False,
     cu_seqlens: Optional[torch.LongTensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
+    output: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -313,6 +317,7 @@ def fused_recurrent_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        output,
     )
     return o, final_state
 
@@ -475,6 +480,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     disable_output_calculation: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -489,7 +495,8 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         # When output calculation is disabled, allocate minimal tensor
         o = q.new_empty(NK, 1, 1, 1, 1)  # minimal allocation
     else:
-        o = q.new_empty(NK, *v.shape)
+        o = output.unsqueeze(0) if output is not None else q.new_empty(
+            NK, *v.shape)
 
     grid = (NK, NV, N * HV)
 
@@ -528,7 +535,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
 class FusedRecurrentUpdateFunction(torch.autograd.Function):
 
     @staticmethod
-    @input_guard
+    @input_guard(exclude_args=["output"])
     def forward(
         ctx,
         q: torch.Tensor,
@@ -545,6 +552,7 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
         disable_output_calculation: bool = False,
         intermediate_states_buffer: Optional[torch.Tensor] = None,
         cache_steps: Optional[int] = None,
+        output: Optional[torch.Tensor] = None,
     ):
         o = fused_recurrent_gated_delta_rule_update_fwd(
             q=q,
@@ -561,6 +569,7 @@ class FusedRecurrentUpdateFunction(torch.autograd.Function):
             disable_output_calculation=disable_output_calculation,
             intermediate_states_buffer=intermediate_states_buffer,
             cache_steps=cache_steps,
+            output=output,
         )
 
         return o
@@ -589,6 +598,7 @@ def fused_recurrent_gated_delta_rule_update(
     disable_output_calculation: bool = False,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
         if q.shape[0] != 1:
@@ -622,5 +632,6 @@ def fused_recurrent_gated_delta_rule_update(
         disable_output_calculation,
         intermediate_states_buffer,
         cache_steps,
+        output,
     )
     return o

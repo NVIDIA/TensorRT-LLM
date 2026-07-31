@@ -35,7 +35,7 @@ async def _iter_sse_data(response_content):
                 continue
             payload = line.removeprefix("data:").lstrip()
             if payload == "[DONE]":
-                continue
+                return
             yield payload
 
 

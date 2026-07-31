@@ -1,6 +1,3 @@
-# Imported first to register the op before the chain via ..modules.attention re-enters this package.
-from . import triton_fused_inv_rope_fp8_quant  # noqa: F401  # isort: skip
-
 import torch
 
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
@@ -11,9 +8,9 @@ from .torch_custom_ops import BufferKind, bmm_out
 from .trtllm_gen_custom_ops import fp8_block_scale_moe_runner
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
 
-# Attention custom ops (attn_custom_op_inplace, mla_custom_op_inplace) are defined in
-# modules.attention and must be imported from there. They are not re-exported here to
-# avoid circular imports: custom_ops must not depend on modules.attention.
+# Attention custom ops are defined in modules.attention, and MLA custom ops are
+# defined in modules.mla. They are not re-exported here to avoid circular imports:
+# custom_ops must not depend on modules.attention or modules.mla.
 
 
 def inplace_slice_copy(dest: torch.Tensor, src: torch.Tensor, dim1_start: int,

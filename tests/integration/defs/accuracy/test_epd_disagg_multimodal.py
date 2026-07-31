@@ -207,6 +207,9 @@ class EPDVariant:
             ),
             max_batch_size=64,
             expected_quant_algo=QuantAlgo.FP8,
+            # Default 128 workers trips a native-library abort in the CPU-side
+            # multimodal preprocessing path on H100 (nvbugs/6478692).
+            max_workers=16,
         )
 
     @classmethod
@@ -282,6 +285,8 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
             ),
         ],
     )
+    # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
+    @pytest.mark.threadleak(enabled=False)
     def test_disaggregated_videomme(self, variant: EPDVariant) -> None:
         """Run VideoMME shard through a model-specific llmapi E/PD config."""
         with self._launch_epd(variant) as llm:

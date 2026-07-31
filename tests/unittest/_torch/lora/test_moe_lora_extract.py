@@ -28,12 +28,14 @@ LoraModuleType = lora_layer.LoraModuleType
 class _ExtractStub:
     """Minimal stand-in for a CutlassFusedMoE instance.
 
-    _extract_moe_lora_tensors only reads self.layer_idx and the class attribute
-    self._MOE_LORA_MODULE_NAMES, so we can drive it via the unbound method
+    _extract_moe_lora_tensors reads self.layer_idx and the small slot-gathering
+    helpers, which we borrow from CutlassFusedMoE so the unbound method can run
     without constructing real weights or a GPU layer.
     """
 
-    _MOE_LORA_MODULE_NAMES = CutlassFusedMoE._MOE_LORA_MODULE_NAMES
+    _gather_moe_lora_slots = CutlassFusedMoE._gather_moe_lora_slots
+    _require_fc1_fc2 = staticmethod(CutlassFusedMoE._require_fc1_fc2)
+    _empty_kernel_slot_dict = staticmethod(CutlassFusedMoE._empty_kernel_slot_dict)
 
     def __init__(self, layer_idx=0):
         self.layer_idx = layer_idx

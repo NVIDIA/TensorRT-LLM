@@ -7,8 +7,8 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_radio
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel
-from tensorrt_llm._torch.models.multimodal_encoder_graph import _MM_SIDE_STREAM_ENV
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -20,6 +20,15 @@ _TINY_VIT = modeling_radio.VITTIMMConfig(
     intermediate_size=128,
     img_size=32,
 )
+
+# Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
+# ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
+# ``max_batch_size`` / ``max_num_tokens``). The encoder ``AttentionMetadata`` is
+# sized once at load to this max budget; each forward re-preps it with the real
+# per-image seq lens. Two distinct axes: requests = image/sequence count budget,
+# tokens = total patch budget.
+_ENCODER_TEST_MAX_NUM_REQUESTS = 2048
+_ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
 def _make_vision_config():
@@ -53,13 +62,6 @@ def _make_vision_config():
     return config
 
 
-@pytest.fixture(autouse=True)
-def clean_side_stream_env(monkeypatch):
-    """Temporarily unset side-stream prefetch for tests unless a test sets it explicitly."""
-    monkeypatch.delenv(_MM_SIDE_STREAM_ENV, raising=False)
-    yield
-
-
 @pytest.fixture
 def tiny_vit_config():
     with mock.patch.dict(
@@ -89,6 +91,16 @@ def test_radio_fp8_parent_kv_cache_does_not_leak_into_vit(tiny_vit_config):
     vision tower, FlashInfer raises at forward time about it not being supported.
     """
     vision_model = RADIOVisionModel(_make_fp8_model_config(), disable_quantization=True)
+    # Engine normally calls this after model load by walking `model.modules()`
+    # for `MultimodalEncoderMixin` instances (the mixin lives on the inner
+    # `VisionTransformer`, not the `RADIOVisionModel` wrapper); standalone tests
+    # must mirror that themselves.
+    for module in vision_model.modules():
+        if isinstance(module, MultimodalEncoderMixin):
+            module.setup_attn_metadata(
+                max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS,
+                max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS,
+            )
 
     device = torch.device("cuda")
     dtype = torch.bfloat16

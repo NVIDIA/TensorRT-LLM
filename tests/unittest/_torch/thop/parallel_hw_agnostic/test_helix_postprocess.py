@@ -20,6 +20,19 @@ import torch
 from parameterized import parameterized
 
 import tensorrt_llm
+from tensorrt_llm._torch.modules.attention import _helix_sanitize_empty_kv, _helix_zero_kv_mask
+
+
+class _FakeAttnMetadata:
+    """Minimal stand-in exposing only the fields _helix_zero_kv_mask reads."""
+
+    def __init__(self, kv_lens_cuda=None, seq_lens_cuda=None):
+        self.kv_lens_cuda = kv_lens_cuda
+        self.seq_lens_cuda = seq_lens_cuda
+
+    @property
+    def num_seqs(self):
+        return self.seq_lens_cuda.shape[0]
 
 
 def baseline(gathered_o, gathered_stats, kv_lora_rank, scale, native_v1=False, native_v2=False):
@@ -289,6 +302,52 @@ class TestHelixPostProcess(unittest.TestCase):
             native_v2=native_v2,
         )
 
+    def test_helix_postprocess_empty_rank_noop(self):
+        """A CP rank that owns no KV blocks (num_total_blocks < cp_size) must be a
+        no-op in the combine: it contributes (-inf, 0) softmax stats and a zeroed
+        partial output. The result must match combining only the non-empty ranks
+        and stay finite.
+
+        This mirrors the Python post-sanitization in _helix_post_process, which
+        forces zero-local-KV rows to (-inf, 0) and zeros their partial output
+        before this op runs.
+        """
+        device = torch.device("cuda")
+        cp_size, num_tokens, num_heads, kv_lora_rank = 4, 8, 2, 64
+        dtype = torch.float16
+        scale = 1.0
+
+        gathered_o = torch.empty(
+            cp_size, num_tokens, num_heads, kv_lora_rank, dtype=dtype, device=device
+        ).uniform_(-1, 1)
+        gathered_stats = torch.empty(
+            cp_size, num_tokens, num_heads, 2, dtype=torch.float32, device=device
+        )
+        gathered_o_max = torch.max(gathered_o, dim=-1, keepdim=True)[0]
+        gathered_stats[..., 0] = gathered_o_max[..., 0]
+        gathered_stats[..., 1] = torch.sum(torch.exp(gathered_o - gathered_o_max), dim=-1)
+
+        # Mark the highest CP rank as "empty" (rank 0 always owns block 0, so it
+        # is never empty). Empty rank: (-inf, 0) stats and zeroed partial output.
+        empty = cp_size - 1
+        gathered_stats[empty, ..., 0] = float("-inf")
+        gathered_stats[empty, ..., 1] = 0.0
+        gathered_o[empty] = 0.0
+
+        gathered_o_v = gathered_o.view(cp_size, num_tokens, num_heads * kv_lora_rank)
+        output = torch.ops.trtllm.helix_post_process(gathered_o_v, gathered_stats, scale)
+
+        # Reference: combine only the non-empty ranks.
+        expected = baseline(
+            gathered_o_v[:empty].contiguous(),
+            gathered_stats[:empty].contiguous(),
+            kv_lora_rank,
+            scale,
+        )
+
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-2)
+
     def test_helix_postprocess_invalid_inputs(self):
         """Test error handling for invalid inputs (non-native)"""
         device = torch.device("cuda")
@@ -412,6 +471,82 @@ class TestHelixPostProcess(unittest.TestCase):
             gathered_stats = torch.randn(4, 8, 1, 2, dtype=torch.float32, device=device)
             with pytest.raises(RuntimeError):
                 torch.ops.trtllm.helix_post_process(gathered_o, gathered_stats, 1.0)
+
+
+class TestHelixZeroKvMask(unittest.TestCase):
+    """Unit tests for the per-token zero-local-KV mask helper.
+
+    kv_lens_cuda is per-sequence, so the helper must expand it to per-token using
+    seq_lens_cuda. This matters when a sequence spans multiple tokens (e.g.
+    speculative decoding), where num_tokens != num_seqs.
+    """
+
+    def test_single_token_per_seq(self):
+        # Plain decode: one token per sequence, so per-seq == per-token.
+        # Seq 1 owns zero KV blocks on this rank.
+        meta = _FakeAttnMetadata(
+            kv_lens_cuda=torch.tensor([5, 0, 7], dtype=torch.int32),
+            seq_lens_cuda=torch.tensor([1, 1, 1], dtype=torch.int32),
+        )
+        mask = _helix_zero_kv_mask(meta, num_tokens=3)
+        expected = torch.tensor([False, True, False])
+        torch.testing.assert_close(mask, expected)
+
+    def test_multi_token_per_seq_spec_dec(self):
+        # Speculative decoding: each gen sequence spans multiple tokens, so the
+        # per-sequence empty flag must be expanded by seq_lens (num_tokens=9).
+        meta = _FakeAttnMetadata(
+            kv_lens_cuda=torch.tensor([5, 0, 7], dtype=torch.int32),
+            seq_lens_cuda=torch.tensor([3, 3, 3], dtype=torch.int32),
+        )
+        mask = _helix_zero_kv_mask(meta, num_tokens=9)
+        expected = torch.tensor([False, False, False, True, True, True, False, False, False])
+        torch.testing.assert_close(mask, expected)
+
+    def test_generation_slice_with_contexts(self):
+        # MLA passes only the generation slice: seq 0 is context, seqs 1-2 are
+        # generations spanning 2 tokens each (num_tokens=4). Seq 1 is empty.
+        meta = _FakeAttnMetadata(
+            kv_lens_cuda=torch.tensor([10, 0, 4], dtype=torch.int32),
+            seq_lens_cuda=torch.tensor([8, 2, 2], dtype=torch.int32),
+        )
+        mask = _helix_zero_kv_mask(meta, num_tokens=4, seq_start=1, num_seqs=2)
+        expected = torch.tensor([True, True, False, False])
+        torch.testing.assert_close(mask, expected)
+
+    def test_returns_none_without_buffers(self):
+        # Missing either buffer disables masking.
+        assert _helix_zero_kv_mask(_FakeAttnMetadata(), num_tokens=4) is None
+        meta = _FakeAttnMetadata(kv_lens_cuda=torch.tensor([0, 1]))
+        assert _helix_zero_kv_mask(meta, num_tokens=2) is None
+
+    def test_sanitize_forces_noop_and_clears_nan(self):
+        # Empty-rank rows (with NaNs from zero-key softmax) must become a no-op:
+        # zeroed partial output and (-inf, 0) softmax stats.
+        partial_o = torch.tensor([[1.0, 2.0], [float("nan"), float("nan")], [3.0, 4.0]])
+        softmax_stats = torch.tensor(
+            [
+                [[0.5, 1.0]],
+                [[float("nan"), 0.0]],
+                [[0.7, 2.0]],
+            ]
+        )
+        mask = torch.tensor([False, True, False])
+        out_o, out_stats = _helix_sanitize_empty_kv(partial_o, softmax_stats, mask)
+
+        assert torch.isfinite(out_o).all()
+        torch.testing.assert_close(out_o[1], torch.zeros(2))
+        # Non-masked rows are untouched.
+        torch.testing.assert_close(out_o[0], torch.tensor([1.0, 2.0]))
+        assert out_stats[1, 0, 0] == float("-inf")
+        assert out_stats[1, 0, 1] == 0.0
+
+    def test_sanitize_none_mask_is_passthrough(self):
+        partial_o = torch.randn(3, 2)
+        softmax_stats = torch.randn(3, 1, 2)
+        out_o, out_stats = _helix_sanitize_empty_kv(partial_o, softmax_stats, None)
+        assert out_o is partial_o
+        assert out_stats is softmax_stats
 
 
 if __name__ == "__main__":

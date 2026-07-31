@@ -209,6 +209,10 @@ struct Multihead_attention_params_base
     // threadblock counter to identify the complete of partial attention computations
     int* block_counter = nullptr;
 
+    float* cascade_partial_out = nullptr; // [batch_beam x num_heads x head_size]
+    float* cascade_partial_max = nullptr; // [batch_beam x num_heads]
+    float* cascade_partial_sum = nullptr; // [batch_beam x num_heads]
+
     int const* memory_length_per_sample = nullptr;
     int32_t const* mrope_position_deltas = nullptr;
 };

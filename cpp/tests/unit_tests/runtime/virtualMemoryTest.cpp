@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/nvmlWrapper.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
@@ -1502,7 +1503,7 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
 
     // Create a buffer using the virtual address allocator
     auto buffer = std::make_unique<VirtualAddressDeviceBuffer>(
-        size, nvinfer1::DataType::kINT8, CudaVirtualMemoryAllocator{config});
+        size, tensorrt_llm::DataType::kINT8, CudaVirtualMemoryAllocator{config});
 
     auto memoryAfterAllocation = getCurrentProcessMemoryInfo();
     if (memoryInfoAvailable())
@@ -1513,7 +1514,7 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
     // Test that we can access the buffer data
     ASSERT_NE(buffer->data(), nullptr) << "Buffer data should not be null";
     ASSERT_EQ(buffer->getSize(), size) << "Buffer size should match requested size";
-    ASSERT_EQ(buffer->getDataType(), nvinfer1::DataType::kINT8) << "Buffer data type should be INT8";
+    ASSERT_EQ(buffer->getDataType(), tensorrt_llm::DataType::kINT8) << "Buffer data type should be INT8";
     ASSERT_EQ(buffer->getMemoryType(), MemoryType::kGPU) << "Buffer memory type should be GPU";
 
     // Test memory access by setting memory to a known pattern
@@ -1574,7 +1575,7 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocatorUnalignedSize)
 
     // Create a buffer using the virtual address allocator
     auto buffer = std::make_unique<VirtualAddressDeviceBuffer>(
-        size, nvinfer1::DataType::kINT8, CudaVirtualMemoryAllocator{config});
+        size, tensorrt_llm::DataType::kINT8, CudaVirtualMemoryAllocator{config});
 
     auto memoryAfterAllocation = getCurrentProcessMemoryInfo();
     if (memoryInfoAvailable())

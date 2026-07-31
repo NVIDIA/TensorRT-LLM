@@ -7,28 +7,6 @@ trap 'rc=$?; echo "Error in file ${BASH_SOURCE[0]} on line $LINENO: $BASH_COMMAN
 cd $resourcePathNode
 llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
-set_value_in_command() {
-    # Parameters
-    local key="$1"
-    local value="$2"
-    local command="$3"
-
-    # Transform the key
-    local placeholder="__PLACEHOLDER_${key}__"
-
-    # Check if placeholder exists
-    if [[ "$command" != *"$placeholder"* ]]; then
-        echo "Error: placeholder '$placeholder' not found in the command" >&2
-        return 1
-    fi
-
-    # Replace all occurrences
-    local result="${command//${placeholder}/${value}}"
-
-    # Return the result
-    echo "$result"
-}
-
 # Only the first process will set the git config
 if [ $SLURM_PROCID -eq 0 ]; then
     # Update HOME/.gitconfig
@@ -54,49 +32,24 @@ llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 
-# get trtllm wheel path and add to pytest command
+# Wheel path for the CBTS .coveragerc @TRTLLM_WHEEL_PATH@ substitution below.
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
 echo "TRTLLM WHEEL PATH: $trtllmWhlPath"
-# In disaggregated mode, we only set coverage config file in benchmark pytest.
-if [[ -z "${DISAGG_SERVING_TYPE:-}" || "${DISAGG_SERVING_TYPE}" == "BENCHMARK" ]]; then
-    pytestCommand=$(set_value_in_command "TRTLLM_WHL_PATH" "$trtllmWhlPath" "$pytestCommand")
-fi
 
 # Only the first process will save the coverage config file
 if [ $SLURM_PROCID -eq 0 ]; then
-    sed -i "s|---wheel_path---|$trtllmWhlPath|g" "$coverageConfigFile"
+    sed -i "s|@TRTLLM_WHEEL_PATH@|$trtllmWhlPath|g" "$coverageConfigFile"
 else
     # Sleep 30 seconds to wait for the coverage config file to be saved
     sleep 30
 fi
 
-containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')
-containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
-containerLDLibPath=$LD_LIBRARY_PATH
-containerLDLibPath=$(echo "$containerLDLibPath" | sed 's/[[:space:]]+/_/g')
-if [[ "$containerLDLibPath" != *"$containerPipLLMLibPath"* ]]; then
-  containerLDLibPath="$containerPipLLMLibPath:$containerLDLibPath"
-  containerLDLibPath="${containerLDLibPath%:}"
-fi
-export LD_LIBRARY_PATH=$containerLDLibPath
-
-# Slurm ENROOT/pyxis may inject UCX_TLS=tcp from the host MPI stack (intended for
-# host-only MPI jobs). That disables CUDA transports and breaks NIXL GPU memory
-# registration. Unset it so UCX can auto-select.
-if [ "${UCX_TLS:-}" = "tcp" ]; then
-    unset UCX_TLS
-    echo "Unset UCX_TLS (cluster injected UCX_TLS=tcp)"
-fi
-
-# Force PMIx to use the in-memory hash GDS instead of ds12/ds21 shared-memory.
-# Under `srun --mpi=pmix` with the DLFW 26.04 OpenMPI build, the shared-memory
-# GDS modes can fail to publish UCX worker addresses across nodes, producing:
-#   pml_ucx.c:178  Error: Failed to receive UCX worker address: Not found (-13)
-#   pml_ucx.c:482  Error: Failed to resolve UCX endpoint for rank N
-# See https://github.com/open-mpi/ompi/issues/6981. Setting this is a no-op
-# when PMIx isn't used.
-export PMIX_MCA_gds=hash
+# Library path + UCX/PMIx fixups shared with the disagg cache-transceiver
+# precheck (slurm_precheck_run.sh) -- keeping them in one place guarantees the
+# precheck observes the same network environment as the real test steps.
+source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
+slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort

@@ -960,6 +960,79 @@ class TestLTX2ForceOneStageEnv:
         assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
 
 
+class TestTwoStageLoRALoadingOverlap:
+    """Test two-stage LoRA load orchestration without loading checkpoints."""
+
+    def test_load_standard_components_overlaps_lora_with_base_components(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_two_stages
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+            LTX2TwoStagesPipeline,
+        )
+
+        events = []
+        lora_deltas = {"linear.weight": torch.ones(1)}
+
+        class FakeFuture:
+            def result(self):
+                events.append("lora_result")
+                return lora_deltas
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                assert max_workers == 1
+
+            def submit(self, fn, *args):
+                events.append("lora_submit")
+                assert fn is pipeline_ltx2_two_stages._load_lora_deltas
+                assert args == (
+                    "/fake/lora.safetensors",
+                    pipeline.transformer,
+                    pipeline._TRANSFORMER_PREFIX,
+                )
+                return FakeFuture()
+
+            def shutdown(self, wait=True):
+                events.append(f"shutdown:{wait}")
+
+        def fake_base_load(self, checkpoint_dir, device, skip_components=None, **kwargs):
+            events.append("base_load")
+            assert checkpoint_dir == "/fake/checkpoint"
+            assert device == torch.device("cpu")
+
+        monkeypatch.setattr(pipeline_ltx2_two_stages, "ThreadPoolExecutor", FakeExecutor)
+        monkeypatch.setattr(
+            pipeline_ltx2_two_stages,
+            "_get_free_gpu_memory_gib",
+            lambda device=None: None,
+        )
+        monkeypatch.setattr(LTX2Pipeline, "load_standard_components", fake_base_load)
+
+        class FakeTransformer:
+            def named_modules(self):
+                return []
+
+            def named_parameters(self):
+                return []
+
+        pipeline = LTX2TwoStagesPipeline.__new__(LTX2TwoStagesPipeline)
+        pipeline.pipeline_config = SimpleNamespace(
+            torch_dtype=torch.float32,
+            extra_attrs={
+                "distilled_lora_path": "/fake/lora.safetensors",
+            },
+        )
+        pipeline.model_config = pipeline.pipeline_config
+        pipeline.transformer = FakeTransformer()
+
+        pipeline.load_standard_components("/fake/checkpoint", torch.device("cpu"))
+
+        assert events == ["lora_submit", "base_load", "lora_result", "shutdown:True"]
+        assert pipeline._distilled_lora_deltas is lora_deltas
+
+
 class TestTwoStageUpsamplerBuildingBlocks:
     """Test upsampler components without checkpoints (random weights)."""
 
@@ -1166,20 +1239,96 @@ class TestLTX2TwoStageLoRAHelpers:
         assert queried_devices == ["cuda:1"]
 
     def test_two_stage_cuda_graph_key_includes_lora_state(self):
-        """Original and merged LoRA bindings must not share CUDA graph keys."""
-        lora_state = {"value": "original"}
+        """No (lora_state, topology) combination may share a CUDA graph key.
+
+        Red/green matrix over the states production visits — (original,
+        default) for stage 1 and (merged, stage2) for stage 2 — plus the
+        off-diagonal combinations, proving both key dimensions isolate
+        independently.
+        """
+        state = {"lora": "original", "topology": "default"}
         runner = ltx2_two_stages._LTX2TwoStageCUDAGraphRunner(
             ltx2_two_stages.CUDAGraphRunnerConfig(use_cuda_graph=True),
-            lambda: lora_state["value"],
+            lambda: state["lora"],
+            lambda: state["topology"],
         )
 
-        original_key = runner.get_graph_key(torch.empty(1, 2))
-        lora_state["value"] = "merged"
-        merged_key = runner.get_graph_key(torch.empty(1, 2))
+        keys = {}
+        for lora in ("original", "merged"):
+            for topology in ("default", "stage2"):
+                state["lora"], state["topology"] = lora, topology
+                keys[(lora, topology)] = runner.get_graph_key(torch.empty(1, 2))
 
-        assert original_key != merged_key
-        assert original_key[-1] == ("ltx2_two_stage_lora_state", "original")
-        assert merged_key[-1] == ("ltx2_two_stage_lora_state", "merged")
+        assert len(set(keys.values())) == 4, "graph keys shared across states"
+        for (lora, topology), key in keys.items():
+            assert key[-2] == ("ltx2_two_stage_lora_state", lora)
+            assert key[-1] == ("ltx2_two_stage_topology", topology)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_run_warmup_precaptures_both_topologies(self):
+        """The production warmup entrypoint (_run_warmup) pre-captures one
+        graph per topology; a repeat warmup-shaped request performs zero new
+        captures. forward is stubbed to model the two-stage boundary, but the
+        driver is the real inherited _run_warmup."""
+
+        class TinyTransformer:
+            def __init__(self):
+                self.lin = torch.nn.Linear(8, 8, device="cuda")
+                self.active_topology = "default"
+                self.device = "cuda"
+
+            def forward(self, x):
+                return self.lin(x)
+
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
+        )
+        pipeline.transformer = TinyTransformer()
+        pipeline._cuda_graph_runners = {}
+        pipeline._setup_cuda_graphs()
+        runner = pipeline._cuda_graph_runners["transformer"]
+
+        x = torch.randn(2, 8, device="cuda")
+
+        def fake_forward(*args, **kwargs):
+            for topology in ("default", "stage2"):
+                pipeline.transformer.active_topology = topology
+                pipeline.transformer.forward(x)
+
+        pipeline.forward = fake_forward
+
+        ltx2_two_stages.LTX2TwoStagesPipeline._run_warmup(pipeline, 512, 768, 121, 2)
+        assert sorted(key[-1] for key in runner.graphs) == [
+            ("ltx2_two_stage_topology", "default"),
+            ("ltx2_two_stage_topology", "stage2"),
+        ]
+
+        captures = []
+        original_capture = runner.capture
+        runner.capture = lambda *a, **k: (captures.append(a), original_capture(*a, **k))
+        ltx2_two_stages.LTX2TwoStagesPipeline._run_warmup(pipeline, 512, 768, 121, 2)
+        assert not captures, "post-warmup request re-captured a graph"
+        assert len(runner.graphs) == 2
+
+    def test_two_stage_forward_rejects_indivisible_stage2_tokens(self):
+        """forward() fails fast at request entry when the full-resolution token
+        count does not divide the stage-2 seq-plane size."""
+        lat = ltx2_two_stages.VideoLatentShape.from_pixel_shape(
+            ltx2_two_stages.VideoPixelShape(batch=1, frames=121, height=512, width=768, fps=24.0)
+        )
+        tokens = lat.frames * lat.height * lat.width
+        bad_size = next(s for s in (7, 11, 13) if tokens % s != 0)
+
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.transformer = SimpleNamespace(
+            _has_stage2=True,
+            _sharder_s2=SimpleNamespace(size=bad_size),
+        )
+
+        with pytest.raises(ValueError, match="not divisible by the stage-2"):
+            pipeline.forward(prompt="x", seed=0, height=512, width=768, num_frames=121)
 
     def test_two_stage_cuda_graph_setup_uses_pipeline_config(self):
         """CUDA graph setup runs before the two-stage model_config is assigned."""

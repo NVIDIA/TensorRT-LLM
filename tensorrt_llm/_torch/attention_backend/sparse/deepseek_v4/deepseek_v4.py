@@ -32,9 +32,10 @@ from tensorrt_llm._torch.modules.linear import Linear  # noqa: E402  (avoid cycl
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import is_sm_100f, prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 from ..dsa import (
     HAS_FAST_HADAMARD,
@@ -55,13 +56,37 @@ DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO = 4
 
 
 class DeepseekV4AttentionType(Enum):
+    # attentions managed in sliding-window mode are put in the front on purpose
     SWA = 0
-    COMPRESS = 1
-    COMPRESSOR_STATE = 2
-    COMPRESSOR_SCORE = 3
-    INDEXER_COMPRESS = 4
-    INDEXER_COMPRESSOR_STATE = 5
-    INDEXER_COMPRESSOR_SCORE = 6
+    COMPRESSOR_KV = 1
+    COMPRESSOR_SCORE = 2
+    INDEXER_COMPRESSOR_KV = 3
+    INDEXER_COMPRESSOR_SCORE = 4
+
+    # attentions not managed in sliding-window mode
+    COMPRESS = 5
+    INDEXER_COMPRESS = 6
+
+    @property
+    def role(self) -> DataRole:
+        return DataRole(f"deepseek_v4_{self.name.lower()}")
+
+
+DEEPSEEK_V4_SLIDING_ATTENTION = (
+    DeepseekV4AttentionType.SWA,
+    DeepseekV4AttentionType.COMPRESSOR_KV,
+    DeepseekV4AttentionType.COMPRESSOR_SCORE,
+    DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
+    DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+)
+assert tuple(attn_type.value for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION) == tuple(
+    range(len(DEEPSEEK_V4_SLIDING_ATTENTION))
+)
+
+DEEPSEEK_V4_NON_SLIDING_ATTENTION = (
+    DeepseekV4AttentionType.COMPRESS,
+    DeepseekV4AttentionType.INDEXER_COMPRESS,
+)
 
 
 def is_overlap_compressor(compress_ratio: int) -> bool:
@@ -84,13 +109,13 @@ def compress_ratio_has_attention(compress_ratio: int, attn_type: DeepseekV4Atten
         return True
     if attn_type == DeepseekV4AttentionType.COMPRESS:
         return is_compress
-    if attn_type == DeepseekV4AttentionType.COMPRESSOR_STATE:
+    if attn_type == DeepseekV4AttentionType.COMPRESSOR_KV:
         return is_compress
     if attn_type == DeepseekV4AttentionType.COMPRESSOR_SCORE:
         return is_compress
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
         return is_sparse
-    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE:
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV:
         return is_sparse
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
         return is_sparse
@@ -105,13 +130,13 @@ def get_attn_dim(
         return head_dim
     if attn_type == DeepseekV4AttentionType.COMPRESS:
         return head_dim
-    if attn_type == DeepseekV4AttentionType.COMPRESSOR_STATE:
+    if attn_type == DeepseekV4AttentionType.COMPRESSOR_KV:
         return state_factor * head_dim
     if attn_type == DeepseekV4AttentionType.COMPRESSOR_SCORE:
         return state_factor * head_dim
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
         return index_head_dim
-    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE:
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV:
         return state_factor * index_head_dim
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
         return state_factor * index_head_dim
@@ -134,14 +159,18 @@ def get_token_bytes(
     attn_dim = get_attn_dim(head_dim, index_head_dim, compress_ratio, attn_type)
 
     dtype_bytes = 1 if has_fp8_kv_cache else 2
+    # (indexer) compressor kv and score always use float32
     if attn_type in [
-        DeepseekV4AttentionType.COMPRESSOR_STATE,
+        DeepseekV4AttentionType.COMPRESSOR_KV,
         DeepseekV4AttentionType.COMPRESSOR_SCORE,
-        DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
         DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
     ]:
-        dtype_bytes = 4
-
+        dtype_bytes = 4  # (indexer) compressor kv and score use float32
+    # Indexer cache always packs data + per-block scales into one row.  Only
+    # the two indexer presets ("fp8" blockwise / "fp4" mxfp4) are valid
+    # here — bf16 / fp8_pertensor are reserved for the main-attention
+    # compressor.
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
         if indexer_k_dtype == "fp8":
             return attn_dim + index_head_dim // 128 * 4
@@ -216,8 +245,12 @@ def make_deepseek_v4_sparse_metadata_params(
         max_sparse_topk=_sparse_config_value(
             sparse_attention_config, pretrained_config, "index_topk"
         ),
+        index_head_dim=_sparse_config_value(
+            sparse_attention_config, pretrained_config, "index_head_dim", 128
+        ),
         enable_indexer_skip=sparse_attention_config.skip_indexer_for_short_seqs,
         enable_heuristic_topk=sparse_attention_config.enable_heuristic_topk,
+        use_cute_dsl_topk=sparse_attention_config.use_cute_dsl_topk,
         use_cute_dsl_paged_mqa_logits=(sparse_attention_config.use_cute_dsl_paged_mqa_logits),
         q_split_threshold=sparse_attention_config.q_split_threshold,
         compress_ratios=sparse_attention_config.compress_ratios,
@@ -242,16 +275,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         super().__post_init__()
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
-        window_size = getattr(self.sparse_metadata_params, "window_size", None)
-        if window_size is None and self.sparse_attention_config is not None:
-            window_size = self.sparse_attention_config.window_size
-        compress_ratios = getattr(self.sparse_metadata_params, "compress_ratios", None)
-        if not compress_ratios and self.sparse_attention_config is not None:
-            compress_ratios = self.sparse_attention_config.compress_ratios
-        if compress_ratios:
-            self.compress_ratios = compress_ratios
-
-        self.window_size = window_size
+        self._ctx_output_sizes: Optional[Dict[int, int]] = None
+        sparse_metadata_params = self.sparse_metadata_params
+        if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):
+            raise ValueError("DeepSeek-V4 sparse attention metadata params are not set")
+        self.window_size = sparse_metadata_params.window_size
+        window_size = self.window_size
         assert window_size == 128, (
             f"Dual-pool sparse MLA requires window_size == 128, which equals to the"
             f"TileSizeKV of the FMHA kernel. (got {window_size})."
@@ -275,11 +304,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             elif compress_ratio == 4:
                 attention_types.append((1, DeepseekV4AttentionType.SWA))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_STATE))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESS))
                 attention_types.append(
-                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE)
+                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV)
                 )
                 attention_types.append(
                     (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE)
@@ -287,7 +316,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             else:
                 attention_types.append((1, DeepseekV4AttentionType.SWA))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_STATE))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
         self.attention_type_set = set(attention_types)
 
@@ -424,21 +453,38 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
-        self.block_tables = {
-            attention_type: self.get_empty(
+        # Sliding-window caches use per-layer page indices and are indexed by
+        # [local_layer_idx, attention_type.value, sequence, block]. COMPRESS
+        # uses ratio-shared page indices, and INDEXER_COMPRESS keeps a separate
+        # compatibility table for the generic DSA indexer path.
+        block_table_shape = (
+            self.kv_cache_manager.num_local_layers,
+            len(DEEPSEEK_V4_SLIDING_ATTENTION),
+            self.max_num_sequences,
+            self.kv_cache_manager.max_blocks_per_seq,
+        )
+        self.sliding_block_tables = self.get_empty(
+            self.cuda_graph_buffers,
+            block_table_shape,
+            cache_name="sliding_block_tables",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
+        compress_block_table_shape = (
+            self.max_num_sequences,
+            self.kv_cache_manager.max_blocks_per_seq,
+        )
+        self.compress_block_tables = {
+            compress_ratio: self.get_empty(
                 self.cuda_graph_buffers,
-                (self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq),
-                cache_name=f"block_tables_{attention_type}",
+                compress_block_table_shape,
+                cache_name=f"compress_block_tables_{compress_ratio}",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-            for attention_type in self.attention_type_set
-        }
-        self.host_block_tables = {
-            attention_type: torch.empty_like(
-                self.block_tables[attention_type], device="cpu", pin_memory=prefer_pinned()
-            )
-            for attention_type in self.attention_type_set
+            for compress_ratio in self._compress_ratios_sorted
+            if is_compress_layer(compress_ratio)
         }
 
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
@@ -471,47 +517,41 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self._init_cache_buffer_data_pointers()
 
     def prepare_for_indexer_k_cache(self):
-        """Optimized: bulk tensor copy instead of per-row Python loop.
-
-        Note: must use num_contexts=0 for get_batch_attn_offset because the
-        indexer k cache always uses generation-style copy indices regardless
-        of request type.
-        """
-        num_seqs = self.num_seqs
-        offsets = self.kv_cache_manager.get_batch_attn_offset(
+        """Prepare the shared indexer K-cache decode table for DSA kernels."""
+        # INDEXER_COMPRESS uses shared page indices, so the generic DSA
+        # indexer path only needs one 2D block table.
+        self.kv_cache_manager.copy_batch_indexer_compress_block_tables(
+            self.host_indexer_k_cache_block_offsets,
             self.request_ids,
-            1,  # beam_width
-            0,  # num_contexts=0 (indexer always uses gen-style copy index)
-            num_seqs,
-            DeepseekV4AttentionType.INDEXER_COMPRESS,
-            DEEPSEEK_V4_SPARSE_RATIO,
+            beam_width=self.beam_width,
+            num_contexts=self.num_contexts,
+            num_seqs=self.num_seqs,
         )
-        num_cols = offsets.shape[1]
-        self.host_indexer_k_cache_block_offsets[:num_seqs, :num_cols] = offsets[:num_seqs]
-        self.indexer_k_cache_block_offsets[:num_seqs].copy_(
-            self.host_indexer_k_cache_block_offsets[:num_seqs],
+        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
+            self.host_indexer_k_cache_block_offsets[: self.num_seqs],
             non_blocking=True,
         )
+        # Columns beyond each sequence's allocated indexer blocks contain BAD_PAGE_INDEX (-1).
+        # CUDA-graph padded token slots may still compute scatter addresses from those columns
+        # before being ignored, so map them to block 0, matching the base DSA metadata path.
+        self.indexer_k_cache_block_offsets.clamp_(min=0)
 
     def prepare_for_block_tables(self):
-        """Prepare block tables for all attention types.
-
-        Delegates offset computation to DeepseekV4CacheManager.get_batch_block_offsets
-        (single get_copy_index call, deduplicated by pool), then copies to device.
-        """
-        num_seqs = self.num_seqs
-        offsets_map = self.kv_cache_manager.get_batch_block_offsets(
-            self.request_ids, self.num_contexts, self.attention_type_set
+        """Prepare block tables for sliding-window and compressed attention."""
+        self.kv_cache_manager.copy_batch_sliding_block_tables(
+            self.sliding_block_tables,
+            self.request_ids,
+            self.num_contexts,
+            self.num_seqs,
         )
-
-        # Phase 1: write host buffers.
-        for key, offsets in offsets_map.items():
-            self.host_block_tables[key][:num_seqs] = offsets[:num_seqs]
-
-        # Phase 2: batch H2D copies.
-        for key in self.attention_type_set:
-            self.block_tables[key][:num_seqs].copy_(
-                self.host_block_tables[key][:num_seqs], non_blocking=True
+        for compress_ratio, compress_block_table in self.compress_block_tables.items():
+            self.kv_cache_manager.copy_batch_compress_block_tables(
+                compress_block_table,
+                self.request_ids,
+                compress_ratio=compress_ratio,
+                beam_width=self.beam_width,
+                num_contexts=self.num_contexts,
+                num_seqs=self.num_seqs,
             )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
@@ -612,10 +652,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         extend_compress_ratios = self.compress_ratios + [self.compress_ratios[-1]] * (
             self.max_draft_tokens - 1
         )
+        # SWA uses PER_LAYER indices; COMPRESS uses SHARED indices. The sparse
+        # MLA conversion kernel receives a representative base pointer per pool
+        # and a per-layer buffer pointer so it can account for any layer offset.
+        self.sparse_mla_base_ptrs = {
+            1: self.kv_cache_manager.swa_pool_ptr,
+        }
+        for ratio, compress_pool_ptr in self.kv_cache_manager.compress_pool_ptrs.items():
+            self.sparse_mla_base_ptrs[ratio] = compress_pool_ptr
+
         self.swa_buffer_ptrs = {
-            layer_idx: self.kv_cache_manager.get_buffers(
-                layer_idx, DeepseekV4AttentionType.SWA
-            ).data_ptr()
+            layer_idx: self.kv_cache_manager.swa_pool_ptr
             for layer_idx in self.kv_cache_manager.pp_layers
         }
         self.compressed_buffer_ptrs = {
@@ -626,15 +673,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             if is_compress_layer(extend_compress_ratios[layer_idx])
         }
 
-        # Per-ratio base pointer for sparse MLA global-index conversion.
-        # Ratio 1 is the SWA pool; ratios greater than 1 are compressed pools.
-        self.sparse_mla_base_ptrs = {
-            1: self.kv_cache_manager.swa_pool_ptr,
-        }
-        for ratio, compress_pool_ptr in self.kv_cache_manager.compress_pool_ptrs.items():
-            self.sparse_mla_base_ptrs[ratio] = compress_pool_ptr
-
     def prepare(self):
+        assert self.kv_cache_manager is not None
+        assert self.request_ids is not None
+
+        self.kv_cache_manager.compute_sliding_block_tables(
+            self.request_ids,
+            self.num_contexts,
+        )
+
         TrtllmAttentionMetadata.prepare(self)
 
         num_requests = self.num_contexts + self.num_generations
@@ -662,15 +709,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         has_sparse_layers = DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
 
+        # For block offsets
+        self.prepare_for_block_tables()
+
         # For indexer k cache (only needed when sparse layers exist)
         if has_sparse_layers:
             self.prepare_for_indexer_k_cache()
 
         # For spec decode
         self.prepare_for_spec_decode(kv_lens)
-
-        # For block offsets
-        self.prepare_for_block_tables()
 
         # For DeepSeek-V4 indices
         self.prepare_for_deepseek_v4_indices()
@@ -691,12 +738,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         kv_lens_slice = kv_lens[:num_requests]
         cached_slice = cached_token_lens[:num_requests]
 
+        # Host-side per-ratio ctx compressed-token counts (Python ints), so
+        # _compute_ctx_compressed_position_ids never reads a device scalar
+        # (implicit D2H + stream sync) for its arange size / slice bound.
+        ctx_output_sizes: Optional[Dict[int, int]] = None
         if num_contexts > 0:
             # Prefill path: need per-request tensor ops for ctx scalar metadata.
+            ctx_output_sizes = {}
             for compress_ratio in self.compress_ratio_set:
                 new_comp_kv_lens = kv_lens_slice // compress_ratio - cached_slice // compress_ratio
                 cu_new = new_comp_kv_lens.cumsum(0)
                 num_ctx_compressed_tokens = cu_new[num_contexts - 1].item()
+                ctx_output_sizes[compress_ratio] = num_ctx_compressed_tokens
                 num_gen_compressed_tokens = num_generations * (
                     (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
                 )
@@ -715,12 +768,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 )
                 self.max_ctx_compressed_tokens[compress_ratio] = 0
 
+        # Cached for on_update_kv_lens(); see the reuse gate there.
+        self._ctx_output_sizes = ctx_output_sizes
+
         # 2) CUDA-side: fill *_cuda buffers on device.
         kv_lens_cuda = (
             self.cached_token_lens_cuda[:num_requests] + self._seq_lens_cuda[:num_requests]
         )
         cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
-        self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda)
+        self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda, ctx_output_sizes)
 
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
@@ -735,6 +791,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self,
         kv_lens: torch.Tensor,
         cached_tokens: torch.Tensor,
+        ctx_output_sizes: Optional[Dict[int, int]] = None,
     ):
         """Compute per-ratio compressed KV lens and position IDs on device.
 
@@ -743,6 +800,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         Args:
             kv_lens: Total KV lengths per request (device tensor, [batch_size]).
             cached_tokens: Cached token counts per request (device tensor, [batch_size]).
+            ctx_output_sizes: Optional per-ratio host-computed ctx
+                compressed-token counts (Python ints); avoids implicit
+                device-scalar reads (D2H + stream sync) in the ctx position-id
+                computation. prepare() always passes it; on_update_kv_lens()
+                reuses the cached copy unless the extend_ctx path may have
+                mutated ctx-row kv_lens on device.
         """
         batch_size = kv_lens.shape[0]
         num_contexts = self.num_contexts
@@ -766,6 +829,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 self.compressed_position_ids_cuda,
                 num_contexts,
                 self._compress_ratios_sorted,
+                ctx_output_sizes,
             )
 
         if self.num_gen_tokens_per_seq > 0 and num_generations > 0:
@@ -778,6 +842,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             }
             self._compute_gen_compressed_position_ids(
                 self.past_kv_lens_cuda,
+                self.cu_new_comp_kv_cuda,
                 self.compressed_position_ids_cuda,
                 num_contexts,
                 num_generations,
@@ -801,7 +866,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
         )
 
-        self.prepare_compressed_kv_metadata(kv_lens, cached_tokens)
+        # Reuse prepare()'s host-computed ctx sizes unless the extend_ctx path
+        # (num_chunked_ctx_requests > 0) may have mutated ctx-row kv_lens on
+        # device; every other path only changes gen rows.
+        ctx_output_sizes = (
+            self._ctx_output_sizes if getattr(self, "num_chunked_ctx_requests", 0) == 0 else None
+        )
+        self.prepare_compressed_kv_metadata(kv_lens, cached_tokens, ctx_output_sizes)
 
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
@@ -884,6 +955,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     @maybe_compile(dynamic=True, options={"max-autotune": True})
     def _compute_gen_compressed_position_ids(
         past_kv_lens_bufs: Dict[int, torch.Tensor],
+        cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
         compressed_position_ids_bufs: Dict[int, torch.Tensor],
         num_contexts: int,
         num_generations: int,
@@ -891,7 +963,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compress_ratios: list,
         gen_output_offsets: Dict[int, int],
     ):
-        """Generation compressed position IDs.
+        """Generation position IDs in exact compact compressor output order.
+
+        The decode kernel packs valid outputs according to ``cu_new_comp_kv``.
+        The corresponding request and local offset are recovered for every
+        compact output index. Reserved slots after the compact prefix are masked
+        during postprocess, so their position IDs are irrelevant.
 
         gen_output_offsets: dict mapping compress_ratio -> Python int offset,
         pre-extracted by the caller to avoid tensor-scalar .item() inside
@@ -899,13 +976,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         device = past_kv_lens_bufs[compress_ratios[0]].device
         batch_size = num_contexts + num_generations
         for compress_ratio in compress_ratios:
-            gen_past = past_kv_lens_bufs[compress_ratio][num_contexts:batch_size]
             new_gen_comp = (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
-            gen_offsets = torch.arange(new_gen_comp, dtype=torch.int32, device=device)
-            gen_pos = gen_past.unsqueeze(1) + gen_offsets.unsqueeze(0)
             gen_comp = num_generations * new_gen_comp
-            result = (gen_pos.reshape(-1) * compress_ratio).to(torch.int)
             output_offset = gen_output_offsets[compress_ratio]
+            cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
+            output_idx = torch.arange(gen_comp, dtype=torch.int32, device=device) + output_offset
+            # Search the zero-offset prefix: Inductor miscompiles searchsorted on cu_new_comp[1:].
+            req_idx = torch.searchsorted(cu_new_comp[: batch_size + 1], output_idx, right=True) - 1
+            req_idx = req_idx.clamp(min=num_contexts, max=batch_size - 1)
+            offset_in_req = output_idx - cu_new_comp[req_idx]
+            past_kv_lens = past_kv_lens_bufs[compress_ratio]
+            result = ((past_kv_lens[req_idx] + offset_in_req) * compress_ratio).to(torch.int)
             compressed_position_ids_bufs[compress_ratio][
                 output_offset : output_offset + gen_comp
             ] = result
@@ -947,14 +1028,24 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compressed_position_ids_bufs: Dict[int, torch.Tensor],
         num_contexts: int,
         compress_ratios: list,
+        ctx_output_sizes: Optional[Dict[int, int]] = None,
     ):
-        """Context-only compressed position IDs (eager, data-dependent shapes)."""
+        """Context-only compressed position IDs (eager, data-dependent shapes).
+
+        ctx_output_sizes (host ints) keeps the arange size and slice bound off
+        the device; the 0-dim-CUDA fallback costs two implicit D2H syncs per
+        ratio.
+        """
         device = past_kv_lens_bufs[compress_ratios[0]].device
         for compress_ratio in compress_ratios:
             past_kv = past_kv_lens_bufs[compress_ratio]
             cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
 
-            total_ctx_comp = cu_new_comp[num_contexts]
+            total_ctx_comp = (
+                ctx_output_sizes[compress_ratio]
+                if ctx_output_sizes is not None
+                else cu_new_comp[num_contexts]
+            )
             ctx_idx = torch.arange(total_ctx_comp, dtype=torch.int32, device=device)
             ctx_cu = cu_new_comp[: num_contexts + 1].to(torch.int32)
             ctx_req = torch.searchsorted(ctx_cu[1:], ctx_idx, right=True)
@@ -988,6 +1079,11 @@ class DeepseekV4Indexer(Indexer):
             layer_idx,
             aux_stream,
         )
+        # Preserve the checkpoint's 128x128 FP8 quantization while deriving a
+        # native-MXF8 (sf_vec=32) scale view for the TRT-LLM CuTe DSL fused
+        # indexer-Q projection.  FP8BlockScalesLinearMethod materializes the
+        # derived, swizzled scale once after weight loading.
+        self.wq_b.use_indexer_q_cutedsl_fusion = True
         # Override base Indexer.weights_proj to bf16 (matches V4 checkpoint).
         self.weights_proj = Linear(
             self.hidden_size,
@@ -1047,6 +1143,10 @@ class DeepseekV4Indexer(Indexer):
         """
         q = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim)
+        return self._apply_q_rope(q, position_ids)
+
+    def _apply_q_rope(self, q: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """Apply RoPE in-place to a projected indexer Q tensor."""
         # Fused in-place RoPE on the rope portion of each head
         nope_dim = self.head_dim - self.rope_dim
         torch.ops.trtllm.mla_rope_inplace(
@@ -1060,6 +1160,49 @@ class DeepseekV4Indexer(Indexer):
             self.rotary_emb.is_neox,
         )
         return q
+
+    def _project_and_quantize_q(
+        self, qr: torch.Tensor, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project Q and produce the cache precision consumed by the indexer.
+
+        The DSv4 MXFP4 configuration can fuse projection, interleaved RoPE,
+        and FP4 quantization. If the optional Hadamard transform is active,
+        retain the legacy path because that transform changes all 128 values
+        in a head and is not part of the CuTe DSL kernel.
+        """
+        use_fused_project_mxfp4 = (
+            self.indexer_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE
+            and not HAS_FAST_HADAMARD
+            and not self.rotary_emb.is_neox
+            and self.head_dim == 128
+            and self.rope_dim == 64
+            and self.wq_b.has_fp8_block_scales
+            and hasattr(self.wq_b, "indexer_q_weight_scale_cutedsl")
+            and hasattr(
+                torch.ops.trtllm,
+                "cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell",
+            )
+            and qr.dtype == torch.bfloat16
+            and is_sm_100f()
+        )
+        if use_fused_project_mxfp4:
+            q_fp4, q_scale = torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell(
+                qr,
+                self.wq_b.weight,
+                self.wq_b.indexer_q_weight_scale_cutedsl,
+                position_ids.view(-1),
+                self.rotary_emb.rotary_cos_sin.view(-1, self.rope_dim),
+                self.wq_b.indexer_q_alpha_cutedsl,
+                use_tvm_ffi=True,
+            )
+            return q_fp4.view(-1, self.n_heads, self.head_dim // 2), q_scale.view(
+                -1, self.n_heads, 1
+            )
+
+        q = self.wq_b(qr).view(-1, self.n_heads, self.head_dim)
+        q = self._apply_q_rope(q, position_ids)
+        return self._quantize_q(q)
 
     def _quantize_q(self, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Rotate + quantize (layout matches compressor K: [nope|pe]). After
@@ -1117,12 +1260,44 @@ class DeepseekV4Indexer(Indexer):
         assert k_scale is not None, "FP8 blockwise indexer cache update requires scale tensor"
         self._update_k_cache(k_fp8, k_scale, metadata)
 
+    def precompute_aux(
+        self,
+        hidden_states: torch.Tensor,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
+        """Pre-launch the qr-independent half of the indexer prepare phase.
+
+        Runs weights_proj + internal compressor + k_cache_update on
+        ``self.aux_stream`` and records ``weights_proj_event`` /
+        ``k_cache_update_event``.  The caller hands the returned tuple back to
+        ``forward()`` via the ``pre_aux`` kwarg, which makes the overlapped
+        prepare path skip its own aux-stream launch and consume these results
+        directly.
+
+        Returns ``None`` when multi-stream mode is off (caller should fall
+        back to the normal ``forward()`` call without ``pre_aux``).
+        """
+        if not (do_multi_stream() and self.aux_stream is not None):
+            return None
+        self.indexer_start_event.record()
+        with torch.cuda.stream(self.aux_stream):
+            self.indexer_start_event.wait()
+            weights = self.weights_proj(hidden_states)
+            self.weights_proj_event.record()
+            k_fp8, k_scale = self.compressor(hidden_states, metadata)
+            self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
+            self.k_cache_update_event.record()
+        return (weights, k_fp8, k_scale)
+
     def _run_overlapped_indexer_prepare(
         self,
         qr: torch.Tensor,
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
+        pre_aux: Optional[
+            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+        ] = None,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
     ]:
@@ -1132,7 +1307,12 @@ class DeepseekV4Indexer(Indexer):
         the recorded launch point and owns weights projection, compressor, and
         the K-cache update.
 
-        Timeline:
+        When ``pre_aux`` is provided the aux-stream work has already been
+        launched (and ``weights_proj_event`` / ``k_cache_update_event``
+        recorded) by ``precompute_aux``; the aux-stream block here is skipped
+        and the precomputed tensors are consumed directly.
+
+        Timeline (pre_aux=None):
             current stream:
                 record indexer_start_event
                 q_proj + RoPE -> quant_q
@@ -1150,21 +1330,31 @@ class DeepseekV4Indexer(Indexer):
             weights_proj --------------------> weight_scale
             compressor -> update_k_cache ----> final wait
         """
-        self.indexer_start_event.record()
+        if pre_aux is None:
+            self.indexer_start_event.record()
 
-        q = self._qk_projection_and_rope(qr, position_ids)
+            q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
 
-        with torch.cuda.stream(self.aux_stream):
-            self.indexer_start_event.wait()
+            with torch.cuda.stream(self.aux_stream):
+                self.indexer_start_event.wait()
 
-            weights = self.weights_proj(hidden_states)
-            self.weights_proj_event.record()
+                weights = self.weights_proj(hidden_states)
+                self.weights_proj_event.record()
 
-            k_fp8, k_scale = self.compressor(hidden_states, metadata)
-            self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
-            self.k_cache_update_event.record()
-
-        q_fp8, q_scale = self._quantize_q(q)
+                k_fp8, k_scale = self.compressor(hidden_states, metadata)
+                self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
+                self.k_cache_update_event.record()
+        else:
+            weights, k_fp8, k_scale = pre_aux
+            # pre_aux tensors were allocated on aux_stream; record on the
+            # consuming stream so the caching allocator can't recycle them mid-use.
+            cur_stream = torch.cuda.current_stream()
+            weights.record_stream(cur_stream)
+            if k_fp8 is not None:
+                k_fp8.record_stream(cur_stream)
+            if k_scale is not None:
+                k_scale.record_stream(cur_stream)
+            q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
 
         self.weights_proj_event.wait()
         weights = self._apply_weight_scale(weights, q_scale)
@@ -1181,9 +1371,7 @@ class DeepseekV4Indexer(Indexer):
     ) -> Tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
     ]:
-        q = self._qk_projection_and_rope(qr, position_ids)
-
-        q_fp8, q_scale = self._quantize_q(q)
+        q_fp8, q_scale = self._project_and_quantize_q(qr, position_ids)
 
         weights = self.weights_proj(hidden_states)
 
@@ -1193,18 +1381,36 @@ class DeepseekV4Indexer(Indexer):
         self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
         return q_fp8, q_scale, k_fp8, k_scale, weights
 
+    def _update_k_cache(
+        self,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+    ) -> None:
+        # DSV4's indexer compressor already scatters INDEXER_COMPRESS. The
+        # shared DSA scatter would duplicate that write.
+        return
+
     def forward(
         self,
         qr: torch.Tensor,
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
+        pre_aux: Optional[
+            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+        ] = None,
     ):
         if do_multi_stream() and self.aux_stream is not None:
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
-                qr, hidden_states, metadata, position_ids
+                qr,
+                hidden_states,
+                metadata,
+                position_ids,
+                pre_aux=pre_aux,
             )
         else:
+            assert pre_aux is None, "pre_aux requires multi-stream mode"
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_serial_indexer_prepare(
                 qr, hidden_states, metadata, position_ids
             )
@@ -1401,14 +1607,15 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         # Use global req_id directly
         req_id = metadata.req_idx_per_token[start_idx:end_idx]
         swa_local_indices = metadata.swa_local_indices_cuda[start_idx:end_idx]
-        block_table_swa = metadata.block_tables[(1, DeepseekV4AttentionType.SWA)]
+        local_layer_idx = kv_cache_manager.layer_offsets[layer_idx]
+        block_table_swa = metadata.sliding_block_tables[
+            local_layer_idx, DeepseekV4AttentionType.SWA.value
+        ]
 
         if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
-            block_table_compressed = metadata.block_tables[
-                (self.compress_ratio, DeepseekV4AttentionType.COMPRESS)
-            ]
+            block_table_compressed = metadata.compress_block_tables[self.compress_ratio]
             if self.compress_ratio == 4:
                 topk_indices = forward_args.topk_indices
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"

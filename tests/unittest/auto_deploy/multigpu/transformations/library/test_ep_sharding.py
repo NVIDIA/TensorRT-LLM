@@ -23,6 +23,7 @@ from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_tr
 from _model_test_utils import MoEOpModel
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+from tensorrt_llm._torch.auto_deploy._compat import AllReduceStrategy
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     EPShardingInfo,
@@ -34,7 +35,6 @@ from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimiz
 from tensorrt_llm._torch.auto_deploy.utils._graph import lint, recompile
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-from tensorrt_llm.functional import AllReduceStrategy
 
 
 def _run_ep_shard_job(
