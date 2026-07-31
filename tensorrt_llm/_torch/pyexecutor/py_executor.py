@@ -6999,7 +6999,17 @@ class PyExecutor:
                                       0)
             draft_len = get_draft_token_length(request)
             if draft_len > 0:
-                request.py_total_draft_tokens += draft_len
+                # Mirror C++ LlmRequest::updateNumTokensPerIteration, which
+                # clamps the drafted count to getMaxDraftPathLen(): with
+                # tree-based drafting the request carries up to
+                # max_total_draft_tokens draft tokens, but at most
+                # max_draft_len (the max path length) of them can be accepted
+                # in one step, so the acceptance-rate denominator counts paths,
+                # not trees. No-op for linear chains (draft_len <=
+                # max_draft_len there).
+                drafted = (min(draft_len, self.max_draft_len)
+                           if self.max_draft_len > 0 else draft_len)
+                request.py_total_draft_tokens += drafted
                 request.py_total_accepted_draft_tokens += py_num_accepted
                 for pos in range(min(draft_len, MAX_SPEC_DECODE_POSITIONS)):
                     request.py_per_pos_drafted[pos] += 1
