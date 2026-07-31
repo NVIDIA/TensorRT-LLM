@@ -2178,7 +2178,8 @@ class TestParameterValidation:
 
         # A beam width above max_beam_width is rejected: buffers are only
         # allocated up to max_beam_width.
-        with pytest.raises(RequestError, match=".*exceeds max_beam_width.*"):
+        with pytest.raises(RequestError,
+                           match=".*is not equal to max_beam_width.*"):
             _ = llm.generate(input_prompts,
                              sampling_params=SamplingParams(
                                  max_tokens=fixed_params["max_tokens"],
