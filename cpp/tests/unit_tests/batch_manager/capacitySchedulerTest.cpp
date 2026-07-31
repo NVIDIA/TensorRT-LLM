@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
@@ -45,6 +46,56 @@ namespace tc = tensorrt_llm::common;
 
 using CudaStreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using VecTokens = std::vector<TokenIdType>;
+
+namespace
+{
+
+constexpr char kExcludeDisaggGenerationTransferFromCapacityEnv[]
+    = "TRTLLM_NVBUG_6448152_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY";
+
+struct ScopedEnv
+{
+    explicit ScopedEnv(char const* key, char const* value)
+        : mKey(key)
+    {
+        char const* previousValue = std::getenv(key);
+        mHadPreviousValue = previousValue != nullptr;
+        if (mHadPreviousValue)
+        {
+            mPreviousValue = previousValue;
+        }
+        if (value != nullptr)
+        {
+            setenv(key, value, 1);
+        }
+        else
+        {
+            unsetenv(key);
+        }
+    }
+
+    ~ScopedEnv()
+    {
+        if (mHadPreviousValue)
+        {
+            setenv(mKey.c_str(), mPreviousValue.c_str(), 1);
+        }
+        else
+        {
+            unsetenv(mKey.c_str());
+        }
+    }
+
+    ScopedEnv(ScopedEnv const&) = delete;
+    ScopedEnv& operator=(ScopedEnv const&) = delete;
+
+private:
+    std::string mKey;
+    bool mHadPreviousValue;
+    std::string mPreviousValue;
+};
+
+} // namespace
 
 struct RequestState
 {
@@ -97,7 +148,13 @@ public:
 
     [[nodiscard]] SizeType32 determineNumPages(std::shared_ptr<LlmRequest> llmReqeust) const override
     {
+        ++mDetermineNumPagesCalls;
         return mNumPages;
+    }
+
+    [[nodiscard]] std::size_t getDetermineNumPagesCalls() const
+    {
+        return mDetermineNumPagesCalls;
     }
 
     inline bool enabled() const override
@@ -109,6 +166,7 @@ private:
     SizeType32 mNumPages;
     SizeType32 mMaxDevicePages;
     SizeType32 mMaxHostPages;
+    mutable std::size_t mDetermineNumPagesCalls{0};
 };
 
 class CapacitySchedulerTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -808,6 +866,8 @@ TEST_F(CapacitySchedulerTest, DisaggGenInitMaxUtilization)
 
 TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
 {
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, nullptr);
+
     SizeType32 kvCacheMaxNumTokens = 200;
     SizeType32 kvCacheTokensPerBlock = 10;
     SizeType32 kvCacheMaxNumTokensPerSeq = 90;
@@ -848,6 +908,270 @@ TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
             << "policy=" << static_cast<int>(capacitySchedulerPolicy);
         EXPECT_TRUE(pausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
     }
+}
+
+TEST_F(CapacitySchedulerTest, DisaggGenTransferCapacityTreatmentIsExercisedAtBoundary)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    auto kvCacheManager = getKvCacheManager(2, 10, 200, 90);
+    auto peftCacheManager = getPeftCacheManager();
+    auto transferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+
+    RequestVector fittingRequests;
+    RequestVector fittingDisaggGenInitRequests;
+    RequestVector pausedRequests;
+    testing::internal::CaptureStdout();
+    {
+        auto capacityScheduler
+            = CapacityScheduler(1, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        std::tie(fittingRequests, fittingDisaggGenInitRequests, pausedRequests)
+            = capacityScheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager);
+    }
+    auto const output = testing::internal::GetCapturedStdout();
+
+    EXPECT_TRUE(fittingRequests.empty());
+    ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1U);
+    EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId);
+    EXPECT_TRUE(pausedRequests.empty());
+    EXPECT_THAT(output, testing::HasSubstr("NVBUG6448152_CAPACITY event=effective_config"));
+    EXPECT_THAT(output, testing::HasSubstr("NVBUG6448152_CAPACITY event=exercised path=disagg_init"));
+    EXPECT_THAT(output, testing::HasSubstr("transfer_active=1"));
+    EXPECT_THAT(output, testing::HasSubstr("treatment_only_init_admits=1"));
+    EXPECT_THAT(output, testing::HasSubstr("NVBUG6448152_CAPACITY event=summary"));
+    EXPECT_THAT(output, testing::HasSubstr("treatment_only_init_total=1"));
+    EXPECT_THAT(output, testing::HasSubstr("treatment_only_ready_generation_total=0"));
+    EXPECT_THAT(output, testing::HasSubstr("legacy_capacity_output_histogram=0:1"));
+    EXPECT_THAT(output, testing::HasSubstr("treatment_capacity_output_histogram=1:1"));
+}
+
+TEST_F(CapacitySchedulerTest, DisaggGenTransferCapacityTreatmentDoesNotClaimUnchangedBoundary)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    auto kvCacheManager = getKvCacheManager(2, 10, 200, 90);
+    auto peftCacheManager = getPeftCacheManager();
+    auto transferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+
+    RequestVector fittingDisaggGenInitRequests;
+    testing::internal::CaptureStdout();
+    {
+        auto capacityScheduler
+            = CapacityScheduler(2, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        std::tie(std::ignore, fittingDisaggGenInitRequests, std::ignore)
+            = capacityScheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager);
+    }
+    auto const output = testing::internal::GetCapturedStdout();
+
+    ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1U);
+    EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId);
+    EXPECT_THAT(output, testing::Not(testing::HasSubstr("NVBUG6448152_CAPACITY event=exercised")));
+    EXPECT_THAT(output, testing::HasSubstr("exercised_iterations=0"));
+}
+
+TEST_F(CapacitySchedulerTest, DisaggGenTransferCapacityTreatmentReportsReadyGenerationDivergence)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    auto kvCacheManager = getKvCacheManager(2, 10, 200, 90);
+    auto peftCacheManager = getPeftCacheManager();
+    auto transferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto generationReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kGENERATION_IN_PROGRESS);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+    kvCacheManager->addSequenceBatch(
+        {{{generationReq->mRequestId, generationReq->mPromptLen, generationReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*generationReq)});
+
+    RequestVector fittingRequests;
+    RequestVector fittingDisaggGenInitRequests;
+    RequestVector pausedRequests;
+    testing::internal::CaptureStdout();
+    {
+        auto capacityScheduler
+            = CapacityScheduler(1, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        std::tie(fittingRequests, fittingDisaggGenInitRequests, pausedRequests)
+            = capacityScheduler(RequestList{transferReq, generationReq}, kvCacheManager, peftCacheManager);
+    }
+    auto const output = testing::internal::GetCapturedStdout();
+
+    ASSERT_EQ(fittingRequests.size(), 1U);
+    EXPECT_EQ(fittingRequests.front()->mRequestId, generationReq->mRequestId);
+    EXPECT_TRUE(fittingDisaggGenInitRequests.empty());
+    EXPECT_TRUE(pausedRequests.empty());
+    EXPECT_THAT(output, testing::HasSubstr("event=exercised path=ready_generation"));
+    EXPECT_THAT(output, testing::HasSubstr("treatment_only_ready_generation=1"));
+    EXPECT_THAT(output, testing::HasSubstr("treatment_only_init_total=0"));
+    EXPECT_THAT(output, testing::HasSubstr("treatment_only_ready_generation_total=1"));
+    EXPECT_THAT(output, testing::HasSubstr("legacy_capacity_output_histogram=0:1"));
+    EXPECT_THAT(output, testing::HasSubstr("treatment_capacity_output_histogram=1:1"));
+}
+
+TEST_F(CapacitySchedulerTest, ExcludedDisaggGenTransferStillReservesFutureKvCapacity)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    constexpr SizeType32 kTokensPerBlock = 10;
+    constexpr SizeType32 kWindowSize = 90;
+    constexpr SizeType32 kMaxNumTokens = 60;
+    auto makeRequestsAndManager = [&]()
+    {
+        auto kvCacheManager = getKvCacheManager(2, kTokensPerBlock, kMaxNumTokens, kWindowSize);
+        auto transferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+            LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+        auto pendingReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+            LlmRequestState::kDISAGG_GENERATION_INIT);
+        kvCacheManager->addSequenceBatch(
+            {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+            {std::ref(*transferReq)});
+        return std::make_tuple(std::move(kvCacheManager), std::move(transferReq), std::move(pendingReq));
+    };
+
+    auto [controlKvCacheManager, controlTransferReq, controlPendingReq] = makeRequestsAndManager();
+    auto const freeBlocks = controlKvCacheManager->getNumFreeBlocks();
+    auto const transferRemaining
+        = controlKvCacheManager->getRemainingBlocksToCompletion(*controlTransferReq, kWindowSize);
+    auto const pendingRemaining
+        = controlKvCacheManager->getRemainingBlocksToCompletion(*controlPendingReq, kWindowSize);
+    ASSERT_LE(pendingRemaining, freeBlocks);
+    ASSERT_GT(transferRemaining + pendingRemaining, freeBlocks);
+
+    auto peftCacheManager = getPeftCacheManager();
+    auto controlScheduler
+        = CapacityScheduler(1, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, controlKvCacheManager != nullptr);
+    auto [controlRequests, controlDisaggInitRequests, controlPausedRequests]
+        = controlScheduler(RequestList{controlPendingReq}, controlKvCacheManager, peftCacheManager);
+    EXPECT_TRUE(controlRequests.empty());
+    ASSERT_EQ(controlDisaggInitRequests.size(), 1U);
+    EXPECT_EQ(controlDisaggInitRequests.front()->mRequestId, controlPendingReq->mRequestId);
+    EXPECT_TRUE(controlPausedRequests.empty());
+
+    auto [treatmentKvCacheManager, treatmentTransferReq, treatmentPendingReq] = makeRequestsAndManager();
+    ASSERT_EQ(treatmentKvCacheManager->getNumFreeBlocks(), freeBlocks);
+    auto treatmentScheduler
+        = CapacityScheduler(1, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, treatmentKvCacheManager != nullptr);
+    auto [treatmentRequests, treatmentDisaggInitRequests, treatmentPausedRequests] = treatmentScheduler(
+        RequestList{treatmentTransferReq, treatmentPendingReq}, treatmentKvCacheManager, peftCacheManager);
+    EXPECT_TRUE(treatmentRequests.empty());
+    EXPECT_TRUE(treatmentDisaggInitRequests.empty());
+    EXPECT_TRUE(treatmentPausedRequests.empty());
+}
+
+TEST_F(CapacitySchedulerTest, ExcludedDisaggGenTransferStillClaimsPeftCapacity)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    auto kvCacheManager = getKvCacheManager(2, 10, 200, 90);
+    auto peftCacheManager = std::make_shared<MockPeftCacheManager>(15, 15, 15);
+    auto transferReq = createRequest(10, 40, 0, 100, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(
+        10, 40, 1, 200, tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_INIT);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+
+    auto capacityScheduler
+        = CapacityScheduler(1, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+    auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+        = capacityScheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager);
+
+    EXPECT_TRUE(fittingRequests.empty());
+    EXPECT_TRUE(fittingDisaggGenInitRequests.empty());
+    EXPECT_TRUE(pausedRequests.empty());
+    EXPECT_EQ(peftCacheManager->getDetermineNumPagesCalls(), 2U);
+}
+
+TEST_F(CapacitySchedulerTest, StaticBatchStillCountsDisaggGenTransferAgainstCapacity)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    auto kvCacheManager = getKvCacheManager(2, 10, 200, 90);
+    auto peftCacheManager = getPeftCacheManager();
+    auto transferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+
+    auto capacityScheduler = CapacityScheduler(1, CapacitySchedulerPolicy::kSTATIC_BATCH, kvCacheManager != nullptr);
+    auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+        = capacityScheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager);
+
+    EXPECT_TRUE(fittingRequests.empty());
+    EXPECT_TRUE(fittingDisaggGenInitRequests.empty());
+    EXPECT_TRUE(pausedRequests.empty());
+}
+
+TEST_F(CapacitySchedulerTest, MaxUtilizationStillCountsDisaggGenTransferAgainstCapacity)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    auto kvCacheManager = getKvCacheManager(2, 10, 200, 90);
+    auto peftCacheManager = getPeftCacheManager();
+    auto transferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+
+    auto capacityScheduler = CapacityScheduler(1, CapacitySchedulerPolicy::kMAX_UTILIZATION, kvCacheManager != nullptr);
+    auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+        = capacityScheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager);
+
+    EXPECT_TRUE(fittingRequests.empty());
+    EXPECT_TRUE(fittingDisaggGenInitRequests.empty());
+    EXPECT_TRUE(pausedRequests.empty());
+}
+
+TEST_F(CapacitySchedulerTest, CapacityTreatmentScansPastLogicalCapToReserveLaterTransfer)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    auto kvCacheManager = getKvCacheManager(3, 10, 300, 90);
+    auto peftCacheManager = std::make_shared<MockPeftCacheManager>(1, 3, 3);
+    auto generationReq = createRequest(
+        10, 40, 0, 100, tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kGENERATION_IN_PROGRESS);
+    auto pendingReq = createRequest(
+        10, 40, 1, 200, tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_INIT);
+    auto transferReq = createRequest(10, 40, 2, 300, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    kvCacheManager->addSequenceBatch(
+        {{{generationReq->mRequestId, generationReq->mPromptLen, generationReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*generationReq)});
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+
+    auto capacityScheduler
+        = CapacityScheduler(1, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+    auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+        = capacityScheduler(RequestList{generationReq, pendingReq, transferReq}, kvCacheManager, peftCacheManager);
+
+    ASSERT_EQ(fittingRequests.size(), 1U);
+    EXPECT_EQ(fittingRequests.front()->mRequestId, generationReq->mRequestId);
+    EXPECT_TRUE(fittingDisaggGenInitRequests.empty());
+    EXPECT_TRUE(pausedRequests.empty());
+    EXPECT_EQ(peftCacheManager->getDetermineNumPagesCalls(), 2U);
 }
 
 TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionDisabledPreservesCandidates)

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -413,6 +416,43 @@ class TestDisaggTransferAdmissionController:
         assert admitted == []
         assert wait_for_progress
         executor._revert_ctx_alloc.assert_not_called()
+
+    def test_native_slot_observer_preserves_transport_gate_decision(self):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor.is_warmup = False
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        controller = DisaggTransferAdmissionController(max_tokens_in_buffer=32, tokens_per_block=32)
+        controller.select = Mock(wraps=controller.select)
+        executor._disagg_transfer_admission_controller = controller
+        executor._native_slot_transport_observer_enabled = True
+        executor._native_slot_transport_observer_calls = 0
+        executor._native_slot_transport_observer_candidates = 0
+        executor._native_slot_transport_observer_admitted = 0
+        executor._native_slot_transport_observer_deferred = 0
+        executor._native_slot_transport_observer_active_blocks_max = 0
+        executor._native_slot_transport_observer_limited_calls = 0
+        executor._native_slot_transport_observer_wait_calls = 0
+        executor._native_slot_transport_observer_first_defer_logged = False
+        candidate = _make_disagg_transfer_request(2, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+
+        assert admitted == []
+        assert wait_for_progress
+        controller.select.assert_called_once_with(executor.active_requests, [candidate])
+        executor._revert_ctx_alloc.assert_called_once_with([candidate])
+        assert executor._native_slot_transport_observer_calls == 1
+        assert executor._native_slot_transport_observer_candidates == 1
+        assert executor._native_slot_transport_observer_admitted == 0
+        assert executor._native_slot_transport_observer_deferred == 1
+        assert executor._native_slot_transport_observer_limited_calls == 1
+        assert executor._native_slot_transport_observer_wait_calls == 1
+        assert executor._native_slot_transport_observer_active_blocks_max == 1
 
 
 class TestDisaggTransferIdleProgress:

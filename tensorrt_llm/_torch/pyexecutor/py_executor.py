@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import functools
@@ -101,6 +104,9 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY_ENV = (
+    "TRTLLM_NVBUG_6448152_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY")
 
 
 class PPCommTag(IntEnum):
@@ -774,6 +780,26 @@ class PyExecutor:
                                    None)
         self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer, tokens_per_block)
+        self._native_slot_transport_observer_enabled = (
+            os.getenv(_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY_ENV) == "1")
+        self._native_slot_transport_observer_calls = 0
+        self._native_slot_transport_observer_candidates = 0
+        self._native_slot_transport_observer_admitted = 0
+        self._native_slot_transport_observer_deferred = 0
+        self._native_slot_transport_observer_active_blocks_max = 0
+        self._native_slot_transport_observer_limited_calls = 0
+        self._native_slot_transport_observer_wait_calls = 0
+        self._native_slot_transport_observer_first_defer_logged = False
+        self._native_slot_transport_observer_summary_logged = False
+        if self._native_slot_transport_observer_enabled:
+            logger.info(
+                "NVBUG6448152_TRANSPORT_GATE event=effective_config "
+                "mode=observe_only behavior=unchanged multiplier=1 bypass=0 "
+                "budget_blocks="
+                f"{self._disagg_transfer_admission_controller.max_transfer_blocks}"
+                " tokens_per_block="
+                f"{self._disagg_transfer_admission_controller.tokens_per_block}"
+            )
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
@@ -2020,6 +2046,7 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+        self._log_native_slot_transport_observer_summary()
 
         for i in range(self.num_micro_batches):
             try:
@@ -2741,6 +2768,39 @@ class PyExecutor:
 
         admission_result = controller.select(self.active_requests,
                                              fitting_disagg_gen_init_requests)
+        if (getattr(self, "_native_slot_transport_observer_enabled", False)
+                and not self.is_warmup):
+            self._native_slot_transport_observer_calls += 1
+            self._native_slot_transport_observer_candidates += len(
+                fitting_disagg_gen_init_requests)
+            self._native_slot_transport_observer_admitted += len(
+                admission_result.admitted_requests)
+            self._native_slot_transport_observer_deferred += (
+                admission_result.deferred_request_count)
+            self._native_slot_transport_observer_active_blocks_max = max(
+                self._native_slot_transport_observer_active_blocks_max,
+                admission_result.active_transfer_blocks,
+            )
+            if admission_result.limited_by_budget:
+                self._native_slot_transport_observer_limited_calls += 1
+            if admission_result.is_blocked_by_active_transfers():
+                self._native_slot_transport_observer_wait_calls += 1
+            first_defer_logged = (
+                self._native_slot_transport_observer_first_defer_logged)
+            if (admission_result.deferred_request_count > 0
+                    and not first_defer_logged):
+                logger.info(
+                    "NVBUG6448152_TRANSPORT_GATE event=deferred "
+                    "behavior=unchanged "
+                    f"candidates={len(fitting_disagg_gen_init_requests)} "
+                    f"admitted={len(admission_result.admitted_requests)} "
+                    f"deferred={admission_result.deferred_request_count} "
+                    "active_transfer_blocks="
+                    f"{admission_result.active_transfer_blocks} "
+                    "admitted_transfer_blocks="
+                    f"{admission_result.admitted_transfer_blocks} "
+                    f"budget_blocks={controller.max_transfer_blocks}")
+                self._native_slot_transport_observer_first_defer_logged = True
         if admission_result.deferred_request_count > 0:
             logger.debug("Disagg transfer admission deferred "
                          f"{admission_result.deferred_request_count} requests; "
@@ -2756,6 +2816,33 @@ class PyExecutor:
 
         return (admission_result.admitted_requests,
                 admission_result.is_blocked_by_active_transfers())
+
+    def _log_native_slot_transport_observer_summary(self) -> None:
+        if (not getattr(
+                self,
+                "_native_slot_transport_observer_enabled",
+                False,
+        ) or getattr(
+                self,
+                "_native_slot_transport_observer_summary_logged",
+                False,
+        )):
+            return
+        self._native_slot_transport_observer_summary_logged = True
+        controller = self._get_disagg_transfer_admission_controller()
+        logger.info(
+            "NVBUG6448152_TRANSPORT_GATE event=summary "
+            "mode=observe_only behavior=unchanged multiplier=1 bypass=0 "
+            f"budget_blocks={controller.max_transfer_blocks} "
+            f"tokens_per_block={controller.tokens_per_block} "
+            f"calls={self._native_slot_transport_observer_calls} "
+            f"candidates_total={self._native_slot_transport_observer_candidates} "
+            f"admitted_total={self._native_slot_transport_observer_admitted} "
+            f"deferred_total={self._native_slot_transport_observer_deferred} "
+            f"limited_calls={self._native_slot_transport_observer_limited_calls} "
+            f"wait_calls={self._native_slot_transport_observer_wait_calls} "
+            "active_transfer_blocks_max="
+            f"{self._native_slot_transport_observer_active_blocks_max}")
 
     def _revert_deferred_disagg_gen_init_alloc(
             self, candidates: List[LlmRequest],
