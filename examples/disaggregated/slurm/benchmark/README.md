@@ -14,8 +14,6 @@ The benchmarking process is orchestrated through a combination of Python scripts
    - `start_server.sh`: Starts the disaggregated serving coordinator
    - `wait_server.sh`: Waits for server readiness before benchmarking
    - `run_benchmark.sh` / `run_benchmark_nv_sa.sh`: Execute benchmark workloads
-   - `accuracy_eval.sh`: Runs accuracy evaluation using lm_eval
-   - `gen_server_config.py`: Generates server configuration from worker settings
 
 ## Configuration (config.yaml)
 
