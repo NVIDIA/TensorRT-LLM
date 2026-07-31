@@ -23,9 +23,10 @@ from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 
 
 class _FakeComm:
-    def __init__(self, rank=0, size=2):
+    def __init__(self, rank=0, size=2, membership=(0, 1)):
         self.rank = rank
         self.size = size
+        self.membership = membership
         self.barrier_count = 0
 
     def Get_rank(self):
@@ -36,6 +37,9 @@ class _FakeComm:
 
     def barrier(self):
         self.barrier_count += 1
+
+    def allgather(self, value):
+        return list(self.membership)
 
 
 class _TestMnnvlMemory(mnnvl.MnnvlMemory):
@@ -49,6 +53,7 @@ def memory(monkeypatch):
         comm=comm,
         comm_size=2,
         comm_rank=0,
+        comm_membership=(0, 1),
         aligned_size=64,
         mem_handles=[11, 22],
         start_address=1000,
@@ -57,6 +62,7 @@ def memory(monkeypatch):
     )
     obj = _TestMnnvlMemory.__new__(_TestMnnvlMemory)
     obj.ptr = 1032
+    obj.mapping = SimpleNamespace(rank=0)
     _TestMnnvlMemory.allocated_map = {obj.ptr: record}
     _TestMnnvlMemory.address_refcnt = {record.start_address: 1}
     _TestMnnvlMemory.current_start_address = record.start_address
@@ -105,10 +111,23 @@ def test_checkpoint_restore_reuses_layout_with_fresh_handles(memory, monkeypatch
     assert not obj.mapped
     assert record.state is mnnvl._MnnvlAllocationState.RESTORING
     assert record.mem_handles == [33, 44]
-    assert record.comm is restored_comm
-    assert _TestMnnvlMemory.comm is restored_comm
+    assert record.comm is not restored_comm
+    assert record.pending_comm is restored_comm
     obj._checkpoint_restore_complete()
     assert obj.mapped
+    assert record.comm is restored_comm
+    assert _TestMnnvlMemory.comm is restored_comm
+
+
+def test_checkpoint_restore_rejects_changed_ordered_membership(memory):
+    obj, record = memory
+    obj.checkpoint_prepare()
+
+    with pytest.raises(RuntimeError, match="ordered membership differs"):
+        obj.checkpoint_restore(_FakeComm(membership=(1, 0)))
+
+    assert record.state is mnnvl._MnnvlAllocationState.UNMAPPED
+    assert record.pending_comm is None
 
 
 def test_checkpoint_prepare_failure_is_terminal_and_fails_closed(memory):

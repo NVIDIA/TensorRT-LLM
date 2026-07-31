@@ -55,6 +55,22 @@ def _collect_active_ranks(
     return [rank for rank, clients_idle in enumerate(clients_idle_by_rank) if not clients_idle]
 
 
+def _collect_unready_ranks(
+    comm: _CollectiveCommunicator,
+    *,
+    local_ready: bool,
+    expected_size: int,
+) -> list[int]:
+    """Collectively return ranks that could not finish local restore work."""
+    ready_by_rank = comm.allgather(local_ready)
+    if len(ready_by_rank) != expected_size:
+        raise RuntimeError(
+            "MNNVL workspace communicator size does not match the MoE EP group: "
+            f"{len(ready_by_rank)} != {expected_size}"
+        )
+    return [rank for rank, ready in enumerate(ready_by_rank) if not ready]
+
+
 class _WorkspaceClient(Protocol):
     def _mnnvl_checkpoint_is_idle(self) -> bool:
         """Return whether this client can safely enter a checkpoint."""
@@ -75,8 +91,10 @@ class _WatchdogConfig:
 class _MnnvlAlltoAllWorkspaceLifecycle:
     """Own checkpoint and watchdog transitions for one shared MoE workspace.
 
-    The checkpoint coordinator must prevent new dispatches from starting while
-    a transition is in progress.
+    A top-level engine checkpoint coordinator must atomically stop admission and
+    drain or abort in-flight work before invoking this resource hook. The local
+    client and rank-wide idle checks are preflight validation only; they do not
+    prevent a new dispatch from starting after the idle vote.
     """
 
     def __init__(
@@ -199,7 +217,7 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
             self._watchdog_config = None
 
     def checkpoint_prepare(self) -> None:
-        """Stop shared readers, then collectively detach the backing handles."""
+        """Preflight shared readers, then collectively detach backing handles."""
         if not self._memory.mapped:
             self._stop_watchdog()
             self._memory.checkpoint_prepare()
@@ -233,21 +251,38 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
         restored = self._memory.checkpoint_restore(comm)
         if restored is False:
             return
+        local_error: Exception | None = None
         try:
-            refreshed_metainfo = initialize_frontend()
-            if not torch.equal(refreshed_metainfo, self._metainfo):
+            try:
+                refreshed_metainfo = initialize_frontend()
+                if not torch.equal(refreshed_metainfo, self._metainfo):
+                    raise RuntimeError(
+                        "MoE All-to-All metainfo changed during MNNVL restore; "
+                        "captured CUDA graphs cannot be replayed safely"
+                    )
+                self._metainfo = refreshed_metainfo
+                self._workspace_state["metainfo"] = refreshed_metainfo
+                self._coordinator = self._create_coordinator()
+                torch.cuda.synchronize()
+                self._start_watchdog()
+                for client in list(self._clients):
+                    client._mnnvl_checkpoint_reset()
+            except Exception as error:
+                local_error = error
+
+            unready_ranks = _collect_unready_ranks(
+                comm,
+                local_ready=local_error is None,
+                expected_size=self._ep_size,
+            )
+            if unready_ranks:
+                self._stop_watchdog()
+                if local_error is not None:
+                    raise local_error
                 raise RuntimeError(
-                    "MoE All-to-All metainfo changed during MNNVL restore; "
-                    "captured CUDA graphs cannot be replayed safely"
+                    "MNNVL workspace restore failed on ranks "
+                    f"{unready_ranks}; refusing to publish the restored workspace"
                 )
-            self._metainfo = refreshed_metainfo
-            self._workspace_state["metainfo"] = refreshed_metainfo
-            self._coordinator = self._create_coordinator()
-            torch.cuda.synchronize()
-            comm.barrier()
-            self._start_watchdog()
-            for client in list(self._clients):
-                client._mnnvl_checkpoint_reset()
             self._memory._checkpoint_restore_complete()
         except Exception:
             self._memory._checkpoint_restore_failed()

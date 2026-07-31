@@ -47,16 +47,23 @@ class _FailingResetClient(_Client):
 
 
 class _FakeComm:
-    def __init__(self, clients_idle_by_rank: list[bool] | None = None) -> None:
+    def __init__(
+        self,
+        clients_idle_by_rank: list[bool] | None = None,
+        gathered_values: list[list[bool]] | None = None,
+    ) -> None:
         self.barrier_count = 0
         self.allgather_count = 0
         self.clients_idle_by_rank = clients_idle_by_rank
+        self.gathered_values = list(gathered_values or [])
 
     def barrier(self) -> None:
         self.barrier_count += 1
 
     def allgather(self, local_clients_idle: bool) -> list[bool]:
         self.allgather_count += 1
+        if self.gathered_values:
+            return self.gathered_values.pop(0)
         if self.clients_idle_by_rank is not None:
             return self.clients_idle_by_rank
         return [local_clients_idle, local_clients_idle]
@@ -242,7 +249,7 @@ def test_checkpoint_suspends_and_recreates_one_shared_watchdog(
     assert lifecycle.watchdog_for(second) is new_watchdog
     assert first.reset_count == 1
     assert second.reset_count == 1
-    assert comm.barrier_count == 1
+    assert comm.allgather_count == 1
 
 
 def test_unregister_stops_watchdog_after_last_enabled_client() -> None:
@@ -405,6 +412,43 @@ def test_checkpoint_restore_failure_after_watchdog_start_stops_it(
     new_coordinator.release_watchdog.assert_called_once_with(new_watchdog)
     memory._checkpoint_restore_failed.assert_called_once_with()
     memory._checkpoint_restore_complete.assert_not_called()
+
+
+def test_checkpoint_restore_remote_failure_fails_closed_on_every_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle, memory, metainfo = _make_lifecycle()
+    client = _Client()
+    _register_without_watchdog(lifecycle, client)
+    memory.mapped = False
+    memory.checkpoint_restore.return_value = True
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    comm = _FakeComm(gathered_values=[[True, False]])
+
+    with pytest.raises(RuntimeError, match=r"restore failed on ranks \[1\]"):
+        lifecycle.checkpoint_restore(comm, Mock(return_value=metainfo))
+
+    memory._checkpoint_restore_failed.assert_called_once_with()
+    memory._checkpoint_restore_complete.assert_not_called()
+
+
+def test_checkpoint_restore_reports_local_failure_to_every_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle, memory, _ = _make_lifecycle()
+    memory.mapped = False
+    memory.checkpoint_restore.return_value = True
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    comm = _FakeComm(gathered_values=[[False, True]])
+
+    with pytest.raises(RuntimeError, match="frontend restore failed"):
+        lifecycle.checkpoint_restore(
+            comm,
+            Mock(side_effect=RuntimeError("frontend restore failed")),
+        )
+
+    assert comm.allgather_count == 1
+    memory._checkpoint_restore_failed.assert_called_once_with()
 
 
 def test_two_sided_checkpoint_prepare_rejects_active_shared_owner(
@@ -622,6 +666,27 @@ def test_one_sided_finalizer_unregisters_from_shared_lifecycle() -> None:
     gc.collect()
 
     assert lifecycle.unregister_count == 1
+
+
+def test_one_sided_finalizer_preserves_collective_workspace_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_key = ("shared",)
+    workspace_state = {"memory": object()}
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {workspace_key: workspace_state})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {workspace_key: 1})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", workspace_state)
+    wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
+    wrapper._workspace_lifecycle = Mock()
+    wrapper._workspace_key = workspace_key
+    wrapper._workspace_registered = True
+
+    del wrapper
+    gc.collect()
+
+    assert NVLinkOneSided._WORKSPACES[workspace_key] is workspace_state
+    assert NVLinkOneSided._WORKSPACE is workspace_state
+    assert workspace_key not in NVLinkOneSided._WORKSPACE_REFCOUNTS
 
 
 def test_one_sided_aborted_construction_does_not_release_sibling_workspace(

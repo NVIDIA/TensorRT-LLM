@@ -400,7 +400,7 @@ class NVLinkOneSided(Communication):
         return True
 
     def destroy(self):
-        """Release this instance's reference to the shared symmetric workspace."""
+        """Release shared state during explicit, rank-coordinated teardown."""
         if getattr(self, "_destroyed", False):
             return
 
@@ -435,8 +435,20 @@ class NVLinkOneSided(Communication):
         self._dispatch_state = {"phase": "destroyed"}
 
     def __del__(self) -> None:
-        if not sys.is_finalizing():
-            self.destroy()
+        if sys.is_finalizing():
+            return
+        lifecycle = getattr(self, "_workspace_lifecycle", None)
+        if lifecycle is not None:
+            lifecycle.unregister(self)
+        workspace_key = getattr(self, "_workspace_key", None)
+        if workspace_key is not None and getattr(self, "_workspace_registered", False):
+            refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
+            if refcount > 0:
+                NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
+            else:
+                NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
+        self._workspace_registered = False
+        self._workspace_lifecycle = None
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """

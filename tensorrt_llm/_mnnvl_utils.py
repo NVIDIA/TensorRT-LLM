@@ -65,12 +65,14 @@ class _MnnvlAllocationRecord:
     comm: Any
     comm_size: int
     comm_rank: int
+    comm_membership: tuple[int, ...]
     aligned_size: int
     mem_handles: List[Any]
     start_address: int
     rank_stride: int
     address_offset: int
     state: _MnnvlAllocationState = _MnnvlAllocationState.MAPPED
+    pending_comm: Any = None
 
 
 class MnnvlMemory:
@@ -322,6 +324,12 @@ class MnnvlMemory:
         comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
+        comm_membership = tuple(int(rank) for rank in comm.allgather(mapping.rank))
+        if len(comm_membership) != comm_size:
+            raise RuntimeError(
+                "MNNVL communicator membership size does not match its rank count: "
+                f"{len(comm_membership)} != {comm_size}"
+            )
         all_rank_allocate_sizes = comm.allgather(size)
         assert len(all_rank_allocate_sizes) == comm_size
         assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
@@ -346,6 +354,7 @@ class MnnvlMemory:
             comm=comm,
             comm_size=comm_size,
             comm_rank=comm_rank,
+            comm_membership=comm_membership,
             aligned_size=aligned_size,
             mem_handles=mem_handles,
             start_address=cls.current_start_address,
@@ -431,6 +440,13 @@ class MnnvlMemory:
                 f"rank/size {comm_rank}/{comm_size} != "
                 f"{record.comm_rank}/{record.comm_size}"
             )
+        comm_membership = tuple(int(rank) for rank in comm.allgather(self.mapping.rank))
+        if comm_membership != record.comm_membership:
+            raise RuntimeError(
+                "Cannot restore MNNVL memory with a communicator whose ordered "
+                "membership differs from the graph-visible allocation layout: "
+                f"{comm_membership} != {record.comm_membership}"
+            )
         record.state = _MnnvlAllocationState.RESTORING
         try:
             torch.cuda.synchronize()
@@ -444,8 +460,7 @@ class MnnvlMemory:
         except Exception:
             record.state = _MnnvlAllocationState.BROKEN
             raise
-        record.comm = comm
-        cls.comm = comm
+        record.pending_comm = comm
         return True
 
     def _checkpoint_restore_complete(self) -> None:
@@ -453,6 +468,11 @@ class MnnvlMemory:
         record = type(self).allocated_map[self.ptr]
         if record.state is not _MnnvlAllocationState.RESTORING:
             raise RuntimeError(f"Cannot complete MNNVL restore in {record.state.value} state")
+        if record.pending_comm is None:
+            raise RuntimeError("Cannot complete MNNVL restore without a replacement communicator")
+        record.comm = record.pending_comm
+        type(self).comm = record.pending_comm
+        record.pending_comm = None
         record.state = _MnnvlAllocationState.MAPPED
 
     def _checkpoint_restore_failed(self) -> None:
@@ -460,6 +480,7 @@ class MnnvlMemory:
         record = type(self).allocated_map[self.ptr]
         if record.state is _MnnvlAllocationState.RESTORING:
             record.state = _MnnvlAllocationState.BROKEN
+            record.pending_comm = None
 
     @staticmethod
     @functools.cache
