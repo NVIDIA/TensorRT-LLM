@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import inspect
-from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -29,7 +28,7 @@ from ...peft.lora.layer import (MOE_LORA_MODULE_NAMES,
 from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
-from .interface import AlltoallMethodType, MoE
+from .interface import MoE
 from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
@@ -259,7 +258,6 @@ class CutlassFusedMoE(MoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
@@ -322,12 +320,6 @@ class CutlassFusedMoE(MoE):
         )
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
-
-        self.alltoall_method_type = AlltoallMethodType.NotEnabled
-        self.alltoall_workspace = None
-        self.alltoall_prepare_workspace = None
-        self.use_low_precision_combine = False
-        self.moe_a2a = None
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -415,10 +407,12 @@ class CutlassFusedMoE(MoE):
         """
         if not self._moe_lora_enabled or max_num_tokens <= 0:
             return
-        # MoE LoRA only runs on the unquantized fp16/bf16 path (the C++ op
-        # rejects quantized weights), so a quantized layer can never reach the
-        # LoRA scratch; skip and let the (impossible) runtime path error loudly.
-        if getattr(self, "has_any_quant", False):
+        # MoE LoRA runs on the unquantized fp16/bf16 path or the per-tensor FP8
+        # (qdq) path (see moeOp.cpp). Any other quant mode (FP8 block-scale,
+        # NVFP4, MXFP8, integer WoQ) is rejected by the C++ op, so a layer in
+        # those modes can never reach the LoRA scratch; skip and let the runtime
+        # path error loudly.
+        if getattr(self, "has_any_quant", False) and not self.has_fp8_qdq:
             return
         # Weights must exist to read the runner's weight dtype. If they have not
         # been created yet, skip; the lazy sizing + in-capture guard still
@@ -434,27 +428,35 @@ class CutlassFusedMoE(MoE):
         assert max_lora_size > 0, (
             "reserve_moe_lora_cuda_graph_workspace requires max_lora_size > 0 "
             f"(got {max_lora_size}).")
-        # MoE LoRA only runs on the unquantized fp16/bf16 path, so the MoERunner
-        # instance key below (all-False quant flags, x/weight/out == self.dtype)
-        # must match the key the runtime fused_moe op uses on the same layer;
-        # otherwise the reservation lands on a different cached C++ runner.
-        assert self.dtype in (torch.float16, torch.bfloat16), (
-            "MoE LoRA requires fp16/bf16 activations to reserve a deterministic "
-            f"FusedMoeRunner key; got {self.dtype}.")
+
+        # The reservation must land on the *same* cached C++ FusedMoeRunner that
+        # the runtime torch.ops.trtllm.fused_moe op uses on this layer, so the
+        # MoERunner instance key must match the runtime key exactly. The runtime
+        # key uses the activation dtype the op sees:
+        #   - per-tensor FP8 (qdq): quantize_input casts activations to e4m3, so
+        #     x/weight are fp8 and the output (LoRA compute) dtype is self.dtype;
+        #   - unquantized fp16/bf16: x/weight/output all equal self.dtype.
+        # Every quant flag in the key is False for both (per-tensor FP8 is not
+        # block-scaled / MXFP8 / W4). If a runtime call ever uses a different
+        # key, the C++ capture guard surfaces a clear error rather than
+        # corrupting replay.
+        weight_dtype = self.w3_w1_weight.dtype
+        if self.has_fp8_qdq:
+            act_dtype = torch.float8_e4m3fn
+            output_dtype = self.dtype
+        else:
+            assert self.dtype in (torch.float16, torch.bfloat16), (
+                "MoE LoRA requires fp16/bf16 activations to reserve a "
+                f"deterministic FusedMoeRunner key; got {self.dtype}.")
+            act_dtype = self.dtype
+            output_dtype = self.dtype
 
         from ...custom_ops.torch_custom_ops import MoERunner
 
-        # Build the MoERunner with the same instance key the functional
-        # torch.ops.trtllm.fused_moe op uses, so we reserve on the *same* cached
-        # C++ FusedMoeRunner that capture will use. For the unquantized LoRA
-        # path x/weight/output dtypes all equal self.dtype and every quant flag
-        # is False. If a runtime call ever uses a different key, the C++
-        # capture guard surfaces a clear error rather than corrupting replay.
-        weight_dtype = self.w3_w1_weight.dtype
         runner = MoERunner(
-            x_dtype=self.dtype,
+            x_dtype=act_dtype,
             weight_dtype=weight_dtype,
-            output_dtype=self.dtype,
+            output_dtype=output_dtype,
             top_k=self.routing_method.experts_per_token,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
@@ -697,12 +699,6 @@ class CutlassFusedMoE(MoE):
     def has_int8_woq_per_channel(self):
         return self.quant_config and self.quant_config.layer_quant_mode.is_int8_weight_only(
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
-
-    @cached_property
-    def enable_alltoall(self):
-        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
-        """
-        return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
     def quantize_input(
         self,
