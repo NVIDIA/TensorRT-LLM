@@ -46,7 +46,12 @@ def test_pcie_nvl_sku_detected_by_name(mock_get_device_name) -> None:
     "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex", side_effect=lambda index: index
 )
 @patch.object(MnnvlMemory, "support_nvlink", return_value=True)
+@patch(
+    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetP2PStatus",
+    return_value=pynvml.NVML_P2P_STATUS_NOT_SUPPORTED,
+)
 def test_split_nvlink_topology_detected(
+    mock_get_p2p_status,
     mock_support_nvlink,
     mock_get_handle,
     mock_get_count,
@@ -64,6 +69,7 @@ def test_split_nvlink_topology_detected(
     ):
         assert MnnvlMemory._is_pcie_nvl_sku(0)
 
+    mock_get_p2p_status.assert_called_once_with(0, 4, pynvml.NVML_P2P_CAPS_INDEX_NVLINK)
     mock_support_nvlink.assert_called_once_with(0, need_all_up=False)
 
 
@@ -75,11 +81,16 @@ def test_split_nvlink_topology_detected(
 )
 @patch.object(MnnvlMemory, "support_nvlink", return_value=False)
 @patch(
+    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetP2PStatus",
+    return_value=pynvml.NVML_P2P_STATUS_NOT_SUPPORTED,
+)
+@patch(
     "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetTopologyCommonAncestor",
     return_value=pynvml.NVML_TOPOLOGY_SYSTEM,
 )
 def test_pcie_hopper_with_system_peers_is_not_split_nvlink(
     mock_common_ancestor,
+    mock_get_p2p_status,
     mock_support_nvlink,
     mock_get_handle,
     mock_get_count,
@@ -88,6 +99,38 @@ def test_pcie_hopper_with_system_peers_is_not_split_nvlink(
 ) -> None:
     assert not MnnvlMemory._is_pcie_nvl_sku(0)
     mock_support_nvlink.assert_called_once_with(0, need_all_up=False)
+    mock_get_p2p_status.assert_called_once_with(0, 1, pynvml.NVML_P2P_CAPS_INDEX_NVLINK)
+    mock_common_ancestor.assert_called_once_with(0, 1)
+
+
+@patch("tensorrt_llm._mnnvl_utils.torch.cuda.get_device_name", return_value="NVIDIA H200")
+@patch.object(MnnvlMemory, "_ensure_nvml_initialized")
+@patch("tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetCount", return_value=2)
+@patch(
+    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetHandleByIndex",
+    side_effect=lambda index: index,
+)
+@patch.object(MnnvlMemory, "support_nvlink")
+@patch(
+    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetP2PStatus",
+    return_value=pynvml.NVML_P2P_STATUS_OK,
+)
+@patch(
+    "tensorrt_llm._mnnvl_utils.pynvml.nvmlDeviceGetTopologyCommonAncestor",
+    return_value=pynvml.NVML_TOPOLOGY_SYSTEM,
+)
+def test_dual_socket_hgx_with_system_peers_is_not_split_nvlink(
+    mock_common_ancestor,
+    mock_get_p2p_status,
+    mock_support_nvlink,
+    mock_get_handle,
+    mock_get_count,
+    mock_initialize,
+    mock_get_device_name,
+) -> None:
+    assert not MnnvlMemory._is_pcie_nvl_sku(0)
+    mock_get_p2p_status.assert_called_once_with(0, 1, pynvml.NVML_P2P_CAPS_INDEX_NVLINK)
+    mock_support_nvlink.assert_not_called()
     mock_common_ancestor.assert_called_once_with(0, 1)
 
 

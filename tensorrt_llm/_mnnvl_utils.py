@@ -409,10 +409,17 @@ class MnnvlMemory:
                     pynvml.nvmlDeviceGetTopologyCommonAncestor(self_handle, peer_handle)
                     == pynvml.NVML_TOPOLOGY_SYSTEM
                 ):
-                    # SYSTEM is only a distance classification. Require an
-                    # actual NVLink-capable local connection before using it
-                    # to identify multiple NVLink islands.
-                    return MnnvlMemory.support_nvlink(dev_id, need_all_up=False)
+                    # SYSTEM is only a distance classification. A dual-socket
+                    # HGX can still provide NVLink P2P to such a peer through
+                    # NVSwitch. Split islands instead have local NVLink but no
+                    # NVLink P2P path to the SYSTEM peer.
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        self_handle,
+                        peer_handle,
+                        pynvml.NVML_P2P_CAPS_INDEX_NVLINK,
+                    )
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                        return MnnvlMemory.support_nvlink(dev_id, need_all_up=False)
         except pynvml.NVMLError:
             return False
         return False
