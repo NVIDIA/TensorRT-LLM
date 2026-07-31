@@ -41,13 +41,14 @@ other GPU architectures may be added in a future release.
   revision into the same in-place environment after installing TensorRT-LLM:
 
   ```bash
-  .venv-3.12/bin/python -m pip install -U 'packaging>=24.2'  # required by the FlashInfer source build
   .venv-3.12/bin/python -u -m pip install --force-reinstall --no-deps \
       --no-build-isolation \
       "flashinfer-python[cu13] @ git+https://github.com/PerkzZheng/flashinfer-k3.git@b6cc594918baf76c40c3a6236fd53f0f8fb9d2dc"
   ```
 
-  The TensorRT-LLM environment already provides FlashInfer's runtime
+  The `packaging>=24.2` requirement of this source build is already
+  satisfied by `requirements.txt`. The TensorRT-LLM environment already
+  provides FlashInfer's runtime
   dependencies; `--no-deps` prevents pip from replacing its pinned PyTorch,
   Triton, CUDA, and CuTeDSL packages. Install FlashInfer last: TensorRT-LLM
   currently pins `flashinfer-python==0.6.14`, so a later

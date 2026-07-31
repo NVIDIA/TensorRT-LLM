@@ -41,20 +41,22 @@ done
 case "$MODE" in
     dep16)
         TP_SIZE=16; MAX_BATCH_SIZE=64
-        MODE_ENV=""
+        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1"
         ;;
     tep16)
         TP_SIZE=16; MAX_BATCH_SIZE=16
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ_KDA=0 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1"
+        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_KDA=0 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1"
         # bf16 KDA read + FP8 gate_up at tp16: c1 77.0 tps/user (12.98 ms) vs
         # 55.1 bare, GSM8K 96.85 (also 96.82 for KDA=0 alone, 96.63 gate_up
-        # alone, 96.44 bare). Do NOT add the separated-routing env here: alone
-        # it scores 94.05 at tp16 and combined with gate_up it destroys
+        # alone, 96.44 bare). "Bare" = the master FP8 stack with no overrides
+        # (measured when the FP8 read was default-on; the master env is now
+        # set explicitly instead). Do NOT add the separated-routing env here:
+        # alone it scores 94.05 at tp16 and combined with gate_up it destroys
         # accuracy (8.49-9.36); that pair is tep8-only (96.59).
         ;;
     tep8)
         TP_SIZE=8; MAX_BATCH_SIZE=16
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1 TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1"
+        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1 TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1"
         ;;
     *) echo "error: unknown --mode: $MODE (dep16|tep16|tep8)" >&2; exit 2 ;;
 esac
