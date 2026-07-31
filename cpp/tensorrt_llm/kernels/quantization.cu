@@ -429,6 +429,71 @@ template void invokeFP4Quantization<__nv_fp8_e4m3, 32>(int b, int m, int n, __nv
     int multiProcessorCount, cudaStream_t stream);
 #endif
 
+__global__ void unpackInt4PackedTensorToInt8Kernel(int8_t* output, int8_t const* input, int64_t numPacked)
+{
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < numPacked;
+         idx += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        int8_t const packed = input[idx];
+        // The double shift sign-extends the low nibble; the high nibble uses an arithmetic shift.
+        int8_t const elt0 = static_cast<int8_t>(packed << 4) >> 4;
+        int8_t const elt1 = static_cast<int8_t>(packed >> 4);
+        output[2 * idx] = elt0;
+        output[2 * idx + 1] = elt1;
+    }
+}
+
+__global__ void mxfp4DequantizeUnswizzledKernel(float* output, uint8_t const* weight, uint8_t const* scale,
+    int64_t numPacked, int64_t k, int64_t scaleStride, int64_t groupSize)
+{
+    // Keep the LUT identical to the CPU reference implementation in weightOnlyQuantOp.cpp.
+    float const fp4Lut[16]
+        = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, 0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    auto const* scaleE8m0 = reinterpret_cast<__nv_fp8_e8m0 const*>(scale);
+
+    for (int64_t packedIdx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; packedIdx < numPacked;
+         packedIdx += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        uint8_t const packed = weight[packedIdx];
+        uint8_t const low = packed & 0xF;
+        uint8_t const high = (packed & 0xF0) >> 4;
+
+        int64_t const scaleNIdx = packedIdx / (k / 2);
+        int64_t const scaleKIdx = ((packedIdx * 2) % k) / groupSize;
+        // static_cast<float>(__nv_fp8_e8m0) decodes the e8m0 scale, matching the CPU reference exactly.
+        float const scaleValue = static_cast<float>(scaleE8m0[scaleNIdx * scaleStride + scaleKIdx]);
+
+        output[2 * packedIdx] = fp4Lut[low] * scaleValue;
+        output[2 * packedIdx + 1] = fp4Lut[high] * scaleValue;
+    }
+}
+
+void invokeUnpackInt4PackedTensorToInt8(int8_t* output, int8_t const* input, int64_t numPacked, cudaStream_t stream)
+{
+    if (numPacked <= 0)
+    {
+        return;
+    }
+    constexpr int block = 256;
+    int64_t const numBlocks = (numPacked + block - 1) / block;
+    dim3 const grid(static_cast<unsigned int>(std::min<int64_t>(numBlocks, 65535)));
+    unpackInt4PackedTensorToInt8Kernel<<<grid, block, 0, stream>>>(output, input, numPacked);
+}
+
+void invokeMxfp4DequantizeUnswizzled(float* output, uint8_t const* weight, uint8_t const* scale, int64_t numPacked,
+    int64_t k, int64_t scaleStride, int64_t groupSize, cudaStream_t stream)
+{
+    if (numPacked <= 0)
+    {
+        return;
+    }
+    constexpr int block = 256;
+    int64_t const numBlocks = (numPacked + block - 1) / block;
+    dim3 const grid(static_cast<unsigned int>(std::min<int64_t>(numBlocks, 65535)));
+    mxfp4DequantizeUnswizzledKernel<<<grid, block, 0, stream>>>(
+        output, weight, scale, numPacked, k, scaleStride, groupSize);
+}
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

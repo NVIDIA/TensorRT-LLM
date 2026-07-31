@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import triton
@@ -24,12 +24,10 @@ from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from ...distributed import allgather
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from ...utils import AuxStreamType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
-from .interface import AlltoallMethodType
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
@@ -800,7 +798,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
     ):
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
@@ -831,7 +828,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             swiglu_limit=swiglu_limit,
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
-            without_comm=without_comm,
         )
 
     def get_workspace(self, m_max: int, group_size: int):
@@ -899,10 +895,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 )
         else:
             return UnquantizedFusedMoEMethod()
-
-    def select_alltoall_method_type(self) -> AlltoallMethodType:
-        """DeepGEMM backend currently doesn't support alltoall; honor overrides but default to disabled."""
-        return AlltoallMethodType.NotEnabled
 
     def quantize_input(
         self,
@@ -1117,205 +1109,3 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         )
 
         return final_hidden_states
-
-    @nvtx_range("[DG] forward")
-    def forward_chunk(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        input_ids: Optional[torch.IntTensor] = None,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        workspace: Optional[dict] = None,
-    ) -> torch.Tensor:
-        if isinstance(x, Fp4QuantizedTensor):
-            assert output_dtype is not None
-        else:
-            output_dtype = x.dtype
-
-        # apply routing
-        token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits, input_ids)
-        assert token_selected_experts.shape[
-            1] == self.routing_method.experts_per_token
-        assert token_selected_experts.shape == token_final_scales.shape
-        assert token_selected_experts.shape[0] == router_logits.shape[0]
-        assert token_final_scales.dtype == torch.float32
-        assert token_selected_experts.dtype == torch.int32
-
-        if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
-            assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
-            x = x * token_final_scales.to(x.dtype)
-            # TODO: remove this once we have correct fusedmoe kernel ready
-            token_final_scales = None
-
-        # quantize inputs
-        x_sf = None
-        if self.has_any_quant:
-            if self.has_deepseek_fp8_block_scales:
-                pass
-            else:
-                raise ValueError(
-                    f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
-                )
-
-        use_allgather = self.use_dp and self.parallel_size > 1
-        if use_allgather:
-            x, x_sf, token_selected_experts, token_final_scales = allgather(
-                [x, x_sf, token_selected_experts, token_final_scales],
-                self.mapping,
-                dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
-
-        # Call run_moe to handle the core MoE computation
-        final_hidden_states = self.run_moe(
-            x=x,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            x_sf=x_sf,
-            workspace=workspace,
-        )
-
-        return final_hidden_states
-
-    def forward_impl(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        *,
-        input_ids: Optional[torch.IntTensor] = None,
-        do_finalize: bool = True,  # used by other MoE backends
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
-        if self.use_dp and self.parallel_size > 1:
-            assert all_rank_num_tokens is not None
-            assert use_dp_padding is not None
-            num_rows = sum(all_rank_num_tokens)
-        else:
-            num_rows = x.shape[0]
-
-        # In case of num_rows is larger than max_chunk_size * 2, we need to split the input into multiple chunks.
-        # Because we will use two streams in chunked moe and preallocate two workspaces.
-        num_chunks = 1
-        if num_rows > self.moe_max_num_tokens * 2:
-            num_chunks = (num_rows + self.moe_max_num_tokens -
-                          1) // self.moe_max_num_tokens
-
-        if use_dp_padding:
-            all_rank_num_tokens_padded = [max(all_rank_num_tokens)
-                                          ] * len(all_rank_num_tokens)
-        else:
-            all_rank_num_tokens_padded = all_rank_num_tokens
-
-        if num_chunks == 1:
-            # create workspace
-            num_rows = x.shape[0]
-            if self.use_dp:
-                num_rows = sum(all_rank_num_tokens_padded)
-            workspaces = self.get_workspaces([num_rows])
-            outputs = self.forward_chunk(
-                x,
-                router_logits,
-                input_ids=input_ids,
-                output_dtype=output_dtype,
-                all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding,
-                workspace=workspaces[0])
-            outputs = self.reducescatter_or_allreduce(
-                outputs,
-                all_rank_num_tokens=all_rank_num_tokens_padded,
-                use_dp_padding=use_dp_padding)
-        else:
-            if self.use_dp:
-                all_rank_chunk_size_list = [
-                    self.split_chunk(val, num_chunks)
-                    for val in all_rank_num_tokens_padded
-                ]
-                all_rank_num_tokens_list = [[
-                    val[idx_chunk] for val in all_rank_chunk_size_list
-                ] for idx_chunk in range(num_chunks)]
-                chunk_size_list = all_rank_chunk_size_list[self.parallel_rank]
-            else:
-                all_rank_num_tokens_list = [None] * num_chunks
-                chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
-
-            # create workspace
-            chunk_size_0 = sum(all_rank_num_tokens_list[0]
-                               ) if self.use_dp else chunk_size_list[0]
-            chunk_size_1 = sum(all_rank_num_tokens_list[1]
-                               ) if self.use_dp else chunk_size_list[1]
-            workspaces = self.get_workspaces([chunk_size_0, chunk_size_1])
-            workspace_0 = workspaces[0]
-            workspace_1 = workspaces[1]
-
-            x_list = x.split(chunk_size_list)
-            router_logits_list = router_logits.split(chunk_size_list)
-            input_ids_list = input_ids.split(
-                chunk_size_list) if input_ids is not None else [None
-                                                                ] * num_chunks
-
-            self.event_dict[EventType.Main].record()
-            with torch.cuda.stream(self.aux_stream):
-                self.event_dict[EventType.Main].wait()
-
-            def _forward_chunk(x_, router_logits_, input_ids_, idx, workspace):
-                return self.forward_chunk(
-                    x_,
-                    router_logits_,
-                    input_ids=input_ids_,
-                    all_rank_num_tokens=all_rank_num_tokens_list[idx]
-                    if self.use_dp else None,
-                    use_dp_padding=use_dp_padding,
-                    workspace=workspace)
-
-            def _reducescatter_or_allreduce(x_, idx):
-                return self.reducescatter_or_allreduce(
-                    x_,
-                    all_rank_num_tokens=all_rank_num_tokens_list[idx],
-                    use_dp_padding=use_dp_padding)
-
-            outputs_list = []
-            # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
-            for idx_chunk, (x, router_logits, input_ids_chunk) in enumerate(
-                    zip(x_list, router_logits_list, input_ids_list)):
-
-                if idx_chunk % 2 == 0:
-                    with torch.cuda.stream(self.aux_stream):
-                        outputs = _forward_chunk(x, router_logits,
-                                                 input_ids_chunk, idx_chunk,
-                                                 workspace_0)
-                    if idx_chunk > 0:
-                        outputs_list[-1] = _reducescatter_or_allreduce(
-                            outputs_list[-1], idx_chunk - 1)
-                else:
-                    outputs = _forward_chunk(x, router_logits, input_ids_chunk,
-                                             idx_chunk, workspace_1)
-                    with torch.cuda.stream(self.aux_stream):
-                        outputs_list[-1] = _reducescatter_or_allreduce(
-                            outputs_list[-1], idx_chunk - 1)
-
-                outputs_list.append(outputs)
-
-            if num_chunks % 2 == 0:
-                outputs_list[-1] = _reducescatter_or_allreduce(
-                    outputs_list[-1], -1)
-            else:
-                with torch.cuda.stream(self.aux_stream):
-                    outputs_list[-1] = _reducescatter_or_allreduce(
-                        outputs_list[-1], -1)
-            with torch.cuda.stream(self.aux_stream):
-                self.event_dict[EventType.MoeChunkingOverlap].record()
-            self.event_dict[EventType.MoeChunkingOverlap].wait()
-
-            outputs = torch.cat(outputs_list)
-
-        if self.use_dp and self.parallel_size > 1:
-            rank = self.parallel_rank
-            outputs = outputs[:all_rank_num_tokens[rank]]
-        return outputs

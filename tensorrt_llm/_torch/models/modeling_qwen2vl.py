@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed, Qwen2_5_VisionTransformerPretrainedModel)
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
@@ -153,7 +154,14 @@ def _prepare_qwen_vl_mrope_config(
         if len(delta_tensors) != num_seq_slots:
             raise RuntimeError(
                 "Missing MRoPE position deltas for seq-slot cache update")
-        deltas = torch.cat(delta_tensors, dim=0)
+        # `delta_tensors` originate from per-request `multimodal_data` and may
+        # be CPU-resident when the owning model's `multimodal_data_device_paths`
+        # does not cover `mrope_config.*` (or a path skips the engine's H2D
+        # move), while the seq-slot cache and `seq_slots` live on the model
+        # device. `index_copy_` requires all tensors on the same device.
+        deltas = torch.cat(delta_tensors,
+                           dim=0).to(device=mrope_position_deltas_cache.device,
+                                     non_blocking=True)
         mrope_position_deltas_cache.index_copy_(0, seq_slots, deltas)
 
     if position_ids is not None \
@@ -297,6 +305,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         divided by ``spatial_merge_unit`` (the post-merger placeholder count)."""
         if isinstance(image, torch.Tensor):
             image_h, image_w = int(image.shape[-2]), int(image.shape[-1])
+        elif isinstance(image, np.ndarray):
+            # HWC uint8 from ImageMediaIO's "np" format.
+            image_h, image_w = int(image.shape[0]), int(image.shape[1])
         else:
             image_h, image_w = image.height, image.width
         encoder_tokens = self._num_vision_tokens(width=image_w,
@@ -312,6 +323,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if isinstance(first_frame, torch.Tensor):
             frame_h = int(first_frame.shape[-2])
             frame_w = int(first_frame.shape[-1])
+        elif isinstance(first_frame, np.ndarray):
+            # HWC uint8 from VideoMediaIO's "np" format.
+            frame_h = int(first_frame.shape[0])
+            frame_w = int(first_frame.shape[1])
         else:
             frame_h, frame_w = first_frame.height, first_frame.width
         encoder_tokens = self._num_vision_tokens(width=frame_w,
@@ -858,18 +873,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         # Text-only fast path: skip the multi-modal HF processor (tokenizer
         # output matches it bit-exactly when `images` / `videos` are `None`)
-        # while still populating mrope_config since the LM is M-RoPE.
+        # and emit no multimodal data at all. Without vision spans the M-RoPE
+        # coordinates degenerate to the scalar token positions on all three
+        # axes and the position delta is zero, which is exactly what the model
+        # engine falls back to for a request carrying no `mrope_config`.
+        # Synthesizing them would cost an O(seq_len) (3, 1, N) tensor per
+        # request that the engine then moves to device, and in disaggregated
+        # serving the prefill worker re-registers that tensor as a CUDA IPC
+        # handle no one ever consumes.
         if not mm_data:
             input_ids = self.tokenizer(text_prompt,
                                        return_tensors="pt").input_ids
-            attention_mask = torch.ones_like(input_ids)
-            mrope_config = self.get_mrope_config(input_ids, None, None,
-                                                 attention_mask, None)
-            return input_ids[0].to(torch.int32).tolist(), {
-                "multimodal_data": {
-                    "mrope_config": mrope_config
-                },
-            }
+            return input_ids[0].to(torch.int32).tolist(), None
 
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs)
@@ -889,7 +904,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 "video_grid_thw": processed_inputs.get('video_grid_thw')
             }
 
-        # NOTE: Even on the text-only prompts, we still need 'mrope_position_ids'.
+        # Computed from the fused ids so the vision spans get their per-axis
+        # coordinates; the text-only path above returns before reaching here.
         mrope_config = self.get_mrope_config(
             processed_inputs['input_ids'],
             processed_inputs.get('image_grid_thw', None),
@@ -1080,11 +1096,15 @@ class Qwen2VisionModelBase(nn.Module):
         embeds = []
         if pixel_values is not None:
             embed = self.visual(pixel_values, grid_thw=image_grid_thw)
+            if isinstance(embed, BaseModelOutputWithPooling):
+                embed = embed.pooler_output
             embeds.append(embed)
 
         if pixel_values_videos is not None:
-            embeds.append(
-                self.visual(pixel_values_videos, grid_thw=video_grid_thw))
+            embed = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+            if isinstance(embed, BaseModelOutputWithPooling):
+                embed = embed.pooler_output
+            embeds.append(embed)
         return embeds
 
 
@@ -1155,7 +1175,10 @@ class Qwen2_5_VLVisionAttention(Attention):
         # uses head_dim=80 (e.g. 1280 hidden / 16 heads), so use PyTorch RoPE.
         if IS_FLASHINFER_AVAILABLE and self.head_dim % 64 == 0 and position_ids is not None:
             try:
-                cos_sin_cache = torch.cat([cos, sin], dim=-1).contiguous()
+                # flashinfer requires cos_sin_cache in float32; upstream may cache
+                # cos/sin in the vision tower dtype (e.g. bf16) as a perf hint.
+                cos_sin_cache = torch.cat([cos, sin], dim=-1).to(
+                    torch.float32).contiguous()
                 flashinfer_apply_rope_with_cos_sin_cache_inplace(
                     position_ids,
                     q,
@@ -1165,7 +1188,7 @@ class Qwen2_5_VLVisionAttention(Attention):
                     is_neox=True,
                 )
                 return q, k, v
-            except RuntimeError as err:
+            except (RuntimeError, ValueError) as err:
                 logger.warning(
                     "Qwen2.5-VL vision RoPE: FlashInfer failed (%s); "
                     "falling back to PyTorch RotaryEmbedding.apply_rotary_pos_emb.",
@@ -1852,8 +1875,12 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
         mrope_config = {}
-        # NOTE: Qwen*-VL series has mrope_config even on the text-only prompts, so we need to separate
-        # the entries that do have multimodal data from those that correspond to text-only prompts.
+        # `multimodal_params` holds one entry per request that carried any
+        # multimodal data, context entries first, followed by the generation
+        # entries that only seed the MRoPE delta cache. The slice bounds the
+        # scan to the context prefix; `_get_requests_with_mm_data` is what
+        # actually selects the entries with encoder input, so this does not
+        # rely on the entries lining up with the context requests.
         if num_context_requests > 0:
             mm_multimodal_params = self._get_requests_with_mm_data(
                 multimodal_params[:num_context_requests])
@@ -1948,7 +1975,8 @@ class Qwen2VLModel(Qwen2VLModelBase):
         return [
             "image.pixel_values", "image.image_grid_thw",
             "video.pixel_values_videos", "video.video_grid_thw",
-            "multimodal_embedding"
+            "multimodal_embedding", "mrope_config.mrope_position_ids",
+            "mrope_config.mrope_position_deltas"
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):

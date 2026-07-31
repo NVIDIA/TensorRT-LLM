@@ -30,6 +30,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
@@ -39,6 +40,7 @@
 
 #include <ATen/native/cuda/Resize.h>
 
+#include <algorithm>
 #include <functional>
 #include <map>
 
@@ -86,7 +88,8 @@ enum class MoeLoraRequestType : int32_t
 // ---------------------------------------------------------------------------
 inline void moeLoraGroupedGemmRunImpl(::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGroupedGemmModule const& mod,
     int64_t num_permuted_tokens, int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes,
-    int64_t splitk_slices, void const* input_base, void* output_base, nvinfer1::DataType data_type, cudaStream_t stream)
+    int64_t splitk_slices, void const* input_base, void* output_base, tensorrt_llm::DataType data_type,
+    cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(mod.permuted_ranks_dev != nullptr,
         "Grouped-GEMM LoRA module is missing permuted ranks buffer (forgot to populate grouped_gemm?).");
@@ -334,6 +337,8 @@ public:
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
         mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
+        replaceUnsupportedProfiles(mGemm1Profiles);
+        replaceUnsupportedProfiles(mGemm2Profiles);
         cuInit(0);
     }
 
@@ -548,7 +553,17 @@ public:
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
 
-        setRunnerProfiles(profile_ids);
+        // ===== Routed-expert LoRA activation flags =====
+        // LoRA is activated by the per-request (fc1_lora_ranks) or slot-indexed
+        // (fc1_slot_lora_ranks) schema. Computed before tactic selection so a
+        // GEMM2 fused-finalize tactic can be excluded when LoRA is active (the
+        // routed-expert LoRA delta occupies the GEMM2 epilogue that the FINALIZE
+        // fusion would use).
+        bool const lora_per_request = fc1_lora_ranks.has_value();
+        bool const lora_slot_indexed = fc1_slot_lora_ranks.has_value();
+        bool const lora_active = lora_per_request || lora_slot_indexed;
+
+        setRunnerProfiles(profile_ids, lora_active);
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -568,10 +583,8 @@ public:
         }
 
         // ===== Routed-expert LoRA setup =====
-        // LoRA is activated by the per-request schema (fc1_lora_ranks).
-        bool const lora_per_request = fc1_lora_ranks.has_value();
-        bool const lora_slot_indexed = fc1_slot_lora_ranks.has_value();
-        bool const lora_active = lora_per_request || lora_slot_indexed;
+        // Activation flags (lora_per_request / lora_slot_indexed / lora_active)
+        // were computed above, before tactic selection.
         bool const is_gated_act = isGatedActivation(base_activation_type);
         if (lora_active)
         {
@@ -992,6 +1005,28 @@ private:
     std::vector<Profile> mGemm1Profiles;
     std::vector<Profile> mGemm2Profiles;
 
+    void replaceUnsupportedProfiles(std::vector<Profile>& profiles) const
+    {
+        if (!mUseW4GroupScaling && !mUseFusedFinalize)
+        {
+            return;
+        }
+
+        auto const unsupported = [](Profile const& profile)
+        { return profile.epilogue_schedule == tensorrt_llm::cutlass_extensions::EpilogueScheduleType::NO_SMEM; };
+        auto const replacement = std::find_if(
+            profiles.begin(), profiles.end(), [&](Profile const& profile) { return !unsupported(profile); });
+        TORCH_CHECK(replacement != profiles.end(),
+            "No supported MoE GEMM tactic remains after replacing unsupported NO_SMEM epilogues.");
+        for (auto& profile : profiles)
+        {
+            if (unsupported(profile))
+            {
+                profile = *replacement;
+            }
+        }
+    }
+
     // ===== Routed-expert LoRA state =====
     // Pinned-host and persistent-device buffers for the capture-safe MoE LoRA
     // path. The pinned-host tensors hold the per-token expanded LoRA tables
@@ -1113,7 +1148,7 @@ private:
         }
     }
 
-    void setRunnerProfiles(torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+    void setRunnerProfiles(torch::optional<c10::ArrayRef<int64_t>> profile_ids, bool lora_active = false)
     {
         if (mUseDeepSeekFP8BlockScaling)
         {
@@ -1136,6 +1171,26 @@ private:
             best_gemm2_profile
                 = profile_ids.value()[1] == -1 ? best_gemm2_profile : mGemm2Profiles.at(profile_ids.value()[1]);
         }
+
+        // Routed-expert MoE LoRA is incompatible with the GEMM2 fused-finalize
+        // epilogue: the LoRA delta is applied in the GEMM2 epilogue that the
+        // FINALIZE fusion would otherwise occupy (see setupTmaWarpSpecializedInputs
+        // in moe_kernels.cu). The GEMM2 tactic autotuner profiles with LoRA off
+        // (runGemmProfile forces USE_LORA=false) and can therefore select a
+        // FINALIZE tactic, and a cached runner may still expose FINALIZE tactics
+        // if it was first constructed with fused finalize enabled. Downgrade the
+        // selected tactic to the equivalent non-fused (NONE) epilogue when LoRA
+        // is active. Every FINALIZE config is a copy of a valid non-FINALIZE
+        // config with the fusion flag flipped (see MoeGemmRunner::getConfigs), so
+        // clearing the flag yields a supported tactic with the same tile shape.
+        if (lora_active
+            && best_gemm2_profile.epilogue_fusion_type
+                == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE)
+        {
+            best_gemm2_profile.epilogue_fusion_type
+                = tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
+        }
+
         mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
     }
 
@@ -1181,17 +1236,17 @@ private:
 
     // ===== LoRA helpers =====
 
-    // Map a torch dtype to the TRT-LLM nvinfer1::DataType used to size the
+    // Map a torch dtype to the TRT-LLM tensorrt_llm::DataType used to size the
     // grouped-GEMM low-rank scratch. Kept as a const member (not static) so the
     // FP8 case can read mOutputDtype to pick the fp16/bf16 LoRA compute dtype.
-    nvinfer1::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
+    tensorrt_llm::DataType loraTypeFromActDtype(c10::ScalarType dtype) const
     {
         switch (dtype)
         {
-        case c10::ScalarType::Half: return nvinfer1::DataType::kHALF;
-        case c10::ScalarType::Float: return nvinfer1::DataType::kFLOAT;
+        case c10::ScalarType::Half: return tensorrt_llm::DataType::kHALF;
+        case c10::ScalarType::Float: return tensorrt_llm::DataType::kFLOAT;
 #ifdef ENABLE_BF16
-        case c10::ScalarType::BFloat16: return nvinfer1::DataType::kBF16;
+        case c10::ScalarType::BFloat16: return tensorrt_llm::DataType::kBF16;
 #endif
 #ifdef ENABLE_FP8
         case c10::ScalarType::Float8_e4m3fn:

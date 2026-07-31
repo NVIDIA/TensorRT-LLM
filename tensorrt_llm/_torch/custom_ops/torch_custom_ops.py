@@ -25,10 +25,11 @@ import triton  # type: ignore[import]
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._torch.distributed.allreduce_helper import \
+    CustomAllReduceHelper
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
-from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 from tensorrt_llm.quantization.utils import fp8_quantize
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
@@ -55,26 +56,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
-
-
-def _init_deep_gemm_pdl() -> None:
-    try:
-        cuda_available = torch.cuda.is_available()
-    except RuntimeError as err:
-        logger.warning(
-            f"Failed to query CUDA availability for DeepGEMM PDL: {err}")
-        return
-
-    if not cuda_available:
-        return
-
-    try:
-        deep_gemm.set_pdl(get_env_enable_pdl())
-    except RuntimeError as err:
-        logger.warning(f"Failed to initialize DeepGEMM PDL: {err}")
-
-
-_init_deep_gemm_pdl()
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -1131,6 +1112,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     # SM version OK, check if CuteDSL supports the current shape
                     cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
                         self.output_dtype)
+                    # get_valid_tactics ranks/prunes with nvMatmulHeuristics
+                    # internally when TRTLLM_CUTEDSL_NVMMH_ENABLE=1 (no-op
+                    # otherwise), so the returned list already reflects any
+                    # opt-in pruning before it enters the unified tactic list.
                     cutedsl_tactics = cutedsl_runner.get_valid_tactics(
                         inputs, profile)
 
@@ -2056,7 +2041,9 @@ def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
 def silu_and_mul(x: torch.Tensor,
                  scale: Optional[torch.Tensor] = None,
                  dtype: Optional[torch.dtype] = None,
-                 swiglu_limit: Optional[float] = None) -> torch.Tensor:
+                 swiglu_limit: Optional[float] = None,
+                 swiglu_alpha: Optional[float] = None,
+                 swiglu_beta: Optional[float] = None) -> torch.Tensor:
     b, n = x.shape
 
     assert n % 2 == 0
@@ -2076,6 +2063,8 @@ def silu_and_mul(x: torch.Tensor,
         x_stride=x.stride(0),
         d=d,
         swiglu_limit=swiglu_limit or 0.0,
+        swiglu_alpha=swiglu_alpha if swiglu_alpha is not None else 1.0,
+        swiglu_beta=swiglu_beta if swiglu_beta is not None else 0.0,
         BLOCK_SIZE=1024,
         HAS_O_SCALE=scale is not None,
         HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
@@ -2090,6 +2079,8 @@ def _(
     scale: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = None,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
 ) -> torch.Tensor:
     b, n = x.shape
 
@@ -2122,17 +2113,20 @@ class AllReduceRunner(TunableRunner):
         op: int,
         eps: float,
         trigger_completion_at_end: bool,
+        input_uses_nccl_window: bool = False,
     ):
         self.tp_size = tp_size
         self.op = op
         self.group = group
         self.eps = eps
         self.trigger_completion_at_end = trigger_completion_at_end
+        self.input_uses_nccl_window = input_uses_nccl_window
 
     def unique_id(self):
         return (
             self.tp_size,
             self.op,
+            self.input_uses_nccl_window,
         )
 
     @classmethod
@@ -2269,6 +2263,16 @@ def _(
     return None
 
 
+# Host-side predicate for custom-op implementations only. Do not call this
+# directly from model forward code or compiled graphs; it returns a Python bool
+# and is intended only to let another custom op gate its setup logic.
+@torch.library.register_fake("trtllm::is_nccl_window_buffer")
+def _(input: torch.Tensor, group: List[int]) -> bool:
+    raise AssertionError(
+        "trtllm::is_nccl_window_buffer should only be called inside another "
+        "custom op runtime implementation, not from fake/tracing execution.")
+
+
 @torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())
 def tunable_allreduce(
     input: torch.Tensor,
@@ -2285,13 +2289,24 @@ def tunable_allreduce(
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
+    group_list = list(group)
 
+    def _uses_nccl_symmetric_memory_window(input_tensor: torch.Tensor) -> bool:
+        # Keep is_nccl_window_buffer scoped inside this custom op. Calling it
+        # from normal model code would expose a host-side bool predicate to the
+        # graph instead of using it only to configure autotune execution.
+        return (isinstance(input_tensor, torch.Tensor) and input_tensor.is_cuda
+                and torch.ops.trtllm.is_nccl_window_buffer(
+                    input_tensor, group_list))
+
+    input_uses_nccl_window = _uses_nccl_symmetric_memory_window(input)
     allreduce_runner = AllReduceRunner(
         len(group),
         group,
         op,
         eps,
         trigger_completion_at_end,
+        input_uses_nccl_window,
     )
 
     def _inputs_pre_hook_register_nccl_symmetric_memory_window(
@@ -2299,11 +2314,13 @@ def tunable_allreduce(
         if not inputs:
             return inputs
         input_tensor = inputs[0]
+        if not input_uses_nccl_window:
+            return inputs
         if not isinstance(input_tensor,
                           torch.Tensor) or not input_tensor.is_cuda:
             return inputs
         nccl_symmetric_memory_window_tensor, actual_kind = torch.ops.trtllm.allocate_output(
-            input_tensor, int(BufferKind.NCCL_WINDOW), list(group))
+            input_tensor, int(BufferKind.NCCL_WINDOW), group_list)
         if actual_kind != int(BufferKind.NCCL_WINDOW):
             return inputs
         nccl_symmetric_memory_window_tensor.copy_(input_tensor)
@@ -2311,9 +2328,12 @@ def tunable_allreduce(
         new_inputs[0] = nccl_symmetric_memory_window_tensor
         return new_inputs
 
-    tuning_config = replace(
-        AllReduceRunner.tuning_config,
-        inputs_pre_hook=_inputs_pre_hook_register_nccl_symmetric_memory_window)
+    tuning_config = AllReduceRunner.tuning_config
+    if input_uses_nccl_window:
+        tuning_config = replace(
+            AllReduceRunner.tuning_config,
+            inputs_pre_hook=
+            _inputs_pre_hook_register_nccl_symmetric_memory_window)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",

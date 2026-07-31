@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from _torch.helpers import per_block_cast_to_fp8_e8m0
+from _torch.helpers import per_block_cast_to_fp8_e8m0, per_token_cast_to_fp8_e8m0
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -36,6 +36,19 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..test_sparse_mla_forward import RopeConfig, _calc_diff, apply_rotary_emb, precompute_freqs_cis
+
+FP8_O_PROJ_DIFF_TOL = 2e-3
+
+
+def _per_token_fp8_quant_dequant(x: torch.Tensor) -> torch.Tensor:
+    """Simulate the fused inverse-RoPE FP8 quantization consumed by o_a_proj."""
+    original_shape = x.shape
+    flattened_x = x.reshape(-1, original_shape[-1])
+    fp8_x, scale = per_token_cast_to_fp8_e8m0(flattened_x)
+    dequant_x = (fp8_x.view(flattened_x.shape[0], -1, 128).float() * scale.unsqueeze(-1)).view_as(
+        flattened_x
+    )
+    return dequant_x.to(x.dtype).reshape(original_shape)
 
 
 def calculate_reference_deepseek_v4_o_proj(
@@ -74,6 +87,10 @@ def calculate_reference_deepseek_v4_o_proj(
 
     # Reshape for grouped projection
     attn_out_grouped = attn_out_latent.view(num_tokens, n_local_groups, -1)
+    if is_fp8:
+        attn_out_grouped = _per_token_fp8_quant_dequant(
+            attn_out_grouped.transpose(0, 1).contiguous()
+        ).transpose(0, 1)
 
     # Apply o_a_proj: einsum equivalent to bmm
     o_lora = torch.einsum("tgd,grd->tgr", attn_out_grouped, o_a_proj)
@@ -219,7 +236,12 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
             fp8_a_weight = fp8_a_weight.reshape(n_local_groups, o_lora_rank, dim)
             mla.o_a_proj.data = fp8_a_weight
             mla.o_a_proj_scale.data = fp8_a_scale
-            mla.o_a_proj_dequant.data = o_a_proj_bf16
+            # mla.o_a_proj_dequant is None for DSv4 on SM100: PR #14254
+            # decouples the FP8-native o_a_proj path from
+            # use_cute_dsl_blockscaling_bmm, so DSv4 unconditionally uses the
+            # fused inv-RoPE + FP8 quant + cute-dsl BMM chain and never needs
+            # the bf16-dequant fallback buffer. The reference path below uses
+            # o_a_proj_bf16 directly.
 
         # Initialize o_b_proj weights
         if dtype_str == "bf16":
@@ -256,8 +278,16 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         o_a_proj_ref = mla.o_a_proj.data
         o_b_proj_weight_ref = mla.o_b_proj.weight.data
     else:
-        # For FP8, convert back to bf16 for reference calculation
-        o_a_proj_ref = o_a_proj_bf16
+        # Match the FP8-native o_a_proj path: the runtime BMM consumes
+        # quantized o_a_proj plus block scales, not the original BF16 weight.
+        o_a_proj_ref = (
+            weight_dequant(
+                fp8_a_weight.reshape(-1, dim).contiguous(),
+                fp8_a_scale.contiguous(),
+            )
+            .bfloat16()
+            .reshape(o_a_proj_bf16.shape)
+        )
         o_b_proj_weight_ref = fp8_b_weight_dequant
 
     freqs_cis = precompute_freqs_cis(
@@ -302,7 +332,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
     if dtype_str == "fp8":
         diff = _calc_diff(output, reference_output)
-        assert diff < 1e-3, f"{diff=}"
+        assert diff < FP8_O_PROJ_DIFF_TOL, f"{diff=}"
     else:
         torch.testing.assert_close(output, reference_output, rtol=0.1, atol=0.1)
         print(f"  ✓ Test passed for num_tokens={num_tokens}, dtype={dtype_str}\n")

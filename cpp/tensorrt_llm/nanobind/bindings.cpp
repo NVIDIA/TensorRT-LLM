@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,12 +32,14 @@
 
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
 #include "tensorrt_llm/nanobind/batch_manager/buffers.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
@@ -46,7 +48,6 @@
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/suffixAutomaton/bindings.h"
 #include "tensorrt_llm/nanobind/testing/kvCacheManagerTestUtilBinding.h"
-#include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -135,6 +136,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     auto mInternalBatchManagerKvCacheV2Utils
         = mInternalBatchManager.def_submodule("kv_cache_manager_v2_utils", "KV Cache Manager V2 Utils bindings");
+    auto mInternalBatchManagerKvCacheV2
+        = mInternalBatchManager.def_submodule("kv_cache_manager_v2", "KV Cache Manager V2 bindings");
+    tensorrt_llm::nanobind::batch_manager::KvCacheManagerV2Bindings::initBindings(mInternalBatchManagerKvCacheV2);
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
@@ -168,17 +172,17 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_rw("host_cache_size", &tb::PeftCacheManagerConfig::hostCacheSize)
         .def_rw("lora_prefetch_dir", &tb::PeftCacheManagerConfig::loraPrefetchDir);
 
-    nb::enum_<nvinfer1::DataType>(m, "DataType")
-        .value("FLOAT", nvinfer1::DataType::kFLOAT)
-        .value("HALF", nvinfer1::DataType::kHALF)
-        .value("INT8", nvinfer1::DataType::kINT8)
-        .value("INT32", nvinfer1::DataType::kINT32)
-        .value("BOOL", nvinfer1::DataType::kBOOL)
-        .value("UINT8", nvinfer1::DataType::kUINT8)
-        .value("FP8", nvinfer1::DataType::kFP8)
-        .value("BF16", nvinfer1::DataType::kBF16)
-        .value("INT64", nvinfer1::DataType::kINT64)
-        .value("NVFP4", nvinfer1::DataType::kFP4)
+    nb::enum_<tensorrt_llm::DataType>(m, "DataType")
+        .value("FLOAT", tensorrt_llm::DataType::kFLOAT)
+        .value("HALF", tensorrt_llm::DataType::kHALF)
+        .value("INT8", tensorrt_llm::DataType::kINT8)
+        .value("INT32", tensorrt_llm::DataType::kINT32)
+        .value("BOOL", tensorrt_llm::DataType::kBOOL)
+        .value("UINT8", tensorrt_llm::DataType::kUINT8)
+        .value("FP8", tensorrt_llm::DataType::kFP8)
+        .value("BF16", tensorrt_llm::DataType::kBF16)
+        .value("INT64", tensorrt_llm::DataType::kINT64)
+        .value("NVFP4", tensorrt_llm::DataType::kFP4)
         .export_values();
 
     nb::enum_<tr::ModelConfig::ModelVariant>(m, "GptModelVariant")
@@ -295,7 +299,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def(nb::self != nb::self);
 
     nb::class_<tr::ModelConfig>(m, "ModelConfig")
-        .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, nvinfer1::DataType>(),
+        .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, tensorrt_llm::DataType>(),
             nb::arg("vocab_size"), nb::arg("num_layers"), nb::arg("num_attention_layers"), nb::arg("num_rnn_layers"),
             nb::arg("num_heads"), nb::arg("hidden_size"), nb::arg("data_type"))
         .def_prop_ro("vocab_size", &tr::ModelConfig::getVocabSize)
@@ -512,7 +516,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tensorrt_llm::nanobind::process_group::initBindings(mInternalProcessGroup);
     tpb::Buffers::initBindings(mInternalBatchManager);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
-    tensorrt_llm::nanobind::testing::initBindings(mInternalTesting);
     tensorrt_llm::nanobind::testing::initKvCacheTestUtilBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);
 
@@ -545,4 +548,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 
     m.def("steady_clock_now", []() { return std::chrono::steady_clock::now(); });
+    // Global (offset-normalized) steady clock, matching what
+    // LlmRequest::setKvCacheTransferStart/End expect. Reads the process-global
+    // steady clock offset, set by PyExecutor at startup.
+    m.def("global_steady_clock_now", []() { return tb::LlmRequest::getSteadyClockNow(); });
 }

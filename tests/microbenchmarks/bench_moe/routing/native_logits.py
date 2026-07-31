@@ -123,7 +123,13 @@ def _project_router_logits_for_plan(
     Returns ``(router_logits, status, reason)`` where ``status`` is one of
     ``"exact"``, ``"projected"``, or ``"rejected"``.
     """
-    local_num_tokens = int(plan.per_rank_num_tokens[src_rank])
+    # Derive the effective token count from the dispatch-matrix row sum.
+    # In MoE-TP + attention-DP layouts (DTP / CUSTOM-DP) the row sum equals
+    # the aggregated source tokens for the EP rank (which is what the router
+    # sees after the in-MoE allgather), while per_rank_num_tokens[src_rank]
+    # would only cover one DP shard.
+    row_sum = sum(plan.dispatch_matrix[src_rank])
+    local_num_tokens = row_sum // max(top_k, 1) if row_sum > 0 else 0
     if local_num_tokens == 0:
         return (
             torch.empty((0, num_experts), dtype=dtype, device=device),

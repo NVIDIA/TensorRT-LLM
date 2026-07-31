@@ -108,6 +108,7 @@ _LATENT_W = 4
 _TEXT_LEN = 8
 _MAX_TEXT_LEN = 16
 _TIMESTEP = 500.0
+_NUM_TRAIN_TIMESTEPS = 1000.0
 _FPS = 24.0
 
 # Audio (sound) modality: audio tokens are appended to the gen sequence, so the
@@ -387,7 +388,8 @@ def _forward(model: Cosmos3VFMTransformer, device: torch.device, text_seed: int)
     with torch.inference_mode():
         return model(
             hidden_states=hs,
-            timestep=ts,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
             text_ids=text_ids,
             text_mask=text_mask,
             video_shape=video_shape,
@@ -413,7 +415,8 @@ def _forward_with_audio(
     with torch.inference_mode():
         out = model(
             hidden_states=hs,
-            timestep=ts,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
             text_ids=text_ids,
             text_mask=text_mask,
             video_shape=video_shape,

@@ -282,6 +282,8 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
             ),
         ],
     )
+    # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
+    @pytest.mark.threadleak(enabled=False)
     def test_disaggregated_videomme(self, variant: EPDVariant) -> None:
         """Run VideoMME shard through a model-specific llmapi E/PD config."""
         with self._launch_epd(variant) as llm:

@@ -224,7 +224,12 @@ struct GvrParams; // primary undefined → compile-time error for bad combos
 template <>
 struct GvrParams<float, 512>
 {
-    static constexpr int kFTarget = 384;
+    // kFTarget=kK aligns the secant's soft steering target with the band's
+    // lower edge; eliminates the upper-clamp saturation on tight-σ + high-A2
+    // layers (L36/L42/L28). Cross-prompt simulator validation on swe-bench
+    // 32k/64k/100k showed 2.19× / 1.77× / 1.51× total P2-iter reduction with
+    // zero cap-hits, zero per-layer regression vs the prior kFTarget=384.
+    static constexpr int kFTarget = 512;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 1024;
 };
@@ -232,7 +237,14 @@ struct GvrParams<float, 512>
 template <>
 struct GvrParams<float, 1024>
 {
-    static constexpr int kFTarget = 2560;
+    // kFTarget = kK (see GvrParams<float, 512> rationale). Q9k Pro 32k
+    // K=1024 native sweep (M=K=1024) finds kFT=1024 reduces sum_mean
+    // P2 iters from 35.33 (kFT=2560) → 30.21 (1.17× speedup) with zero
+    // per-layer regression and zero cap-hits. The prior kFT=2560 setting
+    // was tuned with M=512 K=1024 (sparse_attention_config default
+    // index_topk=512 inherited Flash's K), which does not represent
+    // production Pro behavior (production: M = K).
+    static constexpr int kFTarget = 1024;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 1024;
 };
@@ -251,7 +263,8 @@ struct GvrParams<float, 2048>
 template <>
 struct GvrParams<__nv_bfloat16, 512>
 {
-    static constexpr int kFTarget = 384;
+    // kFTarget aligned to kK — see GvrParams<float, 512> rationale.
+    static constexpr int kFTarget = 512;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 512;
 };
@@ -259,7 +272,8 @@ struct GvrParams<__nv_bfloat16, 512>
 template <>
 struct GvrParams<__nv_bfloat16, 1024>
 {
-    static constexpr int kFTarget = 2560;
+    // kFTarget = kK — see GvrParams<float, 1024> rationale.
+    static constexpr int kFTarget = 1024;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 512;
 };
@@ -275,7 +289,8 @@ struct GvrParams<__nv_bfloat16, 2048>
 template <>
 struct GvrParams<__half, 512>
 {
-    static constexpr int kFTarget = 384;
+    // kFTarget aligned to kK — see GvrParams<float, 512> rationale.
+    static constexpr int kFTarget = 512;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 512;
 };
@@ -283,7 +298,8 @@ struct GvrParams<__half, 512>
 template <>
 struct GvrParams<__half, 1024>
 {
-    static constexpr int kFTarget = 2560;
+    // kFTarget = kK — see GvrParams<float, 1024> rationale.
+    static constexpr int kFTarget = 1024;
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 1024;
 };

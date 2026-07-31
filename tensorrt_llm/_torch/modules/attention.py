@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import weakref
 from typing import List, Optional, Tuple, Union
@@ -24,19 +27,6 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
-
-
-def _lower_sparse_attention_params(sparse_attn_cfg,
-                                   pretrained_config=None,
-                                   layer_idx: Optional[int] = None):
-    if getattr(sparse_attn_cfg, "algorithm", None) == "deepseek_v4":
-        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
-            make_deepseek_v4_sparse_params
-
-        return make_deepseek_v4_sparse_params(
-            sparse_attn_cfg, pretrained_config=pretrained_config)
-    return sparse_attn_cfg.to_sparse_params(pretrained_config=pretrained_config,
-                                            layer_idx=layer_idx)
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -609,13 +599,12 @@ class Attention(nn.Module):
         self.attn_backend = config.attn_backend
 
         sparse_attn_cfg = config.sparse_attention_config
-        sparse_params = (_lower_sparse_attention_params(
-            sparse_attn_cfg,
+        sparse_params = (sparse_attn_cfg.to_sparse_params(
             pretrained_config=config.pretrained_config,
             layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
 
-        attn_cls = get_attention_backend(
-            self.attn_backend, sparse_attention_config=sparse_attn_cfg)
+        attn_cls = get_attention_backend(self.attn_backend,
+                                         sparse_params=sparse_params)
 
         self.is_marlin_enabled: bool = is_nvfp4_marlin_enabled()
 
@@ -686,7 +675,6 @@ class Attention(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
-            attn_cls=attn_cls,
             sparse_params=sparse_params,
         )
 
@@ -710,6 +698,42 @@ class Attention(nn.Module):
         if k is None and v is None:
             q, k, v = q.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         return q, k, v
+
+    def preprocess_qkv(
+        self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
+        """Transform the fused QKV projection into attention inputs.
+
+        Splits out the optional attention output gate and applies RoPE (plus
+        any subclass-specific processing such as QK norm, via apply_rope).
+        Subclasses may override this to fuse these steps into a single kernel.
+
+        Returns:
+            tuple: (q, k, v, gate). k and v are None when q holds the fused
+            QKV tensor; gate is None when attn_output_gate is disabled.
+        """
+        gate = None
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+            orig_shape = q_gate.shape[:-1]
+            # Single line: view -> chunk -> reshape both q and gate
+            q, gate = [
+                t.reshape(*orig_shape, -1) for t in torch.chunk(
+                    q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
+            ]
+        else:
+            q, k, v = qkv, None, None
+        q, k, v = self.apply_rope(q, k, v, position_ids)
+        return q, k, v, gate
+
+    def apply_output_gate(self, attention_output: torch.Tensor,
+                          gate: torch.Tensor) -> torch.Tensor:
+        """Apply the attention output gate."""
+        if gate.shape != attention_output.shape:
+            gate = gate.reshape(attention_output.shape)
+        return attention_output * torch.sigmoid(gate)
 
     def convert_qkv(self, q, k, v):
         if k is None and v is None and not self.support_fused_qkv:
@@ -998,18 +1022,6 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
-            orig_shape = q_gate.shape[:-1]
-            # Single line: view -> chunk -> reshape both q and gate
-            q, gate = [
-                t.reshape(*orig_shape, -1) for t in torch.chunk(
-                    q_gate.view(*orig_shape, self.num_heads, -1), 2, dim=-1)
-            ]
-        else:
-            q, k, v = qkv, None, None
-
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).
         if (not self.rope_fusion
@@ -1023,7 +1035,7 @@ class Attention(nn.Module):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
 
-        q, k, v = self.apply_rope(q, k, v, position_ids)
+        q, k, v, gate = self.preprocess_qkv(qkv, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
         if attention_sinks is not None:
@@ -1049,8 +1061,7 @@ class Attention(nn.Module):
         )
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            attn_output = self.apply_output_gate(attn_output, gate)
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

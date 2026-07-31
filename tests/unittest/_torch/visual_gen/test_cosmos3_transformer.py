@@ -20,20 +20,24 @@ Override checkpoint:
 import gc
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
-os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
-from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+    PRETRAINED_CONFIG_COMPAT_DEFAULTS,
+    Cosmos3VFMTransformer,
+    apply_pretrained_config_compat_defaults,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
-pytestmark = pytest.mark.cosmos3
+pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -73,6 +77,7 @@ COSMOS3_NANO_PATH = _checkpoint("DIFFUSION_MODEL_PATH_COSMOS3", "Cosmos3-Nano")
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
+_NUM_TRAIN_TIMESTEPS = 1000.0
 
 COSMOS3_FP8_QUANT_CONFIG = {
     "quant_algo": "FP8",
@@ -216,7 +221,8 @@ class TestCosmos3Unit:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -233,14 +239,16 @@ class TestCosmos3Unit:
         with torch.inference_mode():
             out1 = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
             )
             out2 = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -261,7 +269,8 @@ class TestCosmos3Unit:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -335,7 +344,8 @@ class TestCosmos3Audio:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -358,7 +368,8 @@ class TestCosmos3Audio:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -378,7 +389,8 @@ class TestCosmos3Audio:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -419,7 +431,8 @@ class TestCosmos3TransformerCheckpoint:
         with torch.inference_mode():
             out = transformer(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -448,7 +461,8 @@ class TestCosmos3TransformerCheckpoint:
             with torch.inference_mode():
                 out = transformer(
                     hidden_states=hs,
-                    timestep=ts,
+                    timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                    raw_timestep=ts,
                     text_ids=text_ids,
                     text_mask=text_mask,
                     video_shape=video_shape,
@@ -458,3 +472,36 @@ class TestCosmos3TransformerCheckpoint:
             del pipeline
             gc.collect()
             torch.cuda.empty_cache()
+
+
+# --- CPU-only coverage: checkpoint config schema compatibility ---
+
+
+class TestConfigCompatDefaults:
+    """Newer diffusers conversions omit fields older ones carried explicitly."""
+
+    def test_new_schema_gets_defaults(self):
+        config = SimpleNamespace(hidden_size=64, rope_axes_dim=[4, 2, 2])
+        apply_pretrained_config_compat_defaults(config)
+        for key, value in PRETRAINED_CONFIG_COMPAT_DEFAULTS.items():
+            assert getattr(config, key) == value
+
+    def test_old_schema_untouched(self):
+        # Every field deliberately differs from its compat default, so an
+        # overwrite of any one of them fails its assertion.
+        config = SimpleNamespace(
+            position_embedding_type="rope_3d",
+            max_position_embeddings=12345,
+            temporal_compression_factor_sound=7,
+        )
+        apply_pretrained_config_compat_defaults(config)
+        assert config.position_embedding_type == "rope_3d"
+        assert config.max_position_embeddings == 12345
+        assert config.temporal_compression_factor_sound == 7
+
+    def test_idempotent(self):
+        config = SimpleNamespace(hidden_size=64)
+        apply_pretrained_config_compat_defaults(config)
+        snapshot = vars(config).copy()
+        apply_pretrained_config_compat_defaults(config)
+        assert vars(config) == snapshot

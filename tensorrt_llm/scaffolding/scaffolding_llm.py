@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import threading
 import traceback
 from collections import deque
@@ -6,9 +7,12 @@ from dataclasses import dataclass
 from typing import Any, Generator, List, Mapping, Union
 
 from .controller import Controller, ParallelProcess
+from .execution_scope import ExecutionScope, current_scope
 from .result import ScaffoldingResult
 from .task import Task
 from .worker import Worker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -50,7 +54,7 @@ class ScaffoldingLlm:
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
     def _get_loop(self):
@@ -90,16 +94,64 @@ class ScaffoldingLlm:
     async def _handle_parallel_process(self,
                                        tasks: ParallelProcess,
                                        request: ScaffoldingRequest = None):
-        """Handle parallel execution of multiple generators."""
+        """Handle parallel execution of multiple generators.
+
+        Creates a child :class:`ExecutionScope` for each branch so that
+        downstream code (workers, tracers, replay) can distinguish
+        concurrent branches.  Resources acquired under a child scope are
+        automatically released when the branch completes.
+        """
+        parent_scope = current_scope.get()
         async_tasks = [
             asyncio.create_task(
-                self._handle_controller_generator(sub_gen, request))
-            for sub_gen in tasks.sub_gens
+                self._handle_branch(
+                    sub_gen,
+                    request,
+                    self._get_parallel_branch_scope(tasks, parent_scope, idx),
+                )) for idx, sub_gen in enumerate(tasks.sub_gens)
         ]
         await asyncio.gather(*async_tasks)
 
+    @staticmethod
+    def _get_parallel_branch_scope(tasks: ParallelProcess,
+                                   parent_scope: ExecutionScope,
+                                   branch_index: int) -> ExecutionScope:
+        if tasks.branch_paths is None:
+            return parent_scope.child(branch_index)
+        return parent_scope.with_branch_path(tasks.branch_paths[branch_index])
+
+    async def _handle_branch(self, gen: Generator, request: ScaffoldingRequest,
+                             scope: ExecutionScope):
+        """Run a single parallel branch under its own scope."""
+        token = current_scope.set(scope)
+        try:
+            await self._handle_controller_generator(gen, request)
+        finally:
+            current_scope.reset(token)
+            await self._notify_scope_end(scope)
+
+    async def _notify_scope_end(self, scope: ExecutionScope):
+        """Inform all workers that *scope* has finished."""
+        for worker in self.workers.values():
+            try:
+                await worker.on_scope_end(scope.scope_id)
+            except Exception:
+                logger.warning(
+                    "Worker %s.on_scope_end(%s) failed",
+                    type(worker).__name__,
+                    scope.scope_id,
+                    exc_info=True,
+                )
+
     async def _handle_single_request(self, request: ScaffoldingRequest):
-        """Process a single scaffolding request."""
+        """Process a single scaffolding request.
+
+        Sets :data:`current_scope` so that every downstream
+        ``asyncio.create_task`` (workers, parallel sub-generators, etc.)
+        inherits the per-request execution scope.
+        """
+        scope = ExecutionScope(request_id=request.result.id)
+        token = current_scope.set(scope)
         try:
             gen = self._create_controller_generator(request)
             await self._handle_controller_generator(gen, request)
@@ -109,6 +161,8 @@ class ScaffoldingLlm:
             request.result.set_output(None)
             raise
         finally:
+            current_scope.reset(token)
+            await self._notify_scope_end(scope)
             self.running_req_count -= 1
             self._maybe_schedule()
 
@@ -172,6 +226,17 @@ class ScaffoldingLlm:
         self.main_loop_thread.start()
 
     def generate_async(self, prompt: str) -> ScaffoldingResult:
+        """Submit a prompt for asynchronous scaffolding execution.
+
+        Args:
+            prompt: The user prompt to process.
+
+        Returns:
+            A :class:`ScaffoldingResult` whose ``aresult()`` /
+            ``result()`` methods block until execution completes.
+            The result carries a unique :pyattr:`ScaffoldingResult.id`
+            that workers can read via :data:`current_scope`.
+        """
         result = ScaffoldingResult()
 
         async def put_request():
@@ -180,7 +245,8 @@ class ScaffoldingLlm:
                     prompt=prompt,
                     kwargs={},
                     result=result,
-                    controller=self.prototype_controller.clone())
+                    controller=self.prototype_controller.clone(),
+                )
             except Exception as e:
                 self.task_queue.put(None)
                 print(

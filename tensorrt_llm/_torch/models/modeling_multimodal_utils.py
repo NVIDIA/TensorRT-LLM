@@ -19,7 +19,8 @@
 import functools
 import math
 import os
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
+from typing import (Any, Callable, Dict, List, Optional, Tuple, TypedDict,
+                    Union, cast)
 
 import torch
 import torch.nn.functional as F
@@ -61,6 +62,34 @@ _PROCESSOR_OUTPUT_KEYS = frozenset({
     "second_per_grid_ts",
     "mm_token_type_ids",
 })
+
+
+def _get_cached_merged_typed_dict(schema, cache):
+    """Return a stable copy of ProcessorMixin's ephemeral merged TypedDict.
+
+    `ProcessorMixin._merge_kwargs` creates a fresh
+    `TypedDict("merged_typed_dict", ...)` for image/video kwargs on every
+    processor call. `huggingface_hub` caches strict dataclass validators by
+    schema-object identity, so a fresh type defeats that cache. Reuse an
+    equivalent TypedDict class keyed by (totality, annotation items) so the
+    upstream validator hits cache and skips the recursive type validation.
+    """
+    if getattr(schema, "__name__", None) != "merged_typed_dict":
+        return schema
+    try:
+        cache_key = (getattr(schema, "__total__",
+                             True), tuple(schema.__annotations__.items()))
+        cached_schema = cache.get(cache_key)
+    except TypeError:
+        return schema
+    if cached_schema is None:
+        cached_schema = TypedDict(
+            "merged_typed_dict",
+            dict(schema.__annotations__),
+            total=getattr(schema, "__total__", True),
+        )
+        cache[cache_key] = cached_schema
+    return cached_schema
 
 
 @functools.lru_cache(maxsize=None)
@@ -107,6 +136,7 @@ def _install_processor_output_validation_filter():
             "No transformers module exposes validate_typed_dict; "
             "cannot patch processor output validation.")
     base_orig = binders[0].validate_typed_dict
+    merged_schema_cache: dict = {}
 
     def _filtered_validate(schema, data):
         if isinstance(data, dict):
@@ -114,6 +144,7 @@ def _install_processor_output_validation_filter():
                 k: v
                 for k, v in data.items() if k not in _PROCESSOR_OUTPUT_KEYS
             }
+        schema = _get_cached_merged_typed_dict(schema, merged_schema_cache)
         return base_orig(schema, data)
 
     for b in binders:
@@ -147,13 +178,14 @@ def _get_uncached_multimodal_params(
     return params_to_run
 
 
-def _cache_multimodal_embeddings(
+def _store_chunked_prefill_embeddings(
     multimodal_params: List[MultimodalParams],
     embeddings: List[torch.Tensor],
 ) -> None:
     """
-    Cache computed multimodal embeddings back to multimodal_data to avoid recomputation.
-    Note this function only caches multimodal embeddings within the current request context,
+    Store computed multimodal embeddings back to multimodal_data to avoid recomputation.
+
+    NOTE: this function only stores multimodal embeddings within the current request context,
     mostly for chunked prefill. It does not persist embeddings across different requests or sessions.
     """
     # TODO: support multiple multimodal modalities per request
@@ -236,12 +268,23 @@ def get_multimodal_embeddings(
     if not multimodal_params:
         return []
 
-    # Wait before touching tensors produced on the MM side stream. Do not
-    # clear the event here; repeated stream-side waits are cheap, and leaving
-    # the event field untouched avoids races if a caller accidentally reuses it.
+    # Wait before touching tensors produced on the MM side stream. Do not clear the event here;
+    # repeated stream-side waits are cheap, and leaving the event field untouched avoids races if a
+    # caller accidentally reuses it.
+    # Register attached embeddings with the consumer stream as well: the request drops its Python
+    # references after prefill, potentially before the asynchronous gather below has finished
+    # reading them.
     for param in multimodal_params:
         if param.encoder_event is not None:
-            torch.cuda.current_stream().wait_event(param.encoder_event)
+            consumer_stream = torch.cuda.current_stream()
+            consumer_stream.wait_event(param.encoder_event)
+            embeds = param.multimodal_data.get("multimodal_embedding")
+            if isinstance(embeds, torch.Tensor):
+                embeds = [embeds]
+            if isinstance(embeds, list):
+                for embed in embeds:
+                    if isinstance(embed, torch.Tensor) and embed.is_cuda:
+                        embed.record_stream(consumer_stream)
 
     # Step 1: Find uncached multimodal params that need encoder processing
     uncached_multimodal_params = _get_uncached_multimodal_params(
@@ -276,8 +319,8 @@ def get_multimodal_embeddings(
             return encoder_embeddings
 
         # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
-        _cache_multimodal_embeddings(uncached_multimodal_params,
-                                     encoder_embeddings)
+        _store_chunked_prefill_embeddings(uncached_multimodal_params,
+                                          encoder_embeddings)
 
     # Step 4: Gather all embeddings for the batch
     for param in multimodal_params:
@@ -302,9 +345,11 @@ def get_attached_multimodal_embeddings(
         multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
     """Gather embeddings already stored on MultimodalParams.
 
-    Use this on E/P prefill workers and cached-only paths. The encoder already
-    ran somewhere else. This only makes the tensor list that
-    find_input_mm_embeds slices.
+    Use this on E/P prefill workers and cached-only paths. The encoder already ran somewhere else.
+    This only makes the tensor list that `find_input_mm_embeds` slices.
+
+    Side-stream-prefetched requests must use `get_multimodal_embeddings`, which waits on
+    `encoder_event` and registers attached tensors with the consuming stream before gathering them.
     """
     attached_embeddings = []
     for param in multimodal_params:

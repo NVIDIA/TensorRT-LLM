@@ -15,6 +15,7 @@
 
 import inspect
 import math
+import threading
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
@@ -34,11 +35,11 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
+from ...mmap_utils import advise_tensor_pageout
 from ...utils import (ActivationType, replace_parameter_and_save_metadata,
                       swizzle_sf, unswizzle_sf)
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
-from .moe_load_balancer import advise_tensor_pageout
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -453,6 +454,8 @@ class FusedMoEMethodBase(ABC):
             module.w2_bias.data if module.bias else None, **additional_kargs)
 
         self.load_quant_scales(module, weights)
+        if weights:
+            module._weights_transformed = False
 
         if self.need_load_shared_weights(module):
             local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
@@ -519,7 +522,7 @@ class FusedMoEMethodBase(ABC):
             # before the next layer is loaded. This prevents accumulation of all
             # layers' shared weight tensors in host memory simultaneously.
             # Partial-loading callers (e.g. RLHF reload) instead rely on
-            # ``post_load_weights`` to finalize once the loading sequence ends.
+            # ``transform_weights`` to finalize once the loading sequence ends.
             self._finalize_shared_weights(module)
 
     def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
@@ -538,14 +541,14 @@ class FusedMoEMethodBase(ABC):
         shared memory, then delete the private CPU tensor copies.
 
         Calling this at the end of each layer's ``load_weights`` (rather than
-        deferring to ``post_load_weights``) prevents all layers' CPU tensors
+        deferring to ``transform_weights``) prevents all layers' CPU tensors
         from accumulating in host memory simultaneously.  With fewer GPUs per
         node each rank is responsible for more experts, so the accumulated
         private tensors can easily exceed available host memory.
 
         This method is idempotent: if the per-layer ``local_shared_*`` tensors
         have already been finalized (and deleted), it is a no-op.  This lets
-        ``post_load_weights`` invoke it as a safety net for callers that pass
+        ``transform_weights`` invoke it as a safety net for callers that pass
         ``allow_partial_loading=True`` (e.g. the RLHF reload path), without
         double-finalizing in the eager path.
         """
@@ -572,18 +575,24 @@ class FusedMoEMethodBase(ABC):
         module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
         module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights()
 
-    def post_load_weights(self, module: torch.nn.Module):
+    def transform_weights(self, module: torch.nn.Module) -> None:
         # Safety net for deferred-finalization callers (e.g. RLHF reload, which
         # passes allow_partial_loading=True and so skips the eager per-layer
         # finalization in load_weights).  Idempotent when finalization already
         # ran eagerly.
         self._finalize_shared_weights(module)
+
+    def cache_derived_state(self, module: torch.nn.Module) -> None:
         if hasattr(module,
                    "layer_load_balancer") and module.layer_load_balancer:
             module.layer_load_balancer.set_initial_weight_assignments(
                 module.initial_global_assignments)
         # Re-setup quant scales after loading weights as the tensors may have been modified.
         self.setup_quant_scales(module)
+
+    def post_load_weights(self, module: torch.nn.Module) -> None:
+        self.transform_weights(module)
+        self.cache_derived_state(module)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: List[Dict]):
         pass
@@ -788,10 +797,10 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
                                             module.rebuild_tensor_metadata)
         module._trtllm_gen_layout_transform_pending = False
 
-    def post_load_weights(self, module: torch.nn.Module):
+    def transform_weights(self, module: torch.nn.Module) -> None:
         if getattr(module, "_trtllm_gen_layout_transform_pending", False):
             self.process_weights_after_loading(module)
-        super().post_load_weights(module)
+        super().transform_weights(module)
 
 
 def load_expert_fc31_input_scale_fp8_qdq(w1_input_scale, w3_input_scale,
@@ -1019,8 +1028,8 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         delattr(module, 'tmp_fc31_input_scale')
         delattr(module, 'tmp_fc2_input_scale')
 
-    def post_load_weights(self, module):
-        super().post_load_weights(module)
+    def transform_weights(self, module: torch.nn.Module) -> None:
+        super().transform_weights(module)
 
         # Padding weights to meet FP8 GEMM alignment requirements.
         def _maybe_padding_weights(tensor: torch.Tensor, row_alignment: int,
@@ -1284,11 +1293,11 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                             transformed_shared_w2_scale.cpu())
         super()._prepare_shared_weights_for_finalization(module)
 
-    def post_load_weights(self, module: torch.nn.Module):
-        super().post_load_weights(module)
+    def transform_weights(self, module: torch.nn.Module) -> None:
+        super().transform_weights(module)
 
         if self._needs_e8m0_resmooth():
-            logger.debug("Resmoothing FP8 weights in post_load_weights")
+            logger.debug("Resmoothing FP8 weights in transform_weights")
             resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
                 module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
             module.w3_w1_weight.data.copy_(resmoothed_w3_w1_weight)
@@ -1304,7 +1313,6 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                                                 "w2_weight_scaling_factor",
                                                 transformed_w2_scale,
                                                 module.rebuild_tensor_metadata)
-            self.setup_quant_scales(module)
 
 
 class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
@@ -2087,6 +2095,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     """
     eplb_support_status = EplbSupportStatus.SUPPORTED
 
+    # Whether raw per-expert block-scale staging is an EPLB migration
+    # target. Children that migrate derived formats and free the raw
+    # sources (MegaMoE-CuteDSL) set this False.
+    _eplb_migrate_raw_block_scales = True
+
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
         # Divide by 16 because we use int64 to pack 16 fp4 values
@@ -2640,11 +2653,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             # before register_all_parameter_slot_and_to_fix_weight_fns below.
             self._prepare_shared_weight_scales_for_finalization(module)
             weight_fns = {
-                'w3_w1_weight_scale': module.local_shared_w3_w1_scale_tensors,
-                'w2_weight_scale': module.local_shared_w2_scale_tensors,
                 'fc31_alpha': shared_fc31_alpha,
                 'fc2_alpha': shared_fc2_alpha,
             }
+            if self._eplb_migrate_raw_block_scales:
+                weight_fns['w3_w1_weight_scale'] = (
+                    module.local_shared_w3_w1_scale_tensors)
+                weight_fns['w2_weight_scale'] = (
+                    module.local_shared_w2_scale_tensors)
             if shared_fc31_weight_scale_2 is not None:
                 weight_fns['fc31_weight_scale_2'] = shared_fc31_weight_scale_2
             if shared_fc2_weight_scale_2 is not None:
@@ -2946,7 +2962,7 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     """NVFP4 MoE quantization method for the Marlin backend.
 
     Inherits weight loading from the CUTLASS method, then transforms the loaded
-    weights to Marlin tiled format in ``post_load_weights``.
+    weights to Marlin tiled format in ``transform_weights``.
 
     The Marlin kernel is W4A16 (BF16 activations, no activation quantization),
     so global_scale must be the raw ``weight_scale_2`` — not the CUTLASS alpha
@@ -2954,7 +2970,7 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     raw ``weight_scale_2`` values.
     """
 
-    # Marlin's ``post_load_weights`` repacks weights into Marlin tiled format
+    # Marlin's ``transform_weights`` repacks weights into Marlin tiled format
     # and rebuilds the module parameters, which is incompatible with dynamic
     # EPLB weight migration.
     eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
@@ -2970,12 +2986,12 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         w2_ws2 = w2_weight_scale_2[...].reshape([])
         dst_w2_alpha.copy_(w2_ws2)
 
-    def post_load_weights(self, module):
+    def transform_weights(self, module: torch.nn.Module) -> None:
         """Transform CUTLASS-format NVFP4 weights to Marlin tiled format."""
         from tensorrt_llm.quantization.utils import marlin_utils
 
         # Standard CUTLASS loading (swizzles scales, computes alpha, etc.)
-        super().post_load_weights(module)
+        super().transform_weights(module)
 
         num_experts = module.expert_size_per_partition
         hidden_size = module.hidden_size
@@ -3243,11 +3259,11 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     """NVFP4 quant method for the FlashInfer B12x MoE backend (SM120 / SM121).
 
     Inherits the full CUTLASS NVFP4 weight pipeline (cat + pad +
-    block_scale_interleave + setup_quant_scales) so the backend's
+    block_scale_interleave) so the backend's
     hybrid prefill path can continue to consume the standard CUTLASS
     NVFP4 GroupGEMM layout via the inherited ``CutlassFusedMoE.run_moe``.
 
-    On top of that base layout, ``post_load_weights`` materialises the
+    On top of that base layout, ``transform_weights`` materialises the
     b12x-specific weight tensors: SF un-normalization (multiply per-block
     FP8 scales by ``weight_scale_2 = fc_alpha * fc_input_scale``),
     ``convert_sf_to_mma_layout`` reshape, per-expert ``w*_alpha = 1 /
@@ -3266,11 +3282,12 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         ActivationType.Swiglu: "silu",
     }
 
-    def post_load_weights(self, module: torch.nn.Module):
-        # Base class handles shared-weight finalize, load-balancer init,
-        # and setup_quant_scales. Leaves the standard CUTLASS NVFP4
-        # weight + SF layout in place for the inherited prefill path.
-        super().post_load_weights(module)
+    def transform_weights(self, module: torch.nn.Module) -> None:
+        # Base class handles shared-weight finalization. The cache stage
+        # handles load-balancer assignments and setup_quant_scales.
+        # Leaves the standard CUTLASS NVFP4 weight + SF layout in place
+        # for the inherited prefill path.
+        super().transform_weights(module)
 
         try:
             from flashinfer import B12xMoEWrapper
@@ -3438,20 +3455,21 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
        MegaMoE-format derived tensors, and fills the per-slot
        ``fc1_norm_const`` tensor from each expert's raw ``w2.input_scale``.
 
-    EPLB support is ``SUPPORTED``: dynamic EPLB migrates the four
-    ``mega_fc*_weight*`` derived parameters and per-expert
-    ``fc1_norm_const`` via CPU shared-staging buffers built in
-    :meth:`_build_mega_shared_staging` / :meth:`_build_fc1_norm_const` and
-    registered through :meth:`register_all_parameter_slot_and_to_fix_weight_fns`,
-    in addition to the standard NVFP4 family (``w3_w1_weight`` /
-    ``w2_weight`` / ``w*_weight_scale`` / ``fc*_alpha``) handled by the
-    base / grandparent classes. Slot migration replaces all raw +
-    MegaMoE-derived parameters atomically with byte-consistent values from
-    the source rank (the source built mega = transform(raw) once at
-    load time, so the migrated raw and mega bytes stay paired).
+    EPLB support is ``SUPPORTED`` with DERIVED-ONLY migration (the
+    MegaMoE-DeepGemm pattern): dynamic EPLB migrates the ``mega_fc*``
+    derived parameters and ``fc1_norm_const`` via CPU shared staging, plus
+    the per-expert ``fc*_alpha`` / ``fc*_weight_scale_2`` handled by the
+    NVFP4 parent. The RAW source params are NOT migration targets (see
+    :meth:`_finalize_shared_weights`, ``_eplb_migrate_raw_block_scales``)
+    and are freed unconditionally after packing (``run_moe`` reads only
+    the mega buffers). Dynamic EPLB + hot weight RELOAD is unsupported.
     """
 
     eplb_support_status = EplbSupportStatus.SUPPORTED
+
+    # Raw block scales are freed after packing; migrating them would slice
+    # 0-element placeholders (see class docstring).
+    _eplb_migrate_raw_block_scales = False
 
     # On-device NVFP4 byte formats. Same constants the Cutlass child
     # uses; they describe the NVFP4 weight / FP8 block-scale packing,
@@ -3500,7 +3518,9 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     @classmethod
     def fc1_sf_flat_size(cls, intermediate: int, hidden: int) -> int:
         """``round_up(expand_intermediate, SfPaddingBlock=128) *
-        round_up(ceil(hidden / 16), 4)`` -- matches kernel_fc12.py:880-890.
+        round_up(ceil(hidden / 16), 4)`` -- matches the FC1 weight-SF view
+        in ``kernel_fc12.py`` (``intermediate_gateup_padded`` /
+        ``expected_fc1_weight_sf_cols``).
         ``expand_intermediate = 2 * intermediate``.
         """
         expand_intermediate = intermediate * 2
@@ -3510,10 +3530,24 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     @classmethod
     def fc2_sf_flat_size(cls, hidden: int, intermediate: int) -> int:
         """``round_up(hidden, SfPaddingBlock=128) *
-        round_up(ceil(intermediate / 16), 4)`` -- matches runner_fc12.py:1305.
+        round_up(ceil(intermediate / 16), 4)`` -- matches the FC2 weight-SF
+        view in ``kernel_fc12.py`` (``hidden_padded_fc2`` /
+        ``expected_fc2_weight_sf_cols``).
         """
         return (cls._round_up_int(hidden, 128) *
                 cls._round_up_int(cls._ceil_div_int(intermediate, 16), 4))
+
+    # Source-checkpoint tensors kept as 0-element placeholders outside the
+    # load window so the full source set and the mega buffers never coexist
+    # (streaming load: peak = steady set + ONE layer of sources).
+    _STREAMED_SOURCE_PARAMS = ("w3_w1_weight", "w3_w1_weight_scale",
+                               "w2_weight", "w2_weight_scale")
+
+    # Serializes the transient source-set window (materialize -> load ->
+    # eager finalize) across MODULES: the generic loader runs module loads
+    # on a ThreadPoolExecutor, and concurrent windows would break the
+    # "peak = steady set + ONE layer" bound. Class-level on purpose.
+    _streamed_transient_lock = threading.Lock()
 
     # -----------------------------------------------------------------
     # create_weights: register MegaMoE-format parameters in addition to
@@ -3537,6 +3571,12 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                 f"got expand_intermediate="
                 f"{module.expand_intermediate_size_per_partition}, "
                 f"intermediate={module.intermediate_size_per_partition}.")
+        # Fail fast: the derived-only EPLB migration path registers no bias
+        # staging.
+        if module.bias and self.need_load_shared_weights(module):
+            raise NotImplementedError(
+                "NVFP4MegaMoECuteDslMethod does not support expert bias "
+                "together with dynamic-EPLB shared weight loading.")
 
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
         self.block_scales_vec_size = torch.iinfo(
@@ -3551,6 +3591,21 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         super().create_weights(module, self.weight_dtype, weight_vec_size,
                                self.block_scales_dtype,
                                self.block_scales_vec_size)
+
+        # Streaming load: shrink the source params to 0-element placeholders
+        # (full shapes preserved in rebuild_tensor_metadata); load_weights
+        # rematerializes one module at a time. Otherwise init materializes
+        # the full source set AND the mega buffers (~229 GB/rank).
+        for _name in self._STREAMED_SOURCE_PARAMS:
+            _p = getattr(module, _name)
+            replace_parameter_and_save_metadata(
+                module, _name,
+                nn.Parameter(torch.empty(0, dtype=_p.dtype),
+                             requires_grad=False),
+                module.rebuild_tensor_metadata)
+        # Rebind quant_scales to the placeholders so the full-size CPU
+        # init tensors are actually released.
+        self.setup_quant_scales(module)
 
         num_local_slots = module.expert_size_per_partition
         hidden = module.hidden_size
@@ -3616,6 +3671,55 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         )
         module.register_parameter("fc1_norm_const", fc1_norm_const)
 
+    def _materialize_source_params(self, module: torch.nn.Module):
+        """Rematerialize this module's streamed source params (full shape)
+        so the loader can fill them; no-op when already materialized.
+        """
+        for name in self._STREAMED_SOURCE_PARAMS:
+            p = getattr(module, name, None)
+            if (p is not None and p.data.numel() == 0
+                    and name in module.rebuild_tensor_metadata):
+                meta = module.rebuild_tensor_metadata[name]['meta']
+                module.register_parameter(
+                    name,
+                    nn.Parameter(torch.empty_like(meta, device="cuda"),
+                                 requires_grad=False))
+
+    def _finalize_shared_weights(self, module: torch.nn.Module):
+        # Derived-only EPLB migration: skip the base raw-weight
+        # registration -- the balancer would IndexError slicing the freed
+        # 0-element raw placeholders (see class docstring).
+        if not self.need_load_shared_weights(module):
+            return
+        if not hasattr(module, 'local_shared_w3_w1_tensors'):
+            # Already finalized (idempotent, mirroring the base contract).
+            return
+        if module.bias:
+            raise ValueError(
+                "MegaMoE-CuteDSL EPLB shared loading does not support "
+                "expert bias.")
+        delattr(module, 'local_shared_w3_w1_tensors')
+        delattr(module, 'local_shared_w2_tensors')
+        module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights()
+
+    def load_weights(self,
+                     module: torch.nn.Module,
+                     weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     allow_partial_loading: bool = False):
+        if allow_partial_loading:
+            raise NotImplementedError(
+                "MegaMoE-CuteDSL only supports full initial weight loading.")
+
+        # The transient source-set window is serialized across modules
+        # (_streamed_transient_lock).
+        with NVFP4MegaMoECuteDslMethod._streamed_transient_lock:
+            self._materialize_source_params(module)
+            super().load_weights(module,
+                                 weights,
+                                 weight_loading_mode,
+                                 allow_partial_loading=allow_partial_loading)
+
     # -----------------------------------------------------------------
     # Loader overrides (4x @abstractmethod hooks on the grandparent).
     # Each one stashes the raw checkpoint shard in a tmp dict keyed by
@@ -3630,23 +3734,18 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                                  dst_w3_w1_weight: torch.Tensor,
                                  allow_partial_loading: bool = False,
                                  expert_idx: int = -1):
-        if not allow_partial_loading:
-            assert w1_weight is not None and w3_weight is not None
-        if w1_weight is None and w3_weight is None:
-            return
+        assert w1_weight is not None and w3_weight is not None
         device = dst_w3_w1_weight.device
-        w1_weight_shard = load_weight_shard(
-            w1_weight,
-            module.tp_size,
-            module.tp_rank,
-            TensorParallelMode.COLUMN,
-            device=device) if w1_weight is not None else None
-        w3_weight_shard = load_weight_shard(
-            w3_weight,
-            module.tp_size,
-            module.tp_rank,
-            TensorParallelMode.COLUMN,
-            device=device) if w3_weight is not None else None
+        w1_weight_shard = load_weight_shard(w1_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+        w3_weight_shard = load_weight_shard(w3_weight,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
 
         if not hasattr(module, 'tmp_cutlass_w3_w1_weights'):
             module.tmp_cutlass_w3_w1_weights = {}
@@ -3655,22 +3754,17 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         dict_key = (dst_base, expert_idx)
         expert_entry = module.tmp_cutlass_w3_w1_weights.setdefault(dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight
-        if w1_weight_shard is not None:
-            expert_entry['w1'] = w1_weight_shard.contiguous().view(
-                dst_w3_w1_weight.dtype)
-        if w3_weight_shard is not None:
-            expert_entry['w3'] = w3_weight_shard.contiguous().view(
-                dst_w3_w1_weight.dtype)
+        expert_entry['w1'] = w1_weight_shard.contiguous().view(
+            dst_w3_w1_weight.dtype)
+        expert_entry['w3'] = w3_weight_shard.contiguous().view(
+            dst_w3_w1_weight.dtype)
 
     def load_expert_w2_weight(self,
                               module: torch.nn.Module,
                               w2_weight: torch.Tensor,
                               dst_w2_weight: torch.Tensor,
                               allow_partial_loading: bool = False):
-        if not allow_partial_loading:
-            assert w2_weight is not None
-        if w2_weight is None:
-            return
+        assert w2_weight is not None
         device = dst_w2_weight.device
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
@@ -3682,6 +3776,9 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         cast_w2_weight_shard = self._maybe_padding_shape(
             cast_w2_weight_shard, dst_w2_weight)
         dst_w2_weight.copy_(cast_w2_weight_shard, non_blocking=True)
+        if not hasattr(module, '_streamed_w2_covered'):
+            module._streamed_w2_covered = set()
+        module._streamed_w2_covered.add(dst_w2_weight.data_ptr())
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self,
@@ -3691,18 +3788,16 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             dst_w3_w1_weight_scale: torch.Tensor,
             expert_idx: int = -1):
         device = dst_w3_w1_weight_scale.device
-        w1_weight_scale = load_weight_shard(
-            w1_weight_scale,
-            module.tp_size,
-            module.tp_rank,
-            TensorParallelMode.COLUMN,
-            device=device) if w1_weight_scale is not None else None
-        w3_weight_scale = load_weight_shard(
-            w3_weight_scale,
-            module.tp_size,
-            module.tp_rank,
-            TensorParallelMode.COLUMN,
-            device=device) if w3_weight_scale is not None else None
+        w1_weight_scale = load_weight_shard(w1_weight_scale,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
+        w3_weight_scale = load_weight_shard(w3_weight_scale,
+                                            module.tp_size,
+                                            module.tp_rank,
+                                            TensorParallelMode.COLUMN,
+                                            device=device)
 
         if not hasattr(module, 'tmp_cutlass_w3_w1_weight_scales'):
             module.tmp_cutlass_w3_w1_weight_scales = {}
@@ -3712,12 +3807,10 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         expert_entry = module.tmp_cutlass_w3_w1_weight_scales.setdefault(
             dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight_scale
-        if w3_weight_scale is not None:
-            expert_entry['w3'] = w3_weight_scale.contiguous().view(
-                dst_w3_w1_weight_scale.dtype)
-        if w1_weight_scale is not None:
-            expert_entry['w1'] = w1_weight_scale.contiguous().view(
-                dst_w3_w1_weight_scale.dtype)
+        expert_entry['w3'] = w3_weight_scale.contiguous().view(
+            dst_w3_w1_weight_scale.dtype)
+        expert_entry['w1'] = w1_weight_scale.contiguous().view(
+            dst_w3_w1_weight_scale.dtype)
 
     def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
                                           w2_weight_scale: torch.Tensor,
@@ -3742,6 +3835,9 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         cast_w2_weight_scale = self._maybe_padding_shape(
             cast_w2_weight_scale, dst_w2_weight_scale)
         dst_w2_weight_scale.copy_(cast_w2_weight_scale)
+        if not hasattr(module, '_streamed_w2_scale_covered'):
+            module._streamed_w2_scale_covered = set()
+        module._streamed_w2_scale_covered.add(dst_w2_weight_scale.data_ptr())
 
     @staticmethod
     def _maybe_padding_shape(source_tensor: torch.Tensor,
@@ -3773,7 +3869,111 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     # mega-format CPU staging with the load balancer. ``fc1_norm_const`` is
     # built before the parent deletes raw input-scale staging.
     # -----------------------------------------------------------------
+    def _streamed_coverage(self, module: torch.nn.Module) -> Dict[str, int]:
+        """Per-component count of routed local experts that received data.
+        A w3_w1 stash entry counts only when BOTH halves arrived; the
+        direct-copy w2 paths are tracked via row-pointer sets. Routed
+        slots are told apart from EPLB shared staging by storage base.
+        """
+
+        def _stash_covered(stash_name: str, param) -> int:
+            base = param.data.storage().data_ptr()
+            stash = getattr(module, stash_name, {})
+            return sum(1 for (b, _idx), e in stash.items()
+                       if b == base and 'w1' in e and 'w3' in e)
+
+        def _rows_covered(set_name: str, param) -> int:
+            # Tensor (not storage) base: the recorded row addresses came
+            # from ``dst.data_ptr()`` of slices of this tensor.
+            base = param.data.data_ptr()
+            end = base + param.data.numel() * param.data.element_size()
+            ptrs = getattr(module, set_name, ())
+            return sum(1 for p in ptrs if base <= p < end)
+
+        return {
+            'w3_w1_weight':
+            _stash_covered('tmp_cutlass_w3_w1_weights', module.w3_w1_weight),
+            'w3_w1_weight_scale':
+            _stash_covered('tmp_cutlass_w3_w1_weight_scales',
+                           module.w3_w1_weight_scale),
+            'w2_weight':
+            _rows_covered('_streamed_w2_covered', module.w2_weight),
+            'w2_weight_scale':
+            _rows_covered('_streamed_w2_scale_covered', module.w2_weight_scale),
+        }
+
+    def _check_initial_aux_scale_coverage(self,
+                                          module: torch.nn.Module) -> None:
+        """Reject partially populated NVFP4 auxiliary-scale families."""
+        n_slots = module.expert_size_per_partition
+        n_experts = module.num_experts
+        weight_scale_2 = getattr(module, 'tmp_weight_scale_2', None) or {}
+        raw_input_scales = getattr(module, 'tmp_raw_input_scales', None) or {}
+
+        families = {
+            'weight_scale_2': (
+                sum(1 for entry in weight_scale_2.values() if entry),
+                sum(1 for entry in weight_scale_2.values()
+                    if {'w1', 'w3', 'w2'} <= set(entry)),
+                n_slots,
+            ),
+            'w1/w3 input_scale': (
+                sum(1 for entry in raw_input_scales.values()
+                    if 'w1' in entry or 'w3' in entry),
+                sum(1 for entry in raw_input_scales.values()
+                    if 'w1' in entry and 'w3' in entry),
+                n_experts,
+            ),
+            'w2 input_scale': (
+                sum(1 for entry in raw_input_scales.values() if 'w2' in entry),
+                sum(1 for entry in raw_input_scales.values() if 'w2' in entry),
+                n_experts,
+            ),
+        }
+        incomplete = {
+            name: (complete, required)
+            for name, (present, complete, required) in families.items()
+            if present and complete < required
+        }
+        if incomplete:
+            raise RuntimeError(
+                "MegaMoE-CuteDSL initial load delivered partial auxiliary "
+                "scale families: " +
+                ", ".join(f"{name}={complete}/{required}"
+                          for name, (complete, required) in incomplete.items()))
+
+        has_weight_scale_2 = families['weight_scale_2'][0] > 0
+        has_input_scale = (families['w1/w3 input_scale'][0] > 0
+                           or families['w2 input_scale'][0] > 0)
+        if has_input_scale and not has_weight_scale_2:
+            raise RuntimeError(
+                "MegaMoE-CuteDSL initial load provided input_scale without "
+                "weight_scale_2; both are required to derive expert alphas.")
+        if has_weight_scale_2 and not families['w2 input_scale'][0]:
+            raise RuntimeError(
+                "MegaMoE-CuteDSL initial load provided weight_scale_2 without "
+                "w2 input_scale; both are required to derive fc2 alpha.")
+
     def process_weights_after_loading(self, module: torch.nn.Module):
+        if module.w3_w1_weight.data.numel() == 0:
+            return
+
+        n_slots = module.expert_size_per_partition
+        coverage = self._streamed_coverage(module)
+        incomplete = {k: v for k, v in coverage.items() if v < n_slots}
+        if incomplete:
+            raise RuntimeError(
+                "MegaMoE-CuteDSL initial load left source components "
+                f"partially covered ({n_slots} local experts required per "
+                "component): " + ", ".join(f"{k}={v}/{n_slots}"
+                                           for k, v in incomplete.items()) +
+                ". The uncovered rows are uninitialized; full initial "
+                "loading must provide w1+w3+w2 weights and block scales for "
+                "every local expert.")
+        self._check_initial_aux_scale_coverage(module)
+        for attr in ('_streamed_w2_covered', '_streamed_w2_scale_covered'):
+            if hasattr(module, attr):
+                delattr(module, attr)
         # ---- Cat raw w3+w1 weights ----
         # Iterates BOTH routed (module.w3_w1_weight.data) and shared
         # (module.local_shared_w3_w1_tensors) entries: the loader keys
@@ -3842,6 +4042,31 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         if self.need_load_shared_weights(module):
             self._register_mega_shared_staging(module)
 
+        # ---- Release the now-dead source NVFP4 routed weights ----
+        # run_moe reads only the mega buffers, and EPLB migration targets
+        # are mega-format too (see class docstring), so the raw set is
+        # freed unconditionally. Rebinding quant_scales inside the shrink
+        # matters: otherwise every layer's freed source scales (~11 GB/rank)
+        # stay reachable until the model-wide sweep rebinds them.
+        self._shrink_streamed_source_params(module)
+
+    def _shrink_streamed_source_params(self, module: torch.nn.Module):
+        """Re-shrink materialized streamed sources to 0-element placeholders
+        and rebind quant_scales to them. Idempotent.
+        """
+        for _name in self._STREAMED_SOURCE_PARAMS:
+            _p = getattr(module, _name, None)
+            if _p is not None and _p.data.numel() > 0:
+                # On repeat calls replace_parameter_and_save_metadata
+                # re-registers the ORIGINAL saved placeholder; the device
+                # of the tensor passed here is effectively ignored.
+                replace_parameter_and_save_metadata(
+                    module, _name,
+                    nn.Parameter(torch.empty(0, dtype=_p.data.dtype),
+                                 requires_grad=False),
+                    module.rebuild_tensor_metadata)
+        self.setup_quant_scales(module)
+
     @staticmethod
     def _build_fc1_norm_const_tensor(raw_input_scales: Dict,
                                      expert_ids: List[int],
@@ -3878,6 +4103,10 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             scalar = module.fc2_input_scale.data.reshape(()).to(torch.float32)
             module.fc1_norm_const.data.copy_(
                 scalar.expand(num_local_slots).contiguous())
+            return
+        if not any('w2' in e for e in raw_input_scales.values()):
+            # Weights-only reload: the stash exists but carries no w2 input
+            # scales; keep the previously built values.
             return
 
         routed_norm_const = self._build_fc1_norm_const_tensor(
@@ -4053,12 +4282,18 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         mega_fc2_weight_sf}`` via :meth:`_build_mega_format_buffers`
         (the transform pipeline itself).
         """
+
+        # CPU-staged reload sources: upload ONE layer transiently so the
+        # pack pipeline runs on GPU (see _materialize_source_params).
+        def _on_cuda(t: torch.Tensor) -> torch.Tensor:
+            return t if t.is_cuda else t.cuda()
+
         mega_fc1, mega_fc1_sf, mega_fc2, mega_fc2_sf = (
             self._build_mega_format_buffers(
-                raw_w3_w1=module.w3_w1_weight.data,
-                raw_w3_w1_sf=module.w3_w1_weight_scale.data,
-                raw_w2=module.w2_weight.data,
-                raw_w2_sf=module.w2_weight_scale.data,
+                raw_w3_w1=_on_cuda(module.w3_w1_weight.data),
+                raw_w3_w1_sf=_on_cuda(module.w3_w1_weight_scale.data),
+                raw_w2=_on_cuda(module.w2_weight.data),
+                raw_w2_sf=_on_cuda(module.w2_weight_scale.data),
                 num_slots=module.expert_size_per_partition,
                 intermediate=module.intermediate_size_per_partition,
                 hidden=module.hidden_size,
@@ -4955,24 +5190,17 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
     def process_weights_after_loading(self,
                                       module: torch.nn.Module,
                                       num_elts_per_sf: int = 16):
-        # Call parent to compute global input scales, alphas, and fc31_scale_c first
         super().process_weights_after_loading(module,
                                               num_elts_per_sf=num_elts_per_sf)
 
-        # Normalize biases to account for the global scale factors,
-        # matching the kernel's expectation (similar to test_moe.py logic).
-        # This must happen after alphas are finalized.
+        # Cubin clamp / GLU bias inputs are consumed in the pre-dequant GEMM
+        # output domain (i.e. divided by fc31_alpha / fc2_alpha).
         if module.w3_w1_bias is not None:
-            # gemm1_bias * gemm1_scales_global * hidden_states_scale_global
             module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
-
         if module.w2_bias is not None:
-            # gemm2_bias * c_global_sf * gemm2_scales_global
             module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
-
         if module.swiglu_beta is not None:
             module.swiglu_beta.data.div_((module.fc31_alpha.data))
-
         if module.swiglu_limit is not None:
             module.swiglu_limit.data.div_((module.fc31_alpha.data))
 
@@ -5662,8 +5890,8 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
 
-    def post_load_weights(self, module: torch.nn.Module):
-        super().post_load_weights(module)
+    def cache_derived_state(self, module: torch.nn.Module) -> None:
+        super().cache_derived_state(module)
         # Create a proxy weight of unpadded size; dtype does not matter
         w1_weight = torch.empty([module.intermediate_size, module.hidden_size])
         # Calculate alignment
@@ -6254,7 +6482,7 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
         # ``initial_local_expert_ids`` which already populate the device
         # weight tensors above). We allocate matching CPU tensors with the
         # same per-expert shape/dtype as the device weights and load the
-        # same MXFP4 byte layout into them. ``post_load_weights`` will later
+        # same MXFP4 byte layout into them. ``transform_weights`` will later
         # transform these into DG-required form and register them with the
         # host_tensor_sharer so peer ranks can read them during migration.
         # The CPU staging is required because EPLB's host_tensor_sharer
@@ -6292,7 +6520,25 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
                 module.local_shared_w2_scale_tensors,
             )
 
+        self._clear_transformed_weight_cache(module)
+        module._weights_transformed = False
         module._weights_loaded = True
+
+    @staticmethod
+    def _clear_transformed_weight_cache(module: torch.nn.Module) -> None:
+        """Drop DG-derived tensors so fresh raw weights rebuild the native layout."""
+        for attr in (
+                "_t_l1",
+                "_t_l2",
+                "_t_l1_weight",
+                "_t_l1_scale",
+                "_t_l1_scale_slot",
+                "_t_l2_weight",
+                "_t_l2_scale",
+                "_t_l2_scale_slot",
+        ):
+            if hasattr(module, attr):
+                setattr(module, attr, None)
 
     def _transform_weights_for_mega_moe(
         self,
@@ -6345,24 +6591,26 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
         return dg.transform_weights_for_mega_moe((l1_weight, l1_sf),
                                                  (l2_weight, l2_sf))
 
-    def post_load_weights(self, module: torch.nn.Module) -> None:
+    def transform_weights(self, module: torch.nn.Module) -> None:
         """Transform loaded MXFP4 weights into DG-native form.
 
         Pipeline (each step is independent and idempotent on its own guard):
           1. ``_transform_main_weights`` - DG-form L1/L2 + EPLB-friendly slot views
           2. ``_setup_shared_weights_for_eplb`` - host-side shared copies for dynamic EPLB
-          3. ``_attach_initial_weight_assignments`` - tell load_balancer the initial layout
 
         The NVLink SymmBuffer (forward-time activation workspace, not
-        weight storage) is allocated by ``MegaMoEDeepGemm.__init__`` itself
-        because that is the build-time lockstep window where the
-        ``symm_mem.rendezvous`` collective is safe; see
+        weight storage) is allocated by ``MegaMoEDeepGemm.cache_derived_state``
+        so the rendezvous runs after MetaInitMode and for GMS RO readers; see
         ``MegaMoEDeepGemm._alloc_symm_buffer``.
         """
-        assert module._weights_loaded, "post_load_weights before load_weights"
+        assert module._weights_loaded, "transform_weights before load_weights"
+        if module.num_slots % module.ep_size != 0:
+            raise ValueError(
+                f"MegaMoEDeepGemm requires num_slots ({module.num_slots}) "
+                f"divisible by ep_size ({module.ep_size}). Adjust the EPLB "
+                f"replication factor or ep_size.")
         self._transform_main_weights(module)
         self._setup_shared_weights_for_eplb(module)
-        self._attach_initial_weight_assignments(module)
 
     def _transform_main_weights(self, module: torch.nn.Module) -> None:
         """Build DG-form ``_t_l1`` / ``_t_l2`` and EPLB-friendly slot views.
@@ -6505,11 +6753,3 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
         ):
             delattr(module, attr)
         module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights()
-
-    @staticmethod
-    def _attach_initial_weight_assignments(module: torch.nn.Module) -> None:
-        """Hand the initial expert->slot assignments to the load balancer."""
-        if hasattr(module,
-                   "layer_load_balancer") and module.layer_load_balancer:
-            module.layer_load_balancer.set_initial_weight_assignments(
-                module.initial_global_assignments)

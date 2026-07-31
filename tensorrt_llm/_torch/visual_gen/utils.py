@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -55,7 +55,7 @@ class SequenceSharder:
     uniformly for sequence parallelism (CP × Ulysses).
 
     Models call ``shard(...)`` / ``gather(...)`` / ``shard_rope(...)`` directly;
-    when the sharder is inactive (``size == 1`` or runtime-disabled) every
+    when the sharder is inactive (``size == 1``) every
     method is a no-op pass-through so the call sites do not need an
     ``if is_active`` guard.
 
@@ -65,11 +65,25 @@ class SequenceSharder:
     seq axis from a ``seq_len`` argument).
     """
 
-    def __init__(self, size: int, rank: int, group: Optional[ProcessGroup]):
+    def __init__(
+        self,
+        size: int,
+        rank: int,
+        group: Optional[ProcessGroup],
+        gather_index: Optional[List[int]] = None,
+    ):
         self._size = size
         self._rank = rank
         self._group = group
-        self._enabled = size > 1
+        # Optional shard-order permutation: gather_index[s] = the GROUP rank that
+        # holds shard s. Needed when shard indices don't follow group-rank order
+        # (dist.new_group sorts its rank list, so a group built from a permuted
+        # rank list still numbers members by ascending global rank).
+        if gather_index is not None and sorted(gather_index) != list(range(size)):
+            raise ValueError(
+                f"gather_index must be a permutation of range({size}), got {gather_index}"
+            )
+        self._gather_index = gather_index
 
     # ------------------------------------------------------------------
     # Factory
@@ -122,7 +136,7 @@ class SequenceSharder:
     # ------------------------------------------------------------------
     @property
     def is_active(self) -> bool:
-        return self._enabled and self._size > 1
+        return self._size > 1
 
     @property
     def size(self) -> int:
@@ -135,18 +149,6 @@ class SequenceSharder:
     @property
     def group(self) -> Optional[ProcessGroup]:
         return self._group
-
-    def disable(self) -> None:
-        """Run as if ``size == 1``.
-
-        Used by LTX2's stage-2 single-rank execution path where the
-        non-primary workers have already exited.
-        """
-        self._enabled = False
-
-    def enable(self) -> None:
-        """Re-enable sharding after :meth:`disable` (no-op if size == 1)."""
-        self._enabled = self._size > 1
 
     # ------------------------------------------------------------------
     # Shard
@@ -162,7 +164,7 @@ class SequenceSharder:
         """Contiguous block-shard ``tensor`` along ``dim``.
 
         Returns ``tensor`` unchanged when:
-          * the sharder is inactive (``size == 1`` or runtime-disabled),
+          * the sharder is inactive (``size == 1``),
           * ``tensor is None``,
           * ``expected_seq_len`` is given and ``tensor.shape[dim]`` doesn't
             match — used by LTX2 to skip dataclass fields whose seq axis
@@ -249,6 +251,8 @@ class SequenceSharder:
         tensor = tensor.contiguous()
         parts = [torch.empty_like(tensor) for _ in range(self._size)]
         dist.all_gather(parts, tensor, group=self._group)
+        if self._gather_index is not None:
+            parts = [parts[g] for g in self._gather_index]
         out = torch.cat(parts, dim=dim)
 
         if unpad_to is not None:

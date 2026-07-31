@@ -147,6 +147,12 @@ def test_get_stats_raises_on_encoder_only(bert_encode_llm):
         bert_encode_llm.get_stats()
 
 
+def test_get_kv_cache_capacity_raises_on_encoder_only(bert_encode_llm):
+    """get_kv_cache_capacity() raises RuntimeError when encode_only=True."""
+    with pytest.raises(RuntimeError, match="encode_only=True"):
+        bert_encode_llm.get_kv_cache_capacity()
+
+
 # --------------------------------------------------------------------------- #
 # Batch tokenization (Triton pattern)
 # --------------------------------------------------------------------------- #

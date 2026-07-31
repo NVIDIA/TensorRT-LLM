@@ -277,12 +277,14 @@ class DiffusionExecutor:
         visual_gen_args: "VisualGenArgs",
         req_hmac_key: Optional[bytes] = None,
         resp_hmac_key: Optional[bytes] = None,
+        in_client_process: bool = False,
     ):
         self.request_queue_addr = request_queue_addr
         self.response_queue_addr = response_queue_addr
         self.device_id = device_id
         self.visual_gen_args = visual_gen_args
         self.resp_hmac_key = resp_hmac_key
+        self.in_client_process = in_client_process
 
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
@@ -435,6 +437,9 @@ class DiffusionExecutor:
             output = self.pipeline.infer(req)
             generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
+                # CUDA IPC handles are invalid within the producing process, so
+                # a same-process client takes the media via in-process handoff.
+                output.to_handle(local=self.in_client_process)
                 self.response_queue.put(
                     DiffusionResponse(
                         request_id=req.request_id,
@@ -463,8 +468,14 @@ def run_diffusion_worker(
     req_hmac_key: Optional[bytes] = None,
     resp_hmac_key: Optional[bytes] = None,
     local_rank: Optional[int] = None,
+    in_client_process: bool = False,
 ):
-    """Entry point for worker process."""
+    """Entry point for worker process.
+
+    ``in_client_process``: True only when this worker runs inside the client
+    process. Declared by the launch site — never derive it from the
+    environment here, the env writes below make every worker look external.
+    """
     try:
         # Set log level before any other work so loading logs are visible
         logger.set_level(log_level)
@@ -498,6 +509,19 @@ def run_diffusion_worker(
                     f"performance."
                 )
 
+        # NCCL_NVLS_ENABLE=0 is required to prevent a hang on Blackwell when
+        # VSA (CuTeDSL) + Ulysses is active
+        if torch.cuda.is_available() and visual_gen_args is not None:
+            _attn = visual_gen_args.attention_config
+            _sa = getattr(_attn, "sparse_attention_config", None)
+            _is_vsa = (
+                getattr(_attn, "backend", "") == "CUTEDSL"
+                and getattr(_sa, "algorithm", "") == "vsa"
+            )
+            _has_ulysses = getattr(visual_gen_args.parallel_config, "ulysses_size", 1) > 1
+            if _is_vsa and _has_ulysses:
+                os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+
         dist.init_process_group(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
             init_method="env://",
@@ -513,6 +537,7 @@ def run_diffusion_worker(
             visual_gen_args=visual_gen_args,
             req_hmac_key=req_hmac_key,
             resp_hmac_key=resp_hmac_key,
+            in_client_process=in_client_process,
         )
         executor.serve_forever()
         if executor.pipeline is not None:
@@ -673,6 +698,7 @@ class DiffusionRemoteClient:
                     "resp_hmac_key": self.resp_hmac_key,
                     "log_level": logger.level,
                     "local_rank": local_rank,
+                    "in_client_process": True,
                 },
                 daemon=True,
             )
@@ -812,6 +838,9 @@ class DiffusionRemoteClient:
                 if isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
                         logger.info("DiffusionClient: Received READY signal")
+
+                    if isinstance(response.output, PipelineOutput):
+                        response.output.to_tensor()
 
                     # Schedule the lock acquisition and event setting in the event loop
                     asyncio.run_coroutine_threadsafe(

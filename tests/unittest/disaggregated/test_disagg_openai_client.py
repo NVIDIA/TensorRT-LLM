@@ -376,7 +376,11 @@ class TestDisaggIdRegenOnRetry:
     async def test_retry_regenerates_disagg_id(self):
         session = AsyncMock(spec=aiohttp.ClientSession)
         ids = iter(range(1000, 2000))
-        client = self._make_client(session, disagg_id_generator=lambda: next(ids))
+
+        async def next_id():
+            return next(ids)
+
+        client = self._make_client(session, disagg_id_generator=next_id)
 
         session.post.side_effect = [
             aiohttp.ClientError("transient"),

@@ -15,7 +15,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -33,6 +33,27 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+# Some Cosmos3OmniTransformer checkpoint configs omit these fields; the values
+# match what other conversions carry explicitly.
+PRETRAINED_CONFIG_COMPAT_DEFAULTS = {
+    "position_embedding_type": "unified_3d_mrope",
+    "max_position_embeddings": 262144,
+    "temporal_compression_factor_sound": 1,
+}
+
+
+_PretrainedConfigT = TypeVar("_PretrainedConfigT")
+
+
+def apply_pretrained_config_compat_defaults(
+    pretrained_config: _PretrainedConfigT,
+) -> _PretrainedConfigT:
+    """Fill missing schema fields in place (idempotent); returns the config."""
+    for key, value in PRETRAINED_CONFIG_COMPAT_DEFAULTS.items():
+        if getattr(pretrained_config, key, None) is None:
+            setattr(pretrained_config, key, value)
+    return pretrained_config
 
 
 class Qwen3VLTextRMSNorm(nn.Module):
@@ -702,7 +723,7 @@ class Cosmos3LanguageModel(nn.Module):
 class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__(model_config)
-        pretrained_config = model_config.pretrained_config
+        pretrained_config = apply_pretrained_config_compat_defaults(model_config.pretrained_config)
         self.audio_gen = getattr(pretrained_config, "sound_gen", False)
         self.action_gen = getattr(pretrained_config, "action_gen", False)
 
@@ -972,7 +993,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self,
         hidden_states: torch.Tensor,
         timestep: Optional[torch.Tensor] = None,
-        attention_timestep: Optional[torch.Tensor] = None,
+        raw_timestep: Optional[torch.Tensor] = None,
         text_ids: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
         video_shape: Optional[Tuple[int, int, int]] = None,
@@ -986,9 +1007,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         Args:
             hidden_states: [B, C, T, H, W] noisy latents
-            timestep: Raw scheduler diffusion timestep, shape [B]
-            attention_timestep: Normalized diffusion timestep in [0, 1], shape [B],
-                for attention backends that use timestep-dependent behavior.
+            timestep: Normalized diffusion timestep in [0, 1], shape [B].
+            raw_timestep: Raw scheduler diffusion timestep, shape [B], used by
+                the Cosmos3 time embedding path.
             text_ids: [B, S_text] tokenized text input
             text_mask: [B, S_text] attention mask for text (1=real, 0=pad)
             video_shape: (T, H, W) in latent space
@@ -1009,6 +1030,10 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             provided; otherwise None.  action is always None for now.
         """
         del kwargs  # Kept for diffusers API compatibility.
+        if timestep is None:
+            raise ValueError("Cosmos3VFMTransformer.forward requires normalized timestep.")
+        if raw_timestep is None:
+            raise ValueError("Cosmos3VFMTransformer.forward requires raw_timestep.")
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
         max_real_len = text_mask.sum(dim=1).max().item()
@@ -1017,7 +1042,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
 
         with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-            time_embed = self.time_embedder((timestep * self.timestep_scale))
+            time_embed = self.time_embedder((raw_timestep * self.timestep_scale))
         time_embed = time_embed.to(hidden_states.dtype)
 
         if noisy_frame_mask is not None:
@@ -1048,7 +1073,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 text_ids,
                 text_mask,
                 freqs_und,
-                timestep=attention_timestep,
+                timestep=timestep,
             )
             self.cached_freqs_gen = freqs_gen
 
@@ -1114,7 +1139,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     k_und,
                     v_und,
                     freqs_gen,
-                    timestep=attention_timestep,
+                    timestep=timestep,
                     real_text_lens=real_text_lens,
                 )
             else:
@@ -1123,7 +1148,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     k_und,
                     v_und,
                     freqs_gen,
-                    timestep=attention_timestep,
+                    timestep=timestep,
                 )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)

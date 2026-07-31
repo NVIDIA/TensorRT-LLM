@@ -301,6 +301,12 @@ models:
         default: null
         status: prototype
         required: false
+      priority:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
+        required: false
 
   CompletionResponseChoice:
     fields:
@@ -501,6 +507,12 @@ models:
         type: Optional[List[int]]
         default: null
         status: stable
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
         required: false
       model:
         kind: openai
@@ -796,6 +808,12 @@ models:
         default: null
         status: beta
         required: false
+      priority:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionResponseChoice:
     fields:
@@ -891,6 +909,12 @@ models:
         type: Optional[List[int]]
         default: null
         status: stable
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
         required: false
 
   ChatCompletionResponseStreamChoice:
