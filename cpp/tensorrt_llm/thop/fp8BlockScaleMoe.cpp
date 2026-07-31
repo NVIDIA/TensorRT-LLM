@@ -417,7 +417,13 @@ class FP8BlockScaleMoeRunner : public torch::CustomClassHolder
 
 public:
     explicit FP8BlockScaleMoeRunner()
-        : mSupportedTileN{8, 16, 32, 64, 128}
+        // tileN=8 is excluded: every DeepSeek-FP8 GEMM2 cubin at that tile faults with
+        // cudaErrorIllegalAddress in its epilogue store on sm100f/sm103, so the tile size is
+        // broken rather than a single cubin (https://nvbugs/6525059). Dropping it here rather
+        // than in TrtllmGenBatchedGemmRunner::skipQuirks both raises the fallback clamp floor
+        // below and avoids constructing a tileN=8 runner, which would throw on an empty
+        // passing-config list.
+        : mSupportedTileN{16, 32, 64, 128}
     {
         for (int tileN : mSupportedTileN)
         {
