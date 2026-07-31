@@ -1344,7 +1344,14 @@ class TestLogsprobsInBatchedSampling:
 
                         # Validate sampled rank
                         if req.py_beam_width == 1:
-                            # FIXME: "rank" is not behaving as expected for beam search requests
+                            # FIXME: "rank" is not behaving as expected for beam search requests.
+                            #   There are two factors. First, "rank" is not clearly specified for beam search
+                            #   (could be logprob rank within beam or across all beams) and therefore
+                            #   'rank=1' is returned for all finished beams
+                            #   via _finalize_beam and convert_logprobs_tensor_to_list. Second,
+                            #   during decoding (unfinished beam, in general this is the case in this test),
+                            #   request logprobs are set via handle_logprobs and store_logprobs_list_to_request,
+                            #   which inspects uninitialized elements of log_probs_store.sampled_log_prob_ranks.
                             min_rank = (
                                 req_log_probs[req_logit_offset] > recomputed_logprob
                             ).sum().item() + 1
