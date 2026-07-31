@@ -48,13 +48,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
-# Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
-# the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
-# (896 experts / top-16) register-spills and costs ~33 us/layer at decode
-# batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
-# the same math the attention-DP deployments already run.
-FORCE_SEPARATED_ROUTING = os.environ.get("TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
-
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor, MxFp8QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
@@ -68,6 +61,13 @@ from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .interface import MoESchedulerKind
+
+# Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
+# the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
+# (896 experts / top-16) register-spills and costs ~33 us/layer at decode
+# batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
+# the same math the attention-DP deployments already run.
+FORCE_SEPARATED_ROUTING = os.environ.get("TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
 __all__ = [
     "MoEScheduler",
