@@ -82,6 +82,7 @@ _COSMOS3_DEFAULT_OFFLOAD_STAGES = (
         "nvidia/Cosmos3-Nano",
         "nvidia/Cosmos3-Super",
         "nvidia/Cosmos3-Super-Image2Video",
+        "nvidia/Cosmos3-Super-Image2Video-4Step",
         "nvidia/Cosmos3-Super-Text2Image",
         "nvidia/Cosmos3-Super-Text2Image-4Step",
     ],
@@ -95,6 +96,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # Pre-load placeholder; load_standard_components derives the real
         # policy from the checkpoint's scheduler via from_scheduler().
         self.sampling = Cosmos3SamplingPolicy()
+        self.default_use_system_prompt = COSMOS3_EXTRA_SPECS["use_system_prompt"].default
         if getattr(
             primary_pretrained_config,
             "audio_gen",
@@ -187,6 +189,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
     ) -> None:
         skip_components = skip_components or []
+
+        # Prompting defaults are checkpoint-declared: distilled conversions
+        # carry ``default_use_system_prompt`` in model_index.json (diffusers'
+        # distilled blocks default it to True); older checkpoints omit it and
+        # keep the historical False.
+        model_index_path = os.path.join(checkpoint_dir, "model_index.json")
+        if os.path.exists(model_index_path):
+            with open(model_index_path) as f:
+                model_index = json.load(f)
+            self.default_use_system_prompt = bool(
+                model_index.get("default_use_system_prompt", self.default_use_system_prompt)
+            )
 
         if self.audio_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
             logger.info("Loading audio tokenizer...")
@@ -292,7 +306,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def extra_param_specs(self):
-        return dict(COSMOS3_EXTRA_SPECS)
+        specs = dict(COSMOS3_EXTRA_SPECS)
+        specs["use_system_prompt"] = specs["use_system_prompt"].model_copy(
+            update={"default": self.default_use_system_prompt}
+        )
+        return specs
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
@@ -353,7 +371,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 "use_resolution_template",
                 COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
             ),
-            use_system_prompt=extra_params.get("use_system_prompt", False),
+            # None = unset; forward() resolves it to the checkpoint default.
+            use_system_prompt=extra_params.get("use_system_prompt"),
             use_guardrails=extra_params.get("use_guardrails", True),
             enable_audio=extra_params.get("enable_audio", False),
             output_type=output_type,
@@ -625,6 +644,30 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         velocity_mask = 1.0 - condition_mask
         return latents, velocity_mask, image_latent
 
+    def _conditioning_anchor_post_step(self, image_latent: Optional[torch.Tensor]):
+        """Per-step re-anchor of the conditioned frame for distilled sampling.
+
+        The distilled FlowMatchEuler step is stochastic: it re-noises every
+        position, including the frame the velocity mask holds still, so the
+        conditioning frame the model reads as clean context degrades from step
+        2 on. Writing the clean latent back after every scheduler step keeps
+        it clean (diffusers' distilled loop re-anchors the same way).
+        Deterministic UniPC steps never move a zero-velocity frame, so base
+        checkpoints need no per-step anchor and keep their exact behavior.
+
+        Returns a ``post_step_fn`` for ``BasePipeline.denoise``, or ``None``
+        when no anchoring is needed.
+        """
+        if not self.sampling.is_distilled or image_latent is None:
+            return None
+
+        def post_step_fn(latents: torch.Tensor) -> torch.Tensor:
+            # In-place: writes one latent frame, no full-tensor copies.
+            latents[:, :, 0:1] = image_latent
+            return latents
+
+        return post_step_fn
+
     # =========================================================================
     # VAE decode
     # =========================================================================
@@ -691,7 +734,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         frame_rate: float = COSMOS3_720P_PARAMS["frame_rate"],
         use_duration_template: bool = COSMOS3_EXTRA_SPECS["use_duration_template"].default,
         use_resolution_template: bool = COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
-        use_system_prompt: bool = COSMOS3_EXTRA_SPECS["use_system_prompt"].default,
+        use_system_prompt: Optional[bool] = None,
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
         enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
         output_type: str = COSMOS3_EXTRA_SPECS["output_type"].default,
@@ -704,10 +747,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         signature default from an explicit argument, so on distilled
         checkpoints (which fix steps/guidance and reject anything else) direct
         callers must pass checkpoint-valid sampling values.
+
+        ``use_system_prompt=None`` means "unset": it resolves to the
+        checkpoint-declared default, so warmup and other direct callers build
+        the same prompt as served requests.
         """
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
+
+        if use_system_prompt is None:
+            use_system_prompt = self.default_use_system_prompt
 
         use_guardrails = use_guardrails and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
 
@@ -720,13 +770,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         is_t2i = output_type == "image"
 
         self.sampling.validate_request(num_inference_steps, guidance_scale)
-
-        if image is not None and self.sampling.is_distilled:
-            raise ValueError(
-                "Image-conditioned generation is not supported on distilled Cosmos3 "
-                "checkpoints yet: the stochastic scheduler re-noises the conditioned "
-                "frame at every step, and this pipeline does not re-anchor it per step."
-            )
 
         guidance_interval = None
         if is_t2i:
@@ -745,6 +788,16 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # rebuilt the scheduler with shift=3.0.
             self.scheduler = self.sampling.set_flow_shift(
                 self.scheduler, self.sampling.checkpoint_flow_shift
+            )
+
+        # Weight-presence guard, not workflow policy: the request explicitly
+        # asks for audio, but the checkpoint ships no audio tower. Silently
+        # returning a silent video would hide the capability limit.
+        if enable_audio and not self.audio_gen:
+            raise ValueError(
+                "enable_audio=True, but this checkpoint has no audio tower "
+                "(transformer config declares sound_gen=false). Drop enable_audio "
+                "or use an audio-capable Cosmos3 checkpoint."
             )
 
         if isinstance(prompt, str):
@@ -954,6 +1007,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             extra_streams=extra_streams,
             guidance_interval=guidance_interval,
             scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
+            post_step_fn=self._conditioning_anchor_post_step(image_latent),
         )
 
         if extra_streams is not None:
@@ -970,8 +1024,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         decode_start = time.time()
 
         if image_latent is not None:
-            latents = latents.clone()
-            latents[:, :, 0:1, :, :] = image_latent.to(device=latents.device, dtype=latents.dtype)
+            # In-place: the loop output is consumed only by the decode below.
+            latents[:, :, 0:1] = image_latent
 
         video = self.decode_latents(latents, self._decode_latents)
 
