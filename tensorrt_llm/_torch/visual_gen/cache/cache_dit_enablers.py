@@ -26,9 +26,9 @@ from ..config import CacheDiTConfig
 # Batched CFG: default enable_separate_cfg False (single cond+uncond batch).
 # Qwen-Image uses non-batched CFG (two separate forward passes),
 # so it has no enable_separate_cfg flag here.
-_WAN_CFG_DEFAULT = False
-_FLUX_CFG_DEFAULT = False
-_LTX2_CFG_DEFAULT = False
+_WAN_BATCHED_CFG_DEFAULT = False
+_FLUX_BATCHED_CFG_DEFAULT = False
+_LTX2_BATCHED_CFG_DEFAULT = False
 
 # Wan 2.2 dual-transformer: stricter caps on the low-noise expert stack (second ParamsModifier).
 _WAN22_LOW_NOISE_MAX_WARMUP_STEPS = 2
@@ -39,8 +39,8 @@ _WAN22_LOW_NOISE_MAX_CACHED_STEPS = 20
 class CacheDiTEnableResult:
     """Return value from a cache-dit enabler."""
 
-    refresh: Callable[[int], None]
-    disable_target: Any
+    refresh: Callable[..., None]
+    disable: Callable[[], None]
     summary_modules: List[nn.Module]
 
 
@@ -158,7 +158,7 @@ def _refresh_ctx(
 def enable_cache_dit_for_wan(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> CacheDiTEnableResult:
     """Wan T2V / I2V: single transformer (2.1) or dual (2.2)."""
     calibrator = _maybe_calibrator(cache_dit_cfg)
-    separate = _resolved_enable_separate_cfg(cache_dit_cfg, _WAN_CFG_DEFAULT)
+    separate = _resolved_enable_separate_cfg(cache_dit_cfg, _WAN_BATCHED_CFG_DEFAULT)
 
     transformer_2 = getattr(pipeline, "transformer_2", None)
 
@@ -171,13 +171,13 @@ def enable_cache_dit_for_wan(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> Ca
             forward_pattern=[ForwardPattern.Pattern_2],
             params_modifiers=[ParamsModifier(cache_config=db_cfg)],
         )
-        disable_target = cache_dit.enable_cache(
+        _cached = cache_dit.enable_cache(
             adapter,
             cache_config=db_cfg,
             calibrator_config=calibrator,
         )
 
-        def refresh(num_inference_steps: int) -> None:
+        def refresh(num_inference_steps: int, **_kwargs) -> None:
             _refresh_ctx(
                 pipeline.transformer,
                 cache_dit_cfg,
@@ -187,7 +187,7 @@ def enable_cache_dit_for_wan(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> Ca
 
         return CacheDiTEnableResult(
             refresh=refresh,
-            disable_target=disable_target,
+            disable=lambda: cache_dit.disable_cache(_cached),
             summary_modules=[pipeline.transformer],
         )
 
@@ -197,7 +197,7 @@ def enable_cache_dit_for_wan(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> Ca
     )
 
     # Wan 2.2: dual BlockAdapter, two ParamsModifier stacks (high-noise / low-noise experts),
-    # shared DBCacheConfig for enable_cache; batched CFG → enable_separate_cfg from _WAN_CFG_DEFAULT.
+    # shared DBCacheConfig for enable_cache; batched CFG → enable_separate_cfg from _WAN_BATCHED_CFG_DEFAULT.
     adapter = BlockAdapter(
         transformer=[pipeline.transformer, transformer_2],
         blocks=[pipeline.transformer.blocks, transformer_2.blocks],
@@ -217,13 +217,13 @@ def enable_cache_dit_for_wan(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> Ca
             ),
         ],
     )
-    disable_target = cache_dit.enable_cache(
+    _cached = cache_dit.enable_cache(
         adapter,
         cache_config=shared,
         calibrator_config=calibrator,
     )
 
-    def refresh_dual(num_inference_steps: int) -> None:
+    def refresh_dual(num_inference_steps: int, **_kwargs) -> None:
         hi, lo = split_wan22_inference_steps(pipeline, num_inference_steps)
         if cache_dit_cfg.scm_steps_mask_policy is None:
             cache_dit.refresh_context(pipeline.transformer, num_inference_steps=hi, verbose=False)
@@ -235,7 +235,7 @@ def enable_cache_dit_for_wan(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> Ca
     logger.info("Cache-DiT: Wan 2.2 dual-transformer mode enabled.")
     return CacheDiTEnableResult(
         refresh=refresh_dual,
-        disable_target=disable_target,
+        disable=lambda: cache_dit.disable_cache(_cached),
         summary_modules=[pipeline.transformer, transformer_2],
     )
 
@@ -248,7 +248,7 @@ def enable_cache_dit_for_flux(
 ) -> CacheDiTEnableResult:
     """Cache-DiT BlockAdapter for FLUX.1 / FLUX.2."""
     calibrator = _maybe_calibrator(cache_dit_cfg)
-    separate = _resolved_enable_separate_cfg(cache_dit_cfg, _FLUX_CFG_DEFAULT)
+    separate = _resolved_enable_separate_cfg(cache_dit_cfg, _FLUX_BATCHED_CFG_DEFAULT)
     db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=separate)
 
     if calibrator is not None:
@@ -294,13 +294,13 @@ def enable_cache_dit_for_flux(
         f"W={db_cfg.max_warmup_steps}",
     )
 
-    disable_target = cache_dit.enable_cache(
+    _cached = cache_dit.enable_cache(
         adapter,
         cache_config=db_cfg,
         calibrator_config=calibrator,
     )
 
-    def refresh_flux(num_inference_steps: int) -> None:
+    def refresh_flux(num_inference_steps: int, **_kwargs) -> None:
         _refresh_ctx(
             pipeline.transformer,
             cache_dit_cfg,
@@ -310,7 +310,7 @@ def enable_cache_dit_for_flux(
 
     return CacheDiTEnableResult(
         refresh=refresh_flux,
-        disable_target=disable_target,
+        disable=lambda: cache_dit.disable_cache(_cached),
         summary_modules=[pipeline.transformer],
     )
 
@@ -321,7 +321,7 @@ def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> C
     Second arg uses cache-dit encoder_hidden_states slot.
     """
     calibrator = _maybe_calibrator(cache_dit_cfg)
-    separate = _resolved_enable_separate_cfg(cache_dit_cfg, _LTX2_CFG_DEFAULT)
+    separate = _resolved_enable_separate_cfg(cache_dit_cfg, _LTX2_BATCHED_CFG_DEFAULT)
     db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=separate)
 
     if calibrator is not None:
@@ -344,13 +344,13 @@ def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> C
         f"W={db_cfg.max_warmup_steps}, R={cache_dit_cfg.residual_diff_threshold:.3f}",
     )
 
-    disable_target = cache_dit.enable_cache(
+    _cached = cache_dit.enable_cache(
         adapter,
         cache_config=db_cfg,
         calibrator_config=calibrator,
     )
 
-    def refresh_ltx2(num_inference_steps: int) -> None:
+    def refresh_ltx2(num_inference_steps: int, **_kwargs) -> None:
         _refresh_ctx(
             transformer,
             cache_dit_cfg,
@@ -360,7 +360,7 @@ def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> C
 
     return CacheDiTEnableResult(
         refresh=refresh_ltx2,
-        disable_target=disable_target,
+        disable=lambda: cache_dit.disable_cache(_cached),
         summary_modules=[transformer],
     )
 
@@ -396,7 +396,7 @@ def enable_cache_dit_for_qwen_image(
         check_forward_pattern=False,
     )
 
-    disable_target = cache_dit.enable_cache(
+    _cached = cache_dit.enable_cache(
         adapter,
         cache_config=db_cfg,
         calibrator_config=calibrator,
@@ -425,7 +425,7 @@ def enable_cache_dit_for_qwen_image(
 
     return CacheDiTEnableResult(
         refresh=refresh,
-        disable_target=disable_target,
+        disable=lambda: cache_dit.disable_cache(_cached),
         summary_modules=[transformer],
     )
 

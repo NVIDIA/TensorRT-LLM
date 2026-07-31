@@ -33,10 +33,8 @@ class CacheDiTAccelerator(CacheAccelerator):
     def unwrap(self) -> None:
         if self._result is None:
             return
-        target = self._result.disable_target
         try:
-            if target is not None:
-                cache_dit.disable_cache(target)
+            self._result.disable()
         except Exception as exc:
             logger.warning("Cache-DiT: disable_cache failed: %s", exc)
         self._result = None

@@ -496,6 +496,9 @@ class TestWan22I2VCombinedOptimizations:
             assert pipeline.cache_accelerator is not None
             assert pipeline.cache_accelerator.is_enabled()
         finally:
+            acc = getattr(pipeline, "cache_accelerator", None)
+            if acc is not None:
+                acc.unwrap()
             del pipeline
             gc.collect()
             torch.cuda.empty_cache()
