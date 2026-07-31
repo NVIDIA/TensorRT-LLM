@@ -41,7 +41,10 @@ from tensorrt_llm._torch.pyexecutor.llm_request import MultimodalEncoderRequestS
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
-from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
+from tensorrt_llm.inputs.registry import (
+    MultimodalEncoderItemMetadata,
+    get_multimodal_encoder_item_metadata,
+)
 from tensorrt_llm.logger import logger
 
 from .modeling_multimodal_utils import (
@@ -425,12 +428,12 @@ class MultimodalModelMixin:
             input order. Flattening the row-count lists recovers the per-item sequence.
         """
         encoder_inputs: list[tuple[MultimodalParams, list[int], str]] = []
-        for multimodal_param, run_indices, modality in self._runs_by_request_modality(
-            selected_items
-        ):
-            item_metadata = get_multimodal_encoder_item_metadata(
-                multimodal_param.multimodal_data or {}
-            )
+        for (
+            multimodal_param,
+            run_indices,
+            modality,
+            item_metadata,
+        ) in self._runs_by_request_modality(selected_items):
             item_refs = item_metadata.item_refs
             # The two slicers take different index spaces. The raw-tensor
             # slicer indexes the modality's own payload, so it gets the
@@ -455,29 +458,35 @@ class MultimodalModelMixin:
     @staticmethod
     def _runs_by_request_modality(
         selected_items: Sequence[tuple[MultimodalParams, int]],
-    ) -> Iterator[tuple[MultimodalParams, list[int], str]]:
+    ) -> Iterator[tuple[MultimodalParams, list[int], str, "MultimodalEncoderItemMetadata"]]:
         """Split scheduler order into maximal same-request, same-modality runs.
 
         Only adjacent items merge, so the flattened result keeps the
-        scheduler's order and outputs map back positionally.
+        scheduler's order and outputs map back positionally. Each run also
+        carries its request's item metadata: fetching it validates the whole
+        record, so it is read once per request rather than once per item, and
+        the caller reuses it instead of fetching again.
         """
         run_param: Optional[MultimodalParams] = None
         run_modality: Optional[str] = None
+        run_metadata: Optional[MultimodalEncoderItemMetadata] = None
         run_indices: list[int] = []
         for multimodal_param, item_idx in selected_items:
-            item_metadata = get_multimodal_encoder_item_metadata(
-                multimodal_param.multimodal_data or {}
+            metadata = (
+                run_metadata
+                if multimodal_param is run_param
+                else get_multimodal_encoder_item_metadata(multimodal_param.multimodal_data or {})
             )
-            if item_metadata is None:
+            if metadata is None:
                 raise ValueError("MM item metadata is required for item encoding")
-            modality = item_metadata.item_refs[item_idx][0]
+            modality = metadata.item_refs[item_idx][0]
             if run_indices and (multimodal_param is not run_param or modality != run_modality):
-                yield run_param, run_indices, run_modality
+                yield run_param, run_indices, run_modality, run_metadata
                 run_indices = []
-            run_param, run_modality = multimodal_param, modality
+            run_param, run_modality, run_metadata = multimodal_param, modality, metadata
             run_indices.append(item_idx)
         if run_indices:
-            yield run_param, run_indices, run_modality
+            yield run_param, run_indices, run_modality, run_metadata
 
     def forward_multimodal_encoder_items(
         self,

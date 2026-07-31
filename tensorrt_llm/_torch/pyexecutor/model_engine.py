@@ -91,7 +91,8 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
+from .llm_request import (LlmRequest, LlmRequestState, _Unset,
+                          get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
@@ -3429,16 +3430,24 @@ class PyTorchModelEngine(ModelEngine):
         # `getattr`: unit tests exercise partially constructed engines.
         if not getattr(self, "mm_encoder_item_scheduling_enabled", False):
             return None
+        # Memoized on the request's encoder state: the inputs are fixed at
+        # admission, and a request whose items span several iterations would
+        # otherwise rebuild the same keys on each one.
+        state = request.py_mm_encoder_state
+        if state is not None and not isinstance(state.cache_item_keys, _Unset):
+            return state.cache_item_keys
         mm_data = request.py_multimodal_data
         item_metadata = get_multimodal_encoder_item_metadata(mm_data)
-        if item_metadata is None:
-            return None
-        return self.model.build_encoder_cache_item_keys(
-            request.multimodal_hashes,
-            item_metadata.item_refs,
-            item_metadata.output_embedding_lengths,
-            mm_data.get("mm_processor_kwargs_hash"),
-        )
+        keys = None if item_metadata is None else (
+            self.model.build_encoder_cache_item_keys(
+                request.multimodal_hashes,
+                item_metadata.item_refs,
+                item_metadata.output_embedding_lengths,
+                mm_data.get("mm_processor_kwargs_hash"),
+            ))
+        if state is not None:
+            state.cache_item_keys = keys
+        return keys
 
     def _resolve_bytes_per_mm_encoder_embedding(self) -> int:
         """Bytes occupied by one multimodal encoder output embedding.
