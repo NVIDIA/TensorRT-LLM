@@ -2178,10 +2178,11 @@ def test_v2_hybrid_logs_recurrent_cache_eviction_and_drop(
     mgr._recurrent_evicted_blocks_total = 0
     mgr._recurrent_onboarded_blocks_total = 0
     mgr._recurrent_dropped_blocks_total = 0
+    mgr._recurrent_status_logged = False
 
     assert mgr.get_iteration_stats() is report
     log_info.assert_called_once_with(
-        "[MambaHybridCacheManagerV2] recurrent cache movement "
+        "[MambaHybridCacheManagerV2] recurrent cache status "
         "rank=3 pool_group_id=6 "
         "evicted_recurrent_blocks=3 evicted_recurrent_bytes=300 "
         "onboarded_recurrent_blocks=1 onboarded_recurrent_bytes=100 "

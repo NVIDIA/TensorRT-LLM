@@ -2778,6 +2778,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._recurrent_evicted_blocks_total = 0
         self._recurrent_onboarded_blocks_total = 0
         self._recurrent_dropped_blocks_total = 0
+        self._recurrent_status_logged = False
         num_cuda_graph_padding_dummy_slots = (
             _get_num_cuda_graph_padding_dummy_slots(spec_config,
                                                     max_batch_size))
@@ -2993,12 +2994,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         evicted_blocks = stats.iter_offload_blocks
         onboarded_blocks = stats.iter_onboard_blocks
         dropped_blocks = stats.iter_host_dropped_blocks
-        if evicted_blocks or onboarded_blocks or dropped_blocks:
+        has_movement = bool(evicted_blocks or onboarded_blocks
+                            or dropped_blocks)
+        if has_movement:
             self._recurrent_evicted_blocks_total += evicted_blocks
             self._recurrent_onboarded_blocks_total += onboarded_blocks
             self._recurrent_dropped_blocks_total += dropped_blocks
+        if has_movement or not self._recurrent_status_logged:
             logger.info(
-                f"[MambaHybridCacheManagerV2] recurrent cache movement "
+                f"[MambaHybridCacheManagerV2] recurrent cache status "
                 f"rank={self.mapping.rank} pool_group_id={pool_group_id} "
                 f"evicted_recurrent_blocks={evicted_blocks} "
                 f"evicted_recurrent_bytes={stats.iter_offload_bytes} "
@@ -3018,6 +3022,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"{stats.primary_evictable_num_blocks} "
                 f"host_used_recurrent_blocks={stats.secondary_used_num_blocks} "
                 f"host_free_recurrent_blocks={stats.secondary_free_num_blocks}")
+            self._recurrent_status_logged = True
         return report
 
     @staticmethod
