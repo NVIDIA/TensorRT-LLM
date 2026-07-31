@@ -95,6 +95,9 @@ def ensure_bench_serving_repo() -> str:
     return bench_script
 
 
+# Fallback whole-test budget, used only when a config declares no `slurm.timeout`
+# AND the test carries no `TIMEOUT (N)` marker (i.e. local runs). Under CI the
+# effective value is always clamped to the marker -- see marker_bounded_timeout.
 DEFAULT_TIMEOUT = 10800
 # Defaults for the server *ready* wait, separate from the whole-test timeout:
 # a server that is not healthy after this long is not going to be, and failing
@@ -104,6 +107,71 @@ DEFAULT_TIMEOUT = 10800
 # once EVERY ctx/gen worker has finished model load + autotune + warmup.
 AGG_SERVER_READY_TIMEOUT = 1800
 DISAGG_SERVER_READY_TIMEOUT = 3600
+
+# How far ahead of the per-test pytest `TIMEOUT (N)` marker the harness's own
+# waits give up. The marker kill is a SIGALRM from pytest-timeout: it reports
+# "Test terminated unexpectedly" with l_e2e_time_ms = 1000 and no indication of
+# which wait was stuck. Failing HARNESS_TIMEOUT_MARGIN seconds earlier lets the
+# harness raise its own RuntimeError instead, naming the wait that hung and
+# leaving the server-log tails in the CI log -- so a real hang is classifiable
+# rather than an anonymous kill.
+HARNESS_TIMEOUT_MARGIN = 180
+
+
+def marker_bounded_timeout(config_timeout: int, pytest_timeout: Optional[int]) -> int:
+    """Bound a config-declared timeout by this test's own pytest timeout marker.
+
+    ``DEFAULT_TIMEOUT`` (and the per-config ``slurm.timeout``) are provisioned at
+    or above the largest ``TIMEOUT (N)`` marker in the test lists, so on their own
+    they can never fire before pytest kills the process. Clamping to the marker --
+    rather than to a constant, which would false-kill the legitimately long
+    128k8k benchmarks -- makes every harness wait bounded by the same budget CI
+    actually enforces, per test.
+
+    The returned value is not only a wait bound: for disagg it is also passed to
+    ``trtllm-serve disaggregated`` as ``-t``/``-r``, so a smaller marker also
+    shortens the proxy's own request/router timeouts. That cannot cause a
+    failure the marker would not have caused anyway (the proxy bound stays below
+    the wall-clock kill), but it does change the failure *mode*: a stuck request
+    now surfaces as a proxy timeout rather than as the whole test being killed.
+
+    Returns ``config_timeout`` unchanged when no marker is present (local runs,
+    or a test list entry without ``TIMEOUT``).
+    """
+    if not pytest_timeout or pytest_timeout <= 0:
+        return config_timeout
+    # The 60s clamp is a negative guard, not a case that occurs today: it would
+    # only bind for a marker under 4 minutes, and the smallest marker in the
+    # test lists is 30 minutes. It exists so a hand-edited tiny marker degrades
+    # to a short-but-positive bound instead of a negative one.
+    return min(config_timeout, max(60, pytest_timeout - HARNESS_TIMEOUT_MARGIN))
+
+
+def get_pytest_timeout(request) -> Optional[int]:
+    """Seconds from this test's pytest-timeout marker, or None if unmarked.
+
+    The marker is attached from the test-list ``TIMEOUT (N)`` suffix by
+    ``test_list_parser.apply_test_list_markers``; ``N`` is in minutes there and
+    already converted to seconds on the marker.
+
+    Falls back to the global ``--timeout`` / ini value so that a run which sets
+    only the global bound (and no per-test marker) still gets the clamp instead
+    of silently keeping ``DEFAULT_TIMEOUT``.
+    """
+    marker = request.node.get_closest_marker("timeout")
+    value = None
+    if marker is not None:
+        value = marker.args[0] if marker.args else marker.kwargs.get("timeout")
+    if value is None:
+        try:
+            value = request.config.getoption("timeout", None)
+        except ValueError:
+            # pytest-timeout not installed: no bound to inherit.
+            value = None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -1327,6 +1395,14 @@ class DisaggTestCmds(NamedTuple):
 
         The benchmark-done check runs FIRST so a server exiting just after a
         completed benchmark cannot fail an otherwise-passing test.
+
+        ``self.timeout`` is the backstop for the case a process death does not
+        cover (a live-but-wedged server). It is clamped to this test's own
+        ``TIMEOUT (N)`` marker by ``marker_bounded_timeout``, so it fires --
+        with this message and the elapsed time -- shortly before pytest would
+        SIGALRM the process into an unattributable "Test terminated
+        unexpectedly". Before that clamp it defaulted to ``DEFAULT_TIMEOUT``,
+        which is >= every marker in the test lists and so never fired.
         """
         start_time = time.time()
         while True:
@@ -1716,9 +1792,12 @@ def get_config_dir(benchmark_mode: Optional[str]) -> str:
 class PerfSanityTestConfig:
     """Configuration for perf sanity tests."""
 
-    def __init__(self, test_case_name: str, output_dir: str):
+    def __init__(self, test_case_name: str, output_dir: str, pytest_timeout: Optional[int] = None):
         self._output_dir = output_dir
         self._perf_results: Dict[int, List[Dict[str, float]]] = {}
+        # Per-test budget from the test list's `TIMEOUT (N)` marker; every
+        # harness wait is clamped to it (see marker_bounded_timeout).
+        self._pytest_timeout = pytest_timeout
 
         # Initialize server configs
         self.server_configs: List = []
@@ -1864,7 +1943,9 @@ class PerfSanityTestConfig:
         slurm_config = config.get("slurm", {})
         worker_config = config.get("worker_config", {})
 
-        timeout = slurm_config.get("timeout", DEFAULT_TIMEOUT)
+        timeout = marker_bounded_timeout(
+            slurm_config.get("timeout", DEFAULT_TIMEOUT), self._pytest_timeout
+        )
         numa_bind = slurm_config.get("numa_bind", False)
         gpus_per_node = hardware.get("gpus_per_node", 0)
         model_name = metadata.get("model_name", "")
@@ -2056,7 +2137,7 @@ class PerfSanityTestConfig:
         return AggrTestCmds(
             server_cmds=server_cmds,
             client_cmds=client_cmds,
-            timeout=DEFAULT_TIMEOUT,
+            timeout=marker_bounded_timeout(DEFAULT_TIMEOUT, self._pytest_timeout),
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             client_configs=self.server_client_configs,
@@ -2566,9 +2647,11 @@ PERF_SANITY_TEST_CASES = get_aggr_test_cases() + get_disagg_test_cases() + MULTI
 
 
 @pytest.mark.parametrize("perf_sanity_test_case", PERF_SANITY_TEST_CASES)
-def test_e2e(output_dir, perf_sanity_test_case):
+def test_e2e(request, output_dir, perf_sanity_test_case):
     # Create config and parse test case name
-    config = PerfSanityTestConfig(perf_sanity_test_case, output_dir)
+    config = PerfSanityTestConfig(
+        perf_sanity_test_case, output_dir, pytest_timeout=get_pytest_timeout(request)
+    )
 
     # Parse config file to get server_configs and server_client_configs
     config.parse_config_file()
