@@ -168,7 +168,7 @@ class OpenAIHttpClient(OpenAIClient):
         self._request_perf_metrics = request_perf_metrics
         self._internal_disagg_auth_key = internal_disagg_auth_key
 
-    def _get_request_headers(self, request: UCompletionRequest) -> Dict[str, str]:
+    def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
         if self._role != ServerRole.GENERATION:
             return {}
         if not request_requires_internal_disagg_auth(request):

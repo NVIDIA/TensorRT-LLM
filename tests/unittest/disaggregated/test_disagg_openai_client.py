@@ -131,13 +131,10 @@ class TestOpenAIHttpClient:
         ):
             OpenAIHttpClient(router=mock_router, role=ServerRole.GENERATION)
 
-        assert session.call_args.kwargs[
-            "max_field_size"] == _PERF_METRICS_HEADER_BUDGET_BYTES
+        assert session.call_args.kwargs["max_field_size"] == _PERF_METRICS_HEADER_BUDGET_BYTES
 
     @pytest.mark.asyncio
-    async def test_generation_request_with_opaque_state_is_signed(
-        self, mock_router, mock_session
-    ):
+    async def test_generation_request_with_opaque_state_is_signed(self, mock_router, mock_session):
         """Opaque state forwarded to generation workers gets internal auth."""
         _reset_prometheus_registry()
         client = OpenAIHttpClient(

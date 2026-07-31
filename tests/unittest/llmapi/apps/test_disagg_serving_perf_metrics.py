@@ -73,9 +73,12 @@ def internal_request_auth_key():
     return secrets.token_hex(32)
 
 
-def worker_config(model_name: str, disagg_cluster_config: dict,
-                  perf_metrics_output_dir,
-                  internal_request_auth_key: str):
+def worker_config(
+    model_name: str,
+    disagg_cluster_config: dict,
+    perf_metrics_output_dir,
+    internal_request_auth_key: str,
+):
     return {
         "model": model_name,
         "disagg_cluster": disagg_cluster_config,
@@ -105,9 +108,9 @@ def workers(
     internal_request_auth_key: str,
 ):
     model_path = get_model_path(model_name)
-    extra_config = worker_config(model_name, disagg_cluster_config,
-                                 perf_metrics_output_dir,
-                                 internal_request_auth_key)
+    extra_config = worker_config(
+        model_name, disagg_cluster_config, perf_metrics_output_dir, internal_request_auth_key
+    )
 
     def worker(server_role: str, port: int):
         return RemoteOpenAIServer(
