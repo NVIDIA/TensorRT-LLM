@@ -43,7 +43,7 @@ kvc::TransferDescs makeDescs(std::vector<std::tuple<std::uintptr_t, std::size_t,
 
 TEST(BounceTransferPlan, EmptyYieldsNoChunks)
 {
-    auto plan = b::BounceTransferPlan::build(makeDescs({}), makeDescs({}), /*slot=*/1024, /*maxDescs=*/64);
+    auto plan = b::BounceTransferPlan::build(makeDescs({}), makeDescs({}), /*maxChunkSizeBytes=*/1024, /*maxDescs=*/64);
     EXPECT_EQ(plan.numChunks(), 0u);
     EXPECT_EQ(plan.totalDescs(), 0u);
     EXPECT_EQ(plan.totalBytes(), 0u);
@@ -70,12 +70,13 @@ TEST(BounceTransferPlan, TwoDescsPackOneChunkWith32ByteAlignedOffsets)
     auto const& c = plan.chunks()[0];
     EXPECT_EQ(c.bounceOffsets[0], 0u);
     EXPECT_EQ(c.bounceOffsets[1], 128u); // alignUp(100,32)=128
+    EXPECT_EQ(c.sizes, (std::vector<std::uint32_t>{100, 50}));
     EXPECT_EQ(c.totalBytes, 150u);
 }
 
 TEST(BounceTransferPlan, OverflowSplitsIntoTwoChunks)
 {
-    // slot=256; two 200-byte descs cannot share a slot.
+    // With a 256-byte chunk cap, two 200-byte descriptors cannot share a chunk.
     auto plan = b::BounceTransferPlan::build(
         makeDescs({{0x1000, 200, 0}, {0x2000, 200, 0}}), makeDescs({{0x9000, 200, 0}, {0xA000, 200, 0}}), 256, 64);
     EXPECT_EQ(plan.numChunks(), 2u);
@@ -83,28 +84,28 @@ TEST(BounceTransferPlan, OverflowSplitsIntoTwoChunks)
     EXPECT_EQ(plan.chunks()[1].srcPtrs.size(), 1u);
 }
 
-TEST(BounceTransferPlan, DescExactlySlotBytesIsOneChunk)
+TEST(BounceTransferPlan, DescExactlyChunkSizeIsOneChunk)
 {
     auto plan = b::BounceTransferPlan::build(makeDescs({{0x1000, 256, 0}}), makeDescs({{0x9000, 256, 0}}), 256, 64);
     ASSERT_EQ(plan.numChunks(), 1u);
     EXPECT_EQ(plan.chunks()[0].totalBytes, 256u);
 }
 
-TEST(BounceTransferPlan, DescLargerThanSlotThrows)
+TEST(BounceTransferPlan, DescLargerThanChunkThrows)
 {
     EXPECT_ANY_THROW(
         (void) b::BounceTransferPlan::build(makeDescs({{0x1000, 257, 0}}), makeDescs({{0x9000, 257, 0}}), 256, 64));
 }
 
-TEST(BounceTransferPlan, MaxChunkBytesAboveU32Throws)
+TEST(BounceTransferPlan, MaxChunkSizeBytesAboveU32Throws)
 {
-    // A chunk's packed size travels in 32-bit wire fields, so maxChunkBytes must fit in 32 bits even
-    // though arena offsets are 64-bit. Building with a >4 GiB cap must be rejected, not silently wrap.
-    EXPECT_ANY_THROW((void) b::BounceTransferPlan::build(
-        makeDescs({{0x1000, 8, 0}}), makeDescs({{0x9000, 8, 0}}), /*maxChunkBytes=*/(std::size_t{1} << 32), 64));
+    // A chunk's packed size travels in 32-bit wire fields, so maxChunkSizeBytes must fit in 32 bits
+    // even though arena offsets are 64-bit. Building with a >4 GiB cap must be rejected.
+    EXPECT_ANY_THROW((void) b::BounceTransferPlan::build(makeDescs({{0x1000, 8, 0}}), makeDescs({{0x9000, 8, 0}}),
+        /*maxChunkSizeBytes=*/(std::size_t{1} << 32), 64));
     // Exactly 4 GiB - 1 is allowed.
     EXPECT_NO_THROW((void) b::BounceTransferPlan::build(makeDescs({{0x1000, 8, 0}}), makeDescs({{0x9000, 8, 0}}),
-        /*maxChunkBytes=*/(std::size_t{1} << 32) - 1, 64));
+        /*maxChunkSizeBytes=*/(std::size_t{1} << 32) - 1, 64));
 }
 
 TEST(BounceTransferPlan, MaxDescsPerChunkBoundary)
@@ -117,13 +118,16 @@ TEST(BounceTransferPlan, MaxDescsPerChunkBoundary)
     EXPECT_EQ(plan.chunks()[1].srcPtrs.size(), 1u);
 }
 
-TEST(BounceTransferPlan, DeviceMismatchSplits)
+TEST(BounceTransferPlan, MixedSourceDeviceIdsThrow)
 {
-    auto plan = b::BounceTransferPlan::build(makeDescs({{0x1000, 8, 0}, {0x2000, 8, 0}}),
-        makeDescs({{0x9000, 8, /*dev=*/0}, {0xA000, 8, /*dev=*/1}}), 4096, 64);
-    ASSERT_EQ(plan.numChunks(), 2u);
-    EXPECT_EQ(plan.chunks()[0].dstDeviceId, 0u);
-    EXPECT_EQ(plan.chunks()[1].dstDeviceId, 1u);
+    EXPECT_ANY_THROW((void) b::BounceTransferPlan::build(makeDescs({{0x1000, 8, /*dev=*/0}, {0x2000, 8, /*dev=*/1}}),
+        makeDescs({{0x9000, 8, /*dev=*/0}, {0xA000, 8, /*dev=*/0}}), 4096, 64));
+}
+
+TEST(BounceTransferPlan, MixedDestinationDeviceIdsThrow)
+{
+    EXPECT_ANY_THROW((void) b::BounceTransferPlan::build(makeDescs({{0x1000, 8, /*dev=*/0}, {0x2000, 8, /*dev=*/0}}),
+        makeDescs({{0x9000, 8, /*dev=*/0}, {0xA000, 8, /*dev=*/1}}), 4096, 64));
 }
 
 TEST(BounceTransferPlan, ZeroLengthDescSkippedButCounted)

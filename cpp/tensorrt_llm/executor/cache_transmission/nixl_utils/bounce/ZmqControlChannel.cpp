@@ -33,7 +33,7 @@ namespace
 // Per-peer outbound queue cap (messages). With the non-blocking send in sendTo(), hitting this cap
 // DROPS the message instead of blocking the caller. Control messages are tiny (tens to a few hundred
 // bytes), so this bounds a stalled peer's queue to a few MB while sitting far above any legitimate
-// in-flight burst (per-flow window x concurrent flows) — drops only happen under genuine peer stall.
+// in-flight burst (per-request chunk cap times concurrent flows), so drops indicate peer stall.
 constexpr int kSendHwm = 1 << 16;
 } // namespace
 
@@ -50,7 +50,7 @@ ZmqControlChannel::ZmqControlChannel(std::string selfName, std::string const& bi
     // fixed agent name, so when a peer is forgotten (removePeer drops its DEALER) and later comes back
     // — same agent name = same identity — it reconnects with the SAME routing id. Without handover the
     // ROUTER REJECTS the new connection while the old one is still being reaped and SILENTLY DROPS its
-    // messages (a forgotten-then-readded peer's WANTs vanish -> leaseTimeout). HANDOVER hands the
+    // messages (a forgotten-then-readded peer's WANTs vanish until request timeout). HANDOVER hands the
     // identity to the new connection instead. (Loopback reconnect makes this race easy to hit.)
     mRouter.set(zmq::sockopt::router_handover, 1);
     // zmq disables IPv6 on a socket by default, so binding an IPv6 address would fail. Enable it when
@@ -119,7 +119,7 @@ void ZmqControlChannel::sendTo(std::string const& peer, std::string const& blob)
         // unreachable peer whose queue is full (kSendHwm + TCP buffers) would wedge the whole reactor
         // — exactly the hang the design forbids. With dontwait a full queue returns an empty result
         // (EAGAIN) instead; we DROP the message. A dropped control message degrades the affected
-        // request to a leaseTimeout FAILURE — never a hang or data corruption.
+        // request to a request-timeout FAILURE rather than blocking this thread.
         auto const sent = it->second.send(msg, zmq::send_flags::dontwait);
         if (!sent.has_value())
         {

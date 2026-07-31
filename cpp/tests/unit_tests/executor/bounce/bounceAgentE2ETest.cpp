@@ -29,6 +29,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -139,21 +140,22 @@ bool verifyAgentBufs(AgentBufs const& x)
 void setBounceEnv()
 {
     setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "1", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MIN_DESC", "4", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_BYTES", "4096", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_BYTES", "2097152", 1); // 2 MiB
-    setenv("TRTLLM_NIXL_BOUNCE_MIN_BLOCK", "256", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_DEPTH", "2", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT", "4", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES", "4096", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", "2097152", 1); // 2 MiB
+    setenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", "256", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST", "2", 1);
 }
 
 void clearBounceEnv()
 {
     unsetenv("TRTLLM_NIXL_BOUNCE_ENABLE");
-    unsetenv("TRTLLM_NIXL_BOUNCE_MIN_DESC");
-    unsetenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_BYTES");
-    unsetenv("TRTLLM_NIXL_BOUNCE_ARENA_BYTES");
-    unsetenv("TRTLLM_NIXL_BOUNCE_MIN_BLOCK");
-    unsetenv("TRTLLM_NIXL_BOUNCE_DEPTH");
+    unsetenv("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT");
+    unsetenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES");
+    unsetenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES");
+    unsetenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES");
+    unsetenv("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST");
+    unsetenv("TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS");
 }
 } // namespace
 
@@ -166,11 +168,11 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
 
     // Enable bounce + tune thresholds so a modest transfer engages it (small regions -> recycling).
     setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "1", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MIN_DESC", "4", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_BYTES", "4096", 1); // per-chunk byte cap
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_BYTES", "1048576", 1);  // 1 MiB shared arena
-    setenv("TRTLLM_NIXL_BOUNCE_MIN_BLOCK", "4096", 1);       // buddy granularity == chunk cap
-    setenv("TRTLLM_NIXL_BOUNCE_DEPTH", "2", 1);              // per-flow window
+    setenv("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT", "4", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES", "4096", 1); // per-chunk byte cap
+    setenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", "1048576", 1);  // 1 MiB shared arena
+    setenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", "4096", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST", "2", 1);
 
     std::unique_ptr<kvc::NixlTransferAgent> a;
     std::unique_ptr<kvc::NixlTransferAgent> b;
@@ -260,6 +262,52 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     b->shutdown();
     cudaFree(dSrc);
     cudaFree(dDst);
+    clearBounceEnv();
+}
+
+TEST(BounceAgentE2E, NixlNotificationsPreserveSyncMessages)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    setBounceEnv();
+    setenv("TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS", "1", 1);
+
+    std::unique_ptr<kvc::NixlTransferAgent> a;
+    std::unique_ptr<kvc::NixlTransferAgent> b;
+    try
+    {
+        a = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{"notifAgentA", true, false, true});
+        b = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{"notifAgentB", true, false, true});
+    }
+    catch (std::exception const& e)
+    {
+        clearBounceEnv();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+    }
+
+    a->loadRemoteAgent("notifAgentB", b->getLocalAgentDesc());
+    std::string const expected = "ordinary-sync-message";
+    a->notifySyncMessage("notifAgentB", expected);
+
+    bool received = false;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!received && std::chrono::steady_clock::now() < deadline)
+    {
+        auto notifications = b->getNotifiedSyncMessages();
+        auto const it = notifications.find("notifAgentA");
+        received = it != notifications.end()
+            && std::find(it->second.begin(), it->second.end(), expected) != it->second.end();
+        if (!received)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    EXPECT_TRUE(received) << "NIXL bounce control consumed an ordinary sync message";
+
+    a->shutdown();
+    b->shutdown();
     clearBounceEnv();
 }
 
@@ -357,8 +405,8 @@ TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
 // once, so both arenas serve sender (gather) AND receiver (scatter) roles simultaneously. Both are
 // senders here, so — exactly like transfer.py when two ranks each write to each other — each loads
 // the other's AgentDesc; there is still NO manual addPeer (loadRemoteAgent wires each agent's own
-// bounce transport). Every transfer must land byte-exact with no cross-talk / hang (R2/R3/R4 over
-// the production API).
+// bounce transport). Every transfer must land byte-exact with no cross-talk or hang over the
+// production API.
 TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
 {
     if (!hasCuda())

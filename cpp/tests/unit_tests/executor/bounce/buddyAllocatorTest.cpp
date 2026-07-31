@@ -133,17 +133,17 @@ TEST(BuddyAllocator, ZeroAndOverflowSizeRejectedNoHang)
 
 TEST(BuddyAllocator, LargeRecycledStreamLargerThanArena)
 {
-    // Models a single transfer whose TOTAL bytes >> arena: chunks of maxChunkBytes streamed through
+    // Models a single transfer whose total bytes exceed the arena: bounded chunks stream through
     // a small arena with recycling (alloc chunk -> "send" -> free -> alloc next). The arena only
-    // ever holds a few chunks; an unbounded total streams through. (R1 with variable regions.)
+    // ever holds a few chunks; an unbounded total streams through variable-size regions.
     std::size_t const minBlock = 1024;
-    std::size_t const chunk = 4 * 1024;                    // maxChunkBytes
+    std::size_t const chunk = 4 * 1024;                    // maxChunkSizeBytes
     b::BuddyAllocator a(/*capacity=*/4 * chunk, minBlock); // arena holds only 4 chunks at once
     std::size_t streamed = 0;
     std::vector<std::uint64_t> inflight;
     for (int i = 0; i < 1000; ++i) // 1000 chunks * 4KiB = 4MiB through a 16KiB arena
     {
-        // keep a window of up to 4 chunks in flight
+        // Keep up to 4 chunks in flight.
         if (inflight.size() == 4)
         {
             a.free(inflight.front());

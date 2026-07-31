@@ -32,15 +32,16 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // ----------------------------------------------------------------------------
 // Pure logic, no GPU / threads / IO — fully unit-testable. It is the data-region allocator for the
 // bounce v2 arena (one shared registered buffer): instead of fixed full slots, each chunk gets a
-// region sized to its actual bytes, so MANY small transfers fit (high concurrency, no waste) while
-// a transfer LARGER than the whole buffer still streams through (its chunks are each ≤ a modest
-// maxChunkBytes and recycled per ACK via the credit window).
+// region whose buddy block is sized to its actual bytes, so MANY small transfers fit with less
+// internal waste while a transfer larger than the whole buffer still streams through (each chunk is
+// bounded by maxChunkSizeBytes and allocations are recycled after scatter completion).
 //
 // alloc(bytes) rounds up to a power-of-two multiple of minBlock and returns the byte offset of a
 // free block of that order (splitting a larger one if needed). free(offset) coalesces with the
 // buddy block whenever it is also free. Properties:
-//   - NO external fragmentation: blocks only ever merge with their power-of-two buddy.
-//   - Internal fragmentation ≤ 2x (a request rounds up to the next power-of-two block).
+//   - Structured external fragmentation: only free buddies of the same order coalesce, so total
+//     free bytes may exceed a request while no sufficiently large block is currently available.
+//   - Internal fragmentation is less than 2x because requests round up to a power-of-two block.
 //   - alloc returns nullopt when no block of the needed order is free (caller applies backpressure;
 //     a large alloc may transiently fail under fragmentation but a later free+coalesce frees a
 //     high-order block — no deadlock, since frees come from independently-completing flows).
@@ -85,8 +86,8 @@ public:
     /// Why offset-only is sufficient: free() is offset-keyed (the order/size is looked up internally
     /// via mAllocOrder), so the caller never needs to remember the block size to release it. And the
     /// caller must use its OWN requested length for the actual transfer — NOT the rounded-up block
-    /// size: the slack between `bytes` and minBlock<<order is internal fragmentation that is unmapped
-    /// to no real data, so writing/reading it would move garbage. In bounce, CreditScheduler carries
+    /// size: the slack between `bytes` and minBlock<<order contains no logical payload, so
+    /// writing/reading it would move unrelated bytes. In bounce, CreditScheduler carries
     /// the requested chunk bytes as Grant.len and the sender RDMA-writes exactly that many bytes.
     /// (Use blockBytes() if you ever genuinely need the rounded-up size, e.g. for metrics.)
     [[nodiscard]] std::optional<std::uint64_t> alloc(std::size_t bytes);
@@ -112,7 +113,7 @@ public:
     [[nodiscard]] std::size_t freeBytes() const noexcept;
 
     /// Largest single alloc that can succeed right now (0 if none) — i.e. minBlock << (highest
-    /// order with a free block). Lets the caller cap maxChunkBytes / detect "won't fit".
+    /// order with a free block). Lets callers detect temporary allocation backpressure.
     [[nodiscard]] std::size_t maxAllocBytes() const noexcept;
 
     /// Number of currently-allocated blocks (for tests / metrics / leak checks).

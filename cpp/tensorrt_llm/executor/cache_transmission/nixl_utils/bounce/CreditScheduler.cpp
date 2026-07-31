@@ -24,11 +24,11 @@
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
-CreditScheduler::CreditScheduler(
-    std::uint64_t baseAddr, std::size_t arenaBytes, std::size_t minBlock, std::uint32_t maxWindow)
-    : mArena(arenaBytes, minBlock)
+CreditScheduler::CreditScheduler(std::uint64_t baseAddr, std::size_t arenaSizeBytes,
+    std::size_t arenaAllocationGranularityBytes, std::uint32_t maxInflightChunksPerRequest)
+    : mArena(arenaSizeBytes, arenaAllocationGranularityBytes)
     , mBaseAddr(baseAddr)
-    , mMaxWindow(maxWindow == 0 ? 1 : maxWindow)
+    , mMaxInflightChunksPerRequest(maxInflightChunksPerRequest == 0 ? 1 : maxInflightChunksPerRequest)
     , mEagerBudgetBytes(mArena.capacity() / 2)
 {
 }
@@ -86,20 +86,20 @@ void CreditScheduler::dropFromRing(std::string const& flow)
 // Hand out as many region grants as possible RIGHT NOW, fairly and bounded. Called whenever space
 // frees up or new demand arrives (onWant / onScatterDone / releaseLocal / reclaim*). Three rules:
 //   1. Fair: rotate over flows round-robin (mRing + mCursor) so no flow starves.
-//   2. Per-flow window W: a flow may hold at most mMaxWindow regions in flight (held.size() < W);
-//      more must wait for an ACK to free one. This bounds a single flow's pipeline depth.
+//   2. Per-request cap: a flow may hold at most mMaxInflightChunksPerRequest allocations; more must
+//      wait for scatter completion to free one.
 //   3. Arena capacity: all flows' regions share one buddy arena; if the next chunk doesn't fit, skip
 //      this flow (a smaller chunk elsewhere may still fit) -> backpressure, never an error.
 // Shape: each inner sweep grants AT MOST ONE region then breaks, advancing the cursor past the flow
 // just served; the outer loop re-sweeps from there. That one-at-a-time + advance gives strict
-// rotation (A,B,A,B,...) instead of draining one flow's whole window first. It stops when a full
-// sweep grants nothing (every flow is done / window-full / can't fit). Returns the GRANTs to send.
+// rotation (A,B,A,B,...) instead of filling one request to its in-flight cap first. It stops when a full
+// sweep grants nothing (every flow is done / at its in-flight cap / can't fit). Returns the GRANTs.
 std::vector<Grant> CreditScheduler::schedule()
 {
     std::vector<Grant> grants;
     bool progress = true;
-    // Re-sweep as long as the previous sweep granted something (a grant may free a slot/leave room for
-    // the next flow); stop when a whole sweep makes no progress, or the ring is empty.
+    // Re-sweep as long as the previous sweep granted something; stop when a whole sweep makes no
+    // progress or the ring is empty.
     while (progress && !mRing.empty())
     {
         progress = false;
@@ -117,15 +117,15 @@ std::vector<Grant> CreditScheduler::schedule()
                 continue;
             }
             auto& st = fit->second;
-            if (st.pending.empty() || st.held.size() >= mMaxWindow)
+            if (st.pending.empty() || st.held.size() >= mMaxInflightChunksPerRequest)
             {
-                continue; // nothing more wanted, or at the per-flow window cap
+                continue; // nothing more wanted, or at the per-request in-flight cap
             }
             std::uint32_t const want = st.pending.front();
             // NOTE: no aging — a flow whose FRONT chunk can't fit right now is skipped while smaller
             // chunks elsewhere keep cycling, so a large chunk can be passed over under sustained small
             // traffic (HOL; never a deadlock — buddy coalescing eventually frees a high-order block,
-            // and maxChunkBytes <= arena guarantees it can fit a drained arena).
+            // and maxChunkSizeBytes is clamped so it can fit a drained arena).
             auto off = mArena.alloc(want);
             if (!off)
             {

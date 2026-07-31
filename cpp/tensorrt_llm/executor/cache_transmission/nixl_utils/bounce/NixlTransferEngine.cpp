@@ -110,7 +110,7 @@ bool NixlTransferEngine::registerRegion(void* addr, std::size_t bytes)
 std::uint64_t NixlTransferEngine::postWrite(std::string const& peer, void const* src, std::uint64_t dstAddr,
     std::uint32_t remoteDevId, std::uint32_t bytes, cudaStream_t stream)
 {
-    (void) stream; // NIXL is not ordered against the gather stream; caller synced it already.
+    (void) stream; // NIXL is not stream-ordered; the caller already observed gather completion.
     // Local src is on this agent's GPU (mDeviceId); the remote dst is on the peer's GPU, whose
     // index is carried in the credit (remoteDevId). Do NOT assume sender/receiver share a device
     // index — that is false when ranks aren't single-GPU-per-rank.

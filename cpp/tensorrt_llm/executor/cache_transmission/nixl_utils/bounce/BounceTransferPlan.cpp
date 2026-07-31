@@ -91,7 +91,7 @@ void buildScatterRuns(BounceChunk& chunk, bool merge)
 } // namespace
 
 BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
-    std::size_t maxChunkBytes, std::size_t maxDescsPerChunk, bool mergeScatterRuns)
+    std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk, bool mergeScatterRuns)
 {
     BounceTransferPlan plan;
 
@@ -99,21 +99,24 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
     auto const& dstVec = dstDescs.getDescs();
     TLLM_CHECK_WITH_INFO(srcVec.size() == dstVec.size(), "BounceTransferPlan: src/dst desc count mismatch (%zu vs %zu)",
         srcVec.size(), dstVec.size());
-    TLLM_CHECK_WITH_INFO(
-        maxChunkBytes > 0 && maxDescsPerChunk > 0, "BounceTransferPlan: maxChunkBytes/maxDescsPerChunk must be > 0");
+    TLLM_CHECK_WITH_INFO(maxChunkSizeBytes > 0 && maxDescsPerChunk > 0,
+        "BounceTransferPlan: maxChunkSizeBytes/maxDescsPerChunk must be > 0");
     // A chunk's packed size flows through 32-bit fields on the wire (Grant.len, WANT chunk sizes,
     // scatter entry size, Posted.writeBytes), so a chunk must fit in 32 bits. Arena offsets are
     // 64-bit (arena may exceed 4 GiB) but a single staging chunk above 4 GiB is nonsensical.
-    TLLM_CHECK_WITH_INFO(maxChunkBytes <= std::numeric_limits<std::uint32_t>::max(),
-        "BounceTransferPlan: maxChunkBytes (%zu) must be <= 4 GiB (chunk size is 32-bit on the wire)", maxChunkBytes);
+    TLLM_CHECK_WITH_INFO(maxChunkSizeBytes <= std::numeric_limits<std::uint32_t>::max(),
+        "BounceTransferPlan: maxChunkSizeBytes (%zu) must be <= 4 GiB (chunk size is 32-bit on the wire)",
+        maxChunkSizeBytes);
 
     if (srcVec.empty())
     {
         return plan; // 0 descs -> 0 chunks
     }
 
+    auto const sourceDeviceId = srcVec.front().getDeviceId();
+    auto const destinationDeviceId = dstVec.front().getDeviceId();
     BounceChunk current;
-    current.dstDeviceId = dstVec.front().getDeviceId();
+    current.dstDeviceId = destinationDeviceId;
     std::uint64_t cursor = 0; // running write offset within the current chunk region (aligned)
 
     auto flush = [&]()
@@ -133,8 +136,14 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
         auto const& dst = dstVec[i];
         std::size_t const len = src.getLen();
         TLLM_CHECK_WITH_INFO(len == dst.getLen(), "BounceTransferPlan: src/dst len mismatch at idx %zu", i);
-        TLLM_CHECK_WITH_INFO(len <= maxChunkBytes,
-            "BounceTransferPlan: single desc (%zu B) exceeds maxChunkBytes (%zu B)", len, maxChunkBytes);
+        TLLM_CHECK_WITH_INFO(src.getDeviceId() == sourceDeviceId,
+            "BounceTransferPlan: mixed source device ids are unsupported (idx %zu has %u, expected %u)", i,
+            src.getDeviceId(), sourceDeviceId);
+        TLLM_CHECK_WITH_INFO(dst.getDeviceId() == destinationDeviceId,
+            "BounceTransferPlan: mixed destination device ids are unsupported (idx %zu has %u, expected %u)", i,
+            dst.getDeviceId(), destinationDeviceId);
+        TLLM_CHECK_WITH_INFO(len <= maxChunkSizeBytes,
+            "BounceTransferPlan: single desc (%zu B) exceeds maxChunkSizeBytes (%zu B)", len, maxChunkSizeBytes);
         TLLM_CHECK_WITH_INFO(len < (1ULL << 32U), "BounceTransferPlan: single desc (%zu B) exceeds 4 GiB", len);
 
         // A zero-length desc carries no data; skip it so it never forces an empty chunk.
@@ -144,15 +153,14 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
             continue;
         }
 
-        bool const overflow = (cursor + len > maxChunkBytes);
+        bool const overflow = (cursor + len > maxChunkSizeBytes);
         bool const tooManyDescs = (current.srcPtrs.size() >= maxDescsPerChunk);
-        bool const deviceMismatch = !current.srcPtrs.empty() && dst.getDeviceId() != current.dstDeviceId;
 
         // Extend the previous desc in place when src, dst AND the bounce cursor all advance
         // contiguously (the aligned cursor left no gap): one desc instead of two shrinks the gather
         // plan, the scatter runs and the wire messages. Only within the current chunk (`!overflow`)
         // and staying within the u32 per-desc size field.
-        bool const srcDstContig = !current.srcPtrs.empty() && !overflow && !deviceMismatch
+        bool const srcDstContig = !current.srcPtrs.empty() && !overflow
             && src.getAddr() == current.srcPtrs.back() + current.sizes.back()
             && dst.getAddr() == current.dstPtrs.back() + current.sizes.back()
             && cursor == current.bounceOffsets.back() + current.sizes.back()
@@ -168,10 +176,10 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
             continue;
         }
 
-        if (overflow || tooManyDescs || deviceMismatch)
+        if (overflow || tooManyDescs)
         {
             flush();
-            current.dstDeviceId = dst.getDeviceId();
+            current.dstDeviceId = destinationDeviceId;
         }
 
         current.srcPtrs.push_back(static_cast<std::uint64_t>(src.getAddr()));

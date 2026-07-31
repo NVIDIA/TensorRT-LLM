@@ -106,7 +106,7 @@ std::string AgentDesc::serialize() const
         su::serialize(r.totalLen, os);
         su::serialize(r.chunkSize, os);
     }
-    su::serialize(mBounceEndpoint, os); // NIXL-bounce control endpoint (empty when bounce disabled)
+    su::serialize(mBounceHandshake, os); // NIXL-bounce capability handshake (empty when bounce disabled)
     return os.str();
 }
 
@@ -125,11 +125,11 @@ AgentDesc AgentDesc::deserialize(std::string const& data)
         auto chunkSize = su::deserialize<size_t>(is);
         regions.push_back({baseAddr, totalLen, chunkSize});
     }
-    auto bounceEndpoint = su::deserialize<std::string>(is);
+    auto bounceHandshake = su::deserialize<std::string>(is);
     TLLM_CHECK_WITH_INFO(!is.fail(),
         "AgentDesc::deserialize failed: stream error after reading %zu/%zu regions (data size=%zu)", regions.size(),
         numRegions, data.size());
-    return AgentDesc{std::move(backendAgentDesc), std::move(regions), std::move(bounceEndpoint)};
+    return AgentDesc{std::move(backendAgentDesc), std::move(regions), std::move(bounceHandshake)};
 }
 
 // ── VmmDescSplitter utilities (backend-agnostic, no NIXL dependency) ──

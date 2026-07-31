@@ -60,61 +60,108 @@ private:
     std::vector<std::pair<std::string, std::optional<std::string>>> mSaved;
 };
 
-std::size_t arenaBytesFor(char const* value)
+std::size_t arenaSizeBytesFor(char const* value)
 {
     ScopedEnv env;
-    env.set("TRTLLM_NIXL_BOUNCE_ARENA_BYTES", value);
-    return b::BounceConfig::fromEnv().arenaBytes;
+    env.set("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", value);
+    return b::BounceConfig::fromEnv().arenaSizeBytes;
 }
 } // namespace
 
 TEST(BounceConfig, ByteSuffixesParse)
 {
-    EXPECT_EQ(arenaBytesFor("12345"), 12345u);
-    EXPECT_EQ(arenaBytesFor("12345B"), 12345u);
-    EXPECT_EQ(arenaBytesFor("512K"), 512ULL << 10);
-    EXPECT_EQ(arenaBytesFor("512KB"), 512ULL << 10);
-    EXPECT_EQ(arenaBytesFor("512kib"), 512ULL << 10);
-    EXPECT_EQ(arenaBytesFor("256M"), 256ULL << 20);
-    EXPECT_EQ(arenaBytesFor("256MB"), 256ULL << 20);
-    EXPECT_EQ(arenaBytesFor("256mb"), 256ULL << 20);
-    EXPECT_EQ(arenaBytesFor("256MiB"), 256ULL << 20);
-    EXPECT_EQ(arenaBytesFor("1G"), 1ULL << 30);
-    EXPECT_EQ(arenaBytesFor("1GB"), 1ULL << 30);
-    EXPECT_EQ(arenaBytesFor("1gb"), 1ULL << 30);
-    EXPECT_EQ(arenaBytesFor("2GiB"), 2ULL << 30);
+    EXPECT_EQ(arenaSizeBytesFor("12345"), 12345u);
+    EXPECT_EQ(arenaSizeBytesFor("12345B"), 12345u);
+    EXPECT_EQ(arenaSizeBytesFor("512K"), 512ULL << 10);
+    EXPECT_EQ(arenaSizeBytesFor("512KB"), 512ULL << 10);
+    EXPECT_EQ(arenaSizeBytesFor("512kib"), 512ULL << 10);
+    EXPECT_EQ(arenaSizeBytesFor("256M"), 256ULL << 20);
+    EXPECT_EQ(arenaSizeBytesFor("256MB"), 256ULL << 20);
+    EXPECT_EQ(arenaSizeBytesFor("256mb"), 256ULL << 20);
+    EXPECT_EQ(arenaSizeBytesFor("256MiB"), 256ULL << 20);
+    EXPECT_EQ(arenaSizeBytesFor("1G"), 1ULL << 30);
+    EXPECT_EQ(arenaSizeBytesFor("1GB"), 1ULL << 30);
+    EXPECT_EQ(arenaSizeBytesFor("1gb"), 1ULL << 30);
+    EXPECT_EQ(arenaSizeBytesFor("2GiB"), 2ULL << 30);
 }
 
 TEST(BounceConfig, ByteGarbageFallsBackToDefault)
 {
-    std::size_t const def = b::BounceConfig{}.arenaBytes;
-    EXPECT_EQ(arenaBytesFor("abc"), def);           // no digits
-    EXPECT_EQ(arenaBytesFor("256XB"), def);         // unknown suffix
-    EXPECT_EQ(arenaBytesFor("256 MB"), def);        // space before suffix
-    EXPECT_EQ(arenaBytesFor("256MBx"), def);        // trailing junk
-    EXPECT_EQ(arenaBytesFor(""), def);              // empty -> default
-    EXPECT_EQ(arenaBytesFor("999999999999G"), def); // multiply would overflow u64
+    std::size_t const def = b::BounceConfig{}.arenaSizeBytes;
+    EXPECT_EQ(arenaSizeBytesFor("abc"), def);           // no digits
+    EXPECT_EQ(arenaSizeBytesFor("256XB"), def);         // unknown suffix
+    EXPECT_EQ(arenaSizeBytesFor("256 MB"), def);        // space before suffix
+    EXPECT_EQ(arenaSizeBytesFor("256MBx"), def);        // trailing junk
+    EXPECT_EQ(arenaSizeBytesFor(""), def);              // empty -> default
+    EXPECT_EQ(arenaSizeBytesFor("999999999999G"), def); // multiply would overflow u64
 }
 
 TEST(BounceConfig, AllByteVarsAcceptSuffix)
 {
     ScopedEnv env;
-    env.set("TRTLLM_NIXL_BOUNCE_ARENA_BYTES", "1GB");
-    env.set("TRTLLM_NIXL_BOUNCE_MIN_BLOCK", "2mb");
-    env.set("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_BYTES", "64MB");
-    env.set("TRTLLM_NIXL_BOUNCE_MAX_AVG", "32kb");
+    env.set("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", "1GB");
+    env.set("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", "2mb");
+    env.set("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES", "64MB");
+    env.set("TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES", "32kb");
     auto const cfg = b::BounceConfig::fromEnv();
-    EXPECT_EQ(cfg.arenaBytes, 1ULL << 30);
-    EXPECT_EQ(cfg.minBlock, 2ULL << 20);
-    EXPECT_EQ(cfg.maxChunkBytes, 64ULL << 20);
-    EXPECT_EQ(cfg.maxAvgDescBytes, 32ULL << 10);
+    EXPECT_EQ(cfg.arenaSizeBytes, 1ULL << 30);
+    EXPECT_EQ(cfg.arenaAllocationGranularityBytes, 2ULL << 20);
+    EXPECT_EQ(cfg.maxChunkSizeBytes, 64ULL << 20);
+    EXPECT_EQ(cfg.maxAverageDescriptorSizeBytes, 32ULL << 10);
 }
 
 TEST(BounceConfig, PlainCountsRejectSuffix)
 {
     // Non-byte vars keep strict integer parsing: a suffix is garbage -> default.
     ScopedEnv env;
-    env.set("TRTLLM_NIXL_BOUNCE_DEPTH", "4MB");
+    env.set("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST", "4MB");
     auto const cfg = b::BounceConfig::fromEnv();
-    EXPECT_EQ(cfg.windowDepth, b::BounceConfig{}.windowDepth);
+    EXPECT_EQ(cfg.maxInflightChunksPerRequest, b::BounceConfig{}.maxInflightChunksPerRequest);
+}
+
+TEST(BounceConfig, DescriptiveNamesParse)
+{
+    ScopedEnv env;
+    env.set("TRTLLM_NIXL_BOUNCE_ENABLE", "true");
+    env.set("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST", "5");
+    env.set("TRTLLM_NIXL_BOUNCE_COPY_STREAM_COUNT", "6");
+    env.set("TRTLLM_NIXL_BOUNCE_SCATTER_WORKER_COUNT", "7");
+    env.set("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT", "8");
+    env.set("TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS", "900");
+    env.set("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", "yes");
+    env.set("TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER", "false");
+    env.set("TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS", "on");
+    env.set("TRTLLM_NIXL_BOUNCE_DISABLE_SCATTER_RUN_MERGING", "1");
+    env.set("TRTLLM_NIXL_BOUNCE_USE_CUB_COPY", "true");
+    env.set("TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS", "true");
+
+    auto const cfg = b::BounceConfig::fromEnv();
+    EXPECT_TRUE(cfg.enabled);
+    EXPECT_EQ(cfg.maxInflightChunksPerRequest, 5u);
+    EXPECT_EQ(cfg.copyStreamCount, 6u);
+    EXPECT_EQ(cfg.scatterWorkerCount, 7u);
+    EXPECT_EQ(cfg.minDescriptorCount, 8u);
+    EXPECT_EQ(cfg.requestTimeoutMs, 900);
+    EXPECT_TRUE(cfg.disableFabricMemory);
+    EXPECT_FALSE(cfg.enableEagerGather);
+    EXPECT_TRUE(cfg.useNixlNotifications);
+    EXPECT_TRUE(cfg.disableScatterRunMerging);
+    EXPECT_TRUE(cfg.useCubCopy);
+    EXPECT_TRUE(cfg.useZeroCopyArguments);
+}
+
+TEST(BounceConfig, InvalidResourceCountsFallBackToDefaults)
+{
+    ScopedEnv env;
+    env.set("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", "0");
+    env.set("TRTLLM_NIXL_BOUNCE_COPY_STREAM_COUNT", "0");
+    env.set("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST", "4294967296");
+    env.set("TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS", "2147483648");
+
+    auto const defaults = b::BounceConfig{};
+    auto const cfg = b::BounceConfig::fromEnv();
+    EXPECT_EQ(cfg.arenaSizeBytes, defaults.arenaSizeBytes);
+    EXPECT_EQ(cfg.copyStreamCount, defaults.copyStreamCount);
+    EXPECT_EQ(cfg.maxInflightChunksPerRequest, defaults.maxInflightChunksPerRequest);
+    EXPECT_EQ(cfg.requestTimeoutMs, defaults.requestTimeoutMs);
 }

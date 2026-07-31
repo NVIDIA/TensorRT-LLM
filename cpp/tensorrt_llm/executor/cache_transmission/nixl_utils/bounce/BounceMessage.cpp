@@ -17,7 +17,10 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceMessage.h"
 
+#include "tensorrt_llm/executor/serializeUtils.h"
+
 #include <cstring>
+#include <sstream>
 
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
@@ -176,6 +179,49 @@ bool decodeCredits(std::string const& blob, BounceMsgHeader const& header, std::
 bool decodeScatter(std::string const& blob, BounceMsgHeader const& header, std::vector<BounceScatterRun>& out)
 {
     return decodeEntries(blob, header, out);
+}
+
+namespace
+{
+// The handshake travels inside AgentDesc (whose fields use executor::serialize_utils), so it uses
+// the SAME serialization utility rather than the raw-memcpy control-message codec above: a magic +
+// format-version prefix, then each field via su::serialize. `formatVersion` versions THIS blob's
+// layout (so the handshake itself can evolve); `wireVersion` inside is the control-message codec
+// version being negotiated.
+constexpr std::uint32_t kHandshakeMagic = 0x424E4853U; // 'B''N''H''S'
+constexpr std::uint16_t kHandshakeFormatVersion = 1U;
+} // namespace
+
+std::string encodeHandshake(BounceHandshake const& handshake)
+{
+    namespace su = tensorrt_llm::executor::serialize_utils;
+    std::ostringstream os;
+    su::serialize(kHandshakeMagic, os);
+    su::serialize(kHandshakeFormatVersion, os);
+    su::serialize(handshake.wireVersion, os);
+    su::serialize(static_cast<std::uint8_t>(handshake.controlKind), os);
+    su::serialize(handshake.arenaUsableCapacityBytes, os);
+    su::serialize(handshake.maxChunkSizeBytes, os);
+    su::serialize(handshake.endpoint, os);
+    return os.str();
+}
+
+bool decodeHandshake(std::string const& blob, BounceHandshake& out)
+{
+    namespace su = tensorrt_llm::executor::serialize_utils;
+    std::istringstream is(blob);
+    auto const magic = su::deserialize<std::uint32_t>(is);
+    auto const formatVersion = su::deserialize<std::uint16_t>(is);
+    if (is.fail() || magic != kHandshakeMagic || formatVersion != kHandshakeFormatVersion)
+    {
+        return false; // absent / foreign / future-format blob -> peer treated as non-bounce
+    }
+    out.wireVersion = su::deserialize<std::uint16_t>(is);
+    out.controlKind = static_cast<BounceControlKind>(su::deserialize<std::uint8_t>(is));
+    out.arenaUsableCapacityBytes = su::deserialize<std::uint64_t>(is);
+    out.maxChunkSizeBytes = su::deserialize<std::uint64_t>(is);
+    out.endpoint = su::deserialize<std::string>(is);
+    return !is.fail();
 }
 
 bool decodeWant(std::string const& blob, BounceMsgHeader const& header, std::vector<std::uint32_t>& outChunkBytes,
