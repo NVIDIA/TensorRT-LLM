@@ -104,7 +104,8 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import \
     build_visual_gen_timing_headers
-from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
+from tensorrt_llm.serve.visual_gen_utils import (
+    cleanup_materialized_conditioning_inputs, parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
@@ -2709,6 +2710,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             image_id = f"image_{uuid.uuid4().hex}"
+            input_paths = None
 
             try:
                 request = await self._parse_image_edit_request(raw_request)
@@ -2718,12 +2720,16 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.generator,
                     media_storage_path=str(self.media_storage_path),
                 )
+                input_paths = params.image
                 logger.info(
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_edit_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt,
-                                                 params=params)
+                try:
+                    output = self.generator.generate(inputs=request.prompt,
+                                                     params=params)
+                finally:
+                    cleanup_materialized_conditioning_inputs(input_paths)
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:
@@ -2744,8 +2750,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # image-edit models such as Qwen-Image-Layered use
             # ``save_layers_to_grid`` to pack all layers into one image here.
             output_images = _normalize_image_output(output.image)
-            pil_format = request.format.upper()
-            ext = f".{request.format}"
+            pil_format = request.output_format.upper()
+            ext = f".{request.output_format}"
             if request.response_format == "b64_json":
                 data = [
                     ImageObject(
@@ -2770,7 +2776,7 @@ class OpenAIServer(_VideoRoutesMixin):
             response = ImageGenerationResponse(
                 created=int(time.time()),
                 data=data,
-                output_format=request.format,
+                output_format=request.output_format,
                 size=f"{params.width}x{params.height}",
             )
 
