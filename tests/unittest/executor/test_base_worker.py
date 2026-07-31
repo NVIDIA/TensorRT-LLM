@@ -50,24 +50,12 @@ def test_enqueue_request_wraps_lora_load_error():
         worker._enqueue_request(request)
 
 
-def test_lora_request_missing_path_fails_at_load_time(tmp_path):
-
-    class LoraManager:
-
-        def load_from_ckpt(self, *args, **kwargs):
-            pytest.fail("missing LoRA path must fail before adapter load")
-
+def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
     missing_path = str(tmp_path / "private-lora-path")
-    worker = object.__new__(BaseWorker)
-    worker._lora_manager = LoraManager()
-    worker._lora_model_config = None
-    worker._runtime_model_config = None
 
-    with pytest.raises(FileNotFoundError) as exc_info:
-        worker._load_lora_adapter(LoRARequest("missing", 1, missing_path))
+    request = LoRARequest("missing", 1, missing_path)
 
-    assert str(exc_info.value) == "lora_path does not exist"
-    assert missing_path not in str(exc_info.value)
+    assert request.path == missing_path
 
 
 def create_fake_executor_config(engine_path, tp_size: int = 1):

@@ -16,7 +16,6 @@ import datetime
 import enum
 import gc
 import json
-import os
 import time
 import traceback
 import uuid
@@ -316,8 +315,6 @@ class BaseWorker(GenerationExecutor):
 
     def _load_lora_adapter(self, lora_request: LoRARequest) -> bool:
         """Returns True if the adapter was loaded by this call, False if it was already loaded"""
-        if lora_request.path is None or not os.path.exists(lora_request.path):
-            raise FileNotFoundError("lora_path does not exist")
         adapter_id = str(lora_request.adapter_id)
         newly_loaded_uids = self._lora_manager.load_from_ckpt(
             [lora_request.path],

@@ -244,8 +244,7 @@ class OpenAIDisaggServer:
                 logger.warning(
                     f"[validation] {method} {path} 400 "
                     f"(n={self._val_err_n}): {brief}")
-            return JSONResponse(status_code=400,
-                                content={"error": "Request validation failed"})
+            return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
 
