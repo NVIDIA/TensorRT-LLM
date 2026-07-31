@@ -62,11 +62,12 @@ PARTIAL_SCORES_ENV_VAR = "TLLM_EVAL_PARTIAL_SCORES_EVERY"
 MAX_IN_FLIGHT_ENV_VAR = "TLLM_EVAL_MAX_IN_FLIGHT"
 
 # When "1", log an aggregate speculative-decoding summary (acceptance
-# length AL as mean decoded tokens/step) at the end of generate_until.
-# No-op output on non-speculative runs. Acceptance rate (AR) reporting is
-# deferred: request_perf_metrics.speculative_decoding counters are only
-# populated by TRTLLMSampler, not the TorchSampler used by one-engine
-# spec-dec, so AR would silently read 0 on the default PyTorch path.
+# length AL as mean decoded tokens/step, plus corpus acceptance rate AR)
+# at the end of generate_until. No-op output on non-speculative runs. AR
+# reads request_perf_metrics.speculative_decoding, which the PyTorch flow
+# backfills from the executor's cumulative draft-token totals; enabling
+# this flag also opts requests into return_perf_metrics (see
+# _get_sampling_params).
 SPEC_STATS_ENV_VAR = "TLLM_EVAL_SPEC_STATS"
 
 

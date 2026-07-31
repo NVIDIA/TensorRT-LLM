@@ -285,7 +285,8 @@ class GenerationResultBase:
         """Return the error message if this result completed with an error."""
         return self._error_msg
 
-    def _maybe_fill_spec_dec_perf_metrics(self, perf_metrics) -> None:
+    def _maybe_fill_spec_dec_perf_metrics(
+            self, perf_metrics: "tllm.RequestPerfMetrics") -> None:
         """Backfill RequestPerfMetrics.speculative_decoding in the PyTorch flow.
 
         The C++ runtime accumulates that section in
