@@ -14,7 +14,8 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
+    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, PostTransformConfigIdentity, PostTransformFeature,
     PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
@@ -36,7 +37,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
-from ..models import AutoModelForCausalLM, LlamaForCausalLM, Qwen2ForCausalLM
+from ..models import (AutoModelForCausalLM, LlamaForCausalLM, Qwen2ForCausalLM,
+                      Qwen3ForCausalLM)
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
                                      DecoderModelForCausalLM, MetaInitMode,
@@ -344,6 +346,28 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
     _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
+    _DENSE_QWEN_BF16_TARGET_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
+        dtypes=frozenset({"bfloat16"}),
+        quant_algorithms=frozenset({"none"}),
+        kv_cache_quant_algorithms=frozenset({"none"}),
+        layerwise_quantization=frozenset({False}),
+        force_dynamic_quantization=frozenset({False}),
+        lora_enabled=frozenset({False}),
+        sparse_attention_enabled=frozenset({False}),
+        attention_backends=frozenset({"TRTLLM"}),
+        tp_sizes=frozenset({1, 2}),
+        pp_sizes=frozenset({1}),
+        cp_sizes=frozenset({1}),
+        moe_tp_sizes=frozenset({1, 2}),
+        moe_ep_sizes=frozenset({1}),
+        attention_tp_sizes=frozenset({1, 2}),
+        attention_cp_sizes=frozenset({1}),
+        attention_dp=frozenset({False}),
+        multi_node=frozenset({False}),
+        tied_word_embeddings=frozenset({False}),
+        rope_types=frozenset({"default"}),
+        rope_fusion=frozenset({True}),
+    )
     _POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(profiles=(
         PostTransformProfile(
             profile_id="llama-for-causal-lm-target-v1",
@@ -364,28 +388,18 @@ class ModelLoader:
             protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
             transform_abi_id=QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-            runtime_constraints=PostTransformRuntimeConstraints(
-                dtypes=frozenset({"bfloat16"}),
-                quant_algorithms=frozenset({"none"}),
-                kv_cache_quant_algorithms=frozenset({"none"}),
-                layerwise_quantization=frozenset({False}),
-                force_dynamic_quantization=frozenset({False}),
-                lora_enabled=frozenset({False}),
-                sparse_attention_enabled=frozenset({False}),
-                attention_backends=frozenset({"TRTLLM"}),
-                tp_sizes=frozenset({1, 2}),
-                pp_sizes=frozenset({1}),
-                cp_sizes=frozenset({1}),
-                moe_tp_sizes=frozenset({1, 2}),
-                moe_ep_sizes=frozenset({1}),
-                attention_tp_sizes=frozenset({1, 2}),
-                attention_cp_sizes=frozenset({1}),
-                attention_dp=frozenset({False}),
-                multi_node=frozenset({False}),
-                tied_word_embeddings=frozenset({False}),
-                rope_types=frozenset({"default"}),
-                rope_fusion=frozenset({True}),
-            ),
+            runtime_constraints=_DENSE_QWEN_BF16_TARGET_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3-for-causal-lm-bf16-target-v1",
+            root_model_class=Qwen3ForCausalLM,
+            architecture="Qwen3ForCausalLM",
+            model_type="qwen3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_DENSE_QWEN_BF16_TARGET_RUNTIME_CONSTRAINTS,
         ),
     ))
 

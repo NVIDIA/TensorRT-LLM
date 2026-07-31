@@ -27,6 +27,7 @@ profiles:
 |---------|------------|-----------------|-------|----------|----------------------|-------------|
 | `llama-for-causal-lm-target-v1` | `LlamaForCausalLM` | `LlamaForCausalLM` / `llama` | Target model | 1 | `trtllm-llama-target-layout-v1` | No speculative mode or separately loaded draft model |
 | `qwen2-for-causal-lm-bf16-target-v1` | `Qwen2ForCausalLM` | `Qwen2ForCausalLM` / `qwen2` | Target model | 1 | `trtllm-qwen2-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP/EP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `qwen3-for-causal-lm-bf16-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP/EP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, and any runtime constraints
@@ -52,11 +53,11 @@ standard checkpoint path. Target-plus-draft post-transform transfer remains
 disabled until layout state is tracked and qualified independently for each
 submodel.
 
-The Qwen2 profile is text-only. It does not enable Qwen2 reward-model, MoE, or
-vision-language roots. FP16, quantized weights or KV cache, alternate attention
-backends, YaRN or unfused RoPE, tied embeddings, TP greater than 2, PP, CP, EP,
-LoRA, sparse attention, attention DP, multi-node transfer, and speculative
-decoding require separate qualification rows.
+The Qwen2 and Qwen3 profiles are text-only. They do not enable reward-model,
+embedding, MoE, or vision-language roots. FP16, quantized weights or KV cache,
+alternate attention backends, YaRN or unfused RoPE, tied embeddings, TP greater
+than 2, PP, CP, EP, LoRA, sparse attention, attention DP, multi-node transfer,
+and speculative decoding require separate qualification rows.
 
 ### Adding a Model Family
 
@@ -189,9 +190,9 @@ path.
 
 ## Notes and Limitations
 
-- Post-transform MX reception is currently limited to the exact Llama and
-  Qwen2 dense profiles above. Other roots and Qwen2 variants safely fall back
-  to Hugging Face loading until explicitly qualified.
+- Post-transform MX reception is currently limited to the exact Llama, Qwen2
+  dense, and Qwen3 dense profiles above. Other roots and variants safely fall
+  back to Hugging Face loading until explicitly qualified.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.

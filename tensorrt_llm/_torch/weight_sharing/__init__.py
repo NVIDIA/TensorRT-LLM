@@ -21,6 +21,7 @@ from tensorrt_llm._torch.weight_sharing.artifact_identity import (
 from tensorrt_llm._torch.weight_sharing.post_transform_profiles import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PostTransformConfigIdentity,
     PostTransformFeature,
     PostTransformProfile,
@@ -46,6 +47,7 @@ __all__ = [
     "ArtifactIdentity",
     "LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1",
     "QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1",
+    "QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1",
     "SOURCE_IDENTITY_FORMAT_VERSION",
     "PostTransformConfigIdentity",
     "PostTransformFeature",
