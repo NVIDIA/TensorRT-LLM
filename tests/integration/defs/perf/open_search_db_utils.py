@@ -190,7 +190,8 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
     if history_data_list:
         for history_data in history_data_list:
             for cmd_idx in cmd_idxs:
-                if benchmark_data_matches(history_data, new_data_dict[cmd_idx], match_keys):
+                if benchmark_data_matches(history_data, new_data_dict[cmd_idx],
+                                          match_keys):
                     history_data_dict[cmd_idx].append(history_data)
                     break
 
