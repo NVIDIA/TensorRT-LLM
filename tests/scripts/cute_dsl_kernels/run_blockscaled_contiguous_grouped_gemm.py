@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -42,7 +42,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Tuple, Type
+from typing import Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -235,6 +235,7 @@ def create_tensors(
     mma_tiler_mn,
     permuted_m=None,
     swap_ab=False,
+    use_direct_store=False,
 ):
     """Create tensors for contiguous grouped GEMM.
 
@@ -275,8 +276,12 @@ def create_tensors(
     b_tensor, b_torch_gpu = cutlass_torch.cute_tensor_like(
         b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
     )
+    c_assumed_align = 32 if use_direct_store else 16
     c_tensor, c_torch_gpu = cutlass_torch.cute_tensor_like(
-        c_torch_cpu, c_dtype, is_dynamic_layout=True, assumed_align=16
+        c_torch_cpu,
+        c_dtype,
+        is_dynamic_layout=True,
+        assumed_align=c_assumed_align,
     )
 
     # Mark tensor with element divisibility for 16B alignment
@@ -293,7 +298,7 @@ def create_tensors(
     c_tensor.mark_compact_shape_dynamic(
         mode=1 if cd_major == "n" else 0,
         stride_order=(2, 0, 1) if cd_major == "n" else (2, 1, 0),
-        divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
+        divisibility=(n if use_direct_store else (32 if ab_dtype == cutlass.Float4E2M1FN else 16)),
     )
 
     tile_idx_to_expert_idx = from_dlpack(_tile_idx_to_expert_idx).mark_layout_dynamic()
@@ -346,6 +351,8 @@ def run(
     permuted_m: int = None,
     use_cupti: bool = False,
     raster_along_m: bool = False,
+    use_direct_store: bool = False,
+    epilogue_tile_n: Optional[int] = None,
     **kwargs,
 ):
     """Prepare A/B/C tensors, launch GPU kernel, and reference checking."""
@@ -368,9 +375,20 @@ def run(
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use CUPTI: {'True' if use_cupti else 'False'}")
     print(f"Raster along M: {raster_along_m}")
+    print(f"Epilogue tile N: {epilogue_tile_n or 'auto'}")
 
     # Unpack parameters
     n, k, l = nkl  # noqa: E741
+    direct_store_requested = use_direct_store
+    use_direct_store = (
+        direct_store_requested
+        and c_dtype is cutlass.BFloat16
+        and c_major == "n"
+        and n % (mma_tiler_mn[1] * cluster_shape_mn[1]) == 0
+    )
+    print(f"Use direct store: {use_direct_store}")
+    if direct_store_requested and not use_direct_store:
+        print("Direct store requirements are not met; using the TMA store fallback")
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
@@ -433,13 +451,18 @@ def run(
         sf_vec_size,
         mma_tiler_mn,
         permuted_m,
+        use_direct_store=use_direct_store,
     )
+    # This runner uses the non-predicated path, which does not consume row limits.
+    tile_idx_to_mn_limit = tile_idx_to_expert_idx
     # Configure gemm kernel
     gemm = Sm100BlockScaledContiguousGroupedGemmKernel(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,
         raster_along_m=raster_along_m,
+        use_direct_store=use_direct_store,
+        epilogue_tile_n=epilogue_tile_n,
     )
 
     # Compute max active clusters on current device
@@ -458,6 +481,7 @@ def run(
         sfa_tensor,
         sfb_tensor,
         tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
         num_non_exiting_tiles,
         alpha,
         max_active_clusters,
@@ -474,6 +498,7 @@ def run(
             sfa_tensor,
             sfb_tensor,
             tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
             num_non_exiting_tiles,
             alpha,
             current_stream,
@@ -576,7 +601,9 @@ def run(
             sf_vec_size,
             mma_tiler_mn,  # cta_tile_m
             permuted_m,
+            use_direct_store=use_direct_store,
         )
+        tile_idx_to_mn_limit = tile_idx_to_expert_idx
         return cute.testing.JitArguments(
             a_tensor,
             b_tensor,
@@ -584,6 +611,7 @@ def run(
             sfa_tensor,
             sfb_tensor,
             tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
             num_non_exiting_tiles,
             alpha,
             current_stream,
@@ -797,6 +825,19 @@ if __name__ == "__main__":
         default=False,
         help="Raster along M dimension for tile scheduler",
     )
+    parser.add_argument(
+        "--use_direct_store",
+        action="store_true",
+        default=False,
+        help="Use the aligned SM103 BF16 256-bit register-to-global epilogue.",
+    )
+    parser.add_argument(
+        "--epilogue_tile_n",
+        type=int,
+        choices=(32, 64),
+        default=None,
+        help="Override the SM103 epilogue tile N dimension.",
+    )
     args = parser.parse_args()
 
     # Process arguments to generate nkl and group_m_list
@@ -835,6 +876,8 @@ if __name__ == "__main__":
         args.permuted_m,
         args.use_cupti,
         args.raster_along_m,
+        args.use_direct_store,
+        args.epilogue_tile_n,
     )
     print("exec_time: ", exec_time)
     print("PASS")
