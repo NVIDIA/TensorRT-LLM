@@ -175,6 +175,20 @@ def createKubernetesPodConfig(image, arch = "amd64")
 }
 
 
+// Run a bash script on a remote login node whose shell may be csh/tcsh.
+// Utils.bashWrappedRemoteCmd escapes with POSIX `'\''`, which the REMOTE login
+// shell must parse -- fine on bash logins (oci-hsg) but csh/tcsh (aws-dfw)
+// chokes ("Unmatched '", "set: Variable name must begin with a letter", "fi:
+// Command not found"). Base64 the script instead: the payload is [A-Za-z0-9+/=]
+// only, so it survives ANY login shell verbatim, and `base64 -d | bash` runs it
+// under bash. Returns a value shaped for sshUserCmd's remotecmd arg (double
+// quoted, like the plain mkdir/tar calls).
+def b64BashRemoteCmd(String script)
+{
+    String b64 = script.bytes.encodeBase64().toString()
+    return "\"echo ${b64} | base64 -d | bash\""
+}
+
 // ---------------------------------------------------------------------------
 // SLURM profile generation: fan out perf-harness runs (one per workload, BOLT
 // hook enabled) then a single cross-workload merge (slurm_merge.sh).
@@ -234,7 +248,7 @@ def submitProfileGen(pipeline)
         // bashWrappedRemoteCmd: not all clusters default to bash, so wrap the
         // multi-line script instead of relying on the login shell.
         Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(tarStage)))
+            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(tarStage)))
 
         // Extract the full source tree + wheel from the tarball (which packs the
         // build commit's TensorRT-LLM/src). The perf harness runs from this
@@ -265,7 +279,7 @@ def submitProfileGen(pipeline)
             fi
         """.stripIndent()
         Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(llvmStage)))
+            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(llvmStage)))
 
         // 2) Fan-out: ONE perf-sanity run per workload (Jenkins parallel{}).
         //    Each drives the perf harness (run_disagg.sh) for its test id, with
@@ -321,7 +335,7 @@ def submitProfileGen(pipeline)
         def retentionRoot = "${scratch}/users/svc_tensorrt/bolt-ci"
         Utils.exec(pipeline, timeout: false, numRetries: 1,
             script: Utils.sshUserCmd(remote,
-                "\"find ${retentionRoot} -mindepth 4 -maxdepth 4 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true\""))
+                b64BashRemoteCmd("find ${retentionRoot} -mindepth 4 -maxdepth 4 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true")))
     }
     return bundle
 }
@@ -391,7 +405,7 @@ CONF
         cut -d'|' -f1 ${workDir}/slurm_jobs.txt | head -1
     """.stripIndent()
     return Utils.exec(pipeline, timeout: false, returnStdout: true, numRetries: 1,
-                      script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(script))).trim().readLines().last().trim()
+                      script: Utils.sshUserCmd(remote, b64BashRemoteCmd(script))).trim().readLines().last().trim()
 }
 
 def submitMerge(pipeline, remote, String ws, String fdataRoot, String outDir, String partArgs)
@@ -408,7 +422,7 @@ def submitMerge(pipeline, remote, String ws, String fdataRoot, String outDir, St
         "FDATA_ROOT=${fdataRoot} OUT_DIR=${outDir} BOLT_APPLY=${APPLY_PROFILES == 'true' ? '1' : '0'} " +
         "sbatch --parsable --nodes=1 ${partArgs} internal/slurm_merge.sh"
     return Utils.exec(pipeline, timeout: false, returnStdout: true, numRetries: 1,
-                      script: Utils.sshUserCmd(remote, "\"${cmd}\"")).trim().tokenize(';')[0].trim()
+                      script: Utils.sshUserCmd(remote, b64BashRemoteCmd(cmd))).trim().tokenize(';')[0].trim()
 }
 
 def pollSlurm(pipeline, remote, String jobId, String label)
@@ -462,7 +476,7 @@ def promoteBundle(pipeline, remote, String bundle)
             rm -f ${netrc}
         """.stripIndent()
         Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(promote)))
+            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(promote)))
     }
     pipeline.echo("Promoted. latest = ${base}/latest.tar.gz")
 }
