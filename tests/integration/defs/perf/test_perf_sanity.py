@@ -894,6 +894,10 @@ class ClientConfig:
         self.model_path = ""
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
+        # Derived from lane identity only (gen_only + concurrency == 1); do not
+        # set this from lane YAML. warmup is intentionally not a baseline match
+        # key, which is only sound while its value stays fully determined by
+        # benchmark_mode and concurrency.
         self.warmup = client_config_data.get("warmup", False)
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
@@ -977,8 +981,9 @@ class ClientConfig:
             "ttft,tpot,itl,e2el",
             "--ignore-eos",
         ]
-        # benchmark_serving's initial single-prompt test run doubles as a warmup
-        # request; keep it disabled unless the lane asks for a warmup.
+        # benchmark_serving's initial single-prompt test run (excluded from
+        # metrics) doubles as a warmup request; keep it disabled unless the
+        # lane requests one.
         if not self.warmup:
             benchmark_cmd.append("--no-test-input")
         if dataset_path:
@@ -1049,6 +1054,7 @@ class ClientConfig:
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
             "b_eos": self.spec_decoding,
+            "b_warmup": self.warmup,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -2007,10 +2013,15 @@ class PerfSanityTestConfig:
                 "use_nv_sa_benchmark": use_nv_sa_benchmark,
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
-                # gen_only measures a single round (iterations forced to 1 above),
-                # so one-time costs like the cache transceiver's lazy connection
-                # setup would land entirely on the measured TTFT without a warmup.
-                "warmup": benchmark_mode == "gen_only",
+                # gen_only measures a single round (iterations forced to 1
+                # above), so one-time costs like the cache transceiver's lazy
+                # connection setup would otherwise land entirely on the
+                # measured TTFT. Scoped to concurrency == 1: the gen executor's
+                # fill gate (TLLM_BENCHMARK_REQ_QUEUES_SIZE) only opens once
+                # `concurrency` requests are queued, so a lone warmup request
+                # would deadlock higher-concurrency lanes — which amortize the
+                # cold start anyway.
+                "warmup": benchmark_mode == "gen_only" and concurrency == 1,
             }
             client_config = ClientConfig(
                 client_config_data,
