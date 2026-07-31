@@ -468,16 +468,23 @@ class PerfMetricsManager:
         )
         try:
             os.makedirs(self._events_dir, exist_ok=True)
-            self._events_file = open(path, "a")
+            self._events_file = open(path, "a", encoding="utf-8")
         except OSError as e:
             logger.warning("Failed to open perf time-events file %s: %s", path, e)
+            # Go permanently inert on open failure. Clearing ``_events_dir`` makes
+            # ``maybe_write_request_events`` short-circuit so no further records are
+            # enqueued -- otherwise the bounded queue would fill to ``maxsize`` and
+            # ``close()``'s ``put()`` would block forever on a consumer that has
+            # already exited. Dropping the thread handle lets ``close()`` early-return.
+            self._events_dir = None
+            self._writer_thread = None
             return
         while True:
             record = self._writer_queue.get()
             if record is _WRITER_STOP:
                 break
             try:
-                self._events_file.write(json.dumps(record) + "\n")
+                self._events_file.write(json.dumps(record, default=str) + "\n")
                 self._events_file.flush()
             except (OSError, TypeError) as e:
                 logger.warning("Failed to write perf time-event record: %s", e)
@@ -488,11 +495,18 @@ class PerfMetricsManager:
 
     def close(self) -> None:
         """Flush and stop the writer thread; safe to call when disabled."""
-        if self._writer_thread is None:
+        thread = self._writer_thread
+        if thread is None:
             return
         try:
-            self._writer_queue.put(_WRITER_STOP)
+            # Bounded put: if the writer thread already exited (e.g. it failed to
+            # open its output file) the queue may be full and never drain, so a
+            # blocking put() would hang teardown forever. The timeout plus the
+            # join() below bound close() regardless of the thread's state.
+            self._writer_queue.put(_WRITER_STOP, timeout=5)
+        except queue.Full:
+            pass
         except Exception:  # noqa: BLE001 - best-effort on teardown
             pass
-        self._writer_thread.join(timeout=30)
+        thread.join(timeout=30)
         self._writer_thread = None

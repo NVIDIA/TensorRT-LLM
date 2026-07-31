@@ -45,6 +45,7 @@ import atexit
 import json
 import os
 import queue
+import sys
 import threading
 from typing import Optional
 
@@ -132,11 +133,18 @@ class JsonlEventWriter:
         )
         try:
             os.makedirs(self._events_dir, exist_ok=True)
-            self._events_file = open(path, "a")
+            self._events_file = open(path, "a", encoding="utf-8")
         except OSError as e:
             # No logger dependency here (stdlib-only, torch-free); print to
             # stderr so a misconfigured path is still visible.
-            print(f"WARNING: failed to open perf time-events file {path}: {e}")
+            print(f"WARNING: failed to open perf time-events file {path}: {e}",
+                  file=sys.stderr)
+            # Go permanently inert on open failure: clear the output dir so
+            # write() short-circuits (an unbounded fill to maxsize would otherwise
+            # make close()'s put() block forever on an exited consumer) and drop
+            # the thread handle so close() early-returns.
+            self._events_dir = None
+            self._writer_thread = None
             return
         while True:
             record = self._writer_queue.get()
@@ -146,7 +154,8 @@ class JsonlEventWriter:
                 self._events_file.write(json.dumps(record, default=str) + "\n")
                 self._events_file.flush()
             except (OSError, TypeError) as e:
-                print(f"WARNING: failed to write perf time-event record: {e}")
+                print(f"WARNING: failed to write perf time-event record: {e}",
+                      file=sys.stderr)
         try:
             self._events_file.close()
         except OSError:
@@ -154,18 +163,26 @@ class JsonlEventWriter:
 
     def close(self) -> None:
         """Flush and stop the writer thread; safe to call repeatedly / when inert."""
-        if self._writer_thread is None:
+        thread = self._writer_thread
+        if thread is None:
             return
         if self._dropped:
             print(
                 f"WARNING: perf time-events writer dropped {self._dropped} record(s) "
-                f"({self._filename_prefix}) due to a full queue"
+                f"({self._filename_prefix}) due to a full queue",
+                file=sys.stderr,
             )
         try:
-            self._writer_queue.put(_WRITER_STOP)
+            # Bounded put: if the writer thread already exited (e.g. open failure)
+            # the queue may be full and never drain, so a blocking put() would hang
+            # teardown forever. The timeout plus the join() below bound close()
+            # regardless of the thread's state.
+            self._writer_queue.put(_WRITER_STOP, timeout=5)
+        except queue.Full:
+            pass
         except Exception:  # noqa: BLE001 - best-effort on teardown
             pass
-        self._writer_thread.join(timeout=30)
+        thread.join(timeout=30)
         self._writer_thread = None
 
 
