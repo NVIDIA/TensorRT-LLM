@@ -166,7 +166,8 @@ struct Node
 
 // Build one full bounce node (agent+engine+arena+exec+channel+transport). Returns nullptr if the
 // NIXL agent/backend can't init or the arena can't be registered (caller GTEST_SKIPs). `cfg` supplies
-// arenaBytes/minBlock/windowDepth etc., so callers control the scheduler/arena sizing.
+// arenaSizeBytes/arenaAllocationGranularityBytes/maxInflightChunksPerRequest etc., so callers
+// control the scheduler/arena sizing.
 inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig const& cfg, std::size_t maxDescs)
 {
     auto n = std::make_unique<Node>();
@@ -181,8 +182,9 @@ inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig c
         return nullptr;
     }
     n->eng = std::make_unique<b::NixlTransferEngine>(n->agent->getRawAgent(), 0);
-    n->arena = std::make_unique<b::BounceArena>(cfg.arenaBytes, 0, /*allowFabric=*/false);
-    n->exec = std::make_unique<b::ExecPool>(cfg.windowDepth + 4, maxDescs, 0);
+    n->arena = std::make_unique<b::BounceArena>(cfg.arenaSizeBytes, 0, /*allowFabric=*/false);
+    n->exec = std::make_unique<b::ExecPool>(
+        cfg.maxInflightChunksPerRequest + 4, maxDescs, 0, cfg.useZeroCopyArguments, cfg.useCubCopy);
     if (!n->eng->registerRegion(n->arena->base(), n->arena->bytes()))
     {
         return nullptr;
@@ -195,12 +197,12 @@ inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig c
 
 // Bidirectional connect for the white-box harness. Two SEPARATE wirings are needed here because the
 // transport under test is hand-built (b::BounceTransport with its own b::ZmqControlChannel) and lives
-// OUTSIDE the agent, so — unlike production (bounceAgentE2ETest) — loadRemoteAgent cannot wire it:
+// OUTSIDE the agent, so loadRemoteAgent cannot wire this standalone transport:
 //   - loadRemoteAgent(AgentDesc) exchanges only the NIXL metadata layer (so createXferReq can resolve
-//     the remote arena). We use the AgentDesc path — the one production disagg uses
-//     (tensorrt_llm/_torch/disaggregation/native/transfer.py) — NOT the connection-info path.
+//     the remote arena). The connection-info overload would not carry the structured metadata.
 //   - addPeer() wires the control-channel layer (the DEALER to the peer's ROUTER) on the standalone
-//     transport. Production folds this into loadRemoteAgent + WANT self-bootstrap; here it is manual.
+//     transport. NixlTransferAgent normally folds this into handshake registration plus WANT
+//     self-bootstrap; here it is manual.
 inline void wirePair(Node& a, Node& b)
 {
     a.agent->loadRemoteAgent(b.name, b.agent->getLocalAgentDesc());

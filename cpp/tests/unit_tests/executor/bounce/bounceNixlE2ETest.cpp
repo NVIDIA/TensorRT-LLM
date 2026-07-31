@@ -17,14 +17,13 @@
 
 // Real-NIXL FAILURE/EDGE paths for the bounce v2 pipeline that need a hand-built (white-box)
 // BounceTransport to inject faults the public agent API can't easily reach — a peer that never
-// GRANTs (leaseTimeout) and forgetPeer() while a transfer is in flight. Each test stands up real
+// GRANTs (request timeout) and forgetPeer() while a transfer is in flight. Each test stands up real
 // NixlTransferAgents (agent + UCX backend + metadata via getRawAgent()), registers the bounce arena
 // on each raw agent, and drives standalone BounceTransports over ACTUAL NIXL RDMA.
 //
 // The happy-path / concurrency / bidirectional / multi-agent coverage lives in bounceAgentE2ETest,
 // which drives the SAME pipeline through the production entry point (NixlTransferAgent::
-// submitTransferRequests) with the production one-directional AgentDesc bootstrap — a strictly more
-// faithful setup, so it is not duplicated here.
+// submitTransferRequests) with one-directional AgentDesc bootstrap, so it is not duplicated here.
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceArena.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
@@ -173,8 +172,9 @@ std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig const& c
         return nullptr;
     }
     n->eng = std::make_unique<b::NixlTransferEngine>(n->agent->getRawAgent(), 0);
-    n->arena = std::make_unique<b::BounceArena>(cfg.arenaBytes, 0, /*allowFabric=*/false);
-    n->exec = std::make_unique<b::ExecPool>(cfg.windowDepth + 4, maxDescs, 0);
+    n->arena = std::make_unique<b::BounceArena>(cfg.arenaSizeBytes, 0, /*allowFabric=*/false);
+    n->exec = std::make_unique<b::ExecPool>(
+        cfg.maxInflightChunksPerRequest + 4, maxDescs, 0, cfg.useZeroCopyArguments, cfg.useCubCopy);
     if (!n->eng->registerRegion(n->arena->base(), n->arena->bytes()))
     {
         return nullptr;
@@ -187,12 +187,12 @@ std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig const& c
 
 // Bidirectional connect for the white-box harness. Two SEPARATE wirings are needed here because the
 // transport under test is hand-built (b::BounceTransport with its own b::ZmqControlChannel) and lives
-// OUTSIDE the agent — so, unlike production (bounceAgentE2ETest), loadRemoteAgent cannot wire it:
+// OUTSIDE the agent, so loadRemoteAgent cannot wire this standalone transport:
 //   - loadRemoteAgent(AgentDesc) exchanges only the NIXL metadata layer (so createXferReq can resolve
-//     the remote arena). We use the AgentDesc path — the one production disagg uses — not the
-//     connection-info path.
+//     the remote arena). The connection-info overload would not carry the structured metadata.
 //   - addPeer() wires the control-channel layer (the DEALER to the peer's ROUTER) on the standalone
-//     transport. Production folds this into loadRemoteAgent + WANT self-bootstrap; here it is manual.
+//     transport. NixlTransferAgent normally folds this into handshake registration plus WANT
+//     self-bootstrap; here it is manual.
 void wirePair(Node& a, Node& b)
 {
     a.agent->loadRemoteAgent(b.name, b.agent->getLocalAgentDesc());
@@ -202,26 +202,25 @@ void wirePair(Node& a, Node& b)
 }
 } // namespace
 
-// FAILURE PATH over the real stack: a request whose peer never GRANTs must FAIL on leaseTimeout, not
+// FAILURE PATH over the real stack: a request whose peer never GRANTs must FAIL on requestTimeout, not
 // hang. The sender's WANT goes to a control endpoint with no live receiver transport (nobody grants),
-// so checkTimeouts must resolve the future kFAILURE within ~leaseTimeoutMs (R5 over the real
-// ZmqControlChannel + NixlTransferEngine wiring).
+// so checkTimeouts must resolve the future kFAILURE within ~requestTimeoutMs over the real
+// ZmqControlChannel + NixlTransferEngine wiring.
 TEST(BounceNixlE2E, NoGrantTimesOutNotHang)
 {
     if (!hasCuda())
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    constexpr std::size_t kMaxChunkBytes = 4096;
-    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, kMaxChunkBytes / 256ULL);
+    constexpr std::size_t kMaxChunkSizeBytes = 4096;
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, kMaxChunkSizeBytes / 256ULL);
     b::BounceConfig cfg;
-    cfg.maxChunkBytes = kMaxChunkBytes;
-    cfg.arenaBytes = 1 << 20;
-    cfg.minBlock = 256;
-    cfg.windowDepth = 2;
-    cfg.window = 2;
-    cfg.scatterWorkers = 2;
-    cfg.leaseTimeoutMs = 1500; // short: a no-grant request must fail fast, not hang
+    cfg.maxChunkSizeBytes = kMaxChunkSizeBytes;
+    cfg.arenaSizeBytes = 1 << 20;
+    cfg.arenaAllocationGranularityBytes = 256;
+    cfg.maxInflightChunksPerRequest = 2;
+    cfg.scatterWorkerCount = 2;
+    cfg.requestTimeoutMs = 1500; // short: a no-grant request must fail fast, not hang
 
     auto A = makeNode("toGrantA", cfg, maxDescs);
     if (!A)
@@ -246,23 +245,22 @@ TEST(BounceNixlE2E, NoGrantTimesOutNotHang)
 // corrupt. We submit then immediately forgetPeer the target; the request must RESOLVE (SUCCESS if it
 // beat the queued reclaim, else FAILURE) — never hang. Then several FRESH transfers to the same peer
 // must still complete byte-exact, proving forgetPeer's reclaim returned the regions to the arena and
-// left the reactor healthy (small arena + window -> a leak would soon exhaust it and stall these).
+// left the reactor healthy (a small arena would quickly expose a leaked allocation).
 TEST(BounceNixlE2E, ForgetPeerInFlightRecovers)
 {
     if (!hasCuda())
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    constexpr std::size_t kMaxChunkBytes = 4096;
-    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, kMaxChunkBytes / 256ULL);
+    constexpr std::size_t kMaxChunkSizeBytes = 4096;
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, kMaxChunkSizeBytes / 256ULL);
     b::BounceConfig cfg;
-    cfg.maxChunkBytes = kMaxChunkBytes;
-    cfg.arenaBytes = 1 << 20;
-    cfg.minBlock = 256;
-    cfg.windowDepth = 2;
-    cfg.window = 2;
-    cfg.scatterWorkers = 2;
-    cfg.leaseTimeoutMs = 5000;
+    cfg.maxChunkSizeBytes = kMaxChunkSizeBytes;
+    cfg.arenaSizeBytes = 1 << 20;
+    cfg.arenaAllocationGranularityBytes = 256;
+    cfg.maxInflightChunksPerRequest = 2;
+    cfg.scatterWorkerCount = 2;
+    cfg.requestTimeoutMs = 5000;
 
     auto A = makeNode("fpA", cfg, maxDescs);
     auto B = makeNode("fpB", cfg, maxDescs);
