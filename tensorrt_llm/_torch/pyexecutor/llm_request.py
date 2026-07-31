@@ -766,6 +766,21 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # response (see PyExecutor._handle_responses / LlmResult.spec_dec_totals).
         self.py_total_draft_tokens = 0
         self.py_total_accepted_draft_tokens = 0
+        # Denominator paired with py_num_accepted_draft_tokens: the number of
+        # genuinely proposed draft tokens the sampler verified in the step it
+        # wrote that numerator for (CUDA-graph padding excluded). Written by
+        # the samplers' update_requests, consumed (and reset to 0) by
+        # PyExecutor._accumulate_spec_dec_stats so each verified step is
+        # counted exactly once. py_draft_tokens itself cannot serve as the
+        # denominator: it is padded for CUDA graphs and, in the one-model
+        # flow, already holds the NEXT step's drafts by response time.
+        self.py_num_draft_tokens_verified = 0
+        # Number of real draft tokens installed for the upcoming step,
+        # recorded by Drafter.pad_draft_tokens_for_cuda_graph before it pads
+        # py_draft_tokens to the static max. None when no drafter recorded a
+        # count (e.g. one-model flow, which tracks lengths in its sample
+        # state instead).
+        self.py_draft_tokens_effective_len = None
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
