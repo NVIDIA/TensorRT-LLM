@@ -76,6 +76,10 @@ _PATCH_TARGETS = (
 # bootstrap deadline expires.
 _SHADOW_BUILD_FINISH_GRACE = 30.0
 _FALLBACK_IDENTITY_TIMEOUT = 300.0
+# Mirrors mpi_session._IDENTITY_BARRIER_TIMEOUT: the identity gate spends its
+# bootstrap budget first and only then runs the barrier, so the fallback total
+# has to include both phases.
+_FALLBACK_BARRIER_TIMEOUT = 60.0
 
 
 def _fallback_identity_timeout() -> float:
@@ -92,7 +96,7 @@ def _fallback_identity_timeout() -> float:
 
 
 def _shadow_build_wait_timeout() -> float:
-    """Upper-level wait budget derived from the MPI bootstrap deadline.
+    """Upper-level wait budget derived from the MPI identity-gate budget.
 
     Do not import TensorRT-LLM here: this plugin must stay usable by pure-logic
     tests and suites without built bindings. A real shadow build imports
@@ -100,9 +104,12 @@ def _shadow_build_wait_timeout() -> float:
     setting is present by the time ``take()`` waits on that build.
     """
     mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
-    timeout_fn = getattr(mpi_session, "_identity_barrier_timeout", None)
-    identity_timeout = timeout_fn() if timeout_fn is not None else _fallback_identity_timeout()
-    return identity_timeout + _SHADOW_BUILD_FINISH_GRACE
+    budget_fn = getattr(mpi_session, "identity_gate_budget", None)
+    if budget_fn is not None:
+        gate_budget = budget_fn()
+    else:
+        gate_budget = _fallback_identity_timeout() + _FALLBACK_BARRIER_TIMEOUT
+    return gate_budget + _SHADOW_BUILD_FINISH_GRACE
 
 
 def _reuse_layer_active() -> bool:

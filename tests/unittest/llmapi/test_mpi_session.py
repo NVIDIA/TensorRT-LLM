@@ -17,6 +17,7 @@ from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
                                              _identity_barrier_timeout,
+                                             _identity_bootstrap_timeout,
                                              split_mpi_env)
 
 # isort: off
@@ -221,40 +222,78 @@ def test_wait_workers_exit_bounded_by_timeout_on_live_worker():
     assert 0.2 <= waited < 2.0  # bounded: a wedged worker cannot hang teardown
 
 
+def _resolved_futures(values):
+    from concurrent.futures import Future
+
+    out = []
+    for value in values:
+        f = Future()
+        f.set_result(value)
+        out.append(f)
+    return out
+
+
 def _collect_identities(monkeypatch,
                         results,
                         pending=0,
                         n_workers=2,
-                        observed_timeouts=None):
-    """Drive _collect_worker_identities on an inert stand-in (no MPI spawn)."""
+                        observed_timeouts=None,
+                        bootstrap=None,
+                        manager_alive=True,
+                        killed=None):
+    """Drive _collect_worker_identities on an inert stand-in (no MPI spawn).
+
+    ``results``/``pending`` describe what the *barrier* phase returns.
+    ``bootstrap`` describes what the warm-up phase returns; by default the
+    warm-up mirrors ``results``, i.e. a pool that bootstrapped normally. Pass
+    ``bootstrap=[]`` for a pool whose workers never came up at all.
+    """
     import types
     from concurrent.futures import Future
 
-    futs = []
-    for r in results:
-        f = Future()
-        f.set_result(r)
-        futs.append(f)
-    never = [Future() for _ in range(pending)]  # never resolve
-
     from tensorrt_llm.llmapi import mpi_session as m
 
-    def _fake_wait(fs, timeout):
+    barrier_futs = _resolved_futures(results) + [
+        Future() for _ in range(pending)
+    ]
+    if bootstrap is None:
+        bootstrap = list(results)
+    hello_futs = _resolved_futures(bootstrap)
+    hello_futs += [Future() for _ in range(n_workers - len(hello_futs))]
+
+    real_wait = m.futures_wait
+
+    def _wait(fs, timeout=None, **kwargs):
         if observed_timeouts is not None:
             observed_timeouts.append(timeout)
-        return futs, never
+        return real_wait(fs, timeout=timeout, **kwargs)
 
-    monkeypatch.setattr(m, "futures_wait", _fake_wait)
-    killed = []
+    monkeypatch.setattr(m, "futures_wait", _wait)
+    # Keep the bootstrap phase short: these tests exercise the control flow,
+    # not the production budget (which is asserted directly elsewhere).
+    monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT",
+                       os.environ.get("TRTLLM_MPI_IDENTITY_TIMEOUT", "0.3"))
+    monkeypatch.setattr(m, "_BOOTSTRAP_POLL_INTERVAL", 0.05)
+    monkeypatch.setattr(m, "_IDENTITY_BARRIER_TIMEOUT", 0.1)
+
+    if killed is None:
+        killed = []
     monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
-    it = iter(futs + never)
+    queues = {
+        m._worker_hello: iter(hello_futs),
+        m._worker_identity_barrier: iter(barrier_futs),
+    }
     stand_in = types.SimpleNamespace(
         n_workers=n_workers,
-        mpi_pool=types.SimpleNamespace(submit=lambda fn: next(it),
+        mpi_pool=types.SimpleNamespace(submit=lambda fn: next(queues[fn]),
                                        shutdown=lambda wait=True: None),
-        _teardown_unidentified_pool=lambda ids: MpiPoolSession.
-        _teardown_unidentified_pool(stand_in, ids),
     )
+    stand_in._teardown_unidentified_pool = (
+        lambda ids: MpiPoolSession._teardown_unidentified_pool(stand_in, ids))
+    stand_in._pool_can_make_progress = lambda: manager_alive
+    stand_in._wait_worker_bootstrap = (
+        lambda futures, timeout: MpiPoolSession._wait_worker_bootstrap(
+            stand_in, futures, timeout))
     result = MpiPoolSession._collect_worker_identities(stand_in)
     return result, killed
 
@@ -281,6 +320,109 @@ def test_identity_collection_fails_closed_on_timeout(monkeypatch):
         _collect_identities(monkeypatch, [me], pending=1)
 
 
+def test_identity_gate_marks_every_failure_path(monkeypatch):
+    """(d) One greppable marker, on every way this gate can fail.
+
+    The marker lives in the exception message because that is the channel
+    proven to reach CI logs for this code path.
+    """
+    import pytest as _pytest
+
+    from tensorrt_llm.llmapi.mpi_session import (_IDENTITY_GATE_MARKER,
+                                                 _process_start_time)
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    # barrier phase: bootstrapped, then a worker never reached the barrier
+    with _pytest.raises(RuntimeError) as barrier_exc:
+        _collect_identities(monkeypatch, [me], pending=1)
+    # bootstrap phase: no worker ever ran a task
+    with _pytest.raises(RuntimeError) as bootstrap_exc:
+        _collect_identities(monkeypatch, [me], pending=1, bootstrap=[])
+
+    assert _IDENTITY_GATE_MARKER in str(barrier_exc.value)
+    assert _IDENTITY_GATE_MARKER in str(bootstrap_exc.value)
+    # ...and the two phases are distinguishable, which is the whole point:
+    # a dead pool and a slow one used to emit byte-identical text.
+    assert "phase=barrier" in str(barrier_exc.value)
+    assert "phase=bootstrap" in str(bootstrap_exc.value)
+
+
+def test_dead_pool_fails_without_burning_the_bootstrap_budget(monkeypatch):
+    """Blocker 1: dead and slow must not cost the same wall time.
+
+    mpi4py raises a failed ``MPI_Comm_spawn`` inside its manager thread, so
+    the futures simply never resolve. The thread's death is the positive
+    signal that separates that from a bootstrap that is merely slow.
+    """
+    import time as _time
+
+    import pytest as _pytest
+
+    monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", "30")
+    t0 = _time.monotonic()
+    with _pytest.raises(RuntimeError, match="phase=bootstrap"):
+        _collect_identities(monkeypatch, [],
+                            pending=2,
+                            bootstrap=[],
+                            manager_alive=False)
+    elapsed = _time.monotonic() - t0
+    # Gives up on the positive death signal, not on the 30s deadline.
+    assert elapsed < 5.0
+
+
+def test_slow_bootstrap_is_not_mistaken_for_a_dead_pool(monkeypatch):
+    """The other half of Blocker 1: a live-but-slow pool must be waited for."""
+    import time as _time
+
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    other = (1, b"1")
+    t0 = _time.monotonic()
+    ids, killed = _collect_identities(monkeypatch, [me, other])
+    assert set(ids) == {me, other} and not killed
+    # The healthy path pays no extra deadline: it returns as soon as the
+    # probes come back.
+    assert _time.monotonic() - t0 < 5.0
+
+
+def test_barrier_phase_uses_the_tight_fixed_deadline(monkeypatch):
+    """The guard's own bound must not inherit the bootstrap budget."""
+    from tensorrt_llm.llmapi import mpi_session as m
+
+    assert m._IDENTITY_BARRIER_TIMEOUT == 60.0
+    # ...and it is strictly tighter than the bootstrap budget it replaced,
+    # so widening the bootstrap budget never widens the guard.
+    monkeypatch.delenv("TRTLLM_MPI_IDENTITY_TIMEOUT", raising=False)
+    assert m._IDENTITY_BARRIER_TIMEOUT < m._identity_bootstrap_timeout()
+    assert (m.identity_gate_budget() == m._identity_bootstrap_timeout() +
+            m._IDENTITY_BARRIER_TIMEOUT)
+
+
+def test_warm_up_identities_are_reaped_when_the_barrier_stalls(monkeypatch):
+    """Blocker 2's root cause: a 0/N failure used to reap nothing.
+
+    The warm-up probes are collective-free, so they come back even when the
+    barrier does not — giving the teardown real PIDs to SIGKILL instead of an
+    empty tuple.
+    """
+    import pytest as _pytest
+
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    killed = []
+    with _pytest.raises(RuntimeError, match="phase=barrier"):
+        _collect_identities(monkeypatch, [],
+                            pending=1,
+                            n_workers=1,
+                            bootstrap=[me],
+                            killed=killed)
+    # Before warm-then-measure the barrier returned nothing, partial_identities
+    # was empty, and the SIGKILL loop was a no-op.
+    assert killed == [os.getpid()]
+
+
 def test_identity_collection_fails_closed_on_duplicate_pids(monkeypatch):
     import pytest as _pytest
 
@@ -292,15 +434,11 @@ def test_identity_collection_fails_closed_on_duplicate_pids(monkeypatch):
 
 
 def test_identity_collection_uses_configured_timeout(monkeypatch):
-    from tensorrt_llm.llmapi.mpi_session import _process_start_time
-
+    # The env override now sizes the BOOTSTRAP phase (spawn + import), which
+    # is the phase whose cost varies by node. The barrier phase keeps its own
+    # fixed, tight deadline.
     monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", "123.5")
-    observed_timeouts = []
-    me = (os.getpid(), _process_start_time(os.getpid()))
-    _collect_identities(monkeypatch, [me],
-                        n_workers=1,
-                        observed_timeouts=observed_timeouts)
-    assert observed_timeouts == [123.5]
+    assert _identity_bootstrap_timeout() == 123.5
 
 
 def test_identity_timeout_covers_worker_bootstrap(monkeypatch):
@@ -308,6 +446,35 @@ def test_identity_timeout_covers_worker_bootstrap(monkeypatch):
     # it must exceed the slowest bootstrap the repo measures (~117s busy node).
     monkeypatch.delenv("TRTLLM_MPI_IDENTITY_TIMEOUT", raising=False)
     assert _identity_barrier_timeout() > 117.0
+    assert _identity_bootstrap_timeout() > 117.0
+
+
+def test_wait_shutdown_false_never_touches_the_identity_gate(monkeypatch):
+    """The production default must be byte-for-byte unaffected by this gate.
+
+    ``llm.py`` constructs ``MpiPoolSession`` without ``wait_shutdown``; the
+    two-phase gate (and its warm-up submits) must never run on that path.
+    """
+    import types
+
+    from tensorrt_llm.llmapi import mpi_session as m
+
+    submitted = []
+    monkeypatch.setattr(
+        m.MpiPoolSession, "_start_mpi_pool", lambda self: setattr(
+            self, "mpi_pool",
+            types.SimpleNamespace(submit=lambda fn: submitted.append(fn))))
+    monkeypatch.setattr(
+        m.MpiPoolSession, "_collect_worker_identities",
+        lambda self: pytest.fail("identity gate ran with wait_shutdown=False"))
+    monkeypatch.setattr(m, "ENABLE_MULTI_DEVICE", False)
+    # The inert pool cannot be joined; keep __del__ from arming the abort
+    # watchdog on it.
+    monkeypatch.setattr(m.MpiPoolSession, "shutdown_abort", lambda self: None)
+
+    session = m.MpiPoolSession(n_workers=2)
+    assert session._worker_identities == ()
+    assert submitted == []  # no warm-up probe, no barrier: nothing submitted
 
 
 # Invalid values (unparsable, non-positive) fall back to the default rather
@@ -325,6 +492,39 @@ def test_identity_timeout_covers_worker_bootstrap(monkeypatch):
 def test_identity_timeout_env_override(monkeypatch, raw, expected):
     monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", raw)
     assert _identity_barrier_timeout() == expected
+
+
+def test_wait_shutdown_call_sites_are_inventoried():
+    """Freeze the set of test-infra pool builders that arm the identity gate.
+
+    Every one of these pays the gate's cost and inherits its failure mode, so a
+    new one has to be a deliberate act rather than a copy-paste. If this fails,
+    either the site is intentional (update the inventory) or the caller should
+    reuse an existing builder.
+    """
+    import re
+
+    repo = os.path.abspath(os.path.join(cur_dir, "..", "..", ".."))
+    inventory = {
+        "tests/test_common/session_prefetcher.py": 2,
+        "tests/test_common/session_reuse.py": 3,
+    }
+    pattern = re.compile(
+        r"^\s*[\w.]+\s*=?\s*.*\(\s*n_workers=.*wait_shutdown=True")
+    for rel, expected in inventory.items():
+        path = os.path.join(repo, rel)
+        if not os.path.exists(path):
+            pytest.skip(f"{rel} not present in this checkout")
+        with open(path, encoding="utf-8") as f:
+            found = [
+                line.strip() for line in f if pattern.match(line) or (
+                    "wait_shutdown=True" in line and "n_workers=" in line
+                    and not line.lstrip().startswith("#"))
+            ]
+        assert len(found) == expected, (
+            f"{rel}: {len(found)} wait_shutdown=True pool builders, expected "
+            f"{expected}. New call sites inherit the MPI identity gate's "
+            f"budget and failure mode:\n" + "\n".join(found))
 
 
 def test_prefetch_fallback_identity_timeout_matches_mpi_default():
