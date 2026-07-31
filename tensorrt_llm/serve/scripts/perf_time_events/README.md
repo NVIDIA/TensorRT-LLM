@@ -36,11 +36,33 @@ Setting `TRTLLM_PERF_TIME_EVENTS_PATH` alone:
   `step_metrics` / `ctx_chunk_metrics` entry gains:
   `iter_counter`, `iter_batch_size`, `num_ctx_requests`, `num_gen_requests`,
   `context_token_number`, `generation_token_number`, plus the per-request
-  `req_context_token_number` / `req_generation_token_number`, and the
-  per-iteration starvation counters `num_capacity_fitting` / `num_scheduled`.
+  `req_context_token_number` / `req_generation_token_number`, the
+  per-iteration starvation counters `num_capacity_fitting` / `num_scheduled`,
+  and the scheduler-admission timestamps `scheduled_time` /
+  `capacity_scheduled_time` (the latter is omitted under the merged
+  KV-cache-manager-v2 scheduler, which has no distinct capacity stage).
+  All counts exclude attention-DP / CUDA-graph padding (dummy) requests.
 - Starts a **daemon writer thread per rank** that drains an in-process queue and
   writes the JSONL file. The executor loop only builds a dict and does a
   non-blocking `queue.put_nowait`, so capture stays off the critical path.
+
+### Optional companion timelines (disagg router + benchmark client)
+
+Two more directory env vars capture the timelines from the other processes in a
+disagg run. Both are optional and torch-free (they use the stdlib writer in
+`tensorrt_llm/serve/perf_time_events_writer.py`):
+
+```bash
+# On the disaggregated router/orchestrator (OpenAIDisaggServer):
+export TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH=/tmp/router_events
+# On the benchmark client (benchmark_serving load generator):
+export TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH=/tmp/client_events
+```
+
+They produce `disagg_router_*.jsonl` (router dispatch timeline, joined to
+worker records by `ctx_request_id`) and `client_*.jsonl` (client send timeline,
+surfaced standalone — the client has no shared request id or clock epoch with
+the server).
 
 After the run:
 
@@ -52,9 +74,15 @@ After the run:
 /tmp/kv_csv/<instance>_<rank>_gen_transfer_summary.csv
 ```
 
-Each JSONL record is `{request_id, rank, ctx_request_id, time_breakdown_metrics}`
-— the same `time_breakdown_metrics` shape the `time_breakdown` tool already
-understands, so a single per-rank file can be fed straight to that tool too.
+Each JSONL record is
+`{request_id, rank, ctx_request_id, time_breakdown_metrics, request_timing_metrics?}`
+— the `time_breakdown_metrics` field is the same shape the `time_breakdown` tool
+already understands, so a single per-rank file can be fed straight to that tool
+too. `request_timing_metrics` (present when the request carried perf metrics —
+forced on by the serve entrypoints under `TRTLLM_PERF_TIME_EVENTS_PATH`) holds
+the C++ request-lifecycle scalars (`arrival_time`, `first_scheduled_time`,
+`first_token_time`, `last_token_time`, KV-cache-transfer start/end,
+`kv_cache_size`) as steady-clock seconds.
 
 ## 2. Aggregating (optional)
 
@@ -62,6 +90,8 @@ understands, so a single per-rank file can be fed straight to that tool too.
 python -m tensorrt_llm.serve.scripts.perf_time_events \
     --event-dir /tmp/perf_events \
     --kv-csv-dir /tmp/kv_csv \
+    --router-dir /tmp/router_events \
+    --client-dir /tmp/client_events \
     -o /tmp/perf_events/combined.json \
     --html /tmp/perf_events/timeline.html
 ```
@@ -72,20 +102,31 @@ Arguments (all optional; env-derived defaults shown):
 |---|---|---|
 | `--event-dir` | `$TRTLLM_PERF_TIME_EVENTS_PATH` | Directory of per-rank `time_events_*.jsonl`. |
 | `--kv-csv-dir` | `$TRTLLM_KVCACHE_TIME_OUTPUT_PATH` | Directory of KV-transfer CSVs to join in. |
+| `--router-dir` | `$TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH` | Directory of disagg-router `disagg_router_*.jsonl` (joined by `ctx_request_id`). |
+| `--client-dir` | `$TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH` | Directory of benchmark-client `client_*.jsonl` (standalone timeline). |
 | `--perf-json` | — | An additional `/perf_metrics` JSON dump (aggregated single-server runs). |
 | `-o`, `--output` | `perf_time_events.combined.json` | Combined JSON output path. |
 | `--html [PATH]` | off | Also emit the interactive HTML timeline (reuses `time_breakdown`). |
 
-The combined JSON is `{records, unjoined_kv_events, match_stats}`. Each record
-gains, where available:
+The combined JSON is
+`{records, unjoined_kv_events, unjoined_router_events, client_events, match_stats}`.
+Each record gains, where available:
 
 - `kv_transfer_events` / `kv_gen_summary` / `kv_cpp_events` — KV rows joined by
   `request_id` / `ctx_request_id` (native join key `unique_rid`; C++ join key
   `RequestID`). Rows that never matched a request are reported under
   `unjoined_kv_events` with a match-rate WARNING.
+- `router_dispatch` — the router-side dispatch record, joined **strictly** on
+  `ctx_request_id` (the only key the router and worker genuinely share). A
+  `ctx_request_id` reported by more than one distinct request is treated as
+  non-joinable and surfaced under `unjoined_router_events` instead of
+  false-joining — this is the gen-only benchmark path, where the service
+  hardcodes `ctx_request_id=1` for every request
+  (`TRTLLM_DISAGG_BENCHMARK_GEN_ONLY`).
 - `derived` — `inter_step_gaps` / `inter_chunk_gaps` (idle time between
-  consecutive forward passes) and `starved` (per-iteration
-  `num_capacity_fitting − num_scheduled`).
+  consecutive forward passes), `starved` (per-iteration
+  `num_capacity_fitting − num_scheduled`), and the cross-process lifecycle /
+  router-dispatch spans.
 
 `--html` is the only path that pulls in `plotly` (lazily, via the sibling
 `time_breakdown` package); the parse / merge / JSON path is pure stdlib.
