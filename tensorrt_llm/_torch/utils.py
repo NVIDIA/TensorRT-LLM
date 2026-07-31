@@ -26,6 +26,9 @@ aux_stream_name_list = [
     'MoeOutputMemset',
     'MoeFc2Alpha',
     'EngramPrecompute',
+    'MlaIndexer',
+    'MlaIndexerAux',
+    'MlaCompressor',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',

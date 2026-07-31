@@ -122,7 +122,8 @@ class Eagle3MLAttention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         next_layer_regular: bool = False,
     ):
         config = model_config.pretrained_config
@@ -152,7 +153,7 @@ class Eagle3MLAttention(MLA):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            aux_stream=aux_stream,
+            aux_stream_dict=aux_stream_dict,
         )
 
         # Override the kv_a_proj_with_mqa projection for first layer.
@@ -200,7 +201,7 @@ class Eagle3DecoderLayer(DecoderLayer):
             self.self_attn = Eagle3MLAttention(
                 model_config,
                 layer_idx,
-                aux_stream=aux_stream,
+                aux_stream_dict={AuxStreamType.Attention: aux_stream},
                 next_layer_regular=self._next_layer_regular,
             )
         else:
