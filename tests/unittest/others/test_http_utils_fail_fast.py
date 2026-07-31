@@ -86,6 +86,18 @@ def test_missing_check_file_does_not_crash_the_wait(tmp_path):
     assert "Path doesn't exist" in msg
 
 
+def test_shared_abort_interrupts_endpoint_wait_before_request():
+    def abort_check():
+        raise RuntimeError("paired arm aborted")
+
+    with pytest.raises(RuntimeError, match="paired arm aborted"):
+        wait_for_endpoint_ready(
+            DEAD_URL,
+            timeout=30,
+            abort_check=abort_check,
+        )
+
+
 def test_fail_if_proc_died_raises_with_log_tail(tmp_path):
     """Event-driven babysitter check: dead child -> immediate raise + log tail."""
     log = _server_log(tmp_path, "gen server init...\nfinal gen words\n")

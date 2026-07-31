@@ -31,10 +31,18 @@ import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
 from test_common.perf_sanity_agreement import (
+    BENCHMARK_STATUS_FAILED,
+    BENCHMARK_STATUS_SUCCESS,
     expected_disagg_lifecycle_roles,
     extract_agreement_arm_log,
+    find_backend_event_loop_fatal,
     format_agreement_arm_marker,
     is_paired_agreement_configuration,
+    read_coordination_text,
+    run_polled_command,
+    terminate_subprocess,
+    validate_completed_benchmark_output,
+    write_atomic_coordination_text,
 )
 
 from defs.trt_test_alternative import print_info
@@ -112,6 +120,7 @@ DEFAULT_TIMEOUT = 10800
 # once EVERY ctx/gen worker has finished model load + autotune + warmup.
 AGG_SERVER_READY_TIMEOUT = 1800
 DISAGG_SERVER_READY_TIMEOUT = 3600
+SERVER_PROCESS_TERMINATE_TIMEOUT = 60
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -1077,6 +1086,7 @@ class DisaggConfig:
         model_name: str,
         hardware: dict,
         server_env_var: str,
+        client_timeout_seconds: Optional[int] = None,
         post_benchmark_drain_seconds: float = 0.0,
         expected_context_activations: Optional[int] = None,
         expected_async_terminal_commits: Optional[int] = None,
@@ -1093,6 +1103,7 @@ class DisaggConfig:
         self.model_name = model_name
         self.hardware = hardware
         self.server_env_var = server_env_var
+        self.client_timeout_seconds = client_timeout_seconds
         self.post_benchmark_drain_seconds = post_benchmark_drain_seconds
         self.expected_context_activations = expected_context_activations
         self.expected_async_terminal_commits = expected_async_terminal_commits
@@ -1230,6 +1241,7 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    client_timeout_seconds: Optional[int] = None
     post_benchmark_drain_seconds: float = 0.0
     client_configs: Dict[int, List["ClientConfig"]] = {}
     # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
@@ -1238,6 +1250,53 @@ class DisaggTestCmds(NamedTuple):
     # disagg, only rank-0 pytest goes through this path; multi-rank workers
     # receive env via SLURM env propagation set up by submit.py.
     server_configs: List[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]] = []
+
+    def _terminate_server_process(
+        self,
+        server_proc: subprocess.Popen | None,
+        description: str,
+    ) -> Optional[RuntimeError]:
+        """Terminate a server subprocess without allowing teardown to hang."""
+        if not self._is_paired_agreement_run():
+            if server_proc is not None:
+                server_proc.terminate()
+                server_proc.wait()
+            return None
+        teardown_error = terminate_subprocess(
+            server_proc,
+            description,
+            SERVER_PROCESS_TERMINATE_TIMEOUT,
+        )
+        if teardown_error is not None:
+            print_info(f"{description} required forced teardown: {teardown_error}")
+        return teardown_error
+
+    def _paired_abort_path(self, server_idx: int) -> str:
+        return os.path.join(self.test_output_dir, f"paired_abort.{server_idx}.txt")
+
+    def publish_paired_arm_abort(self, server_idx: int, error: Exception) -> None:
+        """Wake every paired-arm role after any one role fails."""
+        if not self._is_paired_agreement_run():
+            return
+        try:
+            write_atomic_coordination_text(
+                self._paired_abort_path(server_idx),
+                f"{type(error).__name__}: {error}",
+            )
+        except OSError as abort_error:
+            print_info(
+                f"Unable to publish paired-arm abort without masking "
+                f"{type(error).__name__}: {abort_error}"
+            )
+
+    def _fail_if_paired_arm_aborted(self, server_idx: int) -> None:
+        if not self._is_paired_agreement_run():
+            return
+        abort_text = read_coordination_text(self._paired_abort_path(server_idx))
+        if abort_text is not None:
+            raise RuntimeError(
+                f"Paired agreement arm {server_idx} aborted by another role: {abort_text}"
+            )
 
     def _generate_hostname_file(self, server_idx: int, port: int):
         """Create hostname file for coordination."""
@@ -1257,6 +1316,7 @@ class DisaggTestCmds(NamedTuple):
         hostnames = []
 
         while True:
+            self._fail_if_paired_arm_aborted(server_idx)
             elapsed_time = time.time() - start_time
             print_info(
                 f"Waiting for hostnames in {hostnames_folder}, "
@@ -1314,6 +1374,7 @@ class DisaggTestCmds(NamedTuple):
         config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         start_time = time.time()
         while True:
+            self._fail_if_paired_arm_aborted(server_idx)
             if os.path.exists(config_path):
                 print_info(f"Server config file found: {config_path}")
                 break
@@ -1331,6 +1392,7 @@ class DisaggTestCmds(NamedTuple):
 
     def wait_for_benchmark_ready(
         self,
+        server_idx: int,
         benchmark_status_file: str,
         server_proc: subprocess.Popen | None = None,
         server_log: str | None = None,
@@ -1345,12 +1407,31 @@ class DisaggTestCmds(NamedTuple):
         benchmark rank's bounded ready-wait failing fast on the dead endpoint
         -- instead of every rank sitting in this loop for the full timeout.
 
-        The benchmark-done check runs FIRST so a server exiting just after a
+        A paired-arm abort is checked first. Otherwise, benchmark success is
+        checked before process liveness so a server exiting just after a
         completed benchmark cannot fail an otherwise-passing test.
         """
         start_time = time.time()
+        server_log_offset = 0
+        paired_agreement_run = self._is_paired_agreement_run()
         while True:
-            if os.path.exists(benchmark_status_file):
+            self._fail_if_paired_arm_aborted(server_idx)
+            if paired_agreement_run:
+                benchmark_status = read_coordination_text(benchmark_status_file)
+                if benchmark_status == BENCHMARK_STATUS_FAILED:
+                    raise RuntimeError(f"Benchmark role failed for paired arm {server_idx}")
+                if benchmark_status == BENCHMARK_STATUS_SUCCESS:
+                    print_info(
+                        "Benchmark status file found, terminating server "
+                        f"{self.disagg_serving_type}"
+                    )
+                    break
+                if benchmark_status is not None:
+                    raise RuntimeError(
+                        f"Unexpected benchmark status {benchmark_status!r} in "
+                        f"{benchmark_status_file}"
+                    )
+            elif os.path.exists(benchmark_status_file):
                 print_info(
                     f"Benchmark status file found, terminating server {self.disagg_serving_type}"
                 )
@@ -1360,6 +1441,16 @@ class DisaggTestCmds(NamedTuple):
                 f"{self.disagg_serving_type} server",
                 [server_log] if server_log else None,
             )
+            if server_log and paired_agreement_run:
+                fatal_line, server_log_offset = find_backend_event_loop_fatal(
+                    server_log,
+                    server_log_offset,
+                )
+                if fatal_line is not None:
+                    report_error(
+                        f"{self.disagg_serving_type} backend event loop failed: {fatal_line}",
+                        [server_log],
+                    )
             elapsed_time = time.time() - start_time
             print_info(f"Waiting for benchmark status file, elapsed time: {elapsed_time}s")
             if elapsed_time > self.timeout:
@@ -1384,12 +1475,12 @@ class DisaggTestCmds(NamedTuple):
         """Wait until every disaggregated pytest role reaches one arm barrier."""
         if not self._is_paired_agreement_run():
             return
+        self._fail_if_paired_arm_aborted(server_idx)
         marker_dir = os.path.join(self.test_output_dir, f"{barrier_name}.{server_idx}")
         os.makedirs(marker_dir, exist_ok=True)
         marker_name = f"{self.disagg_serving_type}.{os.getenv('SLURM_PROCID', '0')}"
         marker_path = os.path.join(marker_dir, marker_name)
-        with open(marker_path, "w") as marker:
-            marker.write("Done")
+        write_atomic_coordination_text(marker_path, "Done")
 
         ctx_config, gen_config, _ = self.server_configs[server_idx]
         expected_roles = expected_disagg_lifecycle_roles(
@@ -1400,6 +1491,7 @@ class DisaggTestCmds(NamedTuple):
         )
         start_time = time.time()
         while True:
+            self._fail_if_paired_arm_aborted(server_idx)
             observed_roles = set(os.listdir(marker_dir))
             missing_roles = expected_roles.difference(observed_roles)
             if not missing_roles:
@@ -1442,6 +1534,7 @@ class DisaggTestCmds(NamedTuple):
         start_time = time.time()
         pending_evidence = ["paired-arm markers"]
         while True:
+            self._fail_if_paired_arm_aborted(server_idx)
             log_text = None
             if os.path.isfile(log_path):
                 with open(log_path, "r", errors="replace") as log_file:
@@ -1621,11 +1714,16 @@ class DisaggTestCmds(NamedTuple):
         server_logs.append(os.path.join(self.test_output_dir, "disagg_server.log"))
         return server_logs
 
-    @staticmethod
-    def _wait_for_config_file(config_path: str, timeout: int = 600) -> None:
+    def _wait_for_config_file(
+        self,
+        server_idx: int,
+        config_path: str,
+        timeout: int = 600,
+    ) -> None:
         """Wait for a config file to be written by the primary (_0) worker."""
         start_time = time.time()
         while not os.path.exists(config_path):
+            self._fail_if_paired_arm_aborted(server_idx)
             elapsed = time.time() - start_time
             if elapsed > timeout:
                 raise RuntimeError(
@@ -1657,6 +1755,7 @@ class DisaggTestCmds(NamedTuple):
                 flush=True,
             )
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
+            server_proc = None
             port = get_free_port()
             self._generate_hostname_file(server_idx, port)
             is_ctx = "CTX" in self.disagg_serving_type
@@ -1665,7 +1764,7 @@ class DisaggTestCmds(NamedTuple):
             # Non-primary workers wait for _0 worker to write the config file
             if self.disagg_serving_type not in ("CTX_0", "GEN_0"):
                 config_idx = server_cmd.index("--config") + 1
-                self._wait_for_config_file(server_cmd[config_idx])
+                self._wait_for_config_file(server_idx, server_cmd[config_idx])
 
             server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
             try:
@@ -1688,16 +1787,34 @@ class DisaggTestCmds(NamedTuple):
                         stderr=subprocess.STDOUT,
                     )
                     self.wait_for_benchmark_ready(
+                        server_idx,
                         benchmark_status_file,
                         server_proc=server_proc,
                         server_log=server_file_path,
                     )
-            finally:
+            except BaseException as error:
                 print_info(f"Server {self.disagg_serving_type} stopped")
-                server_proc.terminate()
-                server_proc.wait()
+                teardown_error = self._terminate_server_process(
+                    server_proc,
+                    f"{self.disagg_serving_type} server",
+                )
+                if teardown_error is not None:
+                    if hasattr(error, "add_note"):
+                        error.add_note(str(teardown_error))
+                    else:
+                        print_info(str(teardown_error))
+                raise
+            else:
+                print_info(f"Server {self.disagg_serving_type} stopped")
+                teardown_error = self._terminate_server_process(
+                    server_proc,
+                    f"{self.disagg_serving_type} server",
+                )
+                if teardown_error is not None:
+                    raise teardown_error
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
+            disagg_server_proc = None
             try:
                 self._generate_disagg_server_config(server_idx)
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
@@ -1717,22 +1834,38 @@ class DisaggTestCmds(NamedTuple):
                         stderr=subprocess.STDOUT,
                     )
                     self.wait_for_benchmark_ready(
+                        server_idx,
                         benchmark_status_file,
                         server_proc=disagg_server_proc,
                         server_log=disagg_server_file_path,
                     )
-            finally:
+            except BaseException as error:
                 print_info(f"Disagg server {self.disagg_serving_type} stopped")
-                disagg_server_proc.terminate()
-                disagg_server_proc.wait()
+                teardown_error = self._terminate_server_process(
+                    disagg_server_proc,
+                    f"{self.disagg_serving_type} server",
+                )
+                if teardown_error is not None:
+                    if hasattr(error, "add_note"):
+                        error.add_note(str(teardown_error))
+                    else:
+                        print_info(str(teardown_error))
+                raise
+            else:
+                print_info(f"Disagg server {self.disagg_serving_type} stopped")
+                teardown_error = self._terminate_server_process(
+                    disagg_server_proc,
+                    f"{self.disagg_serving_type} server",
+                )
+                if teardown_error is not None:
+                    raise teardown_error
 
         elif self.disagg_serving_type == "BENCHMARK":
-            benchmark_completed = False
             # Perf-benchmark clients whose gen-worker device step time must be
             # parsed once the gen logs are flushed. The parse is deferred out of
             # the client loop because gen_server_*.log keeps being written until
             # the gen srun exits, and the gen srun only exits after
-            # benchmark_status is written in the finally below. Parsing inside
+            # benchmark_status is written after the client/drain block below. Parsing inside
             # the loop (as before) could read a truncated / not-yet-flushed log
             # and report a wrong mean (nvbugs 6487036 / 6487040).
             pending_device_step_time: List[dict] = []
@@ -1747,6 +1880,7 @@ class DisaggTestCmds(NamedTuple):
                         self.timeout, server_ready_timeout(DISAGG_SERVER_READY_TIMEOUT, "DISAGG")
                     ),
                     check_files=self.get_server_logs(server_idx),
+                    abort_check=lambda: self._fail_if_paired_arm_aborted(server_idx),
                 )
 
                 client_configs = self.client_configs.get(server_idx, [])
@@ -1776,14 +1910,23 @@ class DisaggTestCmds(NamedTuple):
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
                             bench_env.update(client_config.to_env())
-                        output = subprocess.check_output(
-                            client_cmd_with_port,
-                            env=bench_env,
-                            stderr=subprocess.STDOUT,
-                        ).decode()
-
-                        with open(benchmark_file_path, "w") as benchmark_ctx:
-                            benchmark_ctx.write(output)
+                        if self.client_timeout_seconds is None:
+                            output = subprocess.check_output(
+                                client_cmd_with_port,
+                                env=bench_env,
+                                stderr=subprocess.STDOUT,
+                            ).decode()
+                            with open(benchmark_file_path, "w") as benchmark_ctx:
+                                benchmark_ctx.write(output)
+                        else:
+                            output = run_polled_command(
+                                client_cmd_with_port,
+                                env=bench_env,
+                                log_path=benchmark_file_path,
+                                timeout_seconds=self.client_timeout_seconds,
+                                abort_check=lambda: self._fail_if_paired_arm_aborted(server_idx),
+                                terminate_timeout_seconds=SERVER_PROCESS_TERMINATE_TIMEOUT,
+                            )
 
                         outputs.append(output)
                         # Defer the gen-worker device-step-time parse until the
@@ -1824,18 +1967,48 @@ class DisaggTestCmds(NamedTuple):
                         output_dir=self.test_output_dir,
                         server_idx=server_idx,
                     )
-                benchmark_completed = True
-
-            finally:
-                if benchmark_completed and self.post_benchmark_drain_seconds > 0:
+                if self.post_benchmark_drain_seconds > 0:
                     print_info(
                         "Benchmark clients completed; keeping services alive for "
                         f"{self.post_benchmark_drain_seconds:g}s so post-client "
                         "transfer consensus can drain"
                     )
                     time.sleep(self.post_benchmark_drain_seconds)
-                with open(benchmark_status_file, "w") as status_file:
-                    status_file.write("Done")
+                if paired_agreement_run:
+                    for client_idx, output in enumerate(outputs):
+                        client_config = (
+                            client_configs[client_idx] if client_idx < len(client_configs) else None
+                        )
+                        if client_config is None or client_config.only_run_accuracy:
+                            continue
+                        required_metrics = dict(PERF_METRIC_LOG_QUERIES)
+                        if client_config.spec_decoding:
+                            required_metrics.update(SPEC_DECODING_PERF_METRIC_LOG_QUERIES)
+                        validate_completed_benchmark_output(
+                            output,
+                            expected_requests=(
+                                client_config.concurrency * client_config.iterations
+                            ),
+                            required_metric_patterns=required_metrics,
+                        )
+            except BaseException as error:
+                try:
+                    write_atomic_coordination_text(
+                        benchmark_status_file,
+                        BENCHMARK_STATUS_FAILED if paired_agreement_run else "Done",
+                    )
+                except OSError as status_error:
+                    status_note = f"Unable to publish benchmark failure status: {status_error}"
+                    if hasattr(error, "add_note"):
+                        error.add_note(status_note)
+                    else:
+                        print_info(status_note)
+                raise
+            else:
+                write_atomic_coordination_text(
+                    benchmark_status_file,
+                    BENCHMARK_STATUS_SUCCESS if paired_agreement_run else "Done",
+                )
 
             # benchmark_status is written, so the gen workers can now stop and
             # their srun will exit and drop gen_server_{i}.done. Wait once for
@@ -1844,11 +2017,11 @@ class DisaggTestCmds(NamedTuple):
             # flushed log is complete, so no settle polling is needed. Only
             # gen_only runs emit prev_device_step_time; other modes parse to
             # None and skip the summary line.
-            # A paired agreement run deliberately keeps each outer GEN srun
-            # alive across the between-arm lifecycle barrier. Its end-of-srun
-            # sentinel therefore cannot exist after the first arm. These are
-            # e2e arms and do not publish the gen-only device-step metric, so
-            # skip this single-run-only postprocessing rather than deadlocking.
+            # An agreement-validation run keeps each outer GEN srun alive
+            # through the lifecycle/evidence barriers. Its end-of-srun sentinel
+            # therefore cannot exist before this test returns. These are e2e
+            # arms and do not publish the gen-only device-step metric, so skip
+            # this single-run-only postprocessing rather than deadlocking.
             if pending_device_step_time and not paired_agreement_run:
                 self.wait_for_gen_log_sentinels()
                 for record in pending_device_step_time:
@@ -2151,6 +2324,11 @@ class PerfSanityTestConfig:
         )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
+        client_timeout_seconds = benchmark.get("client_timeout_seconds")
+        if client_timeout_seconds is not None:
+            client_timeout_seconds = int(client_timeout_seconds)
+            if client_timeout_seconds <= 0:
+                raise ValueError("client_timeout_seconds must be positive")
         post_benchmark_drain_seconds = float(
             benchmark.get("post_benchmark_drain_seconds", 0.0) if benchmark_mode == "e2e" else 0.0
         )
@@ -2293,6 +2471,7 @@ class PerfSanityTestConfig:
                     model_name=model_name,
                     hardware=hardware,
                     server_env_var=server_env_var,
+                    client_timeout_seconds=client_timeout_seconds,
                     post_benchmark_drain_seconds=post_benchmark_drain_seconds,
                     expected_context_activations=expected_context_activations,
                     expected_async_terminal_commits=expected_async_terminal_commits,
@@ -2461,6 +2640,7 @@ class PerfSanityTestConfig:
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
+            client_timeout_seconds=disagg_config.client_timeout_seconds,
             post_benchmark_drain_seconds=disagg_config.post_benchmark_drain_seconds,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
@@ -2513,6 +2693,8 @@ class PerfSanityTestConfig:
 
             except Exception as e:
                 outputs[server_idx] = []
+                if isinstance(commands, DisaggTestCmds):
+                    commands.publish_paired_arm_abort(server_idx, e)
                 # Aggregated mode does not set DISAGG_SERVING_TYPE, so the
                 # default "BENCHMARK" applies and report_error is always called.
                 # Disagg mode sets DISAGG_SERVING_TYPE per srun; only the
