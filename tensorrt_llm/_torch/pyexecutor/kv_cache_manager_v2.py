@@ -2154,15 +2154,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.
 
-        For a disagg gen request whose KV transmission just completed
-        (state == DISAGG_GENERATION_TRANS_COMPLETE), py_draft_tokens is
-        still [] when the scheduler asks for capacity, because it gets
-        mirrored from context_phase_params.draft_tokens later in
-        _prepare_disagg_gen_transmission_complete (which runs AFTER the
-        scheduler in the executor loop). Without compensating here, the
-        first gen forward writes 1 + len(ctx_draft_tokens) tokens into
-        KV cache but only +1 was reserved, OOB-ing the KV block table at
-        the next tokens_per_block-aligned boundary.
+        During the context-to-generation transition, ``py_draft_tokens`` is
+        still empty when the scheduler asks for capacity. Prefer transferred
+        context draft tokens; if there are none, reserve the generation
+        worker's configured draft capacity before its first forward pass.
         """
         draft_len = get_draft_token_length(req)
         if (
@@ -2173,6 +2168,8 @@ class KVCacheManagerV2(BaseResourceManager):
             ctx_draft_tokens = req.context_phase_params.draft_tokens
             if ctx_draft_tokens is not None:
                 draft_len = len(ctx_draft_tokens)
+            if draft_len == 0 and not self.is_draft and not req.py_disable_speculative_decoding:
+                draft_len = self.max_total_draft_tokens
         return draft_len
 
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
