@@ -89,6 +89,16 @@ TEST(ZmqControlChannel, RecvTimesOutWhenIdle)
     EXPECT_FALSE(a.recv(peer, blob, 50)); // nothing sent -> timeout, no spurious message
 }
 
+TEST(ZmqControlChannel, InvalidEndpointsThrow)
+{
+    b::ZmqControlChannel a("invalidEndpointA");
+    EXPECT_ANY_THROW(a.addPeer("emptyPeer", ""));
+    EXPECT_ANY_THROW(a.addPeer("malformedPeer", "not-a-zmq-endpoint"));
+
+    b::ZmqControlChannel valid("validEndpointB");
+    EXPECT_TRUE(a.addPeer("validPeer", valid.localEndpoint()));
+}
+
 TEST(ZmqControlChannel, ManyMessagesPreserveOrderAndContent)
 {
     b::ZmqControlChannel a("ordA");

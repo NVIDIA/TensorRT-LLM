@@ -381,8 +381,9 @@ public:
     BounceTransport(BounceTransport const&) = delete;
     BounceTransport& operator=(BounceTransport const&) = delete;
 
-    /// Register where to reach `peer` (its ControlChannel endpoint).
-    void addPeer(std::string const& peer, std::string const& endpoint);
+    /// Register where to reach `peer` (its ControlChannel endpoint). Returns false when the
+    /// underlying channel cannot load an optional endpoint; a mandatory invalid endpoint may throw.
+    bool addPeer(std::string const& peer, std::string const& endpoint);
 
     /// This agent's capability handshake, encoded for AgentDesc: control endpoint plus the fields a
     /// peer validates before engaging bounce (wire version, control kind and effective chunk cap).
