@@ -63,11 +63,17 @@ class ReuseScope(NamedTuple):
 
 
 class ReuseMatch(NamedTuple):
-    """Volatile result of a KV cache prefix match."""
+    """Volatile result of a KV cache prefix match.
+
+    ``num_tokens_before_ssm_pruning`` is the longest reusable attention-prefix
+    match after attention-page availability checks but before an SSM snapshot
+    is required. For Kimi K3, the attention life cycles hold MLA cache pages.
+    """
 
     blocks: list["Block"]
     num_tokens: int
     num_lookup_tokens: int
+    num_tokens_before_ssm_pruning: int
 
 
 # id_offset is usually vocab_size
@@ -583,7 +589,7 @@ class BlockRadixTree:
                 block = partial_block
                 yield block, match_len
 
-    def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
+    def _prune_match(self, matched: list[tuple[Block, int]]) -> tuple[list[tuple[Block, int]], int]:
         tokens_per_block = self._tokens_per_block
         assert all(b[1] == tokens_per_block for b in matched[:-1])
 
@@ -612,6 +618,7 @@ class BlockRadixTree:
             n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
             if n < lc.num_sink_blocks:
                 matched = matched[:n]
+        num_tokens_before_ssm_pruning = self._num_matched_tokens(matched)
         # Check SSM snapshot availability before SWA window constraints.
         # Truncating to the last reusable SSM snapshot can change the matched
         # length used by the SWA check.
@@ -662,7 +669,7 @@ class BlockRadixTree:
                     break
             else:
                 break
-        return matched
+        return matched, num_tokens_before_ssm_pruning
 
     def match(
         self,
@@ -676,13 +683,14 @@ class BlockRadixTree:
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
         """
-        matched = self._prune_match(
+        matched, num_tokens_before_ssm_pruning = self._prune_match(
             list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         )
         return ReuseMatch(
             [block for block, _ in matched],
             self._num_matched_tokens(matched),
             len(tokens),
+            num_tokens_before_ssm_pruning,
         )
 
     def _check_sanity(self) -> bool:

@@ -154,6 +154,10 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
         # In-place venv of the built checkout (build_wheel.py creates .venv-3.12).
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
 
+        # The leader receives --log_level through trtllm-serve. Spawned MPI
+        # workers read TLLM_LOG_LEVEL instead, so export it for all ranks.
+        export TLLM_LOG_LEVEL=\${TLLM_LOG_LEVEL:-info}
+
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' trtllm-serve \
             \"$MODEL\" \
             --backend pytorch \

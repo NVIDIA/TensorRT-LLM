@@ -2193,7 +2193,7 @@ class TestSSMSupport(unittest.TestCase):
 
     def test_ssm_reuse_keeps_snapshots_from_multiple_commits(self) -> None:
         """Multiple commit() calls keep independently reusable SSM snapshots."""
-        cfg = self._make_ssm_reuse_config(tokens_per_block=32)
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
         self.manager = KVCacheManager(cfg)
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
@@ -2214,6 +2214,8 @@ class TestSSMSupport(unittest.TestCase):
         kv2.close()
 
         kv3 = self.manager.create_kv_cache(input_tokens=prompt[:48])
+        # Attention pages cover all 48 tokens, but the latest SSM snapshot is 32.
+        self.assertEqual(kv3.num_tokens_before_ssm_pruning, 48)
         self.assertEqual(kv3.num_committed_tokens, 32)
         kv3.resume(stream)
         kv3.close()

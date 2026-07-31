@@ -18,7 +18,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
-                    Optional, Tuple, Union)
+                    Optional, Sequence, Tuple, Union)
 
 import torch
 import triton
@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy, KVCacheManagerV2, Role)
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
+    KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -50,7 +52,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
-                                                      SsmLayerConfig)
+                                                      SsmLayerConfig,
+                                                      TokenIdExt, _KVCache)
 
 GB = 1 << 30
 
@@ -2772,6 +2775,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
         self._seed_rank_offset = _mamba_rank_offset(mapping)
         self._seed_request_counter = 0
+        self._recurrent_evicted_blocks_total = 0
+        self._recurrent_onboarded_blocks_total = 0
+        self._recurrent_dropped_blocks_total = 0
         num_cuda_graph_padding_dummy_slots = (
             _get_num_cuda_graph_padding_dummy_slots(spec_config,
                                                     max_batch_size))
@@ -2934,6 +2940,85 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.all_ssm_states = []
             self.all_conv_states = []
             self._setup_replay_buffers(spec_config)
+
+    def _create_kv_cache(
+        self,
+        request_id: int,
+        lora_task_id: Optional[int],
+        input_tokens: Optional[Sequence[TokenIdExt]],
+        *,
+        cache_salt: Optional[str] = None,
+        is_dummy: bool = False,
+        expected_prompt_length: Optional[int] = None,
+    ) -> Optional[_KVCache]:
+        kv_cache = super()._create_kv_cache(
+            request_id,
+            lora_task_id,
+            input_tokens,
+            cache_salt=cache_salt,
+            is_dummy=is_dummy,
+            expected_prompt_length=expected_prompt_length,
+        )
+        if (kv_cache is not None and input_tokens is not None and not is_dummy
+                and self.local_num_mamba_layers > 0):
+            # Prefix lookup excludes the final prompt token because it must be
+            # recomputed by prefill. Restore it for the request-length metric.
+            request_total_tokens = len(input_tokens) + 1
+            logger.info(
+                f"[MambaHybridCacheManagerV2] prefix reuse rank={self.mapping.rank} "
+                f"request_id={request_id} "
+                f"request_total_tokens={request_total_tokens} "
+                f"longest_attention_match_tokens="
+                f"{kv_cache.num_tokens_before_ssm_pruning} "
+                f"latest_recurrent_snapshot_tokens="
+                f"{kv_cache.num_committed_tokens}")
+        return kv_cache
+
+    def get_iteration_stats(self) -> Optional[KVCacheV2IterationStatsReport]:
+        """Log recurrent-cache movement; this is KDA state for Kimi K3."""
+        report = super().get_iteration_stats()
+        if report is None:
+            return None
+
+        ssm_life_cycle_id = self.impl._life_cycles.ssm_life_cycle_id
+        if ssm_life_cycle_id is None:
+            return report
+        pool_group_id = int(
+            self.impl._storage.get_pool_group_index(ssm_life_cycle_id))
+        pool_group_report = report.by_pool_group.get(pool_group_id)
+        if pool_group_report is None:
+            return report
+
+        stats = pool_group_report.stats
+        evicted_blocks = stats.iter_offload_blocks
+        onboarded_blocks = stats.iter_onboard_blocks
+        dropped_blocks = stats.iter_host_dropped_blocks
+        if evicted_blocks or onboarded_blocks or dropped_blocks:
+            self._recurrent_evicted_blocks_total += evicted_blocks
+            self._recurrent_onboarded_blocks_total += onboarded_blocks
+            self._recurrent_dropped_blocks_total += dropped_blocks
+            logger.info(
+                f"[MambaHybridCacheManagerV2] recurrent cache movement "
+                f"rank={self.mapping.rank} pool_group_id={pool_group_id} "
+                f"evicted_recurrent_blocks={evicted_blocks} "
+                f"evicted_recurrent_bytes={stats.iter_offload_bytes} "
+                f"onboarded_recurrent_blocks={onboarded_blocks} "
+                f"onboarded_recurrent_bytes={stats.iter_onboard_bytes} "
+                f"dropped_recurrent_blocks={dropped_blocks} "
+                f"dropped_recurrent_bytes={stats.iter_host_dropped_bytes} "
+                f"total_evicted_recurrent_blocks="
+                f"{self._recurrent_evicted_blocks_total} "
+                f"total_onboarded_recurrent_blocks="
+                f"{self._recurrent_onboarded_blocks_total} "
+                f"total_dropped_recurrent_blocks="
+                f"{self._recurrent_dropped_blocks_total} "
+                f"gpu_used_recurrent_blocks={stats.primary_used_num_blocks} "
+                f"gpu_free_recurrent_blocks={stats.primary_free_num_blocks} "
+                f"gpu_evictable_recurrent_blocks="
+                f"{stats.primary_evictable_num_blocks} "
+                f"host_used_recurrent_blocks={stats.secondary_used_num_blocks} "
+                f"host_free_recurrent_blocks={stats.secondary_free_num_blocks}")
+        return report
 
     @staticmethod
     def get_cache_size_per_token(model_config,

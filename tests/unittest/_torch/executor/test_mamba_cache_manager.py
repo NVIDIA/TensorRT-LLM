@@ -2113,6 +2113,88 @@ def test_v2_hybrid_uses_upstream_min_snapshot_policy():
         mgr.shutdown()
 
 
+@pytest.mark.parametrize("rank", [0, 3])
+def test_v2_hybrid_logs_prefix_reuse_on_each_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+) -> None:
+    kv_cache = SimpleNamespace(
+        num_tokens_before_ssm_pruning=96,
+        num_committed_tokens=64,
+    )
+    create_kv_cache = MagicMock(return_value=kv_cache)
+    log_info = MagicMock()
+    monkeypatch.setattr(KVCacheManagerV2, "_create_kv_cache", create_kv_cache)
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.info", log_info)
+
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.mapping = SimpleNamespace(rank=rank)
+    mgr.local_num_mamba_layers = 1
+    result = mgr._create_kv_cache(
+        request_id=123,
+        lora_task_id=None,
+        input_tokens=list(range(127)),
+        expected_prompt_length=127,
+    )
+
+    assert result is kv_cache
+    log_info.assert_called_once_with(
+        f"[MambaHybridCacheManagerV2] prefix reuse rank={rank} request_id=123 "
+        "request_total_tokens=128 "
+        "longest_attention_match_tokens=96 "
+        "latest_recurrent_snapshot_tokens=64"
+    )
+
+
+def test_v2_hybrid_logs_recurrent_cache_eviction_and_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats = SimpleNamespace(
+        iter_offload_blocks=3,
+        iter_offload_bytes=300,
+        iter_onboard_blocks=1,
+        iter_onboard_bytes=100,
+        iter_host_dropped_blocks=2,
+        iter_host_dropped_bytes=200,
+        primary_used_num_blocks=11,
+        primary_free_num_blocks=5,
+        primary_evictable_num_blocks=4,
+        secondary_used_num_blocks=7,
+        secondary_free_num_blocks=9,
+    )
+    report = SimpleNamespace(
+        by_pool_group={6: SimpleNamespace(stats=stats)},
+    )
+    monkeypatch.setattr(KVCacheManagerV2, "get_iteration_stats", MagicMock(return_value=report))
+    log_info = MagicMock()
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.info", log_info)
+
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.mapping = SimpleNamespace(rank=3)
+    mgr.impl = SimpleNamespace(
+        _life_cycles=SimpleNamespace(ssm_life_cycle_id=2),
+        _storage=SimpleNamespace(get_pool_group_index=MagicMock(return_value=6)),
+    )
+    mgr._recurrent_evicted_blocks_total = 0
+    mgr._recurrent_onboarded_blocks_total = 0
+    mgr._recurrent_dropped_blocks_total = 0
+
+    assert mgr.get_iteration_stats() is report
+    log_info.assert_called_once_with(
+        "[MambaHybridCacheManagerV2] recurrent cache movement "
+        "rank=3 pool_group_id=6 "
+        "evicted_recurrent_blocks=3 evicted_recurrent_bytes=300 "
+        "onboarded_recurrent_blocks=1 onboarded_recurrent_bytes=100 "
+        "dropped_recurrent_blocks=2 dropped_recurrent_bytes=200 "
+        "total_evicted_recurrent_blocks=3 "
+        "total_onboarded_recurrent_blocks=1 "
+        "total_dropped_recurrent_blocks=2 "
+        "gpu_used_recurrent_blocks=11 gpu_free_recurrent_blocks=5 "
+        "gpu_evictable_recurrent_blocks=4 "
+        "host_used_recurrent_blocks=7 host_free_recurrent_blocks=9"
+    )
+
+
 @skip_no_cuda
 def test_v2_hybrid_preserves_per_conversation_and_disables_periodic_snapshots():
     mgr = _build_v2_hybrid_with_mamba_layer(
