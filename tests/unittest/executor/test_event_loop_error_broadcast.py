@@ -13,8 +13,15 @@ neither GPUs nor models.
 import datetime
 import queue as _stdlib_queue
 
+import pytest
+
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper
 from tensorrt_llm.executor.utils import ErrorResponse
+
+# CI's CPU stages select tests with ``-m "cpu_only and not disabled"``; without
+# this marker the whole file is deselected and pytest exits 5 (no tests ran),
+# which the runner reports as a failure. These are pure stub-based unit tests.
+pytestmark = pytest.mark.cpu_only
 
 
 class _EngineStub:
@@ -56,6 +63,9 @@ class _WorkerStub:
         self.popped = []
         self.result_queue = None
         self.postproc_queues = None
+        # responses_handler() reads this unguarded (base_worker.py); BaseWorker
+        # sets it in __init__, which this stub bypasses, so seed it to None.
+        self.frontend_result_queues = None
 
         # Echoed straight back so __call__'s filter is a no-op.
         def _engine_response_callback(r):
