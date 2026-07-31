@@ -1188,49 +1188,63 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
         long executeStartMs = System.currentTimeMillis()
-        try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext)
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            // Decide whether this failure is a SLURM timeout (the test ran to
-            // its partition walltime) rather than a transient infra blip.
-            // Measure elapsed from when the job was first observed RUNNING.
-            // Fall back to executeStartMs if the RUNNING stamp was never set.
+        // Reclassify a raw test-execution failure against the SLURM job's terminal
+        // state: a walltime kill is a UserFailure (not retryable), while a job still
+        // alive when the monitor lost contact is transient infra (retry on a fresh
+        // node). Kept as a closure so executeLLMTestOnSlurm can apply it INSIDE the
+        // task runner -- that way cacheErrorAndUploadResult suppresses this attempt's
+        // junit for the SAME typed failure the retry loop acts on. Deciding it only
+        // here (after junit already ran) is what left retried-and-passed agent stages
+        // UNSTABLE from an intermediate attempt's results.
+        def classifySlurmFailure = { Throwable err ->
+            // Measure elapsed from when the job was first observed RUNNING; fall back
+            // to executeStartMs if the RUNNING stamp was never set.
             long timeoutBaselineMs = (jobRunningStartMs ?: executeStartMs) as long
             long elapsedMin = Math.floorDiv(System.currentTimeMillis() - timeoutBaselineMs, 60000L)
             Integer walltimeMin = (partition?.time ?: SlurmConfig.DEFAULT_TIMEOUT_SHORT) as Integer
             def slurmState = querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobID)
 
             if (slurmState == "TIMEOUT") {
-                throw new UserFailure(
+                return new UserFailure(
                     "SLURM job ${slurmJobID} for ${stageName} ended in state TIMEOUT " +
                     "(hit partition walltime ${walltimeMin}min); treating as a test timeout, not retrying. " +
-                    "Original failure: ${e.message}",
-                    e)
+                    "Original failure: ${err.message}",
+                    err)
             }
 
             if (slurmState == null && walltimeMin != null
                     && elapsedMin >= (long)(SLURM_TIMEOUT_RETRY_FRACTION * walltimeMin)) {
-                throw new UserFailure(
+                return new UserFailure(
                     "SLURM job ${slurmJobID} for ${stageName} ran ${elapsedMin}min " +
                     "(>= ${(int)(SLURM_TIMEOUT_RETRY_FRACTION * 100)}% of the ${walltimeMin}min walltime) and " +
                     "the SLURM controller was unreachable for an authoritative state; treating as a likely " +
-                    "timeout, not retrying. Original failure: ${e.message}",
-                    e)
+                    "timeout, not retrying. Original failure: ${err.message}",
+                    err)
             }
 
             if (isNonTerminalSlurmState(slurmState)) {
-                throw new InfraFailure(
+                return new InfraFailure(
                     "SLURM job ${slurmJobID} for ${stageName} is still in non-terminal state ${slurmState} " +
                     "(${elapsedMin}min of ${walltimeMin}min walltime); the monitor lost contact while the job was " +
-                    "alive (transient infra), so this is not a test failure. Original failure: ${e.message}",
-                    e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
+                    "alive (transient infra), so this is not a test failure. Original failure: ${err.message}",
+                    err, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
             }
 
             echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} terminal state=${slurmState ?: 'unknown'}, " +
                  "ran ${elapsedMin}min of ${walltimeMin}min walltime; deferring to failure classifier."
+            return err
+        }
+        try {
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+        } catch (InterruptedException e) {
             throw e
+        } catch (Exception e) {
+            // A test-execution failure was already labeled inside the task runner, so
+            // this attempt's junit suppression and the retry loop see the same typed
+            // failure -- just propagate it. Failures raised outside the task runner
+            // (image pull, node/agent bring-up, etc.) were never labeled, so classify
+            // them here on the agent.
+            throw (e instanceof TrtllmCiException ? e : classifySlurmFailure(e))
         }
     } finally {
         // Resource cleanup must run even if SLURM metadata capture is interrupted.
@@ -1254,12 +1268,26 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null, Closure classifySlurmFailure=null)
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(stageName, {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, false, postTag, useClusterDurations)
+            try {
+                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, false, postTag, useClusterDurations)
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                // Label the failure against the SLURM job's terminal state before
+                // cacheErrorAndUploadResult decides junit suppression, so a monitor-
+                // detected infra failure (e.g. slurm-job-still-running) suppresses this
+                // attempt's results and a passing retry stays green. Pipeline aborts
+                // (FlowInterruptedException) must not be relabeled.
+                if (classifySlurmFailure == null || e.getClass().name.contains("FlowInterruptedException")) {
+                    throw e
+                }
+                throw classifySlurmFailure(e)
+            }
         }, {
             // If the execution test list is null, remove the test result xml
             sh """
