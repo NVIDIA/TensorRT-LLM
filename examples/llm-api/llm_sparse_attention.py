@@ -33,9 +33,9 @@ python llm_sparse_attention.py \
     --prompt_budget 2048
 ```
 
-When ``--input_file`` is omitted, the example uses a built-in long prompt that
-exceeds the default ``prompt_budget`` and exercises RocketKV's sparse attention
-path.
+When ``--input_file`` is omitted, the example uses a built-in
+needle-in-a-haystack prompt that exceeds the default ``prompt_budget`` and
+exercises the sparse attention path.
 """
 import argparse
 import json
@@ -45,15 +45,53 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, DeepSeekSparseAttentionConfig,
                                  KvCacheConfig, MoeConfig,
                                  RocketSparseAttentionConfig)
 
-_DEFAULT_PROMPT_CONTEXT = (
-    "TensorRT-LLM accelerates large language model inference on NVIDIA GPUs. "
-    "It combines optimized CUDA kernels, quantization, and in-flight batching "
-    "to improve throughput and latency. Efficient KV cache management helps "
-    "serve long contexts while controlling GPU memory use. ")
-DEFAULT_PROMPTS = [
-    _DEFAULT_PROMPT_CONTEXT * 64 +
-    "\nSummarize the main idea of the preceding context in one sentence."
-]
+# The built-in prompt follows a self-contained needle-in-a-haystack layout:
+# 1. Cycle routine expedition log templates to form a deterministic haystack.
+# 2. Replace one numbered log entry with a unique access-code needle.
+# 3. Append a question that asks the model to retrieve the needle.
+# With the default model, 128 entries produce about 2.8K tokens, exceeding the
+# default 2,048-token prompt budget so that sparse attention is exercised.
+_DEFAULT_LOG_TEMPLATES = (
+    "The survey team checked the northern weather station and recorded normal "
+    "temperature and pressure readings.",
+    "Technicians inspected backup batteries, radio transmitters, and emergency "
+    "lighting; all systems passed routine checks.",
+    "Researchers cataloged soil samples, labeled storage containers, and "
+    "updated the expedition inventory.",
+    "The navigation group reviewed trail maps, satellite images, and the next "
+    "day's travel schedule.",
+    "At sunset, the field crew secured scientific instruments and uploaded the "
+    "day's measurements.",
+    "The medical officer reviewed first-aid supplies and confirmed the "
+    "evacuation plan with base camp.",
+    "Engineers calibrated wind sensors and verified timestamps against the "
+    "observatory master clock.",
+    "The logistics team counted food, water, fuel, and spare parts before "
+    "closing the storage area.",
+)
+_DEFAULT_NUM_LOG_ENTRIES = 128
+_DEFAULT_NEEDLE_INDEX = 87
+_DEFAULT_ACCESS_CODE = "314159"
+
+
+def _build_default_prompt():
+    log_entries = []
+    for index in range(_DEFAULT_NUM_LOG_ENTRIES):
+        if index == _DEFAULT_NEEDLE_INDEX:
+            message = (f"The expedition access code is {_DEFAULT_ACCESS_CODE}. "
+                       "Remember this code for the final question.")
+        else:
+            message = _DEFAULT_LOG_TEMPLATES[index %
+                                             len(_DEFAULT_LOG_TEMPLATES)]
+        log_entries.append(f"Log entry {index}: {message}")
+
+    return (
+        "Read the following expedition field log carefully. One entry contains "
+        "an access code that you will need to recall.\n\n" +
+        "\n".join(log_entries) + "\n\nWhat is the expedition access code?")
+
+
+DEFAULT_PROMPTS = [_build_default_prompt()]
 
 
 def read_input(input_file):
