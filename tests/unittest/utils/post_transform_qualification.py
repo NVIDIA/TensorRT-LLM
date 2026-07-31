@@ -23,12 +23,16 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
-from tensorrt_llm._torch.weight_sharing import PostTransformQualificationDecision
+from tensorrt_llm._torch.weight_sharing import (
+    PostTransformQualificationDecision,
+    PostTransformQualificationReason,
+)
 
 ModelFactory = Callable[[], nn.Module]
 ModelQualifier = Callable[[nn.Module], PostTransformQualificationDecision]
 ReceiverPreparer = Callable[[nn.Module, nn.Module], None]
 StateProbe = Callable[[nn.Module], object]
+OutputProbe = Callable[[nn.Module], object]
 
 
 def copy_post_transform_parameters(producer: nn.Module, receiver: nn.Module) -> None:
@@ -73,6 +77,11 @@ def copy_post_transform_parameters(producer: nn.Module, receiver: nn.Module) -> 
 class PostTransformQualificationCase:
     """Inputs needed to prove full and staged post-load lifecycle equivalence.
 
+    `unqualified_model_factory` must preserve the candidate config dimensions
+    while returning an unregistered exact root type. `output_probes` should be
+    deterministic and exercise the deepest practical output path for the unit
+    fixture; real donor/receiver GPU output coverage remains a separate gate.
+
     `prepare_receiver` simulates installation of a producer's post-transform
     tensors when a family needs value-level coverage. A real MX donor/receiver
     test is still required before enabling a production profile.
@@ -80,8 +89,10 @@ class PostTransformQualificationCase:
 
     profile_id: str
     model_factory: ModelFactory
+    unqualified_model_factory: ModelFactory
     qualify_model: ModelQualifier
     state_probes: tuple[tuple[str, StateProbe], ...]
+    output_probes: tuple[tuple[str, OutputProbe], ...]
     prepare_receiver: ReceiverPreparer = copy_post_transform_parameters
 
     def __post_init__(self) -> None:
@@ -89,9 +100,14 @@ class PostTransformQualificationCase:
             raise ValueError("Qualification case profile_id must not be empty")
         if not self.state_probes:
             raise ValueError("Qualification case must define at least one state probe")
-        probe_names = tuple(name for name, _probe in self.state_probes)
-        if len(probe_names) != len(set(probe_names)):
+        if not self.output_probes:
+            raise ValueError("Qualification case must define at least one output probe")
+        state_probe_names = tuple(name for name, _probe in self.state_probes)
+        if len(state_probe_names) != len(set(state_probe_names)):
             raise ValueError("Qualification case state probe names must be unique")
+        output_probe_names = tuple(name for name, _probe in self.output_probes)
+        if len(output_probe_names) != len(set(output_probe_names)):
+            raise ValueError("Qualification case output probe names must be unique")
 
 
 def _transform_guard_state(model: nn.Module) -> dict[str, bool]:
@@ -190,6 +206,20 @@ def assert_post_transform_lifecycle_equivalent(
     assert decision.profile is not None
     assert decision.profile.profile_id == case.profile_id
 
+    unqualified_model = case.unqualified_model_factory()
+    unqualified_decision = case.qualify_model(unqualified_model)
+    assert not unqualified_decision.qualified, (
+        f"Negative-control root {type(unqualified_model).__name__!r} unexpectedly "
+        f"inherited profile {case.profile_id!r}"
+    )
+    assert (
+        unqualified_decision.reason
+        is PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+    ), (
+        f"Negative-control root {type(unqualified_model).__name__!r} was rejected for "
+        f"{unqualified_decision.reason.value!r}, not exact root-class registration"
+    )
+
     transform_calls = _install_transform_call_recorders(receiver)
     ModelLoader._walk_full_post_load(producer)
     ModelLoader._setup_aliases(receiver)
@@ -220,5 +250,23 @@ def assert_post_transform_lifecycle_equivalent(
             f"Post-transform qualification probe {probe_name!r} differs "
             f"for profile {case.profile_id!r}"
         )
+
+    for probe_name, probe in case.output_probes:
+        with torch.no_grad():
+            producer_output = probe(producer)
+            receiver_output = probe(receiver)
+        try:
+            torch.testing.assert_close(
+                receiver_output,
+                producer_output,
+                rtol=0,
+                atol=0,
+                equal_nan=True,
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                f"Post-transform output probe {probe_name!r} differs "
+                f"for profile {case.profile_id!r}"
+            ) from error
 
     return producer, receiver
