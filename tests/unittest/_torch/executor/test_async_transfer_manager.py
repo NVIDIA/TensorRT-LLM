@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 
 from unittest.mock import MagicMock
 
-from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager
+from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager, AsyncTransferProvider
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 
@@ -110,6 +110,25 @@ def test_start_transfer_multiple_transfers_same_request():
 
     manager.end_transfer(request)
     kv_cache_manager.unpin_blocks_by_id.assert_called_once()
+
+
+def test_end_transfer_retires_only_the_selected_provider():
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.store_blocks_for_reuse.return_value = 100
+    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
+    manager = AsyncTransferManager(resource_manager)
+    request = create_mock_request(42)
+
+    manager.start_transfer(request, AsyncTransferProvider.TRANSCEIVER)
+    manager.start_transfer(request, AsyncTransferProvider.CONNECTOR)
+
+    assert not manager.end_transfer(request, AsyncTransferProvider.TRANSCEIVER)
+    assert not manager.has_transfer(request, AsyncTransferProvider.TRANSCEIVER)
+    assert manager.has_transfer(request, AsyncTransferProvider.CONNECTOR)
+    kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+
+    assert manager.end_transfer(request, AsyncTransferProvider.CONNECTOR)
+    kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(100)
 
 
 def test_transfer_without_storing_blocks():

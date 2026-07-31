@@ -18,6 +18,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationRequest, GenerationResult,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
+from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
 from tensorrt_llm.sampling_params import SamplingParams
@@ -27,6 +28,32 @@ from utils.llm_data import llm_models_root
 # isort: on
 
 WORLD_SIZE = mpi_world_size()
+
+
+class _ChangingDisaggregatedParamsExecutor:
+
+    def __init__(self) -> None:
+        self.params = {}
+        self.calls = 0
+
+    def get_disaggregated_params(self) -> dict:
+        self.calls += 1
+        return self.params
+
+
+def test_disaggregated_params_comes_from_current_executor_lifetime() -> None:
+    llm = BaseLLM.__new__(BaseLLM)
+    executor = _ChangingDisaggregatedParamsExecutor()
+    llm._executor = executor
+
+    assert llm.disaggregated_params == {}
+
+    executor.params = {
+        "ctx_info_endpoint": ["tcp://final:2000"],
+        "ctx_endpoint_generation": "final-generation",
+    }
+    assert llm.disaggregated_params == executor.params
+    assert executor.calls == 2
 
 
 @pytest.fixture(scope="module")
