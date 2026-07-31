@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import re
 import subprocess
 from typing import Dict, List, Optional
 
@@ -129,24 +128,70 @@ def _call_via_dlsym(path: str) -> bool:
     return True
 
 
+def _nm_tools() -> List[str]:
+    """`nm` binaries to try, preferring the staged LLVM toolchain.
+
+    The symbol is hidden (absent from .dynsym) so we read .symtab via nm. The
+    workload container (a pytorch base image) usually has NO binutils, but the
+    BOLT profile-gen job stages an LLVM toolchain and exports BOLT_LLVM_DIR into
+    the container -- llvm-nm lives there. Fall back to any system nm.
+    """
+    tools: List[str] = []
+    llvm_dir = os.environ.get("BOLT_LLVM_DIR", "").strip()
+    if llvm_dir:
+        tools.append(os.path.join(llvm_dir, "bin", "llvm-nm"))
+    tools += ["llvm-nm", "nm"]
+    return tools
+
+
 def _symbol_offset(path: str) -> Optional[int]:
-    """Read st_value for CLEAR_SYMBOL from the ELF symbol table via readelf."""
-    try:
-        out = subprocess.check_output(
-            ["readelf", "-sW", path],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    # readelf -sW rows: Num: Value Size Type Bind Vis Ndx Name
-    for line in out.splitlines():
-        if CLEAR_SYMBOL not in line:
-            continue
-        m = re.match(r"\s*\d+:\s+([0-9a-fA-F]+)\s+\d+\s+FUNC", line)
-        if m:
-            return int(m.group(1), 16)
+    """Read st_value for CLEAR_SYMBOL from .symtab via (llvm-)nm.
+
+    nm rows: ``<hex_addr> <type> <name>``; a defined text symbol has type t/T.
+    Returns the .so-relative offset, or None if no tool ran or the symbol is
+    genuinely absent (stripped).
+    """
+    for tool in _nm_tools():
+        try:
+            out = subprocess.check_output([tool, path], stderr=subprocess.DEVNULL, text=True)
+        except (OSError, subprocess.CalledProcessError):
+            continue  # tool missing/failed -> try the next
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[-1] == CLEAR_SYMBOL and parts[-2] in ("t", "T"):
+                try:
+                    return int(parts[0], 16)
+                except ValueError:
+                    pass
+        return None  # a tool ran; symbol simply isn't in .symtab
     return None
+
+
+class _DlInfo(ctypes.Structure):
+    _fields_ = [
+        ("dli_fname", ctypes.c_char_p),
+        ("dli_fbase", ctypes.c_void_p),
+        ("dli_sname", ctypes.c_char_p),
+        ("dli_saddr", ctypes.c_void_p),
+    ]
+
+
+def _addr_in_lib(addr: int, path: str) -> bool:
+    """dladdr sanity check: confirm `addr` maps into `path`'s image.
+
+    Calling a mis-computed absolute address would SIGSEGV the workload (a long,
+    expensive run), so gate the raw call on dladdr agreeing the address belongs
+    to the expected library.
+    """
+    try:
+        libc = ctypes.CDLL(None)
+        info = _DlInfo()
+        if libc.dladdr(ctypes.c_void_p(addr), ctypes.byref(info)) == 0:
+            return False
+        fname = (info.dli_fname or b"").decode(errors="replace")
+        return os.path.basename(os.path.realpath(fname)) == os.path.basename(os.path.realpath(path))
+    except Exception:
+        return False
 
 
 def _call_via_address(path: str, load_base: int) -> bool:
@@ -155,6 +200,13 @@ def _call_via_address(path: str, load_base: int) -> bool:
     if offset is None:
         return False
     addr = load_base + offset
+    # Never call a raw address we can't confirm is inside the target lib.
+    if not _addr_in_lib(addr, path):
+        logger.warning(
+            f"[bolt] computed {CLEAR_SYMBOL} addr 0x{addr:x} not in {path} "
+            "(dladdr mismatch); skipping to avoid a crash"
+        )
+        return False
     proto = ctypes.CFUNCTYPE(None)
     try:
         proto(addr)()
