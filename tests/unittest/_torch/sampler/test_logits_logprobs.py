@@ -7,7 +7,7 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import _StrategyImpls
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import _StrategyImpls
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
 
@@ -778,6 +778,8 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
                     group_logit_indices=None,
                     top_k=torch.tensor([topk], dtype=torch.int32, device="cuda"),
                     top_p=torch.tensor([topp], dtype=torch.float32, device="cuda"),
+                    # None disables the min-p stage; no request here sets min_p.
+                    min_p=None,
                     temperature=torch.tensor([temperature], dtype=torch.float32, device="cuda"),
                     generator=None,
                 )

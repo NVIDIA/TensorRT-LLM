@@ -24,8 +24,9 @@ combination x request length, the ctx side fills a request's KV blocks with a
 deterministic, rank-specific pattern, sends it, and the gen side verifies the
 received blocks regenerate to the same pattern. Bandwidth is emitted by the
 transceivers themselves into per-rank CSVs (parsed later by report.py):
-  C++  -> TRTLLM_KVCACHE_TIME_OUTPUT_PATH (rank_*_send.csv / rank_*_recv.csv)
-  Py   -> TLLM_KV_TRANSFER_PERF_LOG_FILE  (py_*_*.csv, throughput_mbs)
+  C++  -> TRTLLM_KVCACHE_TIME_OUTPUT_PATH (<instanceId>_*_send.csv / <instanceId>_*_recv.csv)
+  Py   -> same env var (PerfLogManager gives it top priority):
+          <instanceUuid>_<rank>.csv, throughput_mbs column
 
 This driver mirrors the single-process test (tests/unittest/others/
 test_kv_cache_transceiver.py) and the multi-process Python test
@@ -468,15 +469,19 @@ def _preserve_cpp_csvs(csv_dir, ci, rank):
     request lengths of a combination and appends a row per request, so we move
     the whole combination's output aside (rid encodes req_len).
 
-    Each rank touches ONLY its own files: all ranks share `csv_dir`, so a glob
-    over `rank_*` would race -- multiple ranks renaming the same file, leaving
-    some with FileNotFoundError, crashing those ranks and deadlocking the rest on
-    the next case's collective KVCacheManager allreduce.
+    C++ names files "<instanceId>_<rank>_<tag>.csv" (instanceId is a runtime
+    UUID). Each rank touches ONLY files carrying its own "_<rank>_<tag>.csv"
+    suffix: all ranks share `csv_dir`, so matching a broader pattern would race
+    -- multiple ranks renaming the same file, leaving some with
+    FileNotFoundError, crashing those ranks and deadlocking the rest on the next
+    case's collective KVCacheManager allreduce.
     """
     for tag in ("send", "recv"):
-        path = os.path.join(csv_dir, f"rank_{rank}_{tag}.csv")
-        if os.path.exists(path):
-            os.replace(path, os.path.join(csv_dir, f"rank_{rank}_{tag}__c{ci}.csv"))
+        suffix = f"_{rank}_{tag}.csv"
+        for name in os.listdir(csv_dir):
+            if name.endswith(suffix) and "__c" not in name:
+                base = name[: -len(".csv")]
+                os.replace(os.path.join(csv_dir, name), os.path.join(csv_dir, f"{base}__c{ci}.csv"))
 
 
 def main():
@@ -514,12 +519,12 @@ def main():
     work_dir = cfg["environment"]["work_dir"]
     csv_dir = os.path.join(work_dir, "csv", str(sweep), role)
     os.makedirs(csv_dir, exist_ok=True)
+    # One env var drives both transceivers: C++ caches it on first read, and
+    # Python's PerfLogManager gives it top priority (enabling perf logging and
+    # writing task CSVs as <instanceUuid>_<rank>.csv in csv_dir; the
+    # per-transceiver UUID avoids cross-combination collisions, and report.py
+    # identifies these files by header columns, not name).
     os.environ["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = csv_dir
-    # Python perf logging (singleton reads these once; C++ ignores them). Set at
-    # startup so it is enabled regardless of combination ordering. Per-transceiver UUID
-    # filenames (py_<uuid>_<rank>.csv) avoid cross-combination collisions.
-    os.environ["TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO"] = "1"
-    os.environ["TLLM_KV_TRANSFER_PERF_LOG_FILE"] = os.path.join(csv_dir, "py")
 
     status_dir = os.path.join(work_dir, "status")
     os.makedirs(status_dir, exist_ok=True)

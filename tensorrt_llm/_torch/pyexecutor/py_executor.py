@@ -42,7 +42,7 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
@@ -765,10 +765,10 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         # Encoder-decoder models execute the encoder and decoder in separate
-        # iterations. The encoder branch lives in ``_executor_loop`` only;
-        # ``_executor_loop_overlap`` has not been threaded yet. Reject
-        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
-        # is intentionally out of scope for this port).
+        # iterations in both executor loops. PP usage is very rare for these
+        # models, so encoder PP send/recv support is not implemented in the
+        # PyTorch path for now. Reject pp_size > 1.
+        # TODO: Add support for pp + encoder models
         is_encoder_decoder = bool(
             getattr(getattr(self.model_engine.model, "model_config", None),
                     "is_encoder_decoder", False))
@@ -778,11 +778,6 @@ class PyExecutor:
                     "pp_size > 1 is not supported for encoder-decoder models "
                     "in the PyTorch flow; encoder send/recv hooks are out of "
                     "scope. Set pp_size=1 to run T5/BART/mBART.")
-            if not self.disable_overlap_scheduler:
-                raise NotImplementedError(
-                    "Overlap scheduler is not yet wired for encoder-decoder "
-                    "models. Set disable_overlap_scheduler=True for "
-                    "encoder-decoder runs.")
             if getattr(self.model_engine, "_torch_compile_piecewise_cuda_graph",
                        False):
                 raise NotImplementedError(
@@ -919,9 +914,13 @@ class PyExecutor:
         # under steady state — see ping-pong comment in _profiler).
         self._latest_host_step_time_ms: Optional[float] = None
         self._latest_prev_device_step_time_ms: Optional[float] = None
+        self._emit_initial_stats()
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
+        if kv_cache_transceiver is not None:
+            self.hang_detector.register_status_provider(
+                kv_cache_transceiver.get_status_dump)
         cache_transceiver_config = getattr(self.llm_args,
                                            "cache_transceiver_config", None)
         max_tokens_in_buffer = getattr(cache_transceiver_config,
@@ -1279,6 +1278,21 @@ class PyExecutor:
 
     def _set_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
+
+        # First calibration wins (mirrors the C++ guard in CacheTransceiver).
+        # PyExecutor is constructed twice per process (memory-profiling dry run,
+        # then the real executor), so this method runs twice. Recalibration is
+        # idempotent as long as the measurement below reads the raw
+        # steady_clock, but skipping it avoids a redundant barrier+allgather
+        # and protects the offset if the measurement path ever becomes
+        # offset-aware (which would make a second pass observe ~zero skew and
+        # wipe the correct value).
+        if LlmRequest.global_steady_clock_offset is not None:
+            logger.info(
+                f"global_steady_clock_offset already set "
+                f"({LlmRequest.global_steady_clock_offset}); skipping recalibration "
+                f"for rank {self.global_rank}")
+            return
 
         # Sync all ranks
         self.dist.barrier()
@@ -2017,6 +2031,9 @@ class PyExecutor:
 
             # Aggregate stats from all generation requests
             for req in scheduled_batch.generation_requests:
+                # exclude attention dp dummy / CUDA Graph padding requests from AL calculation
+                if getattr(req, 'is_dummy', False):
+                    continue
                 draft_len = getattr(req, 'num_draft_tokens', 0)
                 py_draft_tokens = getattr(req, 'py_draft_tokens', None)
                 py_num_accepted = getattr(req, 'py_num_accepted_draft_tokens',
@@ -2550,6 +2567,10 @@ class PyExecutor:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
+                    if hasattr(self.kv_cache_manager,
+                               "prepare_expect_snapshot_points"):
+                        self.kv_cache_manager.prepare_expect_snapshot_points(
+                            self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
                         self.active_requests, self.inflight_req_ids)
                     if self.kv_cache_transceiver:
@@ -2583,6 +2604,9 @@ class PyExecutor:
                     f'{scheduled_batch.num_context_requests} context requests and '
                     f'{scheduled_batch.num_generation_requests} generation requests'
                 )
+
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
@@ -3256,6 +3280,7 @@ class PyExecutor:
                 if spec_config is not None and spec_config.is_linear_tree else
                 self.model_engine.max_total_draft_tokens)
 
+    @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -3860,6 +3885,7 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    @nvtx_range("_handle_disagg_cache_errors_synced")
     def _handle_disagg_cache_errors_synced(self):
         """Rank-safe disagg cache error and poison handler.
 
@@ -3938,6 +3964,25 @@ class PyExecutor:
             requests=local_voted_error_requests,
             charge_budget=False,
         )
+
+    def _emit_initial_stats(self) -> None:
+        """Emit a startup stats snapshot so that cache_config_info is
+        immediately available to external metric scrapers (e.g. the
+        Kubernetes Inference Gateway EPP) before any inference request."""
+        if not self.enable_iter_perf_stats:
+            return
+        stats = self._get_init_iter_stats(0, 0)
+        kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_cache_manager is not None:
+            kv_stats = kv_cache_manager.get_kv_cache_stats()
+            kv_stats_to_save = KvCacheStats()
+            kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
+            kv_stats_to_save.tokens_per_block = kv_stats.tokens_per_block
+            kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
+            kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
+            stats.kv_cache_stats = kv_stats_to_save
+        self._append_iter_stats(stats)
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -4455,6 +4500,9 @@ class PyExecutor:
 
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
+
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 gpu_forward_events_from_perf_pool = False
                 can_queue, can_queue_this_rank = self._can_queue(
@@ -5225,6 +5273,10 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
+            self.kv_cache_manager.prepare_expect_snapshot_points(
+                self.active_requests)
+
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
@@ -6223,10 +6275,10 @@ class PyExecutor:
             )
         except Exception:
             # Speculative prefetch is best-effort and must never crash the
-            # executor loop. On failure, `py_mm_encoder_event` is not stamped,
-            # so the next iteration's `_prepare_inputs` falls back to the
-            # standard in-iter encode path (which re-runs `to_device` and the
-            # encoder unconditionally when no cached embedding is present).
+            # executor loop. The dispatch helper stamps an event when it queued
+            # any auxiliary-stream work, even on a partial failure, so the next
+            # iteration can safely inspect the request-local data and fall back
+            # to the standard in-iter encode path for any missing embedding.
             logger.warning(
                 f"Cross-iter MM encoder prefetch failed; falling back to "
                 f"in-iter encode.\n{traceback.format_exc()}")

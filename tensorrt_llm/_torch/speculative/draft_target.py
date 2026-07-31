@@ -153,7 +153,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
 
         attn_metadata.update_for_spec_dec()
 
-    def forward(
+    def _forward_impl(
         self,
         input_ids,
         position_ids,

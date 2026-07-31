@@ -52,7 +52,7 @@ from tensorrt_llm._torch.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor, MxFp8QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from .communication import DeepEP, DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided
+from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE, raise_moe_lora_multichunk_unsupported
@@ -387,9 +387,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
         # ========== Step 2: Apply routing ==========
+        # External dispatch (Step 5) sends per-token expert/scale payloads, so
+        # routing must be precomputed whenever a comm strategy is active — even
+        # for backends whose run_moe can otherwise route internally from
+        # router_logits (e.g. MarlinFusedMoE under attention-DP + EP).
         requires_separated_routing = (
             moe.backend._supports_load_balancer()
             or moe.routing_method.requires_separated_routing
+            or moe.comm is not None
             or FORCE_SEPARATED_ROUTING
         )
         if requires_separated_routing:
@@ -420,10 +425,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     "Current workaround for apply_router_weight_on_input does not support fp8 input"
                 )
                 x = x * token_final_scales.to(x.dtype)
-                # DeepEP variants need a non-None token_final_scales tensor
-                # (they don't tolerate None), so feed all-ones; other strategies
-                # accept None and skip the multiply.
-                if isinstance(moe.comm, (DeepEP, DeepEPLowLatency)):
+                # These strategies need non-None token_final_scales, so feed
+                # all-ones after folding the real weights into x.
+                if isinstance(moe.comm, (DeepEP, DeepEPLowLatency, NcclEP)):
                     token_final_scales = torch.ones_like(token_final_scales)
                 else:
                     token_final_scales = None
@@ -1216,6 +1220,13 @@ class FusedCommMoEScheduler(MoEScheduler):
             # MegaMoECuteDsl short-circuit ``x.shape[0] == 0`` inside their
             # quantize_input contracts.
             moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
+
+        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
+        # one adaptive bucket on every EP rank; using a local token count could
+        # diverge and deadlock its in-kernel NVLink barrier.
+        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
+        if set_adaptive is not None:
+            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
 
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's

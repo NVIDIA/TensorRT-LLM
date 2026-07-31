@@ -35,6 +35,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      perf_metrics_output_dir:
+        annotation: Optional[str]
+        default: null
+        status: prototype
       # Bindings and mirrored configs
       peft_cache_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
@@ -59,6 +63,10 @@ methods:
       postprocess_tokenizer_dir:
         annotation: Optional[str]
         default: null
+        status: prototype
+      num_serve_frontends:
+        annotation: int
+        default: 1
         status: prototype
       custom_tokenizer:
         annotation: Optional[str]
@@ -198,7 +206,7 @@ methods:
       perf_metrics_max_requests:
         annotation: int
         default: 0
-        status: prototype
+        status: deprecated
       prometheus_metrics_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig]
         default: null
@@ -437,6 +445,10 @@ methods:
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
     status: beta
+  get_data_transceiver_state:
+    parameters: {}
+    return_annotation: bytes
+    status: prototype
   shutdown:
     parameters: {}
     return_annotation: None

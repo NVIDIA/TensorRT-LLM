@@ -24,7 +24,7 @@ import triton.language as tl
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler.sampling_utils import sampling_batch_spec_dec_one_model
+from ..pyexecutor.sampler.ops.flashinfer import sample_from_logits_op
 from .eagle3 import Eagle3OneModelWorker
 
 if TYPE_CHECKING:
@@ -375,7 +375,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 )
 
     @nvtx_range("eagle3_dyn.forward")
-    def forward(
+    def _forward_impl(
         self,
         input_ids,
         position_ids,
@@ -387,11 +387,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         resource_manager=None,
     ):
         """Override to add accepted_draft_tokens_indices to output."""
-        # Initialize spec_tree_manager before super().forward() which calls
+        # Initialize spec_tree_manager before super()._forward_impl() which calls
         # _forward_draft_loop needing spec_tree_manager.
         if resource_manager is not None:
             self._ensure_spec_tree_manager(resource_manager)
-        output = super().forward(
+        output = super()._forward_impl(
             input_ids,
             position_ids,
             hidden_states,
@@ -772,7 +772,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 self.offset = torch.tensor([0], dtype=torch.int64, device=logits.device)
             self.seed.add_(1).remainder_(2**31)
             top_ks = spec_metadata.top_ks[:num_flat_tokens]
-            sampled = sampling_batch_spec_dec_one_model(
+            sampled = sample_from_logits_op(
                 logits,
                 spec_metadata.temperatures[:num_flat_tokens],
                 top_ks,
@@ -880,7 +880,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # Context tokens bypass the rejection kernel — sample them directly.
         if num_contexts > 0:
             top_ks_ctx = spec_metadata.top_ks[:num_contexts]
-            sampled_ctx = sampling_batch_spec_dec_one_model(
+            sampled_ctx = sample_from_logits_op(
                 logits[:num_contexts],
                 spec_metadata.temperatures[:num_contexts],
                 top_ks_ctx,

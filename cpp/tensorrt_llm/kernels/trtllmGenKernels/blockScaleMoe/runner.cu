@@ -174,9 +174,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     }
     else if (routingMethodType == RoutingMethodType::MiniMax2)
     {
-        // MiniMaxM2: sigmoid(logit) + bias → topK → renormalize un-biased sigmoid scores.
-        // Similar to DeepSeek no-groups but with routeScale = 1.0 and epsilon = 1e-20
-        // to match the Python reference: weight / (sum + 1e-20).
+        // MiniMaxM2/M3: sigmoid(logit) + bias → topK → renormalize un-biased sigmoid scores.
+        // MiniMaxM2 uses the default routeScale = 1.0, while MiniMaxM3 supplies its
+        // model-specific scale. Both use epsilon = 1e-20 to match the Python reference.
         moe::dev::routing::routingCustom::Data routingData;
 
         //
@@ -189,7 +189,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
         routingData.mPtrRoutingBias = routingBias;
         routingData.mDtypeBias = dtypeRoutingBias;
-        routingData.mRouteScale = 1.0f;
+        routingData.mRouteScale = routedScalingFactor;
         routingData.mSumEpsilon = 1e-20f;
 
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method

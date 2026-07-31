@@ -13,10 +13,10 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.weight_sharing import (
-    IdentityCheckPolicy, PostTransformFeature, PostTransformProfile,
-    PostTransformProfileRegistry, PostTransformQualificationDecision,
-    PostTransformTransferScope, SourceIdentity,
-    check_weight_sharing_compatibility)
+    ArtifactIdentity, IdentityCheckPolicy, PostTransformFeature,
+    PostTransformProfile, PostTransformProfileRegistry,
+    PostTransformQualificationDecision, PostTransformTransferScope,
+    SourceIdentity, check_weight_sharing_compatibility)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -42,7 +42,8 @@ from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import resolve_hf_torch_dtype, resolve_ssm_cache_dtype
+from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
+                           resolve_ssm_cache_dtype)
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -50,6 +51,36 @@ _KV_CACHE_MAP = {
     "auto": "auto"
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
+
+
+def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
+                                               llm_args: TorchLlmArgs) -> None:
+    """Validate snapshot reuse after the model and V2 setting are resolved."""
+    if not is_hybrid_linear(config.pretrained_config):
+        return
+
+    kv_cache_config = llm_args.kv_cache_config
+    state_config = kv_cache_config.mamba_state_config
+    has_additional_snapshots = bool(
+        state_config.additional_snapshot_offsets_from_start
+        or state_config.additional_snapshot_offsets_from_end)
+    if (has_additional_snapshots
+            and kv_cache_config.use_kv_cache_manager_v2 is not True):
+        raise ValueError(
+            "Mamba additional snapshot offsets require "
+            "kv_cache_config.use_kv_cache_manager_v2=True after resolving "
+            "the model configuration.")
+
+    has_periodic_snapshots = state_config.periodic_snapshot_interval > 0
+    if (kv_cache_config.enable_block_reuse and not has_periodic_snapshots
+            and not has_additional_snapshots):
+        logger.warning(
+            "Disabling KV cache block reuse for the hybrid Mamba model "
+            "because no Mamba state snapshot policy is configured. Set "
+            "kv_cache_config.mamba_state_config.periodic_snapshot_interval "
+            "to a positive value or provide additional snapshot offsets to "
+            "enable block reuse.")
+        kv_cache_config.enable_block_reuse = False
 
 
 def validate_and_set_mamba_ssm_cache_dtype(
@@ -71,7 +102,7 @@ def validate_and_set_mamba_ssm_cache_dtype(
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
-                                    pyt_kv_cache_dtype: str) -> QuantAlgo:
+                                    pyt_kv_cache_dtype: str) -> None:
     logger.info(
         f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
     )
@@ -105,6 +136,14 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
+    # MIXED_PRECISION checkpoints carry per-layer QuantConfigs in
+    # quant_config_dict; modules built from them (e.g. attention) must agree
+    # with the global config on the KV element size, otherwise the KV pool is
+    # allocated with the overridden dtype while attention layers read/write
+    # with the checkpoint dtype -> out-of-bounds access.
+    if model_config.quant_config_dict is not None:
+        for layer_quant_config in model_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
@@ -383,6 +422,8 @@ class ModelLoader:
                                                  config.pretrained_config)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
+        use_kv_cache_manager_v2 = (
+            llm_args.kv_cache_config.use_kv_cache_manager_v2)
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -395,15 +436,6 @@ class ModelLoader:
                     logger.info(
                         f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
                     )
-
-        use_kv_cache_manager_v2 = llm_args.kv_cache_config.use_kv_cache_manager_v2
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
-        if use_kv_cache_manager_v2 == "auto":
-            logger.info(
-                "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
-                llm_args.kv_cache_config.use_kv_cache_manager_v2,
-                model_cls.__name__
-                if model_cls is not None else "unknown model")
 
         # The transceiver preference follows the checkpoint's original
         # architecture: _resolve_class may rewrite it to an execution class
@@ -418,6 +450,15 @@ class ModelLoader:
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
                                           config.pretrained_config)
+        _resolve_kv_cache_manager_v2_auto(
+            llm_args, model_defaults, original_setting=use_kv_cache_manager_v2)
+        _validate_and_adjust_mamba_snapshot_config(config, llm_args)
+        if use_kv_cache_manager_v2 == "auto":
+            logger.info(
+                "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
+                llm_args.kv_cache_config.use_kv_cache_manager_v2,
+                model_cls.__name__
+                if model_cls is not None else "unknown model")
 
         return llm_args
 
@@ -431,6 +472,39 @@ class ModelLoader:
         strict gate), so default HF/AUTO paths should not even build one.
         """
         return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == "MX"
+
+    @staticmethod
+    def _build_source_identity(
+        config: ModelConfig,
+        model: DecoderModelForCausalLM,
+        *,
+        checkpoint_dir: str,
+        model_name: str,
+        fallback_on_artifact_error: bool,
+    ) -> Optional[SourceIdentity]:
+        """Build the local identity without weakening artifact validation.
+
+        Artifact construction remains fail-closed. MX may convert an artifact
+        error into an unavailable local identity so its compatibility gate
+        falls back to disk; GMS propagates the error because it has no fallback.
+        """
+        try:
+            artifact_identity = ArtifactIdentity.from_checkpoint(checkpoint_dir)
+        except (OSError, RuntimeError, ValueError) as error:
+            if not fallback_on_artifact_error:
+                raise
+            logger.warning(
+                "Unable to build checkpoint artifact identity for MX checkpoint "
+                f"{checkpoint_dir}; falling back to regular checkpoint loading: {error}"
+            )
+            return None
+
+        return SourceIdentity.from_model_config(
+            config,
+            model,
+            artifact_identity=artifact_identity,
+            model_name=model_name,
+        )
 
     def load(
         self,
@@ -475,12 +549,16 @@ class ModelLoader:
                 # ground truth; building it here (post-construction,
                 # pre-weight-load) gives producer and consumer a common,
                 # comparable lifecycle point.
-                self._source_identity = SourceIdentity.from_model_config(
+                self._source_identity = self._build_source_identity(
                     config,
                     model,
+                    checkpoint_dir=checkpoint_dir,
                     model_name=str(
                         getattr(self.llm_args, "model", None)
                         or checkpoint_dir),
+                    fallback_on_artifact_error=(
+                        load_format != LoadFormat.GMS
+                        and checkpoint_loader.checkpoint_format == "MX"),
                 )
 
             memo: dict[torch.Tensor, torch.Tensor] = {}
@@ -1272,6 +1350,8 @@ class ModelLoader:
             force_dynamic_quantization=self.llm_args.force_dynamic_quantization,
             spec_config=self.spec_config,
             sparse_attention_config=self.sparse_attention_config,
+            kv_cache_compression_config=(
+                self.llm_args.kv_cache_compression_config),
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,

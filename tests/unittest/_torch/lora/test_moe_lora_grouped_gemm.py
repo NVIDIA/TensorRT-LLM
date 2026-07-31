@@ -19,14 +19,22 @@ surface the eager-only tests in `test_moe_lora_op.py` cannot reach:
      on-device fed by captured H2D copies of the stable pinned slot tables, so
      reassigning a slot's adapter in place is reflected on replay WITHOUT
      re-capture (mirroring attention LoRA and the normal decode loop).
+  5. CUDA-graph workspace reservation for both base-weight modes MoE LoRA
+     supports: unquantized bf16 and per-tensor FP8 (qdq).
 
 They require a CUDA GPU and the built `trtllm::fused_moe` op.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.peft.lora.moe_layout import make_per_expert_lora, reference_swiglu_moe_lora
+from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tests.unittest.utils.util import skip_pre_ada
 
 _TRTLLM_AVAILABLE = hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_moe")
 
@@ -146,7 +154,9 @@ def _slot_kwargs(token_to_slot, adapter_sets, rank):
     )
 
 
-def _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype, lora_kwargs):
+def _call_fused_moe(
+    x, w3_w1, w2, topk_ids, topk_scores, output_dtype, lora_kwargs, quant_scales=None
+):
     common = dict(
         input=x,
         token_selected_experts=topk_ids,
@@ -156,7 +166,7 @@ def _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype, lora_kwar
         fc2_expert_weights=w2,
         fc2_expert_biases=None,
         output_dtype=output_dtype,
-        quant_scales=[],
+        quant_scales=quant_scales if quant_scales is not None else [],
     )
     common.update(lora_kwargs)
     return torch.ops.trtllm.fused_moe(**common)[0]
@@ -323,7 +333,6 @@ def test_reserve_prevents_growth_across_captures():
     (TRTLLM-12507).
     """
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
-    from tensorrt_llm._torch.utils import ActivationType
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -404,6 +413,245 @@ def test_reserve_prevents_growth_across_captures():
     assert torch.isfinite(out2).all()
     torch.testing.assert_close(out1, ref1, rtol=_RTOL, atol=_ATOL)
     torch.testing.assert_close(out2, ref2, rtol=_RTOL, atol=_ATOL)
+
+
+# -- Per-tensor FP8 (qdq) base weights ---------------------------------------
+#
+# MoE LoRA also runs on per-tensor FP8 base weights: the kernel dequantizes the
+# FP8 activations to the bf16/fp16 LoRA compute type before the LoRA GEMM. The
+# runtime op then sees FP8 activations and FP8 weights with a bf16 output, which
+# is a different FusedMoeRunner cache key than the unquantized bf16 path.
+
+_FP8_E4M3_MAX = 448.0
+
+
+def _quant_per_tensor_fp8(t):
+    """Per-tensor symmetric FP8 (e4m3) quantization. Returns (t_fp8, dequant)
+    with t ~= t_fp8.float() * dequant."""
+    amax = t.detach().abs().max().float().clamp(min=1e-6)
+    dequant = amax / _FP8_E4M3_MAX
+    t_fp8 = (t.float() / dequant).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return t_fp8, dequant
+
+
+def _build_fp8_moe_inputs(x, w3_w1, w2):
+    """Quantize the bf16 base MoE inputs to per-tensor FP8 (qdq).
+
+    Returns (x_fp8, w3_w1_fp8, w2_fp8, quant_scales), where quant_scales holds
+    the four entries moeOp.cpp::getQuantParams consumes, in order: fc1_dequant
+    (per-expert), fc2_quant (scalar), fc2_dequant (per-expert), fc1_input_dequant
+    (scalar). fc2_quant is 1.0 because at these shapes the SwiGLU intermediate
+    stays inside the e4m3 range, so no calibrated activation scale is needed.
+    """
+
+    def _per_expert(w):
+        w_fp8 = torch.empty_like(w, dtype=torch.float8_e4m3fn)
+        scales = torch.empty(w.shape[0], dtype=torch.float32, device=w.device)
+        for e in range(w.shape[0]):
+            w_fp8[e], scales[e] = _quant_per_tensor_fp8(w[e])
+        return w_fp8, scales
+
+    x_fp8, input_dequant = _quant_per_tensor_fp8(x)
+    w3_w1_fp8, w3_w1_scale = _per_expert(w3_w1)
+    w2_fp8, w2_scale = _per_expert(w2)
+    quant_scales = [
+        (w3_w1_scale * input_dequant).to(torch.float32),
+        torch.tensor(1.0, dtype=torch.float32, device=x.device),
+        w2_scale.to(torch.float32),
+        input_dequant.to(torch.float32).reshape(()),
+    ]
+    return x_fp8, w3_w1_fp8, w2_fp8, quant_scales
+
+
+def _make_fp8_qdq_moe_layer(w3_w1_fp8, top_k, dtype=torch.bfloat16):
+    """A CutlassFusedMoE carrying just the state
+    reserve_moe_lora_cuda_graph_workspace reads, with a real FP8-qdq QuantConfig
+    so has_fp8_qdq and has_any_quant report what they do on a loaded layer. The
+    tests drive the real method rather than restating its key derivation.
+    """
+    layer = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    layer._moe_lora_enabled = True
+    layer._weights_created = True  # gates the has_* quant properties
+    layer.quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+    layer.dtype = dtype
+    layer.w3_w1_weight = w3_w1_fp8
+    layer.routing_method = SimpleNamespace(experts_per_token=top_k)
+    layer.tp_size = 1
+    layer.tp_rank = 0
+    layer.ep_size = 1
+    layer.ep_rank = 0
+    layer.cluster_size = 1
+    layer.cluster_rank = 0
+    layer.use_fused_finalize = True
+    layer.activation_type = int(ActivationType.Swiglu)
+    layer.is_gated_activation = True
+    return layer
+
+
+@requires_cuda_and_op
+@skip_pre_ada
+def test_fp8_qdq_reserve_resolves_to_runtime_runner():
+    """An FP8-qdq layer must reserve on the same cached C++ FusedMoeRunner the
+    runtime op resolves to.
+
+    The runner cache is keyed by (x_dtype, weight_dtype, output_dtype) plus the
+    quant flags. On the FP8-qdq path the op sees FP8 activations, because the
+    layer quantizes x to e4m3 before the call, with a bf16 output, so the
+    reservation must key on the FP8 activation dtype rather than self.dtype.
+    Keying on self.dtype leaves both calls succeeding on two different cached
+    runners, so the assertions inspect the cache instead of the output.
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k, rank = 4, 2, 8
+    max_lora_size = 2
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    x_fp8, w3_w1_fp8, w2_fp8, quant_scales = _build_fp8_moe_inputs(x, w3_w1, w2)
+
+    layer = _make_fp8_qdq_moe_layer(w3_w1_fp8, top_k, dtype=dtype)
+    CutlassFusedMoE.reserve_moe_lora_cuda_graph_workspace(layer, num_tokens, rank, max_lora_size)
+
+    assert len(MoERunner.runner_dict) == 1, (
+        f"reservation must build exactly one cached runner; got {list(MoERunner.runner_dict)}"
+    )
+    ((reserved_key, reserved_runner),) = MoERunner.runner_dict.items()
+    assert reserved_key[:3] == (torch.float8_e4m3fn, torch.float8_e4m3fn, dtype), (
+        f"FP8-qdq reservation keyed on {reserved_key[:3]}; expected FP8 activations "
+        f"and weights with a {dtype} output, matching what the runtime op sees."
+    )
+
+    # The runtime op derives its own key from the tensors it is handed, so a
+    # mismatch caches a second runner.
+    adapters = _make_adapter_set(
+        num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=1100
+    )
+    token_to_slot = torch.zeros(num_tokens, dtype=torch.int32)
+    slot_kwargs = _slot_kwargs(token_to_slot, [adapters], rank)
+    out = _call_fused_moe(
+        x_fp8,
+        w3_w1_fp8,
+        w2_fp8,
+        topk_ids,
+        topk_scores,
+        dtype,
+        dict(slot_kwargs),
+        quant_scales=quant_scales,
+    )
+
+    assert torch.isfinite(out).all()
+    assert len(MoERunner.runner_dict) == 1, (
+        "the FP8-qdq runtime call cached a second FusedMoeRunner, so the "
+        "reservation pre-sized LoRA scratch on a runner capture never uses: "
+        f"reserved {reserved_key}, cache now holds {list(MoERunner.runner_dict)}"
+    )
+    assert MoERunner.runner_dict[reserved_key] is reserved_runner, (
+        "the cached C++ runner was rebuilt instead of reused, discarding the reserved LoRA scratch"
+    )
+
+
+@requires_cuda_and_op
+@skip_pre_ada
+def test_fp8_qdq_reserve_prevents_growth_across_captures():
+    """FP8-qdq counterpart of test_reserve_prevents_growth_across_captures, going
+    through the layer's own reserve method.
+
+    Reserving the worst case up front, then capturing two graphs at growing slot
+    counts (1 then 2) on the same cached runner, must not reallocate the LoRA
+    scratch. Once a capture has been observed the C++ op rejects any growth, so
+    a reservation that missed this runner fails the second capture outright
+    instead of corrupting replay.
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k, rank = 4, 2, 8
+    max_lora_size = 2
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    x_fp8, w3_w1_fp8, w2_fp8, quant_scales = _build_fp8_moe_inputs(x, w3_w1, w2)
+
+    layer = _make_fp8_qdq_moe_layer(w3_w1_fp8, top_k, dtype=dtype)
+    CutlassFusedMoE.reserve_moe_lora_cuda_graph_workspace(layer, num_tokens, rank, max_lora_size)
+
+    baseline = _call_fused_moe(
+        x_fp8, w3_w1_fp8, w2_fp8, topk_ids, topk_scores, dtype, {}, quant_scales=quant_scales
+    ).clone()
+
+    adapter_a = _make_adapter_set(
+        num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=1200
+    )
+    adapter_b = _make_adapter_set(
+        num_experts, rank, hidden_size, inter_size, dtype, device, base_seed=1300
+    )
+
+    # Capture #1: one active slot.
+    tts1 = torch.zeros(num_tokens, dtype=torch.int32)
+    sk1 = _slot_kwargs(tts1, [adapter_a], rank)
+    graph1, captured1 = _warmup_and_capture(
+        lambda: _call_fused_moe(
+            x_fp8,
+            w3_w1_fp8,
+            w2_fp8,
+            topk_ids,
+            topk_scores,
+            dtype,
+            dict(sk1),
+            quant_scales=quant_scales,
+        )
+    )
+
+    # Capture #2: two active slots on the same cached runner, with no cache clear
+    # in between.
+    tts2 = (torch.arange(num_tokens) % 2).to(torch.int32)
+    sk2 = _slot_kwargs(tts2, [adapter_a, adapter_b], rank)
+    graph2, captured2 = _warmup_and_capture(
+        lambda: _call_fused_moe(
+            x_fp8,
+            w3_w1_fp8,
+            w2_fp8,
+            topk_ids,
+            topk_scores,
+            dtype,
+            dict(sk2),
+            quant_scales=quant_scales,
+        )
+    )
+
+    assert len(MoERunner.runner_dict) == 1, (
+        "the FP8-qdq LoRA captures must all share the reserved runner; cache holds "
+        f"{list(MoERunner.runner_dict)}"
+    )
+
+    graph1.replay()
+    graph2.replay()
+    torch.cuda.synchronize()
+
+    out1 = captured1.clone()
+    out2 = captured2.clone()
+    assert torch.isfinite(out1).all()
+    assert torch.isfinite(out2).all()
+
+    # Numerics for the FP8 + LoRA math are covered in test_moe_lora_op.py; here
+    # it is enough that each replayed graph applied its own LoRA routing.
+    def _mean_abs(p, q):
+        return (p.float() - q.float()).abs().mean().item()
+
+    assert _mean_abs(out1, baseline) > 1e-3, "captured FP8 graph applied no LoRA delta"
+    assert _mean_abs(out2, baseline) > 1e-3, "captured FP8 graph applied no LoRA delta"
+    assert _mean_abs(out1, out2) > 1e-3, (
+        "the two captures routed different adapter slots but produced the same "
+        "output, so the slot tables were not honored on replay"
+    )
 
 
 def _set_slot_ptrs_inplace(slot_kwargs, adapters, slot_index=0):

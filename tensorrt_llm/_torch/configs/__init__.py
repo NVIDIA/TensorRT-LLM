@@ -9,6 +9,7 @@ from tensorrt_llm._torch.configs.gemma4_unified import (
 )
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
+from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
 
 
 def _register_custom_configs_with_transformers() -> None:
@@ -44,6 +45,10 @@ def _register_custom_configs_with_transformers() -> None:
         # "kimi_linear" without trust_remote_code.
         "kimi_linear": KimiLinearConfig,
         "laguna": LagunaConfig,
+        # minicpmv4_6 is only registered in transformers>=5.7.0; register our
+        # own composite config so AutoTokenizer.from_pretrained works on older
+        # releases (the model itself is built via load_pretrained_config).
+        "minicpmv4_6": MiniCPMV4_6Config,
         "gemma4_unified": Gemma4UnifiedConfig,
         "gemma4_unified_text": Gemma4UnifiedTextConfig,
         "gemma4_unified_vision": Gemma4UnifiedVisionConfig,
@@ -72,4 +77,6 @@ __all__ = [
     "Gemma4UnifiedVisionConfig",
     "KimiLinearConfig",
     "LagunaConfig",
+    "MiniCPMV4_6Config",
+    "MiniCPMV4_6VisionConfig",
 ]

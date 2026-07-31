@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -82,6 +83,15 @@ enum LlmRequestType
 };
 
 class ContextProgress;
+
+// Process-global offset between the local steady clock and the global steady
+// clock (rank 0's steady clock). The storage lives in a single translation unit
+// (llmRequest.cpp) and is reached through this accessor so that
+// libtensorrt_llm.so and the nanobind extension module share one copy across
+// .so boundaries. An inline-static member would instead give each shared object
+// its own copy, so an offset calibrated on one side would be invisible to the
+// other.
+std::optional<std::chrono::steady_clock::duration>& globalSteadyClockOffset();
 
 template <typename TTensor, typename TStream = runtime::BufferManager::CudaStreamPtr>
 class GenericLlmRequest
@@ -221,6 +231,7 @@ public:
             mState = LlmRequestState::kENCODER_INIT;
         }
 
+        adoptContextPhaseDraftTokens();
         initialize(*inputTokens, returnLogProbs, arrivalTime);
     }
 
@@ -289,6 +300,7 @@ public:
         {
             mState = LlmRequestState::kENCODER_INIT;
         }
+        adoptContextPhaseDraftTokens();
         initialize(inputTokens, returnLogProbs);
     }
 
@@ -521,6 +533,7 @@ public:
         default: throw std::runtime_error("Unsupported request type found.");
         }
 
+        adoptContextPhaseDraftTokens();
         initialize(req.getInputTokenIds(), req.getOutputConfig().returnLogProbs);
     }
 
@@ -539,9 +552,29 @@ public:
         return mContextPhaseParams;
     }
 
+    /// @brief Get the number of generation tokens carried by context phase handoff.
+    /// @return Number of first generation tokens plus draft tokens.
+    [[nodiscard]] SizeType32 getNumContextPhaseGenerationTokens() const noexcept
+    {
+        if (!mContextPhaseParams.has_value())
+        {
+            return 0;
+        }
+
+        auto const& contextPhaseParams = mContextPhaseParams.value();
+        auto numTokens = static_cast<SizeType32>(contextPhaseParams.getFirstGenTokens().size());
+        auto const& draftTokens = contextPhaseParams.getDraftTokens();
+        if (draftTokens.has_value())
+        {
+            numTokens += static_cast<SizeType32>(draftTokens->size());
+        }
+        return numTokens;
+    }
+
     void setContextPhaseParams(executor::ContextPhaseParams contextPhaseParams)
     {
         mContextPhaseParams = std::move(contextPhaseParams);
+        adoptContextPhaseDraftTokens();
     }
 
     /// @brief Get the state params of the context
@@ -1233,6 +1266,18 @@ public:
         mEstimatedReusableTokens = estimatedReusableTokens;
     }
 
+    //! Get the absolute context positions at which recurrent-state snapshots are expected.
+    [[nodiscard]] std::vector<SizeType32> const& getExpectedSnapshotPoints() const noexcept
+    {
+        return mExpectedSnapshotPoints;
+    }
+
+    //! Set the absolute context positions at which recurrent-state snapshots are expected.
+    void setExpectedSnapshotPoints(std::vector<SizeType32> expectedSnapshotPoints)
+    {
+        mExpectedSnapshotPoints = std::move(expectedSnapshotPoints);
+    }
+
     void setDraftTokens(std::shared_ptr<VecTokens> const& draftTokens)
     {
         mDraftTokens = draftTokens;
@@ -1312,7 +1357,7 @@ public:
         mEncoderOutput = std::move(encoderOutput);
     }
 
-    void allocEncoderOutputHost(SizeType32 encoderHiddenSize, nvinfer1::DataType dataType)
+    void allocEncoderOutputHost(SizeType32 encoderHiddenSize, tensorrt_llm::DataType dataType)
     {
         mEncoderOutputHost = runtime::BufferManager::pinned(
             runtime::ITensor::makeShape({getEncoderOutputLen(), encoderHiddenSize}), dataType);
@@ -1328,13 +1373,13 @@ public:
         return mEncoderHiddenStates;
     }
 
-    void allocEncoderOutput(runtime::BufferManager const& manager, nvinfer1::DataType dataType)
+    void allocEncoderOutput(runtime::BufferManager const& manager, tensorrt_llm::DataType dataType)
     {
         // unique_ptr --> shared_ptr ownership move
         mEncoderOutput = std::move(manager.emptyTensor(runtime::MemoryType::kGPU, dataType));
     }
 
-    void allocEncoderHiddenStates(runtime::BufferManager const& manager, nvinfer1::DataType dataType)
+    void allocEncoderHiddenStates(runtime::BufferManager const& manager, tensorrt_llm::DataType dataType)
     {
         // unique_ptr --> shared_ptr ownership move
         mEncoderHiddenStates = std::move(manager.emptyTensor(runtime::MemoryType::kGPU, dataType));
@@ -1452,7 +1497,7 @@ public:
         mContextLogitsHost = std::move(contextLogitsHost);
     }
 
-    void allocContextLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
+    void allocContextLogitsHost(SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDataType)
     {
         mContextLogitsHost = runtime::BufferManager::pinnedPool(
             runtime::ITensor::makeShape({mPromptLen, vocabSizePadded}), logitsDataType);
@@ -1471,7 +1516,7 @@ public:
         mGenerationLogitsHost = std::move(generationLogitsHost);
     }
 
-    void allocGenerationLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
+    void allocGenerationLogitsHost(SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDataType)
     {
         if (mIsStreaming)
         {
@@ -1490,7 +1535,7 @@ public:
         }
     }
 
-    void allocTargetModelAcceptedTokenLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
+    void allocTargetModelAcceptedTokenLogitsHost(SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDataType)
     {
         mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
             runtime::ITensor::makeShape({1, getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
@@ -1844,14 +1889,18 @@ public:
         mDecodingIter = iter;
     }
 
+    // Callers must pass a global-steady-clock time point (getSteadyClockNow(),
+    // or a value merged from such time points). Normalizing again here would
+    // apply the global steady clock offset twice, which corrupts cross-node
+    // min/max merging whenever the offset is non-zero.
     void setKvCacheTransferStart(TimePoint time) const
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferStart = maybeToGlobalSteadyClock(time);
+        mPerfMetrics.timingMetrics.kvCacheTransferStart = time;
     }
 
     void setKvCacheTransferEnd(TimePoint time) const
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferEnd = maybeToGlobalSteadyClock(time);
+        mPerfMetrics.timingMetrics.kvCacheTransferEnd = time;
     }
 
     TimePoint getKvCacheTransferStart() const
@@ -2027,8 +2076,8 @@ public:
         return mUseDraftModel;
     }
 
-    // If sGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
-    // time point
+    // If the global steady clock offset is set, return a global steady clock time point, otherwise return local steady
+    // clock time point
     [[nodiscard]] static TimePoint getSteadyClockNow()
     {
         return maybeToGlobalSteadyClock(std::chrono::steady_clock::now());
@@ -2057,9 +2106,6 @@ public:
 
     // current position of the prompt tuning table (only used in chunked prefill mode)
     SizeType32 mPtableCurrentPosition{0};
-
-    // The offset between local steady clock and global steady clock (at rank 0)
-    inline static std::optional<Duration> sGlobalSteadyClockOffset{std::nullopt};
 
 protected:
     bool mIsStreaming;
@@ -2095,6 +2141,9 @@ protected:
     // capacity-scheduler queries. Reset to 0 after addSequenceBatch sets
     // the authoritative mPrepopulatedPromptLen and advances context position.
     mutable SizeType32 mEstimatedReusableTokens{0};
+
+    // Absolute context positions at which recurrent-state snapshots are expected.
+    std::vector<SizeType32> mExpectedSnapshotPoints;
 
     SizeType32 mMaxSentTokenLen;
 
@@ -2237,6 +2286,20 @@ protected:
     std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
 private:
+    void adoptContextPhaseDraftTokens()
+    {
+        if (hasDraftTokens() || !mContextPhaseParams.has_value())
+        {
+            return;
+        }
+
+        auto const& draftTokens = mContextPhaseParams.value().getDraftTokens();
+        if (draftTokens.has_value() && !draftTokens->empty())
+        {
+            mDraftTokens = std::make_shared<VecTokens>(*draftTokens);
+        }
+    }
+
     void initialize(
         VecTokens const& inputTokens, bool outputLogProbs, std::optional<TimePoint> arrivalTime = std::nullopt)
     {
@@ -2356,7 +2419,7 @@ private:
 
         auto const numWords = static_cast<SizeType32>(words.size());
         auto const shape = runtime::ITensor::makeShape({2, numWords});
-        auto tensor = runtime::BufferManager::pinnedPool(shape, nvinfer1::DataType::kINT32);
+        auto tensor = runtime::BufferManager::pinnedPool(shape, tensorrt_llm::DataType::kINT32);
         auto* data = runtime::bufferCast<int32_t>(*tensor);
         std::memcpy(data, words.data(), numWords * sizeof(int32_t));
         std::memcpy(data + numWords, offsets.data(), numWords * sizeof(int32_t));
@@ -2369,9 +2432,10 @@ private:
 
     static TimePoint maybeToGlobalSteadyClock(TimePoint const& time_point)
     {
-        if (sGlobalSteadyClockOffset.has_value())
+        auto const& offset = globalSteadyClockOffset();
+        if (offset.has_value())
         {
-            return time_point + *sGlobalSteadyClockOffset;
+            return time_point + *offset;
         }
         return time_point;
     }

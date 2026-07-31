@@ -34,6 +34,7 @@ from .modeling_kimi_linear import KimiLinearForCausalLM
 from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
+from .modeling_minicpmv4_6 import MiniCPMV4_6Model
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
 from .modeling_minimaxm3 import (MiniMaxM3ForCausalLM,
                                  MiniMaxM3VLForConditionalGeneration)
@@ -65,6 +66,7 @@ from .modeling_step3p7vl import Step3p7VLForConditionalGeneration
 from .modeling_t5 import T5ForConditionalGeneration
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
+from .modeling_whisper import WhisperForConditionalGeneration
 
 # Note: for better readiblity, this should have same order as imports above
 __all__ = [
@@ -91,6 +93,7 @@ __all__ = [
     "KimiLinearForCausalLM",
     "LlamaForCausalLM",
     "LlavaNextModel",
+    "MiniCPMV4_6Model",
     "Mistral3VLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
@@ -132,6 +135,7 @@ __all__ = [
     "Cohere2ForCausalLM",
     "Step3p7ForCausalLM",
     "Step3p7VLForConditionalGeneration",
+    "WhisperForConditionalGeneration",
 ]
 
 if transformers.__version__ >= "4.45.1":

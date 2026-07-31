@@ -761,6 +761,15 @@ def _register_fake():
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     (m, num_packed_sf_k), dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::fp8_quantize_1x128_cutedsl_ue8m0")
+    def _(input: torch.Tensor):
+        m, k = input.shape
+        padded_m = fp4_utils.pad_up(m, 128)
+        sf_cols = fp4_utils.pad_up(k // 32, 4)
+        return torch.empty_like(input,
+                                dtype=torch.float8_e4m3fn), input.new_empty(
+                                    (padded_m * sf_cols, ), dtype=torch.uint8)
+
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
         x: torch.Tensor,
@@ -1396,6 +1405,40 @@ def _register_fake():
         sf_vec_size = 16
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
+        return y_fp4, sf_out
+
+    @torch.library.register_fake("trtllm::fused_adaptive_layernorm")
+    def _(
+        x: torch.Tensor,
+        ln_weight: Optional[torch.Tensor],
+        ln_bias: Optional[torch.Tensor],
+        scale_msa: Optional[torch.Tensor],
+        shift_msa: Optional[torch.Tensor],
+        seq_len_per_batch: int,
+        eps: float,
+    ) -> torch.Tensor:
+        return x.new_empty(x.shape, dtype=torch.bfloat16)
+
+    @torch.library.register_fake("trtllm::fused_adaptive_layernorm_quant")
+    def _(
+        x: torch.Tensor,
+        ln_weight: Optional[torch.Tensor],
+        ln_bias: Optional[torch.Tensor],
+        scale_msa: Optional[torch.Tensor],
+        shift_msa: Optional[torch.Tensor],
+        sf_scale: torch.Tensor,
+        seq_len_per_batch: int,
+        eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        D = x.shape[-1]
+        M = 1
+        for d in x.shape[:-1]:
+            M *= d
+        y_fp4 = x.new_empty((M, D // 2), dtype=torch.uint8)
+        _, scale_shape = fp4_utils.get_fp4_shape((M, D),
+                                                 16,
+                                                 is_swizzled_layout=True)
+        sf_out = x.new_empty((scale_shape, ), dtype=torch.uint8)
         return y_fp4, sf_out
 
     @torch.library.register_fake("trtllm::fused_relu2_quantize")

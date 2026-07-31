@@ -57,7 +57,9 @@ from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
@@ -69,7 +71,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +332,41 @@ def test_marlin_moe_repack_is_transform_stage():
     assert NVFP4MarlinFusedMoEMethod.post_load_weights is FusedMoEMethodBase.post_load_weights
 
 
+def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
+    cfg = ModelConfig()
+    cfg.moe_backend = "MARLIN"
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo) if quant_algo else None
+    return cfg
+
+
+def test_get_moe_cls_marlin_selects_marlin_for_nvfp4():
+    assert get_moe_cls(_marlin_model_config()) is MarlinFusedMoE
+
+
+@pytest.mark.parametrize(
+    "quant_algo",
+    [
+        pytest.param(None, id="unquantized"),
+        pytest.param(QuantAlgo.FP8, id="fp8"),
+    ],
+)
+def test_get_moe_cls_marlin_falls_back_to_cutlass_on_non_nvfp4(quant_algo):
+    """MARLIN + non-NVFP4 layers (e.g. unquantized MTP draft layers in
+    MIXED_PRECISION checkpoints) fall back to CutlassFusedMoE instead of
+    raising, matching CUTEDSL/DENSEGEMM fallback behavior."""
+    assert get_moe_cls(_marlin_model_config(quant_algo)) is CutlassFusedMoE
+
+
+def test_get_moe_cls_marlin_override_quant_config_per_layer():
+    """Per-layer override (the MTP draft-layer path): an unquantized per-layer
+    override falls back to Cutlass even though the global config is NVFP4."""
+    cfg = _marlin_model_config()
+    assert (
+        get_moe_cls(cfg, override_quant_config=QuantConfig(quant_algo=None), layer_idx=52)
+        is CutlassFusedMoE
+    )
+
+
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
@@ -475,6 +512,63 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         match=r"MegaMoEDeepGemm requires num_slots \(10\) divisible by ep_size \(4\)",
     ):
         method.post_load_weights(DummyModule())
+
+
+def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
+        skip_create_weights_in_init=True,
+    )
+    return MegaMoECuteDsl(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        model_config=model_config,
+        init_load_balancer=False,
+    )
+
+
+def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Profiling scratch is sized for the largest adaptive bucket.
+    monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    buckets = moe._maxt_buckets
+    assert len(buckets) >= 2, f"expected a multi-bucket ladder, got {buckets}"
+    small_hint = buckets[0]
+    assert moe._select_launch_max_tokens(small_hint) == buckets[0]
+    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
+    assert moe._select_launch_max_tokens(small_hint) == buckets[-1]
+
+
+def test_megamoe_cutedsl_tactic_autotune_defaults_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Standard serving must not pay for the 36-tactic sweep by default.
+    monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    assert moe.tactic_autotune is False
+
+
+def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
+    prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
+    assert len(decode) == len(prefill) == 36
+    assert {t[-1] for t in decode} == {(1, 1)}
+    assert {t[-1] for t in prefill} == {(2, 4)}
+    # The deterministic fallback stays inside the curated axes.
+    for num_tokens in (64, 4096, 16384):
+        megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
+    invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
+    invalid_tactic[2] = 511
+    with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
+        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
 
 
 def run_backend_moe(
