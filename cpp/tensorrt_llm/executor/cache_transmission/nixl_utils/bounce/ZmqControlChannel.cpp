@@ -20,6 +20,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceNvtx.h"
 
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmException.h"
 
 #include <array>
 #include <chrono>
@@ -71,22 +72,35 @@ std::string ZmqControlChannel::localEndpoint() const
     return mEndpoint;
 }
 
-void ZmqControlChannel::addPeer(std::string const& peer, std::string const& endpoint)
+bool ZmqControlChannel::addPeer(std::string const& peer, std::string const& endpoint)
 {
     std::lock_guard<std::mutex> lk(mMu);
     if (mDealers.find(peer) != mDealers.end())
     {
-        return; // idempotent
+        return true; // idempotent
     }
-    zmq::socket_t dealer(mCtx, zmq::socket_type::dealer);
-    dealer.set(zmq::sockopt::routing_id, mSelfName); // so peer's ROUTER sees us by name
-    dealer.set(zmq::sockopt::linger, 0);
-    dealer.set(zmq::sockopt::sndhwm, kSendHwm);      // bound the queue; full -> sendTo drops (never blocks)
-    // Enable IPv6 unconditionally (off by default in zmq) so a DEALER can connect to an IPv6 peer
-    // endpoint; harmless when the endpoint is IPv4. Mirrors ucx_utils' connect socket.
-    dealer.set(zmq::sockopt::ipv6, 1);
-    dealer.connect(endpoint);
-    mDealers.emplace(peer, std::move(dealer));
+    if (endpoint.empty())
+    {
+        TLLM_THROW("ZmqControlChannel(%s): peer %s requires a non-empty endpoint", mSelfName.c_str(), peer.c_str());
+    }
+    try
+    {
+        zmq::socket_t dealer(mCtx, zmq::socket_type::dealer);
+        dealer.set(zmq::sockopt::routing_id, mSelfName); // so peer's ROUTER sees us by name
+        dealer.set(zmq::sockopt::linger, 0);
+        dealer.set(zmq::sockopt::sndhwm, kSendHwm);      // bound the queue; full -> sendTo drops (never blocks)
+        // Enable IPv6 unconditionally (off by default in zmq) so a DEALER can connect to an IPv6 peer
+        // endpoint; harmless when the endpoint is IPv4. Mirrors ucx_utils' connect socket.
+        dealer.set(zmq::sockopt::ipv6, 1);
+        dealer.connect(endpoint);
+        mDealers.emplace(peer, std::move(dealer));
+        return true;
+    }
+    catch (zmq::error_t const& e)
+    {
+        TLLM_THROW(
+            "ZmqControlChannel(%s): peer %s has an invalid endpoint: %s", mSelfName.c_str(), peer.c_str(), e.what());
+    }
 }
 
 void ZmqControlChannel::removePeer(std::string const& peer)

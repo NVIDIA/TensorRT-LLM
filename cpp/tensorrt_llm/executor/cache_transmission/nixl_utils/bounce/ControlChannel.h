@@ -70,8 +70,10 @@ public:
     [[nodiscard]] virtual std::string localEndpoint() const = 0;
 
     /// Register where to reach `peer` (its localEndpoint()). Must be called before
-    /// the first sendTo(peer, ...). Idempotent.
-    virtual void addPeer(std::string const& peer, std::string const& endpoint) = 0;
+    /// the first sendTo(peer, ...). Idempotent. Returns false when the underlying transport
+    /// cannot load an optional endpoint; implementations whose endpoint is mandatory may throw
+    /// when it is empty or malformed.
+    virtual bool addPeer(std::string const& peer, std::string const& endpoint) = 0;
 
     /// Forget `peer`: drop its send-side socket/endpoint (e.g. when the peer is lost, so the
     /// per-peer resource isn't kept alive until shutdown). Idempotent; thread-safe with

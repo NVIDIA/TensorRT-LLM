@@ -22,6 +22,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmException.h"
 
 #include <algorithm>
 #include <chrono>
@@ -259,10 +260,20 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     // Self-bootstrap the reverse control path. Disaggregated serving supports one-directional
     // metadata exchange: the KV sender may load our agent metadata without us loading the sender's.
     // In that case we have no reverse route for GRANT/ACK, so register the sender endpoint carried
-    // by WANT here (addPeer is idempotent).
-    if (!endpoint.empty())
+    // by WANT here (addPeer is idempotent). A cancel is still honored when registration fails so it
+    // can reclaim any flow state left by an earlier, valid WANT.
+    bool reversePathReady = false;
+    try
     {
-        mCtx.channel->addPeer(peer, endpoint);
+        reversePathReady = mCtx.channel->addPeer(peer, endpoint);
+    }
+    catch (tensorrt_llm::common::TllmException const& e)
+    {
+        // A malformed WANT is peer input on the reactor thread. Reject it without allowing an
+        // exception to escape the thread; handshake registration still propagates this error to
+        // the caller because a ZMQ endpoint is mandatory there.
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): rejected WANT from peer %s: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
     }
     auto const key = makeKey(peer, h.requestId);
     if (isCancelWant(chunkBytes))
@@ -278,6 +289,10 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
         {
             mScattering[off] = true;
         }
+        return;
+    }
+    if (!reversePathReady)
+    {
         return;
     }
     mCtx.sendGrants(mCtx.scheduler.onWant(key, chunkBytes));
@@ -1349,19 +1364,30 @@ void BounceTransport::shutdown()
     mSender.failAll();
 }
 
-void BounceTransport::addPeer(std::string const& peer, std::string const& endpoint)
+bool BounceTransport::addPeer(std::string const& peer, std::string const& endpoint)
 {
-    mCtx.channel->addPeer(peer, endpoint);
+    return mCtx.channel->addPeer(peer, endpoint);
 }
 
 std::string BounceTransport::localHandshakeBlob() const
 {
+    auto endpoint = mCtx.channel->localEndpoint();
+    if (endpoint.empty())
+    {
+        if (!mCtx.cfg.useNixlNotifications)
+        {
+            TLLM_THROW("BounceTransport(%s): ZMQ control requires a non-empty local endpoint", mCtx.selfName.c_str());
+        }
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): local control endpoint unavailable; not advertising bounce", mCtx.selfName.c_str());
+        return {};
+    }
     BounceHandshake handshake;
     handshake.wireVersion = kBounceVersion;
     handshake.controlKind = mCtx.cfg.useNixlNotifications ? BounceControlKind::kNIXL_NOTIF : BounceControlKind::kZMQ;
     handshake.arenaUsableCapacityBytes = mCtx.scheduler.arenaCapacity();
     handshake.maxChunkSizeBytes = mCtx.cfg.maxChunkSizeBytes; // post-ctor-clamp effective value
-    handshake.endpoint = mCtx.channel->localEndpoint();
+    handshake.endpoint = std::move(endpoint);
     return encodeHandshake(handshake);
 }
 
@@ -1408,7 +1434,14 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
             static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes));
         return false;
     }
-    mCtx.channel->addPeer(peer, handshake.endpoint);
+    if (!mCtx.channel->addPeer(peer, handshake.endpoint))
+    {
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): peer %s bounce endpoint could not be registered -> bounce disabled for "
+            "this peer (NIXL fallback)",
+            mCtx.selfName.c_str(), peer.c_str());
+        return false;
+    }
     std::lock_guard<std::mutex> lk(mPeerMu);
     mHandshakedPeers.insert(peer);
     return true;

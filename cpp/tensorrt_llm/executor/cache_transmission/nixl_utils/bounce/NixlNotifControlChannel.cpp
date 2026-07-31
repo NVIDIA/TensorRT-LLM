@@ -59,13 +59,13 @@ std::string NixlNotifControlChannel::localEndpoint() const
     return mLocalMd;
 }
 
-void NixlNotifControlChannel::addPeer(std::string const& peer, std::string const& endpoint)
+bool NixlNotifControlChannel::addPeer(std::string const& peer, std::string const& endpoint)
 {
     {
         std::lock_guard<std::mutex> lk(mMu);
         if (mPeers.find(peer) != mPeers.end())
         {
-            return; // idempotent
+            return true; // idempotent
         }
     }
     // `endpoint` is the peer's serialized agent metadata (see localEndpoint). Loading it gives this
@@ -75,7 +75,7 @@ void NixlNotifControlChannel::addPeer(std::string const& peer, std::string const
     {
         TLLM_LOG_WARNING(
             "NixlNotifControlChannel(%s): addPeer(%s) with empty metadata; dropping", mSelfName.c_str(), peer.c_str());
-        return;
+        return false;
     }
     std::string loadedName;
     nixl_status_t const st = mAgent->loadRemoteMD(endpoint, loadedName);
@@ -83,7 +83,7 @@ void NixlNotifControlChannel::addPeer(std::string const& peer, std::string const
     {
         TLLM_LOG_WARNING("NixlNotifControlChannel(%s): loadRemoteMD for peer %s failed: %s", mSelfName.c_str(),
             peer.c_str(), nixlEnumStrings::statusStr(st).c_str());
-        return;
+        return false;
     }
     if (loadedName != peer)
     {
@@ -91,10 +91,11 @@ void NixlNotifControlChannel::addPeer(std::string const& peer, std::string const
         // zmq endpoint string arrived instead of MD because the peers disagree on the channel type).
         TLLM_LOG_WARNING("NixlNotifControlChannel(%s): addPeer(%s) metadata names agent '%s'; dropping",
             mSelfName.c_str(), peer.c_str(), loadedName.c_str());
-        return;
+        return false;
     }
     std::lock_guard<std::mutex> lk(mMu);
     mPeers.insert(peer);
+    return true;
 }
 
 void NixlNotifControlChannel::removePeer(std::string const& peer)
