@@ -251,6 +251,28 @@ class TestParseRouterDir(unittest.TestCase):
             _write(os.path.join(d, "other.jsonl"), json.dumps(_router_record("x")) + "\n")
             self.assertEqual(parse_router_dir(d), {})
 
+    def test_duplicate_ctx_id_is_non_joinable(self):
+        # The gen-only benchmark path hardcodes ctx_request_id=1 for every
+        # request (TRTLLM_DISAGG_BENCHMARK_GEN_ONLY). Such an ambiguous key must
+        # NOT stay joinable (that would false-attach one surviving row to every
+        # worker record); it is moved to _no_ctx instead.
+        with tempfile.TemporaryDirectory() as d:
+            _write(
+                os.path.join(d, "disagg_router_pid100.jsonl"),
+                json.dumps(_router_record("1", disagg_request_id=10))
+                + "\n"
+                + json.dumps(_router_record("1", disagg_request_id=20))
+                + "\n"
+                + json.dumps(_router_record("1", disagg_request_id=30))
+                + "\n",
+            )
+            by_ctx = parse_router_dir(d)
+            # The ambiguous ctx key is not directly joinable...
+            self.assertNotIn("1", by_ctx)
+            # ...all three rows are surfaced as leftovers instead.
+            self.assertIn("_no_ctx", by_ctx)
+            self.assertEqual(len(by_ctx["_no_ctx"]), 3)
+
 
 class TestParseClientDir(unittest.TestCase):
     def test_sorted_by_send_wall_time(self):
@@ -360,6 +382,32 @@ class TestRouterAndClientMerge(unittest.TestCase):
             self.assertIn(("ctxORPHAN", 111), ids)
             self.assertIn((None, 999), ids)
             self.assertEqual(merger.match_stats["matched_router_ctx"], 0)
+
+    def test_gen_only_ctx_id_1_does_not_false_join(self):
+        # Regression: under TRTLLM_DISAGG_BENCHMARK_GEN_ONLY the service stamps
+        # ctx_request_id=1 on every request, so multiple router rows share it.
+        # No worker record should pick up a router_dispatch by that ambiguous
+        # key; all router rows fall through to unjoined leftovers.
+        with tempfile.TemporaryDirectory() as ev, tempfile.TemporaryDirectory() as rt:
+            _write(
+                os.path.join(ev, "time_events_rank0_pid1.jsonl"),
+                json.dumps(_make_record(10, ctx_request_id="1")) + "\n"
+                + json.dumps(_make_record(20, ctx_request_id="1")) + "\n",
+            )
+            _write(
+                os.path.join(rt, "disagg_router_pid1.jsonl"),
+                json.dumps(_router_record("1", disagg_request_id=10)) + "\n"
+                + json.dumps(_router_record("1", disagg_request_id=20)) + "\n",
+            )
+
+            merger = PerfTimeEventsMerger()
+            records = merger.merge(event_dir=ev, router_dir=rt)
+            self.assertEqual(len(records), 2)
+            for out in records:
+                self.assertNotIn("router_dispatch", out)
+            self.assertEqual(merger.match_stats["matched_router_ctx"], 0)
+            # Both router rows surface as leftovers rather than false-joining.
+            self.assertEqual(len(merger.unjoined_router_events), 2)
 
     def test_client_events_standalone_in_payload(self):
         with tempfile.TemporaryDirectory() as ev, tempfile.TemporaryDirectory() as cl:

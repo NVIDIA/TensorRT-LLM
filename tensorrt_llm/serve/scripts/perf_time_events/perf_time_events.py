@@ -92,7 +92,7 @@ def parse_event_dir(event_dir: str) -> List[Dict[str, Any]]:
     return records
 
 
-def parse_router_dir(router_dir: str) -> Dict[str, Dict[str, Any]]:
+def parse_router_dir(router_dir: str) -> Dict[str, Any]:
     """Parse disagg-router ``disagg_router_*.jsonl`` files, keyed by ctx id.
 
     Each record is one finished request as written by
@@ -102,12 +102,23 @@ def parse_router_dir(router_dir: str) -> Dict[str, Dict[str, Any]]:
     (``ctx_request_id`` -- the cross-process key shared with the worker per-rank
     files -- and the router's own ``disagg_request_id``).
 
-    Returned keyed by ``str(ctx_request_id)`` so worker records join in O(1).
-    Records without a ``ctx_request_id`` (gen-only / no-ctx path) are collected
-    under the sentinel key ``""`` as a list appended into ``_no_ctx`` so they are
-    still reported rather than silently dropped.
+    Returns a dict keyed by ``str(ctx_request_id)`` (each mapping to a single
+    router record ``dict``) so worker records join in O(1), plus one reserved
+    key ``"_no_ctx"`` -> ``List[dict]`` holding every record that CANNOT be
+    joined on ``ctx_request_id``:
+
+    * records with no ``ctx_request_id`` (the gen-only / no-ctx path), and
+    * records whose ``ctx_request_id`` is ambiguous because more than one
+      distinct request reported it. This happens on the gen-only benchmark
+      path, where the service hardcodes ``ctx_request_id=1`` for every request
+      (``TRTLLM_DISAGG_BENCHMARK_GEN_ONLY``); keeping such a key joinable would
+      false-attach one surviving router row to every worker record, so those
+      records are made non-joinable and surfaced as leftovers instead.
+
+    (Return type is ``Dict[str, Any]`` because the ``"_no_ctx"`` value is a list
+    while every other value is a single record dict.)
     """
-    by_ctx: Dict[str, Dict[str, Any]] = {}
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     no_ctx: List[Dict[str, Any]] = []
     files = sorted(glob.glob(os.path.join(router_dir, "disagg_router_*.jsonl")))
     for path in files:
@@ -118,9 +129,24 @@ def parse_router_dir(router_dir: str) -> Dict[str, Dict[str, Any]]:
             if ctx_id is None:
                 no_ctx.append(obj)
             else:
-                by_ctx[str(ctx_id)] = obj
+                grouped[str(ctx_id)].append(obj)
+
+    by_ctx: Dict[str, Any] = {}
+    for ctx_id, rows in grouped.items():
+        if len(rows) == 1:
+            by_ctx[ctx_id] = rows[0]
+        else:
+            # Ambiguous ctx id -- cannot uniquely attribute a router record to a
+            # worker record (e.g. the gen-only ctx_request_id=1 hardcode). Make
+            # it non-joinable rather than last-write-wins false-joining.
+            print(
+                f"WARNING: router ctx_request_id={ctx_id!r} reported by "
+                f"{len(rows)} distinct requests; treating as non-joinable "
+                f"(gen-only benchmark hardcode?)"
+            )
+            no_ctx.extend(rows)
     if no_ctx:
-        by_ctx["_no_ctx"] = no_ctx  # type: ignore[assignment]
+        by_ctx["_no_ctx"] = no_ctx
     return by_ctx
 
 
@@ -330,13 +356,19 @@ class PerfTimeEventsMerger:
             if joined_cpp:
                 rec["kv_cpp_events"] = joined_cpp
 
-            # Router dispatch join (by ctx_request_id -- the cross-process key).
+            # Router dispatch join -- STRICTLY on ctx_request_id, the only key
+            # the router and the worker per-rank files genuinely share. An
+            # earlier version also tried the worker-local request_id, which can
+            # false-join to an unrelated router record whose ctx id numerically
+            # equals this record's request_id. Ambiguous/duplicate ctx ids were
+            # already dropped from router_by_ctx by parse_router_dir.
             router_rec = None
-            for rid in rids:
-                if rid in router_by_ctx:
-                    router_rec = router_by_ctx[rid]
-                    matched_router_ctx.add(rid)
-                    break
+            ctx_rid = rec.get("ctx_request_id")
+            if ctx_rid is not None:
+                ctx_rid = str(ctx_rid)
+                router_rec = router_by_ctx.get(ctx_rid)
+                if router_rec is not None:
+                    matched_router_ctx.add(ctx_rid)
             if router_rec is not None:
                 rec["router_dispatch"] = router_rec
 
