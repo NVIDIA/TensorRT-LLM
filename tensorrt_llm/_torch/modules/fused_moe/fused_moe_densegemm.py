@@ -10,7 +10,6 @@ import torch
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils import fp4_utils
 
-from ...distributed import allgather
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, swizzle_sf, unswizzle_sf
@@ -157,7 +156,6 @@ class DenseGEMMFusedMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type=None,
     ):
         # DenseGEMM CuTe DSL kernels only support SM100 and SM103.
@@ -201,9 +199,9 @@ class DenseGEMMFusedMoE(MoE):
         )
 
         # Call MoE base class directly (not CutlassFusedMoE).
-        # Note: `without_comm` and `apply_router_weight_on_input` are accepted
-        # for API compatibility with create_moe_backend() but are not passed to
-        # MoE.__init__() since DenseGEMM does not use alltoall communication.
+        # Note: `apply_router_weight_on_input` is accepted for API
+        # compatibility with create_moe_backend() but is not passed to
+        # MoE.__init__().
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -535,77 +533,3 @@ class DenseGEMMFusedMoE(MoE):
             x_sf=x_sf,
             enable_alltoall=enable_alltoall,
         )
-
-    def forward_chunk(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        repeating_info: tuple = (True, True),
-    ) -> torch.Tensor:
-        # Currently, the default path is that ConfigurableMoE calls DenseGEMMFusedMoE.run_moe.
-        # This forward_chunk method is a reference implementation of the legacy path.
-        # Apply routing
-        token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
-        assert token_selected_experts.shape[1] == self.routing_method.experts_per_token
-        assert token_selected_experts.shape == token_final_scales.shape
-        assert token_selected_experts.shape[0] == router_logits.shape[0]
-        assert token_final_scales.dtype == torch.float32
-        assert token_selected_experts.dtype == torch.int32
-
-        x, x_sf = self.quantize_input(x)
-
-        if self.use_dp and self.parallel_size > 1:
-            x, x_sf, token_selected_experts, token_final_scales = allgather(
-                [x, x_sf, token_selected_experts, token_final_scales],
-                self.mapping,
-                dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens,
-            )
-
-        x = self.run_moe(
-            x=x,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            x_sf=x_sf,
-            enable_alltoall=False,
-        )
-        return x
-
-    def forward_impl(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        *,
-        do_finalize: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        assert do_finalize, "DenseGEMMFusedMoE does not support do_finalize=False"
-
-        is_first_call = self.repeat_idx == 0
-        is_last_call = self.repeat_idx == self.repeat_count - 1
-
-        outputs = self.forward_chunk(
-            x,
-            router_logits,
-            output_dtype,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
-            repeating_info=(is_first_call, is_last_call),
-        )
-        outputs = self.reducescatter_or_allreduce(
-            outputs,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
-        )
-
-        if self.use_dp and self.parallel_size > 1:
-            rank = self.parallel_rank
-            outputs = outputs[: all_rank_num_tokens[rank]]
-        self.repeat_idx = 0 if self.repeat_idx == self.repeat_count - 1 else self.repeat_idx + 1
-        return outputs

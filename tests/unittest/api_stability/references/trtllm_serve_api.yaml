@@ -301,6 +301,12 @@ models:
         default: null
         status: prototype
         required: false
+      priority:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
+        required: false
 
   CompletionResponseChoice:
     fields:
@@ -801,6 +807,12 @@ models:
         type: Optional[Dict[str, Any]]
         default: null
         status: beta
+        required: false
+      priority:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
         required: false
 
   ChatCompletionResponseChoice:

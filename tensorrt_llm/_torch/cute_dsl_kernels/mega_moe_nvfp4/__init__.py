@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """CuteDSL MegaMoE NVFP4 kernel package.
 
-Hosts the ported MegaMoE fused dispatch + FC1 + activation + FC2 + combine
-CuteDSL kernel (flattened from the upstream ``moe_nvfp4_swapab/`` + ``src/``
-split). The package is loaded
+Hosts the MegaMoE fused dispatch + FC1 + activation + FC2 + combine CuteDSL
+kernel. The package is loaded
 lazily by :mod:`tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_cute_dsl`
 through :func:`import_kernel` so environments without a CUDA 13 Cutlass DSL
 runtime can still import the backend file for capability probing.
@@ -39,7 +38,6 @@ __all__ = [
     "from_blocked",
     "import_kernel",
     "import_sym_buffer_host",
-    "import_topk_reduce",
     "stack_byte_reinterpretable_tensors",
     "to_blocked",
 ]
@@ -72,20 +70,3 @@ def import_sym_buffer_host():
     # SymBufferHost lives at module scope as a factory; the upstream API
     # constructs the per-world-size variant inside sym_buffer.py.
     return sym_buffer
-
-
-def import_topk_reduce():
-    """Lazily import the standalone CuteDSL top-k reduce kernel API.
-
-    Returns ``(compile_topk_reduce, launch_compiled_topk_reduce)`` from
-    :mod:`.topk_reduce` (mirrors :func:`import_kernel`). The reduce kernel
-    is only needed by the opt-in transformers graph
-    (``apply_topk_in_fc1=False``); the deepgemm-default route reduces on
-    the host via ``combine_output.sum(dim=1)`` and never imports it. Like
-    ``import_kernel`` this stays lazy so non-SM100 / no-cutlass-dsl
-    environments can import the backend for capability probing without
-    pulling the heavyweight CuteDSL symbols.
-    """
-    from .topk_reduce import compile_topk_reduce, launch_compiled_topk_reduce
-
-    return compile_topk_reduce, launch_compiled_topk_reduce

@@ -1839,6 +1839,36 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
         )
 
 
+def external_drafter_config_kwargs(model_config, spec_config) -> dict:
+    """`ModelConfig.from_pretrained` kwargs for a one-model external drafter.
+
+    The drafter is a separate checkpoint, so it gets its own `ModelConfig`; the
+    kwargs below are the execution-layout properties it must inherit from the
+    target engine it runs inside.
+
+    `moe_load_balancer` is propagated for DSpark ONLY. DSpark's draft stages are
+    full DeepSeek-V4 blocks sharing the target's expert topology and layer-index
+    namespace (`layer_idx = num_hidden_layers + stage_id`), so they can register
+    into the target's EPLB manager. Other external drafters (PARD, DFlash,
+    draft-target) are independent checkpoints whose expert topology and layer
+    numbering need not match the target's, and whose EPLB configs would therefore
+    be keyed against a different namespace -- do not generalize this without
+    designing a per-drafter EPLB config domain and layer identity first.
+    """
+    kwargs = dict(
+        trust_remote_code=True,
+        attn_backend=model_config.attn_backend,
+        moe_backend=model_config.moe_backend,
+        mapping=model_config.mapping,
+        spec_config=None,  # Avoid recursive spec-dec
+        max_num_tokens=model_config.max_num_tokens,
+        moe_max_num_tokens=model_config.moe_max_num_tokens,
+    )
+    if spec_config.spec_dec_mode.is_dspark():
+        kwargs["moe_load_balancer"] = model_config.moe_load_balancer
+    return kwargs
+
+
 def get_draft_model(model_config, draft_config, lm_head, model):
     """Construct the draft model for the configured speculative-decoding mode
     (EAGLE3 / MTP / PARD / DFlash). The DFlash branch selects the Laguna drafter
@@ -1878,9 +1908,11 @@ def get_draft_model(model_config, draft_config, lm_head, model):
         # modeling_speculative). The DSpark draft reuses the target's aux streams.
         # The draft stage count (n_mtp_layers) is not in the HF config, so derive
         # it from the checkpoint's mtp.* namespace.
-        from .modeling_dspark import DSparkForCausalLM, count_dspark_stages
+        from .modeling_dspark import (DSparkForCausalLM, count_dspark_stages,
+                                      validate_dspark_eplb_layer_base)
         num_stages = count_dspark_stages(
             model_config.spec_config.speculative_model)
+        validate_dspark_eplb_layer_base(model_config, draft_config)
         return DSparkForCausalLM(
             draft_config,
             getattr(model, "aux_stream_dict", None),
@@ -1904,11 +1936,22 @@ def get_draft_model(model_config, draft_config, lm_head, model):
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
-    def __init__(self, model: TModel, model_config: ModelConfig[TConfig]):
+    def __init__(self,
+                 model: TModel,
+                 model_config: ModelConfig[TConfig],
+                 hidden_size: int | None = None,
+                 vocab_size: int | None = None) -> None:
+        # Composite configs (e.g. vision-language wrappers) may not expose
+        # hidden_size/vocab_size at the top level; callers can pass the
+        # text-config values explicitly.
+        if hidden_size is None:
+            hidden_size = model_config.pretrained_config.hidden_size
+        if vocab_size is None:
+            vocab_size = model_config.pretrained_config.vocab_size
         super().__init__(model,
                          config=model_config,
-                         hidden_size=model_config.pretrained_config.hidden_size,
-                         vocab_size=model_config.pretrained_config.vocab_size)
+                         hidden_size=hidden_size,
+                         vocab_size=vocab_size)
         self.draft_model = None
         self.draft_config = None
         self.spec_worker = None
@@ -1952,13 +1995,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(
                         model_config.spec_config.speculative_model,
-                        trust_remote_code=True,
-                        attn_backend=model_config.attn_backend,
-                        moe_backend=model_config.moe_backend,
-                        mapping=model_config.mapping,
-                        spec_config=None,  # Avoid recursive spec-dec
-                        max_num_tokens=model_config.max_num_tokens,
-                        moe_max_num_tokens=model_config.moe_max_num_tokens)
+                        **external_drafter_config_kwargs(
+                            model_config, spec_config))
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
