@@ -2335,7 +2335,8 @@ def create_kv_cache_compression_manager(
     if config.algorithm == "triattention":
         if not is_sm_100f():
             raise RuntimeError(
-                "TriAttention requires an SM100-family device (SM100 or SM103).")
+                "TriAttention requires an SM100-family device (SM100 or SM103)."
+            )
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
         from ..kv_cache_compression.triattention.triattention import \
             TriAttention
