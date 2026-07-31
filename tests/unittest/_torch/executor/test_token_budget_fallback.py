@@ -40,6 +40,10 @@ class _FakeRequest:
     ):
         _FakeRequest._next_id += 1
         self.py_request_id = _FakeRequest._next_id
+        # PyExecutor's inflight-set bookkeeping reads ``request_id`` (the C++
+        # binding's name) rather than ``py_request_id``; keep them in sync so the
+        # same fake drives both the fallback and TestInflightIdsSurviveTrim.
+        self.request_id = self.py_request_id
         self.context_chunk_size = context_chunk_size
         self.context_current_position = context_current_position
         # Mirrors the C++ semantics: is_last_context_chunk is a *computed*
@@ -279,9 +283,12 @@ class TestFitTokenBudget(unittest.TestCase):
         # added sequences for context requests the fallback then defers --
         # orphaning them and causing a double-add when they reschedule.
         #
-        # Build the aggregate ResourceManager with the same ordering as
-        # production (draft-like manager first, KV cache manager last) and assert
-        # the earlier manager observes the *already-deferred* batch.
+        # The executor loop drives the fallback via
+        # ResourceManager.maybe_fit_token_budget before it calls
+        # prepare_resources; build the aggregate ResourceManager with the same
+        # ordering as production (draft-like manager first, KV cache manager
+        # last) and assert the earlier manager observes the *already-deferred*
+        # batch.
         target = _make_manager(
             max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False
         )
@@ -310,6 +317,7 @@ class TestFitTokenBudget(unittest.TestCase):
                 ]
             )
         )
+        rm.maybe_fit_token_budget(batch)
         rm.prepare_resources(batch)
 
         # ctx_keep (96) fits into 112; ctx_defer (64) does not and is deferred.
@@ -318,13 +326,142 @@ class TestFitTokenBudget(unittest.TestCase):
         self.assertEqual(observed, [[ctx_keep.py_request_id]])
         self.assertEqual(batch.num_context_requests, 1)
 
+    def test_prepare_resources_does_not_trim(self):
+        # The fallback must NOT be reachable from prepare_resources: the
+        # executor loop drives it earlier so that _can_queue's attention-DP
+        # tp_allgather(batch_size) and the PP inflight-set registration both see
+        # the trimmed batch. A second trim here would be redundant at best, and
+        # leaving it as the *only* trim point is what let a rank shed its way to
+        # an empty batch after the ranks had already voted to run.
+        target = _make_manager(
+            max_num_tokens=128, tokens_per_block=16, enable_chunked_prefill=False
+        )
+        target.is_draft = False
+        target.prepare_resources = lambda batch: None
+
+        ctx_over_budget = _FakeRequest(context_chunk_size=64)
+        gen = _FakeRequest(py_beam_width=100)  # remaining = 28, so ctx cannot fit
+        batch = _make_batch([ctx_over_budget], [gen])
+
+        rm = ResourceManager(OrderedDict([(ResourceManagerType.KV_CACHE_MANAGER, target)]))
+        rm.prepare_resources(batch)
+
+        self.assertEqual(batch.num_context_requests, 1)
+
+        # ...and the batch is trimmed only once maybe_fit_token_budget is called.
+        rm.maybe_fit_token_budget(batch)
+        self.assertEqual(batch.num_context_requests, 0)
+
     def test_generation_alone_over_budget_raises(self):
+        # A context request must be present for the fallback to engage at all
+        # (see test_gen_only_batch_is_left_alone); generation requests that
+        # exceed the budget by themselves leave nothing to shed.
         mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
         gen = _FakeRequest(py_beam_width=200)
-        batch = _make_batch([], [gen])
+        ctx = _FakeRequest(context_chunk_size=16)
+        batch = _make_batch([ctx], [gen])
 
         with self.assertRaises(RuntimeError):
             mgr._fit_token_budget(batch)
+
+    def test_gen_only_batch_is_left_alone(self):
+        # Context requests are the only thing the fallback can shed, so a
+        # gen-only batch returns before the generation-token accounting: it
+        # keeps that scan off the executor loop's hottest path, and it avoids
+        # raising on a condition nothing here can fix. An over-budget gen-only
+        # batch stays the concern of the _prepare_tp_inputs assert, which fails
+        # one batch rather than killing the (possibly only rank-local) event
+        # loop.
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+        gen = _FakeRequest(py_beam_width=200)  # 200 > max_num_tokens
+        batch = _make_batch([], [gen])
+
+        mgr._fit_token_budget(batch)  # must not raise
+
+        self.assertEqual(batch.num_context_requests, 0)
+        self.assertEqual(batch.generation_requests, [gen])
+
+
+class TestInflightIdsSurviveTrim(unittest.TestCase):
+    """The fallback must not strand ids in PyExecutor's inflight set.
+
+    ``_executor_loop_pp`` calls ``_add_inflight_ids`` before
+    ``ResourceManager.prepare_resources`` and ``_remove_inflight_ids`` after, so
+    the fallback runs between them and mutates the batch: a deferred context
+    request is dropped from it, and a re-chunked one moves out of
+    ``context_requests_last_chunk``. Removal must therefore erase the ids that
+    were actually inserted, not re-derive them from the trimmed batch -- an id
+    left behind makes the scheduler skip that request forever (scheduler.py's
+    ``if req.request_id in inflight_request_ids: continue``).
+    """
+
+    @staticmethod
+    def _bare_executor():
+        # Same trick as _make_manager: PyExecutor.__init__ builds an engine, so
+        # instantiate bare and supply only the inflight set the methods touch.
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
+
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.inflight_req_ids = ReqIdsSet()
+        return executor
+
+    def test_trimmed_context_requests_leave_no_inflight_ids(self):
+        executor = self._bare_executor()
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+
+        gen = _FakeRequest(py_beam_width=100)  # leaves a 28-token budget
+        # Both start as last-chunk requests, so both are registered inflight.
+        # ctx_rechunked shrinks to a block-aligned 16 and flips to a non-last
+        # chunk; ctx_deferred no longer fits and is dropped from the batch.
+        ctx_rechunked = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        ctx_deferred = _FakeRequest(context_chunk_size=64, prompt_len=64)
+        batch = _make_batch([ctx_rechunked, ctx_deferred], [gen])
+
+        executor._add_inflight_ids(batch)
+        self.assertEqual(
+            sorted(batch.added_inflight_req_ids),
+            sorted([ctx_rechunked.request_id, ctx_deferred.request_id, gen.request_id]),
+        )
+
+        mgr._fit_token_budget(batch)
+
+        # Preconditions for the regression: the batch really did change shape.
+        self.assertEqual(ctx_rechunked.context_chunk_size, 16)
+        self.assertIn(ctx_rechunked, batch.context_requests_chunking)
+        self.assertEqual(batch.context_requests_last_chunk, [])
+        self.assertNotIn(ctx_deferred, batch.context_requests)
+
+        executor._remove_inflight_ids(batch)
+
+        for req in (ctx_rechunked, ctx_deferred, gen):
+            self.assertNotIn(
+                req.request_id,
+                executor.inflight_req_ids,
+                f"request {req.request_id} left in the inflight set; the scheduler "
+                "would never schedule it again",
+            )
+        self.assertEqual(batch.added_inflight_req_ids, [])
+
+    def test_untrimmed_batch_round_trips(self):
+        # The batch the fallback leaves alone must behave exactly as before.
+        executor = self._bare_executor()
+        mgr = _make_manager(max_num_tokens=128, tokens_per_block=16)
+
+        gen = _FakeRequest(py_beam_width=1)
+        ctx = _FakeRequest(context_chunk_size=16)
+        batch = _make_batch([ctx], [gen])
+
+        executor._add_inflight_ids(batch)
+        for req in (ctx, gen):
+            self.assertIn(req.request_id, executor.inflight_req_ids)
+
+        mgr._fit_token_budget(batch)
+        self.assertEqual(batch.num_context_requests, 1)
+
+        executor._remove_inflight_ids(batch)
+        for req in (ctx, gen):
+            self.assertNotIn(req.request_id, executor.inflight_req_ids)
 
 
 if __name__ == "__main__":

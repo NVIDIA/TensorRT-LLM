@@ -2592,6 +2592,12 @@ class PyExecutor:
                         num_fitting_reqs, fitting_disagg_gen_init_requests,
                         wait_for_disagg_gen_transfer_progress, all_gen_first)
 
+                # Re-validate the per-step token budget and shed deferrable
+                # work here, before the batch is measured, registered in the
+                # inflight set, voted on by _can_queue, or allocated against.
+                # See ResourceManager.maybe_fit_token_budget.
+                self.resource_manager.maybe_fit_token_budget(scheduled_batch)
+
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
                 logger.debug(
@@ -3721,6 +3727,11 @@ class PyExecutor:
                 # client receives an error instead of hanging.
                 self._handle_errors(error_msg, requests=self.active_requests)
                 return None, None
+
+        # Re-validate the per-step token budget and shed deferrable work here,
+        # before the batch is measured, voted on by _can_queue, or allocated
+        # against. See ResourceManager.maybe_fit_token_budget.
+        self.resource_manager.maybe_fit_token_budget(scheduled_batch)
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -6979,30 +6990,47 @@ class PyExecutor:
         Only requests that sample new tokens should be added to the inflight set since their next iteration depends
         on these new tokens, so they should be skipped in the scheduler until the new tokens are generated.
         This includes context requests that finish context phase and generation requests.
+
+        The inserted ids are recorded on ``scheduled_requests`` so the paired
+        ``_remove_inflight_ids`` erases exactly what was added, rather than
+        re-deriving the set from a batch that may have changed in between. An id
+        left behind is not recoverable: the scheduler skips inflight ids, so the
+        request is never scheduled again while still holding its KV blocks and
+        sequence slot.
+
+        Callers currently trim the batch before this point (see
+        ``ResourceManager.maybe_fit_token_budget``, which can defer a context
+        request out of the batch entirely or re-chunk one out of
+        ``context_requests_last_chunk``), so the two views agree today. Snapshot
+        anyway: the pairing must not silently depend on that ordering.
         """
+        added: List[int] = []
         for req in scheduled_requests.context_requests_last_chunk:
             logger.debug(
                 f"Context request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
+            added.append(req.request_id)
         for req in scheduled_requests.generation_requests:
             logger.debug(
                 f"Generation request with ID {req.request_id} added to DECODER model inflight set"
             )
             self.inflight_req_ids.insert(req.request_id)
+            added.append(req.request_id)
+        scheduled_requests.added_inflight_req_ids = added
 
     def _remove_inflight_ids(self, scheduled_requests: ScheduledRequests):
-        """Remove request IDs of current sampling requests from self.inflight_req_ids."""
-        for req in scheduled_requests.context_requests_last_chunk:
+        """Remove the request IDs this batch added to self.inflight_req_ids.
+
+        Erases the ids recorded by ``_add_inflight_ids`` rather than re-deriving
+        them from the batch, which may have been trimmed since (see there).
+        """
+        for req_id in scheduled_requests.added_inflight_req_ids:
             logger.debug(
-                f"Context request with ID {req.request_id} removed from DECODER model inflight set"
+                f"Request with ID {req_id} removed from DECODER model inflight set"
             )
-            self.inflight_req_ids.erase(req.request_id)
-        for req in scheduled_requests.generation_requests:
-            logger.debug(
-                f"Generation request with ID {req.request_id} removed from DECODER model inflight set"
-            )
-            self.inflight_req_ids.erase(req.request_id)
+            self.inflight_req_ids.erase(req_id)
+        scheduled_requests.added_inflight_req_ids = []
 
     def _handle_speculative_decoding(
         self, scheduled_batch, previous_tensors, target_inputs

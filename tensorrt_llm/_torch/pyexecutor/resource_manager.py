@@ -822,7 +822,21 @@ class KVCacheManager(BaseResourceManager):
         instead. Re-chunking with chunked prefill disabled produces an invalid
         forward pass (empty-query asserts / missing quantized KV buffers /
         cudaErrorInvalidValue) -- see the regression covered by PR #15187.
+
+        Context requests are the only work this fallback can shed, so a batch
+        with none scheduled returns immediately -- including before the
+        generation-token accounting below, which cannot change the outcome when
+        there is nothing to defer or re-chunk. That keeps the gen-only batch
+        (the executor loop's hottest, most latency-sensitive path) free of an
+        O(num_generation_requests) scan that costs ~50us at 512 generation
+        requests and ~100us at 1024.
         """
+        # Tested against the two lists rather than the ``context_requests``
+        # property, which concatenates them into a fresh list on every access.
+        if (not scheduled_batch.context_requests_chunking
+                and not scheduled_batch.context_requests_last_chunk):
+            return
+
         budget = self.max_num_tokens
 
         # Generation requests are in-flight and cannot be deferred. If they
@@ -912,16 +926,17 @@ class KVCacheManager(BaseResourceManager):
         """Apply the prep-boundary token-budget fallback to ``scheduled_batch``.
 
         This is a *batch-level* scheduling decision (defer/re-chunk context
-        requests so the forward pass cannot exceed ``max_num_tokens``) and MUST
-        run before any resource manager allocates KV cache for the batch. It is
-        therefore driven once by ``ResourceManager.prepare_resources`` rather
-        than from this manager's own ``prepare_resources``: the target KV cache
-        manager is deliberately invoked *last* (see ``_util.py``'s
-        ``move_to_end(KV_CACHE_MANAGER)``), so running the fallback here would
-        let an earlier manager -- e.g. a separate draft KV cache manager under
-        MTP -- add sequences for context requests the fallback then defers,
-        orphaning those sequences and tripping a double-add (``emplaceDone``,
-        kvCacheManager.cpp) when the deferred requests reschedule.
+        requests so the forward pass cannot exceed ``max_num_tokens``), so it is
+        driven once by ``ResourceManager.maybe_fit_token_budget`` from the
+        executor loop -- see there for why it has to run that early -- rather
+        than from this manager's own ``prepare_resources``. In particular the
+        target KV cache manager is deliberately invoked *last* (see
+        ``_util.py``'s ``move_to_end(KV_CACHE_MANAGER)``), so running the
+        fallback here would let an earlier manager -- e.g. a separate draft KV
+        cache manager under MTP -- add sequences for context requests the
+        fallback then defers, orphaning those sequences and tripping a
+        double-add (``emplaceDone``, kvCacheManager.cpp) when the deferred
+        requests reschedule.
         """
         if not self.is_draft:
             # The draft-model engine builds inputs with a different token shape;
@@ -2771,22 +2786,36 @@ class ResourceManager:
             self, type: ResourceManagerType) -> Optional[BaseResourceManager]:
         return self.resource_managers.get(type)
 
-    @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        # Apply the prep-boundary token-budget fallback (#13318) once, before
-        # any manager allocates resources. It defers/re-chunks context requests
-        # so the forward pass cannot exceed max_num_tokens, and mutates
-        # scheduled_batch in place. It must run up front so every manager --
-        # including a separate draft KV cache manager (MTP) that is invoked
-        # before the target KV cache manager -- observes the same deferred
-        # batch; otherwise an earlier manager adds sequences for context
-        # requests the fallback later defers, orphaning them and tripping a
-        # double-add (emplaceDone) when those requests reschedule.
+    @nvtx_range("maybe_fit_token_budget")
+    def maybe_fit_token_budget(self, scheduled_batch: ScheduledRequests):
+        """Apply the prep-boundary token-budget fallback (#13318) to the batch.
+
+        Defers or re-chunks context requests so the forward pass cannot exceed
+        max_num_tokens, mutating scheduled_batch in place. Driven by the
+        executor loop right after scheduling -- not from prepare_resources --
+        because the batch it produces must be the one every later step sees:
+
+        - _can_queue all-gathers scheduled_batch.batch_size under attention DP
+          and gates on no rank being empty. Trimming after that vote lets a rank
+          shed its way to an empty batch once the ranks have already agreed to
+          run, which is the exact state that gate exists to prevent.
+        - _add_inflight_ids (PP) registers the batch's last-chunk context
+          requests in the inflight set. Trimming after it registers requests
+          that are no longer in the batch.
+        - Every resource manager keys off the batch's contents, including a
+          separate draft KV cache manager (MTP) invoked before the target one.
+          A manager that adds sequences for a context request the fallback then
+          defers orphans them, tripping a double-add (emplaceDone) when those
+          requests reschedule.
+        """
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
         if kv_cache_manager is not None and hasattr(kv_cache_manager,
                                                     "maybe_fit_token_budget"):
             kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
+
+    @nvtx_range("prepare_resources")
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
