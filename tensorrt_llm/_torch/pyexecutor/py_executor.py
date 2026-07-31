@@ -918,6 +918,9 @@ class PyExecutor:
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
+        if kv_cache_transceiver is not None:
+            self.hang_detector.register_status_provider(
+                kv_cache_transceiver.get_status_dump)
         cache_transceiver_config = getattr(self.llm_args,
                                            "cache_transceiver_config", None)
         max_tokens_in_buffer = getattr(cache_transceiver_config,
