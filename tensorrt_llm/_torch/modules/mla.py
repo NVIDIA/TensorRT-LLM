@@ -1075,7 +1075,69 @@ class MLA(nn.Module):
             return False
         return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
-    def _deepseek_v4_q_b_layernorm_fused_fp8(self, q_proj: torch.Tensor):
+    def _fused_q_rope_inputs(
+        self, attn_metadata: AttentionMetadata, num_contexts: int, num_generations: int
+    ):
+        """(cos_sin, cache_lens, seq_len, cu_q_seqlens) for the fused Q RoPE.
+
+        Returns all-None when the batch does not qualify. Single-phase batches only:
+        context rows take positions from a ragged token cumsum, generation rows from a
+        uniform query length, and one launch cannot do both.
+        """
+        if os.environ.get("TRTLLM_DISABLE_FUSED_Q_ROPE", "0") == "1":
+            return None, None, 0, None
+        cache_lens = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
+        if cache_lens is None:
+            return None, None, 0, None
+        if num_contexts > 0 and num_generations > 0:
+            # Mixed: the two halves would need different position rules in one launch.
+            return None, None, 0, None
+
+        seq_len = 0
+        cu_q_seqlens = None
+        if num_generations > 0:
+            num_gen_tokens = attn_metadata.num_tokens - attn_metadata.num_ctx_tokens
+            if num_gen_tokens <= 0 or num_gen_tokens % num_generations != 0:
+                return None, None, 0, None
+            seq_len = num_gen_tokens // num_generations
+            cache_lens = cache_lens[num_contexts:]
+        else:
+            # NOT YET SAFE TO ENABLE. In kFuseRope mode the kernel writes the rotated
+            # rope segment as FP8 and leaves bf16 `q_pe` stale. The context RoPE
+            # kernel's Q region would then rotate that stale q_pe and overwrite the
+            # correct FP8 rope slots. Enabling this needs the matching skip in
+            # `applyMLARopeAndAssignQKVKernelOptContext` (MlaParams::q_rope_done),
+            # which is not plumbed yet -- so keep context on the existing path.
+            if os.environ.get("TRTLLM_ENABLE_FUSED_Q_ROPE_CTX", "0") != "1":
+                return None, None, 0, None
+            # Context is ragged, so positions come from a token-wise cumsum rather
+            # than a uniform seq_len. `ctx_uncached_token_indptr` is exactly
+            # cumsum(seq_lens[:num_contexts]) and is already maintained per
+            # iteration; the kernel pairs it with the cache lengths to recover each
+            # row's cached offset, which is what makes chunked prefill work.
+            cu_q_seqlens = getattr(attn_metadata, "ctx_uncached_token_indptr", None)
+            if cu_q_seqlens is None:
+                return None, None, 0, None
+            cu_q_seqlens = cu_q_seqlens[: num_contexts + 1]
+            cache_lens = cache_lens[:num_contexts]
+
+        # The table must already cover every position these rows will read.
+        ensure = getattr(self.mqa, "_ensure_rope_table_size", None)
+        if ensure is not None:
+            ensure(attn_metadata.max_seq_len)
+        cos_sin = getattr(self.mqa, "rotary_cos_sin", None)
+        if cos_sin is None:
+            return None, None, 0, None
+        return cos_sin, cache_lens, seq_len, cu_q_seqlens
+
+    def _deepseek_v4_q_b_layernorm_fused_fp8(
+        self,
+        q_proj: torch.Tensor,
+        rope_cos_sin: Optional[torch.Tensor] = None,
+        cache_seq_lens: Optional[torch.Tensor] = None,
+        seq_len: int = 0,
+        cu_q_seqlens: Optional[torch.Tensor] = None,
+    ):
         # Returns (placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv).
         # `placeholder_q` keeps the [num_tokens, num_heads*head_dim] bf16 layout
         # the downstream `forward_absorption_context` needs for its `q.shape[0]`
@@ -1097,6 +1159,9 @@ class MLA(nn.Module):
             (num_tokens, self.num_heads_tp * self.qk_head_dim), dtype=torch.float8_e4m3fn
         )
         q_pe = q_proj.new_empty((num_tokens, self.num_heads_tp, rope_dim))
+        # With rope inputs the kernel also rotates the rope segment and writes it
+        # FP8 into `quant_q_buffer`, so `q_pe` is left untouched and the generation
+        # RoPE kernel is not needed at all.
         torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
             q_proj,
             quant_q_buffer,
@@ -1106,6 +1171,10 @@ class MLA(nn.Module):
             self.kv_lora_rank,
             float(self.q_b_layernorm.variance_epsilon),
             self._quant_scale_qkv,
+            rope_cos_sin,
+            cache_seq_lens,
+            seq_len,
+            cu_q_seqlens,
         )
         # Both buffers must be live for the fused path; the downstream
         # absorption-context op switches on `quant_scale_qkv is not None`
@@ -1926,20 +1995,32 @@ class MLA(nn.Module):
                 # them so stale buffers cannot silently re-enable fusion.
                 self._fused_quant_q_buffer = None
                 self._fused_q_pe = None
+                self._fused_q_rope_done = False
                 return self._deepseek_v4_q_b_layernorm(q_proj)
             q_proj = self.q_b_proj(q)
             if self._is_fused_q_fp8_quant_enabled(
                 num_generations=num_generations, num_contexts=num_contexts
             ):
+                # Decode-only batches can also fold the Q RoPE in here: one lane
+                # already owns exactly one rotary pair, so it is register-local, and
+                # it leaves the whole FP8 Q row complete -- which is what lets the
+                # generation RoPE kernel be skipped entirely below.
+                rope_cos_sin, cache_seq_lens, rope_seq_len, rope_cu_q_seqlens = (
+                    self._fused_q_rope_inputs(attn_metadata, num_contexts, num_generations)
+                )
                 placeholder_q, quant_q_buffer, q_pe, quant_scale_qkv = (
-                    self._deepseek_v4_q_b_layernorm_fused_fp8(q_proj)
+                    self._deepseek_v4_q_b_layernorm_fused_fp8(
+                        q_proj, rope_cos_sin, cache_seq_lens, rope_seq_len, rope_cu_q_seqlens
+                    )
                 )
                 self._fused_quant_q_buffer = quant_q_buffer
                 self._fused_q_pe = q_pe
                 self._quant_scale_qkv = quant_scale_qkv
+                self._fused_q_rope_done = rope_cos_sin is not None
                 return placeholder_q
             self._fused_quant_q_buffer = None
             self._fused_q_pe = None
+            self._fused_q_rope_done = False
             return self._deepseek_v4_q_b_layernorm(q_proj)
 
         def _compressor_branch():
@@ -2809,34 +2890,48 @@ class MLA(nn.Module):
             # Already ran on aux_stream, overlapped with the Q branch; the RoPE
             # kernel still has to be told the KV half is done so it runs kSkipKv.
             _kv_hoisted = getattr(self, "_fused_kv_norm_hoisted", False)
-            self.mqa.mla_rope_generation(
-                fused_q,
-                q_pe,
-                latent_cache,
-                attn_metadata,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                fmha_scheduler_counter,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                quant_q_buffer,
-                kv_norm_weight=(
-                    self.kv_a_layernorm.weight if _fused_kv_norm and not _kv_hoisted else None
-                ),
-                kv_norm_eps=float(self.kv_a_layernorm.variance_epsilon),
-                kv_done_elsewhere=_kv_hoisted,
-                # Non-None tells the launcher q_nope is already FP8, so it drops the
-                # q_nope quantize rows (1024 of 1161 at head_num 128) from the grid.
-                quant_scale_qkv=quant_scale_qkv,
-                precomputed_cu_seqlens=precomputed_cu_seqlens,
-                # `_deepseek_v4_local_to_global_kernel` emits the tile counter and the
-                # bmm scales on this path -- it is the last kernel before FMHA, so it
-                # is a strictly better home than block (0,0) of the RoPE kernels. Same
-                # condition as the sparse_attn_predict branch that writes them.
-                precomputed_fmha_scheduler=(
-                    has_fp8_kv_cache and mla_bmm1_scale is not None and mla_bmm2_scale is not None
-                ),
+            # q_b_layernorm already rotated the rope segment straight into the FP8 Q
+            # buffer, so the RoPE kernel has no Q work left. Its KV half is still
+            # needed (unless hoisted), hence kv_only rather than skipping the call.
+            _q_rope_done = getattr(self, "_fused_q_rope_done", False) and _fused_kv_norm
+            assert not (_q_rope_done and not precomputed_cu_seqlens), (
+                "fused Q RoPE drops the kernel that fills cu_q_seqlens; "
+                "attention metadata must precompute them"
             )
+            # Both halves already done elsewhere -> nothing left to launch at all.
+            _skip_rope_op = _q_rope_done and _kv_hoisted
+            if not _skip_rope_op:
+                self.mqa.mla_rope_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                    kv_norm_weight=(
+                        self.kv_a_layernorm.weight if _fused_kv_norm and not _kv_hoisted else None
+                    ),
+                    kv_norm_eps=float(self.kv_a_layernorm.variance_epsilon),
+                    kv_done_elsewhere=_kv_hoisted,
+                    # Non-None tells the launcher q_nope is already FP8, so it drops the
+                    # q_nope quantize rows (1024 of 1161 at head_num 128) from the grid.
+                    quant_scale_qkv=quant_scale_qkv,
+                    kv_only=_q_rope_done and not _kv_hoisted,
+                    precomputed_cu_seqlens=precomputed_cu_seqlens,
+                    # `_deepseek_v4_local_to_global_kernel` emits the tile counter and the
+                    # bmm scales on this path -- it is the last kernel before FMHA, so it
+                    # is a strictly better home than block (0,0) of the RoPE kernels. Same
+                    # condition as the sparse_attn_predict branch that writes them.
+                    precomputed_fmha_scheduler=(
+                        has_fp8_kv_cache
+                        and mla_bmm1_scale is not None
+                        and mla_bmm2_scale is not None
+                    ),
+                )
         else:
             fused_q = torch.empty(
                 [num_tokens, self.num_heads_tp, (self.kv_lora_rank + self.qk_rope_head_dim)],
@@ -2963,6 +3058,7 @@ class MLA(nn.Module):
         # consumed so a later forward cannot pick up a stale pair.
         self._fused_quant_q_buffer = None
         self._fused_q_pe = None
+        self._fused_q_rope_done = False
 
         if enable_dsv4_epilogue_fusion:
             return attn_out_latent

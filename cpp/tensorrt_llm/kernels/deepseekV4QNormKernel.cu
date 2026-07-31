@@ -141,10 +141,30 @@ void dispatchDeepseekV4QNorm(
 // (kPairsPerLane-1) iterations cover the nope range and the last iteration
 // covers the rope range exactly.
 
-template <typename T, int kHeadDim, int kNopeDim>
+// `kFuseRope`: also apply the Q RoPE here and write the rotated rope segment as
+// FP8 into the same row of `quant_q_nope`, instead of handing an un-rotated bf16
+// `q_pe` to `applyMLARopeAndAssignQKVKernelGeneration`. The layout already suits
+// it -- `kRopePairs == kWarpSize` means lane `l` owns exactly rope pair `l`, so
+// the rotation is register-local and needs no extra loads beyond one float2 of
+// cos/sin. With the q_nope quantize region already gone, this leaves that kernel
+// with nothing to do on the DSv4 decode path.
+//
+// Positions match whichever RoPE kernel this replaces:
+//   generation -- uniform query length, so batch = token / seq_len and
+//                 position = kv_cache_len[batch] - seq_len + token % seq_len.
+//   context    -- ragged, so the sequence owning a token is found by binary search
+//                 over `cu_q_seqlens` (in TOKENS here, unlike the generation
+//                 `seqQOffset` which counts Q rows), and
+//                 position = local_token + (kv_cache_len[b] - current_seq_len).
+//                 The second term is the chunked-prefill cached offset.
+// Passing `cu_q_seqlens` selects the context form. Every lane of a warp shares
+// `row`, so the search is uniform across the warp and does not diverge.
+template <typename T, int kHeadDim, int kNopeDim, bool kFuseRope = false>
 __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8_e4m3* __restrict__ quant_q_nope,
     T* __restrict__ q_pe_out, float const* __restrict__ quant_scale_qkv_ptr, int totalRows,
-    int quantQNopeRowStrideBytes, float eps)
+    int quantQNopeRowStrideBytes, float eps, float2 const* __restrict__ cos_sin_cache = nullptr,
+    int const* __restrict__ cache_seq_lens = nullptr, int num_heads = 0, int seq_len = 0,
+    int64_t const* __restrict__ cu_q_seqlens = nullptr, int num_seqs = 0)
 {
     static_assert(kHeadDim % (2 * kWarpSize) == 0);
     static_assert(kNopeDim > 0 && kNopeDim < kHeadDim);
@@ -202,20 +222,67 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
         nopeOutPair[pairIdx] = __nv_fp8x2_e4m3(scaled);
     }
 
-    // Last iter is the rope segment -> bf16/fp16 STG (no extra quant scale).
+    // Last iter is the rope segment.
     {
         constexpr int i = kPairsPerLane - 1;
         int const pairIdx = i * kWarpSize + laneId;   // in [kNopePairs, kPairsPerRow)
         int const ropePairIdx = pairIdx - kNopePairs; // in [0, kRopePairs)
         float2 normalized{values[i].x * normScale, values[i].y * normScale};
-        ropeOutPair[ropePairIdx] = Vec2Traits<T>::fromFloat2(normalized);
+        if constexpr (kFuseRope)
+        {
+            // Rows are (token, head) pairs, and the position depends on the token
+            // alone. Same derivation the generation RoPE kernel uses.
+            int const token = row / num_heads;
+            int positionId;
+            if (cu_q_seqlens != nullptr)
+            {
+                int lo = 0;
+                int hi = num_seqs - 1;
+                while (lo < hi)
+                {
+                    int const mid = (lo + hi + 1) >> 1;
+                    if (cu_q_seqlens[mid] <= token)
+                    {
+                        lo = mid;
+                    }
+                    else
+                    {
+                        hi = mid - 1;
+                    }
+                }
+                int const seqBegin = static_cast<int>(cu_q_seqlens[lo]);
+                int const currentSeqLen = static_cast<int>(cu_q_seqlens[lo + 1]) - seqBegin;
+                positionId = (token - seqBegin) + (cache_seq_lens[lo] - currentSeqLen);
+            }
+            else
+            {
+                int const batchIdx = token / seq_len;
+                positionId = cache_seq_lens[batchIdx] - seq_len + (token % seq_len);
+            }
+            // The cos/sin table is float2 (cos, sin) with a stride of kRopeDim per
+            // position; GPT-J style rotation pairs adjacent elements, so pair p
+            // reads entry p.
+            float2 const coef = cos_sin_cache[static_cast<int64_t>(kRopeDim) * positionId + ropePairIdx];
+            float2 const rotated{
+                coef.x * normalized.x - coef.y * normalized.y, coef.x * normalized.y + coef.y * normalized.x};
+            // Straight into the rope slots of the same FP8 row the nope segment
+            // just filled, so the whole Q row is complete when this kernel exits.
+            float2 const scaled{rotated.x * quantScale, rotated.y * quantScale};
+            nopeOutPair[kNopePairs + ropePairIdx] = __nv_fp8x2_e4m3(scaled);
+        }
+        else
+        {
+            // bf16/fp16 STG, no extra quant scale; the RoPE kernel rotates it later.
+            ropeOutPair[ropePairIdx] = Vec2Traits<T>::fromFloat2(normalized);
+        }
     }
 }
 
 template <typename T>
 void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q_pe_out,
     void const* quant_scale_qkv_ptr, int totalRows, int headDim, int nopeDim, int quantQNopeRowStrideBytes, float eps,
-    cudaStream_t stream)
+    void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len, int64_t const* cu_q_seqlens,
+    int num_seqs, cudaStream_t stream)
 {
     assert(headDim == 512);
     assert(nopeDim == 448);
@@ -223,9 +290,27 @@ void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q
 
     dim3 const block(kThreadsPerBlock);
     dim3 const grid((totalRows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-    deepseekV4QNormFusedKernel<T, 512, 448><<<grid, block, 0, stream>>>(static_cast<T const*>(input),
-        static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
-        static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps);
+    // Fusing the RoPE needs the rope slots of the same row, so the caller must be
+    // using the interleaved layout, and needs positions, which only generation has.
+    // Context supplies cu_q_seqlens and needs no uniform seq_len; generation
+    // supplies seq_len and no cu_q_seqlens. Either way the rope slots must live in
+    // this row, i.e. the interleaved layout.
+    bool const haveRopePositions = cu_q_seqlens != nullptr ? num_seqs > 0 : seq_len > 0;
+    bool const fuseRope = cos_sin_cache != nullptr && cache_seq_lens != nullptr && num_heads > 0 && haveRopePositions
+        && quantQNopeRowStrideBytes == headDim;
+    if (fuseRope)
+    {
+        deepseekV4QNormFusedKernel<T, 512, 448, true><<<grid, block, 0, stream>>>(static_cast<T const*>(input),
+            static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
+            static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps,
+            static_cast<float2 const*>(cos_sin_cache), cache_seq_lens, num_heads, seq_len, cu_q_seqlens, num_seqs);
+    }
+    else
+    {
+        deepseekV4QNormFusedKernel<T, 512, 448, false><<<grid, block, 0, stream>>>(static_cast<T const*>(input),
+            static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
+            static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps);
+    }
 }
 
 } // namespace
@@ -250,7 +335,8 @@ void invokeDeepseekV4QNorm(
 
 void invokeDeepseekV4QNormFusedFp8(void const* input, void* quant_q_nope, void* q_pe_out,
     void const* quant_scale_qkv_ptr, int totalRows, int headDim, int nopeDim, int quantQNopeRowStrideBytes,
-    bool isBfloat16, float eps, cudaStream_t stream)
+    bool isBfloat16, float eps, void const* cos_sin_cache, int const* cache_seq_lens, int num_heads, int seq_len,
+    int64_t const* cu_q_seqlens, int num_seqs, cudaStream_t stream)
 {
     if (totalRows == 0)
     {
@@ -260,12 +346,14 @@ void invokeDeepseekV4QNormFusedFp8(void const* input, void* quant_q_nope, void* 
     if (isBfloat16)
     {
         dispatchDeepseekV4QNormFused<__nv_bfloat16>(input, quant_q_nope, q_pe_out, quant_scale_qkv_ptr, totalRows,
-            headDim, nopeDim, quantQNopeRowStrideBytes, eps, stream);
+            headDim, nopeDim, quantQNopeRowStrideBytes, eps, cos_sin_cache, cache_seq_lens, num_heads, seq_len,
+            cu_q_seqlens, num_seqs, stream);
     }
     else
     {
         dispatchDeepseekV4QNormFused<half>(input, quant_q_nope, q_pe_out, quant_scale_qkv_ptr, totalRows, headDim,
-            nopeDim, quantQNopeRowStrideBytes, eps, stream);
+            nopeDim, quantQNopeRowStrideBytes, eps, cos_sin_cache, cache_seq_lens, num_heads, seq_len, cu_q_seqlens,
+            num_seqs, stream);
     }
 }
 
