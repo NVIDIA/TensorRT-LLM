@@ -26,6 +26,12 @@ from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
+WIDEEP_DEPRECATION_MESSAGE = (
+    "The WIDEEP MoE backend is deprecated and can no longer be selected. Wide "
+    "expert parallelism and EPLB are supported by the other backends: use "
+    "DEEPGEMM for FP8 block-scale checkpoints, or TRTLLM / CUTEDSL / CUTLASS "
+    "otherwise.")
+
 
 def _get_pretrained_megamoe_capability_args(
         model_config: ModelConfig) -> Dict[str, Optional[object]]:
@@ -154,7 +160,7 @@ def get_moe_cls(
             )
             return CutlassFusedMoE
     elif moe_backend.upper() == "WIDEEP":
-        return WideEPMoE
+        raise ValueError(WIDEEP_DEPRECATION_MESSAGE)
     elif moe_backend.upper() == "TRITON":
         return TritonFusedMoE
     elif moe_backend.upper() == "MEGAMOE_DEEPGEMM":
@@ -288,6 +294,9 @@ def create_moe_backend(
     Returns:
         MoE: MoE backend instance
     """
+    if moe_cls is WideEPMoE:
+        raise ValueError(WIDEEP_DEPRECATION_MESSAGE)
+
     # Get parameters from pretrained_config if not explicitly provided
     pretrained_config = model_config.pretrained_config
     if num_experts is None:
@@ -310,7 +319,6 @@ def create_moe_backend(
     moe_load_balancer = get_moe_load_balancer()
     if moe_load_balancer is not None:
         supported_load_balancer_backends = (
-            WideEPMoE,
             CutlassFusedMoE,
             TRTLLMGenFusedMoE,
             CuteDslFusedMoE,
@@ -336,7 +344,7 @@ def create_moe_backend(
 
     if swiglu_limit is not None:
         assert moe_cls in [
-            CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE, WideEPMoE,
+            CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE,
             DeepGemmFusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit is not supported in {moe_cls.__name__}."
 
@@ -344,7 +352,7 @@ def create_moe_backend(
         # MegaMoECuteDsl uses the scalar only as a fallback when no per-expert
         # tensor limit is given (see the MegaMoE branch below).
         assert moe_cls in [
-            CutlassFusedMoE, TRTLLMGenFusedMoE, WideEPMoE, DeepGemmFusedMoE,
+            CutlassFusedMoE, TRTLLMGenFusedMoE, DeepGemmFusedMoE,
             MegaMoEDeepGemm, CuteDslFusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
@@ -394,22 +402,6 @@ def create_moe_backend(
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
         )
-    elif moe_cls == WideEPMoE:
-        return moe_cls(
-            routing_method=routing_method,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            dtype=dtype,
-            reduce_results=reduce_results,
-            model_config=model_config,
-            aux_stream_dict=aux_stream_dict,
-            weight_loading_mode=weight_loading_mode,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            layer_idx=layer_idx,
-            swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
-            activation_type=activation_type)
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
 
