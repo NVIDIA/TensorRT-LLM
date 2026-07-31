@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for warmup-cleanup behavior in PyTorchModelEngine.warmup().
 
 Locks in that gc.collect() + torch.cuda.empty_cache() fire immediately after
@@ -175,29 +178,13 @@ def _capture_tllm_logs():
 class TestWarmupCleanup(unittest.TestCase):
     """Lock in warmup-cleanup behavior introduced by PR #14609 (Plan B)."""
 
-    def test_main_cuda_graph_warmup_defers_encoder_decoder_encoder(self):
+    def test_encoder_decoder_encoder_warmup_is_deferred_and_uses_two_passes(self):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.cuda_graph_runner = SimpleNamespace(
             enabled=True,
             is_warmup_only=True,
         )
-        model_engine.encoder_cuda_graph_runner = SimpleNamespace(enabled=True)
         model_engine._torch_compile_piecewise_cuda_graph = False
-        resource_manager = object()
-
-        with (
-            patch.object(model_engine, "_capture_generation_cuda_graphs") as generation,
-            patch.object(model_engine, "_capture_mixed_encoder_decoder_cuda_graphs") as mixed,
-            patch.object(model_engine, "_capture_encoder_decoder_encoder_cuda_graphs") as encoder,
-        ):
-            model_engine._run_cuda_graph_warmup(resource_manager)
-
-        generation.assert_called_once_with(resource_manager)
-        mixed.assert_called_once_with(resource_manager)
-        encoder.assert_not_called()
-
-    def test_encoder_decoder_encoder_warmup_uses_two_passes(self):
-        model_engine = object.__new__(PyTorchModelEngine)
         model_engine.is_warmup = False
 
         @contextlib.contextmanager
@@ -214,13 +201,22 @@ class TestWarmupCleanup(unittest.TestCase):
         resource_manager = object()
         warmup_states = []
 
-        with patch.object(
-            model_engine,
-            "_capture_encoder_decoder_encoder_cuda_graphs",
-            side_effect=lambda _: warmup_states.append(runner.is_warmup_only),
+        with (
+            patch.object(model_engine, "_capture_generation_cuda_graphs") as generation,
+            patch.object(model_engine, "_capture_mixed_encoder_decoder_cuda_graphs") as mixed,
+            patch.object(
+                model_engine,
+                "_capture_encoder_decoder_encoder_cuda_graphs",
+                side_effect=lambda _: warmup_states.append(runner.is_warmup_only),
+            ) as encoder,
         ):
+            model_engine._run_cuda_graph_warmup(resource_manager)
+            generation.assert_called_once_with(resource_manager)
+            mixed.assert_called_once_with(resource_manager)
+            encoder.assert_not_called()
             model_engine._warmup_encoder_decoder_encoder_cuda_graphs(resource_manager)
 
+        assert encoder.call_count == 2
         assert warmup_states == [True, False]
         assert not runner.is_warmup_only
 

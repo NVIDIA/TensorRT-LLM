@@ -5375,7 +5375,13 @@ class PyExecutor:
                                    for request in encoder_requests)
         num_scheduled_tokens += sum(1 + request.num_draft_tokens
                                     for request in generation_requests)
-        should_wait = (self.encoder_batch_wait_iters_count
+        has_decoder_work = bool(context_requests or generation_requests)
+        if not has_decoder_work:
+            has_decoder_work = any(
+                request.request_id in self.inflight_req_ids
+                and request.state != LlmRequestState.ENCODER_INIT
+                for request in self.active_requests)
+        should_wait = (has_decoder_work and self.encoder_batch_wait_iters_count
                        < self.batch_wait_timeout_iters and num_scheduled_tokens
                        < self.batch_wait_max_tokens_ratio * self.max_num_tokens)
         if should_wait:
@@ -5477,7 +5483,7 @@ class PyExecutor:
             warmup(self.resource_manager)
 
     def _submit_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
-        """Queue encoder work without blocking the decoder executor thread."""
+        """Queue encoder work, serializing it with decoder work under TP."""
         executor = self.encoder_launch_executor
         if executor is None:
             raise RuntimeError("Encoder launch executor is unavailable.")
@@ -5486,12 +5492,32 @@ class PyExecutor:
         for request in requests:
             self.inflight_req_ids.insert(request.request_id)
 
+        serialize_tp = self.dist.tp_size > 1
+        if serialize_tp:
+            self.encoder_stream.wait_stream(self.execution_stream)
+
         try:
             future = executor.submit(self._run_encoder_step_unchecked, requests)
         except Exception:
             for request in requests:
                 self.inflight_req_ids.erase(request.request_id)
             raise
+
+        if serialize_tp:
+            # Encoder and decoder forwards share TP communicators and
+            # workspaces. Complete encoder GPU work before the caller launches
+            # decoder work, while retaining the worker thread affinity needed
+            # by encoder CUDA graph replay.
+            try:
+                result = future.result()
+                result.ready_event.synchronize()
+                self._publish_encoder_step(requests, result)
+            except Exception as e:
+                self._finish_failed_encoder_step(requests, e)
+                return
+            for request in requests:
+                self.inflight_req_ids.erase(request.request_id)
+            return
 
         self.pending_encoder_steps.append(
             PendingEncoderStep(requests=requests, future=future))

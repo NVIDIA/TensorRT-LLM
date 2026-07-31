@@ -3676,6 +3676,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     and get_draft_token_length(request) == 0
                     and request._py_embedding_bias_1d is None
                     and not getattr(request, "py_bad_words", None)
+                    and not getattr(request, "py_no_repeat_ngram_size", None)
                     and not request.py_min_length
                     and not request.py_return_log_probs
                     and not request.py_stop_words_list

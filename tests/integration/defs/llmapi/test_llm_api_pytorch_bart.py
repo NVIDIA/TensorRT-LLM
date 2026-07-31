@@ -606,12 +606,23 @@ def test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
             )
 
 
+@pytest.mark.parametrize(
+    "tensor_parallel_size",
+    [
+        pytest.param(1, id="tp1"),
+        pytest.param(2, id="tp2", marks=pytest.mark.skip_less_device(2)),
+    ],
+)
 def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
     monkeypatch: pytest.MonkeyPatch,
+    tensor_parallel_size: int,
 ) -> None:
-    """Admit encoder work while an older request remains in decoder generation."""
+    """Preserve mixed-length encoder outputs during continuous admission."""
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
-    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    if tensor_parallel_size == 1:
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    else:
+        monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
 
     model_path = _get_model_path(_MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -626,8 +637,8 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
         num_return_sequences=1,
     )
     encoder_graph_config = EncodeCudaGraphConfig(
-        batch_sizes=[1],
-        num_tokens=[64],
+        batch_sizes=[1, 2],
+        num_tokens=[64, 128],
         seq_lens=[64],
         enable_padding=True,
     )
@@ -636,14 +647,14 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
         model_path,
         backend="pytorch",
         attn_backend="TRTLLM",
-        cuda_graph_config=_decoder_cuda_graph_config([2]),
+        cuda_graph_config=_decoder_cuda_graph_config([3]),
         encoder_cuda_graph_config=encoder_graph_config,
         enable_encoder_decoder_mixed_cuda_graph=True,
         disable_overlap_scheduler=False,
         dtype="bfloat16",
         enable_chunked_prefill=False,
-        encoder_max_batch_size=1,
-        encoder_max_num_tokens=64,
+        encoder_max_batch_size=2,
+        encoder_max_num_tokens=128,
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=_MAX_KV_TOKENS,
@@ -651,38 +662,41 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
             use_kv_cache_manager_v2=False,
         ),
-        max_batch_size=2,
+        max_batch_size=3,
         max_beam_width=1,
         max_input_len=_MAX_SEQUENCE_LENGTH,
         max_num_tokens=_MAX_SEQUENCE_LENGTH,
         max_seq_len=_MAX_SEQUENCE_LENGTH,
         model_kwargs={"torch_dtype": "bfloat16"},
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
+        batch_wait_timeout_iters=2,
+        tensor_parallel_size=tensor_parallel_size,
     ) as llm:
-        model_engine = llm._executor.engine.model_engine
-        encoder_runner = model_engine.encoder_cuda_graph_runner
-        decoder_runner = model_engine.cuda_graph_runner
-
-        assert encoder_runner.enabled
-        assert encoder_runner.graphs
-        captured_mixed_keys = {key for key in decoder_runner.graphs if key[5] and key[6]}
-        assert captured_mixed_keys
-
         encoder_replay_keys = []
         decoder_replay_keys = []
-        original_encoder_replay = encoder_runner.replay
-        original_decoder_replay = decoder_runner.replay
+        if tensor_parallel_size == 1:
+            model_engine = llm._executor.engine.model_engine
+            encoder_runner = model_engine.encoder_cuda_graph_runner
+            decoder_runner = model_engine.cuda_graph_runner
 
-        def record_encoder_replay(key, inputs):
-            encoder_replay_keys.append(key)
-            return original_encoder_replay(key, inputs)
+            assert encoder_runner.enabled
+            assert encoder_runner.graphs
+            captured_mixed_keys = {key for key in decoder_runner.graphs if key[5] and key[6]}
+            assert captured_mixed_keys
 
-        def record_decoder_replay(key, inputs):
-            decoder_replay_keys.append(key)
-            return original_decoder_replay(key, inputs)
+            original_encoder_replay = encoder_runner.replay
+            original_decoder_replay = decoder_runner.replay
 
-        monkeypatch.setattr(encoder_runner, "replay", record_encoder_replay)
-        monkeypatch.setattr(decoder_runner, "replay", record_decoder_replay)
+            def record_encoder_replay(key, inputs):
+                encoder_replay_keys.append(key)
+                return original_encoder_replay(key, inputs)
+
+            def record_decoder_replay(key, inputs):
+                decoder_replay_keys.append(key)
+                return original_decoder_replay(key, inputs)
+
+            monkeypatch.setattr(encoder_runner, "replay", record_encoder_replay)
+            monkeypatch.setattr(decoder_runner, "replay", record_decoder_replay)
 
         first_response = llm.generate_async(
             _SOURCE_TEXT,
@@ -692,34 +706,42 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
         first_stream_step = next(first_response)
         assert not first_stream_step.finished
 
-        second_response = llm.generate_async(
-            _MIXED_ENCODER_SOURCE_TEXTS[1],
-            sampling_params=second_sampling_params,
-            streaming=False,
-        )
+        encoder_replay_count_before_admission = len(encoder_replay_keys)
+        admitted_responses = [
+            llm.generate_async(
+                source_text,
+                sampling_params=second_sampling_params,
+                streaming=False,
+            )
+            for source_text in _MIXED_ENCODER_SOURCE_TEXTS
+        ]
 
         first_response.result()
-        second_response.result()
+        for response in admitted_responses:
+            response.result()
 
         first_token_ids = _assert_bart_response(
             first_response,
             num_return_sequences=1,
             max_tokens=_CONTINUOUS_ADMISSION_MAX_NEW_TOKENS,
         )
-        second_token_ids = _assert_bart_response(
-            second_response,
-            num_return_sequences=1,
-        )
         assert first_token_ids[0][:_MAX_NEW_TOKENS] == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
-        _assert_expected_generation(
-            tokenizer,
-            second_token_ids,
-            exact_match=True,
-            expected_token_ids_by_output=_MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST[1],
-        )
 
-        assert len(encoder_replay_keys) >= 2
-        assert set(encoder_replay_keys) <= set(encoder_runner.graphs)
-        replayed_mixed_keys = {key for key in decoder_replay_keys if key[5] and key[6]}
-        assert replayed_mixed_keys
-        assert replayed_mixed_keys <= captured_mixed_keys
+        for request_idx, response in enumerate(admitted_responses):
+            token_ids = _assert_bart_response(response, num_return_sequences=1)
+            _assert_expected_generation(
+                tokenizer,
+                token_ids,
+                exact_match=True,
+                expected_token_ids_by_output=(
+                    _MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST[request_idx]
+                ),
+            )
+
+        if tensor_parallel_size == 1:
+            admitted_encoder_keys = encoder_replay_keys[encoder_replay_count_before_admission:]
+            assert any(key[0] == 2 for key in admitted_encoder_keys)
+            assert set(encoder_replay_keys) <= set(encoder_runner.graphs)
+            replayed_mixed_keys = {key for key in decoder_replay_keys if key[5] and key[6]}
+            assert replayed_mixed_keys
+            assert replayed_mixed_keys <= captured_mixed_keys

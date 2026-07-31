@@ -12,7 +12,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
-    _restore_spec_decode_capture_state, _save_spec_decode_capture_state)
+    EncoderCUDAGraphRunner, _restore_spec_decode_capture_state,
+    _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input)
@@ -149,6 +150,70 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
+
+    def test_encoder_cuda_graph_stages_and_restores_fixed_sequence_slots(
+            self) -> None:
+        runner = EncoderCUDAGraphRunner.__new__(EncoderCUDAGraphRunner)
+        runner.is_encoder_decoder = True
+        runner.use_fixed_sequence_slots = True
+        runner.supported_batch_sizes = [2]
+        runner.supported_seq_lens = [512]
+        runner.max_supported_num_tokens = 1024
+        small_key = (2, 512, 512)
+        compatible_key = (2, 1024, 512)
+        runner._capture_sequence_lengths = {
+            small_key: [511, 1],
+            compatible_key: [512, 512],
+        }
+        runner._capture_keys_by_batch_size = {
+            2: [small_key, compatible_key],
+        }
+        runner._arange_max = torch.arange(1024, dtype=torch.int32)
+
+        self.assertEqual(
+            runner._get_dynamic_capture_key([200, 300],
+                                            allow_batch_padding=False),
+            compatible_key)
+
+        source_sequence_lengths = [1, 400]
+        key = runner._get_dynamic_capture_key(source_sequence_lengths,
+                                              allow_batch_padding=False)
+        self.assertEqual(key, small_key)
+        self.assertEqual(runner._get_capture_sequence_offsets(key),
+                         [0, 511, 512])
+
+        input_ids = torch.arange(401, dtype=torch.int32)
+        inputs = runner.prepare_encoder_decoder_inputs(
+            {
+                "input_ids": input_ids,
+                "position_ids": input_ids,
+                "seq_lens": source_sequence_lengths,
+            },
+            key,
+            source_sequence_lengths,
+        )
+        self.assertEqual(inputs["seq_lens"], [400, 1])
+        self.assertEqual(inputs["_encoder_source_to_slot"], [1, 0])
+
+        static_tensors = {
+            "input_ids": torch.empty(512, dtype=torch.int32),
+            "position_ids": torch.empty((1, 512), dtype=torch.int32),
+        }
+        runner._stage_encoder_decoder_inputs(key, inputs, static_tensors)
+        expected_staged_ids = torch.zeros(512, dtype=torch.int32)
+        expected_staged_ids[:400] = input_ids[1:]
+        expected_staged_ids[511] = input_ids[0]
+        torch.testing.assert_close(static_tensors["input_ids"],
+                                   expected_staged_ids)
+        torch.testing.assert_close(static_tensors["position_ids"][0],
+                                   expected_staged_ids)
+
+        fixed_slot_output = torch.arange(512).unsqueeze(1)
+        restored_output = runner.restore_encoder_decoder_output(
+            key, fixed_slot_output, inputs)
+        expected_output = torch.cat(
+            (fixed_slot_output[511:512], fixed_slot_output[:400]))
+        torch.testing.assert_close(restored_output, expected_output)
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:

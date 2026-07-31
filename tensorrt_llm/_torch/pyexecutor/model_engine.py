@@ -563,7 +563,7 @@ class PyTorchModelEngine(ModelEngine):
                                         if self._cuda_graph_seq_lens else 0)
 
         use_encoder_cuda_graph = ((self._is_encoder_decoder_model()
-                                   or self._is_encode_only())
+                                   or self._is_encode_only)
                                   and self.encoder_cuda_graph_config is not None
                                   and bool(self._cuda_graph_num_tokens)
                                   and bool(self._cuda_graph_seq_lens))
@@ -820,6 +820,10 @@ class PyTorchModelEngine(ModelEngine):
             max_seq_len=self.max_seq_len,
             cuda_graph_mem_pool=self._cuda_graph_mem_pool,
             is_encoder_decoder=self._is_encoder_decoder_model(),
+            use_fixed_sequence_slots=(self._is_encoder_decoder_model()
+                                      and hasattr(
+                                          pretrained_config,
+                                          "relative_attention_num_buckets")),
         )
         self.encoder_cuda_graph_runner = EncoderCUDAGraphRunner(
             encoder_cuda_graph_runner_config)
@@ -2176,6 +2180,15 @@ class PyTorchModelEngine(ModelEngine):
 
         operation = ("warmup" if runner.is_warmup_only else "capture")
         hidden_size = self._get_enc_dec_hidden_size()
+        max_num_encoder_tokens = max(
+            (total_encoder_tokens
+             for num_contexts, total_encoder_tokens in context_shapes
+             if total_encoder_tokens <= num_contexts * max_encoder_output_len
+             and any(batch_size > num_contexts
+                     for batch_size in runner.supported_batch_sizes)),
+            default=0)
+        if max_num_encoder_tokens == 0:
+            return
         model_config = self.model.model_config.pretrained_config
         # BART/mBART prepend a forced BOS token after decoder_start; T5 uses
         # decoder_start alone. Match the LLM API's decoder-prefix construction.
@@ -2226,6 +2239,11 @@ class PyTorchModelEngine(ModelEngine):
                         )
                         request.py_skip_cross_kv_projection = False
 
+                    runner._get_static_encoder_hidden_states(
+                        context_requests[0].py_encoder_output,
+                        max_num_encoder_tokens,
+                        allow_allocate=True,
+                    )
                     logger.info("Run mixed encoder-decoder CUDA graph "
                                 f"{operation} for batch size={batch_size}, "
                                 f"context requests={num_contexts}, "
@@ -3543,19 +3561,19 @@ class PyTorchModelEngine(ModelEngine):
             static_eligible = (
                 hasattr(batch_manager_bindings,
                         "prepare_encoder_decoder_inputs")
-                and self._is_encoder_decoder_model()
-                and not self.enable_spec_decode and not self.is_draft_model
+                and self._is_encoder_decoder_model() and not self.is_draft_model
                 and self.max_beam_width == 1
                 and self.sparse_attention_config is None and not self.use_mrope
                 and not self.enable_attention_dp
                 and not self.mapping.has_cp_helix() and not self.is_multimodal
-                and self.lora_model_config is None
                 and not self.attn_runtime_features.chunked_prefill
                 and not self.attn_runtime_features.cache_reuse
                 and not self.attn_runtime_features.has_speculative_draft_tokens)
             self._encoder_decoder_input_fast_path_static_eligible = \
                 static_eligible
-        if (not static_eligible or new_tokens_device is None
+        if (not static_eligible or self.enable_spec_decode
+                or self.lora_model_config is not None
+                or new_tokens_device is None
                 or next_draft_tokens_device is not None
                 or self.guided_decoder is not None):
             return False
@@ -7309,7 +7327,6 @@ class PyTorchModelEngine(ModelEngine):
         input_ids = inputs.get('encoder_input_ids_host')
         position_ids = inputs.get('encoder_position_ids_host')
         seq_lens = inputs['encoder_seq_lens']
-        actual_num_tokens = sum(seq_lens)
         runner = self.encoder_cuda_graph_runner
 
         if input_ids is None or position_ids is None:
@@ -7338,12 +7355,11 @@ class PyTorchModelEngine(ModelEngine):
             # the previous captured H2D before updating seq_lens or any other
             # shared host input for this replay.
             runner.retire_staging()
+            model_inputs = runner.prepare_encoder_decoder_inputs(
+                padded_runner_inputs, key, seq_lens)
             graph_attn_metadata.prepare_encoder_cuda_graph_replay(
-                padded_runner_inputs['seq_lens'], key[1])
-            model_inputs = {
-                **padded_runner_inputs,
-                'attn_metadata': graph_attn_metadata,
-            }
+                model_inputs['seq_lens'], key[1])
+            model_inputs['attn_metadata'] = graph_attn_metadata
 
             moe_load_balancer: MoeLoadBalancer = getattr(
                 self, 'moe_load_balancer', None)
@@ -7369,7 +7385,8 @@ class PyTorchModelEngine(ModelEngine):
         if not isinstance(graph_outputs, torch.Tensor):
             raise TypeError("Encoder-decoder CUDA graph replay must return "
                             "a tensor of encoder hidden states.")
-        return graph_outputs[:actual_num_tokens].clone()
+        return runner.restore_encoder_decoder_output(key, graph_outputs,
+                                                     model_inputs)
 
     @nvtx_range("forward_encoder")
     def forward_encoder(

@@ -207,11 +207,20 @@ class CUDAGraphRunner:
                 raise RuntimeError(
                     "Mixed encoder-decoder CUDA graph replay requires the "
                     "encoder hidden-state buffer initialized during warmup.")
+            if self.graphs:
+                raise RuntimeError(
+                    "Mixed encoder-decoder CUDA graph encoder hidden-state "
+                    "buffer cannot be allocated after graph capture.")
             static_encoder_hidden_states = encoder_hidden_states.new_empty(
                 (num_encoder_tokens, encoder_hidden_states.shape[1]))
             self.shared_static_tensors[
                 "encoder_hidden_states"] = static_encoder_hidden_states
 
+        if static_encoder_hidden_states.shape[0] < num_encoder_tokens:
+            raise RuntimeError(
+                "Mixed encoder-decoder CUDA graph encoder hidden-state buffer "
+                f"has capacity {static_encoder_hidden_states.shape[0]}, but "
+                f"{num_encoder_tokens} tokens were requested.")
         return static_encoder_hidden_states[:num_encoder_tokens]
 
     def _is_mixed_encoder_decoder_batch(self, batch: ScheduledRequests) -> bool:
@@ -852,6 +861,8 @@ class CUDAGraphRunner:
 
 
 EncoderKeyType: TypeAlias = Tuple[int, int, int]
+_ENCODER_SOURCE_SEQ_LENS = "_encoder_source_seq_lens"
+_ENCODER_SOURCE_TO_SLOT = "_encoder_source_to_slot"
 
 
 @dataclass
@@ -868,6 +879,7 @@ class EncoderCUDAGraphRunnerConfig:
     max_seq_len: int
     cuda_graph_mem_pool: Any
     is_encoder_decoder: bool = False
+    use_fixed_sequence_slots: bool = False
 
 
 class EncoderCUDAGraphRunner:
@@ -895,6 +907,7 @@ class EncoderCUDAGraphRunner:
         self.max_supported_num_tokens = config.max_cuda_graph_num_tokens
         self.supported_seq_lens = sorted(config.cuda_graph_seq_lens)
         self.is_encoder_decoder = config.is_encoder_decoder
+        self.use_fixed_sequence_slots = config.use_fixed_sequence_slots
         self.capture_keys: frozenset[EncoderKeyType] = frozenset()
         self._capture_sequence_lengths: Dict[EncoderKeyType, List[int]] = {}
         if self.is_encoder_decoder:
@@ -996,7 +1009,13 @@ class EncoderCUDAGraphRunner:
 
     def _build_encoder_decoder_capture_layouts(
             self) -> Dict[EncoderKeyType, List[int]]:
-        """Derive reachable encoder-decoder capture keys via get_graph_key."""
+        """Map each reachable graph key to one physical sequence-slot layout.
+
+        Sequence layout is deliberately not part of ``EncoderKeyType``. Multiple
+        configured shapes may normalize to the same three-dimensional key, so
+        the first deterministic layout becomes that graph's fixed slot
+        capacities. Runtime sequences are assigned to those slots during replay.
+        """
         capture_layouts: Dict[EncoderKeyType, List[int]] = {}
         for batch_size in self.supported_batch_sizes:
             for num_tokens in self.supported_num_tokens:
@@ -1009,25 +1028,37 @@ class EncoderCUDAGraphRunner:
                     key, _, is_valid = self.get_graph_key(
                         {"seq_lens": sequence_lengths})
                     if is_valid:
+                        # Capture at most one graph/layout for a normalized key;
+                        # alternative runtime layouts do not create more keys.
                         capture_layouts.setdefault(key, sequence_lengths)
 
         return capture_layouts
 
     def _get_dynamic_capture_key(
         self,
-        batch_size: int,
-        num_tokens: int,
-        max_seq_len: int,
+        sequence_lengths: List[int],
         allow_batch_padding: bool,
     ) -> Optional[EncoderKeyType]:
-        """Return the smallest compatible dynamic-layout capture key."""
+        """Return the smallest key whose token bucket and slots fit the batch.
+
+        Keys are ordered from smaller to larger buckets. For fixed-slot replay,
+        aggregate token and maximum-length checks are insufficient: every
+        runtime sequence (including batch-padding dummies) must also fit in a
+        distinct capture-time slot. An incompatible key is skipped in favor of
+        a larger existing key; no new layout-specific key is created.
+        """
+        batch_size = len(sequence_lengths)
+        sum(sequence_lengths)
+        max_seq_len = max(sequence_lengths) if sequence_lengths else 0
         candidate_batch_sizes = (self.supported_batch_sizes
                                  if allow_batch_padding else [batch_size])
         for padded_batch_size in candidate_batch_sizes:
             if padded_batch_size < batch_size:
                 continue
 
-            required_num_tokens = num_tokens + padded_batch_size - batch_size
+            padded_sequence_lengths = (sequence_lengths + [1] *
+                                       (padded_batch_size - batch_size))
+            required_num_tokens = sum(padded_sequence_lengths)
             for key in self._capture_keys_by_batch_size.get(
                     padded_batch_size, []):
                 _, padded_num_tokens, padded_max_seq_len = key
@@ -1038,15 +1069,71 @@ class EncoderCUDAGraphRunner:
                         or padded_num_tokens
                         > padded_batch_size * padded_max_seq_len):
                     continue
+                if (self.use_fixed_sequence_slots
+                        and self._get_sequence_slot_mapping(
+                            key, padded_sequence_lengths) is None):
+                    # The batch fits the aggregate bucket but not this key's
+                    # individual slot capacities. Try the next captured key.
+                    continue
                 return key
 
         return None
+
+    def _get_sequence_slot_mapping(
+        self,
+        key: EncoderKeyType,
+        sequence_lengths: List[int],
+    ) -> Optional[List[int]]:
+        """Assign each runtime sequence to one compatible physical graph slot.
+
+        The returned list maps source request index to capture slot index. It
+        changes only physical placement: source request order is retained
+        separately and restored after replay.
+        """
+        capture_lengths = self._capture_sequence_lengths.get(key)
+        if (capture_lengths is None
+                or len(capture_lengths) != len(sequence_lengths)):
+            return None
+
+        # Preserve physical order when every request already fits its
+        # corresponding slot, avoiding unnecessary scatter/gather permutation.
+        if all(sequence_length <= capture_length
+               for sequence_length, capture_length in zip(
+                   sequence_lengths, capture_lengths)):
+            return list(range(len(sequence_lengths)))
+
+        # Largest-to-largest matching is sufficient for one-to-one scalar
+        # capacities: if any sorted request exceeds its paired slot, no
+        # permutation can make the layout fit.
+        sequence_order = sorted(range(len(sequence_lengths)),
+                                key=lambda index:
+                                (-sequence_lengths[index], index))
+        capture_order = sorted(range(len(capture_lengths)),
+                               key=lambda index:
+                               (-capture_lengths[index], index))
+        source_to_slot = [0] * len(sequence_lengths)
+        for source_index, slot_index in zip(sequence_order, capture_order):
+            if sequence_lengths[source_index] > capture_lengths[slot_index]:
+                return None
+            source_to_slot[source_index] = slot_index
+        return source_to_slot
 
     def get_capture_warmup_sequence_lengths(
             self, key: EncoderKeyType) -> Optional[List[int]]:
         """Return the representative sequence layout for a capture key."""
         sequence_lengths = self._capture_sequence_lengths.get(key)
         return list(sequence_lengths) if sequence_lengths is not None else None
+
+    def _get_capture_sequence_offsets(self, key: EncoderKeyType) -> List[int]:
+        """Return cumulative fixed-slot offsets for a capture layout."""
+        offsets = [0]
+        for sequence_length in self._capture_sequence_lengths[key]:
+            offsets.append(offsets[-1] + sequence_length)
+        if offsets[-1] != key[1]:
+            raise ValueError(
+                f"Encoder CUDA graph layout for key {key} contains "
+                f"{offsets[-1]} tokens.")
+        return offsets
 
     def _get_valid_graph_key(self, batch_size: int, num_tokens: int,
                              max_seq_len: int) -> EncoderKeyType:
@@ -1087,9 +1174,7 @@ class EncoderCUDAGraphRunner:
         if self.is_encoder_decoder:
             if self.padding_enabled and self.capture_keys:
                 padded_key = self._get_dynamic_capture_key(
-                    batch_size,
-                    num_tokens,
-                    max_seq_len,
+                    seq_lens,
                     allow_batch_padding=False,
                 )
                 if padded_key is None:
@@ -1139,9 +1224,7 @@ class EncoderCUDAGraphRunner:
         if self.is_encoder_decoder and self.capture_keys:
             seq_lens = inputs['seq_lens']
             padded_key = self._get_dynamic_capture_key(
-                batch_size,
-                sum(seq_lens),
-                max(seq_lens) if seq_lens else 0,
+                seq_lens,
                 allow_batch_padding=True,
             )
             padded_batch_size = padded_key[0] if padded_key is not None else 0
@@ -1168,6 +1251,48 @@ class EncoderCUDAGraphRunner:
             inputs['seq_lens']) + [1] * padding_size
 
         yield padded_inputs
+
+    def prepare_encoder_decoder_inputs(
+        self,
+        inputs: Dict[str, Any],
+        key: EncoderKeyType,
+        source_sequence_lengths: List[int],
+    ) -> Dict[str, Any]:
+        """Arrange runtime sequence metadata in capture-time slot order."""
+        if not self.is_encoder_decoder:
+            return inputs
+
+        if not self.use_fixed_sequence_slots:
+            prepared_inputs = dict(inputs)
+            prepared_inputs[_ENCODER_SOURCE_SEQ_LENS] = list(
+                source_sequence_lengths)
+            return prepared_inputs
+
+        sequence_lengths = inputs["seq_lens"]
+        if (sequence_lengths[:len(source_sequence_lengths)]
+                != source_sequence_lengths):
+            raise ValueError("Encoder source sequence lengths must be the "
+                             "unpadded prefix of graph sequence lengths.")
+
+        source_to_slot = self._get_sequence_slot_mapping(key, sequence_lengths)
+        if source_to_slot is None:
+            raise ValueError(
+                f"Encoder sequence lengths {sequence_lengths} are not "
+                f"compatible with CUDA graph key {key}.")
+
+        # Attention metadata follows physical slot order, while the packed
+        # source tensors and the final returned output remain in request order.
+        slot_sequence_lengths = [0] * len(sequence_lengths)
+        for source_index, slot_index in enumerate(source_to_slot):
+            slot_sequence_lengths[slot_index] = sequence_lengths[source_index]
+
+        prepared_inputs = dict(inputs)
+        prepared_inputs["seq_lens"] = slot_sequence_lengths
+        prepared_inputs[_ENCODER_SOURCE_SEQ_LENS] = list(
+            source_sequence_lengths)
+        prepared_inputs[_ENCODER_SOURCE_TO_SLOT] = source_to_slot[:len(
+            source_sequence_lengths)]
+        return prepared_inputs
 
     def maybe_get_cuda_graph(
         self,
@@ -1259,6 +1384,16 @@ class EncoderCUDAGraphRunner:
         # be pinned or pageable; only captured H2D copies require pinned memory.
         graph_attn_metadata.bind_encoder_cuda_graph_seq_lens(
             self.shared_static_tensors_cpu["seq_lens"], padded_batch_size)
+        if self.use_fixed_sequence_slots:
+            # CUDA graph replay keeps each request in its capture-time token
+            # slot. Explicit boundaries let attention combine those fixed
+            # offsets with the per-replay logical sequence lengths above.
+            capture_offsets = self._get_capture_sequence_offsets(key)
+            capture_offsets_cuda = torch.tensor(capture_offsets,
+                                                dtype=torch.int32,
+                                                device="cuda")
+            graph_attn_metadata.cu_q_seqlens = capture_offsets_cuda
+            graph_attn_metadata.cu_kv_seqlens = capture_offsets_cuda
         graph_attn_metadata.max_seq_len = self.config.max_seq_len
         graph_attn_metadata.request_ids = list(range(padded_batch_size))
 
@@ -1285,6 +1420,10 @@ class EncoderCUDAGraphRunner:
         # Captured H2D nodes read pinned host buffers. In CC mode, where H2D
         # is not captured, stage directly into the graph-resident CUDA buffers.
         static_tensors = self.shared_static_tensors_cpu if self._capture_h2d_copy else self.shared_static_tensors
+
+        if self.is_encoder_decoder and _ENCODER_SOURCE_TO_SLOT in inputs:
+            self._stage_encoder_decoder_inputs(key, inputs, static_tensors)
+            return
 
         input_ids = inputs["input_ids"]
         if isinstance(input_ids, list):
@@ -1321,6 +1460,88 @@ class EncoderCUDAGraphRunner:
             offset = actual_tokens
 
         staged_position_ids[offset:padded_num_tokens].fill_(0)
+
+    def _stage_encoder_decoder_inputs(
+        self,
+        key: EncoderKeyType,
+        inputs: Dict[str, Any],
+        static_tensors: Dict[str, torch.Tensor],
+    ) -> None:
+        """Scatter packed request inputs into fixed capture-time slots."""
+        source_sequence_lengths = inputs[_ENCODER_SOURCE_SEQ_LENS]
+        source_to_slot = inputs[_ENCODER_SOURCE_TO_SLOT]
+
+        input_ids = inputs["input_ids"]
+        if isinstance(input_ids, list):
+            source_input_ids = torch.tensor(input_ids, dtype=torch.int32)
+        elif isinstance(input_ids, torch.Tensor):
+            source_input_ids = input_ids
+        else:
+            raise TypeError(f"Unsupported input_ids type: {type(input_ids)}")
+
+        actual_num_tokens = sum(source_sequence_lengths)
+        if int(source_input_ids.shape[0]) != actual_num_tokens:
+            raise ValueError(
+                "Packed encoder input IDs must match source sequence lengths.")
+
+        position_ids = inputs.get("position_ids")
+        if isinstance(position_ids, list):
+            source_position_ids = torch.tensor(position_ids, dtype=torch.int32)
+        elif isinstance(position_ids, torch.Tensor):
+            source_position_ids = position_ids.flatten()
+        elif position_ids is None:
+            source_position_ids = None
+        else:
+            raise TypeError(
+                f"Unsupported position_ids type: {type(position_ids)}")
+        if (source_position_ids is not None
+                and int(source_position_ids.shape[0]) != actual_num_tokens):
+            raise ValueError("Packed encoder position IDs must match source "
+                             "sequence lengths.")
+
+        static_tensors["input_ids"][:key[1]].zero_()
+        static_tensors["position_ids"][:, :key[1]].zero_()
+
+        capture_offsets = self._get_capture_sequence_offsets(key)
+
+        source_offset = 0
+        for source_index, sequence_length in enumerate(source_sequence_lengths):
+            slot_index = source_to_slot[source_index]
+            destination_offset = capture_offsets[slot_index]
+            source_slice = slice(source_offset, source_offset + sequence_length)
+            destination_slice = slice(destination_offset,
+                                      destination_offset + sequence_length)
+            static_tensors["input_ids"][destination_slice].copy_(
+                source_input_ids[source_slice])
+            if source_position_ids is None:
+                static_tensors["position_ids"][0, destination_slice].copy_(
+                    self._arange_max[:sequence_length])
+            else:
+                static_tensors["position_ids"][0, destination_slice].copy_(
+                    source_position_ids[source_slice])
+            source_offset += sequence_length
+
+    def restore_encoder_decoder_output(
+        self,
+        key: EncoderKeyType,
+        output: torch.Tensor,
+        inputs: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Compact fixed-slot graph output back into request order."""
+        source_sequence_lengths = inputs[_ENCODER_SOURCE_SEQ_LENS]
+        if _ENCODER_SOURCE_TO_SLOT not in inputs:
+            return output[:sum(source_sequence_lengths)].clone()
+
+        source_to_slot = inputs[_ENCODER_SOURCE_TO_SLOT]
+
+        capture_offsets = self._get_capture_sequence_offsets(key)
+
+        output_slices = []
+        for source_index, sequence_length in enumerate(source_sequence_lengths):
+            source_offset = capture_offsets[source_to_slot[source_index]]
+            output_slices.append(output[source_offset:source_offset +
+                                        sequence_length])
+        return torch.cat(output_slices, dim=0)
 
     def capture(
         self,

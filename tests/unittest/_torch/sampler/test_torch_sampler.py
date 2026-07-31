@@ -657,13 +657,50 @@ def test_select_generated_logits(
     run_test_with_warmup(_test_runner, max_sync_s=0.3)
 
 
+@force_ampere
+def test_greedy_no_repeat_ngram_uses_token_ban_path():
+    sampler = TorchSampler(
+        TorchSampler.Args(
+            max_seq_len=16,
+            max_draft_len=0,
+            max_num_sequences=1,
+            max_beam_width=1,
+            max_total_draft_tokens=0,
+            disable_overlap_scheduler=True,
+        )
+    )
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=4,
+        input_tokens=[1, 2, 1],
+        sampling_config=SamplingConfig(),
+        seq_slot=0,
+        is_streaming=False,
+    )
+    request.py_no_repeat_ngram_size = 2
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.generation_requests = [request]
+    logits = torch.tensor([[0.0, 0.0, 10.0, 9.0]], device="cuda")
+
+    *_, new_tokens_host, single_step_greedy = sampler._process_requests(
+        scheduled_requests,
+        {"logits": logits},
+        sampler.store.new_tokens,
+        [0],
+    )
+    torch.cuda.synchronize()
+
+    assert not single_step_greedy
+    assert new_tokens_host.reshape(-1)[0].item() == 3
+
+
 class TestFinishReasons:
     NOT_FINISHED = FinishReason.NOT_FINISHED
     STOP_WORDS = FinishReason.STOP_WORDS
     END_ID = FinishReason.END_ID
     LENGTH = FinishReason.LENGTH
 
-    def test_single_step_greedy_checks_finish_reasons_on_host(self):
+    def test_single_step_greedy_updates_finish_reasons_and_filters_completed_requests(self):
         sampler = object.__new__(TorchSampler)
         sampler.max_seq_len = 20
         sampler._track_pending_steps = False
@@ -686,8 +723,18 @@ class TestFinishReasons:
                 sampling_config=SamplingConfig(),
                 is_streaming=False,
             ),
+            LlmRequest(
+                request_id=2,
+                seq_slot=2,
+                input_tokens=[2, 0],
+                max_new_tokens=10,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
         ]
-        new_tokens = torch.tensor([2, 7], dtype=torch.int32)
+        requests[2].finish_by(FinishReason.LENGTH, 0)
+        new_tokens = torch.tensor([2, 7, 99], dtype=torch.int32)
         state = SampleStateTorch(
             requests=requests,
             device=None,
@@ -707,39 +754,7 @@ class TestFinishReasons:
         assert requests[1].is_finished_due_to_length
         assert requests[0].get_tokens(0)[-1] == 2
         assert requests[1].get_tokens(0)[-1] == 7
-
-    def test_single_step_greedy_filters_requests_completed_after_sampling(self):
-        sampler = object.__new__(TorchSampler)
-        sampler.max_seq_len = 20
-        sampler._track_pending_steps = False
-        requests = [
-            LlmRequest(
-                request_id=request_id,
-                seq_slot=request_id,
-                input_tokens=[2, 0],
-                max_new_tokens=10,
-                end_id=2,
-                sampling_config=SamplingConfig(),
-                is_streaming=False,
-            )
-            for request_id in range(2)
-        ]
-        requests[0].finish_by(FinishReason.LENGTH, 0)
-        state = SampleStateTorch(
-            requests=requests,
-            device=None,
-            host=SampleStateTensorsHostTorch(
-                new_tokens=torch.tensor([99, 7], dtype=torch.int32),
-                finish_reasons=None,
-                first_finish_reasons=None,
-            ),
-            single_step_greedy=True,
-        )
-
-        sampler.update_requests(state)
-
-        assert requests[0].get_tokens(0) == [2, 0]
-        assert requests[1].get_tokens(0)[-1] == 7
+        assert requests[2].get_tokens(0) == [2, 0]
 
     class RequestCase:
         MAX_NEW_TOKENS = 10

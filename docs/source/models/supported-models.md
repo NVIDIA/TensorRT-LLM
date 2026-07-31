@@ -6,6 +6,7 @@ The following is a table of supported models for the PyTorch backend:
 | Architecture                         | Model                              | HuggingFace Example                          |
 | ------------------------------------ | ---------------------------------- | -------------------------------------------- |
 | `AfmoeForCausalLM`                   | Arcee Foundation MoE (Trinity)     | `arcee-ai/Trinity-Mini`                      |
+| `BartForConditionalGeneration`       | BART                               | `facebook/bart-large-cnn`                    |
 | `BertForSequenceClassification`      | BERT-based                         | `textattack/bert-base-uncased-yelp-polarity` |
 | `Cohere2ForCausalLM`                 | Command A                          | `CohereLabs/c4ai-command-a-03-2025`          |
 | `DeciLMForCausalLM`                  | Nemotron                           | `nvidia/Llama-3_1-Nemotron-51B-Instruct`     |
@@ -33,6 +34,7 @@ The following is a table of supported models for the PyTorch backend:
 | `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
+| `MBartForConditionalGeneration`      | mBART                              | `facebook/mbart-large-50-many-to-one-mmt`    |
 | `MiniCPMV4_6ForConditionalGeneration` [^14]| MiniCPM-V 4.6                    | `openbmb/MiniCPM-V-4.6`                      |
 | `MiniMaxM2ForCausalLM` [^5]          | MiniMax M2/M2.1/M2.7              | `MiniMaxAI/MiniMax-M2.7`                    |
 | `MiniMaxM3SparseForConditionalGeneration` [^12]| MiniMax-M3                       | `MiniMaxAI/MiniMax-M3`                      |
@@ -57,6 +59,8 @@ The following is a table of supported models for the PyTorch backend:
 | `SkyworkR1V2ForConditionalGeneration` [^5] | Skywork R1V2, Skywork SWE    | `Skywork/Skywork-R1V2-38B`                   |
 | `SmolLM3ForCausalLM` [^5]            | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
 | `Step3p7ForConditionalGeneration` [^8]| Step-3.7-Flash                    | `stepfun-ai/Step-3.7-Flash`                  |
+| `T5ForConditionalGeneration`         | T5, Flan-T5, ByT5                  | `google/flan-t5-small`                       |
+| `WhisperForConditionalGeneration`    | Whisper                            | `openai/whisper-large-v3`                    |
 
 
 ## Model-Feature Support Matrix (Key Models)
@@ -94,6 +98,24 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
 [^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
 [^14]: Requires `transformers>=5.7.0`: MiniCPM-V 4.6 was upstreamed into transformers as a native model type (`minicpmv4_6`) and the checkpoint ships no remote code (`auto_map`) to fall back on. The Qwen3.5-hybrid text tower runs in BF16. Image, video, and text inputs are supported in this release (video reuses the same NaViT-packed vision path as image via `MiniCPMV4_6InputProcessor`).
+
+# Encoder-Decoder Feature Support Matrix (PyTorch Backend)
+
+The following capabilities apply to the supported encoder-decoder architectures. For configuration guidance and
+limitations, see [Use encoder-decoder models with the PyTorch backend](./encoder-decoder.md).
+
+| Model Architecture/Feature | Overlap Scheduler | Decoder CUDA Graph | Encoder CUDA Graph | KV Cache Manager V1 | KV Cache Manager V2 | Beam Search | Tensor Parallelism | Pipeline Parallelism | Chunked Prefill |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `BartForConditionalGeneration` | Yes | Yes (except FP32) | Yes | Yes | Yes (single beam) | Yes (V1 only) | Yes | No | No (encoder phase) |
+| `MBartForConditionalGeneration` | Yes | Yes (except FP32) | Yes | Yes | Yes (single beam) | Yes (V1 only) | Yes | No | No (encoder phase) |
+| `T5ForConditionalGeneration` | Yes | Yes (except FP32) | Yes | Yes | Yes (single beam) | Yes (V1 only) | Yes | No | No (encoder phase) |
+| `WhisperForConditionalGeneration` | Yes | Yes (except FP32) | No (feature inputs) | Yes | Yes (single beam) | Yes (V1 only) | Yes | No | No (encoder phase) |
+
+Decoder CUDA graphs support greedy and beam-search decoding with KV cache manager V1 and single-beam decoding with
+V2. Encoder CUDA graphs support the token-input BART, mBART, and T5 families; Whisper's feature-driven audio encoder
+runs eagerly. Use the `TRTLLM` attention backend for encoder-decoder models; tensor parallelism also requires attention
+head counts divisible by the tensor parallel size. Chunked prefill is not supported for the encoder phase, so the
+complete encoder input must fit in the iteration token budget.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 

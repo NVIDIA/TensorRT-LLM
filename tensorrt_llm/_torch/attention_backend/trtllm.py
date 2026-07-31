@@ -673,9 +673,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:num_seqs].fill_(1)
 
+        max_blocks = None
+        if self.kv_cache_manager.tokens_per_block:
+            max_blocks = ceil_div(max_kv_len,
+                                  self.kv_cache_manager.tokens_per_block)
         self.kv_cache_manager.copy_batch_block_offsets(
-            self.kv_cache_block_offsets, self.request_ids, self.beam_width,
-            self.num_contexts, num_seqs)
+            self.kv_cache_block_offsets,
+            self.request_ids,
+            self.beam_width,
+            self.num_contexts,
+            num_seqs,
+            max_blocks=max_blocks)
         self._bind_runtime_views(
             kv_lens_cuda=self.kv_lens_cuda[:num_seqs],
             kv_lens=kv_lens,
