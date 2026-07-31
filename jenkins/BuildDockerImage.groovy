@@ -325,8 +325,23 @@ def buildImage(config, imageKeyToTag)
             trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
         }
     }
-    def containerGenFailure = null
-    try {
+    // The two `docker login`s above are held for the whole build and released by
+    // the reclaim below. resourceLedger.withResource runs the reclaim in a
+    // finally on both success and failure -- re-raising the body's own error --
+    // replacing the prior try/catch/finally/containerGenFailure/rethrow. If the
+    // build pod dies before the finally runs, the registered entry is left live
+    // for a post-build sweep (Phase 3) rather than being silently lost.
+    resourceLedger.withResource(this,
+        id: "docker-login/${config.stageName}",
+        type: "dockerLogin",
+        reclaim: { p, e ->
+            stage ("Docker Logout") {
+                withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
+                    sh "docker logout urm.nvidia.com"
+                    sh "docker logout ${DEFAULT_GIT_URL}:5005"
+                }
+            }
+        }) {
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
         def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
@@ -421,18 +436,6 @@ def buildImage(config, imageKeyToTag)
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """
             }
-        }
-    } catch (Exception ex) {
-        containerGenFailure = ex
-    } finally {
-        stage ("Docker Logout") {
-            withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
-                sh "docker logout urm.nvidia.com"
-                sh "docker logout ${DEFAULT_GIT_URL}:5005"
-            }
-        }
-        if (containerGenFailure != null) {
-            throw containerGenFailure
         }
     }
 }
