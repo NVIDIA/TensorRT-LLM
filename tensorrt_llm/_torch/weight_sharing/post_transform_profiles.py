@@ -42,6 +42,9 @@ LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-llama-target-layout-v1"
 # Stable contract for unquantized Qwen2 dense fused-QKV and fused-gate-up
 # tensors plus the target-only receiver finalization used by its first profile.
 QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
+# Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
+# tensors, Q/K norm state, and target-only receiver finalization.
+QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
 _MISSING = object()
 
 

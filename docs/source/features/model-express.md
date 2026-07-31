@@ -27,6 +27,7 @@ profiles:
 |---------|------------|-----------------|-------|----------|----------------------|-------------|
 | `llama-for-causal-lm-target-v1` | `LlamaForCausalLM` | `LlamaForCausalLM` / `llama` | Target model | 1 | `trtllm-llama-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen2-for-causal-lm-bf16-target-v1` | `Qwen2ForCausalLM` | `Qwen2ForCausalLM` / `qwen2` | Target model | 1 | `trtllm-qwen2-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `qwen3-for-causal-lm-bf16-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, and any runtime constraints
@@ -57,14 +58,14 @@ standard checkpoint path. Target-plus-draft post-transform transfer remains
 disabled until layout state is tracked and qualified independently for each
 submodel.
 
-The Llama and Qwen2 profiles are text-only and do not enable reward-model, MoE,
-or vision-language roots. FP16, quantized weights or KV cache, alternate
-attention backends, YaRN or unfused RoPE, tied embeddings, TP greater than 2,
-PP greater than 1, CP greater than 1, LoRA, sparse attention, attention DP,
-multi-node transfer, and speculative decoding require separate qualification
-rows. The profiles do not constrain MoE-only backend and mapping settings
-because these dense roots do not consume them. `SourceIdentity` still requires
-donor and receiver configurations to match.
+The Llama, Qwen2, and Qwen3 profiles are text-only and do not enable
+reward-model, embedding, MoE, or vision-language roots. FP16, quantized weights
+or KV cache, alternate attention backends, YaRN or unfused RoPE, tied
+embeddings, TP greater than 2, PP greater than 1, CP greater than 1, LoRA,
+sparse attention, attention DP, multi-node transfer, and speculative decoding
+require separate qualification rows. The profiles do not constrain MoE-only
+backend and mapping settings because these dense roots do not consume them.
+`SourceIdentity` still requires donor and receiver configurations to match.
 
 ### Adding a Model Family
 
@@ -112,12 +113,15 @@ pytest -v tests/integration/defs/model_express/test_model_express.py \
 
 Run the TP=2 rank-mapping qualification on four GPUs by selecting
 `llama-bf16-tp2`. `TRTLLM_MX_LLAMA_MODEL` can override the default TinyLlama
-checkpoint path. `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model,
-or NIXL prerequisites from skips into failures and must be set by a CI
-qualification stage. That stage must also allocate the GPUs declared by the
-selected test row. `TRTLLM_MX_E2E_TIMEOUT_S` controls the 1200-second timeout
-used for the baseline worker, receiver worker, and donor-readiness wait;
-increase it for slow model storage or startup.
+checkpoint path. The Qwen2 and Qwen3 profile rows use `qwen2-bf16-tp1` /
+`qwen2-bf16-tp2` and `qwen3-bf16-tp1` / `qwen3-bf16-tp2`, with optional model
+path overrides in `TRTLLM_MX_QWEN2_MODEL` and `TRTLLM_MX_QWEN3_MODEL`.
+`TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model, or NIXL
+prerequisites from skips into failures and must be set by a CI qualification
+stage. That stage must also allocate the GPUs declared by the selected test
+row. `TRTLLM_MX_E2E_TIMEOUT_S` controls the 1200-second timeout used for the
+baseline worker, receiver worker, and donor-readiness wait; increase it for
+slow model storage or startup.
 
 The dedicated H100 CI stages own isolated Redis and ModelExpress 0.4.1
 sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs
@@ -251,10 +255,10 @@ path.
 
 ## Notes and Limitations
 
-- Post-transform MX reception is currently limited to the exact Llama and
-  Qwen2/Qwen2.5 dense profiles above. Other roots and variants that do not
-  match the documented identity and runtime envelope safely fall back to
-  Hugging Face loading until explicitly qualified.
+- Post-transform MX reception is currently limited to the exact Llama,
+  Qwen2/Qwen2.5 dense, and Qwen3 dense profiles above. Other roots and variants
+  that do not match the documented identity and runtime envelope safely fall
+  back to Hugging Face loading until explicitly qualified.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.
