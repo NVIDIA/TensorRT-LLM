@@ -83,6 +83,22 @@ LIST_EMIT_MAX_TOKENS = 786432  # B * raw length; between the measured
 LIST_EMIT_MIN_N = 16384
 RUNGS_MIN_B = 16
 
+# Mid-row weak band: rows long enough that the stock kernel splits them
+# across a cluster, but short enough (and at a small enough batch) that
+# its split grid still fits one wave. The assist tiers cannot follow -
+# splitting a row costs them more than the scan it saves - so the stock
+# kernel wins outright and the epilogue should emit nothing. Measured
+# against the stock kernel on the captured grid: without this band 15 of
+# 154 cells run below stock (worst 0.86 at flash 512k batch 16); with it,
+# 2 cells at 0.99. Longer K needs less row before the tiers pay, hence
+# the two upper bounds. Batch 1-2 still take the list tier (checked
+# first): there the emitted list beats stock by 1.5x even inside the band.
+ASSIST_WEAK_MIN_N = 49152
+ASSIST_WEAK_MAX_N_SMALL_K = 196608  # k <= ASSIST_WEAK_K
+ASSIST_WEAK_MAX_N_LARGE_K = 98304
+ASSIST_WEAK_K = 512
+ASSIST_WEAK_MAX_B = 32
+
 # rungs-tier block_max pays only at small K: with K=1024 the tight-line
 # pass rate runs too high and the prefix read is pure overhead.
 RUNGS_BM_MAX_K = 512
@@ -122,12 +138,17 @@ def plan_emission(
         # and this holds for the zero-emission rungs tier too - it is
         # the same kernel, so the floor is the same
         return "none"
-    if not have_epilogue:
-        return "rungs"  # closed-loop lines cost nothing to carry
-    if n_comp >= LIST_EMIT_MIN_N and (
-        batch == 1 or batch * n_comp * compress_ratio <= LIST_EMIT_MAX_TOKENS
+    if (
+        have_epilogue
+        and n_comp >= LIST_EMIT_MIN_N
+        and (batch == 1 or batch * n_comp * compress_ratio <= LIST_EMIT_MAX_TOKENS)
     ):
         return "list"
+    weak_max = ASSIST_WEAK_MAX_N_SMALL_K if k <= ASSIST_WEAK_K else ASSIST_WEAK_MAX_N_LARGE_K
+    if batch <= ASSIST_WEAK_MAX_B and ASSIST_WEAK_MIN_N <= n_comp < weak_max:
+        return "none"  # stock's split grid wins this band outright
+    if not have_epilogue:
+        return "rungs"  # closed-loop lines cost nothing to carry
     if batch >= RUNGS_MIN_B:
         return "rungs"  # throughput regime: emitting anything is a loss
     return "counts"
