@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
@@ -45,6 +46,53 @@ namespace tc = tensorrt_llm::common;
 
 using CudaStreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using VecTokens = std::vector<TokenIdType>;
+
+namespace
+{
+
+constexpr char kReplayPrePr15356GneFirstGateEnv[] = "TRTLLM_NVBUG_6448152_REPLAY_PRE15356_GNE_FIRST_GATE";
+
+class ScopedEnv
+{
+public:
+    ScopedEnv(char const* key, char const* value)
+        : mKey(key)
+    {
+        auto const* previousValue = std::getenv(key);
+        mHadPreviousValue = previousValue != nullptr;
+        if (mHadPreviousValue)
+        {
+            mPreviousValue = previousValue;
+        }
+        if (value != nullptr)
+        {
+            setenv(key, value, 1);
+        }
+        else
+        {
+            unsetenv(key);
+        }
+    }
+
+    ~ScopedEnv()
+    {
+        if (mHadPreviousValue)
+        {
+            setenv(mKey.c_str(), mPreviousValue.c_str(), 1);
+        }
+        else
+        {
+            unsetenv(mKey.c_str());
+        }
+    }
+
+private:
+    std::string mKey;
+    std::string mPreviousValue;
+    bool mHadPreviousValue{false};
+};
+
+} // namespace
 
 struct RequestState
 {
@@ -808,6 +856,8 @@ TEST_F(CapacitySchedulerTest, DisaggGenInitMaxUtilization)
 
 TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
 {
+    ScopedEnv scopedEnv(kReplayPrePr15356GneFirstGateEnv, nullptr);
+
     SizeType32 kvCacheMaxNumTokens = 200;
     SizeType32 kvCacheTokensPerBlock = 10;
     SizeType32 kvCacheMaxNumTokensPerSeq = 90;
@@ -848,6 +898,195 @@ TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
             << "policy=" << static_cast<int>(capacitySchedulerPolicy);
         EXPECT_TRUE(pausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
     }
+}
+
+TEST_F(CapacitySchedulerTest, CompletePrePr15356FirstGateReplayReportsLogicalDivergence)
+{
+    ScopedEnv scopedEnv(kReplayPrePr15356GneFirstGateEnv, "1");
+    auto kvCacheManager = getKvCacheManager(2, 10, 200, 90);
+    auto peftCacheManager = getPeftCacheManager();
+    auto transferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+
+    RequestVector fittingDisaggGenInitRequests;
+    RequestVector fittingDisaggGenInitRequestsWithoutTransfer;
+    RequestVector fittingDisaggGenInitRequestsAfterShadowStop;
+    testing::internal::CaptureStdout();
+    {
+        auto scheduler = CapacityScheduler(1, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        std::tie(std::ignore, fittingDisaggGenInitRequestsWithoutTransfer, std::ignore)
+            = scheduler(RequestList{pendingReq}, kvCacheManager, peftCacheManager);
+        std::tie(std::ignore, fittingDisaggGenInitRequests, std::ignore)
+            = scheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager);
+        std::tie(std::ignore, fittingDisaggGenInitRequestsAfterShadowStop, std::ignore)
+            = scheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager);
+    }
+    auto const output = testing::internal::GetCapturedStdout();
+
+    ASSERT_EQ(fittingDisaggGenInitRequestsWithoutTransfer.size(), 1U);
+    EXPECT_EQ(fittingDisaggGenInitRequestsWithoutTransfer.front()->mRequestId, pendingReq->mRequestId);
+    ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1U);
+    EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId);
+    ASSERT_EQ(fittingDisaggGenInitRequestsAfterShadowStop.size(), 1U);
+    EXPECT_EQ(fittingDisaggGenInitRequestsAfterShadowStop.front()->mRequestId, pendingReq->mRequestId);
+    EXPECT_THAT(output, testing::HasSubstr("event=effective_config"));
+    EXPECT_THAT(output, testing::HasSubstr("event=shadow_skipped"));
+    EXPECT_THAT(output, testing::HasSubstr("reason=no_transfer shadow_iterations=0"));
+    EXPECT_THAT(output, testing::HasSubstr("event=transfer_active"));
+    EXPECT_THAT(output, testing::HasSubstr("event=exercised"));
+    EXPECT_THAT(output, testing::HasSubstr("transfer_active=1"));
+    EXPECT_THAT(output, testing::HasSubstr("pre_only=1"));
+    EXPECT_THAT(output, testing::HasSubstr("post_only=0"));
+    EXPECT_THAT(output, testing::HasSubstr("pre_only_disagg_init=1"));
+    EXPECT_THAT(output, testing::HasSubstr("pre_only_ready_generation=0"));
+    EXPECT_THAT(output, testing::HasSubstr("pre_only_other=0"));
+    EXPECT_THAT(output, testing::HasSubstr("reason_logical=1"));
+    EXPECT_THAT(output, testing::HasSubstr("event=shadow_stopped"));
+    EXPECT_THAT(output, testing::HasSubstr("event=summary"));
+    EXPECT_THAT(output, testing::HasSubstr("shadow_iterations=1"));
+    EXPECT_THAT(output, testing::HasSubstr("treatment_only_iterations=2"));
+    EXPECT_THAT(output, testing::HasSubstr("shadow_stopped=1"));
+}
+
+TEST_F(CapacitySchedulerTest, CompletePrePr15356FirstGateReplayReportsReadyGenerationDivergence)
+{
+    ScopedEnv scopedEnv(kReplayPrePr15356GneFirstGateEnv, "1");
+    auto kvCacheManager = getKvCacheManager(2, 10, 200, 90);
+    auto peftCacheManager = getPeftCacheManager();
+    auto transferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto readyReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kGENERATION_IN_PROGRESS);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}},
+            {{readyReq->mRequestId, readyReq->mPromptLen, readyReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq), std::ref(*readyReq)});
+
+    RequestVector fittingRequests;
+    testing::internal::CaptureStdout();
+    {
+        auto scheduler = CapacityScheduler(1, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        std::tie(fittingRequests, std::ignore, std::ignore)
+            = scheduler(RequestList{transferReq, readyReq}, kvCacheManager, peftCacheManager);
+    }
+    auto const output = testing::internal::GetCapturedStdout();
+
+    ASSERT_EQ(fittingRequests.size(), 1U);
+    EXPECT_EQ(fittingRequests.front()->mRequestId, readyReq->mRequestId);
+    EXPECT_THAT(output, testing::HasSubstr("event=exercised"));
+    EXPECT_THAT(output, testing::HasSubstr("pre_only_disagg_init=0"));
+    EXPECT_THAT(output, testing::HasSubstr("pre_only_ready_generation=1"));
+    EXPECT_THAT(output, testing::HasSubstr("pre_only_other=0"));
+    EXPECT_THAT(output, testing::HasSubstr("reason_logical=1"));
+}
+
+TEST_F(CapacitySchedulerTest, CompletePrePr15356FirstGateReplayReportsSelfKvDivergence)
+{
+    ScopedEnv scopedEnv(kReplayPrePr15356GneFirstGateEnv, "1");
+    constexpr SizeType32 kTokensPerBlock = 10;
+    constexpr SizeType32 kWindowSize = 90;
+    auto kvCacheManager = getKvCacheManager(2, kTokensPerBlock, 60, kWindowSize);
+    auto peftCacheManager = getPeftCacheManager();
+    auto transferReq = createRequest(10, 40, 0, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(10, 40, 1, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_INIT);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+    auto const freeBlocks = kvCacheManager->getNumFreeBlocks();
+    auto const transferRemaining = kvCacheManager->getRemainingBlocksToCompletion(*transferReq, kWindowSize);
+    auto const pendingRemaining = kvCacheManager->getRemainingBlocksToCompletion(*pendingReq, kWindowSize);
+    ASSERT_LE(pendingRemaining, freeBlocks);
+    ASSERT_GT(transferRemaining + pendingRemaining, freeBlocks);
+
+    RequestVector fittingDisaggGenInitRequests;
+    testing::internal::CaptureStdout();
+    {
+        auto scheduler = CapacityScheduler(2, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        std::tie(std::ignore, fittingDisaggGenInitRequests, std::ignore)
+            = scheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager);
+    }
+    auto const output = testing::internal::GetCapturedStdout();
+
+    ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1U);
+    EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId);
+    EXPECT_THAT(output, testing::HasSubstr("reason_self_kv=1"));
+    EXPECT_THAT(output, testing::HasSubstr("reason_logical=0"));
+}
+
+TEST_F(CapacitySchedulerTest, CompletePrePr15356FirstGateReplayReportsPeftDivergence)
+{
+    ScopedEnv scopedEnv(kReplayPrePr15356GneFirstGateEnv, "1");
+    auto kvCacheManager = getKvCacheManager(2, 10, 200, 90);
+    auto peftCacheManager = std::make_shared<MockPeftCacheManager>(15, 15, 15);
+    auto transferReq = createRequest(10, 40, 0, 100, tensorrt_llm::executor::Request::kDefaultPriority,
+        LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createRequest(
+        10, 40, 1, 200, tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_INIT);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+
+    RequestVector fittingDisaggGenInitRequests;
+    testing::internal::CaptureStdout();
+    {
+        auto scheduler = CapacityScheduler(2, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        std::tie(std::ignore, fittingDisaggGenInitRequests, std::ignore)
+            = scheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager);
+    }
+    auto const output = testing::internal::GetCapturedStdout();
+
+    ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1U);
+    EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId);
+    EXPECT_THAT(output, testing::HasSubstr("reason_peft=1"));
+    EXPECT_THAT(output, testing::HasSubstr("reason_logical=0"));
+}
+
+TEST_F(CapacitySchedulerTest, CompletePrePr15356FirstGateReplayReportsCrossKvDivergence)
+{
+    ScopedEnv scopedEnv(kReplayPrePr15356GneFirstGateEnv, "1");
+    constexpr SizeType32 kTokensPerBlock = 10;
+    constexpr SizeType32 kCrossWindowSize = 40;
+    auto kvCacheManager = getKvCacheManager(2, kTokensPerBlock, 200, 90);
+    auto crossKvCacheManager = getKvCacheManager(2, kTokensPerBlock, 60, kCrossWindowSize,
+        /*sinkTokenLength=*/0, /*enableReuse=*/false, kv_cache_manager::CacheType::kCROSS);
+    auto peftCacheManager = getPeftCacheManager();
+    auto transferReq = createFromExecutorRequest(10, 40, kCrossWindowSize, 0);
+    transferReq->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    auto pendingReq = createFromExecutorRequest(10, 40, kCrossWindowSize, 1);
+    pendingReq->setState(LlmRequestState::kDISAGG_GENERATION_INIT);
+    kvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+    crossKvCacheManager->addSequenceBatch(
+        {{{transferReq->mRequestId, transferReq->getEncoderOutputLen(), transferReq->mSamplingConfig.beamWidth}}},
+        {std::ref(*transferReq)});
+    auto const freeCrossBlocks = crossKvCacheManager->getNumFreeBlocks();
+    auto const transferRemaining = crossKvCacheManager->getRemainingBlocksToCompletion(*transferReq, kCrossWindowSize);
+    auto const pendingRemaining = crossKvCacheManager->getRemainingBlocksToCompletion(*pendingReq, kCrossWindowSize);
+    ASSERT_LE(pendingRemaining, freeCrossBlocks);
+    ASSERT_GT(transferRemaining + pendingRemaining, freeCrossBlocks);
+
+    RequestVector fittingDisaggGenInitRequests;
+    testing::internal::CaptureStdout();
+    {
+        auto scheduler = CapacityScheduler(2, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, kvCacheManager != nullptr);
+        std::tie(std::ignore, fittingDisaggGenInitRequests, std::ignore)
+            = scheduler(RequestList{transferReq, pendingReq}, kvCacheManager, peftCacheManager, crossKvCacheManager);
+    }
+    auto const output = testing::internal::GetCapturedStdout();
+
+    ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1U);
+    EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId);
+    EXPECT_THAT(output, testing::HasSubstr("reason_cross_kv=1"));
+    EXPECT_THAT(output, testing::HasSubstr("reason_self_kv=0"));
+    EXPECT_THAT(output, testing::HasSubstr("reason_logical=0"));
 }
 
 TEST_F(CapacitySchedulerTest, DisaggTransferAdmissionDisabledPreservesCandidates)

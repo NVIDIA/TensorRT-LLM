@@ -21,12 +21,16 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/scheduledBlocksManager.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -34,8 +38,228 @@ using kv_cache_manager::VecUniqueTokens;
 using kv_cache_manager::BlockKey;
 using kv_cache_manager::BlockKeyHasher;
 
+struct GuaranteedNoEvictDecisionTrace
+{
+    std::uint64_t transferActive{0};
+    bool logicalCapacityReached{false};
+    std::unordered_map<RequestIdType, std::uint8_t> rejectionReasons;
+};
+
+struct GuaranteedNoEvictReplayStats
+{
+    ~GuaranteedNoEvictReplayStats()
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_PRE15356_GNE event=summary mode=complete_first_gate_replay "
+            "iterations=%llu shadow_iterations=%llu treatment_only_iterations=%llu shadow_stopped=%d "
+            "transfer_active_iterations=%llu transfer_active_total=%llu transfer_active_max=%llu "
+            "divergence_iterations=%llu post_candidates_total=%llu pre_candidates_total=%llu "
+            "pre_only_total=%llu pre_only_disagg_init_total=%llu pre_only_ready_generation_total=%llu "
+            "pre_only_other_total=%llu post_only_total=%llu reason_logical_total=%llu reason_self_kv_total=%llu "
+            "reason_cross_kv_total=%llu reason_peft_total=%llu reason_unknown_total=%llu",
+            static_cast<unsigned long long>(iterations), static_cast<unsigned long long>(shadowIterations),
+            static_cast<unsigned long long>(treatmentOnlyIterations), static_cast<int>(shadowStopped),
+            static_cast<unsigned long long>(transferActiveIterations),
+            static_cast<unsigned long long>(transferActiveTotal), static_cast<unsigned long long>(transferActiveMax),
+            static_cast<unsigned long long>(divergenceIterations), static_cast<unsigned long long>(postCandidatesTotal),
+            static_cast<unsigned long long>(preCandidatesTotal), static_cast<unsigned long long>(preOnlyTotal),
+            static_cast<unsigned long long>(preOnlyDisaggInitTotal),
+            static_cast<unsigned long long>(preOnlyReadyGenerationTotal),
+            static_cast<unsigned long long>(preOnlyOtherTotal), static_cast<unsigned long long>(postOnlyTotal),
+            static_cast<unsigned long long>(reasonLogicalTotal), static_cast<unsigned long long>(reasonSelfKvTotal),
+            static_cast<unsigned long long>(reasonCrossKvTotal), static_cast<unsigned long long>(reasonPeftTotal),
+            static_cast<unsigned long long>(reasonUnknownTotal));
+    }
+
+    std::uint64_t iterations{0};
+    std::uint64_t shadowIterations{0};
+    std::uint64_t treatmentOnlyIterations{0};
+    std::uint64_t transferActiveIterations{0};
+    std::uint64_t transferActiveTotal{0};
+    std::uint64_t transferActiveMax{0};
+    std::uint64_t divergenceIterations{0};
+    std::uint64_t postCandidatesTotal{0};
+    std::uint64_t preCandidatesTotal{0};
+    std::uint64_t preOnlyTotal{0};
+    std::uint64_t preOnlyDisaggInitTotal{0};
+    std::uint64_t preOnlyReadyGenerationTotal{0};
+    std::uint64_t preOnlyOtherTotal{0};
+    std::uint64_t postOnlyTotal{0};
+    std::uint64_t reasonLogicalTotal{0};
+    std::uint64_t reasonSelfKvTotal{0};
+    std::uint64_t reasonCrossKvTotal{0};
+    std::uint64_t reasonPeftTotal{0};
+    std::uint64_t reasonUnknownTotal{0};
+    bool transferActiveLogged{false};
+    bool divergenceLogged{false};
+    bool noTransferShadowSkipLogged{false};
+    bool shadowStopped{false};
+};
+
 namespace
 {
+
+constexpr char kReplayPrePr15356GneFirstGateEnv[] = "TRTLLM_NVBUG_6448152_REPLAY_PRE15356_GNE_FIRST_GATE";
+
+constexpr std::uint8_t kAdmissionReasonLogical = 1U << 0U;
+constexpr std::uint8_t kAdmissionReasonSelfKv = 1U << 1U;
+constexpr std::uint8_t kAdmissionReasonCrossKv = 1U << 2U;
+constexpr std::uint8_t kAdmissionReasonPeft = 1U << 3U;
+
+void addAdmissionReason(
+    GuaranteedNoEvictDecisionTrace* trace, std::shared_ptr<LlmRequest> const& req, std::uint8_t reason)
+{
+    if (trace != nullptr)
+    {
+        trace->rejectionReasons[req->mRequestId] |= reason;
+    }
+}
+
+bool hasRequest(RequestVector const& requests, RequestIdType requestId)
+{
+    return std::any_of(
+        requests.begin(), requests.end(), [requestId](auto const& req) { return req->mRequestId == requestId; });
+}
+
+void recordReplayComparison(GuaranteedNoEvictReplayStats& stats, RequestVector const& postPrCandidates,
+    RequestVector const& prePrCandidates, GuaranteedNoEvictDecisionTrace const& postPrTrace)
+{
+    std::uint64_t preOnly{0};
+    std::uint64_t preOnlyDisaggInit{0};
+    std::uint64_t preOnlyReadyGeneration{0};
+    std::uint64_t preOnlyOther{0};
+    std::uint64_t postOnly{0};
+    std::uint64_t reasonLogical{0};
+    std::uint64_t reasonSelfKv{0};
+    std::uint64_t reasonCrossKv{0};
+    std::uint64_t reasonPeft{0};
+    std::uint64_t reasonUnknown{0};
+
+    for (auto const& req : prePrCandidates)
+    {
+        if (hasRequest(postPrCandidates, req->mRequestId))
+        {
+            continue;
+        }
+        ++preOnly;
+        if (req->isDisaggGenerationInitState())
+        {
+            ++preOnlyDisaggInit;
+        }
+        else if (req->isGenerationInProgressState())
+        {
+            ++preOnlyReadyGeneration;
+        }
+        else
+        {
+            ++preOnlyOther;
+        }
+        auto reason = std::uint8_t{0};
+        auto const reasonIt = postPrTrace.rejectionReasons.find(req->mRequestId);
+        if (reasonIt != postPrTrace.rejectionReasons.end())
+        {
+            reason = reasonIt->second;
+        }
+        if (reason == 0 && postPrTrace.logicalCapacityReached)
+        {
+            reason = kAdmissionReasonLogical;
+        }
+        reasonLogical += static_cast<std::uint64_t>((reason & kAdmissionReasonLogical) != 0);
+        reasonSelfKv += static_cast<std::uint64_t>((reason & kAdmissionReasonSelfKv) != 0);
+        reasonCrossKv += static_cast<std::uint64_t>((reason & kAdmissionReasonCrossKv) != 0);
+        reasonPeft += static_cast<std::uint64_t>((reason & kAdmissionReasonPeft) != 0);
+        reasonUnknown += static_cast<std::uint64_t>(reason == 0);
+    }
+    for (auto const& req : postPrCandidates)
+    {
+        postOnly += static_cast<std::uint64_t>(!hasRequest(prePrCandidates, req->mRequestId));
+    }
+
+    auto postIt = postPrCandidates.begin();
+    for (auto const& req : prePrCandidates)
+    {
+        if (postIt != postPrCandidates.end() && (*postIt)->mRequestId == req->mRequestId)
+        {
+            ++postIt;
+        }
+    }
+    bool const postIsOrderedSubset = postIt == postPrCandidates.end();
+    TLLM_CHECK_WITH_INFO(postOnly == 0 && postIsOrderedSubset,
+        "Complete pre-PR15356 first-gate replay must be an ordered relaxation of post-PR15356 admission");
+
+    ++stats.iterations;
+    ++stats.shadowIterations;
+    stats.transferActiveTotal += postPrTrace.transferActive;
+    stats.transferActiveMax = std::max(stats.transferActiveMax, postPrTrace.transferActive);
+    stats.transferActiveIterations += static_cast<std::uint64_t>(postPrTrace.transferActive > 0);
+    stats.divergenceIterations += static_cast<std::uint64_t>(preOnly > 0);
+    stats.postCandidatesTotal += postPrCandidates.size();
+    stats.preCandidatesTotal += prePrCandidates.size();
+    stats.preOnlyTotal += preOnly;
+    stats.preOnlyDisaggInitTotal += preOnlyDisaggInit;
+    stats.preOnlyReadyGenerationTotal += preOnlyReadyGeneration;
+    stats.preOnlyOtherTotal += preOnlyOther;
+    stats.postOnlyTotal += postOnly;
+    stats.reasonLogicalTotal += reasonLogical;
+    stats.reasonSelfKvTotal += reasonSelfKv;
+    stats.reasonCrossKvTotal += reasonCrossKv;
+    stats.reasonPeftTotal += reasonPeft;
+    stats.reasonUnknownTotal += reasonUnknown;
+
+    if (postPrTrace.transferActive > 0 && !stats.transferActiveLogged)
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_PRE15356_GNE event=transfer_active mode=complete_first_gate_replay "
+            "transfer_active=%llu post_candidates=%llu pre_candidates=%llu",
+            static_cast<unsigned long long>(postPrTrace.transferActive),
+            static_cast<unsigned long long>(postPrCandidates.size()),
+            static_cast<unsigned long long>(prePrCandidates.size()));
+        stats.transferActiveLogged = true;
+    }
+    if (preOnly > 0 && !stats.divergenceLogged)
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_PRE15356_GNE event=exercised mode=complete_first_gate_replay "
+            "transfer_active=%llu post_candidates=%llu pre_candidates=%llu pre_only=%llu post_only=%llu "
+            "pre_only_disagg_init=%llu pre_only_ready_generation=%llu pre_only_other=%llu "
+            "post_is_ordered_subset=%d reason_logical=%llu reason_self_kv=%llu reason_cross_kv=%llu "
+            "reason_peft=%llu reason_unknown=%llu",
+            static_cast<unsigned long long>(postPrTrace.transferActive),
+            static_cast<unsigned long long>(postPrCandidates.size()),
+            static_cast<unsigned long long>(prePrCandidates.size()), static_cast<unsigned long long>(preOnly),
+            static_cast<unsigned long long>(postOnly), static_cast<unsigned long long>(preOnlyDisaggInit),
+            static_cast<unsigned long long>(preOnlyReadyGeneration), static_cast<unsigned long long>(preOnlyOther),
+            static_cast<int>(postIsOrderedSubset), static_cast<unsigned long long>(reasonLogical),
+            static_cast<unsigned long long>(reasonSelfKv), static_cast<unsigned long long>(reasonCrossKv),
+            static_cast<unsigned long long>(reasonPeft), static_cast<unsigned long long>(reasonUnknown));
+        stats.divergenceLogged = true;
+    }
+    if (postPrTrace.transferActive > 0 && preOnly > 0 && !stats.shadowStopped)
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_PRE15356_GNE event=shadow_stopped mode=complete_first_gate_replay "
+            "shadow_iterations=%llu treatment_continues=1",
+            static_cast<unsigned long long>(stats.shadowIterations));
+        stats.shadowStopped = true;
+    }
+}
+
+void recordTreatmentOnlyIteration(GuaranteedNoEvictReplayStats& stats, std::uint64_t transferActive)
+{
+    ++stats.iterations;
+    ++stats.treatmentOnlyIterations;
+    stats.transferActiveTotal += transferActive;
+    stats.transferActiveMax = std::max(stats.transferActiveMax, transferActive);
+    stats.transferActiveIterations += static_cast<std::uint64_t>(transferActive > 0);
+    if (transferActive == 0 && !stats.noTransferShadowSkipLogged)
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_PRE15356_GNE event=shadow_skipped mode=complete_first_gate_replay "
+            "reason=no_transfer shadow_iterations=%llu treatment_continues=1",
+            static_cast<unsigned long long>(stats.shadowIterations));
+        stats.noTransferShadowSkipLogged = true;
+    }
+}
 
 std::tuple<std::unordered_set<BlockKey, BlockKeyHasher>, std::unordered_set<BlockKey, BlockKeyHasher>>
 prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
@@ -158,11 +382,23 @@ MaxUtilizationScheduler::MaxUtilizationScheduler(SizeType32 maxNumRequests, bool
 {
 }
 
-GuaranteedNoEvictScheduler::GuaranteedNoEvictScheduler(
-    SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState)
+GuaranteedNoEvictScheduler::GuaranteedNoEvictScheduler(SizeType32 maxNumRequests, LlmRequestState noScheduleUntilState,
+    LlmRequestState noScheduleAfterState, bool replayPrePr15356FirstGate)
     : BaseCapacityScheduler(noScheduleUntilState, noScheduleAfterState)
     , mMaxNumRequests(maxNumRequests)
+    , mReplayPrePr15356FirstGate(replayPrePr15356FirstGate)
+    , mReplayStats(replayPrePr15356FirstGate ? std::make_shared<GuaranteedNoEvictReplayStats>() : nullptr)
 {
+    if (mReplayPrePr15356FirstGate)
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_PRE15356_GNE event=effective_config policy=guaranteed_no_evict "
+            "mode=complete_first_gate_replay post_shadow=transfer_active_until_first_exercised_divergence "
+            "ignore_transfer_logical=1 "
+            "ignore_transfer_self_kv=1 ignore_transfer_cross_kv=1 ignore_transfer_peft=1 "
+            "max_num_requests=%d",
+            static_cast<int>(mMaxNumRequests));
+    }
 }
 
 StaticBatchScheduler::StaticBatchScheduler(
@@ -208,14 +444,34 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::operator()(
     OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
-    return impl<false>(kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests);
+    if (!mReplayPrePr15356FirstGate)
+    {
+        return impl<false>(kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests);
+    }
+    auto prePrResult = impl<false>(kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests, true);
+    auto const transferActive = static_cast<std::uint64_t>(std::count_if(activeRequests.begin(), activeRequests.end(),
+        [](auto const& req) { return req->isDisaggGenerationTransmissionInProgress(); }));
+    if (transferActive == 0 || mReplayStats->shadowStopped)
+    {
+        recordTreatmentOnlyIteration(*mReplayStats, transferActive);
+        return prePrResult;
+    }
+
+    GuaranteedNoEvictDecisionTrace postPrTrace;
+    auto postPrResult
+        = impl<false>(kvCacheManager, crossKvCacheManager, peftCacheManager, activeRequests, false, &postPrTrace);
+    TLLM_CHECK_WITH_INFO(postPrTrace.transferActive == transferActive,
+        "Transfer-active precondition count must match the post-PR15356 decision trace");
+    recordReplayComparison(*mReplayStats, std::get<0>(postPrResult), std::get<0>(prePrResult), postPrTrace);
+    return prePrResult;
 }
 
 template <bool StaticBatchScheduling>
 std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
     OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
-    OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
+    OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests,
+    bool replayPrePr15356FirstGate, GuaranteedNoEvictDecisionTrace* trace) const
 {
     RequestVector scheduledRequests;
 
@@ -257,6 +513,19 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     pendingDisGenInitRequests.reserve(activeRequests.size());
     for (auto const& req : activeRequests)
     {
+        bool const isDisaggGenerationTransfer = req->isDisaggGenerationTransmissionInProgress();
+        if (trace != nullptr && isDisaggGenerationTransfer)
+        {
+            ++trace->transferActive;
+        }
+        if (replayPrePr15356FirstGate && isDisaggGenerationTransfer)
+        {
+            // Before PR #15356, transfer-only requests were invisible to the
+            // capacity scheduler: they consumed neither logical request slots
+            // nor self-KV, cross-KV, or PEFT capacity.
+            continue;
+        }
+
         // if request cannot be scheduled yet or request should no longer be scheduled, skip
         if (
             // Allow disagg_generation_init requests to be scheduled, so that we'll allocate their KV cache
@@ -268,6 +537,11 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
 
         if (numAdmittedRequests >= static_cast<std::size_t>(mMaxNumRequests))
         {
+            if (trace != nullptr)
+            {
+                trace->logicalCapacityReached = true;
+                addAdmissionReason(trace, req, kAdmissionReasonLogical);
+            }
             break;
         }
 
@@ -356,6 +630,11 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
 
                 if (numAdmittedRequests >= static_cast<std::size_t>(mMaxNumRequests))
                 {
+                    if (trace != nullptr)
+                    {
+                        trace->logicalCapacityReached = true;
+                        addAdmissionReason(trace, req, kAdmissionReasonLogical);
+                    }
                     break;
                 }
 
@@ -375,6 +654,10 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                             uniqTaskIds.insert(req->getLoraTaskId().value());
                         }
                     }
+                    else
+                    {
+                        addAdmissionReason(trace, req, kAdmissionReasonPeft);
+                    }
                 }
                 else if (req->isContextInitState() || req->isDisaggGenerationInitState())
                 {
@@ -389,6 +672,19 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     bool reqHasLora = req->getLoraTaskId().has_value();
                     bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
                     auto neededPeftPages = isNewTask && peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
+
+                    if (!enoughBlocks)
+                    {
+                        addAdmissionReason(trace, req, kAdmissionReasonSelfKv);
+                    }
+                    if (!enoughCrossBlocks)
+                    {
+                        addAdmissionReason(trace, req, kAdmissionReasonCrossKv);
+                    }
+                    if (neededPeftPages > availablePeftPages)
+                    {
+                        addAdmissionReason(trace, req, kAdmissionReasonPeft);
+                    }
 
                     if (enoughBlocks && enoughCrossBlocks && neededPeftPages <= availablePeftPages)
                     {
@@ -657,7 +953,8 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT)
     {
-        mScheduler = GuaranteedNoEvictScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState};
+        mScheduler = GuaranteedNoEvictScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState,
+            common::getBoolEnv(kReplayPrePr15356GneFirstGateEnv)};
     }
     else if (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kSTATIC_BATCH)
     {

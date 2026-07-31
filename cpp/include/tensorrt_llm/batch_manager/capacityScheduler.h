@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,6 +33,8 @@ namespace kv_cache_manager
 class BaseKVCacheManager;
 }
 class BasePeftCacheManager;
+struct GuaranteedNoEvictDecisionTrace;
+struct GuaranteedNoEvictReplayStats;
 
 } // namespace tensorrt_llm::batch_manager
 
@@ -120,7 +123,8 @@ class GuaranteedNoEvictScheduler : public BaseCapacityScheduler
 public:
     GuaranteedNoEvictScheduler(SizeType32 maxNumRequests,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE,
+        bool replayPrePr15356FirstGate = false);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
@@ -132,10 +136,13 @@ protected:
     [[nodiscard]] std::tuple<RequestVector, RequestVector> impl(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
         OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
-        OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
+        OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests,
+        bool replayPrePr15356FirstGate = false, GuaranteedNoEvictDecisionTrace* trace = nullptr) const;
 
 private:
     SizeType32 mMaxNumRequests;
+    bool mReplayPrePr15356FirstGate;
+    std::shared_ptr<GuaranteedNoEvictReplayStats> mReplayStats;
 };
 
 /// @brief Schedule requests using the STATIC_BATCH policy

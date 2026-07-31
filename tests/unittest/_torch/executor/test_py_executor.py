@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -413,6 +415,48 @@ class TestDisaggTransferAdmissionController:
         assert admitted == []
         assert wait_for_progress
         executor._revert_ctx_alloc.assert_not_called()
+
+    def test_complete_first_gate_replay_observes_unchanged_second_gate(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = False
+        executor.is_warmup = False
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        executor._pre_pr15356_transport_gate_observer_enabled = True
+        executor._pre_pr15356_transport_gate_observer_calls = 0
+        executor._pre_pr15356_transport_gate_observer_candidates = 0
+        executor._pre_pr15356_transport_gate_observer_admitted = 0
+        executor._pre_pr15356_transport_gate_observer_deferred = 0
+        executor._pre_pr15356_transport_gate_observer_limited_calls = 0
+        executor._pre_pr15356_transport_gate_observer_wait_calls = 0
+        executor._pre_pr15356_transport_gate_observer_active_blocks_max = 0
+        executor._pre_pr15356_transport_gate_observer_first_call_logged = False
+        executor._pre_pr15356_transport_gate_observer_first_defer_logged = False
+        executor._pre_pr15356_transport_gate_observer_summary_logged = False
+        info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", info)
+        candidate = _make_disagg_transfer_request(2, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+        PyExecutor._log_pre_pr15356_transport_gate_observer_summary(executor)
+
+        assert admitted == []
+        assert wait_for_progress
+        assert executor._pre_pr15356_transport_gate_observer_calls == 1
+        assert executor._pre_pr15356_transport_gate_observer_candidates == 1
+        assert executor._pre_pr15356_transport_gate_observer_admitted == 0
+        assert executor._pre_pr15356_transport_gate_observer_deferred == 1
+        assert executor._pre_pr15356_transport_gate_observer_wait_calls == 1
+        messages = [call.args[0] for call in info.call_args_list]
+        assert any("event=observed" in message for message in messages)
+        assert any("event=deferred" in message for message in messages)
+        assert any("event=summary" in message for message in messages)
+        assert any("multiplier=1 bypass=0" in message for message in messages)
 
 
 class TestDisaggTransferIdleProgress:
