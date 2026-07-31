@@ -112,7 +112,7 @@ class LoraConfig(StrictBaseModel):
         "Set to False for models like Phi-4-MM that use a different weight order."
     )
     overlap_lora_and_base: bool = Field(
-        default=True,
+        default=False,
         description=
         "Whether to place LoRA operations on a secondary CUDA stream and overlap them "
         "with base model computations. Improves latency in memory-bound regimes."
