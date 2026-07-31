@@ -457,6 +457,11 @@ class MpiPoolSession(MpiSession):
         """
         warm_futures: List[Future] = []
         bootstrap_timeout = _identity_bootstrap_timeout()
+        # Tracked, not hard-coded: the generic handler below spans both phases,
+        # and a broken executor surfacing during the barrier must not be
+        # reported as a bootstrap failure — that points on-call at
+        # TRTLLM_MPI_IDENTITY_TIMEOUT, which cannot help them.
+        phase = "bootstrap"
         try:
             warm_futures = [
                 self.mpi_pool.submit(_worker_hello)
@@ -474,6 +479,7 @@ class MpiPoolSession(MpiSession):
                     "workers never finished spawning and importing "
                     "tensorrt_llm — raise TRTLLM_MPI_IDENTITY_TIMEOUT only if "
                     "bootstrap on this node is genuinely that slow")
+            phase = "barrier"
             futures = [
                 self.mpi_pool.submit(_worker_identity_barrier)
                 for _ in range(self.n_workers)
@@ -488,7 +494,7 @@ class MpiPoolSession(MpiSession):
             self._teardown_unidentified_pool(
                 _completed_identities(warm_futures))
             raise _IdentityGateFailure(
-                f"{_IDENTITY_GATE_MARKER} phase=bootstrap: worker identity "
+                f"{_IDENTITY_GATE_MARKER} phase={phase}: worker identity "
                 f"collection failed ({e}); pool torn down") from e
         if (not_done or len(identities) != self.n_workers
                 or len({pid

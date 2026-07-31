@@ -241,7 +241,9 @@ def _collect_identities(monkeypatch,
                         manager_alive=True,
                         killed=None,
                         bootstrap_delays=None,
-                        submit_error=None):
+                        barrier_delays=None,
+                        submit_error=None,
+                        result_error=None):
     """Drive _collect_worker_identities on an inert stand-in (no MPI spawn).
 
     ``results``/``pending`` describe what the *barrier* phase returns.
@@ -251,8 +253,15 @@ def _collect_identities(monkeypatch,
     ``bootstrap_delays=[...]`` (seconds, per probe) for a pool whose ranks
     finish ``import tensorrt_llm`` at different times.
 
-    ``submit_error`` makes the *barrier* submit raise, standing in for the
-    exceptions mpi4py surfaces from a broken pool.
+    ``barrier_delays`` (seconds, per barrier task) makes the barrier futures
+    resolve on a timer measured from *helper entry*, i.e. on the same clock as
+    ``bootstrap_delays``. That is what lets a test distinguish a bootstrap that
+    waited for every probe from one that returned on the first: only the former
+    reaches the barrier late enough to find its futures already done.
+
+    ``submit_error`` makes the *barrier* submit raise; ``result_error`` makes a
+    barrier future complete *with* that exception, so ``f.result()`` raises.
+    Both stand in for what mpi4py surfaces from a broken pool.
     """
     import threading
     import types
@@ -260,9 +269,21 @@ def _collect_identities(monkeypatch,
 
     from tensorrt_llm.llmapi import mpi_session as m
 
-    barrier_futs = _resolved_futures(results) + [
-        Future() for _ in range(pending)
-    ]
+    if barrier_delays is not None:
+        barrier_futs = [Future() for _ in barrier_delays]
+        for fut, (delay, value) in zip(barrier_futs,
+                                       zip(barrier_delays, results)):
+            timer = threading.Timer(delay, fut.set_result, args=(value, ))
+            timer.daemon = True
+            timer.start()
+    else:
+        barrier_futs = _resolved_futures(results) + [
+            Future() for _ in range(pending)
+        ]
+    if result_error is not None:
+        broken = Future()
+        broken.set_exception(result_error)
+        barrier_futs = [broken] + barrier_futs[1:]
     if bootstrap is None:
         # Default: the pool bootstrapped normally, i.e. EVERY probe came back.
         # (Padding with unresolved futures here would silently make every
@@ -441,15 +462,20 @@ def test_bootstrap_waits_for_every_worker_not_just_the_first(monkeypatch):
     me = (os.getpid(), _process_start_time(os.getpid()))
     other = (1, b"1")
     monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", "10")
-    # Barrier budget is pinned to 0.1s by the helper; the straggler needs 0.8s,
-    # i.e. 8x the barrier budget. Only an all-probes bootstrap survives this.
+    # The barrier results land on the SAME clock as the straggler's probe. A
+    # bootstrap that returns on the first probe reaches the barrier at ~t=0 and
+    # gets only its 0.1s budget, so the t=0.8s barrier result is still missing
+    # and the pool is torn down; a bootstrap that waits for every probe reaches
+    # it at t=0.8 and finds the results already there. Without this coupling
+    # the test passes either way, which is no guarantee at all.
     ids, killed = _collect_identities(monkeypatch, [me, other],
                                       bootstrap=[me, other],
-                                      bootstrap_delays=[0.0, 0.8])
+                                      bootstrap_delays=[0.0, 0.8],
+                                      barrier_delays=[0.0, 0.8])
     assert set(ids) == {me, other} and not killed
 
 
-def test_gate_tears_down_when_submit_raises_a_runtime_error(monkeypatch):
+def test_gate_tears_down_on_runtime_errors_from_the_pool(monkeypatch):
     """mpi4py.MPI.Exception and BrokenExecutor are both RuntimeErrors.
 
     Both come out of the gate's own submit()/result() calls. If the gate
@@ -457,6 +483,9 @@ def test_gate_tears_down_when_submit_raises_a_runtime_error(monkeypatch):
     teardown, leaving mpi_pool dangling on a half-constructed session whose
     __del__ then blocks on a broken pool — a hang, in the change that exists
     to remove hangs.
+
+    Covers both arrival routes: raised out of submit(), and delivered through
+    a future so f.result() re-raises it.
     """
     from concurrent.futures import BrokenExecutor
 
@@ -466,20 +495,33 @@ def test_gate_tears_down_when_submit_raises_a_runtime_error(monkeypatch):
                                                  _process_start_time)
 
     me = (os.getpid(), _process_start_time(os.getpid()))
-    for error in (BrokenExecutor("pool is broken"),
-                  RuntimeError("plain runtime error")):
-        with _pytest.raises(RuntimeError) as exc:
-            _collect_identities(monkeypatch, [me],
-                                n_workers=1,
-                                bootstrap=[me],
-                                submit_error=error)
-        stand_in = exc.value._stand_in
-        # Torn down: pool disconnected without waiting, and cleared.
-        assert stand_in._pool_closed == [
-            False
-        ], (f"{type(error).__name__} escaped the teardown")
-        assert stand_in.mpi_pool is None
-        assert _IDENTITY_GATE_MARKER in str(exc.value)
+    errors = [
+        BrokenExecutor("pool is broken"),
+        RuntimeError("plain runtime error"),
+    ]
+    mpi = pytest.importorskip("mpi4py.MPI")
+    errors.append(mpi.Exception(mpi.ERR_COMM))
+
+    for how in ("submit", "result"):
+        for error in errors:
+            label = f"{type(error).__name__} via {how}"
+            with _pytest.raises(RuntimeError) as exc:
+                _collect_identities(monkeypatch, [me],
+                                    n_workers=1,
+                                    bootstrap=[me],
+                                    **{f"{how}_error": error})
+            stand_in = exc.value._stand_in
+            # Torn down: pool disconnected without waiting, and cleared.
+            assert stand_in._pool_closed == [
+                False
+            ], (f"{label} escaped the teardown")
+            assert stand_in.mpi_pool is None, label
+            assert _IDENTITY_GATE_MARKER in str(exc.value), label
+            # It failed during the BARRIER, so it must not blame bootstrap and
+            # point on-call at TRTLLM_MPI_IDENTITY_TIMEOUT, which is powerless
+            # against a broken executor.
+            assert "phase=barrier" in str(exc.value), label
+            assert "TRTLLM_MPI_IDENTITY_TIMEOUT" not in str(exc.value), label
 
 
 def test_mpi_and_executor_errors_really_are_runtime_errors():
@@ -527,7 +569,14 @@ def test_pool_can_make_progress_reads_the_real_mpi4py_internals():
 
 
 def test_mpi4py_still_exposes_the_liveness_handle():
-    """Fail loudly on an mpi4py bump that moves the manager thread."""
+    """Fail loudly on an mpi4py bump that moves the manager thread.
+
+    ``_pool_can_make_progress`` walks ``executor._pool.thread`` through
+    ``getattr(..., None)`` and reports "can still progress" on any miss —
+    deliberately, so an unrecognised internal degrades to the deadline instead
+    of killing healthy pools. The cost is that a rename is invisible at
+    runtime, so assert every link of that chain here.
+    """
     pytest.importorskip("mpi4py.futures")
     from mpi4py.futures import MPIPoolExecutor
 
@@ -536,9 +585,21 @@ def test_mpi4py_still_exposes_the_liveness_handle():
                                    "_pool_can_make_progress needs revisiting")
     from mpi4py.futures import _lib
 
-    assert "thread" in _lib.Pool.__init__.__code__.co_names, (
-        "mpi4py's Pool no longer keeps a manager thread; the identity gate's "
-        "dead-pool fast-fail has silently degraded to the full deadline")
+    degraded = ("the identity gate's dead-pool fast-fail has silently "
+                "degraded to the full deadline (it fails safe, so nothing "
+                "else will tell you)")
+    # Link 1: the executor stores its pool on `_pool`.
+    assert "_pool" in MPIPoolExecutor._bootstrap.__code__.co_names, (
+        f"mpi4py's executor no longer keeps its pool on `_pool`; {degraded}")
+    # Link 2: the pool keeps its manager on `thread`...
+    init_names = _lib.Pool.__init__.__code__.co_names
+    assert "thread" in init_names, (
+        f"mpi4py's Pool no longer keeps a manager thread; {degraded}")
+    # ...and that manager is a started threading.Thread, so `.is_alive()`
+    # still means what the predicate assumes it means.
+    assert "Thread" in init_names and "start" in init_names, (
+        f"mpi4py's Pool manager is no longer a started threading.Thread; "
+        f"`.is_alive()` may no longer signal a dead pool. {degraded}")
 
 
 def test_barrier_phase_waits_on_the_barrier_budget_not_the_bootstrap_one(
