@@ -296,6 +296,10 @@ def _flashinfer_gdn_decode(
     assert T_per_seq == 1, (
         f"_flashinfer_gdn_decode expects standard decode (T_per_seq == 1), got "
         f"{T_per_seq}; _can_use_flashinfer_gdn_decode should keep T == N")
+    # TP8 leaves eight BF16 ``a`` values per Qwen3.5 GDN shard. Odd shards can
+    # start 16 bytes into fused projection storage, but CuTe requires 32B.
+    if a_bat.data_ptr() % 32:
+        a_bat = a_bat.clone(memory_format=torch.contiguous_format)
     _fi_gdn_decode_bf16_state_t1(
         A_log=A_log,
         a=a_bat,
@@ -386,9 +390,17 @@ def _flashinfer_gdn_verify(
     output = (output.view(N, T, HV, V) if output is not None else q.new_empty(
         N, T, HV, V))
     # The FI CuTe-DSL kernel asserts 32-byte data alignment on every tensor
-    # argument. The int32 index tensor may be a slice of a larger buffer
+    # argument. ``a`` starts ``num_v_heads_per_tp`` bf16 elements into the fused
+    # ``in_proj_ba`` output, so it is misaligned when that count is not a
+    # multiple of 16 (e.g. Qwen3.5 TEP16: 128 / 16 = 8) -- see the note in
+    # _flashinfer_gdn_decode for why this clones instead of .contiguous().
+    if a.data_ptr() % 32 != 0:
+        a = a.clone(memory_format=torch.contiguous_format)
+    if b.data_ptr() % 32 != 0:
+        b = b.clone(memory_format=torch.contiguous_format)
+    # The int32 index tensor may likewise be a slice of a larger buffer
     # (e.g. state_indices_d = cache_indices[num_prefills:]) whose 4*offset
-    # storage offset breaks that; .int() is a no-op for int32, so realign
+    # storage offset breaks alignment; .int() is a no-op for int32, so realign
     # with an explicit copy when needed.
     initial_state_indices = initial_state_indices.int()
     if initial_state_indices.data_ptr() % 32 != 0:

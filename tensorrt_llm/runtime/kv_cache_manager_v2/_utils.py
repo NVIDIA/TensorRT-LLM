@@ -673,13 +673,28 @@ class DynamicBitset:
         return self._num_set_bits
 
     def resize(self, new_capacity: int) -> None:
-        extra_elems = div_up(new_capacity, 64) - len(self._bits)
-        if extra_elems > 0:
-            self._bits.extend(array.array(self.TYPE_CODE, [0] * extra_elems))
-        elif extra_elems < 0:
-            self._bits = self._bits[:extra_elems]
-            if new_capacity % 64 != 0:
-                self._bits[-1] &= self.ALL_SET_MASK >> (64 - (new_capacity % 64))
+        old_elems = len(self._bits)
+        new_elems = div_up(new_capacity, 64)
+
+        # When the capacity shrinks, every set bit at or above new_capacity is
+        # dropped. Account for those bits so num_set_bits stays accurate, and
+        # mask the retained partial word so any_set() cannot observe stale bits.
+        # This covers both fewer-words and same-word-count (new_elems ==
+        # old_elems with a smaller new_capacity) shrinks.
+        if new_elems <= old_elems:
+            for w in range(new_elems, old_elems):
+                self._num_set_bits -= bin(self._bits[w]).count("1")
+            if new_elems >= 1 and new_capacity % 64 != 0:
+                keep_mask = self.ALL_SET_MASK >> (64 - (new_capacity % 64))
+                word = self._bits[new_elems - 1]
+                dropped = word & ~keep_mask & self.ALL_SET_MASK
+                self._num_set_bits -= bin(dropped).count("1")
+                self._bits[new_elems - 1] = word & keep_mask
+
+        if new_elems > old_elems:
+            self._bits.extend(array.array(self.TYPE_CODE, [0] * (new_elems - old_elems)))
+        elif new_elems < old_elems:
+            self._bits = self._bits[:new_elems]
 
     # check if any bit in the range [start, end) is set
     def any_set(self, start: int, end: int) -> bool:

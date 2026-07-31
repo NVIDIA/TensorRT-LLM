@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import inspect
-from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -29,7 +28,7 @@ from ...peft.lora.layer import (MOE_LORA_MODULE_NAMES,
 from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
-from .interface import AlltoallMethodType, MoE
+from .interface import MoE
 from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
@@ -259,7 +258,6 @@ class CutlassFusedMoE(MoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
@@ -322,12 +320,6 @@ class CutlassFusedMoE(MoE):
         )
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
-
-        self.alltoall_method_type = AlltoallMethodType.NotEnabled
-        self.alltoall_workspace = None
-        self.alltoall_prepare_workspace = None
-        self.use_low_precision_combine = False
-        self.moe_a2a = None
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -707,12 +699,6 @@ class CutlassFusedMoE(MoE):
     def has_int8_woq_per_channel(self):
         return self.quant_config and self.quant_config.layer_quant_mode.is_int8_weight_only(
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
-
-    @cached_property
-    def enable_alltoall(self):
-        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
-        """
-        return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
     def quantize_input(
         self,
