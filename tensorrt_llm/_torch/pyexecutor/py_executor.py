@@ -3205,7 +3205,17 @@ class PyExecutor:
         if planner is None:
             return max_draft_len
 
-        num_gen_requests = len(scheduled_batch.generation_requests)
+        gen_requests = scheduled_batch.generation_requests
+        num_gen_requests = len(gen_requests)
+        # Confidence is read back by SLOT, not by batch position. The snapshot
+        # is one iteration old, and joins/departures reshuffle the batch in
+        # between, so position i is routinely a different request than the one
+        # that was scored there. A request with no slot yet maps to the neutral
+        # row, i.e. "verify the whole block".
+        confidence_rows = [
+            worker.confidence_row_for(request.py_request_id)
+            for request in gen_requests
+        ]
 
         # Cross-rank agreement: draft_len is part of the CUDA-graph key but is
         # NOT covered by the attention-DP consistency allgather, so ranks that
@@ -3229,7 +3239,9 @@ class PyExecutor:
         if getattr(self.model_engine.spec_config, "enable_ragged_verify",
                    False):
             ragged_lens = planner.decide_verify_lens(
-                num_gen_requests=num_gen_requests, all_rank_max=all_rank_max)
+                num_gen_requests=num_gen_requests,
+                rows=confidence_rows,
+                all_rank_max=all_rank_max)
 
         # Land the batch's token total on a captured bucket before the graph key
         # is built, spending the rounding slack on real verification. A batch
@@ -3248,10 +3260,7 @@ class PyExecutor:
                     [len(ragged_lens),
                      sum(1 + int(v) for v in ragged_lens)])
             bucket = self.model_engine.fit_ragged_verify_lens(
-                scheduled_batch.generation_requests,
-                ragged_lens,
-                peer_stats=peer_stats)
-        self.model_engine.ragged_verify_bucket = bucket
+                gen_requests, ragged_lens, peer_stats=peer_stats)
 
         if bucket is not None:
             # The block is always drafted in full -- only verification is
@@ -3263,17 +3272,27 @@ class PyExecutor:
                 int(t) for t in self.model_engine.spec_config.verify_len_tiers)
         else:
             # Clear any window left over from a previous ragged step, otherwise
-            # a fallback iteration would keep trimming on a stale split.
-            for request in scheduled_batch.generation_requests:
+            # a fallback iteration would keep trimming on a stale split. This
+            # has to cover EVERY generation request: _prepare_tp_inputs builds
+            # the token layout per request from py_verify_len, but
+            # _attach_ragged_verify_layout disables the ragged spec metadata as
+            # soon as one request is missing a window. A batch where only some
+            # requests still carry a stale window therefore gets a ragged input
+            # layout with uniform acceptance -- silent token misattribution.
+            for request in gen_requests:
                 request.py_verify_len = None
             runtime_draft_len = planner.decide_draft_len(
-                num_gen_requests=num_gen_requests, all_rank_max=all_rank_max)
+                num_gen_requests=num_gen_requests,
+                rows=confidence_rows,
+                all_rank_max=all_rank_max)
 
         # Stage this step's confidence for the *next* decision. Non-blocking; if
         # it has not landed by then the planner just verifies the full block.
-        rows = worker.staged_confidence_rows()
-        if rows is not None and rows.shape[0] > 0:
-            planner.stage_confidence(rows, rows.shape[0])
+        # The whole slot-indexed buffer is staged, so the next step can look up
+        # whichever requests it happens to be scheduling.
+        buffer = worker.staged_confidence_buffer()
+        if buffer is not None:
+            planner.stage_confidence(buffer)
 
         return int(runtime_draft_len)
 

@@ -285,14 +285,19 @@ class CUDAGraphRunner:
                 key = key + (verify_bucket, )
         return key
 
-    @staticmethod
-    def _ragged_verify_bucket(batch: ScheduledRequests) -> Optional[int]:
+    def _ragged_verify_bucket(self, batch: ScheduledRequests) -> Optional[int]:
         """Total verified token count when the batch uses ragged windows.
 
         None unless *every* generation request carries a window, so a batch the
         scheduler declined to make ragged -- or any non-DSpark batch -- keeps
         the original key.
+
+        Config-gated before touching the batch: this runs on every graph-key
+        build for every model, and a per-request scan there is pure overhead for
+        the ~all of them that will never be ragged.
         """
+        if not getattr(self.spec_config, "enable_ragged_verify", False):
+            return None
         total = 0
         for request in batch.generation_requests:
             verify_len = getattr(request, "py_verify_len", None)
@@ -656,11 +661,12 @@ class CUDAGraphRunner:
         # values -- so read it back rather than assume. Cleared otherwise: the
         # dummy is cached across steps and would carry a stale window into a
         # uniform batch.
-        ragged = any(
-            getattr(request, "py_verify_len", None) is not None
-            for request in batch.generation_requests)
-        padding_dummy_request.py_verify_len = (self.ragged_pad_verify_len
-                                               if ragged else None)
+        if getattr(self.spec_config, "enable_ragged_verify", False):
+            ragged = any(
+                getattr(request, "py_verify_len", None) is not None
+                for request in batch.generation_requests)
+            padding_dummy_request.py_verify_len = (self.ragged_pad_verify_len
+                                                   if ragged else None)
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
 

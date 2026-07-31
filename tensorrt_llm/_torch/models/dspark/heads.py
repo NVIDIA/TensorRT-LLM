@@ -268,8 +268,19 @@ class DSparkConfidenceHead(nn.Module):
         return self.proj(features.float()).squeeze(-1)
 
     def apply_sts(self, confidence_logits: torch.Tensor) -> torch.Tensor:
-        """Raw logits -> calibrated per-position acceptance probabilities in [0, 1]."""
-        return torch.sigmoid(confidence_logits.float() / self.sts_temperatures)
+        """Raw logits -> calibrated per-position acceptance probabilities in [0, 1].
+
+        Works on host tensors too. The verification planner stages confidence to
+        pinned CPU memory and calibrates there, so it calls this with CPU logits
+        while the head (and therefore ``sts_temperatures``) lives on the device;
+        without the transfer that is a device-mismatch ``RuntimeError`` on the
+        first step that reaches calibration. The branch is host-side and the
+        devices match on the in-graph path, so nothing extra is captured.
+        """
+        temperatures = self.sts_temperatures
+        if temperatures.device != confidence_logits.device:
+            temperatures = temperatures.to(confidence_logits.device)
+        return torch.sigmoid(confidence_logits.float() / temperatures)
 
     @torch.no_grad()
     def load_sts_temperatures(self, temperatures: torch.Tensor) -> None:

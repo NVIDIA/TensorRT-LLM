@@ -251,8 +251,9 @@ class DSparkWorker(SpecWorkerBase):
         # ``_confidence_logits`` is the slot-indexed handoff buffer to the
         # verification scheduler; see ``_lazy_init`` for its neutral value.
         self.return_confidence = bool(getattr(spec_config, "enable_confidence_scheduling", False))
-        self._confidence_logits: Optional[torch.Tensor] = None  # [max_batch+1, block]
-        self._last_gen_slots: Optional[torch.Tensor] = None
+        self._confidence_logits: Optional[torch.Tensor] = None  # [max_batch+2, block]
+        # Row index of the permanently-neutral confidence row; see ``_lazy_init``.
+        self._neutral_conf_row = 0
         # Host-side coordinator that turns the confidence snapshot into this
         # iteration's draft length. Built in ``_lazy_init`` (it needs the draft
         # model's block size and calibration head).
@@ -270,17 +271,33 @@ class DSparkWorker(SpecWorkerBase):
             f"use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
 
-    def staged_confidence_rows(self) -> Optional[torch.Tensor]:
-        """Confidence rows for the requests scored by the last draft, or None.
+    def staged_confidence_buffer(self) -> Optional[torch.Tensor]:
+        """The whole slot-indexed confidence buffer, or None when disabled.
 
-        Indexes through ``_last_gen_slots`` rather than taking the buffer's
-        leading rows: the buffer is slot-indexed, and a batch rarely occupies
-        slots ``0..G-1``. Reading the leading rows would score a stale, unrelated
-        set of requests.
+        The *whole* buffer, not the current batch's rows: the planner reads it
+        back by slot, so it must be able to look up any request that is still
+        alive. It is small (``max_num_requests x block`` fp32 -- kilobytes), so
+        staging all of it costs nothing and removes the need to communicate a
+        row ordering across the one-iteration lag.
         """
-        if self._confidence_logits is None or self._last_gen_slots is None:
-            return None
-        return self._confidence_logits[self._last_gen_slots]
+        return self._confidence_logits
+
+    def confidence_row_for(self, req_id: int) -> int:
+        """Buffer row holding ``req_id``'s confidence, host-side.
+
+        Falls back to the permanently-neutral row for a request that has not
+        been drafted yet (or was never assigned a slot). Neutral reads as
+        "certain to be accepted", i.e. verify the full block -- the safe
+        direction, and the same answer today's static behavior gives.
+
+        Keying by slot rather than by batch position is what makes the
+        one-iteration-lagged snapshot usable: the batch is reshuffled by joins
+        and departures between the step that wrote the confidence and the step
+        that reads it, so position ``i`` is routinely a different request.
+        """
+        if self._confidence_logits is None:
+            return self._neutral_conf_row
+        return self._req_to_slot.get(req_id, self._neutral_conf_row)
 
     @property
     def max_draft_len(self) -> int:
@@ -335,8 +352,16 @@ class DSparkWorker(SpecWorkerBase):
             # accepted", which makes the scheduler fall back to verifying the
             # full block -- the safe direction (never verifies fewer tokens than
             # today's static behavior on stale/unwritten rows).
+            #
+            # One row beyond the window buffer: rows ``[0, max_batch)`` are real
+            # request slots and row ``max_batch`` is the scratch row that padded
+            # / unknown requests write through, so neither is reliably neutral.
+            # Row ``max_batch + 1`` is never in ``_batch_to_slot`` and therefore
+            # never written -- that is the row ``confidence_row_for`` hands out
+            # for an unscored request.
+            self._neutral_conf_row = num_rows
             self._confidence_logits = torch.full(
-                (num_rows, block_size),
+                (num_rows + 1, block_size),
                 _NEUTRAL_CONFIDENCE_LOGIT,
                 dtype=torch.float32,
                 device="cuda",
@@ -371,9 +396,16 @@ class DSparkWorker(SpecWorkerBase):
         if table_path:
             with open(table_path, encoding="utf-8") as f:
                 raw = json.load(f)
+            # ``bias`` and ``alpha(bs)`` are optional but not cosmetic: Theta is
+            # a ratio, so the non-trimmable part of the step time moves the
+            # argmax. Omitting them says "step_time_ms already measures whole
+            # steps at the deployment's batch size".
             cost_table = SpsCostTable(
                 token_counts=[int(v) for v in raw["token_counts"]],
                 step_time_ms=[float(v) for v in raw["step_time_ms"]],
+                fixed_overhead_ms=float(raw.get("fixed_overhead_ms", 0.0)),
+                batch_sizes=[int(v) for v in raw.get("batch_sizes", [])],
+                batch_overhead_ms=[float(v) for v in raw.get("batch_overhead_ms", [])],
             )
         else:
             # Explicitly flat: the planner treats this as "unprofiled" and keeps
@@ -444,6 +476,12 @@ class DSparkWorker(SpecWorkerBase):
             self._req_to_slot[req_id] = slot
             self._ctx_len[slot] = 0
             self._kv_windows[slot].zero_()
+            if self._confidence_logits is not None:
+                # A recycled slot still holds the *previous* occupant's scores.
+                # Reset to neutral so the incoming request's first scheduling
+                # decision verifies the full block instead of inheriting a dead
+                # draft's low survival.
+                self._confidence_logits[slot].fill_(_NEUTRAL_CONFIDENCE_LOGIT)
         return self._req_to_slot[req_id]
 
     def _seed_context_windows(
@@ -519,9 +557,10 @@ class DSparkWorker(SpecWorkerBase):
         # hidden states whenever runtime_draft_len < max_draft_len, silently
         # drafting from the wrong context.
         K = self.max_draft_len
-        runtime_draft_len = getattr(spec_metadata, "runtime_draft_len", None)
-        if runtime_draft_len is None:
-            runtime_draft_len = K
+        # Note the ``or K``: SpecMetadata.runtime_draft_len defaults to 0, not
+        # None, so an ``is None`` check would leave a stride of 1 on any path
+        # that has not populated it yet.
+        runtime_draft_len = getattr(spec_metadata, "runtime_draft_len", 0) or K
         Kp1 = int(runtime_draft_len) + 1
         device = accepted_tokens.device
 
@@ -589,14 +628,14 @@ class DSparkWorker(SpecWorkerBase):
         )
         # Stash the raw [G, K] confidence logits for the verification scheduler.
         # Slot-indexed (not batch-position-indexed) so it survives batch
-        # reshuffles; written in place so a captured graph keeps the same storage.
-        # ``_last_gen_slots`` is a *view* into ``_batch_to_slot``, so it keeps
-        # pointing at whichever slots the current batch occupies on replay -- the
-        # scheduler must read the rows for the requests that were actually
-        # scored, not slots 0..G-1.
+        # reshuffles; written in place so a captured graph keeps the same
+        # storage, and scattered through ``slots`` (a view into
+        # ``_batch_to_slot``) so a replay lands on whichever slots the current
+        # batch occupies. The planner reads rows back by slot via
+        # ``confidence_row_for``, so no row ordering has to survive the
+        # one-iteration lag.
         if confidence is not None:
             self._confidence_logits[slots] = confidence.detach()
-            self._last_gen_slots = slots
         return block_logits
 
     def _forward_impl(
@@ -647,6 +686,12 @@ class DSparkWorker(SpecWorkerBase):
         if is_warmup:
             saved_ctx_len = self._ctx_len.clone()
             saved_windows = self._kv_windows.clone()
+            # The confidence buffer is persistent state too: warmup scores
+            # synthetic hidden states, and those scores would otherwise be the
+            # first thing the verification planner ever reads.
+            saved_confidence = (
+                None if self._confidence_logits is None else self._confidence_logits.clone()
+            )
 
         # Assign / reset window slots for context (prefill) requests and seed each
         # request's rolling KV window from its prompt's captured context, so the
@@ -749,6 +794,8 @@ class DSparkWorker(SpecWorkerBase):
         if is_warmup:
             self._ctx_len.copy_(saved_ctx_len)
             self._kv_windows.copy_(saved_windows)
+            if saved_confidence is not None:
+                self._confidence_logits.copy_(saved_confidence)
 
         return {
             "logits": raw_logits,

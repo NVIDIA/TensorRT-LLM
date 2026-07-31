@@ -605,12 +605,10 @@ class PyTorchModelEngine(ModelEngine):
         # pass. All None without ragged verification, so the incremental-update
         # gate below never trips for uniform speculation.
         self.previous_verify_lens = []
-        # Captured token bucket this step's ragged batch was fitted onto, or
-        # None when the batch is uniform. Set once per step by the scheduler.
-        self.ragged_verify_bucket: Optional[int] = None
-        # Window every CUDA-graph padding row carries this step (they share one
-        # dummy object, so they all get the same one). In py_verify_len units.
-        self.ragged_pad_verify_len: int = 0
+        # NOTE: the captured token bucket and the padding rows' window live on
+        # the CUDA graph runner (``ragged_pad_verify_len``), which is what reads
+        # them; the bucket itself is re-derived from the batch in
+        # ``CUDAGraphRunner._ragged_verify_bucket`` so it cannot go stale.
         self.has_previous_device_draft = False
         self.previous_accepted_tokens_cuda = torch.empty((self.batch_size, ),
                                                          dtype=torch.int,
@@ -3654,6 +3652,16 @@ class PyTorchModelEngine(ModelEngine):
         """
         runner = self.cuda_graph_runner
         if not runner.enabled or not verify_lens:
+            return None
+        if len(verify_lens) != len(generation_requests):
+            # Partially windowing a batch is worse than not windowing it: the
+            # token layout is built per request and would go ragged, while
+            # _attach_ragged_verify_layout sees the missing windows and leaves
+            # the spec metadata uniform. Refuse and let the caller fall back.
+            logger.debug(
+                f"DSpark ragged: got {len(verify_lens)} verify lengths for "
+                f"{len(generation_requests)} generation requests; falling back "
+                f"to uniform scheduling")
             return None
         tiers = sorted({
             int(t)

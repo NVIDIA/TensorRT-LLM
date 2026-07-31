@@ -89,28 +89,38 @@ class DSparkVerifyPlanner:
             "fallback_no_snapshot": 0,
             "fallback_flat_cost": 0,
             "fallback_no_confidence": 0,
+            "fallback_short_snapshot": 0,
         }
 
     @property
     def max_tier(self) -> int:
         return self.tiers[-1] if self.tiers else self.cfg.resolved_max_verify_len
 
-    def stage_confidence(self, confidence_logits: torch.Tensor, num_rows: int) -> None:
-        """Start a non-blocking device->host copy of this step's confidence.
+    def stage_confidence(self, confidence_logits: torch.Tensor) -> None:
+        """Start a non-blocking device->host copy of the confidence buffer.
+
+        ``confidence_logits`` is the worker's whole slot-indexed buffer, staged
+        in full so :meth:`decide_verify_lens` can look up any live request by
+        slot. It is kilobytes (``max_num_requests x block`` fp32), so there is
+        nothing to gain from staging a subset -- and a subset would need a row
+        ordering to survive the one-iteration lag, which is exactly what slot
+        keying exists to avoid.
 
         Never synchronizes: the copy is issued on the current stream and an event
         is recorded. :meth:`decide_draft_len` polls that event and simply does not
         use the snapshot if it has not landed.
         """
-        if confidence_logits is None or num_rows <= 0:
+        if confidence_logits is None or confidence_logits.shape[0] == 0:
             return
-        rows = confidence_logits[:num_rows]
-        if self._host_buffer is None or self._host_buffer.shape != rows.shape:
+        if self._host_buffer is None or self._host_buffer.shape != confidence_logits.shape:
             self._host_buffer = torch.empty(
-                rows.shape, dtype=torch.float32, device="cpu", pin_memory=prefer_pinned()
+                confidence_logits.shape,
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=prefer_pinned(),
             )
             self._copy_event = torch.cuda.Event()
-        self._host_buffer.copy_(rows, non_blocking=True)
+        self._host_buffer.copy_(confidence_logits, non_blocking=True)
         self._copy_event.record()
         self._snapshot_valid = True
 
@@ -123,10 +133,48 @@ class DSparkVerifyPlanner:
             return None
         return self._host_buffer
 
+    def _gather_rows(
+        self, *, num_gen_requests: int, rows: Optional[Sequence[int]]
+    ) -> Optional[torch.Tensor]:
+        """This step's confidence, one row per generation request, or None.
+
+        ``rows`` is the per-request buffer row index (``DSparkWorker.
+        confidence_row_for``). Supplying it is what makes the lagged snapshot
+        correct: the batch is reshuffled between the step that wrote the
+        confidence and the step that reads it, so the request at position ``i``
+        is routinely a different one.
+
+        ``rows=None`` keeps the positional reading for callers that own the
+        ordering themselves (the unit tests stage a purpose-built buffer). That
+        path refuses to run on a snapshot with fewer rows than the batch rather
+        than silently returning a short answer -- a short answer becomes a
+        partially-assigned batch downstream, where half the requests get a
+        verify window and half do not.
+        """
+        snapshot = self._ready_snapshot()
+        if snapshot is None:
+            self.stats["fallback_no_snapshot"] += 1
+            return None
+        if rows is None:
+            if snapshot.shape[0] < num_gen_requests:
+                self.stats["fallback_short_snapshot"] += 1
+                return None
+            selected = snapshot[:num_gen_requests]
+        else:
+            if len(rows) != num_gen_requests:
+                self.stats["fallback_short_snapshot"] += 1
+                return None
+            selected = snapshot[torch.as_tensor(list(rows), dtype=torch.long)]
+        if selected.numel() == 0:
+            self.stats["fallback_no_confidence"] += 1
+            return None
+        return selected
+
     def decide_draft_len(
         self,
         *,
         num_gen_requests: int,
+        rows: Optional[Sequence[int]] = None,
         all_rank_max: Optional[Callable[[int], int]] = None,
     ) -> int:
         """Choose this iteration's draft length, agreed across all ranks.
@@ -136,11 +184,13 @@ class DSparkVerifyPlanner:
         snapshot yet, or an unprofiled (flat) cost model under which every extra
         verified token looks free.
 
-        ``all_rank_max`` overrides the constructor's reduction; the caller that
-        owns the distributed handle usually supplies it here.
+        ``rows`` maps each generation request to its buffer row; see
+        :meth:`_gather_rows`. ``all_rank_max`` overrides the constructor's
+        reduction; the caller that owns the distributed handle usually supplies
+        it here.
         """
         self.stats["decisions"] += 1
-        chosen = self._decide_local(num_gen_requests=num_gen_requests)
+        chosen = self._decide_local(num_gen_requests=num_gen_requests, rows=rows)
         all_rank_max = all_rank_max or self.all_rank_max
         if all_rank_max is not None:
             # Max, not min: a rank that wanted to trim more simply verifies a few
@@ -155,6 +205,7 @@ class DSparkVerifyPlanner:
         self,
         *,
         num_gen_requests: int,
+        rows: Optional[Sequence[int]] = None,
         all_rank_max: Optional[Callable[[int], int]] = None,
     ) -> Optional[List[int]]:
         """Per-request verify lengths for a ragged step, or None to stay uniform.
@@ -173,22 +224,23 @@ class DSparkVerifyPlanner:
         The batch-wide *maximum* is still reduced across ranks, because the
         drafted-token buffer width and the per-request padding are sized from
         it; the individual lengths stay local.
+
+        The returned list always has exactly ``num_gen_requests`` entries, or is
+        None. A partial list would leave the tail of the batch without a verify
+        window, and the callers downstream disagree about what that means: the
+        input layout is built per request (so it goes ragged) while the spec
+        metadata sees a ``None`` and stays uniform.
         """
         if num_gen_requests <= 0:
             return None
         if self.cost_table is None or self.cost_table.is_flat:
             self.stats["fallback_flat_cost"] += 1
             return None
-        snapshot = self._ready_snapshot()
-        if snapshot is None:
-            self.stats["fallback_no_snapshot"] += 1
-            return None
-        rows = snapshot[:num_gen_requests]
-        if rows.numel() == 0:
-            self.stats["fallback_no_confidence"] += 1
+        selected = self._gather_rows(num_gen_requests=num_gen_requests, rows=rows)
+        if selected is None:
             return None
 
-        probs = self.apply_calibration(rows)
+        probs = self.apply_calibration(selected)
         survival = compute_survival(probs)
         uniform_len = budget_argmax_over_uniform_lens(
             survival=survival.numpy().astype(np.float64),
@@ -205,23 +257,21 @@ class DSparkVerifyPlanner:
         if all_rank_max is not None:
             agreed_max = int(all_rank_max(int(max(lens))))
             lens = [min(int(v), agreed_max) for v in lens]
+        assert len(lens) == num_gen_requests, (
+            f"internal: produced {len(lens)} verify lengths for {num_gen_requests} requests"
+        )
         return [int(v) for v in lens]
 
-    def _decide_local(self, *, num_gen_requests: int) -> int:
+    def _decide_local(self, *, num_gen_requests: int, rows: Optional[Sequence[int]] = None) -> int:
         if num_gen_requests <= 0:
             return self.max_tier
         if self.cost_table is None or self.cost_table.is_flat:
             self.stats["fallback_flat_cost"] += 1
             return self.max_tier
-        snapshot = self._ready_snapshot()
-        if snapshot is None:
-            self.stats["fallback_no_snapshot"] += 1
+        selected = self._gather_rows(num_gen_requests=num_gen_requests, rows=rows)
+        if selected is None:
             return self.max_tier
-        rows = snapshot[:num_gen_requests]
-        if rows.numel() == 0:
-            self.stats["fallback_no_confidence"] += 1
-            return self.max_tier
-        probs = self.apply_calibration(rows)
+        probs = self.apply_calibration(selected)
         survival = compute_survival(probs).numpy().astype(np.float64)
         return budget_argmax_over_uniform_lens(
             survival=survival,

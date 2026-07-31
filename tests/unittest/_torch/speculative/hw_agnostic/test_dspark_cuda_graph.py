@@ -352,3 +352,105 @@ def test_sts_table_update_is_visible_to_a_captured_graph():
         "the captured graph did not see the new STS temperatures"
     )
     assert torch.allclose(out, torch.sigmoid(head(hid) / 4.0), atol=1e-5)
+
+
+def test_apply_sts_accepts_host_logits_from_a_device_head():
+    """The planner calibrates on the host; the head lives on the device.
+
+    Confidence is staged to pinned CPU memory and the verify planner calls
+    ``apply_sts`` on those rows, while ``sts_temperatures`` is a buffer that
+    moved to CUDA with the draft model. Without the transfer this is a device
+    mismatch -- and it is invisible until a run supplies a profiled cost table,
+    because the flat-table fallback returns before calibration is ever reached.
+    """
+    from tensorrt_llm._torch.models.dspark.heads import DSparkConfidenceHead
+
+    BLK = 5
+    head = DSparkConfidenceHead(hidden_size=8, block_size=BLK)
+    if torch.cuda.is_available():
+        head = head.cuda()
+    head.load_sts_temperatures(torch.full((BLK,), 2.0))
+
+    host_logits = torch.zeros(3, BLK)  # CPU, as the planner stages them
+    probs = head.apply_sts(host_logits)
+    assert probs.device.type == "cpu"
+    assert torch.allclose(probs, torch.full((3, BLK), 0.5), atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# Ragged verification runs inside the same captured graph: DSpark's acceptance
+# is part of the target's forward. The scatter that unpacks a packed ragged
+# batch into the rectangle acceptance wants must therefore capture -- which it
+# only does if ``repeat_interleave`` is told its output size up front. Without
+# that, torch reads the cumulative sum back to the host to size the result,
+# which is illegal under capture.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
+def test_ragged_scatter_is_cuda_graph_capturable():
+    from tensorrt_llm._torch.speculative.dspark_ragged import (
+        build_qo_indptr,
+        scatter_ragged_to_padded,
+    )
+
+    lens = torch.tensor([3, 1, 2], dtype=torch.int32, device="cuda")
+    indptr = build_qo_indptr(lens)
+    flat = torch.tensor([10, 11, 12, 20, 30, 31], dtype=torch.int32, device="cuda")
+    out = torch.empty(3, 4, dtype=torch.int32, device="cuda")
+
+    def run():
+        return scatter_ragged_to_padded(
+            flat, verify_lens=lens, qo_indptr=indptr, max_len=4, pad_value=-1
+        )
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(s)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out.copy_(run())
+
+    g.replay()
+    torch.cuda.synchronize()
+    assert out.tolist() == [[10, 11, 12, -1], [20, -1, -1, -1], [30, 31, -1, -1]]
+
+    # New packed contents must flow through on replay.
+    flat.copy_(torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int32, device="cuda"))
+    g.replay()
+    torch.cuda.synchronize()
+    assert out.tolist() == [[1, 2, 3, -1], [4, -1, -1, -1], [5, 6, -1, -1]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
+def test_ragged_accept_count_is_cuda_graph_capturable():
+    from tensorrt_llm._torch.speculative.dspark_ragged import count_accepted_ragged
+
+    lens = torch.tensor([3, 1, 2], dtype=torch.int32, device="cuda")
+    draft = torch.tensor([[1, 2, 3, 9], [4, 9, 9, 9], [5, 6, 9, 9]], device="cuda")
+    target = torch.tensor([[1, 2, 7, 9], [4, 9, 9, 9], [5, 6, 9, 9]], device="cuda")
+    out = torch.empty(3, dtype=torch.int64, device="cuda")
+
+    def run():
+        return count_accepted_ragged(draft_tokens=draft, target_tokens=target, verify_lens=lens)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(s)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out.copy_(run())
+
+    g.replay()
+    torch.cuda.synchronize()
+    # req 0 matches 2 then diverges; req 1 matches its single position; req 2
+    # matches both. Column 3 is padding for every row and must never count.
+    assert out.tolist() == [2, 1, 2]

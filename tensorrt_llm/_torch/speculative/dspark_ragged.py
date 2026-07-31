@@ -408,14 +408,24 @@ def ragged_gather_index_lists(
     return rows, cols
 
 
-def row_ids_from_lens(verify_lens: torch.Tensor) -> torch.Tensor:
+def row_ids_from_lens(verify_lens: torch.Tensor, *, total: int) -> torch.Tensor:
     """``[bs]`` lengths -> ``[total]`` owning-request id for each packed token.
 
     ``repeat_interleave`` with a *tensor* of repeats is what makes the packing
     ragged; the uniform paths use a scalar repeat and get a fixed stride.
+
+    ``total`` (``sum(verify_lens)``) is mandatory rather than derived. With a
+    device-resident ``repeats`` and no ``output_size``, torch reads the
+    cumulative sum back to the host to size its output -- a sync that is
+    outright *illegal* here, because DSpark is a one-engine drafter whose
+    acceptance runs inside the target's captured CUDA graph. The callers all
+    know the total on the host already (``spec_metadata.total_verify_tokens``,
+    or the packed buffer's own leading dimension).
     """
     return torch.repeat_interleave(
-        torch.arange(verify_lens.numel(), device=verify_lens.device), verify_lens.to(torch.long)
+        torch.arange(verify_lens.numel(), device=verify_lens.device),
+        verify_lens.to(torch.long),
+        output_size=int(total),
     )
 
 
@@ -434,9 +444,13 @@ def scatter_ragged_to_padded(
     (compare draft vs target position by position). This bridges the two
     without a host sync: token ``t`` belongs to request ``row_ids[t]`` at column
     ``t - qo_indptr[row_ids[t]]``.
+
+    ``flat.shape[0]`` is the packed token total, so it is exactly the
+    ``output_size`` :func:`row_ids_from_lens` needs to stay sync-free (and
+    therefore capturable).
     """
     bs = int(verify_lens.numel())
-    rows = row_ids_from_lens(verify_lens)
+    rows = row_ids_from_lens(verify_lens, total=flat.shape[0])
     cols = torch.arange(flat.shape[0], device=flat.device) - qo_indptr.to(torch.long)[rows]
     out = flat.new_full((bs, max_len, *flat.shape[1:]), pad_value)
     out[rows, cols] = flat

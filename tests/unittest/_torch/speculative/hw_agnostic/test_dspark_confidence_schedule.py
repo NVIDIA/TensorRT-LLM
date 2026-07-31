@@ -78,15 +78,18 @@ def _brute_force_budget(survival, num_gen, table, min_len=1, max_len=None):
 
     Spells out the objective: expected emitted tokens per millisecond, where the
     expectation counts one bonus token per request, the always-verified floor
-    positions, and the admitted candidates.
+    positions, and the admitted candidates. The cost is looked up on the tokens
+    actually submitted to the target -- ``bs * (min_len + 1)`` at the floor,
+    because every request also submits its bonus position.
     """
     bs, blk = survival.shape
     cap = min(max_len or blk, blk)
     cand = np.sort(survival[:, min_len:cap].reshape(-1))[::-1]
     base = num_gen + float(survival[:, :min_len].sum())
+    floor_tokens = bs * (min_len + 1)
     best_n, best = 0, -np.inf
     for n in range(cand.size + 1):
-        theta = (base + float(cand[:n].sum())) / table.step_time(bs * min_len + n)
+        theta = (base + float(cand[:n].sum())) / table.step_time(floor_tokens + n, num_gen)
         if theta > best:
             best, best_n = theta, n
     return best_n
@@ -99,7 +102,11 @@ def test_tau_counts_the_always_verified_floor_positions():
     silently moves the optimum. Two batches that differ only in how good their
     floor positions are must be able to choose different budgets.
     """
-    table = SpsCostTable(token_counts=(0, 6), step_time_ms=(1.0, 3.0))
+    # The riser sits just past the floor (bs*(min_len+1) = 8 tokens), so both
+    # shelves are reachable and the constant term can actually decide between
+    # them. With the riser outside the reachable range this test would still
+    # pass but prove nothing.
+    table = SpsCostTable(token_counts=(0, 10), step_time_ms=(1.0, 3.0), fixed_overhead_ms=1.0)
     bs = 4
     good_floor = np.cumprod(np.full((bs, BLOCK), 0.99), axis=1)
     bad_floor = good_floor.copy()
@@ -107,10 +114,16 @@ def test_tau_counts_the_always_verified_floor_positions():
     bad_floor = np.cumprod(
         np.concatenate([bad_floor[:, :1], np.full((bs, BLOCK - 1), 0.99)], axis=1), axis=1
     )
+    budgets = []
     for surv in (good_floor, bad_floor):
-        assert compute_verify_token_budget(
-            survival=surv, num_gen_requests=bs, cost_table=table
-        ) == _brute_force_budget(surv, bs, table)
+        got = compute_verify_token_budget(survival=surv, num_gen_requests=bs, cost_table=table)
+        assert got == _brute_force_budget(surv, bs, table)
+        budgets.append(got)
+    assert budgets[0] != budgets[1], (
+        "the two batches differ only in their floor positions' survival, so a "
+        "planner that ignored the floor's contribution to tau would give them "
+        "the same budget -- keep the riser inside the reachable token range"
+    )
 
 
 def test_budget_matches_brute_force_on_staircase():
@@ -139,8 +152,11 @@ def test_greedy_first_descent_would_be_wrong():
     shelf's optimum is almost 3x better.
     """
     bs = 4
-    # One riser at 6 total tokens, then a long shelf out to the end of the range.
-    table = SpsCostTable(token_counts=(0, 6), step_time_ms=(1.0, 3.0))
+    # One riser just past the floor (bs*(min_len+1) = 8 tokens), then a long
+    # shelf out to the end of the range. The fixed overhead is spelled out
+    # rather than assumed: it is part of what makes the first shelf's Theta
+    # look competitive, and it is no longer a hidden constant in the planner.
+    table = SpsCostTable(token_counts=(0, 10), step_time_ms=(1.0, 3.0), fixed_overhead_ms=1.0)
     # Uniformly high confidence: every extra candidate adds nearly a full token,
     # so tau grows ~7x across the range while cost only doubles.
     surv = np.cumprod(np.full((bs, BLOCK), 0.995), axis=1)
@@ -149,7 +165,7 @@ def test_greedy_first_descent_would_be_wrong():
     cand = np.sort(surv[:, 1:].reshape(-1))[::-1]
 
     def theta(n):
-        return (bs + cand[:n].sum()) / table.step_time(bs + n)
+        return (bs + cand[:n].sum()) / table.step_time(2 * bs + n, bs)
 
     greedy = 0
     while greedy + 1 <= cand.size and theta(greedy + 1) > theta(greedy):
@@ -337,12 +353,14 @@ def test_discrete_argmax_beats_round_then_snap_across_a_riser():
         cost_table=table,
         allowed_lens=[1, 3, 5, 7],
     )
-    # 8*7=56 tokens lands on the 20ms riser; the search must avoid it.
+    # 8*(7+1)=64 tokens lands on the 20ms riser; the search must avoid it.
     assert chosen < 7
 
     def theta(length):
-        tau = 8 + float(surv[:, 1:length].sum())
-        return tau / table.step_time(8 * length)
+        # Mirrors the implementation exactly, including the bonus token every
+        # request submits alongside its drafts.
+        tau = 8 + float(surv[:, :length].sum())
+        return tau / table.step_time(8 * (length + 1), 8)
 
     assert theta(chosen) == max(theta(v) for v in (1, 3, 5, 7))
 
@@ -367,7 +385,7 @@ def test_derived_tiers_lose_nothing_versus_continuous_k():
         )
 
         def theta(length):
-            return (bs + float(surv[:, :length].sum())) / table.step_time(bs * length)
+            return (bs + float(surv[:, :length].sum())) / table.step_time(bs * (length + 1), bs)
 
         best_any = max(theta(v) for v in range(1, BLOCK + 1))
         best_tier = max(theta(v) for v in tiers)
@@ -386,17 +404,18 @@ def test_derived_tiers_respect_the_capture_budget():
 
 
 def test_derived_tiers_are_a_function_of_batch_size():
-    """Tiers move with bs because total tokens = bs * length.
+    """Tiers move with bs because total tokens = bs * (length + 1).
 
-    With a riser at 40 tokens: at bs=8 the shelf ends at length 4, so 4 is a
-    tier; at bs=32 even length 2 is already past the riser, so the shelf yields
-    nothing and only the endpoints remain. A tier set derived once and reused
-    across batch sizes would be wrong for one of them.
+    With a riser at 40 tokens: at bs=8, length 3 costs 8*4=32 tokens (still on
+    the shelf) while length 4 costs 8*5=40 (past it), so 3 is the right edge; at
+    bs=32 even length 1 is already past the riser, so the shelf yields nothing
+    and only the endpoints remain. A tier set derived once and reused across
+    batch sizes would be wrong for one of them.
     """
     table = SpsCostTable(token_counts=(0, 40), step_time_ms=(1.0, 5.0))
     assert derive_verify_len_tiers(
         cost_table=table, num_requests=8, block_size=BLOCK, max_tiers=99
-    ) == [1, 4, BLOCK]
+    ) == [1, 3, BLOCK]
     assert derive_verify_len_tiers(
         cost_table=table, num_requests=32, block_size=BLOCK, max_tiers=99
     ) == [1, BLOCK]
@@ -508,6 +527,56 @@ def test_planner_cross_rank_result_is_snapped_back_onto_a_tier():
 
 def test_planner_empty_batch_is_max_tier():
     assert _planner().decide_draft_len(num_gen_requests=0) == BLOCK
+
+
+def test_planner_refuses_a_snapshot_that_does_not_cover_the_batch():
+    """A short snapshot must fall back, never return a short answer.
+
+    The staged snapshot lags one iteration, so a batch that grew since then has
+    more requests than the snapshot has rows. Returning one length per staged
+    row leaves the tail of the batch without a verify window -- and the two
+    consumers disagree about what that means: the input layout is built per
+    request (so it goes ragged) while the spec metadata sees a missing window
+    and stays uniform. That combination misattributes one request's drafts to
+    another with nothing raising.
+    """
+    p = _planner()
+    p._host_buffer, p._copy_event, p._snapshot_valid = torch.zeros(4, BLOCK), None, True
+    assert p.decide_verify_lens(num_gen_requests=9) is None
+    assert p.stats["fallback_short_snapshot"] == 1
+    assert p.decide_draft_len(num_gen_requests=9) == BLOCK
+
+
+def test_planner_returns_one_verify_len_per_request():
+    p = _planner()
+    p._host_buffer, p._copy_event, p._snapshot_valid = torch.rand(6, BLOCK), None, True
+    lens = p.decide_verify_lens(num_gen_requests=6)
+    assert lens is not None and len(lens) == 6
+
+
+def test_planner_reads_confidence_by_row_not_by_batch_position():
+    """The snapshot is slot-indexed; ``rows`` is what re-associates it.
+
+    The buffer is written by slot and read one iteration later, by which point
+    joins and departures have reshuffled the batch. Position 0 of this step's
+    batch is routinely a different request than the one scored in row 0.
+    """
+    p = _planner()
+    # Row 3 is a confident request, row 0 a hopeless one.
+    buf = torch.full((5, BLOCK), -8.0)
+    buf[3] = 8.0
+    p._host_buffer, p._copy_event, p._snapshot_valid = buf, None, True
+
+    # This step schedules the confident request first, then the hopeless one.
+    lens = p.decide_verify_lens(num_gen_requests=2, rows=[3, 0])
+    assert lens is not None and lens[0] > lens[1], f"row mapping ignored: {lens}"
+
+
+def test_planner_rejects_a_row_list_that_does_not_match_the_batch():
+    p = _planner()
+    p._host_buffer, p._copy_event, p._snapshot_valid = torch.rand(8, BLOCK), None, True
+    assert p.decide_verify_lens(num_gen_requests=4, rows=[0, 1]) is None
+    assert p.stats["fallback_short_snapshot"] == 1
 
 
 def test_planner_uses_the_supplied_calibration():

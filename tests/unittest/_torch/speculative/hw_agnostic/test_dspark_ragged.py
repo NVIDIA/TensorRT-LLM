@@ -290,7 +290,20 @@ def test_ragged_beats_uniform_at_equal_budget():
 
 def test_row_ids_map_each_packed_token_to_its_request():
     lens = torch.tensor([3, 1, 2], dtype=torch.int32)
-    assert row_ids_from_lens(lens).tolist() == [0, 0, 0, 1, 2, 2]
+    assert row_ids_from_lens(lens, total=6).tolist() == [0, 0, 0, 1, 2, 2]
+
+
+def test_row_ids_requires_the_host_total():
+    """``total`` is what keeps the expansion sync-free, so it cannot be optional.
+
+    Without ``output_size`` torch reads the cumulative sum back to the host to
+    size its output. DSpark's acceptance runs inside the target's captured CUDA
+    graph, where that sync is illegal -- so the signature forces every caller to
+    supply a total it already knows.
+    """
+    lens = torch.tensor([3, 1, 2], dtype=torch.int32)
+    with pytest.raises(TypeError):
+        row_ids_from_lens(lens)
 
 
 def test_scatter_unpacks_a_flat_batch_into_rows():

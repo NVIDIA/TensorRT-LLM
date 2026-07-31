@@ -39,6 +39,22 @@ whole curve; so do we, and :mod:`tests` pins it against a brute-force scan.
 step time against the *total* verified token count, and interpolates nothing
 across a riser.
 
+**Total verified tokens includes the bonus position.** A request that verifies
+``L`` drafted positions submits ``L + 1`` tokens to the target -- the bonus
+token it already holds, plus the ``L`` drafts. So a batch of ``bs`` requests at
+uniform length ``L`` costs ``step_time(bs * (L + 1))``, not ``step_time(bs * L)``.
+The two differ by a whole ``bs``, which is easily a shelf's width.
+
+**The cost is two-dimensional, and only one dimension is trimmable.** SGLang
+publishes ``T(bs, K) = bias + alpha(bs) + theta(M)``: a fixed cost, a
+batch-size-dependent cost (the draft pass, weight movement -- untouched by
+trimming), and the target's verify-token cost ``theta(M)``, which is the only
+term a smaller ``M`` reduces. ``Theta = tau / T`` is a *ratio*, so the
+non-trimmable terms are not a constant that cancels -- getting them wrong moves
+the argmax directly. They therefore have to be supplied, not guessed:
+:class:`SpsCostTable` carries ``fixed_overhead_ms`` for ``bias`` and an optional
+``batch_sizes`` / ``batch_overhead_ms`` staircase for ``alpha(bs)``.
+
 The planner runs on the host: its output selects a CUDA graph, and graph
 selection is a host decision in TensorRT-LLM. Keeping it here (rather than on
 device) is deliberate -- a device-side budget would have to be copied back
@@ -46,7 +62,7 @@ before the batch could be shaped, which is exactly the sync we are avoiding.
 """
 
 import bisect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 import numpy as np
@@ -56,11 +72,18 @@ __all__ = [
     "compute_verify_token_budget",
     "budget_argmax_over_uniform_lens",
     "derive_verify_len_tiers",
+    "total_verify_tokens",
 ]
 
-# Fixed per-step overhead folded into every cost lookup (sampling, bookkeeping,
-# launch latency). Matches vLLM PR #47808's ``_FIXED_OVERHEAD_MS``.
-_FIXED_OVERHEAD_MS = 1.0
+
+def total_verify_tokens(num_requests: int, verify_len: int) -> int:
+    """Tokens the target scores for ``num_requests`` each verifying ``verify_len`` drafts.
+
+    One bonus/anchor token per request plus its drafted positions. This is the
+    unit :class:`SpsCostTable` is indexed by; the single place it is computed so
+    the planner and the tier derivation cannot drift apart.
+    """
+    return int(num_requests) * (int(verify_len) + 1)
 
 
 @dataclass(frozen=True)
@@ -68,8 +91,24 @@ class SpsCostTable:
     """Measured decode step time as a function of total verified tokens.
 
     Attributes:
-        token_counts: strictly increasing total-token breakpoints.
-        step_time_ms: measured step time at each breakpoint.
+        token_counts: strictly increasing total-token breakpoints. "Total" means
+            what :func:`total_verify_tokens` computes -- bonus tokens included.
+        step_time_ms: measured ``theta(M)`` at each breakpoint.
+        fixed_overhead_ms: the ``bias`` term -- per-step cost that trimming
+            cannot touch (sampling, bookkeeping, launch latency), if it is not
+            already inside ``step_time_ms``. Defaults to 0.0 on the assumption
+            that a profiled table measured whole steps; set it only when the
+            table isolates the verify term.
+        batch_sizes / batch_overhead_ms: optional ``alpha(bs)`` staircase -- the
+            batch-size-dependent, *non-trimmable* part of the step (the draft
+            pass, weight movement). Looked up by floor on ``batch_sizes``.
+
+    Getting the non-trimmable terms wrong is not harmless. The planner maximizes
+    ``tau / T``, a ratio, so ``bias + alpha(bs)`` does not cancel: understating
+    it makes every verified token look proportionally more expensive than it is
+    and the planner over-trims. On a large-MoE deployment ``alpha(bs)`` is tens
+    of milliseconds while ``theta(M)`` is a few, so a hardcoded guess here would
+    dominate the decision.
 
     Lookup is a floor (staircase) lookup, never an interpolation: between two
     measured points the cost is genuinely flat until a new kernel wave starts,
@@ -80,6 +119,9 @@ class SpsCostTable:
 
     token_counts: Sequence[int]
     step_time_ms: Sequence[float]
+    fixed_overhead_ms: float = 0.0
+    batch_sizes: Sequence[int] = field(default_factory=tuple)
+    batch_overhead_ms: Sequence[float] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if len(self.token_counts) != len(self.step_time_ms):
@@ -93,18 +135,45 @@ class SpsCostTable:
             raise ValueError("token_counts must be strictly increasing")
         if any(t <= 0.0 for t in self.step_time_ms):
             raise ValueError("step_time_ms entries must be positive")
+        if self.fixed_overhead_ms < 0.0:
+            raise ValueError("fixed_overhead_ms must be >= 0")
+        if len(self.batch_sizes) != len(self.batch_overhead_ms):
+            raise ValueError(
+                f"batch_sizes ({len(self.batch_sizes)}) and batch_overhead_ms "
+                f"({len(self.batch_overhead_ms)}) must have the same length"
+            )
+        if any(b <= a for a, b in zip(self.batch_sizes, self.batch_sizes[1:])):
+            raise ValueError("batch_sizes must be strictly increasing")
+        if any(t < 0.0 for t in self.batch_overhead_ms):
+            raise ValueError("batch_overhead_ms entries must be >= 0")
 
-    def step_time(self, num_tokens: int) -> float:
-        """Step time (ms) for a step that verifies ``num_tokens`` tokens in total."""
+    def batch_overhead(self, num_requests: int) -> float:
+        """``alpha(num_requests)`` -- 0.0 when the table has no batch axis."""
+        if not self.batch_sizes:
+            return 0.0
+        idx = bisect.bisect_right(self.batch_sizes, int(num_requests)) - 1
+        idx = min(max(idx, 0), len(self.batch_overhead_ms) - 1)
+        return float(self.batch_overhead_ms[idx])
+
+    def step_time(self, num_tokens: int, num_requests: int = 0) -> float:
+        """``bias + alpha(num_requests) + theta(num_tokens)``, in ms."""
         idx = bisect.bisect_right(self.token_counts, int(num_tokens)) - 1
         idx = min(max(idx, 0), len(self.step_time_ms) - 1)
-        return float(self.step_time_ms[idx]) + _FIXED_OVERHEAD_MS
+        return (
+            float(self.step_time_ms[idx])
+            + self.fixed_overhead_ms
+            + self.batch_overhead(num_requests)
+        )
 
-    def step_times(self, num_tokens: np.ndarray) -> np.ndarray:
-        """Vectorized :meth:`step_time`."""
+    def step_times(self, num_tokens: np.ndarray, num_requests: int = 0) -> np.ndarray:
+        """Vectorized :meth:`step_time` over a token-count array."""
         counts = np.asarray(self.token_counts)
         idx = np.clip(np.searchsorted(counts, num_tokens, side="right") - 1, 0, len(counts) - 1)
-        return np.asarray(self.step_time_ms, dtype=np.float64)[idx] + _FIXED_OVERHEAD_MS
+        return (
+            np.asarray(self.step_time_ms, dtype=np.float64)[idx]
+            + self.fixed_overhead_ms
+            + self.batch_overhead(num_requests)
+        )
 
     @classmethod
     def flat(cls, step_time_ms: float = 1.0) -> "SpsCostTable":
@@ -119,6 +188,12 @@ class SpsCostTable:
 
     @property
     def is_flat(self) -> bool:
+        """Whether the *trimmable* term is constant.
+
+        Only ``theta(M)`` matters here: ``bias`` and ``alpha(bs)`` are the same
+        for every candidate length, so a table that varies only in those cannot
+        distinguish a cheap verified token from an expensive one either.
+        """
         return len(set(self.step_time_ms)) <= 1
 
 
@@ -168,9 +243,12 @@ def compute_verify_token_budget(
     #   * the n admitted candidates, best-first.
     base = float(num_gen_requests) + float(surv[:, :min_verify_len].sum())
     tau = base + np.concatenate(([0.0], np.cumsum(candidates)))
-    floor_tokens = bs * int(min_verify_len)
-    total_tokens = floor_tokens + np.arange(tau.size)
-    theta = tau / cost_table.step_times(total_tokens)
+    # Tokens actually submitted to the target at the floor: every request's
+    # bonus position plus its floor draft positions. Dropping the bonus term
+    # under-reports the batch by a whole ``bs``, which is easily a shelf wide.
+    floor_tokens = total_verify_tokens(bs, min_verify_len)
+    tokens = floor_tokens + np.arange(tau.size)
+    theta = tau / cost_table.step_times(tokens, num_gen_requests)
     return int(np.argmax(theta))
 
 
@@ -196,7 +274,7 @@ def derive_verify_len_tiers(
 
     **The zero-loss property does not survive across batch sizes.** The cost
     shelves live in token space, so a shelf's right edge in *length* space is
-    ``(breakpoint - 1) // batch_size`` -- a function of the batch size. A
+    ``(breakpoint - 1) // batch_size - 1`` -- a function of the batch size. A
     deployment captures graphs for many batch sizes but can only capture one
     ladder, so a single tier set cannot sit on every batch size's right edges.
     Deriving tiers is more robust than hardcoding a pair like ``{1, 5}``, but it
@@ -224,8 +302,10 @@ def derive_verify_len_tiers(
     edges = set()
     for breakpoint_tokens in cost_table.token_counts[1:]:
         # Largest length whose total token count still sits on the shelf below
-        # this breakpoint.
-        length = (int(breakpoint_tokens) - 1) // int(num_requests)
+        # this breakpoint. Total tokens for length L is num_requests * (L + 1)
+        # (see total_verify_tokens), so invert that, not num_requests * L --
+        # otherwise the derived edge sits one shelf too far right.
+        length = (int(breakpoint_tokens) - 1) // int(num_requests) - 1
         if lo <= length <= hi:
             edges.add(length)
     # The last shelf extends past the final breakpoint, so the whole block is
@@ -282,7 +362,7 @@ def budget_argmax_over_uniform_lens(
         # bonus token plus the survival of *every* verified position (including
         # the floor ones), summed over the batch.
         tau = float(num_gen_requests) + float(surv[:, :length].sum())
-        theta = tau / cost_table.step_time(bs * length)
+        theta = tau / cost_table.step_time(total_verify_tokens(bs, length), num_gen_requests)
         if theta > best_theta:
             best_len, best_theta = length, theta
     return int(best_len)

@@ -647,18 +647,62 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Whether generation requests have per-request query lengths."""
         return self.ragged_verify_lens is not None
 
-    def gen_token_repeats(self, device=None) -> torch.Tensor:
-        """Per-generation-request query-token counts as a repeat vector.
+    def gen_token_repeat_list(self) -> List[int]:
+        """Per-generation-request query-token counts, on the host.
 
         Uniform batches get `1 + max_draft_tokens` for every request, so the
         callers below stay bit-identical; ragged batches get the scheduler's
         per-request windows.
+
+        Host-side on purpose: the expanded token count derived from these feeds
+        buffer slicing, and reducing it off a device tensor would be a
+        device->host sync on every step of the *uniform* path too.
         """
         if self.ragged_verify_lens is None:
-            repeats = [1 + self.max_draft_tokens] * self.num_generations
-        else:
-            repeats = self.ragged_verify_lens
-        return torch.tensor(repeats, dtype=torch.long, device=device)
+            return [1 + self.max_draft_tokens] * self.num_generations
+        return list(self.ragged_verify_lens)
+
+    def gen_token_repeats(self, device=None) -> torch.Tensor:
+        """:meth:`gen_token_repeat_list` as a repeat vector for the given device."""
+        return torch.tensor(self.gen_token_repeat_list(),
+                            dtype=torch.long,
+                            device=device)
+
+    def expand_per_gen_token(self,
+                             values: torch.Tensor,
+                             dim: int = 0) -> Tuple[torch.Tensor, int]:
+        """Repeat `values` once per query token, returning `(expanded, num_tokens)`.
+
+        Uniform batches take the scalar `repeat_interleave` -- no repeats
+        tensor, no host->device copy, and no output-size question at all, so
+        this is bit-identical and cost-identical to the fixed-stride expansion
+        it replaced.
+
+        Ragged batches need a per-request repeats vector, which costs two things
+        the scalar form does not, and both are paid for here:
+
+        * `repeat_interleave` with a tensor `repeats` reads their cumulative sum
+          back to the host to size its output unless `output_size` is given, so
+          the total is computed on the host and passed explicitly;
+        * materializing `repeats` on the device is a host->device copy, and from
+          *pageable* memory CUDA synchronizes the stream before starting it. The
+          staging tensor is therefore pinned and the copy issued
+          `non_blocking=True`, matching how the rest of the engine stages
+          host-built index vectors.
+        """
+        repeats = self.gen_token_repeat_list()
+        num_tokens = sum(repeats)
+        if self.ragged_verify_lens is None:
+            stride = 1 + self.max_draft_tokens
+            return values.repeat_interleave(stride, dim=dim), num_tokens
+        repeats_host = torch.tensor(
+            repeats,
+            dtype=torch.long,
+            pin_memory=(prefer_pinned() and values.device.type == 'cuda'))
+        repeats_dev = repeats_host.to(values.device, non_blocking=True)
+        return (values.repeat_interleave(repeats_dev,
+                                         dim=dim,
+                                         output_size=num_tokens), num_tokens)
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
@@ -920,12 +964,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     scheduler_metadata_buffer_full_next_n, non_blocking=True)
             if self.use_expanded_buffers_for_mtp:
                 # One row per query token; the repeat count is per-request
-                # under ragged verification and a constant otherwise.
-                token_repeats = self.gen_token_repeats(
-                    device=gen_indexer_kv_lens.device)
-                num_tokens = int(token_repeats.sum())
-                self.kv_lens_expanded_cuda[:num_tokens] = \
-                    gen_indexer_kv_lens.repeat_interleave(token_repeats)
+                # under ragged verification and a constant otherwise. Both the
+                # host-side total and the sync-free expansion live in
+                # ``expand_per_gen_token``.
+                expanded, num_tokens = self.expand_per_gen_token(
+                    gen_indexer_kv_lens)
+                self.kv_lens_expanded_cuda[:num_tokens] = expanded
                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
                     self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
                     _DG_SCHEDULE_BLOCK_KV, self.num_sms)
@@ -1516,12 +1560,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation): one row per query token,
             # repeating each request's kv_len as many times as it has tokens.
-            token_repeats = self.gen_token_repeats()
-            num_tokens = int(token_repeats.sum())
             gen_kv_lens = self.get_indexer_kv_lens(
                 kv_lens[self.num_contexts:self.num_seqs])
-            gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(
-                token_repeats.to(gen_kv_lens.device))
+            gen_kv_lens_expanded, num_tokens = self.expand_per_gen_token(
+                gen_kv_lens)
             self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
             self.kv_lens_expanded_cuda[:num_tokens].copy_(
                 self.kv_lens_expanded_host[:num_tokens], non_blocking=True)
@@ -1533,8 +1575,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 max_len = self.host_indexer_k_cache_block_offsets.shape[1]
                 gen_block_tensor = self.host_indexer_k_cache_block_offsets[
                     self.num_contexts:self.num_seqs, :max_len]
-                expanded_blocks = gen_block_tensor.repeat_interleave(
-                    token_repeats.to(gen_block_tensor.device), dim=0)
+                expanded_blocks, _ = self.expand_per_gen_token(gen_block_tensor,
+                                                               dim=0)
                 self.host_block_table_expanded[:num_tokens, :max_len].copy_(
                     expanded_blocks, non_blocking=True)
                 self.block_table_expanded[:num_tokens].copy_(

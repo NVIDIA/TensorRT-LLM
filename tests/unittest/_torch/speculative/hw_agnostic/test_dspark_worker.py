@@ -570,33 +570,65 @@ def test_gen_draft_stride_falls_back_to_max_draft_len():
     assert seen["main_hidden"][:, 0].tolist() == [float(g) for g in range(num_gens)]
 
 
-def test_staged_confidence_rows_follow_the_slots_not_the_leading_rows():
+def test_confidence_rows_are_looked_up_by_slot():
     """The confidence buffer is slot-indexed; a batch rarely owns slots 0..G-1.
 
-    Reading the buffer's leading rows would hand the scheduler a stale, unrelated
-    set of requests -- wrong budget, no error.
+    The snapshot the scheduler reads is one iteration old, and joins/departures
+    reshuffle the batch in between, so batch position is not a usable key.
+    ``confidence_row_for`` re-associates each request with the row its own draft
+    wrote.
     """
     worker = _make_worker(enable_confidence_scheduling=True)
     dm, _ = _stride_probe_draft_model()
     worker._lazy_init(dm, _make_metadata(max_num_requests=8))
     assert worker._confidence_logits is not None
 
-    # Tag every slot row with its slot index, then say the batch owns 5,2,7.
-    blk = worker.max_draft_len
+    # Tag every row with its index, then hand three requests explicit slots.
     for s in range(worker._confidence_logits.shape[0]):
         worker._confidence_logits[s] = float(s)
-    worker._last_gen_slots = torch.tensor([5, 2, 7], device="cuda")
+    worker._req_to_slot = {100: 5, 101: 2, 102: 7}
 
-    rows = worker.staged_confidence_rows()
-    assert rows.shape == (3, blk)
-    assert rows[:, 0].tolist() == [5.0, 2.0, 7.0]
+    rows = [worker.confidence_row_for(r) for r in (100, 101, 102)]
+    assert rows == [5, 2, 7]
+    buf = worker.staged_confidence_buffer()
+    assert buf[rows][:, 0].tolist() == [5.0, 2.0, 7.0]
 
 
-def test_staged_confidence_rows_is_none_before_any_draft():
+def test_unscored_request_maps_to_a_permanently_neutral_row():
+    """A request with no slot yet must read as "verify the whole block".
+
+    The scratch row is not safe for this -- padded and unknown requests write
+    through it -- so there is a dedicated row past every real slot that nothing
+    ever writes.
+    """
     worker = _make_worker(enable_confidence_scheduling=True)
     dm, _ = _stride_probe_draft_model()
     worker._lazy_init(dm, _make_metadata(max_num_requests=8))
-    assert worker.staged_confidence_rows() is None
+
+    neutral = worker.confidence_row_for(12345)
+    assert neutral == worker._neutral_conf_row
+    # Past every real slot AND past the scratch row.
+    assert neutral > worker._scratch_slot
+    buf = worker.staged_confidence_buffer()
+    assert torch.sigmoid(buf[neutral]).min().item() > 0.999
+
+
+def test_a_freshly_assigned_slot_starts_neutral():
+    """Otherwise a new request's first decision trims on a dead draft's scores.
+
+    Slots are recycled between requests, so whatever the previous occupant's
+    draft scored is still sitting in the row when the next request moves in.
+    """
+    worker = _make_worker(enable_confidence_scheduling=True)
+    dm, _ = _stride_probe_draft_model()
+    worker._lazy_init(dm, _make_metadata(max_num_requests=8))
+
+    # Every real slot carries a dead previous occupant's hopeless confidence.
+    worker._confidence_logits[: worker._scratch_slot] = -20.0
+
+    slot = worker._assign_slot(100, reset=False)
+    assert slot < worker._scratch_slot
+    assert torch.sigmoid(worker._confidence_logits[slot]).min().item() > 0.999
 
 
 def test_confidence_buffer_absent_when_scheduling_is_off():
