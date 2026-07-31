@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
+# PyTorch oracle derived from vLLM (Apache-2.0), ``_reference_sparse_attn``:
+# https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/tests/kernels/attention/test_minimax_m3.py#L755
 """Correctness tests for the Triton MiniMax-M3 sparse block decode attention.
 
-The PyTorch oracle mirrors vLLM's reference for
-``minimax_m3_sparse_attn_decode``: softmax over exactly the selected blocks,
-each truncated at the query token's own causal extent.
+The PyTorch oracle follows the vLLM reference linked in the file header
+(v0.26.1rc0-77-g6f91edf96): softmax over exactly the selected blocks, each
+truncated at the query token's own causal extent.
 """
 
 import pytest

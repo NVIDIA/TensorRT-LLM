@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
+# Vendored from vLLM (Apache-2.0):
+# https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/vllm/models/minimax_m3/nvidia/ops/index_decode_score.py
 """CuTe DSL MiniMax-M3 index decode block-scoring kernel (Blackwell SM100).
 
 Computes, for every (index head, decode query token, KV block), the maximum
@@ -12,9 +14,8 @@ Uses TMA plus warp-level ``mma.sync`` rather than tcgen05: the score GEMM's N
 dimension is one decode token times a handful of index heads, so CTA occupancy
 matters far more than a deep single-CTA pipeline.
 
-Vendored from vLLM (Apache-2.0)
-``vllm/models/minimax_m3/nvidia/ops/index_decode_score.py`` at
-0.26.1rc1.dev77+g6f91edf96. Differences from upstream:
+Vendored from the vLLM source linked in the file header (v0.26.1rc0-77-g6f91edf96).
+Differences from upstream:
 
 * ``cpasync.make_tiled_tma_atom`` returns ``(atom, tensor)`` in the CuTe DSL
   version pinned here rather than a ``TmaInfo``, so the shared-memory layouts

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
+# Vendored from vLLM (Apache-2.0):
+# https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/vllm/models/minimax_m3/common/ops/sparse_attn.py
 """Triton block-sparse GQA decode attention for MiniMax-M3.
 
 Flash-decoding over the blocks the indexer selected: one CTA per (query token,
@@ -9,9 +11,8 @@ second kernel merges the chunks by LSE weight. That beats running the
 context-schedule FMHA kernel at decode, where a single query token leaves most
 of a 128-row Q tile idle.
 
-Vendored from vLLM (Apache-2.0)
-``vllm/models/minimax_m3/common/ops/sparse_attn.py`` at
-0.26.1rc1.dev77+g6f91edf96. Differences from upstream:
+Vendored from the vLLM source linked in the file header (v0.26.1rc0-77-g6f91edf96).
+Differences from upstream:
 
 * K and V are separate HND paged views (``[num_pages, num_kv_heads, page_size,
   head_dim]``) with independent strides rather than one cache fused along the

@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
+# Vendored from vLLM (Apache-2.0):
+# https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/vllm/cute_utils/__init__.py
+# https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/vllm/cute_utils/cvt.py
 """Warp-level PTX intrinsics for CuTe DSL kernels that use ``mma.sync``.
 
 Most Blackwell kernels in this tree drive the tensor cores through
@@ -9,9 +12,9 @@ GEMM has a tiny N dimension does better with warp-level ``mma.sync`` and high
 CTA occupancy than with a deep single-CTA tcgen05 pipeline, and the DSL has no
 wrapper for that instruction, so it is spelled out as inline PTX here.
 
-Vendored from vLLM (Apache-2.0) ``vllm/cute_utils/__init__.py`` and
-``vllm/cute_utils/cvt.py`` at 0.26.1rc1.dev77+g6f91edf96, reduced to the
-symbols :mod:`minimax_m3_index_decode_score` needs.
+Vendored from the vLLM sources linked in the file header
+(v0.26.1rc0-77-g6f91edf96), reduced to the symbols
+:mod:`minimax_m3_index_decode_score` needs.
 """
 
 import torch
