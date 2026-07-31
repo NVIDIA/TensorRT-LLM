@@ -98,6 +98,7 @@ from .logprobs import (
     get_logprobs_from_request,
     store_logprobs_list_to_request,
 )
+from .penalties import PenaltyHandler
 from .sampler_common import (
     DEFAULT_BEAM_IDX,
     DEFAULT_STEP_IDX,
@@ -1424,6 +1425,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self.store.new_tokens.shape
                 == self._finish_reasons_handler.store.finish_reasons_cuda.shape
             )
+            self._penalty_handler = PenaltyHandler(
+                max_num_sequences=self.max_num_sequences,
+                device="cuda",
+            )
 
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
@@ -1844,10 +1849,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     @override
     def validate_request(self, request: LlmRequest) -> None:
-        # Reject unsupported top-p-decay combinations at admission, so only the
-        # offending request fails (raising later, inside setup_sampler_step or
-        # sampling, would abort the whole executor step).
+        # Reject unsupported top-p-decay and penalty combinations at admission, so
+        # only the offending request fails (raising later, inside setup_sampler_step
+        # or sampling, would abort the whole executor step).
         self._top_p_decay.validate_request(request)
+        self._penalty_handler.validate_request(request)
         if self._use_beam_search:
             if request.py_return_log_probs:
                 if request.py_num_logprobs > 1:
@@ -1896,6 +1902,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._prev_first_finish_reasons_host[slot] = None
 
             self._request_grouper.prepare_for_new_request(request, slot)
+            self._penalty_handler.prepare_for_new_request(request, slot)
 
         max_lens = self._finish_reasons_handler.new_max_lens
         end_ids = self._finish_reasons_handler.new_end_ids
@@ -1924,6 +1931,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._top_p_decay.setup_for_new_requests(
             new_requests, new_seq_slots_cuda_long=seq_slots_tensor_cuda_long
+        )
+
+        self._penalty_handler.update_for_new_requests(
+            new_seq_slots_cuda_long=seq_slots_tensor_cuda_long
         )
 
         if self._use_beam_search:
@@ -2558,6 +2569,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else:
                 return None
 
+        finalized_token_updates: list[tuple[int, list[int]]] = []
         # Fast-path (batched pybind): when the batch is greedy with no beam
         # search, no logprobs, no draft tokens, no stop-words, and no
         # speculative tree, collapse per-request pybind chatter into one
@@ -2648,6 +2660,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 req.py_rewind_len = 0
             else:
                 processed = 1
+                num_tokens_before = req.get_num_tokens(DEFAULT_BEAM_IDX)
                 num_accepted = self.process_draft_tokens(
                     req,
                     new_tokens_tensor=new_tokens,
@@ -2662,6 +2675,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     req.py_num_accepted_draft_tokens = 0
                     req.py_rewind_len = 0
                 processed += num_accepted
+                if actual_draft_len > 0:
+                    num_new_tokens = req.get_num_tokens(DEFAULT_BEAM_IDX) - num_tokens_before
+                    if num_new_tokens > 0:
+                        assert req.py_seq_slot is not None
+                        confirmed_tokens = req.get_tokens(DEFAULT_BEAM_IDX)[-num_new_tokens:]
+                        finalized_token_updates.append((req.py_seq_slot, confirmed_tokens))
                 self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=processed)
             req.py_decoding_iter += 1
             # Check None or empty list
@@ -2671,6 +2690,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 ] = req.py_num_accepted_draft_tokens
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 self._top_p_decay.retire_slot(req)
+
+        self._penalty_handler.update_token_counts(finalized_token_updates)
 
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
         return any(req.py_return_log_probs for req in requests)
@@ -3608,6 +3629,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
         )
 
+        # Apply repetition/presence/frequency penalties in place, before the greedy fast
+        # path, so both greedy and grouped-sampling logits are penalized.
+        self._penalty_handler.apply(
+            logits_cuda,
+            sampling_requests,
+            new_tokens=new_tokens_cuda,
+            seq_slots=seq_slots_cuda,
+            request_offsets=sampling_requests_metadata.req_offsets,
+            request_num_steps=sampling_requests_metadata.req_num_steps,
+            # _is_draft_batch reads requests[0]; an empty batch has no penalties to apply
+            # anyway, so short-circuit rather than index into it.
+            is_draft_batch=bool(sampling_requests) and self._is_draft_batch(sampling_requests),
+        )
+
         has_min_length = any(getattr(r, "py_min_length", None) for r in sampling_requests)
         has_bad_words = any(getattr(r, "py_bad_words", None) for r in sampling_requests)
         # Normalized in executor_request_to_llm_request: a positive int, or
@@ -3743,6 +3778,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         temperature = params.temperature
         top_p = params.top_p
         top_k = params.top_k
+        min_p = params.min_p
 
         # Do not request draft probs when sampling is greedy.
         return not SamplingParams.params_imply_greedy_decoding(
@@ -3750,6 +3786,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             top_p=top_p,
             top_k=top_k,
             use_beam_search=self._use_beam_search,
+            min_p=min_p,
         )
 
 
