@@ -309,39 +309,53 @@ def buildImage(config, imageKeyToTag)
         sh "env | sort"
         sh "apk add make git"
         sh "git config --global --add safe.directory '*'"
-
-        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
-        }
-
-        withCredentials([
-            usernamePassword(
-                credentialsId: "svc_tensorrt_gitlab_read_api_token",
-                usernameVariable: 'USERNAME',
-                passwordVariable: 'PASSWORD'
-            ),
-            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
-        ]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
-        }
     }
-    // The two `docker login`s above are held for the whole build and released by
-    // the reclaim below. resourceLedger.withResource runs the reclaim in a
-    // finally on both success and failure -- re-raising the body's own error --
-    // replacing the prior try/catch/finally/containerGenFailure/rethrow. If the
-    // build pod dies before the finally runs, the registered entry is left live
-    // for a post-build sweep (Phase 3) rather than being silently lost.
+    // resourceLedger.withResource registers the docker-login lifecycle *before*
+    // the first login, then runs the reclaim (logout) in a finally on both
+    // success and failure -- re-raising the body's own error -- replacing the
+    // prior try/catch/finally/containerGenFailure/rethrow. Registering before the
+    // logins means any registry we authenticate to below is owed a logout even if
+    // a later login (or the pod) fails partway through; if the build pod dies
+    // before the finally runs, the entry is left live for a post-build sweep
+    // (Phase 3) rather than being silently lost.
     resourceLedger.withResource(this,
         id: "docker-login/${config.stageName}",
         type: "dockerLogin",
         reclaim: { p, e ->
             stage ("Docker Logout") {
                 withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
-                    sh "docker logout urm.nvidia.com"
-                    sh "docker logout ${DEFAULT_GIT_URL}:5005"
+                    // Best-effort and independent: attempt every logout even if an
+                    // earlier one fails, so a failure on one registry can't leave
+                    // another still authenticated.
+                    try {
+                        sh "docker logout urm.nvidia.com"
+                    } catch (Exception logoutEx) {
+                        echo "docker logout urm.nvidia.com failed: ${logoutEx}"
+                    }
+                    try {
+                        sh "docker logout ${DEFAULT_GIT_URL}:5005"
+                    } catch (Exception logoutEx) {
+                        echo "docker logout for gitlab registry failed: ${logoutEx}"
+                    }
                 }
             }
         }) {
+        stage ("Docker Login") {
+            withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
+            }
+
+            withCredentials([
+                usernamePassword(
+                    credentialsId: "svc_tensorrt_gitlab_read_api_token",
+                    usernameVariable: 'USERNAME',
+                    passwordVariable: 'PASSWORD'
+                ),
+                string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+            ]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
+            }
+        }
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
         def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
