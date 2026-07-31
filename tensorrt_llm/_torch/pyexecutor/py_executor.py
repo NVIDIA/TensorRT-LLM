@@ -74,7 +74,8 @@ from .kv_cache_transceiver import (KvCacheTransceiver,
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length)
+                          get_draft_token_length,
+                          get_effective_draft_token_length)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -1940,11 +1941,25 @@ class PyExecutor:
         ``scheduled_time - capacity_scheduled_time`` isolates the micro-batch
         scheduling stage. Omitted when the active scheduler does not expose it.
         """
-        num_ctx_requests = scheduled_batch.num_context_requests
-        num_gen_requests = scheduled_batch.num_generation_requests
+        # Exclude attention-DP / CUDA-graph padding (dummy) requests from every
+        # count below: they are not real work, and counting them would inflate
+        # exactly the batch-size / starvation numbers this feature exists to
+        # expose. Matches the sibling collectors (_collect_scheduled_batch_stats)
+        # and the acceptance-length aggregation, which both skip is_dummy.
+        ctx_requests = [
+            req for req in scheduled_batch.context_requests
+            if not self._is_stats_dummy_request(req)
+        ]
+        gen_requests = [
+            req for req in scheduled_batch.generation_requests
+            if not self._is_stats_dummy_request(req)
+        ]
+        num_ctx_requests = len(ctx_requests)
+        num_gen_requests = len(gen_requests)
+        iter_batch_size = num_ctx_requests + num_gen_requests
 
         context_token_number = 0
-        for req in scheduled_batch.context_requests:
+        for req in ctx_requests:
             try:
                 context_token_number += req.context_chunk_size
             except RuntimeError:
@@ -1952,14 +1967,18 @@ class PyExecutor:
                 if last_chunk is not None and last_chunk[0] is not None:
                     context_token_number += last_chunk[1] - last_chunk[0]
 
-        # Tokens emitted by gen requests this step (1 + speculative draft each).
+        # Tokens emitted by gen requests this step (1 target + effective
+        # speculative draft each). Uses the shared effective-draft-length helper
+        # so this batch total and the per-request req_generation_token_number
+        # (perf_metrics_manager.append_step_metrics) count draft tokens
+        # identically -- both exclude trailing padding zeros.
         generation_token_number = 0
-        for req in scheduled_batch.generation_requests:
-            generation_token_number += 1 + getattr(req, "num_draft_tokens", 0)
+        for req in gen_requests:
+            generation_token_number += 1 + get_effective_draft_token_length(req)
 
         ctx = {
             "iter_counter": self.iter_counter,
-            "iter_batch_size": scheduled_batch.batch_size,
+            "iter_batch_size": iter_batch_size,
             "num_ctx_requests": num_ctx_requests,
             "num_gen_requests": num_gen_requests,
             "context_token_number": context_token_number,
@@ -1968,8 +1987,11 @@ class PyExecutor:
         if num_fitting_reqs is not None:
             # Starvation: capacity-fit requests that were not micro-batch
             # scheduled this iteration (per-iteration count, not per-request).
+            # num_scheduled mirrors iter_batch_size (dummies excluded) so the
+            # derived num_capacity_fitting - num_scheduled gap is not skewed by
+            # padding requests.
             ctx["num_capacity_fitting"] = num_fitting_reqs
-            ctx["num_scheduled"] = scheduled_batch.batch_size
+            ctx["num_scheduled"] = iter_batch_size
         if schedule_time is not None:
             # Scheduler-admission timestamp for this iteration's micro-batch.
             ctx["scheduled_time"] = schedule_time

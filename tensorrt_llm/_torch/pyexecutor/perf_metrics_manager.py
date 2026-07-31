@@ -18,7 +18,7 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
-from .llm_request import PerfTimingInfo, get_draft_token_length
+from .llm_request import PerfTimingInfo, get_effective_draft_token_length
 
 # Master switch env var. When set to a directory, capture is forced on
 # (independent of ``LlmArgs.return_perf_metrics``), extended per-iteration
@@ -340,8 +340,12 @@ class PerfMetricsManager:
                     if last_chunk is not None and last_chunk[0] is not None:
                         metric["req_context_token_number"] = last_chunk[1] - last_chunk[0]
             else:
-                # Tokens this request emits this gen step (1 + speculative draft).
-                metric["req_generation_token_number"] = 1 + get_draft_token_length(request)
+                # Tokens this request emits this gen step (1 target + effective
+                # speculative draft). Shares get_effective_draft_token_length with
+                # the batch-level generation_token_number so the per-request and
+                # per-iteration counts agree (both exclude padding zeros).
+                metric["req_generation_token_number"] = (
+                    1 + get_effective_draft_token_length(request))
 
         if is_ctx:
             # Mark complete when context is done (remaining == 0 after move_to_next_chunk)

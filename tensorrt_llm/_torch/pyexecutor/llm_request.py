@@ -1232,3 +1232,25 @@ def get_draft_token_length(request: LlmRequest) -> int:
     if request.py_draft_tokens is not None:
         return len(request.py_draft_tokens)
     return 0
+
+
+def get_effective_draft_token_length(request: LlmRequest) -> int:
+    """Return the *effective* number of speculative draft tokens for a request.
+
+    Single source of truth for "how many draft tokens did this request actually
+    contribute this step", shared by the acceptance-length stats, the
+    per-iteration batch-context ``generation_token_number`` and the per-request
+    ``req_generation_token_number`` so those three can never diverge.
+
+    Prefers the C++ ``num_draft_tokens`` counter; when that is 0 (e.g. dynamic
+    draft length has not populated it) falls back to counting the *non-zero*
+    entries of ``py_draft_tokens`` so trailing padding zeros are never miscounted
+    as real speculative work. Differs from :func:`get_draft_token_length`, which
+    returns the raw ``len(py_draft_tokens)`` (padding included).
+    """
+    draft_len = getattr(request, "num_draft_tokens", 0) or 0
+    if draft_len == 0:
+        py_draft_tokens = getattr(request, "py_draft_tokens", None)
+        if py_draft_tokens is not None:
+            draft_len = sum(1 for t in py_draft_tokens if t != 0)
+    return draft_len
