@@ -63,6 +63,13 @@ CLEAR_STRICT_ENV = "TLLM_BOLT_CLEAR_STRICT"
 #: The BOLT runtime entry point that zeroes all instrumentation counters.
 CLEAR_SYMBOL = "__bolt_instr_clear_counters"
 
+#: File written at instrument time mapping "<lib_basename> <hex_offset>", where
+#: the offset is BOLT's printed "clear procedure is 0x..." address. This is the
+#: ONLY reliable way to locate the clear routine: BOLT emits it as a LOCAL
+#: symbol (absent from .dynsym AND .symtab), so dlsym/nm can't find it -- but it
+#: prints the address at instrument time (scripts/bolt/bolt_lib.sh captures it).
+CLEAR_OFFSETS_ENV = "BOLT_CLEAR_OFFSETS_FILE"
+
 #: Basenames (substring match) of the objects we BOLT-instrument. Mirrors the
 #: target set in scripts/bolt/bolt_lib.sh (P0 native libs + P1 bindings/triton).
 _TARGET_LIB_SUBSTRINGS = (
@@ -205,13 +212,13 @@ def _addr_in_lib(addr: int, path: str) -> bool:
         return False
 
 
-def _call_via_address(path: str, load_base: int) -> bool:
-    """Fallback: compute the symbol's runtime address and call it directly."""
-    offset = _symbol_offset(path)
-    if offset is None:
-        return False
+def _call_at_offset(path: str, load_base: int, offset: int) -> bool:
+    """Call the clear routine at load_base+offset, gated by a dladdr check.
+
+    A mis-computed absolute address would SIGSEGV the (long) run, so only call
+    once dladdr confirms the address maps into the expected library.
+    """
     addr = load_base + offset
-    # Never call a raw address we can't confirm is inside the target lib.
     if not _addr_in_lib(addr, path):
         logger.warning(
             f"[bolt] computed {CLEAR_SYMBOL} addr 0x{addr:x} not in {path} "
@@ -224,6 +231,41 @@ def _call_via_address(path: str, load_base: int) -> bool:
     except (ValueError, OSError):
         return False
     return True
+
+
+def _clear_offsets_from_file() -> Dict[str, int]:
+    """Parse the instrument-time "<lib_basename> <hex_offset>" file.
+
+    The offset is BOLT's printed "clear procedure is 0x..." address (the local,
+    unexported __bolt_instr_clear_counters). Returns {basename: offset}; empty
+    if the file is unset/absent.
+    """
+    out: Dict[str, int] = {}
+    fpath = os.environ.get(CLEAR_OFFSETS_ENV, "").strip()
+    if not fpath or not os.path.exists(fpath):
+        return out
+    try:
+        with open(fpath, "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) != 2:
+                    continue
+                name, hexoff = parts
+                try:
+                    out[name] = int(hexoff, 16)
+                except ValueError:
+                    continue
+    except OSError as e:
+        logger.warning(f"[bolt] cannot read {CLEAR_OFFSETS_ENV}={fpath}: {e}")
+    return out
+
+
+def _call_via_address(path: str, load_base: int) -> bool:
+    """Fallback: derive the offset from .symtab via (llvm-)nm, then call it."""
+    offset = _symbol_offset(path)
+    if offset is None:
+        return False
+    return _call_at_offset(path, load_base, offset)
 
 
 def maybe_bolt_clear_counters() -> int:
@@ -250,16 +292,28 @@ def maybe_bolt_clear_counters() -> int:
         logger.info(msg)
         return 0
 
+    # PRIMARY: BOLT-printed "clear procedure" offsets captured at instrument
+    # time (the routine is a local symbol, so dlsym/nm can't see it). dlsym/nm
+    # are kept only as best-effort fallbacks for other BOLT builds.
+    offsets = _clear_offsets_from_file()
+
     cleared: List[str] = []
     failed: List[str] = []
     for path, load_base in libs.items():
-        if _call_via_dlsym(path) or _call_via_address(path, load_base):
-            cleared.append(os.path.basename(path))
+        base = os.path.basename(path)
+        off = offsets.get(base)
+        ok = (
+            (off is not None and _call_at_offset(path, load_base, off))
+            or _call_via_dlsym(path)
+            or _call_via_address(path, load_base)
+        )
+        if ok:
+            cleared.append(base)
         else:
             failed.append(path)
             logger.warning(
                 f"[bolt] could not resolve {CLEAR_SYMBOL} in {path} "
-                "(not instrumented, or symbol stripped)"
+                f"(offsets-file hit={off is not None}; dlsym/nm also failed)"
             )
 
     if cleared:

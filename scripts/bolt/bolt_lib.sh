@@ -233,10 +233,23 @@ instrument_libraries() {
         local base; base="$(basename "$lib")"
         (
             log_info "[$idx/$total] Instrumenting $base"
-            if ! llvm-bolt "$lib" -instrument \
+            _blog="$BOLT_WORK_DIR/instrumented/${base}.bolt.log"
+            if llvm-bolt "$lib" -instrument \
                     --instrumentation-file-append-pid \
                     --instrumentation-file="$fdata_dir/${base%.so}" \
-                    -o "$BOLT_WORK_DIR/instrumented/$base" 2>&1; then
+                    -o "$BOLT_WORK_DIR/instrumented/$base" > "$_blog" 2>&1; then
+                cat "$_blog"
+                # __bolt_instr_clear_counters is emitted as a LOCAL symbol (not
+                # in .dynsym/.symtab), so it can only be called by address. BOLT
+                # prints that address as "clear procedure is 0x...". Record
+                # "<basename> <offset>" so the runtime hook can call it.
+                if [[ -n "${BOLT_CLEAR_OFFSETS_FILE:-}" ]]; then
+                    _clr="$(grep -oE 'clear procedure is 0x[0-9a-fA-F]+' "$_blog" \
+                            | grep -oE '0x[0-9a-fA-F]+' | head -1)"
+                    [[ -n "$_clr" ]] && echo "$base $_clr" >> "$BOLT_CLEAR_OFFSETS_FILE"
+                fi
+            else
+                cat "$_blog"
                 echo "$base" >> "$fail_marker"
             fi
         ) &

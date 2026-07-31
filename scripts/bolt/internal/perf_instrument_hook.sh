@@ -70,6 +70,16 @@ if ! command -v llvm-bolt >/dev/null 2>&1; then
 fi
 command -v llvm-bolt >/dev/null 2>&1 || { echo "[bolt-hook] llvm-bolt not available" >&2; exit 1; }
 
+# The runtime clear-counters hook (bolt_profiling.py) reads this file to call
+# __bolt_instr_clear_counters by address (it is a local symbol; see bolt_lib.sh).
+# Truncate so a re-run on the same node doesn't inherit stale offsets.
+if [[ -n "${BOLT_CLEAR_OFFSETS_FILE:-}" ]]; then
+    : > "$BOLT_CLEAR_OFFSETS_FILE" || true
+fi
+
 echo "[bolt-hook] instrumenting installed TRT-LLM libs on $(hostname); fdata -> $FDATA_OUTPUT_DIR"
 bash "$TOOLKIT/run_local.sh" instrument
 echo "[bolt-hook] instrumentation complete on $(hostname)"
+if [[ -n "${BOLT_CLEAR_OFFSETS_FILE:-}" && -f "$BOLT_CLEAR_OFFSETS_FILE" ]]; then
+    echo "[bolt-hook] captured clear-procedure offsets:"; cat "$BOLT_CLEAR_OFFSETS_FILE"
+fi
