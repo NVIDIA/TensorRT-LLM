@@ -679,3 +679,243 @@ def test_flag_unset_skips_cpp_poison_query():
 
     assert not BindKvCacheTransceiver.has_poisoned_transfer_buffer(transceiver)
     transceiver.impl.has_poisoned_transfer_buffer.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Wedged disagg KV transfer: detection must reach the PP loop, and a missed
+# transfer deadline must stop the executor loop from re-arming the watchdog.
+# ---------------------------------------------------------------------------
+
+
+def _make_ctx_only_request(request_id=11):
+    return SimpleNamespace(
+        py_request_id=request_id,
+        is_context_only_request=True,
+        is_context_finished=True,
+        is_finished_due_to_length=False,
+        is_finished_due_to_cancellation=False,
+        is_disagg_generation_transmission_in_progress=False,
+        py_kv_transfer_start_time=None,
+        py_kv_transfer_timed_out=False,
+    )
+
+
+def _make_ctx_transfer_executor(request, timeout_ms=0):
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.kv_transfer_timeout_ms = timeout_ms
+    executor.kv_cache_manager = Mock()
+    executor.kv_connector_manager = None
+    executor.active_requests = []
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {
+        request.py_request_id: request
+    }
+    executor._check_disagg_ctx_cache_transfer_status = Mock()
+    executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+    return executor
+
+
+def test_ctx_transfer_clock_is_armed_before_the_pp_loop_can_drain():
+    """The CTX-side timeout clock is armed on the iteration the context finishes.
+
+    ``py_kv_transfer_start_time`` is stamped by ``_send_kv_async``, which the PP
+    loop only reaches via ``_handle_executed_batch``. That is the same gate that
+    stops running once the pipeline drains -- but a request can only *enter*
+    transfer by being executed, so the stamp necessarily lands while the gate is
+    still open. The loop goes empty strictly afterwards, with the clock already
+    running. Without this, ``py_kv_transfer_timed_out`` could never be set on
+    CTX and the fix would have nothing to key on.
+    """
+    request = _make_ctx_only_request()
+    executor = _make_ctx_transfer_executor(request)
+
+    PyExecutor._send_kv_async(executor, [request])
+
+    executor.async_transfer_manager.start_transfer.assert_called_once_with(request)
+    executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
+    assert request.py_kv_transfer_start_time is not None, (
+        "the CTX transfer clock must be armed while the batch gate is still open"
+    )
+
+    # The loop is now empty; the clock keeps running and the deadline is missed.
+    PyExecutor._check_kv_transfer_timeout(executor)
+
+    assert request.py_kv_transfer_timed_out is True
+
+
+def test_uncancellable_ctx_transfer_keeps_the_timeout_flag_set():
+    """The release path dead-ends, so the flag stays set for the wedged request.
+
+    ``cancel_request`` returns False whenever in-flight cancellation is off and
+    the transfer is already active, so ``_check_disagg_ctx_cache_transfer_status``
+    ``continue``s without ever clearing the flag. That stickiness is what makes
+    the watchdog predicate stable rather than flapping.
+    """
+    request = _make_ctx_only_request()
+    request.py_kv_transfer_start_time = 1.0
+    request.py_kv_transfer_timed_out = True
+    request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    executor = _make_ctx_transfer_executor(request)
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
+    executor.kv_cache_transceiver.cancel_request.return_value = False
+    executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    executor._disagg_timed_out_ctx_cancelled_ids = set()
+    executor._disagg_inflight_cancel_unsupported_logged = False
+    executor._end_transfer_and_maybe_terminate = Mock()
+    executor._check_cache_transfer_errors = Mock()
+
+    PyExecutor._check_disagg_ctx_cache_transfer_status(executor, 0)
+
+    executor._end_transfer_and_maybe_terminate.assert_not_called()
+    assert request.py_kv_transfer_timed_out is True
+    assert request.py_kv_transfer_start_time == 1.0
+
+
+def _make_empty_pass_executor():
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = Mock()
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.has_any_inflight_requests.return_value = True
+    executor._check_kv_transfer_timeout = Mock()
+    executor._disagg_pp_termination_handler = None
+    executor.enable_iter_perf_stats = True
+    executor._handle_kv_transfer_timeouts_synced = Mock()
+    executor._flush_iter_stats_synced = Mock()
+    executor._commit_kv_cache_stats = Mock()
+    executor._process_iter_stats = Mock()
+    return executor
+
+
+def test_empty_pass_runs_the_timeout_check_the_pp_loop_used_to_skip():
+    """``_handle_executed_batch(None)`` runs exactly the ungated tail.
+
+    This is the call the drained PP loop now makes once per iteration. It must
+    reach ``_check_kv_transfer_timeout`` -- which is what never happened before,
+    because ``handle_executed_batches`` iterates ``executed_batch_num`` times and
+    that is 0 once nothing is queued.
+    """
+    executor = _make_empty_pass_executor()
+
+    PyExecutor._handle_executed_batch(executor, None)
+
+    executor._check_kv_transfer_timeout.assert_called_once_with()
+    executor._handle_kv_transfer_timeouts_synced.assert_called_once_with()
+    executor._flush_iter_stats_synced.assert_called_once_with()
+    # Nothing batch-gated may run: there is no batch.
+    executor._commit_kv_cache_stats.assert_not_called()
+    executor._process_iter_stats.assert_not_called()
+
+
+def _executed_batch_empty_pass_guards():
+    """Return the guard expressions of the empty-pass calls in _executor_loop_pp."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(PyExecutor._executor_loop_pp)))
+    guards = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "_handle_executed_batch"
+                and len(inner.args) == 1
+                and isinstance(inner.args[0], ast.Constant)
+                and inner.args[0].value is None
+            ):
+                guards.append(node.test)
+    return guards
+
+
+def test_pp_loop_makes_one_empty_pass_when_the_pipeline_is_drained():
+    """The drained PP loop must still make a single pass through the tail."""
+    guards = _executed_batch_empty_pass_guards()
+
+    assert len(guards) == 1, (
+        "expected exactly one guarded _handle_executed_batch(None) empty pass in "
+        f"_executor_loop_pp, found {len(guards)}"
+    )
+
+
+def test_empty_pass_is_guarded_only_by_the_broadcast_consensus_value():
+    """Rank symmetry: the guard may depend on nothing rank-local.
+
+    ``executed_batch_num`` is the ring-broadcast consensus value and is identical
+    on every rank, so guarding on it alone means the empty pass -- and the
+    ``tp_allgather`` collectives inside the tail -- is taken by all ranks or by
+    none. Any rank-local term here (``self.dist.rank``, ``executed_batches``,
+    ``unhandled_batch_counter``, ...) would desync the collectives and deadlock
+    every PP job, disagg or not.
+    """
+    import ast
+
+    (guard,) = _executed_batch_empty_pass_guards()
+
+    names = {node.id for node in ast.walk(guard) if isinstance(node, ast.Name)}
+    attributes = {node.attr for node in ast.walk(guard) if isinstance(node, ast.Attribute)}
+
+    assert names == {"executed_batch_num"}, f"guard reads rank-local names: {names}"
+    assert not attributes, f"guard reads rank-local attributes: {attributes}"
+
+
+def _make_watchdog_executor(num_scheduled_requests=0, in_transfer=(), active=()):
+    executor = object.__new__(PyExecutor)
+    executor.num_scheduled_requests = num_scheduled_requests
+    executor.kv_cache_transceiver = Mock()
+    executor.active_requests = list(active)
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {
+        request.py_request_id: request for request in in_transfer
+    }
+    return executor
+
+
+def test_watchdog_predicate_fires_on_wedged_ctx_transfer():
+    request = _make_ctx_only_request()
+    request.py_kv_transfer_timed_out = True
+    executor = _make_watchdog_executor(in_transfer=[request])
+
+    assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is True
+
+
+def test_watchdog_predicate_fires_on_wedged_gen_transfer():
+    request = _make_timeout_request()
+    executor = _make_watchdog_executor(active=[request])
+
+    assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is True
+
+
+def test_watchdog_predicate_ignores_a_healthy_idle_server():
+    """An idle server with nothing past its deadline must never be killed."""
+    request = _make_ctx_only_request()
+    assert request.py_kv_transfer_timed_out is False
+    executor = _make_watchdog_executor(in_transfer=[request], active=[request])
+
+    assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is False
+
+
+def test_watchdog_predicate_ignores_a_completely_idle_server():
+    executor = _make_watchdog_executor()
+
+    assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is False
+
+
+def test_watchdog_predicate_requires_an_empty_batch():
+    """A loop that is still scheduling work is making progress, not wedged."""
+    request = _make_ctx_only_request()
+    request.py_kv_transfer_timed_out = True
+    executor = _make_watchdog_executor(num_scheduled_requests=4, in_transfer=[request])
+
+    assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is False
+
+
+def test_watchdog_predicate_is_inert_without_a_transceiver():
+    """Non-disagg jobs must be untouched by this mechanism."""
+    executor = _make_watchdog_executor()
+    executor.kv_cache_transceiver = None
+
+    assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is False

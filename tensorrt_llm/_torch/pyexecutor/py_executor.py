@@ -921,6 +921,8 @@ class PyExecutor:
         if kv_cache_transceiver is not None:
             self.hang_detector.register_status_provider(
                 kv_cache_transceiver.get_status_dump)
+            self.hang_detector.set_rearm_suppressor(
+                self._is_wedged_on_timed_out_kv_transfer)
         cache_transceiver_config = getattr(self.llm_args,
                                            "cache_transceiver_config", None)
         max_tokens_in_buffer = getattr(cache_transceiver_config,
@@ -2823,6 +2825,25 @@ class PyExecutor:
 
                 # Stage 3.3: Handle executed batches.
                 handle_executed_batches(executed_batch_num)
+
+                # Once the pipeline drains, executed_batch_num is 0 and the
+                # loop above stops calling _handle_executed_batch entirely --
+                # taking out its ungated tail (the KV-transfer timeout check
+                # and the synced-collective drains) along with it. A disagg
+                # KV transfer wedged at that point would then never be flagged
+                # and this loop would spin until the harness timeout. Make one
+                # empty pass so the tail runs every iteration, mirroring the
+                # loop-body drains in _executor_loop_overlap.
+                #
+                # Rank symmetry: executed_batch_num is the ring-broadcast
+                # consensus value and is identical on every rank, so this
+                # branch is taken by all ranks or by none. Combined with
+                # handle_executed_batches (which calls _handle_executed_batch
+                # exactly executed_batch_num times on every rank) the tail runs
+                # max(executed_batch_num, 1) times per iteration everywhere,
+                # keeping the collectives inside it in lockstep.
+                if executed_batch_num == 0:
+                    self._handle_executed_batch(None)
 
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -5602,6 +5623,46 @@ class PyExecutor:
         self._handle_errors(error_msg,
                             requests=error_requests,
                             charge_budget=False)
+
+    def _is_wedged_on_timed_out_kv_transfer(self) -> bool:
+        """Whether this loop is idling behind a KV transfer that blew its deadline.
+
+        Installed as the hang detector's re-arm suppressor. Two conditions,
+        both required:
+
+        * nothing was scheduled on the last iteration, and
+        * some request is flagged ``py_kv_transfer_timed_out``.
+
+        The flag is deliberately the only transfer-side signal used here. It is
+        set solely by ``_check_kv_transfer_timeout``, and only after
+        ``elapsed > kv_transfer_timeout_ms`` -- i.e. after the deadline the
+        operator declared has already been missed -- so there is no legitimate
+        state beyond it. Keying on elapsed time or on schedulability instead
+        would re-admit false positives that this loop must tolerate: a genuine
+        128k-context transfer running for minutes, attention-DP dummy padding,
+        and PP microbatch drain all leave the loop idle without anything being
+        wrong.
+
+        When both hold, the executor is in the disagg livelock: it spins with
+        an empty batch at sub-millisecond period -- re-arming the watchdog
+        thousands of times a second -- while a wedged transfer holds a request
+        the transceiver refuses to cancel. Freezing the watchdog deadline turns
+        that into a hard kill one hang-detection timeout later instead of a run
+        to the harness timeout.
+        """
+        if self.num_scheduled_requests != 0:
+            return False
+        if self.kv_cache_transceiver is None:
+            return False
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if transfer_manager is not None:
+            for request in transfer_manager.requests_in_transfer().values():
+                if request.py_kv_transfer_timed_out:
+                    return True
+        for request in self.active_requests:
+            if request.py_kv_transfer_timed_out:
+                return True
+        return False
 
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):

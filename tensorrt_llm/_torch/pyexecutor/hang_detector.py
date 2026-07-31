@@ -101,6 +101,7 @@ class HangDetector:
         self.active = False
         self._detected = False
         self._status_providers: list[Callable[[], str]] = []
+        self._rearm_suppressor: Optional[Callable[[], bool]] = None
 
     def start(self):
         """Enable hang detection."""
@@ -118,6 +119,42 @@ class HangDetector:
         """Register a nonblocking callable that returns status to dump on hang detection."""
         with self.lock:
             self._status_providers.append(provider)
+
+    def set_rearm_suppressor(self, suppressor: Optional[Callable[[], bool]]) -> None:
+        """Install a predicate that freezes the detection deadline while it holds.
+
+        The executor loop re-arms the watchdog once per iteration, so a loop
+        that spins with nothing to do hides a hang for as long as it spins.
+        While ``suppressor`` returns True the pending detection is left to run
+        down instead of being pushed forward by ``checkpoint()``/``pause()``.
+
+        This can only ever make the detector fire *sooner*, never later: an
+        already-pending detection is never cancelled by the suppressed path,
+        and when nothing is armed yet the normal arming path still runs (see
+        ``_suppress_rearm``). Callers must supply a cheap, nonblocking
+        predicate -- it runs on the executor thread on every checkpoint.
+        """
+        self._rearm_suppressor = suppressor
+
+    def is_armed(self) -> bool:
+        """Whether a hang detection is currently pending."""
+        return self.task is not None and not self.task.done()
+
+    def _suppress_rearm(self) -> bool:
+        """Whether the pending detection must be left alone rather than reset.
+
+        Never suppresses while unarmed, so the detector cannot be disabled by
+        this path -- only prevented from having its deadline pushed forward.
+        """
+        if self._rearm_suppressor is None or not self.is_armed():
+            return False
+        try:
+            return bool(self._rearm_suppressor())
+        except Exception as error:  # noqa: BLE001 - isolate the caller's predicate
+            _best_effort_log_error(
+                f"HangDetector: re-arm suppressor failed with {type(error).__name__}: {error}"
+            )
+            return False
 
     async def _detect_hang(self) -> None:
         await asyncio.sleep(self.timeout)
@@ -154,6 +191,8 @@ class HangDetector:
 
     def checkpoint(self):
         """Reset hang detection timer."""
+        if self._suppress_rearm():
+            return
         self.cancel_task()
         if self.active:
             self.task = asyncio.run_coroutine_threadsafe(self._detect_hang(), self.loop)
@@ -167,6 +206,13 @@ class HangDetector:
     @contextmanager
     def pause(self):
         """Pause hang detection in scope."""
+        if self._suppress_rearm():
+            # A deadline has already been missed. Keep the pending detection
+            # running so a blocking call in this scope cannot hide the hang,
+            # and so the suppressed checkpoint at the top of the executor loop
+            # is not undone by this context manager re-arming on exit.
+            yield
+            return
         try:
             self.cancel_task()
             yield
