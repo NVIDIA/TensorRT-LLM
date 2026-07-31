@@ -2077,8 +2077,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     def mla_rope_generation(
         self,
-        fused_q: torch.Tensor,
-        q_pe: torch.Tensor,
+        fused_q: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
         cu_q_seqlens: torch.Tensor,
@@ -2092,6 +2092,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_norm_eps: float = 1e-6,
         precomputed_cu_seqlens: bool = False,
         precomputed_fmha_scheduler: bool = False,
+        kv_only: bool = False,
+        kv_done_elsewhere: bool = False,
+        quant_scale_qkv: Optional[torch.Tensor] = None,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2161,4 +2164,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_norm_eps,
             precomputed_cu_seqlens,
             precomputed_fmha_scheduler,
+            kv_only,
+            kv_done_elsewhere,
+            quant_scale_qkv,
         )

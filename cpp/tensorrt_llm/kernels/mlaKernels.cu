@@ -1579,8 +1579,18 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
 {
+    // The trailing `head_num * 8` block rows are the q_nope FP8 quantize-copy region
+    // (`head_idx > head_num + 8`). It dominates the launch -- at head_num 128 it is
+    // 1024 of 1161 rows, 88% -- and it is pure requantization of a buffer another
+    // kernel already produced. `deepseek_v4_q_norm_fused_fp8` writes that segment
+    // straight out of q_b_layernorm, exactly as it already does for context, so when
+    // the caller took that path the rows have nothing to do. Dropping them from the
+    // grid makes the region unreachable; no separate template instance needed.
+    bool const useFusedFp8Q = params.fuse_q_fp8_in_rope && params.cache_type == KvCacheDataType::FP8
+        && params.quant_q_buf != nullptr && params.quant_scale_qkv != nullptr;
+
     dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, 32)), params.head_num + 1 + 8);
-    if (params.cache_type == KvCacheDataType::FP8)
+    if (params.cache_type == KvCacheDataType::FP8 && !useFusedFp8Q)
         grid.y += params.head_num * 8;
     TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
         "MLA can only support input sequences with the same sequence length.");
@@ -1610,11 +1620,17 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
+    // Both halves of a Q row must land on one scale: on the fused path the nope
+    // segment was quantized by `deepseek_v4_q_norm_fused_fp8` with `quant_scale_qkv`,
+    // so the rope segment written here has to use the same tensor. They are both 1.0
+    // today, which is why nothing broke, but that is a coincidence, not a contract.
+    float const* quant_scale_q_eff = useFusedFp8Q ? params.quant_scale_qkv : params.quant_scale_q;
+
     cudaLaunchKernelEx(&config, kernel_instance, params.q_buf, params.q_pe, params.latent_cache, params.quant_q_buf,
         kv_cache_buffer, params.cos_sin_cache, params.head_num, params.meta.kv_lora_rank, params.acc_q_len, seq_len,
         params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
         params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
-        params.quant_scale_q, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
+        quant_scale_q_eff, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
         params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank,
         params.precomputed_cu_seqlens, params.precomputed_fmha_scheduler);
 }
