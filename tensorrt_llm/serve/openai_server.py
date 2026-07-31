@@ -471,7 +471,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # expect.
             if self.metrics_collector:
                 self.metrics_collector.log_request_error(http_code=400)
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+            return JSONResponse(status_code=400,
+                                content={"error": "Request validation failed"})
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert isinstance(

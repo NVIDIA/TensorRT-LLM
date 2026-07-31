@@ -15,7 +15,7 @@ from utils.util import skip_single_gpu
 # isort: on
 
 from tensorrt_llm.executor.base_worker import BaseWorker
-from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
@@ -48,6 +48,26 @@ def test_enqueue_request_wraps_lora_load_error():
 
     with pytest.raises(RequestError, match="Failed to load LoRA adapter"):
         worker._enqueue_request(request)
+
+
+def test_lora_request_missing_path_fails_at_load_time(tmp_path):
+
+    class LoraManager:
+
+        def load_from_ckpt(self, *args, **kwargs):
+            pytest.fail("missing LoRA path must fail before adapter load")
+
+    missing_path = str(tmp_path / "private-lora-path")
+    worker = object.__new__(BaseWorker)
+    worker._lora_manager = LoraManager()
+    worker._lora_model_config = None
+    worker._runtime_model_config = None
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        worker._load_lora_adapter(LoRARequest("missing", 1, missing_path))
+
+    assert str(exc_info.value) == "lora_path does not exist"
+    assert missing_path not in str(exc_info.value)
 
 
 def create_fake_executor_config(engine_path, tp_size: int = 1):

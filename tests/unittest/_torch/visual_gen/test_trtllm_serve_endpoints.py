@@ -1590,7 +1590,7 @@ class TestNonVisualGenValidationResponse:
         async def _handler(_, exc):
             if role == "VISUAL_GEN":
                 return _llm_envelope_branch(exc)
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+            return JSONResponse(status_code=400, content={"error": "Request validation failed"})
 
         # Mirror :meth:`OpenAIServer._create_visual_gen_validation_error_response`
         # inline so the test does not depend on instance state.
@@ -1613,14 +1613,17 @@ class TestNonVisualGenValidationResponse:
 
     def test_non_visual_gen_role_returns_shared_400_error_body(self):
         """Non-visual-gen roles return HTTP 400 with the shared
-        ``{"error": str(exc)}`` body that ``test_malformed_json_request``
+        ``{"error": ...}`` body that ``test_malformed_json_request``
         and existing clients depend on."""
         client = TestClient(self._build_app_with_dispatch(role="CONTEXT"))
-        resp = client.post("/route", json={"not_messages": []})
+        secret = "/tmp/private-lora-path"
+        resp = client.post("/route", json={"messages": secret})
         assert resp.status_code == 400
         body = resp.json()
         assert "error" in body
         assert isinstance(body["error"], str)
+        assert body["error"] == "Request validation failed"
+        assert secret not in body["error"]
         # The visual-gen LLM envelope must not leak into non-VG paths.
         assert "object" not in body
         assert "type" not in body
