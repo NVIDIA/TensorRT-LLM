@@ -25,30 +25,11 @@ from typing import Optional, cast
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.bindings.executor import FinishReason
-
-BEAM_SEARCH_PAD_TOKEN = -1
 
 
 @dataclass(kw_only=True)
 class StrategyMetadata:
     """Base class for per-strategy-group metadata passed into sample()."""
-
-
-@dataclass(kw_only=True)
-class BeamSearchMetadata(StrategyMetadata):
-    """Stateful tensors required by beam_search_sampling_batch."""
-
-    cache_indirection: torch.Tensor
-    cache_indirection_buffer: torch.Tensor
-    cum_log_probs: torch.Tensor
-    new_log_probs: torch.Tensor
-    seq_slots: torch.Tensor
-    seq_lens: torch.Tensor
-    finished_beams: torch.Tensor
-    predecessor_beams: torch.Tensor
-    seq_offsets: torch.Tensor
-    beam_idx_arange: torch.Tensor
 
 
 def min_p_renorm_probs(
@@ -160,119 +141,6 @@ def greedy_search_sampling_batch(
     if return_probs:
         softmax = torch.zeros_like(logits)
         softmax.scatter_(1, next_tokens.unsqueeze(-1), 1.0)
-    return next_tokens, softmax
-
-
-def _update_cache_indirection_buffer(
-    cache_indirection_input: torch.Tensor,
-    cache_indirection_output: torch.Tensor,
-    seq_slots: torch.Tensor,
-) -> None:
-    assert cache_indirection_input.device == cache_indirection_output.device
-    cache_indirection_input.index_copy_(0, seq_slots, cache_indirection_output[seq_slots])
-
-
-def beam_search_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    beam_width_in: int,
-    beam_width_out: int,
-    beam_search_args: BeamSearchMetadata,
-    temperature: float | None,
-    return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Sample beam_width tokens for each request in parallel."""
-    logits_dim = logits.dim()
-    assert logits_dim == 2, "logits should be 2D: [batch_size * beam_width, vocab_size]"
-    batch_size, vocab_size = logits.size()
-    batch_size = batch_size // beam_width_in
-
-    logits = logits.view(batch_size, beam_width_in, vocab_size)
-    if temperature is not None and temperature != 0:
-        logits = logits / max(temperature, 1e-5)
-    softmax: Optional[torch.Tensor] = None
-    if return_probs:
-        softmax = torch.softmax(logits, dim=-1)
-    _update_cache_indirection_buffer(
-        beam_search_args.cache_indirection_buffer,
-        beam_search_args.cache_indirection,
-        beam_search_args.seq_slots,
-    )
-    assert batch_size == beam_search_args.seq_slots.size(0)
-
-    logprobs = torch.log_softmax(logits, dim=-1)
-
-    finished_beams_mask = (
-        beam_search_args.finished_beams[beam_search_args.seq_slots, :beam_width_in]
-        != FinishReason.NOT_FINISHED.value
-    )
-    finished_beams_mask_expanded = finished_beams_mask.unsqueeze(-1).expand(
-        -1, -1, logprobs.size(-1)
-    )
-    logprobs = torch.where(finished_beams_mask_expanded, float("-inf"), logprobs)
-    logprobs[..., 0] = torch.where(finished_beams_mask, 0, logprobs[..., 0])
-
-    logprobs += beam_search_args.cum_log_probs.unsqueeze(-1)[
-        beam_search_args.seq_slots, :beam_width_in
-    ]
-
-    logprobs = logprobs.view(batch_size, beam_width_in * vocab_size)
-    sorted_logprobs, sorted_indices = torch.topk(logprobs, k=beam_width_out, sorted=True, dim=-1)
-
-    next_tokens = sorted_indices.to(torch.int32)
-
-    predecessor_beam = next_tokens // vocab_size
-    beam_search_args.predecessor_beams[beam_search_args.seq_slots, :beam_width_out] = (
-        predecessor_beam
-    )
-
-    max_beam_width = beam_search_args.finished_beams.size(1)
-    finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
-
-    offset_predecessor_beam = predecessor_beam + beam_search_args.seq_offsets[
-        : predecessor_beam.size(0)
-    ].unsqueeze(1)
-    finished_beams = finished_beams[offset_predecessor_beam]
-    beam_search_args.finished_beams[beam_search_args.seq_slots] = finished_beams.view(
-        batch_size, max_beam_width
-    )
-
-    cache_indirection = beam_search_args.cache_indirection[
-        beam_search_args.seq_slots, :beam_width_out
-    ]
-    cache_indirection_buffer = beam_search_args.cache_indirection_buffer[
-        beam_search_args.seq_slots, :beam_width_in
-    ]
-    torch.gather(
-        cache_indirection_buffer,
-        dim=1,
-        index=predecessor_beam.unsqueeze(2).expand(-1, -1, cache_indirection.size(2)),
-        out=cache_indirection,
-    )
-
-    index = beam_search_args.seq_lens.view(-1, 1, 1).expand(-1, beam_width_out, 1)
-    src = (
-        beam_search_args.beam_idx_arange[:beam_width_out]
-        .view(1, beam_width_out, 1)
-        .expand(batch_size, beam_width_out, 1)
-    )
-    cache_indirection.scatter_(2, index, src)
-
-    beam_search_args.cache_indirection[beam_search_args.seq_slots, :beam_width_out] = (
-        cache_indirection
-    )
-
-    next_tokens = next_tokens % vocab_size
-    ended_predecessor_mask = torch.gather(dim=1, index=predecessor_beam, input=finished_beams_mask)
-    next_tokens = torch.where(ended_predecessor_mask, BEAM_SEARCH_PAD_TOKEN, next_tokens)
-
-    old_cum_log_probs = beam_search_args.cum_log_probs[beam_search_args.seq_slots].view(-1)
-    beam_search_args.new_log_probs[beam_search_args.seq_slots, :beam_width_out] = (
-        sorted_logprobs[:, :beam_width_out] - old_cum_log_probs[offset_predecessor_beam]
-    )
-    beam_search_args.cum_log_probs[beam_search_args.seq_slots, :beam_width_out] = sorted_logprobs[
-        :, :beam_width_out
-    ]
     return next_tokens, softmax
 
 

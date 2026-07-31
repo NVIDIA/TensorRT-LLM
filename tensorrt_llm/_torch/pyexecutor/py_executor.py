@@ -86,6 +86,8 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
+from .sampler.beam_search import BeamSearchEarlyStop
+from .sampler.sampler_common import _unwrap_singleton
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
@@ -4902,11 +4904,41 @@ class PyExecutor:
         # Validate beam width
         sampling_config = request.sampling_config
         if sampling_config is not None:
+            # Requests must run at exactly max_beam_width.
+            #
+            # TorchSampler can sample a narrower request (buffers are allocated
+            # at max_beam_width and it slices to the per-request width), but the
+            # layers around it are not ready: the attention metadata is stamped
+            # with max_beam_width while the generation rows are laid out at the
+            # per-request width, and the scheduler is not beam-width aware, so a
+            # narrower request can be batched with a wider one and fail at
+            # forward time. Keep rejecting until those agree; TRTLLM-14792.
             if sampling_config.beam_width != self.max_beam_width:
                 raise ValueError(
                     f"Request beam width {sampling_config.beam_width} "
-                    f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
-                )
+                    f"is not equal to max_beam_width {self.max_beam_width}. "
+                    "This is not supported!")
+
+            # Exhaustive early_stopping keeps a pool of finished candidates,
+            # which the context server can already populate on its first step.
+            # That pool is not part of the disaggregated handoff and is cleared
+            # on the generation side, so a completion the context phase found
+            # would be silently dropped -- reachable under aggregation but not
+            # under disaggregation. Reject the combination until the handoff
+            # carries the pool; TRTLLM-14792.
+            if (request.is_context_only_request
+                    or request.is_generation_only_request):
+                early_stopping = _unwrap_singleton(
+                    sampling_config.early_stopping)
+                if (early_stopping is not None
+                        and BeamSearchEarlyStop.from_raw(early_stopping)
+                        is not BeamSearchEarlyStop.TRUE):
+                    raise ValueError(
+                        f"Beam search early_stopping={early_stopping} is not "
+                        "supported with disaggregated serving: the finished-"
+                        "candidate pool is not transferred between the context "
+                        "and generation servers. Use the default "
+                        "(early_stopping=True).")
 
         # Check token ID ranges
         self._validate_token_id_range(request)
@@ -5974,6 +6006,13 @@ class PyExecutor:
                               device=cum_log_probs.device,
                               dtype=cum_log_probs.dtype)
         cum_log_probs[seq_slot, :beam_width].copy_(values)
+
+        # The handoff carries one token already produced upstream. The
+        # per-beam generated-length counter is reset to zero when the request
+        # is admitted here, so seed it to 1: length_penalty normalizes by this
+        # counter, and leaving it at zero would divide by one less than the
+        # true length for the whole request.
+        beam_search_store.beam_gen_lengths[seq_slot, :beam_width].fill_(1)
         return True
 
     @staticmethod

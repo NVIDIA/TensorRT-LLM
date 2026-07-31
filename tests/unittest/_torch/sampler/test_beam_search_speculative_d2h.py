@@ -19,7 +19,7 @@ This file covers the code paths gated behind
 
 * parity vs the default (synchronous) beam-history D2H path,
 * the predictor-miss fallback in
-  `TorchSampler._prepare_beam_history._builder`
+  `BeamSearchHandler._prepare_beam_history._builder`
   (the synchronous `.cpu()` issued when the host-side predictor
   decided the step is non-terminal but the beam still finalizes),
 * the predictor-hit path that routes copies through the side stream.
@@ -43,6 +43,7 @@ from utils.util import assert_no_cuda_sync
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTorch, TorchSampler
+from tensorrt_llm._torch.pyexecutor.sampler.beam_search import BeamSearchHandler
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.llmapi import KvCacheConfig
 
@@ -157,7 +158,7 @@ def _run_with_env(
 
     Opt-in is via `TorchLlmArgs.enable_speculative_beam_history_d2h`.
     `predictor_override` patches
-    `TorchSampler._predict_beam_search_is_likely_finishing` and
+    `BeamSearchHandler.predict_is_likely_finishing` and
     `sampler_method_patches` patches arbitrary `TorchSampler` methods;
     either forces `TLLM_WORKER_USE_SINGLE_PROCESS=1` so class-level patches
     reach the sampler. `sampler_force_async_worker` enables the
@@ -169,9 +170,7 @@ def _run_with_env(
         # sampler to run in-process so the patch is observed.
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     if predictor_override is not None:
-        monkeypatch.setattr(
-            TorchSampler, "_predict_beam_search_is_likely_finishing", predictor_override
-        )
+        monkeypatch.setattr(BeamSearchHandler, "predict_is_likely_finishing", predictor_override)
 
     gc.collect(2)
     llm = _build_llm(

@@ -4363,8 +4363,49 @@ class PyTorchModelEngine(ModelEngine):
         _has_any_multimodal_request = any(r.py_multimodal_data is not None
                                           for r in generation_requests)
         if _n_gen > 0:
-            # All generation requests have the same beam width
+            # The whole batch is laid out with request 0's beam width: every
+            # generation request contributes exactly this many rows to
+            # input_ids / position_ids / sequence_lengths and to the logits the
+            # model returns. The sampler, in turn, locates a request's logits by
+            # accumulating the *per-request* beam widths
+            # (TorchSampler._select_generated_logits ->
+            # calculate_request_offsets). Both agree only while every request in
+            # the batch has the same beam width.
+            #
+            # Mixing widths would desynchronize the two: the sampler would read
+            # a request's rows at the wrong offset, and `logits.view(batch,
+            # beam_width_in, vocab)` succeeds for any shape whose element count
+            # divides, so the result is silently wrong rather than an error.
+            # Supporting mixed widths needs the forward path to emit a fixed
+            # max_beam_width stride and the sampler offsets to match; until
+            # then, fail loudly.
             beam_width = generation_requests[0].py_beam_width
+            # Admission pins every request to max_beam_width, but a
+            # variable-beam-width request narrows or widens per iteration, so
+            # the widths can still diverge mid-batch. Compare the
+            # *per-iteration* width: py_beam_width is fixed at admission and
+            # would be identical across those requests. CUDA-graph padding
+            # requests are built at the engine width and appended after
+            # scheduling, so they are excluded -- they carry no user request
+            # and would otherwise trip this on an ordinary padded batch.
+            real_requests = [
+                req for req in generation_requests
+                if not req.is_cuda_graph_dummy
+            ]
+            iter_widths = {
+                req.get_beam_width_by_iter()
+                for req in real_requests
+            }
+            if len(iter_widths) > 1:
+                # NB: this aborts the whole batch, not just the offending
+                # requests -- ModelEngine has no per-request failure channel,
+                # and by this point the batch is already scheduled. Scoping the
+                # failure needs the scheduler to group by beam width in the
+                # first place, so that no such batch is formed; TRTLLM-14792.
+                raise ValueError(
+                    "Generation requests in one batch must all have the same "
+                    f"beam width; got {sorted(iter_widths)}. Mixed beam widths "
+                    "within a batch are not supported yet (TRTLLM-14792).")
 
             # Pre-extend constant-value lists to avoid per-request append
             # overhead (saves ~3 append calls per request).
