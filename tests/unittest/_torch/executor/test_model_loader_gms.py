@@ -22,6 +22,7 @@ from tensorrt_llm._torch.weight_sharing import (
     ArtifactIdentity,
     PostTransformProfile,
     PostTransformProfileRegistry,
+    PostTransformRuntimeConstraints,
     PostTransformTransferScope,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
@@ -221,6 +222,7 @@ def _tiny_profile_registry() -> PostTransformProfileRegistry:
                 protocol_version=(ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
                 transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
                 transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+                runtime_constraints=PostTransformRuntimeConstraints(),
             ),
         )
     )
