@@ -59,7 +59,7 @@ class FallbackFmha(Fmha):
         if sparse_algorithm in ("deepseek_v4", "dsa"):
             if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla":
                 return False
-            if get_sm_version() == 120:
+            if get_sm_version() in (120, 121):
                 return False
         return True
 
