@@ -1591,7 +1591,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # lists (request ids, seq lens, cached-token counts) are frozen
             # into the graph at capture time and corrupt the cache on replay.
             # The helper falls back to the host-side loop for eager forwards
-            # and q_len > 1 (speculative decoding).
+            # only; under CUDA graphs it scatters device-side for any
+            # uniform q_len (1 for plain decode, 1 + draft_len for padded
+            # spec-dec verification batches).
             append_mla_latent_cache_generation_cuda_graph_safe(
                 metadata,
                 # NOTE: get_buffers / layer_offsets take the GLOBAL layer

@@ -124,26 +124,39 @@ def append_mla_latent_cache_generation_cuda_graph_safe(
     buffers that ``metadata.prepare()`` refreshes every step:
 
     - ``kv_lens_cuda_runtime`` holds each request's total KV length (cached +
-      new), so the new token's position is ``kv_len - 1`` (clamped to 0 so
-      graph-warmup passes with zeroed lengths stay in bounds).
+      new), so the ``q_len`` new tokens sit at positions
+      ``kv_len - q_len .. kv_len - 1`` (clamped to 0 so graph-warmup passes
+      with zeroed lengths stay in bounds).
     - ``kv_cache_block_offsets[pool_idx, slot, 0]`` is the C++
       ``setOffsets``-encoded block table: entries hold
       ``pool_block_index * num_pool_layers * kv_factor`` (+ the K/V field
       index, always 0 for the single-plane MLA cache), so the raw block index
       for the per-layer ``get_buffers`` view is recovered by integer division.
 
+    Handles any uniform ``q_len >= 1`` per generation request: plain decode
+    (``q_len == 1``) and speculative-verification batches (``q_len ==
+    1 + draft_len``; the spec workers pad drafts to the static max, so the
+    per-request token count is uniform). This matters for spec-dec under
+    CUDA graphs: the previous ``q_len == 1``-only version silently fell back
+    to the host-side loop for verification batches, whose capture-time write
+    positions (dummy-request block tables) were frozen into the graph — real
+    requests' generation-token latents were never appended on replay,
+    corrupting decode accuracy (Kimi K3 SA GSM8K 88.2 with graphs vs 96.2
+    eager).
+
     Falls back to the host-side loop for eager forwards (numerics identical
-    to the non-graph baseline) and for ``q_len > 1`` generation (speculative
-    decoding), which the single-token scatter below does not handle.
+    to the non-graph baseline) and for ragged generation batches, which
+    cannot occur under CUDA graphs.
     """
     kv_cache_manager = metadata.kv_cache_manager
     num_ctx = metadata.num_contexts
     n_gen = metadata.num_generations
     # Tensor shapes are static under CUDA graphs, so this host-side check is
-    # stable across replays: one latent row per generation request means
-    # q_len == 1 for every one of them.
-    q_len_is_one = latent_cache.shape[0] == n_gen
-    if not metadata.is_cuda_graph or not q_len_is_one:
+    # stable across replays: generation-only graph batches carry a uniform
+    # per-request token count (1 for plain decode, 1 + draft_len for
+    # padded speculative verification).
+    q_len_is_uniform = n_gen > 0 and latent_cache.shape[0] % n_gen == 0
+    if not metadata.is_cuda_graph or not q_len_is_uniform:
         append_mla_latent_cache(
             kv_cache_manager,
             layer_idx,
@@ -170,20 +183,27 @@ def append_mla_latent_cache_generation_cuda_graph_safe(
     kv_factor = kv_cache_manager.kv_factor
     tokens_per_block = kv_cache_manager.tokens_per_block
 
-    # Everything below only reads graph-stable device buffers.
+    # Everything below only reads graph-stable device buffers. ``q_len`` is
+    # derived from static tensor shapes, so it is a stable host constant per
+    # captured graph (1 for plain decode, 1 + draft_len for spec verify).
+    q_len = latent_cache.shape[0] // n_gen
     kv_lens = metadata.kv_lens_cuda_runtime[num_ctx:num_ctx + n_gen]
-    pos = (kv_lens.to(torch.int64) - 1).clamp_(min=0)
+    # ``kv_len`` includes the new tokens, so they occupy positions
+    # ``kv_len - q_len .. kv_len - 1``. pos: [n_gen, q_len].
+    pos = ((kv_lens.to(torch.int64) - q_len).clamp_(min=0).unsqueeze(1) +
+           torch.arange(q_len, dtype=torch.int64, device=kv_lens.device))
     block_slot = pos // tokens_per_block
     block_offset = pos % tokens_per_block
     # [num_pools, max_num_sequences, 2, max_blocks_per_seq]; the two K/V
     # entries are identical for the kv_factor=1 MLA cache, take field 0.
     block_table = metadata.kv_cache_block_offsets[pool_idx,
                                                   num_ctx:num_ctx + n_gen, 0]
-    encoded = block_table.gather(1, block_slot.unsqueeze(1)).squeeze(1)
+    encoded = block_table.gather(1, block_slot)  # [n_gen, q_len]
     # Placeholder entries are negative; clamp so warmup rows stay in bounds.
-    dest_block = encoded.to(torch.int64).clamp_(min=0) // (num_pool_layers *
-                                                           kv_factor)
-    src = latent_cache.to(kv_cache.dtype)
+    dest_block = encoded.to(
+        torch.int64).clamp_(min=0) // (num_pool_layers * kv_factor)
+    src = latent_cache.to(kv_cache.dtype).reshape(n_gen, q_len,
+                                                  latent_cache.shape[-1])
     if kv_layout == "NHD":
         kv_cache[dest_block, 0, block_offset, 0, :] = src
     elif kv_layout == "HND":

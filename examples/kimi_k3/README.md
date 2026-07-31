@@ -199,11 +199,12 @@ decoding requires the default cache manager, which cannot reuse blocks.
   GSM8K.
 - Speculative decoding:
   - Suffix-automaton (SA) speculative decoding is supported as an opt-in
-    for evaluation (see `eval_extra_llm_options_sa.yaml`). SA requires CUDA
-    graphs disabled (`cuda_graph_config: null`), the overlap scheduler off,
-    and `max_batch_size` ≤ 8. Enabling CUDA graphs together with SA
-    currently degrades output quality. SA speedup is workload-dependent —
-    proportional to n-gram repetition in the generated output.
+    for evaluation (see `eval_extra_llm_options_sa.yaml`). SA requires the
+    overlap scheduler off and `max_batch_size` ≤ 8, and is compatible with
+    CUDA graphs — set the CUDA-graph `max_batch_size` to match (GSM8K with
+    graphs matches the eager baseline for `max_draft_len` 1 and 2). SA
+    speedup is workload-dependent — proportional to n-gram repetition in
+    the generated output.
   - MTP and DFlash speculative decoding are scaffolding only and not yet
     functional; support depends on compatible draft weights.
 - Disaggregated serving works end-to-end within the constraints below; see
