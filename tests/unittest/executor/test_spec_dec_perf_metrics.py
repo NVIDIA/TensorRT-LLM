@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for backfilling RequestPerfMetrics.speculative_decoding.
 
 The PyTorch flow (TorchSampler) never calls
@@ -16,6 +30,10 @@ import pytest
 
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor.result import GenerationResultBase
+
+# CI's CPU stages select tests with ``-m "cpu_only and not disabled"``; without
+# this marker the file would be collected but never run there.
+pytestmark = pytest.mark.cpu_only
 
 
 def _fill(spec_dec_totals, perf_metrics):
@@ -43,6 +61,7 @@ def test_noop_without_totals():
 
     assert pm.speculative_decoding.total_accepted_draft_tokens == 0
     assert pm.speculative_decoding.total_draft_tokens == 0
+    assert pm.speculative_decoding.acceptance_rate == pytest.approx(0.0)
 
 
 def test_noop_when_section_already_populated():
@@ -59,6 +78,7 @@ def test_noop_when_section_already_populated():
 
     assert pm.speculative_decoding.total_accepted_draft_tokens == 5
     assert pm.speculative_decoding.total_draft_tokens == 10
+    assert pm.speculative_decoding.acceptance_rate == pytest.approx(0.5)
 
 
 def test_noop_on_nonpositive_drafted():
@@ -66,7 +86,9 @@ def test_noop_on_nonpositive_drafted():
 
     _fill((0, 0), pm)
 
+    assert pm.speculative_decoding.total_accepted_draft_tokens == 0
     assert pm.speculative_decoding.total_draft_tokens == 0
+    assert pm.speculative_decoding.acceptance_rate == pytest.approx(0.0)
 
 
 def test_survives_pickle_roundtrip():
