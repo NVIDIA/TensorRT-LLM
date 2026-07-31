@@ -309,6 +309,17 @@ def wan22_t2v_fp8():
 
 
 @pytest.fixture(scope="module")
+def wan22_t2v_fp8_rowwise():
+    pipeline = _make_wan22_t2v(
+        quant_config={"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True}
+    )
+    yield pipeline
+    del pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
 def wan22_t2v_trtllm():
     pipeline = _make_wan22_t2v(attention_config=AttentionConfig(backend="TRTLLM"))
     yield pipeline

@@ -959,6 +959,11 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
+    # When True, use tunable_fp8_per_token_quant (AutoTuner selects TRT-LLM vs
+    # vectorized kernel). Visual gen pipelines set this to True before model
+    # construction; LLM paths leave it False.
+    use_tunable_quantize: bool = False
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         weight_shape = (out_features, in_features)
@@ -997,8 +1002,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                                          dtype=torch.float32)
         else:
             # Use dynamic per-token quantization for activation
-            qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
-                input)
+            if FP8RowwiseLinearMethod.use_tunable_quantize:
+                qinput, cur_input_scale = torch.ops.trtllm.tunable_fp8_per_token_quant(
+                    input)
+            else:
+                qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                    input)
 
         # This op does not support bias now.
         output_buffer_kind = (

@@ -436,6 +436,15 @@ def wan21_t2v_fp8_block():
 
 
 @pytest.fixture(scope="module")
+def wan21_t2v_fp8_rowwise():
+    pipeline = _make_wan21_t2v({"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True})
+    yield pipeline
+    del pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
 def wan21_t2v_nvfp4():
     pipeline = _make_wan21_t2v({"quant_algo": "NVFP4", "dynamic": True})
     yield pipeline
@@ -589,13 +598,24 @@ class TestWan21T2VPipelineFeatures:
         [
             ("FP8", "wan21_t2v_fp8"),
             ("FP8_BLOCK_SCALES", "wan21_t2v_fp8_block"),
+            ("FP8_PER_CHANNEL_PER_TOKEN", "wan21_t2v_fp8_rowwise"),
         ],
     )
     def test_fp8_e2e_accuracy(
-        self, wan21_t2v_bf16, wan21_t2v_fp8, wan21_t2v_fp8_block, quant_name, pipe_fixture
+        self,
+        wan21_t2v_bf16,
+        wan21_t2v_fp8,
+        wan21_t2v_fp8_block,
+        wan21_t2v_fp8_rowwise,
+        quant_name,
+        pipe_fixture,
     ):
-        """FP8/FP8_BLOCK_SCALES full-transformer output close to BF16 (cos_sim > 0.99)."""
-        quant_pipeline = wan21_t2v_fp8 if pipe_fixture == "wan21_t2v_fp8" else wan21_t2v_fp8_block
+        """FP8/FP8_BLOCK_SCALES/FP8_PER_CHANNEL_PER_TOKEN full-transformer output close to BF16 (cos_sim > 0.99)."""
+        quant_pipeline = {
+            "wan21_t2v_fp8": wan21_t2v_fp8,
+            "wan21_t2v_fp8_block": wan21_t2v_fp8_block,
+            "wan21_t2v_fp8_rowwise": wan21_t2v_fp8_rowwise,
+        }[pipe_fixture]
         hs, ts, enc = _transformer_inputs()
 
         with torch.no_grad():
