@@ -57,6 +57,16 @@ uint64_t hash64Mix(int64_t input, uint64_t seed)
     return seed ^ (value + static_cast<uint64_t>(kHashCombineConst) + (seed << 6U) + (seed >> 2U));
 }
 
+bool pageCoversBlock(CommittedPage const* page, Block const& block)
+{
+    if (page == nullptr)
+    {
+        return false;
+    }
+    auto const* ssmPage = dynamic_cast<SsmCommittedPage const*>(page);
+    return ssmPage == nullptr || ssmPage->numTokensInBlock >= static_cast<int>(block.tokens.size());
+}
+
 } // namespace
 
 EventManager::EventManager(int maxKvEventEntries, int windowSize, std::optional<int> attentionDpRank,
@@ -176,7 +186,7 @@ void EventManager::addStoredBlockUnlocked(Block const& block)
     std::set<int> lifeCycleIds;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)
     {
-        if (block.storage[lifeCycle] != nullptr)
+        if (pageCoversBlock(block.getPage(lifeCycle), block))
         {
             lifeCycleIds.insert(lifeCycle.value());
         }
@@ -538,8 +548,8 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
         {
             continue;
         }
-        auto const* page = block.storage[lifeCycle];
-        if (page != nullptr)
+        auto const* page = block.getPage(lifeCycle);
+        if (pageCoversBlock(page, block))
         {
             cacheLevel = page->cacheLevel;
             priority = page->priority;

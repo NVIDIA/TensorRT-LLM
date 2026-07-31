@@ -335,7 +335,7 @@ class KVCacheEventManager:
 
     def _add_event(
         self,
-        data: KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData,
+        data: (KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData),
         layer_group_id: LayerGroupId = None,
     ) -> None:
         if self._max_kv_event_entries <= 0:
@@ -416,7 +416,7 @@ class KVCacheEventManager:
 
     def _add_event_unlocked(
         self,
-        data: KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData,
+        data: (KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData),
         layer_group_id: LayerGroupId = None,
     ) -> KVCacheEvent:
         if not isinstance(data, KVCacheRemovedData):
@@ -536,7 +536,7 @@ class KVCacheEventManager:
         cache_level: CacheLevel = GPU_LEVEL
         priority: Priority = PRIORITY_DEFAULT
         found_page = False
-        for life_cycle_id, _ in enumerate(block.storage):
+        for life_cycle_id in range(len(block.storage)):
             if life_cycle_ids is not None and life_cycle_id not in life_cycle_ids:
                 continue
             page = block.get_page(life_cycle_id)
@@ -561,7 +561,7 @@ class KVCacheEventManager:
     @staticmethod
     def _life_cycle_ids_from_radix_block(block: Any) -> set[int]:
         life_cycle_ids = set[int]()
-        for life_cycle_id, _ in enumerate(block.storage):
+        for life_cycle_id in range(len(block.storage)):
             page = block.get_page(life_cycle_id)
             if page is not None and page.num_tokens_in_block >= len(block.tokens):
                 life_cycle_ids.add(life_cycle_id)
