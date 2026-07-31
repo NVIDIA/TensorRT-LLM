@@ -6,7 +6,8 @@ import itertools
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
+from typing import (TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Union,
+                    cast)
 
 import torch
 
@@ -75,6 +76,17 @@ class MultimodalEncoderProgress(Enum):
     precomputed embedding was supplied, or the request has no MM payload."""
 
 
+class _Unset:
+    """Sentinel for a memo that has not been computed yet.
+
+    Distinct from `None`, which is a real result: the request cannot build
+    stable cache keys and its items always encode.
+    """
+
+
+_UNSET = _Unset()
+
+
 @dataclass
 class MultimodalEncoderRequestState:
     """Per-item MM encoder bookkeeping owned by one request.
@@ -112,6 +124,14 @@ class MultimodalEncoderRequestState:
     recorded: List[bool]
     """Whether each atomic item has been written into `embeddings`, in prompt
     order."""
+
+    cache_item_keys: Union[List[Hashable], None, "_Unset"] = _UNSET
+    """Memoized per-item encoder cache keys, or `None` once known to be
+    unkeyable. Derived from the request's content hashes and item metadata,
+    both fixed at admission, so this never goes stale and is computed on the
+    first iteration that schedules any of the request's items rather than on
+    every one. `_UNSET` distinguishes "not computed yet" from "computed, and
+    this request cannot participate in the cache"."""
 
     embeddings: Optional[torch.Tensor] = None
     """Contiguous ``[sum(embedding_lengths), ...]`` storage for every item of

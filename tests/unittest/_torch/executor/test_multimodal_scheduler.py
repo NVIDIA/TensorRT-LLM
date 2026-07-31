@@ -790,6 +790,50 @@ def test_cache_off_encodes_every_item_without_touching_cache(monkeypatch):
     assert len(cache) == 0  # never populated
 
 
+def test_item_cache_keys_are_built_once_per_request(monkeypatch):
+    """Keys depend only on inputs fixed at admission, so a request whose items
+    span several iterations must not rebuild them on each one."""
+    cache = TensorLRUCache(1 << 20, name="test")
+    engine = _cache_engine(cache, monkeypatch, supports_encoder_cache=True)
+    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
+
+    builds = []
+    original = engine.model.build_encoder_cache_item_keys
+
+    def counting(*args, **kwargs):
+        builds.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine.model, "build_encoder_cache_item_keys", counting)
+
+    first = engine.get_mm_encoder_item_keys(request)
+    second = engine.get_mm_encoder_item_keys(request)
+
+    assert first == second
+    assert len(builds) == 1
+
+
+def test_item_cache_keys_memo_records_unkeyable_requests(monkeypatch):
+    """`None` is a real answer -- an unkeyable request must be remembered as
+    such rather than re-derived on every iteration."""
+    cache = TensorLRUCache(1 << 20, name="test")
+    engine = _cache_engine(cache, monkeypatch, supports_encoder_cache=True)
+    # No processor-kwargs hash -> the request cannot build stable keys.
+    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3], kwargs_hash=None)
+
+    builds = []
+    original = engine.model.build_encoder_cache_item_keys
+    monkeypatch.setattr(
+        engine.model,
+        "build_encoder_cache_item_keys",
+        lambda *a, **k: (builds.append(1), original(*a, **k))[1],
+    )
+
+    assert engine.get_mm_encoder_item_keys(request) is None
+    assert engine.get_mm_encoder_item_keys(request) is None
+    assert len(builds) == 1
+
+
 def test_item_cache_keys_share_the_full_request_path_format():
     keys = MultimodalModelMixin.build_encoder_cache_item_keys(
         [[1, 2], [3, 4]], [("image", 0), ("video", 0)], [2, 3], "kw"
