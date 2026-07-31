@@ -10,6 +10,10 @@
 #
 # SLURM mode (set both to activate):
 #   SLURM_SSH_STAT_CMD        shell command that prints the remote results.xml mtime
+#                             (run on the compute node via srun --overlap to bypass
+#                             the login node's NFS attribute cache)
+#   SLURM_SSH_REFRESH_CACHE_CMD  shell command run on the login node to prime its NFS
+#                             cache after the stat detects a change, before SCP
 #   SLURM_SCP_XML_CMD         shell command that SCPs remote results*.xml locally
 #
 # SLURM mode optional enrichment (non-fatal; each retried up to 3 times):
@@ -37,6 +41,13 @@ while [ ! -f "$PROGRESS_DONE_FILE" ]; do
         echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: poll #${_poll} mtime=${m} last=${last}"
         [ "$m" -le "$last" ] && continue
         last=$m
+        # Prime the login node's NFS cache before SCP: the stat above ran on the
+        # compute node (via srun --overlap) so the login node may still have a
+        # stale view of the directory.  Running ls on the login node here forces
+        # a fresh READDIR/GETATTR RPC to the NFS server before we attempt SCP.
+        if [ -n "$SLURM_SSH_REFRESH_CACHE_CMD" ]; then
+            eval "$SLURM_SSH_REFRESH_CACHE_CMD" 2>/dev/null || true
+        fi
         mkdir -p "${WORKSPACE}/${STAGE_NAME}"
         _scp_ok=0
         for _attempt in 1 2 3; do

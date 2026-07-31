@@ -2418,13 +2418,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${progressTar}"
                 def remoteWorkspaceTrk = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
                 def trackCmd = Utils.sshUserCmd(remote, scriptTrackPathNode)
-                // Two-stage NFS cache flush:
-                // 1. ls on the directory (READDIR) makes newly created files visible
-                //    when the login node has a negative dcache entry for results.xml.
-                // 2. ls -la on the file (LOOKUP+GETATTR) refreshes the per-file
-                //    attribute cache for an already-known file whose mtime changed.
-                // Both are needed: the file-only ls does nothing when the file is new.
-                def sshStatCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1; stat -c %Y '${remoteWorkspaceTrk}/results.xml' 2>/dev/null || echo 0\"")
+                // Stat on the compute node via srun --overlap to bypass the login
+                // node's NFS attribute cache.  The login node's NFS client can cache
+                // a stale directory view for up to acdirmax seconds after the compute
+                // node creates results.xml; running stat directly on the node that
+                // wrote the file avoids this cross-client visibility window entirely.
+                // After the mtime check confirms a change, sshRefreshCacheCmd primes
+                // the login node's NFS cache before the SCP step reads the file.
+                def sshStatCmd = Utils.sshUserCmd(remote, "\"srun --overlap --quiet --jobid='${slurmJobId}' --ntasks=1 stat -c %Y '${remoteWorkspaceTrk}/results.xml' 2>/dev/null || echo 0\"")
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
                 def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
@@ -2447,6 +2448,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
                         LABEL_PREFIX='sbatch checkpoint' \\
                         SLURM_SSH_STAT_CMD='${sshStatCmd}' \\
+                        SLURM_SSH_REFRESH_CACHE_CMD='${sshRefreshCacheCmd}' \\
                         SLURM_SCP_XML_CMD='${scpXmlCmd}' \\
                         SLURM_SCP_UNFINISHED_CMD='${scpUnfinishedCmd}' \\
                         SLURM_SSH_LIST_PERF_CMD='${sshListPerfCmd}' \\
