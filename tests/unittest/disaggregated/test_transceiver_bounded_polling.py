@@ -50,9 +50,14 @@ class _FakeRequest:
     request_id: int = 0
     py_disaggregated_params: Optional[object] = None
     kv_cache_transfer_start: Optional[int] = None
+    input_tokens: tuple[int, ...] = (1, 2, 3)
+    py_orig_prompt_len: int = 3
 
     def set_kv_cache_transfer_start(self, value: int) -> None:
         self.kv_cache_transfer_start = value
+
+    def get_tokens(self, _beam_idx: int = 0) -> list[int]:
+        return list(self.input_tokens)
 
 
 class _FakeTransferWorker:
@@ -1665,37 +1670,57 @@ def test_context_activation_digest_is_common_to_legacy_and_authoritative_paths(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv(transceiver_module._CONTEXT_ACTIVATION_DIGEST_ENV, "1")
-    requests = [_FakeRequest(request_id=11), _FakeRequest(request_id=22)]
+    legacy_requests = [
+        _FakeRequest(request_id=11, input_tokens=(1, 2, 3)),
+        _FakeRequest(request_id=22, input_tokens=(4, 5, 6)),
+    ]
 
     legacy = _make_transceiver({})
     legacy._init_context_activation_digest()
-    legacy._wait_reqs = {request.request_id: request for request in requests}
+    legacy._wait_reqs = {request.request_id: request for request in legacy_requests}
+    legacy._register_context_activation_requests(legacy_requests)
     legacy._transfer_worker.ready_request_ids.update(legacy._wait_reqs)
     legacy.prepare_context_requests([])
 
     authoritative = _make_transceiver({})
     _enable_fake_async_consensus(authoritative, peer_ready=True)
     authoritative._init_context_activation_digest()
-    authoritative._async_ready_published = {request.request_id: 0 for request in requests}
-    authoritative._async_ready_prepared = {(request.request_id, 0): request for request in requests}
-    authoritative._async_ready_released = {(request.request_id, 0) for request in requests}
-    authoritative.activate_context_requests_for_schedule(requests)
+    authoritative_requests = [
+        _FakeRequest(request_id=101, input_tokens=(1, 2, 3, 999)),
+        _FakeRequest(request_id=202, input_tokens=(4, 5, 6)),
+    ]
+    authoritative._async_ready_published = {
+        request.request_id: 0 for request in authoritative_requests
+    }
+    authoritative._async_ready_prepared = {
+        (request.request_id, 0): request for request in authoritative_requests
+    }
+    authoritative._async_ready_released = {
+        (request.request_id, 0) for request in authoritative_requests
+    }
+    authoritative.activate_context_requests_for_schedule(authoritative_requests)
 
     assert legacy._context_activation_count == 2
     assert authoritative._context_activation_count == 2
     assert (
         legacy._context_activation_digest.hexdigest()
         == authoritative._context_activation_digest.hexdigest()
-        == "f5e6334494e9cf39f8dbc5e0b404ddc0d2d0491dc8d469705b228e7a8e1b4aa9"
+        == "49107ca9d3459715801efbdc0c45da42da529cd07d169288d8026c7ff1f702fb"
     )
 
     reversed_order = _make_transceiver({})
     reversed_order._init_context_activation_digest()
+    reversed_order._register_context_activation_requests(legacy_requests)
     reversed_order._record_context_activation_ids([22, 11])
     assert (
         reversed_order._context_activation_digest.hexdigest()
-        == "ae0d5811960bd6babae707df768bf641bb04a9eb2d628cc95f2194c39aef55cd"
+        != legacy._context_activation_digest.hexdigest()
     )
+
+    missing_fingerprint = _make_transceiver({})
+    missing_fingerprint._init_context_activation_digest()
+    with pytest.raises(RuntimeError, match="missing its stable prompt fingerprint"):
+        missing_fingerprint._record_context_activation_ids([11])
 
 
 def test_context_activation_digest_is_default_off(monkeypatch) -> None:
@@ -1716,6 +1741,8 @@ def test_context_activation_digest_logs_once_after_shutdown(monkeypatch) -> None
     monkeypatch.setenv(transceiver_module._CONTEXT_ACTIVATION_DIGEST_ENV, "1")
     transceiver = _make_transceiver({})
     transceiver._init_context_activation_digest()
+    requests = [_FakeRequest(request_id=11), _FakeRequest(request_id=22)]
+    transceiver._register_context_activation_requests(requests)
     transceiver._record_context_activation_ids([11, 22])
     transceiver._async_consensus = None
     transceiver._dist = SimpleNamespace(rank=3)
@@ -1726,12 +1753,9 @@ def test_context_activation_digest_logs_once_after_shutdown(monkeypatch) -> None
     transceiver.shutdown()
     transceiver.shutdown()
 
-    info.assert_called_once_with(
-        "PYTHON_CONTEXT_ACTIVATION_SEQUENCE "
-        "rank=3 count=2 "
-        "digest=f5e6334494e9cf39f8dbc5e0b404ddc0d2d0491dc8d469705b228e7a8e1b4aa9 "
-        "algorithm=sha256-length-prefixed-decimal-v1"
-    )
+    message = info.call_args.args[0]
+    assert message.startswith("PYTHON_CONTEXT_ACTIVATION_SEQUENCE rank=3 count=2 digest=")
+    assert message.endswith("algorithm=sha256-length-prefixed-prompt-sha256-v1")
 
 
 def test_async_peer_ready_pins_metadata_while_request_is_pre_active() -> None:

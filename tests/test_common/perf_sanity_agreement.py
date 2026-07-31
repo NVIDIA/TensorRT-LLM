@@ -24,6 +24,7 @@ from typing import Iterable, Optional, Set, Tuple
 
 BENCHMARK_STATUS_FAILED = "FAILED"
 BENCHMARK_STATUS_SUCCESS = "SUCCESS"
+CONTEXT_ACTIVATION_DIGEST_ALGORITHM = "sha256-length-prefixed-prompt-sha256-v1"
 
 _AGREEMENT_ARM_MARKER_RE = re.compile(
     r"PYTHON_AGREEMENT_AB_ARM_(START|END) "
@@ -35,6 +36,19 @@ _BACKEND_EVENT_LOOP_FATAL_MARKERS = (
     "Broadcasting event-loop error",
 )
 _BACKEND_EVENT_LOOP_FATAL_OVERLAP = max(map(len, _BACKEND_EVENT_LOOP_FATAL_MARKERS))
+_CONTEXT_MODE_RE = re.compile(
+    r"PYTHON_ASYNC_CONSENSUS transition=mode_active "
+    r"[^\n]*?rank=(\d+) terminal=(\d+) peer_ready=(\d+)"
+)
+_CONTEXT_SHUTDOWN_RE = re.compile(
+    r"PYTHON_ASYNC_CONSENSUS transition=shutdown_summary "
+    r"rank=(\d+) counters=\{[^\n]*\}"
+)
+_CONTEXT_ACTIVATION_SEQUENCE_RE = re.compile(
+    r"PYTHON_CONTEXT_ACTIVATION_SEQUENCE "
+    r"rank=(\d+) count=(\d+) digest=([0-9a-f]{64}) "
+    rf"algorithm={re.escape(CONTEXT_ACTIVATION_DIGEST_ALGORITHM)}"
+)
 
 
 def write_atomic_coordination_text(path: str, text: str) -> None:
@@ -70,6 +84,82 @@ def read_coordination_text(path: str) -> Optional[str]:
             return marker.read().strip()
     except FileNotFoundError:
         return None
+
+
+def extract_log_after_offset(log_bytes: bytes, offset_text: str) -> bytes:
+    """Return cumulative log bytes after one published byte offset."""
+    try:
+        offset = int(offset_text)
+    except ValueError as error:
+        raise ValueError(f"Invalid log offset: {offset_text!r}") from error
+    if offset < 0 or offset > len(log_bytes):
+        raise ValueError(
+            f"Log offset is outside the cumulative log: offset={offset}, log_size={len(log_bytes)}"
+        )
+    return log_bytes[offset:]
+
+
+def extract_measured_context_lifecycle_log(
+    log_text: str,
+    expected_ranks: Set[int],
+) -> Optional[str]:
+    """Exclude memory-profiling evidence from one measured CTX lifecycle.
+
+    PyTorch serving constructs and shuts down a profiling executor before the
+    final runtime executor. After the first complete profiling-shutdown set,
+    the first complete PP mode set identifies the final runtime's exact start.
+    """
+    first_shutdown_end_by_rank = {}
+    for match in _CONTEXT_SHUTDOWN_RE.finditer(log_text):
+        rank = int(match.group(1))
+        if rank in expected_ranks and rank not in first_shutdown_end_by_rank:
+            first_shutdown_end_by_rank[rank] = match.end()
+        if set(first_shutdown_end_by_rank) == expected_ranks:
+            profiling_boundary = max(first_shutdown_end_by_rank.values())
+            break
+    else:
+        return None
+
+    final_runtime_tail = log_text[profiling_boundary:]
+    first_mode_start_by_rank = {}
+    for match in _CONTEXT_MODE_RE.finditer(final_runtime_tail):
+        rank = int(match.group(1))
+        if rank in expected_ranks and rank not in first_mode_start_by_rank:
+            first_mode_start_by_rank[rank] = match.start()
+        if set(first_mode_start_by_rank) == expected_ranks:
+            measured_start = min(first_mode_start_by_rank.values())
+            return final_runtime_tail[measured_start:]
+    return None
+
+
+def validate_context_agreement_mode(
+    log_text: str,
+    expected_ranks: Set[int],
+    expected_mode: Tuple[int, int],
+) -> bool:
+    """Validate a complete final-runtime mode set, or report it as pending."""
+    mode_by_rank = {
+        int(rank_text): (int(terminal_text), int(peer_ready_text))
+        for rank_text, terminal_text, peer_ready_text in _CONTEXT_MODE_RE.findall(log_text)
+        if int(rank_text) in expected_ranks
+    }
+    if set(mode_by_rank) != expected_ranks:
+        return False
+    observed_modes = set(mode_by_rank.values())
+    if observed_modes != {expected_mode}:
+        raise ValueError(
+            "Agreement mode does not match the configured A/B arm: "
+            f"observed={sorted(observed_modes)}, expected={expected_mode}"
+        )
+    return True
+
+
+def parse_context_activation_sequences(log_text: str):
+    """Parse only prompt-content activation digests from CTX rank evidence."""
+    return {
+        int(rank_text): (int(count_text), digest)
+        for rank_text, count_text, digest in _CONTEXT_ACTIVATION_SEQUENCE_RE.findall(log_text)
+    }
 
 
 def find_backend_event_loop_fatal(
@@ -229,21 +319,11 @@ def format_agreement_arm_marker(
 
 def expected_disagg_lifecycle_roles(
     num_ctx_servers: int,
-    ctx_world_size: int,
     num_gen_servers: int,
-    gen_world_size: int,
 ) -> Set[str]:
-    """Return every pytest role expected at a disaggregated lifecycle barrier."""
-    roles = {
-        f"CTX_{server_idx}.{process_id}"
-        for server_idx in range(num_ctx_servers)
-        for process_id in range(ctx_world_size)
-    }
-    roles.update(
-        f"GEN_{server_idx}.{process_id}"
-        for server_idx in range(num_gen_servers)
-        for process_id in range(gen_world_size)
-    )
+    """Return every outer pytest controller expected at a lifecycle barrier."""
+    roles = {f"CTX_{server_idx}.0" for server_idx in range(num_ctx_servers)}
+    roles.update(f"GEN_{server_idx}.0" for server_idx in range(num_gen_servers))
     roles.update(("DISAGG_SERVER.0", "BENCHMARK.0"))
     return roles
 
