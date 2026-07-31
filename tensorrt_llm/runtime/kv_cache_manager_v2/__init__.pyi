@@ -51,6 +51,9 @@ CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
 
+class PlannedDropHandle:
+    def drop(self) -> None: ...
+
 class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
@@ -89,6 +92,18 @@ class KVCacheIterationStatsDelta:
     iter_intra_device_copy_bytes: int = 0
     iter_host_dropped_blocks: int = 0
     iter_host_dropped_bytes: int = 0
+
+@dataclass(slots=True)
+class SsmSnapshotIterationStatsDelta:
+    iter_snapshot_lookups: int = 0
+    iter_snapshot_hits: int = 0
+    iter_snapshot_misses: int = 0
+    iter_reused_tokens: int = 0
+    iter_unreused_tokens: int = 0
+    iter_aligned_snapshot_hits: int = 0
+    iter_unaligned_snapshot_hits: int = 0
+    @property
+    def iter_snapshot_hit_rate(self) -> float: ...
 
 @dataclass(slots=True, frozen=True)
 class PoolGroupPeakBlockStats:
@@ -272,13 +287,18 @@ class KVCacheEventManager:
     def flush_iteration_events(self) -> None: ...
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
-# From _block_radix_tree.py
+# From _cache_key.py
 def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
     num_tokens: int,
     token_offset: int = 0,
 ) -> list[TokenIdExt]: ...
+def sequence_to_blockchain_keys(
+    tokens_per_block: int,
+    reuse_scope: ReuseScope,
+    tokens: Sequence[TokenIdExt],
+) -> Iterator[tuple[list[TokenIdExt], bytes]]: ...
 
 # From _core/_kv_cache.py
 class _Status(enum.Enum):
@@ -349,6 +369,7 @@ class _KVCache:
     def committed_tokens(self) -> list[TokenIdExt]: ...
     @property
     def reuse_scope(self) -> ReuseScope: ...
+    def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None: ...
     def resume(self, cuda_stream: CudaStream | None = None) -> bool: ...
@@ -481,6 +502,9 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_committed_stats(self) -> KVCacheStatsDelta: ...
     def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
+    def get_and_reset_ssm_snapshot_iteration_stats(
+        self,
+    ) -> dict[LifeCycleId, SsmSnapshotIterationStatsDelta]: ...
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel
     ) -> Sequence[PoolGroupPeakBlockStats]: ...

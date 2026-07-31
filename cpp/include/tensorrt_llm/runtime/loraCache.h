@@ -25,8 +25,6 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include <NvInferRuntime.h>
-
 #include <deque>
 #include <list>
 #include <map>

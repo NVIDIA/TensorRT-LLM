@@ -201,6 +201,9 @@ class _Worker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return K
 
+    def _forward_impl(self, *args: object, **kwargs: object) -> None:
+        raise NotImplementedError
+
 
 def _dispatch_meta(**over):
     base = dict(

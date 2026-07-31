@@ -51,8 +51,9 @@ from tensorrt_llm.quantization.modelopt_config import (
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
-                                              SparseAttentionConfig,
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                              KvCacheCompressionConfig,
+                                              LoraConfig, SparseAttentionConfig,
                                               SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
@@ -148,6 +149,7 @@ class ModelConfig(Generic[TConfig]):
     lm_head_gather_output: bool = True
     lora_config: Optional["LoraConfig"] = None
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
+    kv_cache_compression_config: Optional["KvCacheCompressionConfig"] = None
 
     is_generation: bool = True
     is_encoder_decoder: bool = False
@@ -492,12 +494,15 @@ class ModelConfig(Generic[TConfig]):
         # Read exclude_modules from HF config if present (HF format module names)
         hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
 
-        # DeepSeek V3 FP8 ckpt
-        if hf_quant_config.get("quant_method") == "fp8" and hf_quant_config.get(
-                "weight_block_size", []):
+        # FP8 ckpt: DeepSeek V3 style (weight_block_size) or
+        # per-tensor static activation scale style (activation_scheme="static",
+        # e.g. Ministral / Pixtral).
+        if hf_quant_config.get("quant_method") == "fp8" and (
+                hf_quant_config.get("weight_block_size")
+                or hf_quant_config.get("activation_scheme") == "static"):
             quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 
-            block_size = hf_quant_config.get("weight_block_size", [])
+            block_size = hf_quant_config.get("weight_block_size", [128, 128])
             assert tuple(block_size) == (
                 128, 128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
             quant_config.group_size = block_size[0]
@@ -956,9 +961,14 @@ class ModelConfig(Generic[TConfig]):
                         pretrained_config, 'compress_ratios', None)
                     num_base_layers = pretrained_config.num_hidden_layers
                     spec_config = kwargs.get('spec_config', None)
-                    if (spec_config is not None
-                            and getattr(spec_config, 'num_nextn_predict_layers',
-                                        None) is None):
+                    # ``num_nextn_predict_layers`` is MTP-specific (only read on
+                    # the is_mtp_one_model path). Only set it on configs that
+                    # actually declare the field; other DeepSeek-V4 spec modes
+                    # (e.g. DSpark, which carries its own draft stage count) do
+                    # not, and a blind setattr would fail pydantic validation.
+                    if (spec_config is not None and 'num_nextn_predict_layers'
+                            in type(spec_config).model_fields
+                            and spec_config.num_nextn_predict_layers is None):
                         spec_config.num_nextn_predict_layers = getattr(
                             pretrained_config, 'num_nextn_predict_layers', 1)
                     mtp_enabled = (spec_config is not None and
@@ -989,6 +999,22 @@ class ModelConfig(Generic[TConfig]):
                         window_size = checkpoint_window_size
                     if window_size is None:
                         window_size = pretrained_config.sliding_window
+
+                    # DeepSeek-V4 needs explicit per-layer compress ratios. They
+                    # must come from the checkpoint config or a user override; we
+                    # intentionally do not synthesize a default list (it would
+                    # silently change sparse-attention semantics). Fail fast with
+                    # an actionable message instead of letting the normalization
+                    # below raise an opaque TypeError on None.
+                    if compress_ratios is None:
+                        raise ValueError(
+                            "DeepSeek-V4 requires per-layer `compress_ratios`, "
+                            "but none were found in the checkpoint config and "
+                            "none were provided via `sparse_attention_config`. "
+                            "Set `compress_ratios` in the model's config.json, or "
+                            "pass `sparse_attention_config="
+                            "DeepSeekV4SparseAttentionConfig(compress_ratios=[...])`"
+                            " in --extra_llm_api_options.")
 
                     # Normalize checkpoint-facing ratio 0 (SWA-only/uncompressed)
                     # to 1 internally so cache allocation math works. The

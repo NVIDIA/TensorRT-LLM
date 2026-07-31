@@ -66,7 +66,6 @@ BASE_EXAMPLE_CLASSES = {
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
-    "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
     "tensorrt_llm.inputs.multimodal": ["MultimodalInput"],
     "tensorrt_llm.executor.postproc_worker": [

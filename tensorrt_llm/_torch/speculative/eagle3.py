@@ -398,6 +398,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # prepare() before self.num_tokens is decremented to the attention-DP subseq
     # shape; maybe_capture_hidden_states must bound by this, not self.num_tokens.
     num_capture_tokens: int = 0
+    # Per-generation tree links for Mamba verify in dynamic-tree one-model paths.
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
+    retrieve_parent_token: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -443,9 +447,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                  self.hidden_size * len(self.layers_to_capture)),
                 dtype=self.dtype,
                 device='cuda')
-        if (self.spec_resource_manager is not None
-                and self.spec_resource_manager.batch_indices_cuda is not None):
-            self.batch_indices_cuda = self.spec_resource_manager.batch_indices_cuda
+        batch_indices_cuda = getattr(self.spec_resource_manager,
+                                     "batch_indices_cuda", None)
+        if batch_indices_cuda is not None:
+            self.batch_indices_cuda = batch_indices_cuda
             assert self.batch_indices_cuda.shape[0] >= self.max_num_requests, (
                 f"batch_indices_cuda shape mismatch: "
                 f"{type(self.spec_resource_manager).__name__} has "
@@ -529,6 +534,23 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             gen_request_ids = self.request_ids[num_seqs - self.num_generations:]
             if gen_request_ids:
                 sa_manager.prepare(gen_request_ids, self.runtime_draft_len)
+
+        self.retrieve_next_token = None
+        self.retrieve_next_sibling = None
+        self.retrieve_parent_token = None
+        spec_tree_manager = getattr(self.spec_resource_manager,
+                                    'spec_tree_manager', None)
+        if self.use_dynamic_tree and spec_tree_manager is not None:
+            num_gens = self.num_generations
+            if num_gens > 0:
+                num_contexts = num_seqs - num_gens
+                slot_storage = spec_tree_manager.slot_storage
+                gen_slot_ids = slot_storage.all_ids_buf[
+                    num_contexts:num_contexts + num_gens]
+                next_token, next_sibling = slot_storage.next_links_from_slots(
+                    gen_slot_ids, num_gens)
+                self.retrieve_next_token = next_token
+                self.retrieve_next_sibling = next_sibling
 
     def maybe_capture_hidden_states(
             self,
@@ -624,6 +646,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MTP Eagle: lazily-resolved flag for Mamba hybrid cache support
         self._is_mamba_hybrid_cache = None
 
+        # Worker-side saved spec-dec params; initialized so that a failure
+        # inside _prepare_attn_metadata_for_spec_dec (e.g. an OOM in the
+        # clone calls) cannot turn the cleanup restore into AttributeError.
+        self._saved_packed_mask = None
+        self._saved_position_offsets = None
+        self._saved_position_offsets_cpp = None
+        self._saved_generation_lengths = None
+
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
@@ -679,15 +709,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
 
-    def forward(self,
-                input_ids,
-                position_ids,
-                hidden_states,
-                logits,
-                attn_metadata,
-                spec_metadata,
-                draft_model,
-                resource_manager=None):
+    def _forward_impl(self,
+                      input_ids,
+                      position_ids,
+                      hidden_states,
+                      logits,
+                      attn_metadata,
+                      spec_metadata,
+                      draft_model,
+                      resource_manager=None):
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
@@ -846,11 +876,32 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 #   ADP+LM-head-TP padding to ``max_num_requests`` so every TP
                 #   rank produces logits of the same shape.
                 # Eagle3: logits_processor of the EAGLE draft model.
-                use_lm_head_tp_in_adp = (
+                #
+                # The LM-head-TP fast path (group-stacked rows, vocab-sharded
+                # weight) is only usable when the consumer is an argmax: the
+                # distributed greedy sampler recovers the global argmax from
+                # vocab-shard maxima without materializing full distributions.
+                # Advanced (rejection) sampling needs each request's full-vocab
+                # distribution, so a batch headed for the advanced path
+                # bypasses LM-head-TP and computes full-vocab logits locally --
+                # under ADP the lm_head weight is replicated (the sliced-shard
+                # trick is a runtime optimization), exactly like the target
+                # head. With rejection off, non-greedy batches keep the
+                # LM-head-TP argmax path unconditionally, where the per-rank
+                # greedy flag never enters control flow. This branch is safe
+                # to take group-uniformly because is_all_greedy_sample is
+                # group-synchronized whenever rejection+ADP+LM-head-TP are
+                # combined -- see SpecMetadata.group_all_greedy_sample (anchor
+                # for the group-sync semantics).
+                advanced_draft_sampling = (
+                    spec_metadata.wants_advanced_draft_sampling)
+                # enable_lm_head_tp_in_adp implies enable_attention_dp
+                # (asserted in Mapping.__init__); no separate ADP check.
+                lm_head_tp_in_adp_configured = (
                     self.is_mtp_eagle and self.model_config is not None
-                    and self.model_config.mapping.enable_attention_dp
-                    and getattr(self.model_config.mapping,
-                                'enable_lm_head_tp_in_adp', False))
+                    and self.model_config.mapping.enable_lm_head_tp_in_adp)
+                use_lm_head_tp_in_adp = (lm_head_tp_in_adp_configured
+                                         and not advanced_draft_sampling)
                 if self.is_mtp_eagle:
                     if use_lm_head_tp_in_adp:
                         hidden_states_gathered = hidden_states[gather_ids]
@@ -876,6 +927,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         logits = draft_model.mtp_layers[0].shared_head(
                             padded_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
+                    elif lm_head_tp_in_adp_configured:
+                        # Advanced-sampling bypass: the model's shared_head
+                        # would re-apply the LM-head-TP stacked/sharded path
+                        # from config on its own, so call lm_head directly.
+                        # Under ADP the LMHead weight is replicated and
+                        # is_spec_decoding_head defaults to False, so this is
+                        # a plain local full-vocab GEMM over this rank's own
+                        # rows -- the same computation the target head runs.
+                        logits = draft_model.lm_head(hidden_states[gather_ids])
                     else:
                         logits = draft_model.mtp_layers[0].shared_head(
                             hidden_states[gather_ids], draft_model.lm_head,

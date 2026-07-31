@@ -31,7 +31,6 @@ from contextlib import contextmanager
 from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import numpy as np
@@ -64,7 +63,7 @@ except ImportError:
     has_nvml = False
 # isort: on
 
-from tensorrt_llm.bindings import DataType, GptJsonConfig, LayerType
+from tensorrt_llm.bindings import DataType, LayerType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -773,13 +772,6 @@ class BaseEnumMeta(EnumMeta):
         except ValueError:
             return False
         return True
-
-
-def supports_inflight_batching(engine_dir):
-    config_path = Path(engine_dir) / "config.json"
-    json_config = GptJsonConfig.parse_file(config_path)
-    model_config = json_config.model_config
-    return model_config.supports_inflight_batching
 
 
 class QuantModeWrapper:
