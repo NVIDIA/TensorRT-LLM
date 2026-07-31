@@ -54,6 +54,12 @@ from tensorrt_llm.logger import logger
 #: CI sets this to "1" only in the BOLT profile-generation job.
 CLEAR_COUNTERS_ENV = "TLLM_BOLT_CLEAR_COUNTERS"
 
+#: When "1", raise instead of warn-and-skip if the counters can't be cleared.
+#: Used for the POC so a run that silently fails to clear fails LOUDLY (letting
+#: us confirm whether the symbol is resolvable) rather than producing an
+#: un-cleared profile that looks fine. Off by default -> production stays inert.
+CLEAR_STRICT_ENV = "TLLM_BOLT_CLEAR_STRICT"
+
 #: The BOLT runtime entry point that zeroes all instrumentation counters.
 CLEAR_SYMBOL = "__bolt_instr_clear_counters"
 
@@ -104,6 +110,11 @@ def _iter_loaded_target_libs() -> Dict[str, int]:
             real = os.path.realpath(path)
         except OSError:
             real = path
+        # Only our instrumented objects, which all live under the tensorrt_llm
+        # package. This excludes look-alikes that match "bindings" but aren't
+        # ours (e.g. xgrammar/xgrammar_bindings.cpython-*.so).
+        if "tensorrt_llm" not in real:
+            continue
         start = int(line.split("-", 1)[0], 16)
         # Keep the lowest start seen for this file == load base.
         if real not in libs or start < libs[real]:
@@ -225,29 +236,75 @@ def maybe_bolt_clear_counters() -> int:
     if _already_cleared or not _is_enabled():
         return 0
 
+    strict = os.environ.get(CLEAR_STRICT_ENV, "").strip() == "1"
+    _already_cleared = True
+
     libs = _iter_loaded_target_libs()
     if not libs:
-        logger.info(
+        msg = (
             "[bolt] TLLM_BOLT_CLEAR_COUNTERS set but no instrumented target "
             "libs found in /proc/self/maps (non-instrumented build?)"
         )
-        _already_cleared = True
+        if strict:
+            raise RuntimeError(msg)
+        logger.info(msg)
         return 0
 
     cleared: List[str] = []
+    failed: List[str] = []
     for path, load_base in libs.items():
         if _call_via_dlsym(path) or _call_via_address(path, load_base):
             cleared.append(os.path.basename(path))
         else:
+            failed.append(path)
             logger.warning(
                 f"[bolt] could not resolve {CLEAR_SYMBOL} in {path} "
                 "(not instrumented, or symbol stripped)"
             )
 
-    _already_cleared = True
     if cleared:
         logger.info(
             f"[bolt] cleared instrumentation counters after warmup for "
             f"{len(cleared)} lib(s): {', '.join(sorted(cleared))}"
         )
+    if failed and strict:
+        raise RuntimeError(
+            f"[bolt] TLLM_BOLT_CLEAR_STRICT=1 and could not clear {CLEAR_SYMBOL} "
+            f"in {len(failed)} lib(s): {', '.join(sorted(os.path.basename(p) for p in failed))}. "
+            "Symbol is likely hidden AND stripped from .symtab, or (llvm-)nm is "
+            "unavailable. Failing fast so the profile isn't silently un-cleared."
+        )
     return len(cleared)
+
+
+def _self_check(paths: List[str]) -> int:
+    """CLI dry-run: report symbol resolvability for each given .so, no calling.
+
+    Lets you validate on the cluster against an INSTRUMENTED lib before spending
+    a CI run:  python -m tensorrt_llm._torch.bolt_profiling <inst-lib.so> ...
+    (dlsym needs the lib loadable; the nm-offset path only reads the file.)
+    """
+    rc = 0
+    for path in paths:
+        offset = _symbol_offset(path)
+        dlsym_ok = False
+        try:
+            h = ctypes.CDLL(path)  # dlopen (loads it) to test dlsym visibility
+            dlsym_ok = hasattr(h, CLEAR_SYMBOL)
+        except OSError as e:
+            dlsym_ok = f"load-failed: {e}"
+        status = "OK" if (offset is not None or dlsym_ok is True) else "UNRESOLVABLE"
+        if status != "OK":
+            rc = 1
+        print(
+            f"[bolt-selfcheck] {status}  {path}\n"
+            f"    nm offset : {'0x%x' % offset if offset is not None else 'NOT FOUND'}\n"
+            f"    dlsym     : {dlsym_ok}"
+        )
+    return rc
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(_self_check(sys.argv[1:]))
