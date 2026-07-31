@@ -845,7 +845,8 @@ class KimiKDARuntime(nn.Module):
     """
 
     def __init__(self, cfg, layer_idx: int, mapping=None,
-                 allreduce_strategy=AllReduceStrategy.AUTO):
+                 allreduce_strategy=AllReduceStrategy.AUTO,
+                 aux_stream: Optional[torch.cuda.Stream] = None):
         super().__init__()
         # Lazy import: pulls in fla/einops.
         from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
@@ -905,6 +906,15 @@ class KimiKDARuntime(nn.Module):
         # Persistent batch-row-dense staging for the fused decode kernel's
         # per-section conv windows (lazily sized to the pool slot count).
         self._cs_dense: Optional[torch.Tensor] = None
+        # Side stream (+ fork/join events) for the decode overlap in
+        # ``_forward_decode``: the in-projection GEMV chain against the
+        # conv-window/recurrent-state staging. Only engaged when multi-stream
+        # is active (i.e. under CUDA graphs) and a stream was supplied;
+        # otherwise both legs run in order on the default stream with an
+        # identical result.
+        self.aux_stream = aux_stream
+        self._kda_main_event = torch.cuda.Event()
+        self._kda_stage_event = torch.cuda.Event()
 
     def finalize_decode_weights(self) -> None:
         """Build the decode fast-path constants (once, after weight load).
@@ -1241,35 +1251,68 @@ class KimiKDARuntime(nn.Module):
                               device=x2d.device)
             self._cs_dense = buf
 
-        if self._in_proj_weight is not None:
-            # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
-            proj = torch.nn.functional.linear(x2d, self._in_proj_weight)
-            x_qkv = proj[:, :3 * d]
-            onorm_g = proj[:, 3 * d:4 * d]
-            f_a = proj[:, 4 * d:4 * d + hd]
-            beta = proj[:, 4 * d + hd:4 * d + hd + H]
-        else:
-            # FP8 weight read (KIMI_K3_KDA_GLUE_FP8=1): the loader's fused
-            # FP8 [q | k | v | g] GEMM plus one BF16 GEMV over [f_a | b];
-            # slices below are views.
-            qkvg = mixer.qkvg_proj(x2d)
-            small = torch.nn.functional.linear(x2d,
-                                               self._in_proj_small_weight)
-            x_qkv = qkvg[:, :3 * d]
-            onorm_g = qkvg[:, 3 * d:4 * d]
-            f_a = small[:, :hd]
-            beta = small[:, hd:hd + H]
-        g = mixer.f_b_proj(f_a)  # [B, d]
+        def _in_projection():
+            """In-projection GEMV chain: reads only ``x2d``."""
+            if self._in_proj_weight is not None:
+                # One GEMV over [q | k | v | g | f_a | b]; slices are views.
+                proj = torch.nn.functional.linear(x2d, self._in_proj_weight)
+                x_qkv = proj[:, :3 * d]
+                onorm_g = proj[:, 3 * d:4 * d]
+                f_a = proj[:, 4 * d:4 * d + hd]
+                beta = proj[:, 4 * d + hd:4 * d + hd + H]
+            else:
+                # FP8 weight read (KIMI_K3_KDA_GLUE_FP8=1): the loader's
+                # fused FP8 [q | k | v | g] GEMM plus one BF16 GEMV over
+                # [f_a | b]; slices below are views.
+                qkvg = mixer.qkvg_proj(x2d)
+                small = torch.nn.functional.linear(x2d,
+                                                   self._in_proj_small_weight)
+                x_qkv = qkvg[:, :3 * d]
+                onorm_g = qkvg[:, 3 * d:4 * d]
+                f_a = small[:, :hd]
+                beta = small[:, hd:hd + H]
+            return x_qkv, onorm_g, mixer.f_b_proj(f_a), beta
 
-        # Gather the HF-layout conv windows once, then repack the
-        # historical W-1 columns into the kernel's dense per-section
-        # [B, d, W-1] layout (single strided copy kernel).
-        cs = conv_pool.index_select(0, slot_indices)  # [B, 3d, W]
-        cs_dense = buf[:, :B]
-        cs_dense.copy_(cs.view(B, 3, d, W)[:, :, :, 1:].permute(1, 0, 2, 3))
+        def _stage_conv_windows():
+            """Conv-window gather + repack, plus the recurrent-state gather.
 
-        state = (ssm_pool if ssm_state_indices is not None else
-                 ssm_pool.index_select(0, slot_indices))
+            Reads only the cache pools and ``slot_indices`` — nothing the
+            in-projection produces — so the two halves are data-independent
+            and may run concurrently. Gathers the HF-layout conv windows
+            once, then repacks the historical W-1 columns into the kernel's
+            dense per-section [B, d, W-1] layout (one strided copy).
+            """
+            cs = conv_pool.index_select(0, slot_indices)  # [B, 3d, W]
+            cs_dense = buf[:, :B]
+            cs_dense.copy_(cs.view(B, 3, d, W)[:, :, :, 1:].permute(
+                1, 0, 2, 3))
+            state = (ssm_pool if ssm_state_indices is not None else
+                     ssm_pool.index_select(0, slot_indices))
+            return cs, cs_dense, state
+
+        # The in-projection GEMV chain and the cache staging read disjoint
+        # inputs and write disjoint outputs, but the KDA decode kernel needs
+        # both — so under CUDA graphs issue them on two streams and let the
+        # staging hide behind the GEMV instead of following it. Sequential
+        # (identical result) when multi-stream is off; see the shared/routed
+        # expert overlap in ``KimiK3MoERuntime.forward`` for the same pattern.
+        ((x_qkv, onorm_g, g, beta),
+         (cs, cs_dense, state)) = maybe_execute_in_parallel(
+             _in_projection,
+             _stage_conv_windows,
+             self._kda_main_event,
+             self._kda_stage_event,
+             self.aux_stream,
+             disable_on_compile=True)
+        if self.aux_stream is not None:
+            # ``cs`` and the gathered ``state`` were allocated on the side
+            # stream but are consumed below on this one; tell the caching
+            # allocator they are still live here so it cannot recycle their
+            # storage into a later side-stream allocation mid-use.
+            cur_stream = torch.cuda.current_stream()
+            cs.record_stream(cur_stream)
+            if state is not ssm_pool:
+                state.record_stream(cur_stream)
 
         o = mixer._dispatch.decode_kda(
             x_q=x_qkv[:, :d].unflatten(-1, (H, hd)).unsqueeze(0),
@@ -1653,7 +1696,8 @@ class KimiMLARuntime(nn.Module):
     """Wraps ``KimiK3MLAAttention`` with the mixed-batch executor dispatch."""
 
     def __init__(self, cfg, layer_idx: int, mapping=None, quant_config=None,
-                 allreduce_strategy=AllReduceStrategy.AUTO):
+                 allreduce_strategy=AllReduceStrategy.AUTO,
+                 aux_stream: Optional[torch.cuda.Stream] = None):
         super().__init__()
         import os
 
@@ -1713,6 +1757,10 @@ class KimiMLARuntime(nn.Module):
             use_output_gate=cfg.mla_use_output_gate,
             max_position_embeddings=max_positions,
             quant_config=quant_config,
+            # Shared side stream for the decode-path Q/KV-projection and
+            # bmm/rope overlaps; the MLA forks join before the MoE block
+            # reuses the same stream, so sharing it is safe.
+            aux_stream=aux_stream,
         )
 
     def forward(self, hidden_states: torch.Tensor,
@@ -1768,7 +1816,11 @@ class KimiLinearDecoderLayer(nn.Module):
                 cfg,
                 layer_idx,
                 mapping=model_config.mapping,
-                allreduce_strategy=model_config.allreduce_strategy)
+                allreduce_strategy=model_config.allreduce_strategy,
+                # Shared side stream for the decode in-projection / cache
+                # staging overlap. The attention fork always joins before the
+                # MoE block reuses the same stream, so sharing it is safe.
+                aux_stream=aux_stream)
         else:
             # Forward only the KV-cache quantization to the MLA attention
             # backends (enables FP8 KV cache). The attention projection
@@ -1786,7 +1838,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 layer_idx,
                 mapping=model_config.mapping,
                 quant_config=mla_quant_config,
-                allreduce_strategy=model_config.allreduce_strategy)
+                allreduce_strategy=model_config.allreduce_strategy,
+                aux_stream=aux_stream)
 
         self.is_moe = (cfg.num_experts is not None
                        and layer_idx >= cfg.first_k_dense_replace
@@ -1923,9 +1976,11 @@ class KimiLinearModel(DecoderModel):
         self._text_cfg = cfg
         dtype = torch.bfloat16
 
-        # One side stream shared across all layers, used by KimiK3MoERuntime
-        # to overlap the replicated shared-expert compute with the routed EP
-        # dispatch/combine collectives.
+        # One side stream shared across all layers: KimiK3MoERuntime overlaps
+        # the replicated shared-expert compute with the routed EP
+        # dispatch/combine collectives, and the attention runtimes overlap
+        # their decode-path independent halves on it. Each fork joins before
+        # the next one starts, so a single stream serves all of them.
         self.aux_stream = torch.cuda.Stream()
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size,
