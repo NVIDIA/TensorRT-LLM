@@ -226,10 +226,12 @@ class MsaIndexer:
             and seq_lens_cuda is not None
             and decode_query_len is not None
         ):
-            # The CuTe DSL scorer emits raw Q.K rather than idx_sm_scale * Q.K.
-            # Block ranking, and the +inf forcing of the init/local blocks in
+            # Like the fmha_sm100 proxy, whose max_score is read off the MMA
+            # accumulator before the softmax scale, the CuTe DSL scorer emits
+            # raw Q.K rather than idx_sm_scale * Q.K. Block ranking, and the
+            # +inf forcing of the init/local blocks in
             # select_blocks_from_maxscore, are both invariant under a positive
-            # scale, so the omission does not change the selection.
+            # scale, so neither depends on the omission.
             scored = _cutedsl_score(
                 idx_q,
                 idx_k_paged,

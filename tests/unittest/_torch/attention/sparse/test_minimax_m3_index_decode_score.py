@@ -10,9 +10,7 @@ The PyTorch oracle is ported from vLLM's
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import (
-    _cutedsl_score,
-)
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import _cutedsl_score
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
@@ -73,9 +71,7 @@ def _reference_decode_index_score(
         k_pos = torch.arange(k.shape[0], device=idx_q.device)
         score.masked_fill_(k_pos[None, :] > q_pos[:, None], -float("inf"))
         out[:, token_start : token_start + decode_query_len, :num_blocks] = (
-            score.reshape(num_idx_heads, decode_query_len, num_blocks, PAGE_SIZE)
-            .max(dim=3)
-            .values
+            score.reshape(num_idx_heads, decode_query_len, num_blocks, PAGE_SIZE).max(dim=3).values
         )
     return out
 
@@ -97,9 +93,7 @@ def _make_inputs(seq_lens, *, dtype, num_heads, decode_query_len, seed=0):
     block_table = torch.randperm(num_pages, device="cuda", generator=generator).to(torch.int32)
     block_table = block_table.reshape(batch, max_blocks)
 
-    idx_q = torch.randn(
-        total_q, num_heads, HEAD_DIM, device="cuda", generator=generator
-    ).to(dtype)
+    idx_q = torch.randn(total_q, num_heads, HEAD_DIM, device="cuda", generator=generator).to(dtype)
     index_k_cache = torch.randn(
         num_pages, PAGE_SIZE, HEAD_DIM, device="cuda", generator=generator
     ).to(dtype)
@@ -245,12 +239,11 @@ def test_index_decode_score_feeds_selector(dtype):
 def test_index_decode_score_matches_msa_proxy(dtype):
     """A/B against the fmha_sm100 proxy pass the CuTe DSL scorer replaces.
 
-    The proxy applies idx_sm_scale to the scores and the CuTe DSL kernel does
-    not, so the values are compared after scaling and the selections directly.
+    Both sides report the per-block max of raw Q.K: the proxy's max_score is
+    read off the MMA accumulator before the softmax scale, which in
+    output_maxscore mode is never applied, so the values compare directly.
     """
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import (
-        _proxy_max_score,
-    )
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import _proxy_max_score
 
     seq_lens = [1025, 4097, 300]
     idx_q, k_cache, block_table, seq_lens_dev, backing, score, _ = _make_inputs(
@@ -285,15 +278,13 @@ def test_index_decode_score_matches_msa_proxy(dtype):
     for token, num_valid in enumerate(n_valid_list):
         assert num_valid <= width
         torch.testing.assert_close(
-            backing[:, :num_valid, token] * sm_scale,
+            backing[:, :num_valid, token],
             msa_score[:, :num_valid, token],
             rtol=2e-2,
             atol=2e-2,
         )
 
-    kwargs = dict(
-        topk=MSA_REQUIRED_TOPK, n_valid_blocks=n_valid, init_blocks=0, local_blocks=1
-    )
+    kwargs = dict(topk=MSA_REQUIRED_TOPK, n_valid_blocks=n_valid, init_blocks=0, local_blocks=1)
     assert torch.equal(
         select_blocks_from_maxscore(backing[:, :width].contiguous(), **kwargs),
         select_blocks_from_maxscore(msa_score[:, :width].contiguous(), **kwargs),
