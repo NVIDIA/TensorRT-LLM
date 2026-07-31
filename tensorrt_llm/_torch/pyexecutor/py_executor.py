@@ -918,11 +918,14 @@ class PyExecutor:
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
+        # Initialised unconditionally: an AttributeError raised from the
+        # suppressor would be swallowed by HangDetector._suppress_rearm and
+        # would silently disable the wedged-transfer kill.
+        self._wedged_kv_transfer_iter = -1
+        self._wedged_kv_transfer_result = False
         if kv_cache_transceiver is not None:
             self.hang_detector.register_status_provider(
                 kv_cache_transceiver.get_status_dump)
-            self._wedged_kv_transfer_iter = -1
-            self._wedged_kv_transfer_result = False
             self.hang_detector.set_rearm_suppressor(
                 self._is_wedged_on_timed_out_kv_transfer)
         cache_transceiver_config = getattr(self.llm_args,
@@ -5686,14 +5689,24 @@ class PyExecutor:
 
         The truer signal would be "cancellation was attempted and refused" --
         the ``if not is_cancelled: continue`` branch of
-        ``_check_disagg_ctx_cache_transfer_status``.  It is deliberately not
-        used: that function is reached only from the ``executed_batch is not
-        None`` path, so on a drained PP CTX loop -- exactly the case this fix
-        targets -- cancellation is never attempted and the refusal would never
-        be recorded.  Keying on it would make the fix silently inert on the
-        server that actually hangs.  Elapsed time is the best signal available
-        without also driving cancellation from the empty pass, which would put
-        a C++ cancellation request on every drained iteration.
+        ``_check_disagg_ctx_cache_transfer_status``.  That branch **is
+        reachable** on a drained CTX server: ``_executor_loop_pp`` calls
+        ``_check_disagg_transfer_progress_when_idle`` every iteration, ungated
+        by ``executed_batch_num``, and it reaches
+        ``_check_disagg_ctx_cache_transfer_status`` whenever
+        ``num_fitting_reqs == 0`` and no gen-init request fits -- true exactly
+        when drained.  On ``main`` that call is a no-op only because the loop
+        above it does ``if not request.py_kv_transfer_timed_out: continue`` and
+        the flag is never set, which is the very defect the empty pass fixes.
+        Once the flag is set, cancellation is attempted every iteration and the
+        refusal genuinely occurs.
+
+        It is not used here only because the refusal is **not recorded**:
+        ``_disagg_timed_out_ctx_cancelled_ids`` tracks successful cancellations
+        under in-flight-cancel mode, and nothing tracks refusals.  Adding a
+        refusal set is small but introduces new mutable state on a live disagg
+        path, so it is deliberately left as a follow-up; elapsed time is the
+        v1 proxy.  See the PR description for the follow-up items.
         """
         timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
         if timeout_ms is None:

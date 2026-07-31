@@ -752,6 +752,13 @@ def test_uncancellable_ctx_transfer_keeps_the_timeout_flag_set():
     the transfer is already active, so ``_check_disagg_ctx_cache_transfer_status``
     ``continue``s without ever clearing the flag. That stickiness is what makes
     the watchdog predicate stable rather than flapping.
+
+    Also pins that cancellation *is* attempted once the flag is set. On a
+    drained CTX server this function is still reached every iteration, via
+    ``_check_disagg_transfer_progress_when_idle``, so the refusal genuinely
+    occurs -- it is simply never recorded anywhere. Recording it is the
+    follow-up that would replace the elapsed-time proxy in the watchdog
+    predicate with direct proof of a wedge.
     """
     request = _make_ctx_only_request()
     request.py_kv_transfer_start_time = 1.0
@@ -768,9 +775,12 @@ def test_uncancellable_ctx_transfer_keeps_the_timeout_flag_set():
 
     PyExecutor._check_disagg_ctx_cache_transfer_status(executor, 0)
 
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
     executor._end_transfer_and_maybe_terminate.assert_not_called()
     assert request.py_kv_transfer_timed_out is True
     assert request.py_kv_transfer_start_time == 1.0
+    # The refusal happened but left no trace to key a predicate on.
+    assert executor._disagg_timed_out_ctx_cancelled_ids == set()
 
 
 def _make_empty_pass_executor():
