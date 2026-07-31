@@ -41,9 +41,9 @@ class CacheDiTAccelerator(CacheAccelerator):
             logger.warning("Cache-DiT: disable_cache failed: %s", exc)
         self._result = None
 
-    def refresh(self, num_inference_steps: int) -> None:
+    def refresh(self, num_inference_steps: int, separate_cfg: bool | None = None) -> None:
         if self._result is not None:
-            self._result.refresh(num_inference_steps)
+            self._result.refresh(num_inference_steps, separate_cfg=separate_cfg)
 
     def get_stats(self) -> Dict[str, Any]:
         if self._result is None:

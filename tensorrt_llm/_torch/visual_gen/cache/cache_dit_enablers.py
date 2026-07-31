@@ -368,9 +368,16 @@ def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> C
 def enable_cache_dit_for_qwen_image(
     pipeline: Any, cache_dit_cfg: CacheDiTConfig
 ) -> CacheDiTEnableResult:
-    """Qwen-Image: single transformer, auto-detected by cache-dit (no BlockAdapter needed)."""
+    """Qwen-Image: Pattern_1 BlockAdapter.
+
+    QwenImageTransformerBlock.forward(hidden_states, encoder_hidden_states, temb, ...)
+    returns (encoder_hidden_states, hidden_states) — reversed output order vs input,
+    matching ForwardPattern.Pattern_1.
+    """
     calibrator = _maybe_calibrator(cache_dit_cfg)
-    db_cfg = _build_db_cache_config(cache_dit_cfg)
+    # Qwen-Image runs sequential two-pass CFG; enable_separate_cfg=True keeps separate
+    # cache states for the cond and uncond branches.
+    db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=True)
 
     if calibrator is not None:
         logger.info(f"TaylorSeer enabled with order={cache_dit_cfg.taylorseer_order}")
@@ -380,19 +387,46 @@ def enable_cache_dit_for_qwen_image(
         f"W={db_cfg.max_warmup_steps}",
     )
 
+    transformer = pipeline.transformer
+    adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.transformer_blocks],
+        forward_pattern=[ForwardPattern.Pattern_1],
+        params_modifiers=[ParamsModifier(cache_config=db_cfg)],
+        check_forward_pattern=False,
+    )
+
     disable_target = cache_dit.enable_cache(
-        pipeline.transformer,
+        adapter,
         cache_config=db_cfg,
         calibrator_config=calibrator,
     )
 
-    def refresh(num_inference_steps: int) -> None:
-        _refresh_ctx(pipeline.transformer, cache_dit_cfg, num_inference_steps, False)
+    def refresh(num_inference_steps: int, separate_cfg: bool | None = None) -> None:
+        # separate_cfg=True  → two transformer calls per step (sequential cond + uncond CFG)
+        # separate_cfg=False → one call per step (no negative prompt, or CFG parallel)
+        # separate_cfg=None  → keep the True default (backward-compat)
+        effective_sep = separate_cfg if separate_cfg is not None else True
+        if cache_dit_cfg.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(
+                transformer,
+                num_inference_steps=num_inference_steps,
+                enable_separate_cfg=effective_sep,
+                verbose=False,
+            )
+        else:
+            _refresh_ctx(
+                transformer,
+                cache_dit_cfg,
+                num_inference_steps,
+                False,
+                extra_reset={"enable_separate_cfg": effective_sep},
+            )
 
     return CacheDiTEnableResult(
         refresh=refresh,
         disable_target=disable_target,
-        summary_modules=[pipeline.transformer],
+        summary_modules=[transformer],
     )
 
 

@@ -562,7 +562,7 @@ class TestCacheDiTRealPipelineForward:
                         height=512,
                         width=512,
                         num_inference_steps=16,
-                        true_cfg_scale=4.0,
+                        negative_prompt_cfg_scale=4.0,
                         seed=0,
                         max_sequence_length=256,
                     )

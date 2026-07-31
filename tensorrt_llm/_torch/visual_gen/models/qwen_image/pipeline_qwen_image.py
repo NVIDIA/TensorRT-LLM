@@ -287,7 +287,6 @@ class QwenImagePipeline(BasePipeline):
                 )
             )
             self._apply_teacache_coefficients(QWEN_IMAGE_TEACACHE_COEFFICIENTS)
-            self._setup_cache_acceleration()
 
     # ------------------------------------------------------------------
     # Prompt encoding (Qwen2.5-VL chat template).
@@ -422,10 +421,6 @@ class QwenImagePipeline(BasePipeline):
     # ------------------------------------------------------------------
     # Inference entry points.
     # ------------------------------------------------------------------
-    @property
-    def cache_enabled(self) -> bool:
-        return self.cache_accelerator is not None and self.cache_accelerator.is_enabled()
-
     @property
     def default_generation_params(self) -> dict:
         return dict(_DEFAULT_GENERATION_PARAMS)
@@ -694,13 +689,17 @@ class QwenImagePipeline(BasePipeline):
                 latents = latents.to(latents_dtype)
 
         if getattr(self, "rank", 0) == 0:
-            if cache_on:
-                stats = self.cache_accelerator.get_stats()
-                if stats and "hit_rate" in stats:
-                    logger.info(
-                        f"TeaCache: {stats['hit_rate']:.1%} hit rate "
-                        f"({stats['cached']}/{stats['total']} steps)"
-                    )
+            if cache_acc is not None and cache_acc.is_enabled():
+                stats = cache_acc.get_stats()
+                if stats:
+                    if self.pipeline_config.cache_backend == "cache_dit":
+                        logger.info("Cache-DiT stats: %s", stats)
+                    elif self.pipeline_config.cache_backend == "teacache":
+                        if "hit_rate" in stats:
+                            logger.info(
+                                f"TeaCache: {stats['hit_rate']:.1%} hit rate "
+                                f"({stats['cached']}/{stats['total']} steps)"
+                            )
 
         timer.mark_post_start()
         logger.info("Decoding...")
