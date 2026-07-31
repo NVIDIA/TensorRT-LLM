@@ -304,6 +304,15 @@ class TestFactory:
             is None
         )
 
+    def test_triattention_requires_sm100_family(self, fake_kv_cache_manager):
+        cfg = MagicMock()
+        cfg.algorithm = "triattention"
+        with (
+            patch.object(util_mod, "is_sm_100f", return_value=False),
+            pytest.raises(RuntimeError, match="SM100-family"),
+        ):
+            create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
+
     def test_capabilities_default_false(self):
         config = KvCacheCompressionConfig(algorithm="offload")
         target = _v2_manager(is_draft=False)

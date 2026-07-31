@@ -76,7 +76,13 @@ class TestConfigAndFactory:
             SimpleNamespace(enable_block_reuse=True),
             None,
         )
-        with mock.patch.object(TriAttention, "_initialize_eviction_state") as initialize:
+        with (
+            mock.patch(
+                "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
+                return_value=True,
+            ),
+            mock.patch.object(TriAttention, "_initialize_eviction_state") as initialize,
+        ):
             mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
         assert mgr.budget == 32

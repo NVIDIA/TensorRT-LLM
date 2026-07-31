@@ -22,8 +22,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 prefer_pinned, str_dtype_to_binding,
-                                 torch_dtype_to_str)
+                                 is_sm_100f, prefer_pinned,
+                                 str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -2333,6 +2333,9 @@ def create_kv_cache_compression_manager(
     here. Feature compatibility is checked before resource-manager construction.
     """
     if config.algorithm == "triattention":
+        if not is_sm_100f():
+            raise RuntimeError(
+                "TriAttention requires an SM100-family device (SM100 or SM103).")
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
         from ..kv_cache_compression.triattention.triattention import \
             TriAttention
