@@ -14,12 +14,12 @@ Features:
 - Hover to show individual segment details
 
 Usage as CLI:
-    python time_breakdown.py <json_file> [options]
+    python time_breakdown.py <json_or_jsonl_file> [options]
 
 Usage as library:
     from time_breakdown import RequestTimeBreakdown
     analyzer = RequestTimeBreakdown()
-    timing_data = analyzer.parse_json_file("perf_metrics.json")
+    timing_data = analyzer.parse_json_file("perf_metrics.jsonl")
     analyzer.create_timing_diagram(timing_data, "output.html")
 """
 
@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import plotly.graph_objects as go
+
+from tensorrt_llm.serve._perf_metrics_schema import PerfMetricsRecord
 
 
 @dataclass
@@ -181,7 +183,7 @@ class TimingMetricsConfig:
 class RequestDataParser:
     """Parser for disaggregated format with ctx_perf_metrics and gen_perf_metrics."""
 
-    def parse_request(self, request_data: Dict,
+    def parse_request(self, request_data: PerfMetricsRecord,
                       request_index: int) -> Dict[str, Any]:
         # Check if both ctx_perf_metrics and gen_perf_metrics exist and are not None
         ctx_perf = request_data.get('ctx_perf_metrics')
@@ -207,15 +209,18 @@ class RequestDataParser:
                                                    float('nan'))
         ctx_first_token_time = ctx_metrics.get('first_token_time', float('nan'))
         ctx_server_arrival_time = ctx_metrics.get('server_arrival_time',
-                                                  float('nan'))
-        ctx_server_first_token_time = ctx_metrics.get('server_first_token_time',
-                                                      float('nan'))
+                                                  ctx_arrival_time)
+        ctx_server_first_token_time = ctx_metrics.get(
+            'server_first_token_time',
+            ctx_metrics.get('last_token_time', float('nan')))
 
         # Generation timing
-        gen_server_first_token_time = gen_metrics.get('server_first_token_time',
-                                                      float('nan'))
-        gen_server_arrival_time = gen_metrics.get('server_arrival_time',
-                                                  float('nan'))
+        gen_server_first_token_time = gen_metrics.get(
+            'server_first_token_time',
+            gen_metrics.get('last_token_time', float('nan')))
+        gen_server_arrival_time = gen_metrics.get(
+            'server_arrival_time', gen_metrics.get('arrival_time',
+                                                   float('nan')))
         gen_arrival_time = gen_metrics.get('arrival_time', float('nan'))
         gen_first_token_time = gen_metrics.get('first_token_time', float('nan'))
         gen_first_scheduled_time = gen_metrics.get('first_scheduled_time',
@@ -240,15 +245,13 @@ class RequestDataParser:
         else:
             request_id = request_data.get('request_id', request_index)
 
-        # Time breakdown metrics - check new unified structure first, then fall back to legacy
+        # Time breakdown metrics
         step_metrics = None
         ctx_gpu_forward_time = None
         ctx_gpu_sample_time = None
         ctx_chunk_metrics = None
 
-        # Try new unified time_breakdown_metrics structure
         if is_disaggregated:
-            # time_breakdown_metrics is at gen_perf_metrics top level, not inside perf_metrics
             time_breakdown = (gen_perf or {}).get('time_breakdown_metrics')
             if time_breakdown:
                 step_metrics = time_breakdown.get('step_metrics')
@@ -260,7 +263,6 @@ class RequestDataParser:
                 # Legacy: step_metrics inside perf_metrics
                 gen_perf_data = (gen_perf or {}).get('perf_metrics') or {}
                 step_metrics = gen_perf_data.get('step_metrics')
-            # ctx GPU timing / chunk metrics from ctx_perf
             if ctx_gpu_forward_time is None:
                 ctx_time_breakdown = (ctx_perf
                                       or {}).get('time_breakdown_metrics')
@@ -278,7 +280,6 @@ class RequestDataParser:
                     ctx_gpu_sample_time = (ctx_perf
                                            or {}).get('ctx_gpu_sample_time')
         else:
-            # Try time_breakdown_metrics at top level first (new structure)
             time_breakdown = request_data.get('time_breakdown_metrics')
             if time_breakdown:
                 step_metrics = time_breakdown.get('step_metrics')
@@ -334,26 +335,55 @@ class RequestTimeBreakdown:
 
     def parse_json_file(self, json_file_path: str) -> List[Dict]:
         """Parse JSON performance metrics file and extract timing information."""
-        try:
-            with open(json_file_path, 'r') as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            print(f"Error: File '{json_file_path}' not found.")
-            sys.exit(1)
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON file '{json_file_path}': {e}")
-            sys.exit(1)
+
+        def iter_records(json_file):
+            if json_file_path.endswith('.jsonl'):
+                for line_number, line in enumerate(json_file, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise ValueError(
+                            f"Error parsing JSONL file '{json_file_path}' at "
+                            f"line {line_number}: {error}") from error
+                    if not isinstance(record, dict):
+                        raise ValueError(
+                            f"Expected a JSON object at line {line_number}: "
+                            f"{json_file_path}")
+                    yield record
+                return
+
+            try:
+                data = json.load(json_file)
+            except json.JSONDecodeError as error:
+                json_file.seek(0)
+                if not any(line.strip() for line in json_file):
+                    return
+                raise ValueError(
+                    f"Error parsing JSON file '{json_file_path}': {error}"
+                ) from error
+
+            if isinstance(data, dict):
+                yield data
+            elif isinstance(data, list):
+                yield from data
+            else:
+                raise ValueError(
+                    "Expected a JSON array, JSON object, or JSONL file: "
+                    f"{json_file_path}")
 
         timing_data = []
-        for i, request in enumerate(data):
-            parsed_data = self.parser.parse_request(request, i)
+        with open(json_file_path, 'r') as json_file:
+            for i, request in enumerate(iter_records(json_file)):
+                parsed_data = self.parser.parse_request(request, i)
 
-            # Calculate durations for each metric
-            for metric in self.config.metrics:
-                duration = metric.calculate_duration(parsed_data)
-                parsed_data[f'{metric.name}_time'] = duration
+                # Calculate durations for each metric
+                for metric in self.config.metrics:
+                    duration = metric.calculate_duration(parsed_data)
+                    parsed_data[f'{metric.name}_time'] = duration
 
-            timing_data.append(parsed_data)
+                timing_data.append(parsed_data)
 
         if timing_data:
             has_gen_metrics = any(not math.isnan(
@@ -2141,16 +2171,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python time_breakdown.py perf_metrics.json
-  python time_breakdown.py perf_metrics.json -o my_timing.html
-  python time_breakdown.py perf_metrics.json --stats-only
-  python time_breakdown.py perf_metrics.json --max-requests 50 --sort-by e2e
-  python time_breakdown.py perf_metrics.json --max-requests 100 --sort-by arrival
+  python time_breakdown.py perf_metrics.jsonl
+  python time_breakdown.py perf_metrics.jsonl -o my_timing.html
+  python time_breakdown.py perf_metrics.jsonl --stats-only
+  python time_breakdown.py perf_metrics.jsonl --max-requests 50 --sort-by e2e
+  python time_breakdown.py perf_metrics.jsonl --max-requests 100 --sort-by arrival
         """)
 
-    parser.add_argument('json_file',
-                        type=str,
-                        help='Path to JSON performance metrics file')
+    parser.add_argument(
+        'json_file',
+        type=str,
+        help='Path to a JSON or server-produced JSONL performance metrics file')
     parser.add_argument('-o',
                         '--output',
                         type=str,
@@ -2180,11 +2211,18 @@ Examples:
 
     analyzer = RequestTimeBreakdown()
     print(f"Parsing: {args.json_file}")
-    timing_data = analyzer.parse_json_file(args.json_file)
+    try:
+        timing_data = analyzer.parse_json_file(args.json_file)
+    except FileNotFoundError:
+        print(f"Error: File '{args.json_file}' not found.")
+        return 1
+    except ValueError as error:
+        print(error)
+        return 1
 
     if not timing_data:
         print("No timing data found.")
-        sys.exit(1)
+        return 1
 
     if args.stats_only or args.show_stats:
         analyzer.show_statistics(timing_data)
@@ -2194,7 +2232,8 @@ Examples:
                                        args.output,
                                        max_requests=args.max_requests,
                                        sort_by=args.sort_by)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
