@@ -162,9 +162,6 @@ MOE_LORA_MODULE_TO_KERNEL_SLOT = {
 
 class LoraLayer(torch.nn.Module):
 
-    # Static aux stream for LoRA computations
-    _aux_stream: torch.cuda.Stream | None = None
-
     def __init__(self, lora_module_types: List[LoraModuleType],
                  output_hidden_sizes: List[int]):
         super().__init__()
@@ -207,8 +204,9 @@ class LoraLayer(torch.nn.Module):
                 module_ids=tuple(layer.lora_module_types),
             ) in cuda_graph_params.layer_info for layer in lora_layers)
 
-        execute_in_parallel = (has_lora_layer and lora_params.get(
-            "overlap_lora_and_base", True) and do_multi_stream()
+        lora_aux_stream = lora_params.get("lora_aux_stream")
+        execute_in_parallel = (has_lora_layer and lora_aux_stream is not None
+                               and do_multi_stream()
                                and not torch.compiler.is_compiling())
 
         # Pack all LoRA forwards (e.g., fused/unfused) in a single tuple
@@ -218,9 +216,8 @@ class LoraLayer(torch.nn.Module):
                 for lora_layer in lora_layers)
 
         if execute_in_parallel:
-            # Lazy allocation of aux stream and parallel events
-            if LoraLayer._aux_stream is None:
-                LoraLayer._aux_stream = torch.cuda.Stream()
+            assert lora_aux_stream is not None
+            # Lazy allocation of parallel events
             if lora_layers[0]._par_events is None:
                 lora_layers[0]._par_events = [
                     torch.cuda.Event(), torch.cuda.Event()
@@ -231,7 +228,7 @@ class LoraLayer(torch.nn.Module):
                 lora_forward,
                 lora_layers[0]._par_events[0],
                 lora_layers[0]._par_events[1],
-                LoraLayer._aux_stream,
+                lora_aux_stream,
                 disable_on_compile=True,
             )
         else:
