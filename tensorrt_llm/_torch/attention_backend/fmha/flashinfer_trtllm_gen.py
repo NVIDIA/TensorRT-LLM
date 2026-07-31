@@ -1444,5 +1444,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             is_var_seq=True,
             uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             cute_dsl_impl="monolithic",
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+            # flashinfer rejects the counter buffer unless the trtllm-gen
+            # runner is selected; the cute-dsl MLA path must pass None.
+            multi_ctas_kv_counter_buffer=(
+                self._get_multi_ctas_kv_counter_buffer()
+                if self._mla_backend != "cute-dsl"
+                else None
+            ),
         )
