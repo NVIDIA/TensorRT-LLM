@@ -699,15 +699,17 @@ class _BatchedSamplingResult:
 
     # Processed and raw logprobs buffer. The tensor is sized to accommodate logprobs for all requests currently being
     # processed by the sampler and slice(0, processed_logprobs_end) contains processed logprobs, ordered consistently
-    # with processed_logprobs_reqs. Excludes beam search requests, which have a separate path for logprobs handling.
+    # with processed_logprobs_reqs_indices. Excludes beam search requests, which have a separate path for logprobs
+    # handling.
     logprobs_cuda: torch.Tensor | None = None
 
-    # Requests requesting processed logprobs, same ordering as req_indices
+    # Requests requesting processed logprobs (incl. beam-search requests), same ordering as req_indices.
     processed_logprobs_reqs_indices: list[int] = field(default_factory=list)
     # Index of first unused row of logprobs_cuda
     processed_logprobs_end: int = 0
 
-    # Requests requesting raw logprobs, ordered consistently with original (unpermuted) requests
+    # Requests requesting raw logprobs (incl. beam-search requests), ordered consistently with original
+    # (unpermuted) requests
     raw_logprobs_reqs_indices: list[int] = field(default_factory=list)
     # Indices into logits tensor, ordered consistently with raw_logprobs_reqs_indices.
     # Excludes beam search requests, which have a separate path for logprobs handling.
