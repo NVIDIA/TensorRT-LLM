@@ -894,6 +894,7 @@ class ClientConfig:
         self.model_path = ""
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
+        self.warmup = client_config_data.get("warmup", False)
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
         # is now always passed; output-length stability with spec decoding comes from
@@ -972,11 +973,14 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
             "--ignore-eos",
         ]
+        # benchmark_serving's initial single-prompt test run doubles as a warmup
+        # request; keep it disabled unless the lane asks for a warmup.
+        if not self.warmup:
+            benchmark_cmd.append("--no-test-input")
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
@@ -2003,6 +2007,10 @@ class PerfSanityTestConfig:
                 "use_nv_sa_benchmark": use_nv_sa_benchmark,
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
+                # gen_only measures a single round (iterations forced to 1 above),
+                # so one-time costs like the cache transceiver's lazy connection
+                # setup would land entirely on the measured TTFT without a warmup.
+                "warmup": benchmark_mode == "gen_only",
             }
             client_config = ClientConfig(
                 client_config_data,
