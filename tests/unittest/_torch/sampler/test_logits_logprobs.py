@@ -920,17 +920,17 @@ class TestLogsprobsInBatchedSampling:
         LOGPROBS_CASES = [
             ("nologprobs", {}),
             ("raw_logprobs0", {"logprobs": 0}),
-            ("raw_logprobs2", {"logprobs": 2}),
+            ("raw_logprobs3", {"logprobs": 3}),
             ("proc_logprobs0", {"logprobs": 0, "logprobs_mode": LogprobMode.PROCESSED}),
-            ("proc_logprobs2", {"logprobs": 2, "logprobs_mode": LogprobMode.PROCESSED}),
+            ("proc_logprobs3", {"logprobs": 3, "logprobs_mode": LogprobMode.PROCESSED}),
         ]
         BASE_CASES = {
             **{
-                f"temperature-{label}": SamplingParams(temperature=0.7, **kwargs)
+                f"single-{label}": SamplingParams(temperature=0.7, top_k=2, **kwargs)
                 for label, kwargs in LOGPROBS_CASES
                 if (
                     # FIXME: fails with "Beam search does not support returning multiple logprobs per request"
-                    not include_beam_search or kwargs.get("logprobs") != 2
+                    not include_beam_search or kwargs.get("logprobs") != 3
                 )
             },
             **{
@@ -938,7 +938,7 @@ class TestLogsprobsInBatchedSampling:
                 for label, kwargs in LOGPROBS_CASES
                 if (
                     include_beam_search
-                    and kwargs.get("logprobs") != 2  # top-k logprobs not supported for beam search
+                    and kwargs.get("logprobs") != 3  # top-k logprobs not supported for beam search
                     and "logprobs_mode"
                     not in kwargs  # processed logprobs not defined for beam search
                 )
@@ -973,9 +973,9 @@ class TestLogsprobsInBatchedSampling:
         # includes raw + processed + nologprobs as well as mixes of regular and beam-search requests.
         #
         # Raw/processed logprobs handling does not interfere with 1-beam vs. n-beam handling.
-        # => Consider mixes of raw and processed only for "temperature" strategy.
+        # => Consider mixes of raw and processed only for "single" strategy.
         #    Those cases might be ordering sensitive.
-        # => Consider mixes of beam-search and temperature requests only for raw logprobs=0,2
+        # => Consider mixes of beam-search and single-beam requests only for raw logprobs=0,3
         #    (top-k logprobs not supported for beam search), including ordering.
         #
         # What remains are mixes of beam-search requests with logprobs=None and raw_logprobs=0.
@@ -1029,14 +1029,14 @@ class TestLogsprobsInBatchedSampling:
         def _combine_up_to_3_configs(
             labeled_configs: list[tuple[str, SamplingParams]],
             *,
-            allow_temperature_only: bool = True,
+            allow_single_only: bool = True,
         ) -> list[tuple[list[SamplingParams], str]]:
             res = []
             for cfg_1 in labeled_configs:
                 label_1, params_1 = cfg_1
                 sub_batch_size_1 = rng.integers(low=2, high=max_batch_size)
                 sub_batch_1 = [params_1] * sub_batch_size_1
-                is_temperature_1 = label_1.startswith("temperature")
+                is_single_1 = label_1.startswith("single")
                 label_1 = f"{label_1}_x{sub_batch_size_1}"
 
                 # NB: singular configs were already covered above
@@ -1047,9 +1047,9 @@ class TestLogsprobsInBatchedSampling:
                     label_2, params_2 = cfg_2
                     sub_batch_size_2 = rng.integers(low=2, high=max_batch_size)
                     sub_batch_2 = [params_2] * sub_batch_size_2
-                    is_temperature_2 = label_2.startswith("temperature")
+                    is_single_2 = label_2.startswith("single")
                     label_2 = f"{label_2}_x{sub_batch_size_2}"
-                    if allow_temperature_only or (not is_temperature_1 or not is_temperature_2):
+                    if allow_single_only or (not is_single_1 or not is_single_2):
                         res += _shuffle_mixed_batches(
                             (sub_batch_1, sub_batch_2), (label_1, label_2)
                         )
@@ -1061,10 +1061,10 @@ class TestLogsprobsInBatchedSampling:
                         label_3, params_3 = cfg_3
                         sub_batch_size_3 = rng.integers(low=2, high=max_batch_size)
                         sub_batch_3 = [params_3] * sub_batch_size_3
-                        is_temperature_3 = label_3.startswith("temperature")
+                        is_single_3 = label_3.startswith("single")
                         label_3 = f"{label_3}_x{sub_batch_size_3}"
-                        if allow_temperature_only or (
-                            not is_temperature_1 or not is_temperature_2 or not is_temperature_3
+                        if allow_single_only or (
+                            not is_single_1 or not is_single_2 or not is_single_3
                         ):
                             res += _shuffle_mixed_batches(
                                 (sub_batch_1, sub_batch_2, sub_batch_3),
@@ -1072,12 +1072,12 @@ class TestLogsprobsInBatchedSampling:
                             )
             return res
 
-        # All ordered combinations of up to three configs from the "temperature" family
-        temp_configs = [
-            (key, value) for key, value in BASE_CASES.items() if key.startswith("temperature")
+        # All ordered combinations of up to three configs from the "single" family
+        single_configs = [
+            (key, value) for key, value in BASE_CASES.items() if key.startswith("single")
         ]
-        assert temp_configs
-        test_cases += _combine_up_to_3_configs(temp_configs)
+        assert single_configs
+        test_cases += _combine_up_to_3_configs(single_configs)
 
         if include_beam_search:
             # All ordered combinations of up to three configs from the "beam_search" family
@@ -1094,7 +1094,7 @@ class TestLogsprobsInBatchedSampling:
                 if value.logprobs is not None and value.logprobs_mode != LogprobMode.PROCESSED
             ]
             assert raw_configs
-            test_cases += _combine_up_to_3_configs(raw_configs, allow_temperature_only=False)
+            test_cases += _combine_up_to_3_configs(raw_configs, allow_single_only=False)
 
         return test_cases
 
@@ -1303,11 +1303,21 @@ class TestLogsprobsInBatchedSampling:
 
             # compute probs
             req_logits = logits[logits_offset : (logits_offset + num_logits)]
-            if req.py_logprobs_mode == LogprobMode.PROCESSED:
-                # NB: Test considers only temperature-only or beam search without temperature
+            if is_processed_logprobs:
+                # NB: Test considers only temperature + top-k or beam search without temperature
                 if req.sampling_config.temperature is not None:
                     req_logits = req_logits / req.sampling_config.temperature[0]
             req_log_probs = req_logits.log_softmax(dim=-1)
+            if is_processed_logprobs:
+                # NB: Test considers only temperature + top-k or beam search without temperature
+                if req.sampling_config.top_k is not None:
+                    # Computing req_log_probs by renormalizing without masking. This avoids issues
+                    # with non-deterministic tie-breaking in top-k.
+                    req_log_probs += torch.topk(req_log_probs, k=req.sampling_config.top_k[0])[
+                        0
+                    ].log_softmax(dim=-1).amax(dim=-1, keepdim=True) - req_log_probs.amax(
+                        dim=-1, keepdim=True
+                    )
 
             sampled_tokens = req.get_tokens()
             assert req.py_result is not None
@@ -1367,22 +1377,50 @@ class TestLogsprobsInBatchedSampling:
 
                     # Validate top-k logprobs
                     if req.py_num_logprobs > 0:
-                        _, topk_tokens = torch.topk(
-                            req_log_probs[req_logit_offset], k=req.py_num_logprobs
-                        )
-                        topk_tokens_list = topk_tokens.tolist()
-
+                        # validate result size and remove sampled-token if more than k logprobs returned
                         returned_topk_logprobs = returned_log_probs_step.copy()
-                        if len(returned_log_probs_step) == req.py_num_logprobs:
-                            assert sampled_token in topk_tokens_list
-                        else:
+                        if len(returned_log_probs_step) != req.py_num_logprobs:
                             assert len(returned_log_probs_step) == req.py_num_logprobs + 1
                             returned_topk_logprobs.pop(sampled_token)
 
-                        for topk_token in topk_tokens_list:
-                            validate_logprob_and_rank(
-                                topk_token, returned_topk_logprobs[topk_token]
-                            )
+                        # validate ranks and suppress masked tokens
+                        req_top_k = None
+                        if (req_top_ks := req.sampling_config.top_k) is not None:
+                            req_top_k = req_top_ks[0]
+                        returned_ranks = set()
+                        for token, logprob in returned_topk_logprobs.items():
+                            assert logprob.rank not in returned_ranks
+                            returned_ranks.add(logprob.rank)
+                            if (
+                                is_processed_logprobs
+                                and req_top_k is not None
+                                and logprob.rank > req_top_k
+                            ):
+                                assert logprob.logprob == float("-inf")
+                        assert returned_ranks == set(range(1, req.py_num_logprobs + 1))
+
+                        # validate that remaining set is a top-k set
+                        returned_topk_tokens = [
+                            token
+                            for token, logprob in returned_topk_logprobs.items()
+                            if not is_processed_logprobs
+                            or req_top_k is None
+                            or logprob.rank <= req_top_k
+                        ]
+                        returned_topk_tokens_tensor = torch.tensor(
+                            returned_topk_tokens, dtype=torch.int32
+                        )
+                        returned_topk_mask = torch.zeros((self.VOCAB_SIZE,), dtype=torch.bool)
+                        returned_topk_mask[returned_topk_tokens_tensor] = True
+                        topk_min = req_log_probs[req_logit_offset, returned_topk_mask].amin().item()
+                        other_max = (
+                            req_log_probs[req_logit_offset, ~returned_topk_mask].amax().item()
+                        )
+                        assert topk_min >= other_max
+
+                        # validate logprobs (-inf already validated above)
+                        for token in returned_topk_tokens:
+                            validate_logprob_and_rank(token, returned_topk_logprobs[token])
 
             logits_offset += num_logits
 
