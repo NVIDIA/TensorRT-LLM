@@ -47,15 +47,19 @@ from typing import Optional
 # whole n_comp/K < 1.5 band measures below parity.
 ASSIST_MIN_N_COMP = 4096  # ~8k raw context at compress_ratio 4
 
-# Block-skip prefix pays only when whole-row reads dominate. Measured
-# by attaching block_max to the same shape and diffing (30 interleaved
-# cold reps): at n_comp 65538 it is a wash (+0.0 / -0.1 / +0.6us at
-# batch 1/4/16, 9-16 of 30 reps faster), at 131075 it is -4.5 to -5.0us
-# and wins 30 of 30, at 262127 it is -14us. So the prefix earns its
-# setup one doubling later than it was switched on.
-SKIP_MIN_N_COUNTS = 131072  # va: attach block_max from here up
+# Block-skip prefix pays for the counts tier from 65536 up, but not for
+# the zero-emission rungs tier below 131072. Measured on captured V4
+# rows (5 layers x all decode steps, nsys kernel-only, flash n_comp
+# 65537): counts 16.1us with the prefix vs 17.3 without at batch
+# 4/8/16, rungs 18.5 with vs 17.9 without. A synthetic-Gaussian A/B put
+# the counts break-even a doubling later - the block-max distribution
+# of real rows decides the pass rate, so set this from captures only.
+SKIP_MIN_N_COUNTS = 65536  # va: attach block_max from here up
 SKIP_MIN_N_RUNGS_FLASH = 131072  # vb (flash): bm pays from here
-SKIP_CS_MIN_N_RUNGS = 196608  # vb: cluster split on top of bm from here
+# Cluster split is a loss for the assist tiers below this point,
+# block_max or not: at n_comp 65537 rungs measures 17.9 / 19.0 / 20.4us
+# at cs 1 / 4 / 8 (batch 4) and cs8 spills to 31.5us at batch 16.
+SKIP_CS_MIN_N_RUNGS = 196608  # vb: cluster split from here up
 
 # Emission tax measured on the FP4 indexer itself (ctx 256k and 1M,
 # batch 1..128), as the wall delta of the same kernel with the emission
@@ -147,13 +151,11 @@ def pick_config(tier: str, batch: int, n_comp: int, k: int, num_sms: int) -> Top
     # rungs (vb)
     if k <= RUNGS_BM_MAX_K and n_comp >= SKIP_MIN_N_RUNGS_FLASH:
         r.attach_block_max = True
-    if n_comp >= 65536:
+    if n_comp >= SKIP_CS_MIN_N_RUNGS:
         if batch * 8 <= num_sms // CS8_HALF_DEVICE:
             r.cluster_size = 8
         elif batch * 4 <= (num_sms * CS_HEADROOM_NUM) // CS_HEADROOM_DEN:
             r.cluster_size = 4
         elif batch * 2 <= (num_sms * CS_HEADROOM_NUM) // CS_HEADROOM_DEN:
             r.cluster_size = 2
-    if r.attach_block_max and n_comp < SKIP_CS_MIN_N_RUNGS:
-        r.cluster_size = 1  # bm without cs below the split point
     return r
