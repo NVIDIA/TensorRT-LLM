@@ -82,12 +82,13 @@ def get_build_dir(build_dir, build_type):
 
 
 def apply_msa_patch(project_dir: Path) -> None:
-    """Apply TensorRT-LLM's downstream MSA patch in place, idempotently.
+    """Apply TensorRT-LLM's downstream MSA patches in place, idempotently.
 
-    The patch is applied directly to the pinned 3rdparty/MSA submodule working
-    tree so every consumer sees the patched fmha_sm100 sources: the runtime
-    importer, editable installs, and wheel packaging. Re-running is a no-op, so
-    it is safe to call on every build.
+    Every 3rdparty/patches/msa_*.patch is applied, in sorted order, directly to
+    the pinned 3rdparty/MSA submodule working tree so every consumer sees the
+    patched fmha_sm100 sources: the runtime importer, editable installs, and
+    wheel packaging. Re-running is a no-op, so it is safe to call on every
+    build.
 
     Patching goes through patch(1), as 3rdparty/CMakeLists.txt does for its
     dependencies, so only a working tree is required. A tree copied without the
@@ -97,11 +98,19 @@ def apply_msa_patch(project_dir: Path) -> None:
     """
     msa_source_dir = project_dir / "3rdparty" / "MSA"
     msa_package_dir = msa_source_dir / "python" / "fmha_sm100"
-    msa_patch = project_dir / "3rdparty" / "patches" / "msa_strided_paged_kv.patch"
+    msa_patches = sorted(
+        (project_dir / "3rdparty" / "patches").glob("msa_*.patch"))
     if not msa_package_dir.is_dir():
         raise FileNotFoundError(
             f"MSA sources are missing at {msa_package_dir}; initialize 3rdparty/MSA"
         )
+
+    for msa_patch in msa_patches:
+        _apply_one_msa_patch(msa_source_dir, msa_package_dir, msa_patch)
+
+
+def _apply_one_msa_patch(msa_source_dir: Path, msa_package_dir: Path,
+                         msa_patch: Path) -> None:
 
     def patch_cmd(*flags: str):
         # --no-backup-if-mismatch keeps the .orig copy of a hunk applied at an
@@ -132,11 +141,13 @@ def apply_msa_patch(project_dir: Path) -> None:
             raise RuntimeError(
                 f"Cannot apply {msa_patch} to {msa_source_dir}:\n"
                 f"{forward_check.stdout.strip()}")
-        print(f"-- MSA patch already applied at {msa_package_dir}; skipping.")
+        print(
+            f"-- {msa_patch.name} already applied at {msa_package_dir}; skipping."
+        )
         return
 
     run(patch_cmd("--forward"), cwd=msa_source_dir, check=True)
-    print(f"-- Applied MSA patch to {msa_package_dir}.")
+    print(f"-- Applied {msa_patch.name} to {msa_package_dir}.")
 
 
 def clear_folder(folder_path):

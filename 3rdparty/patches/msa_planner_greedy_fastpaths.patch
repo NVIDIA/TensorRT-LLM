@@ -1,0 +1,311 @@
+--- a/python/fmha_sm100/csrc/include/plan.cuh
++++ b/python/fmha_sm100/csrc/include/plan.cuh
+@@ -263,19 +263,226 @@
+   __syncthreads();
+   int max_qo_tiles = _max_qo_tiles;
+ 
++  // ==========================================================================
++  // Fast path 1 (uniform cost): uniform tile_cost => the greedy is EXACTLY round-robin.
++  //
++  // With every work item costing the same C, the bucket costs stay balanced:
++  // after T tasks, buckets 0..(T%N-1) hold ceil(T/N) and the rest floor(T/N).
++  // The rank order (cost asc, index asc) is therefore the cyclic sequence
++  // starting at m = T%N, so the next batch_count tasks land on buckets
++  // m, m+1, ... (mod N). By induction, global task t -> bucket (t % N), and
++  // bucket i's k-th task is t = i + k*N. Every output below is a closed form
++  // of that, so this is bit-identical to the two greedy passes it replaces.
++  //
++  // Guarded to max_qo_tiles==1 && actual_splits==1 && num_heads<=num_buckets so
++  // the row enumeration collapses to r = b and t = b*num_heads + h.
++  // ==========================================================================
++  __shared__ int _work_offsets[MAX_SMS + 1];
++  __shared__ int _uni_min, _uni_max;
++  if (tid == 0) { _uni_min = 0x7fffffff; _uni_max = 0; }
++  __syncthreads();
++  bool _uniform_ok = (max_qo_tiles == 1) && (num_kv_splits <= 1) && (num_heads > 0) &&
++               (num_heads <= num_buckets) && (batch_size > 0);
++  if (_uniform_ok) {
++    int lmin = 0x7fffffff, lmax = 0;
++    for (int b = tid; b < batch_size; b += static_cast<int>(blockDim.x)) {
++      int ki = 0;
++      if (ceil_div(qo_lens[b], qo_tile_size) > 0)
++        ki = compute_kv_iters(b, 0, qo_lens, kv_lens, qo_offsets,
++                              qo_tile_size, kv_tile_size, causal, pack_factor);
++      if (ki < lmin) lmin = ki;
++      if (ki > lmax) lmax = ki;
++    }
++    atomicMin(&_uni_min, lmin);
++    atomicMax(&_uni_max, lmax);
++  }
++  __syncthreads();
++  if (_uniform_ok && _uni_min == _uni_max && _uni_min > 0) {
++    const int ki = _uni_min;
++    const int C = static_cast<int>(kPerIterOverhead * ki + kTileGlobalOverhead);
++    const int N = num_buckets;
++    const int T = batch_size * num_heads;
++    const int q = T / N;
++    const int rr = T - q * N;
++    if (tid < N) {
++      int cnt = q + (tid < rr ? 1 : 0);
++      int off = tid * q + (tid < rr ? tid : rr);
++      s.sm_task_count[tid] = static_cast<int16_t>(cnt);
++      s.sm_cost[tid] = static_cast<int>(kSMGlobalOverhead) + C * cnt;
++      packed_work_range[tid] = pack_work_range(off, off + cnt);
++    }
++    for (int t = tid; t < T; t += static_cast<int>(blockDim.x)) {
++      int i = t % N;
++      int k = t / N;
++      int pos = i * q + (i < rr ? i : rr) + k;
++      int b = t / num_heads;
++      int h = t - b * num_heads;
++      packed_work_info[pos] = pack_work_info(0, h, b);
++      if (kv_tile_begin_indices) kv_tile_begin_indices[pos] = 0;
++      if (kv_tile_end_indices) kv_tile_end_indices[pos] = ki;
++      if (kv_split_indices) kv_split_indices[pos] = 0;
++    }
++    if (num_kv_splits_per_row && qo_segment_offsets) {
++      for (int b = tid; b < batch_size; b += static_cast<int>(blockDim.x)) {
++        int seg_off = qo_segment_offsets[b];
++        int qo_len = qo_lens[b];
++        int row_end = (qo_tile_size < qo_len) ? qo_tile_size : qo_len;
++        for (int rw = 0; rw < row_end; rw++)
++          num_kv_splits_per_row[seg_off + rw] = 1;
++      }
++    }
++    __syncthreads();
++    return static_cast<int>(kSMGlobalOverhead) + C * (q + (rr > 0 ? 1 : 0));
++  }
++
++  // ==========================================================================
++  // Fast path 2 (single head): num_heads == 1  =>  batch_count == 1  =>  each round needs only
++  // the ARGMIN bucket, not every bucket's rank. rank==0 means "cheapest, ties to
++  // lowest index", which is exactly min(pack_cost_idx(cost,idx)) -- so
++  // find_min_cost_sm (warp-shuffle reduction) is an EXACT substitute for the
++  // O(num_buckets) per-thread rank scan. Costs may vary per row here.
++  //
++  // Pass 2's scan is removed entirely: pass 1 memoises each row's destination
++  // bucket and its index within that bucket, so the output write becomes a
++  // parallel scatter. Bit-identical: same assignment, same order, same offsets.
++  // Scratch reuses the unsplit_* arrays, which only the adaptive path uses.
++  // ==========================================================================
++  if (max_qo_tiles == 1 && num_kv_splits <= 1 && num_heads == 1 &&
++      batch_size > 0 && batch_size <= MAX_UNSPLIT) {
++    for (int b = tid; b < batch_size; b += static_cast<int>(blockDim.x)) {
++      int ki = 0;
++      if (ceil_div(qo_lens[b], qo_tile_size) > 0)
++        ki = compute_kv_iters(b, 0, qo_lens, kv_lens, qo_offsets,
++                              qo_tile_size, kv_tile_size, causal, pack_factor);
++      s.unsplit_kv_iters[b] = static_cast<int16_t>(ki > 0 ? ki : 0);
++      s.unsplit_qo_tile[b] = -1;
++    }
++    if (tid < num_buckets) {
++      s.sm_cost[tid] = kSMGlobalOverhead;
++      s.sm_task_count[tid] = 0;
++    }
++    __syncthreads();
++
++    for (int b = 0; b < batch_size; b++) {
++      int ki = s.unsplit_kv_iters[b];
++      if (ki <= 0) continue;  // uniform across the block: no divergent barrier
++      int tile_cost = static_cast<int>(kPerIterOverhead * ki + kTileGlobalOverhead);
++      int win = find_min_cost_sm(s, num_buckets);
++      if (tid == win) {
++        s.unsplit_qo_tile[b] = static_cast<int16_t>(win);
++        s.unsplit_batch[b] = s.sm_task_count[win];
++        s.sm_cost[win] += tile_cost;
++        s.sm_task_count[win]++;
++      }
++      __syncthreads();
++    }
++
++    int _mx = find_max_cost_sm(s, num_buckets);
++    int _max_cost = s.sm_cost[_mx];
++    if (tid == 0) {
++      int pos = 0;
++      for (int sm = 0; sm < num_buckets; sm++) {
++        _work_offsets[sm] = pos;
++        pos += s.sm_task_count[sm];
++      }
++      _work_offsets[num_buckets] = pos;
++    }
++    __syncthreads();
++
++    for (int b = tid; b < batch_size; b += static_cast<int>(blockDim.x)) {
++      int d = s.unsplit_qo_tile[b];
++      if (d < 0) continue;
++      int pos = _work_offsets[d] + s.unsplit_batch[b];
++      packed_work_info[pos] = pack_work_info(0, 0, b);
++      if (kv_tile_begin_indices) kv_tile_begin_indices[pos] = 0;
++      if (kv_tile_end_indices) kv_tile_end_indices[pos] = s.unsplit_kv_iters[b];
++      if (kv_split_indices) kv_split_indices[pos] = 0;
++    }
++    if (num_kv_splits_per_row && qo_segment_offsets) {
++      for (int b = tid; b < batch_size; b += static_cast<int>(blockDim.x)) {
++        if (s.unsplit_kv_iters[b] <= 0) continue;
++        int seg_off = qo_segment_offsets[b];
++        int qo_len = qo_lens[b];
++        int row_end = (qo_tile_size < qo_len) ? qo_tile_size : qo_len;
++        for (int rw = 0; rw < row_end; rw++)
++          num_kv_splits_per_row[seg_off + rw] = 1;
++      }
++    }
++    __syncthreads();
++    if (tid < num_buckets)
++      packed_work_range[tid] = pack_work_range(
++          _work_offsets[tid], _work_offsets[tid] + s.sm_task_count[tid]);
++    __syncthreads();
++    return _max_cost;
++  }
++
+   if (tid < num_buckets) {
+     s.sm_cost[tid] = kSMGlobalOverhead;
+     s.sm_task_count[tid] = 0;
+   }
+   __syncthreads();
+ 
++  // ==========================================================================
++  // Fast path 3 (row compaction): compact the ACTIVE (qt,b) rows once, then let the existing
++  // greedy walk that list instead of the full rectangle.
++  //
++  // On a production mixed step (1 ctx of ~7373 tok + 255 decode rows) the
++  // rectangle is M = max_qo_tiles*batch = 29*256 = 7424 pairs but only R = 284
++  // do work -- 96% are skipped, and each skip costs a global load of qo_lens[b]
++  // plus an IDIV, executed by all 256 threads, in BOTH passes. Measured: 2939 us
++  // with the rectangle vs 1160 us at the same R without it (61% of the kernel).
++  //
++  // Emission order (qt desc, b asc) and every per-row value are unchanged, so
++  // the greedy sees an identical sequence => bit-identical output.
++  // ==========================================================================
++  __shared__ int _num_rows;
++  __shared__ int _rows_compacted;
++  if (tid == 0) { _num_rows = 0; _rows_compacted = (num_kv_splits <= 1 && batch_size > 0 &&
++                                       max_qo_tiles > 0 && max_qo_tiles <= 32767 &&
++                                       batch_size <= 32767) ? 1 : 0; }
++  __syncthreads();
++  if (_rows_compacted) {
++    for (int qt = max_qo_tiles - 1; qt >= 0; qt--) {
++      for (int base = 0; base < batch_size; base += static_cast<int>(blockDim.x)) {
++        int b = base + tid;
++        int ki = 0;
++        if (b < batch_size && qt < ceil_div(qo_lens[b], qo_tile_size))
++          ki = compute_kv_iters(b, qt, qo_lens, kv_lens, qo_offsets,
++                                qo_tile_size, kv_tile_size, causal, pack_factor);
++        int act = (ki > 0) ? 1 : 0;
++        int off = 0, agg = 0;
++        int row0 = _num_rows;
++        __syncthreads();
++        cub::BlockScan<int, MAX_SMS>(s.scan_temp).ExclusiveSum(act, off, agg);
++        __syncthreads();
++        if (act && row0 + off < MAX_UNSPLIT) {
++          int q = row0 + off;
++          s.unsplit_qo_tile[q]  = static_cast<int16_t>(qt);
++          s.unsplit_batch[q]    = static_cast<int16_t>(b);
++          s.unsplit_kv_iters[q] = static_cast<int16_t>(ki);
++        }
++        __syncthreads();
++        if (tid == 0) _num_rows = row0 + agg;
++        __syncthreads();
++      }
++    }
++    if (tid == 0 && _num_rows > MAX_UNSPLIT) _rows_compacted = 0;   // overflow -> use the rectangle
++    __syncthreads();
++  }
++
+   // Pass 1: batch-assign heads in reverse QO tile order
+-  for (int qt = max_qo_tiles - 1; qt >= 0; qt--) {
+-    for (int b = 0; b < batch_size; b++) {
+-      if (qt >= ceil_div(qo_lens[b], qo_tile_size)) continue;
+-      int total_ki = compute_kv_iters(b, qt, qo_lens, kv_lens, qo_offsets,
+-                                       qo_tile_size, kv_tile_size, causal, pack_factor);
+-      if (total_ki <= 0) continue;
++  for (int row = 0; row < (_rows_compacted ? _num_rows : max_qo_tiles * batch_size); row++) {
++    {
++      int qt, b, total_ki;
++      if (_rows_compacted) {
++        qt = s.unsplit_qo_tile[row]; b = s.unsplit_batch[row]; total_ki = s.unsplit_kv_iters[row];
++      } else {
++        qt = max_qo_tiles - 1 - (row / batch_size); b = row % batch_size;
++        if (qt >= ceil_div(qo_lens[b], qo_tile_size)) continue;
++        total_ki = compute_kv_iters(b, qt, qo_lens, kv_lens, qo_offsets,
++                                    qo_tile_size, kv_tile_size, causal, pack_factor);
++        if (total_ki <= 0) continue;
++      }
+       int actual_splits = (num_kv_splits <= 1) ? 1
+           : ::min(num_kv_splits, ::max(1, total_ki / MIN_ITERS_PER_SPLIT));
+       for (int sp = 0; sp < actual_splits; sp++) {
+@@ -315,7 +522,6 @@
+   int max_cost = s.sm_cost[max_sm];
+ 
+   // Compute work_indptr, reset for pass 2
+-  __shared__ int _work_offsets[MAX_SMS + 1];
+   if (threadIdx.x == 0) {
+     int pos = 0;
+     for (int sm = 0; sm < num_buckets; sm++) {
+@@ -332,12 +538,18 @@
+   if (tid < num_buckets) s.sm_cost[tid] = kSMGlobalOverhead;
+   __syncthreads();
+ 
+-  for (int qt = max_qo_tiles - 1; qt >= 0; qt--) {
+-    for (int b = 0; b < batch_size; b++) {
+-      if (qt >= ceil_div(qo_lens[b], qo_tile_size)) continue;
+-      int total_ki = compute_kv_iters(b, qt, qo_lens, kv_lens, qo_offsets,
+-                                       qo_tile_size, kv_tile_size, causal, pack_factor);
+-      if (total_ki <= 0) continue;
++  for (int row = 0; row < (_rows_compacted ? _num_rows : max_qo_tiles * batch_size); row++) {
++    {
++      int qt, b, total_ki;
++      if (_rows_compacted) {
++        qt = s.unsplit_qo_tile[row]; b = s.unsplit_batch[row]; total_ki = s.unsplit_kv_iters[row];
++      } else {
++        qt = max_qo_tiles - 1 - (row / batch_size); b = row % batch_size;
++        if (qt >= ceil_div(qo_lens[b], qo_tile_size)) continue;
++        total_ki = compute_kv_iters(b, qt, qo_lens, kv_lens, qo_offsets,
++                                    qo_tile_size, kv_tile_size, causal, pack_factor);
++        if (total_ki <= 0) continue;
++      }
+       int actual_splits = (num_kv_splits <= 1) ? 1
+           : ::min(num_kv_splits, ::max(1, total_ki / MIN_ITERS_PER_SPLIT));
+       if (threadIdx.x == 0 && num_kv_splits_per_row && qo_segment_offsets) {
+--- a/python/fmha_sm100/jit.py
++++ b/python/fmha_sm100/jit.py
+@@ -11,6 +11,7 @@
+ 
+ import itertools
+ import fcntl
++import hashlib
+ import logging
+ import os
+ import shutil
+@@ -395,9 +396,22 @@
+ _plan_lock = threading.Lock()
+ 
+ 
++def _plan_sources_tag() -> str:
++    """Content hash of the plan kernel sources.
++
++    The plan cache directory is keyed on it so a source change (for example a
++    refreshed downstream patch) recompiles instead of silently reusing a stale
++    fmha_sm100_plan.so built from older sources.
++    """
++    plan_cu = _FMHA_VARLEN_DIR / "fmha_sm100_plan.cu"
++    plan_cuh = _FMHA_VARLEN_DIR / "include" / "plan.cuh"
++    digest = hashlib.sha256(plan_cu.read_bytes() + plan_cuh.read_bytes())
++    return digest.hexdigest()[:12]
++
++
+ def _do_compile_plan():
+     """Generate and compile plan kernel. No TVM loading."""
+-    cache_dir = CACHE_BASE / "plan"
++    cache_dir = CACHE_BASE / f"plan-{_plan_sources_tag()}"
+     so_path = cache_dir / "fmha_sm100_plan.so"
+ 
+     if so_path.exists():
+@@ -459,7 +473,7 @@
+     try:
+         _do_compile_plan()
+         import tvm_ffi
+-        so_path = CACHE_BASE / "plan" / "fmha_sm100_plan.so"
++        so_path = CACHE_BASE / f"plan-{_plan_sources_tag()}" / "fmha_sm100_plan.so"
+         return tvm_ffi.load_module(str(so_path))
+     finally:
+         _release_file_lock(lock_fd)

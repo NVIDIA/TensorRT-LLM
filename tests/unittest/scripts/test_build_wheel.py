@@ -23,6 +23,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "build_wheel.py"
 MSA_INTERFACE = Path("python/fmha_sm100/cute/interface.py")
+MSA_PLAN = Path("python/fmha_sm100/csrc/include/plan.cuh")
 MSA_PATCH = Path("3rdparty/patches/msa_strided_paged_kv.patch")
 
 _SPEC = importlib.util.spec_from_file_location("build_wheel", SCRIPT_PATH)
@@ -47,7 +48,8 @@ def _stage_project(tmp_path: Path) -> Path:
     shutil.copytree(
         source_msa, project_dir / "3rdparty" / "MSA", ignore=shutil.ignore_patterns(".git")
     )
-    shutil.copy(REPO_ROOT / MSA_PATCH, project_dir / MSA_PATCH)
+    for patch in sorted((REPO_ROOT / "3rdparty" / "patches").glob("msa_*.patch")):
+        shutil.copy(patch, project_dir / "3rdparty" / "patches" / patch.name)
     return project_dir
 
 
@@ -62,6 +64,22 @@ def test_apply_msa_patch_is_idempotent_in_place(tmp_path):
     # raise, leaving the patched content in place.
     apply_msa_patch(project_dir)
     assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
+
+
+def test_apply_msa_patch_applies_every_msa_patch(tmp_path):
+    """All msa_*.patch files apply, not just the first.
+
+    The planner fast paths land in plan.cuh while the strided-paged-kv change
+    lands in interface.py.
+    """
+    project_dir = _stage_project(tmp_path)
+    patched_plan = project_dir / "3rdparty" / "MSA" / MSA_PLAN
+
+    apply_msa_patch(project_dir)
+    assert "Fast path 1 (uniform cost)" in patched_plan.read_text()
+
+    apply_msa_patch(project_dir)
+    assert "Fast path 1 (uniform cost)" in patched_plan.read_text()
 
 
 def test_apply_msa_patch_with_dangling_submodule_gitlink(tmp_path):
