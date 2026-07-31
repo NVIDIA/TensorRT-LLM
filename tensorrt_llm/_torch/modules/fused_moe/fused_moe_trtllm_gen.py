@@ -34,7 +34,7 @@ from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
-                      Fp4QuantizedTensor)
+                      Fp4QuantizedTensor, MxFp8QuantizedTensor)
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 from .moe_op_backend import MoEOpBackend, TRTLLMOpBackend, get_op_backend
 from .wide_ep_ft import get_wide_ep_ft_options
@@ -705,6 +705,14 @@ class TRTLLMGenFusedMoE(MoE):
         - The 2D shape is required for proper handling in alltoall/allgather operations
         - scaling_vector_size is typically the group size for block-wise quantization
         """
+        if isinstance(x, MxFp8QuantizedTensor):
+            assert self.has_w4a8_mxfp4_mxfp8, (
+                "Pre-quantized MXFP8 input requires "
+                "W4A8_MXFP4_MXFP8 quantization")
+            assert not x.is_sf_swizzled, (
+                "Pre-quantized MXFP8 input must use linear scaling factors")
+            return x.fp8_tensor, x.scaling_factor
+
         x_sf = None
         if not self.has_any_quant:
             return x, x_sf
@@ -1098,9 +1106,8 @@ class TRTLLMGenFusedMoE(MoE):
                                     and not self.enable_alltoall)
         post_quant_comm = run_post_quant_allgather or self.enable_alltoall
         requires_separated_routing = (
-            self.routing_method.requires_separated_routing
-            or os.environ.get("TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING",
-                              "0") == "1")
+            self.routing_method.requires_separated_routing or os.environ.get(
+                "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1")
 
         x_sf = None
         token_selected_experts = None
@@ -1362,7 +1369,7 @@ class TRTLLMGenFusedMoE(MoE):
 
     def forward_fake(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         *,
         do_finalize: bool = True,

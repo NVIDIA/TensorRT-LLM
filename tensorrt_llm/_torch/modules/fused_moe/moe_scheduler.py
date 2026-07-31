@@ -48,16 +48,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
-# Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
-# the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
-# (896 experts / top-16) register-spills and costs ~33 us/layer at decode
-# batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
-# the same math the attention-DP deployments already run.
-FORCE_SEPARATED_ROUTING = os.environ.get(
-    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
-
 from tensorrt_llm._torch.expert_statistic import ExpertStatistic
-from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor, MxFp8QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided
@@ -69,6 +61,13 @@ from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .interface import MoESchedulerKind
+
+# Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
+# the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
+# (896 experts / top-16) register-spills and costs ~33 us/layer at decode
+# batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
+# the same math the attention-DP deployments already run.
+FORCE_SEPARATED_ROUTING = os.environ.get("TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
 __all__ = [
     "MoEScheduler",
@@ -95,7 +94,7 @@ class MoEScheduler(ABC):
     @abstractmethod
     def forward(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         *,
         do_finalize: bool,
@@ -136,7 +135,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
     def forward(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         *,
         do_finalize: bool,
@@ -147,6 +146,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
     ) -> torch.Tensor:
         moe = self.moe
+
+        if isinstance(x, MxFp8QuantizedTensor) and getattr(moe, "comm", None) is not None:
+            raise NotImplementedError(
+                "Pre-quantized MXFP8 input is only supported without MoE communication"
+            )
 
         # ========== Step 1: Handle padding ==========
         if all_rank_num_tokens is None:
@@ -247,7 +251,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
     # ------------------------------------------------------------------
     def _prepare_workspace_deepgemm(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         all_rank_num_tokens: List[int],
     ) -> Optional[torch.Tensor]:
         """Single-chunk workspace for DeepGemmFusedMoE; otherwise ``None``.
@@ -321,7 +325,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
     # ------------------------------------------------------------------
     def _forward_single_chunk(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: List[int],
@@ -352,7 +356,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
     def _forward_chunk_impl(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: List[int],
@@ -384,7 +388,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 2: Apply routing ==========
         requires_separated_routing = (
-            moe.backend._supports_load_balancer() or moe.routing_method.requires_separated_routing
+            moe.backend._supports_load_balancer()
+            or moe.routing_method.requires_separated_routing
             or FORCE_SEPARATED_ROUTING
         )
         if requires_separated_routing:
@@ -407,6 +412,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
             # apply_router_weight_on_input: fuse top-k weight onto x
             if moe.apply_router_weight_on_input:
+                if isinstance(x, MxFp8QuantizedTensor):
+                    raise NotImplementedError(
+                        "apply_router_weight_on_input does not support pre-quantized MXFP8 input"
+                    )
                 assert x.dtype != torch.float8_e4m3fn, (
                     "Current workaround for apply_router_weight_on_input does not support fp8 input"
                 )
@@ -573,7 +582,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
     def _forward_multiple_chunks(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         num_chunks: int,
         output_dtype: Optional[torch.dtype],
@@ -836,10 +845,15 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # When the scheduler precomputes top-k for DP/load-balancer paths,
             # the backend must not route again.  Single-rank TRTLLMGen paths do
             # not get precomputed top-k, so they still need router_logits.
-            router_logits_arg = (None if
-                                 (moe.backend._supports_load_balancer()
-                                  or moe.routing_method.requires_separated_routing
-                                  or FORCE_SEPARATED_ROUTING) else router_logits)
+            router_logits_arg = (
+                None
+                if (
+                    moe.backend._supports_load_balancer()
+                    or moe.routing_method.requires_separated_routing
+                    or FORCE_SEPARATED_ROUTING
+                )
+                else router_logits
+            )
             kwargs["router_logits"] = router_logits_arg
             kwargs["do_finalize"] = do_finalize
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
@@ -862,8 +876,8 @@ class FusedCommMoEScheduler(MoEScheduler):
 
     Invariants (see MOE_SCHEDULER_DESIGN.md / mega_moe/CHUNKING_DESIGN.md):
 
-    1. Reject ``Fp4QuantizedTensor`` activation; backend.quantize_input
-       owns the BF16 -> FP8 conversion.
+    1. Reject pre-quantized activation carriers; backend.quantize_input owns
+       the BF16 -> FP8 conversion.
     2. Ignore ``use_dp_padding`` (no host-side cross-rank shape alignment).
     3. Use ``mapping.moe_ep_rank`` for local token count, not global rank.
     4. Strip ADP padding before splitting tensors.
@@ -884,7 +898,7 @@ class FusedCommMoEScheduler(MoEScheduler):
 
     def forward(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         *,
         do_finalize: bool,
@@ -913,7 +927,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 "(MegaMoE) scheduler; only the CUTLASS backend supports it."
             )
 
-        if isinstance(x, Fp4QuantizedTensor):
+        if isinstance(x, (Fp4QuantizedTensor, MxFp8QuantizedTensor)):
             raise NotImplementedError(
                 "Fused-comm MoE expects BF16 activation; "
                 "quantization happens in backend.quantize_input."
@@ -1089,7 +1103,7 @@ class FusedCommMoEScheduler(MoEScheduler):
 
     def _forward_chunk(
         self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        x: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
         *,
         output_dtype: Optional[torch.dtype],
@@ -1120,7 +1134,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         )
         assert do_finalize, "Fused-comm MoE always finalizes inside the fused kernel"
 
-        if isinstance(x, Fp4QuantizedTensor):
+        if isinstance(x, (Fp4QuantizedTensor, MxFp8QuantizedTensor)):
             raise NotImplementedError(
                 "Fused-comm MoE expects BF16 activation; "
                 "quantization happens in backend.quantize_input."

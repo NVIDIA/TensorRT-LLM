@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -229,6 +232,14 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_mxfp8_op")
+    def _(mat_a, mat_b):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        output = mat_a.new_empty(shape, dtype=torch.float8_e4m3fn)
+        scale = mat_a.new_empty((shape[0], shape[-1] // 32), dtype=torch.uint8)
+        return output, scale
+
     @torch.library.register_fake("trtllm::fp4_gemm")
     def _(
         mat1: torch.Tensor,
@@ -443,20 +454,39 @@ def _register_fake():
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
+        do_finalize: bool,
         act_type: int,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
+    ) -> List[torch.Tensor]:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
         out_hidden_size = valid_hidden_size if valid_hidden_size is not None else hidden_size
 
-        if output is not None:
-            return output
+        if do_finalize:
+            if output is not None:
+                return [output]
+            return [
+                hidden_states.new_empty((num_tokens, out_hidden_size),
+                                        dtype=torch.bfloat16)
+            ]
 
-        return hidden_states.new_empty((num_tokens, out_hidden_size),
-                                       dtype=torch.bfloat16)
+        tile_tokens_dim = 128
+        expanded_row_count = num_tokens * top_k
+        max_padding_required = (tile_tokens_dim - 1) * num_experts
+        max_num_padded_tokens = fp4_utils.pad_up(
+            expanded_row_count + max_padding_required, tile_tokens_dim)
+        scale_dtype = (routing_bias.dtype
+                       if routing_bias is not None else torch.bfloat16)
+        return [
+            hidden_states.new_empty((max_num_padded_tokens, hidden_size),
+                                    dtype=torch.bfloat16),
+            hidden_states.new_empty((num_tokens, top_k), dtype=scale_dtype),
+            hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32),
+        ]
 
     @torch.library.register_fake("trtllm::calculate_nvfp4_global_scale")
     def _(input: torch.Tensor, tokens_per_batch: Optional[torch.Tensor]):
@@ -1071,6 +1101,12 @@ def _register_fake():
             torch.empty_like(residual),
             torch.empty_like(residual),
         ]
+
+    @torch.library.register_fake("trtllm::mnnvl_moe_finalize_allreduce_rmsnorm")
+    def _(input, expert_scale_factor, expanded_idx_to_permuted_idx, norm_weight,
+          comm_buffer, buffer_flags, eps) -> torch.Tensor:
+        return input.new_empty(
+            (expanded_idx_to_permuted_idx.shape[0], input.shape[-1]))
 
     @torch.library.register_fake("trtllm::renorm_moe_routing_op")
     def _(router_logits, topk, output_dtype: torch.dtype = None):

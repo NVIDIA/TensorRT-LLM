@@ -1472,10 +1472,11 @@ def trtllm_quant_mxfp4_trtllm_gen_moe_fused(
             local_num_experts,
             None,  # routed_scaling_factor
             routing_method_type,
+            True,  # do_finalize
             0,  # act_type = SwiGlu
             topk_weights=None,
             topk_ids=None,
-        )
+        )[0]
     elif act_dtype == "bf16":
         # bf16 runner takes the activation directly, so pad hidden to 512-aligned here.
         pad_size = expected_hidden - int(x2d.shape[-1])

@@ -2581,7 +2581,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 None, None, 0, num_experts, routed_scaling, routing_method_type,
-                act_type.value, topk_weights, topk_ids)
+                True, act_type.value, topk_weights, topk_ids)[0]
         elif dtype_activation == "bf16":
             output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,

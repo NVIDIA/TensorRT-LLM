@@ -335,6 +335,9 @@ struct MnnvlAllReduceKernelParams
     uint32_t* bufferFlags;
     bool waitForResults;
     QuantizationSFLayout layout;
+    void const* expertScaleFactorPtr = nullptr;
+    int32_t const* expandedIdxToPermutedIdx = nullptr;
+    int topK = 0;
 };
 
 template <typename PackedType, typename T>
@@ -348,6 +351,42 @@ inline __device__ void sanitizeLamportPayload(PackedVec<PackedType, T>& value)
             value.elements[i] = cuda_cast<T, float>(0.F);
         }
     }
+}
+
+template <typename T, typename ScaleType, typename PackedType>
+inline __device__ PackedVec<PackedType, T> finalizeMoeRoutes(
+    MnnvlAllReduceKernelParams<T> const& params, int token, int packedIdx)
+{
+    constexpr int kEltsPerThread = sizeof(PackedType) / sizeof(T);
+    PackedVec<PackedType, T> accumulated;
+#pragma unroll
+    for (int i = 0; i < kEltsPerThread; ++i)
+    {
+        accumulated.elements[i] = cuda_cast<T, float>(0.F);
+    }
+
+    auto const* expertScaleFactor = static_cast<ScaleType const*>(params.expertScaleFactorPtr);
+    for (int k = 0; k < params.topK; ++k)
+    {
+        int const expandedIdx = token * params.topK + k;
+        int32_t const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+        if (permutedIdx < 0)
+        {
+            continue;
+        }
+
+        PackedVec<PackedType, T> routeOutput;
+        routeOutput.packed
+            = loadPacked<PackedType>(&params.shardPtr[permutedIdx * params.tokenDim + packedIdx * kEltsPerThread]);
+        float const routeScale = cuda_cast<float, ScaleType>(expertScaleFactor[expandedIdx]);
+#pragma unroll
+        for (int i = 0; i < kEltsPerThread; ++i)
+        {
+            T const weightedRoute = cuda_cast<T, float>(cuda_cast<float, T>(routeOutput.elements[i]) * routeScale);
+            accumulated.elements[i] += weightedRoute;
+        }
+    }
+    return accumulated;
 }
 
 template <int Rank, uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD>
@@ -568,6 +607,7 @@ using detail::loadPacked;
 using detail::blockReduceSum;
 using detail::divUp;
 using detail::copyF4;
+using detail::finalizeMoeRoutes;
 using detail::MnnvlAllReduceKernelParams;
 using detail::sanitizeLamportPayload;
 using detail::accumulateLamportRanksChunked;
@@ -576,7 +616,7 @@ using detail::writeEpilogueOutput;
 
 template <uint8_t WorldSize, typename T,
     ar_fusion::AllReduceFusionPattern Pattern = ar_fusion::AllReduceFusionPattern::kAllReduce,
-    typename PackedType = float4>
+    bool FuseMoeFinalize = false, typename ScaleType = T, typename PackedType = float4>
 __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllReduceKernelParams<T> params)
 {
     constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
@@ -606,7 +646,14 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     PackedVec<PackedType, T> val;
     if (inBounds)
     {
-        val.packed = loadPacked<PackedType>(&params.shardPtr[threadOffset]);
+        if constexpr (FuseMoeFinalize)
+        {
+            val = finalizeMoeRoutes<T, ScaleType, PackedType>(params, token, packedIdx);
+        }
+        else
+        {
+            val.packed = loadPacked<PackedType>(&params.shardPtr[threadOffset]);
+        }
         sanitizeLamportPayload(val);
 
         reinterpret_cast<PackedType*>(
@@ -863,6 +910,108 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     {
         TLLM_CHECK_WITH_INFO(false, "Failed to dispatch MNNVL AllReduceOneShot kernel.");
     }
+}
+
+void oneshotMoeFinalizeAllreduceRMSNormOp(MoeFinalizeAllReduceRMSNormParams const& params)
+{
+    static int const kSMVersion = tensorrt_llm::common::getSMVersion();
+    TLLM_CHECK_WITH_INFO(kSMVersion >= 90, "[MNNVL MoE Finalize AllReduce RMSNorm] requires SM 90 or newer.");
+    TLLM_CHECK_WITH_INFO(params.input != nullptr, "MoE FC2 output must be provided.");
+    TLLM_CHECK_WITH_INFO(params.output != nullptr, "RMSNorm output must be provided.");
+    TLLM_CHECK_WITH_INFO(params.gamma != nullptr, "RMSNorm gamma must be provided.");
+    TLLM_CHECK_WITH_INFO(params.expertScaleFactor != nullptr, "MoE route weights must be provided.");
+    TLLM_CHECK_WITH_INFO(
+        params.expandedIdxToPermutedIdx != nullptr, "MoE expanded-to-permuted indices must be provided.");
+    TLLM_CHECK_WITH_INFO(params.topK > 0, "MoE top-k must be positive.");
+
+    int const numTokens = params.numTokens;
+    int const tokenDim = params.tokenDim;
+    int const eltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
+    auto [blockSize, clusterSize, loadsPerThread] = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread);
+    dim3 grid(numTokens, clusterSize, 1);
+
+    TLLM_LOG_DEBUG(
+        "[MNNVL MoE Finalize AllReduce RMSNorm] Dispatch: grid size: (%d, %d, 1), block_size: %d, "
+        "cluster_size: %d, loads_per_thread: %d, top_k: %d",
+        numTokens, clusterSize, blockSize, clusterSize, loadsPerThread, params.topK);
+
+    TLLM_CHECK_WITH_INFO(blockSize <= 1024 && loadsPerThread == 1,
+        "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", tokenDim, 1024 * 8 * eltsPerThread);
+
+    cudaLaunchAttribute attrs[2];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    attrs[1].id = cudaLaunchAttributeClusterDimension;
+    attrs[1].val.clusterDim.x = 1;
+    attrs[1].val.clusterDim.y = clusterSize;
+    attrs[1].val.clusterDim.z = 1;
+
+    cudaLaunchConfig_t config{
+        .gridDim = grid,
+        .blockDim = blockSize,
+        .dynamicSmemBytes = 0,
+        .stream = params.stream,
+        .attrs = attrs,
+        .numAttrs = 2U,
+    };
+
+#define LAUNCH_MNNVL_MOE_FINALIZE_KERNEL(WORLD_SIZE, T, SCALE_TYPE)                                                    \
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config,                                                                        \
+        &oneshotAllreduceFusionKernel<WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARRMSNorm, true, SCALE_TYPE>, \
+        kernelParams));
+
+    auto dispatchImpl = [&](auto* typePtr, auto* scaleTypePtr) -> bool
+    {
+        using T = std::remove_pointer_t<decltype(typePtr)>;
+        using ScaleType = std::remove_pointer_t<decltype(scaleTypePtr)>;
+        T** ucPtrs = reinterpret_cast<T**>(params.bufferPtrsDev);
+        T* mcPtr = reinterpret_cast<T*>(params.multicastPtr);
+        T* output = reinterpret_cast<T*>(params.output);
+        T const* input = reinterpret_cast<T const*>(params.input);
+        T const* gamma = reinterpret_cast<T const*>(params.gamma);
+        MnnvlAllReduceKernelParams<T> kernelParams{output, nullptr, input, nullptr, gamma, ucPtrs,
+            reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, nullptr, nullptr, nullptr, numTokens, tokenDim,
+            params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags, false, params.layout,
+            params.expertScaleFactor, params.expandedIdxToPermutedIdx, params.topK};
+
+        switch (params.nRanks)
+        {
+        case 2: LAUNCH_MNNVL_MOE_FINALIZE_KERNEL(2, T, ScaleType); return true;
+        case 4: LAUNCH_MNNVL_MOE_FINALIZE_KERNEL(4, T, ScaleType); return true;
+        case 8: LAUNCH_MNNVL_MOE_FINALIZE_KERNEL(8, T, ScaleType); return true;
+        case 16: LAUNCH_MNNVL_MOE_FINALIZE_KERNEL(16, T, ScaleType); return true;
+        }
+        return false;
+    };
+
+#undef LAUNCH_MNNVL_MOE_FINALIZE_KERNEL
+
+    bool launched = false;
+    if (params.dType == nvinfer1::DataType::kBF16)
+    {
+        if (params.scaleDType == nvinfer1::DataType::kFLOAT)
+        {
+            launched = dispatchImpl((__nv_bfloat16*) nullptr, (float*) nullptr);
+        }
+        else if (params.scaleDType == nvinfer1::DataType::kBF16)
+        {
+            launched = dispatchImpl((__nv_bfloat16*) nullptr, (__nv_bfloat16*) nullptr);
+        }
+    }
+    else if (params.dType == nvinfer1::DataType::kHALF)
+    {
+        if (params.scaleDType == nvinfer1::DataType::kFLOAT)
+        {
+            launched = dispatchImpl((__nv_half*) nullptr, (float*) nullptr);
+        }
+        else if (params.scaleDType == nvinfer1::DataType::kHALF)
+        {
+            launched = dispatchImpl((__nv_half*) nullptr, (__nv_half*) nullptr);
+        }
+    }
+    TLLM_CHECK_WITH_INFO(launched,
+        "Failed to dispatch MNNVL MoE Finalize AllReduce RMSNorm kernel for nranks=%d, dtype=%d, scale_dtype=%d.",
+        params.nRanks, static_cast<int>(params.dType), static_cast<int>(params.scaleDType));
 }
 
 enum MNNVLTwoShotStage : uint8_t

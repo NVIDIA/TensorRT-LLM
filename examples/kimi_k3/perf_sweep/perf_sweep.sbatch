@@ -174,6 +174,7 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
     bash -c "
         set -x
         ulimit -n 65536
+        export PYTHONNOUSERSITE=1
         $ENV_CMD
         export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}
         mkdir -p \"\$TRITON_CACHE_DIR\"
@@ -212,6 +213,17 @@ srun --overlap --kill-on-bad-exit=1 --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
     --output="$WORK_DIR/client.log" \
     bash -c "
         set -x
+        export PYTHONNOUSERSITE=1
+        # Same cache redirects as the server block: importing tensorrt_llm
+        # pulls in flashinfer, which creates \$HOME-based workspace/cache
+        # dirs, and \$HOME resolves to an unwritable /root in this container.
+        export TRITON_CACHE_DIR=/tmp/triton-cache-client
+        export FLASHINFER_WORKSPACE_BASE=$CACHE_DIR/fi_workspace
+        export FLASHINFER_CUBIN_DIR=$CACHE_DIR/fi_cubins
+        export HF_HOME=\${HF_HOME:-$CACHE_DIR/hf_home}
+        export HF_MODULES_CACHE=/tmp/hf-modules-client
+        mkdir -p \"\$TRITON_CACHE_DIR\" \"\$FLASHINFER_WORKSPACE_BASE\" \\
+            \"\$FLASHINFER_CUBIN_DIR\" \"\$HF_HOME\" \"\$HF_MODULES_CACHE\"
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
         export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
         # Same cache redirects as the server step: importing tensorrt_llm on

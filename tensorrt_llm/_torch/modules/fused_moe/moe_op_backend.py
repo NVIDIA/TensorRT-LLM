@@ -93,6 +93,14 @@ class MoEOpBackend:
         """Quantize tensor to MXFP8 format."""
         raise NotImplementedError
 
+    def dsv3_fused_a_gemm_mxfp8(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the low-token fused A GEMM with a linear-layout MXFP8 epilogue."""
+        raise NotImplementedError
+
     # ==================== MoE Runner Operations ====================
 
     def run_fp8_block_scale_moe(
@@ -235,6 +243,13 @@ class TRTLLMOpBackend(MoEOpBackend):
         enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return torch.ops.trtllm.mxfp8_quantize(input, is_sf_swizzled_layout, alignment=alignment)
+
+    def dsv3_fused_a_gemm_mxfp8(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.trtllm.dsv3_fused_a_gemm_mxfp8_op(input, weight)
 
     # MoE Runners
     def run_fp8_block_scale_moe(
@@ -416,7 +431,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
             ):
                 # mxfp4
-                return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+                outputs = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                     router_logits,
                     routing_bias,
                     hidden_states,
@@ -441,6 +456,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                     local_num_experts,
                     routed_scaling_factor,
                     routing_method_type,
+                    do_finalize,
                     gated_act_type,
                     topk_weights,
                     topk_ids,
@@ -448,6 +464,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
                 )
+                return outputs[0] if do_finalize else outputs
 
         elif hidden_states.dtype == torch.bfloat16:
             return torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(

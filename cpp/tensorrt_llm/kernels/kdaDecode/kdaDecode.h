@@ -26,6 +26,22 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::kdaDecode
 {
 
+constexpr int kCompactHeadsWorkThreshold = 144;
+
+constexpr bool isSupportedHeadCount(int numHeads)
+{
+    return numHeads == 1 || numHeads == 2 || numHeads == 3 || numHeads == 4 || numHeads == 6 || numHeads == 8
+        || numHeads == 12 || numHeads == 16 || numHeads == 24 || numHeads == 32 || numHeads == 48 || numHeads == 96;
+}
+
+//! Select the compact-head kernel only in the GB300 domain measured by the
+//! KDA decode sweep. Division keeps the B*H threshold overflow-safe.
+constexpr bool shouldUseCompactHeads(int smVersion, int batchSize, int numHeads, int numValueHeads)
+{
+    return smVersion == 103 && batchSize > 0 && numHeads == numValueHeads && isSupportedHeadCount(numHeads)
+        && batchSize <= kCompactHeadsWorkThreshold / numHeads;
+}
+
 //! Parameters for the fused, single-token KDA decode kernel.
 struct KdaDecodeParams
 {
