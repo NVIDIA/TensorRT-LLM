@@ -106,6 +106,10 @@ DEFAULT_TIMEOUT = 10800
 # once EVERY ctx/gen worker has finished model load + autotune + warmup.
 AGG_SERVER_READY_TIMEOUT = 1800
 DISAGG_SERVER_READY_TIMEOUT = 3600
+# GEN workers normally reap within seconds after benchmark_status is written.
+# Keep this well below the whole-test timeout so a stuck multi-node srun cannot
+# turn the optional log-flush synchronization into a pytest/Slurm cancellation.
+GEN_LOG_SENTINEL_TIMEOUT = 120
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -1319,7 +1323,11 @@ class DisaggTestCmds(NamedTuple):
                 )
             time.sleep(10)
 
-    def wait_for_gen_log_sentinels(self, poll_interval: float = 2.0) -> bool:
+    def wait_for_gen_log_sentinels(
+        self,
+        timeout: float = GEN_LOG_SENTINEL_TIMEOUT,
+        poll_interval: float = 2.0,
+    ) -> bool:
         """Block until every gen worker signals that its log is fully written.
 
         Each gen worker's srun in slurm_launch_draft.sh redirects all of its
@@ -1328,25 +1336,27 @@ class DisaggTestCmds(NamedTuple):
         flushed). The benchmark writes benchmark_status *before* calling this,
         which is what lets the gen srun exit — so this is not circular.
 
-        Returns True once all sentinels exist, or False if self.timeout is
-        reached first. On False the caller still parses whatever is on disk:
-        the sentinel is a correctness optimization against reading a
-        mid-flush log (nvbugs 6487036 / 6487040), never a hang risk for CI.
+        Returns True once all sentinels exist, or False if the dedicated
+        sentinel timeout is reached first. On False the caller still parses
+        whatever is on disk: the sentinel is a correctness optimization
+        against reading a mid-flush log, not a reason to consume the whole-test
+        timeout and trigger Slurm's kill-on-bad-exit cascade (nvbugs 6487036 /
+        6487040 / 6487038).
         """
         sentinels = [
             os.path.join(self.test_output_dir, f"gen_server_{i}.done")
             for i in range(self.num_gen_servers)
         ]
-        start_time = time.time()
+        start_time = time.monotonic()
         while True:
             missing = [p for p in sentinels if not os.path.exists(p)]
             if not missing:
                 print_info("All gen worker log sentinels present; log flush complete.")
                 return True
-            elapsed_time = time.time() - start_time
-            if elapsed_time > self.timeout:
+            elapsed_time = time.monotonic() - start_time
+            if elapsed_time > timeout:
                 print_info(
-                    f"Timeout ({self.timeout}s) waiting for gen worker log "
+                    f"Timeout ({timeout}s) waiting for gen worker log "
                     f"sentinels {missing}; parsing current log contents."
                 )
                 return False
@@ -1475,6 +1485,9 @@ class DisaggTestCmds(NamedTuple):
             # the loop (as before) could read a truncated / not-yet-flushed log
             # and report a wrong mean (nvbugs 6487036 / 6487040).
             pending_device_step_time: List[dict] = []
+            collect_device_step_time = (
+                configs_for_idx is not None and configs_for_idx[2].benchmark_mode == "gen_only"
+            )
             try:
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
@@ -1506,11 +1519,15 @@ class DisaggTestCmds(NamedTuple):
                         )
                         print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
 
-                        # Snapshot gen_server log sizes so the per-client
-                        # average covers only iterations driven by this client.
-                        gen_log_start_offsets = gen_worker_log_sizes(
-                            self.test_output_dir, self.num_gen_servers
-                        )
+                        # Snapshot gen_server log sizes so the gen_only
+                        # per-client average covers only iterations driven by
+                        # this client. Other modes do not emit this metric and
+                        # must not wait for the GEN teardown sentinel.
+                        gen_log_start_offsets = None
+                        if collect_device_step_time:
+                            gen_log_start_offsets = gen_worker_log_sizes(
+                                self.test_output_dir, self.num_gen_servers
+                            )
 
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
@@ -1525,16 +1542,17 @@ class DisaggTestCmds(NamedTuple):
                             benchmark_ctx.write(output)
 
                         outputs.append(output)
-                        # Defer the gen-worker device-step-time parse until the
-                        # gen logs are flushed (see below); remember where to
-                        # write the summary back.
-                        pending_device_step_time.append(
-                            {
-                                "output_index": len(outputs) - 1,
-                                "benchmark_file_path": benchmark_file_path,
-                                "start_offsets": gen_log_start_offsets,
-                            }
-                        )
+                        if collect_device_step_time:
+                            # Defer the gen-worker device-step-time parse until
+                            # the gen logs are flushed (see below); remember
+                            # where to write the summary back.
+                            pending_device_step_time.append(
+                                {
+                                    "output_index": len(outputs) - 1,
+                                    "benchmark_file_path": benchmark_file_path,
+                                    "start_offsets": gen_log_start_offsets,
+                                }
+                            )
                     else:
                         print_info(
                             f"Skipping perf benchmark for client {client_idx}: "
@@ -1570,11 +1588,10 @@ class DisaggTestCmds(NamedTuple):
 
             # benchmark_status is written, so the gen workers can now stop and
             # their srun will exit and drop gen_server_{i}.done. Wait once for
-            # those sentinels (bounded by self.timeout), then parse each
-            # benchmark client's gen-worker device step time a single time: the
-            # flushed log is complete, so no settle polling is needed. Only
-            # gen_only runs emit prev_device_step_time; other modes parse to
-            # None and skip the summary line.
+            # those sentinels (bounded independently of the whole-test timeout),
+            # then parse each benchmark client's gen-worker device step time a
+            # single time. Only gen_only runs populate this queue; other modes
+            # skip both the sentinel wait and device-step-time parsing.
             if pending_device_step_time:
                 self.wait_for_gen_log_sentinels()
                 for record in pending_device_step_time:
