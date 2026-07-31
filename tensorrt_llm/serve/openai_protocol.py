@@ -530,8 +530,12 @@ class CompletionRequest(OpenAIBaseModel):
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    length_penalty: float = 1.0
-    early_stopping: bool = False
+    # Unset by default so the engine picks its own beam-search defaults, as it
+    # does for requests coming through the Python API. Sending concrete values
+    # here would put every served request on the length-normalized, exhaustive
+    # beam-search path.
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[int] = None
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
@@ -886,8 +890,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    length_penalty: float = 1.0
-    early_stopping: bool = False
+    # Unset by default so the engine picks its own beam-search defaults, as it
+    # does for requests coming through the Python API. Sending concrete values
+    # here would put every served request on the length-normalized, exhaustive
+    # beam-search path.
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[int] = None
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
