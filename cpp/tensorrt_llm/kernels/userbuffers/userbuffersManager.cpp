@@ -45,7 +45,9 @@ void UserBuffersManager::initialize(
 std::pair<UBBufferPtr, UBBuffer> UserBuffersManager::allocate_userbuffers(int64_t buffer_size)
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    TLLM_CHECK(buffer_size <= buffer_size_);
+    TLLM_CHECK_WITH_INFO(buffer_size <= buffer_size_,
+        "Requested userbuffer size (%ld bytes) exceeds the manager buffer capacity (%ld bytes)", buffer_size,
+        buffer_size_);
 
     // Check for all unused buffers
     int i = 0;

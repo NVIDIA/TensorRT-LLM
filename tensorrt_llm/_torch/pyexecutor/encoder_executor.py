@@ -57,5 +57,12 @@ class EncoderExecutor:
         return self.model_engine.encoder_forward(inputs, **kwargs)
 
     def shutdown(self):
-        """No background thread to stop — just release model engine resources."""
-        del self.model_engine
+        """Collectively release userbuffers, then drop the model engine."""
+        engine = self.model_engine
+        engine._release_cuda_graphs()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        try:
+            engine.shutdown_userbuffers()
+        finally:
+            del self.model_engine
