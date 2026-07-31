@@ -1536,6 +1536,9 @@ class PyExecutor:
             self.dwdp_manager = None
 
         if userbuffer_errors:
+            for index, error in enumerate(userbuffer_errors, start=1):
+                logger.error(f"Userbuffer shutdown failure {index}/"
+                             f"{len(userbuffer_errors)}: {error}")
             raise RuntimeError(
                 "Failed to shut down userbuffers for one or more model engines"
             ) from userbuffer_errors[0]
