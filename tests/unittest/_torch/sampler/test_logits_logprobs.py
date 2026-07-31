@@ -1299,6 +1299,8 @@ class TestLogsprobsInBatchedSampling:
                 continue
             assert req.py_num_logprobs >= 0
 
+            is_processed_logprobs = req.py_logprobs_mode == LogprobMode.PROCESSED
+
             # compute probs
             req_logits = logits[logits_offset : (logits_offset + num_logits)]
             if req.py_logprobs_mode == LogprobMode.PROCESSED:
@@ -1338,8 +1340,8 @@ class TestLogsprobsInBatchedSampling:
                         torch.testing.assert_close(
                             returned_logprob.logprob,
                             recomputed_logprob,
-                            rtol=1e-4,
-                            atol=1e-5,
+                            rtol=0,
+                            atol=(5e-6 if is_processed_logprobs else 1e-6),  # equals rtol for probs
                         )
 
                         # Validate sampled rank

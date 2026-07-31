@@ -3110,6 +3110,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             # --- Prepare data for logprobs ---
             if return_log_probs:
+                assert batch_processed_logprobs_cuda is not None
+                if logits_cuda.dtype != batch_processed_logprobs_cuda.dtype:
+                    # NB: tensorrt_llm._torch.modules.logits_processor.LogitsProcessor forces logits
+                    #     to float32, so this warning is not expected to get triggered. To support, e.g.,
+                    #     bfloat16, unittest/_torch/sampler/test_logits_logprobs.py::TestLogsprobsInBatchedSampling
+                    #     should be parametrized accordingly and dtype handling in TorchSampler needs
+                    #     to be cleaned up to ensure consistent dtypes for logits, temperature, softmax, etc.
+                    logger.warning_once(
+                        "Processed logprobs calculation is only tested with float32 logits. Results for lower "
+                        "precision logits may be inaccurate.",
+                        key="WARN_INACCURATE_PROCESSED_LOGPROBS",
+                    )
                 need_processed_logprobs_req_indices = group_req_indices[
                     group_need_processed_logprobs
                 ]
@@ -3158,7 +3170,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # Gather relevant logits and probs; using prefix 'proc_lp' for subset of
                     # requests in current sampling requests group which require processed logprobs.
                     assert group_softmax_cuda is not None
-                    assert batch_processed_logprobs_cuda is not None
                     if num_gather_processed_logprobs_req_indices == group_req_indices.size(0):
                         if logit_indices_for_sampler is None:
                             proc_lp_logits_cuda = group_logits_cuda
@@ -3669,8 +3680,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     sampled_log_prob_indices.transpose(0, 1).shape == new_tokens_cuda_1_beam.shape
                 )
                 assert sampled_log_prob_ranks.transpose(0, 1).shape == new_tokens_cuda_1_beam.shape
-
-                logprobs_inout_indices_cuda_size = src_indices_cuda.size(0)
 
                 # Gather sampled tokens / logprobs indices
                 sampled_indices_cuda = new_tokens_cuda_1_beam.view(slot_and_step_size).gather(
