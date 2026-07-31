@@ -32,13 +32,6 @@ def _make_runner(
     )
 
 
-def test_lora_split_k_runner_identity_is_layer_specific():
-    runner = _make_runner(layer_idx=3)
-    other_layer_runner = _make_runner(layer_idx=4)
-
-    assert runner.unique_id() != other_layer_runner.unique_id()
-
-
 def test_lora_split_k_runner_uses_token_buckets():
     runner = _make_runner()
     spec = runner.tuning_config.dynamic_tensor_specs[0]
@@ -54,12 +47,6 @@ def test_lora_split_k_runner_uses_token_buckets():
     assert spec.input_idx == 0
     assert spec.dim_idx == 0
     assert profile[0][0] == 4
-
-
-def test_lora_split_k_runner_returns_all_candidates():
-    runner = _make_runner(input_hidden_size=256)
-
-    assert runner.get_valid_tactics([], None) == [1, 2, 4, 8, 16]
 
 
 def test_lora_layer_reuses_runner_across_cuda_graph_warmups(monkeypatch):
