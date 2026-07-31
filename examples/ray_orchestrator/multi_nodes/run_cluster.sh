@@ -9,7 +9,7 @@
 
 # Run inside an already‑active allocated node.
 # To start a Ray cluster across nodes:
-#       >> bash -e launch_ray.sh
+#       >> bash -e run_cluster.sh
 #
 # See multi_nodes/README.md for more details.
 #
