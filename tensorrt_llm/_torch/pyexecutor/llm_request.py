@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Python extensions for executor requests."""
 
+import itertools
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -148,6 +149,13 @@ class MultimodalEncoderRequestState:
         if len(self.embedding_lengths) != len(self.recorded):
             raise ValueError("MM encoder embedding lengths must have exactly "
                              "one entry per item slot")
+        # Row offsets are fixed once the declared lengths are known, so derive
+        # them here rather than re-summing the prefix on every `record()`
+        # (quadratic in the item count, and every caller now routes through
+        # `record`). Has one extra entry so `_row_starts[i + 1]` is the end of
+        # item `i`; the last is the buffer's total row count.
+        self._row_starts = list(
+            itertools.accumulate(self.embedding_lengths, initial=0))
 
     @property
     def num_items(self) -> int:
@@ -203,7 +211,7 @@ class MultimodalEncoderRequestState:
                 "encoded at most once per request")
         if self.embeddings is None:
             self.embeddings = torch.empty(
-                (sum(self.embedding_lengths), *output.shape[1:]),
+                (self._row_starts[-1], *output.shape[1:]),
                 dtype=output.dtype,
                 device=output.device)
         elif (self.embeddings.shape[1:] != output.shape[1:]
@@ -212,7 +220,7 @@ class MultimodalEncoderRequestState:
             raise ValueError(
                 "MM encoder items for one request must have matching "
                 "output shape, dtype, and device")
-        start = sum(self.embedding_lengths[:item_idx])
+        start = self._row_starts[item_idx]
         self.embeddings[start:start + expected_rows].copy_(output.detach())
         self.recorded[item_idx] = True
 
@@ -230,7 +238,7 @@ class MultimodalEncoderRequestState:
         """
         if self.embeddings is None:
             return 0
-        return sum(self.embedding_lengths) * bytes_per_encoder_embedding
+        return self._row_starts[-1] * bytes_per_encoder_embedding
 
     def finalize(self, multimodal_data: Dict[str, Any]) -> bool:
         """Publish the request's embedding once every item is recorded.
