@@ -157,7 +157,8 @@ def test_adjacent_same_modality_items_share_one_encoder_call():
 
     outputs, encoder_inputs = _run_items(model, [(request, 0), (request, 1)])
 
-    assert [length for _, length, _ in encoder_inputs] == ITEM_ROWS["image"][:2]
+    assert len(encoder_inputs) == 1, "adjacent same-modality items must be sliced together"
+    assert encoder_inputs[0][1] == ITEM_ROWS["image"][:2]
     assert model.encoder_calls == [sum(ITEM_ROWS["image"][:2])]
     assert len(outputs) == 2
 

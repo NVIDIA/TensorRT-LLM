@@ -408,46 +408,80 @@ class MultimodalModelMixin:
     def prepare_multimodal_encoder_inputs(
         self,
         selected_items: Sequence[tuple[MultimodalParams, int]],
-    ) -> list[tuple[MultimodalParams, int, str]]:
+    ) -> list[tuple[MultimodalParams, list[int], str]]:
         """Build selected item encoder inputs before the caller performs H2D.
 
+        Adjacent items from the same request and modality are sliced in one
+        call. That is not just tidier: the packed-layout slicer splits the
+        request's whole pixel payload and concatenates the chosen pieces, so
+        slicing item-by-item re-splits the payload N times and copies each
+        item separately.
+
         Args:
-            selected_items: `(request params, item index)` pairs in scheduler-selected order. Each
-                params object must contain parallel item references and embedding lengths.
+            selected_items: `(request params, item index)` pairs in scheduler-selected order.
 
         Returns:
-            Tuples containing the single-item encoder params, its expected encoder output row count,
-            and its modality, in input order.
+            Tuples of `(sliced encoder params, per-item embedding row counts, modality)`, in
+            input order. Flattening the row-count lists recovers the per-item sequence.
         """
-        encoder_inputs: list[tuple[MultimodalParams, int, str]] = []
+        encoder_inputs: list[tuple[MultimodalParams, list[int], str]] = []
+        for multimodal_param, run_indices, modality in self._runs_by_request_modality(
+            selected_items
+        ):
+            item_metadata = get_multimodal_encoder_item_metadata(
+                multimodal_param.multimodal_data or {}
+            )
+            item_refs = item_metadata.item_refs
+            # The two slicers take different index spaces. The raw-tensor
+            # slicer indexes the modality's own payload, so it gets the
+            # modality-local indices (plus the modality, which also lets it
+            # slice out of an interleaved request); the parallel metadata is
+            # prompt-ordered across modalities, so it gets the global ones.
+            residual = self.build_multimodal_encoder_input(
+                multimodal_param,
+                [item_refs[i][1] for i in run_indices],
+                modality=modality,
+            )
+            self._apply_metadata_slice(residual, multimodal_param, run_indices)
+            encoder_inputs.append(
+                (
+                    residual,
+                    [int(item_metadata.output_embedding_lengths[i]) for i in run_indices],
+                    modality,
+                )
+            )
+        return encoder_inputs
+
+    @staticmethod
+    def _runs_by_request_modality(
+        selected_items: Sequence[tuple[MultimodalParams, int]],
+    ) -> Iterator[tuple[MultimodalParams, list[int], str]]:
+        """Split scheduler order into maximal same-request, same-modality runs.
+
+        Only adjacent items merge, so the flattened result keeps the
+        scheduler's order and outputs map back positionally.
+        """
+        run_param: Optional[MultimodalParams] = None
+        run_modality: Optional[str] = None
+        run_indices: list[int] = []
         for multimodal_param, item_idx in selected_items:
-            multimodal_data = multimodal_param.multimodal_data or {}
-            item_metadata = get_multimodal_encoder_item_metadata(multimodal_data)
+            item_metadata = get_multimodal_encoder_item_metadata(
+                multimodal_param.multimodal_data or {}
+            )
             if item_metadata is None:
                 raise ValueError("MM item metadata is required for item encoding")
-            item_refs = item_metadata.item_refs
-            embedding_lengths = item_metadata.output_embedding_lengths
-            modality, local_idx = item_refs[item_idx]
-            # `build_multimodal_encoder_input` slices the raw modality tensors and
-            # `_apply_metadata_slice` re-slices the parallel per-item metadata
-            # (`multimodal_embedding_lengths`, `multimodal_hashes`) to match. Both
-            # are needed: `encode_multimodal_by_groups` splits the encoder output
-            # using those lengths, so a slice without them yields zero rows.
-            #
-            # The two take different index spaces. The slicer indexes the
-            # modality's own payload, so it gets `local_idx` plus the modality
-            # (which also lets it slice out of an interleaved request); the
-            # metadata is prompt-ordered across modalities, so it gets `item_idx`.
-            residual = self.build_multimodal_encoder_input(
-                multimodal_param, [local_idx], modality=modality
-            )
-            self._apply_metadata_slice(residual, multimodal_param, [item_idx])
-            encoder_inputs.append((residual, embedding_lengths[item_idx], modality))
-        return encoder_inputs
+            modality = item_metadata.item_refs[item_idx][0]
+            if run_indices and (multimodal_param is not run_param or modality != run_modality):
+                yield run_param, run_indices, run_modality
+                run_indices = []
+            run_param, run_modality = multimodal_param, modality
+            run_indices.append(item_idx)
+        if run_indices:
+            yield run_param, run_indices, run_modality
 
     def forward_multimodal_encoder_items(
         self,
-        encoder_inputs: Sequence[tuple[MultimodalParams, int, str]],
+        encoder_inputs: Sequence[tuple[MultimodalParams, list[int], str]],
     ) -> list[torch.Tensor]:
         """Forward prepared MM encoder inputs in scheduler item order.
 
@@ -456,8 +490,8 @@ class MultimodalModelMixin:
                 inputs with the same modality must be batch-compatible.
 
         Returns:
-            One encoder output tensor per prepared item. Each tensor has the declared embedding row
-            count and retains scheduler input order.
+            One encoder output tensor **per item** (not per input tuple). Each tensor has the
+            declared embedding row count and retains scheduler input order.
         """
         outputs: list[torch.Tensor] = []
         group_params: list[MultimodalParams] = []
@@ -479,12 +513,12 @@ class MultimodalModelMixin:
             group_params.clear()
             group_lengths.clear()
 
-        for multimodal_param, embedding_length, modality in encoder_inputs:
+        for multimodal_param, embedding_lengths, modality in encoder_inputs:
             if group_modality is not None and modality != group_modality:
                 flush_group()
             group_modality = modality
             group_params.append(multimodal_param)
-            group_lengths.append(embedding_length)
+            group_lengths.extend(embedding_lengths)
         flush_group()
         return outputs
 
@@ -759,9 +793,20 @@ class MultimodalModelMixin:
             grids = modality_data[grid_key]
             n_items = grids.shape[0]
             patch_counts = [int(c) for c in torch.prod(grids, dim=1).tolist()]
-            per_item = torch.split(modality_data[pixel_key], patch_counts, dim=0)
+            row_starts = list(itertools.accumulate(patch_counts, initial=0))
+            if indices == list(range(indices[0], indices[0] + len(indices))):
+                # Contiguous run: the concatenation is just a row range, so take
+                # a view instead of copying the payload. The common case for
+                # both callers -- a scheduler picks items in order, and cache
+                # misses cluster.
+                pixel_slice = modality_data[pixel_key][
+                    row_starts[indices[0]] : row_starts[indices[-1] + 1]
+                ]
+            else:
+                per_item = torch.split(modality_data[pixel_key], patch_counts, dim=0)
+                pixel_slice = torch.cat([per_item[i] for i in indices], dim=0)
             sliced = {
-                pixel_key: torch.cat([per_item[i] for i in indices], dim=0),
+                pixel_key: pixel_slice,
                 grid_key: grids[indices],
             }
         elif (
