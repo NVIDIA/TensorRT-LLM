@@ -137,7 +137,11 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "use_system_prompt": ExtraParamSchema(
         type="bool",
         default=None,
-        description="Whether to use the system prompt.",
+        description=(
+            "Whether to prepend the system prompt. Unset means the model "
+            "decides: V2V uses it, other modes take the checkpoint's "
+            "declared default."
+        ),
     ),
     "use_guardrails": ExtraParamSchema(
         type="bool",

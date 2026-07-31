@@ -166,7 +166,7 @@ def launch_disaggregated_llm(
         print(
             f"Using unified tp parameter for testing is not recommended. Please use server configs instead."
         )
-    perf_max_requests = 50
+    perf_metrics_output_dir = os.path.join(temp_dir.name, "perf_metrics")
 
     def _apply_perf_flags(cfg: Optional[Dict[str, Any]]):
         if not isinstance(cfg, dict):
@@ -175,7 +175,7 @@ def launch_disaggregated_llm(
             # Only set these if the switch is enabled.
             # Use `setdefault` so explicit per-test overrides are preserved.
             cfg.setdefault("return_perf_metrics", True)
-            cfg.setdefault("perf_metrics_max_requests", perf_max_requests)
+            cfg.setdefault("perf_metrics_output_dir", perf_metrics_output_dir)
 
     _apply_perf_flags(disaggregated_server_config)
     _apply_perf_flags(ctx_server_config)
@@ -479,27 +479,6 @@ def launch_disaggregated_llm(
             thread_pool.futures.append(future)
             return future
 
-        def _get_perf_metrics():
-            path = "/perf_metrics"
-            perf_url = f"http://localhost:{serve_port}{path}"
-            try:
-                print(f"Fetching perf metrics from {perf_url}")
-                resp = requests.get(perf_url, timeout=10)
-                if resp.status_code == 200:
-                    try:
-                        metrics = resp.json()
-                        print("perf_metrics JSON:")
-                        print(json.dumps(metrics, indent=2, ensure_ascii=False))
-                    except ValueError:
-                        print("perf_metrics returned non-JSON response:",
-                              resp.text)
-                else:
-                    print(
-                        f"perf_metrics returned status {resp.status_code}: {resp.text}"
-                    )
-            except requests.exceptions.RequestException as e:
-                print(f"Error fetching {perf_url}: {e}")
-
         def _show_kvcache_time(kv_cache_perf_dir, max_lines=100):
             print(f"kv_cache_perf_dir: {kv_cache_perf_dir}")
             for file in os.listdir(kv_cache_perf_dir):
@@ -515,7 +494,6 @@ def launch_disaggregated_llm(
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
-                _get_perf_metrics()
 
             # Gracefully shut down all server processes
             all_processes = list(

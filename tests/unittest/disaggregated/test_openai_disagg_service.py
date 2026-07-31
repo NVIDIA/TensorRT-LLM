@@ -383,6 +383,31 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+async def test_context_only_response_finishes_hooks(stream):
+    service = _make_service("context_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._check_conditional_disagg = AsyncMock(return_value=(None, True))
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    ctx_response = _make_completion_response("done", finish_reason="stop", context_only=True)
+    service._ctx_client.send_request = AsyncMock(return_value=ctx_response)
+    hooks = mock.Mock()
+    request = CompletionRequest(model="test-model", prompt="hello", stream=stream)
+
+    result = await service._send_disagg_request(request, hooks)
+    if stream:
+        assert [chunk async for chunk in result] == [b"data: [DONE]\n\n"]
+    else:
+        assert result is ctx_response
+
+    hooks.on_resp_done.assert_called_once_with("", request, ctx_response)
+    service._gen_client.send_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
 async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule_style):
     service = _make_service(schedule_style)

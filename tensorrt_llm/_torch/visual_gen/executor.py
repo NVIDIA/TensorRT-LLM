@@ -6,9 +6,9 @@ import threading
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -17,7 +17,6 @@ import zmq
 
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm._torch.visual_gen.utils import classify_worker_error
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
 from tensorrt_llm.logger import logger
@@ -242,6 +241,7 @@ class DiffusionRequest:
     request_id: int
     prompt: List[str]
     params: Optional["VisualGenParams"] = None
+    prepared_inputs: Dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -259,11 +259,11 @@ class DiffusionResponse:
             (valid request does not fit the deployment → 503 /
             ``MemoryError``), or ``None`` for unclassified runtime failures
             (500 / ``RuntimeError``).
-        generation: Wall-clock time the executor measured around the
-            engine's inference call (host ``time.perf_counter()``), in
-            seconds. Default ``0.0`` so the dataclass round-trips through
-            pickling across worker/client; the error path leaves it at
-            ``0.0``.
+        generation: Wall-clock time the executor measured around request
+            preparation and the engine's inference call (host
+            ``time.perf_counter()``), in seconds. Default ``0.0`` so the
+            dataclass round-trips through pickling across worker/client; the
+            error path leaves it at ``0.0``.
     """
 
     request_id: int
@@ -411,6 +411,12 @@ class DiffusionExecutor:
         # Universal field defaults
         for field_name, default_value in self.pipeline.default_generation_params.items():
             if hasattr(params, field_name) and getattr(params, field_name) is None:
+                if (
+                    params.image is not None
+                    and getattr(self.pipeline, "derive_output_size_from_reference", False) is True
+                    and field_name in ("height", "width")
+                ):
+                    continue
                 setattr(params, field_name, default_value)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
@@ -426,21 +432,24 @@ class DiffusionExecutor:
         """Process a single request."""
         try:
             self._merge_defaults(req)
-            cache_key = self.pipeline.warmup_cache_key(
-                req.params.height, req.params.width, num_frames=req.params.num_frames
-            )
-            if self.pipeline._warmed_up_shapes and cache_key not in self.pipeline._warmed_up_shapes:
+            # Include request preparation in executor-side generation latency.
+            # Model-specific preparation runs before the warmup lookup so it
+            # can resolve shape-dependent request fields such as output size.
+            generation_start = time.perf_counter()
+            self.pipeline.prepare_request(req)
+            cache_key = self.pipeline.request_warmup_cache_key(req)
+            cache_key_is_resolved = all(value is not None for value in cache_key)
+            if (
+                cache_key_is_resolved
+                and self.pipeline._warmed_up_shapes
+                and cache_key not in self.pipeline._warmed_up_shapes
+            ):
                 logger.warning(
                     f"Requested shape {cache_key} was not warmed up. "
                     f"First request with this shape will be slower due to "
                     f"torch.compile recompilation or CUDA graph capture. "
                     f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
                 )
-            # Host wall-clock around pipeline.infer(). The pipeline already
-            # syncs at the end (decode_latents path), so this captures the
-            # full executor-side envelope including any pre/post-pipeline work
-            # that the per-phase CUDA-event timings on PipelineOutput do not.
-            generation_start = time.perf_counter()
             output = self.pipeline.infer(req)
             generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
@@ -462,7 +471,7 @@ class DiffusionExecutor:
                     DiffusionResponse(
                         request_id=req.request_id,
                         error_msg=str(e),
-                        error_type=classify_worker_error(e),
+                        error_type=self.pipeline.classify_request_failure(e),
                     )
                 )
 

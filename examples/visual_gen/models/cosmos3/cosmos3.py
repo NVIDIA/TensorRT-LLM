@@ -146,9 +146,11 @@ def main():
         "--use_system_prompt",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Force the system prompt on (--use_system_prompt) or off "
-        "(--no-use_system_prompt). Default: the model decides by mode "
-        "(on for V2V, off otherwise).",
+        help=(
+            "Prepend the Cosmos3 system prompt (--no-use_system_prompt to disable). "
+            "When omitted, V2V uses it and every other mode takes the checkpoint's "
+            "declared default."
+        ),
     )
     parser.add_argument("--enable_audio", action="store_true", help="Enable audio generation")
     parser.add_argument(

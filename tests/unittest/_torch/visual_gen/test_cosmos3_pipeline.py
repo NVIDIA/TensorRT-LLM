@@ -927,3 +927,30 @@ class TestCosmos3FP8Load:
             del pipeline
             gc.collect()
             torch.cuda.empty_cache()
+
+
+class TestErrorClassificationIsOptIn:
+    """Failure classification is per-pipeline, not inferred from the exception
+    class alone. A ``ValueError`` is as likely to be an internal invariant as a
+    rejected input, so a pipeline that hasn't opted in must leave every failure
+    unclassified -- otherwise adding V2V would silently turn other models'
+    internal errors into client errors on the public API.
+    """
+
+    def test_base_pipeline_classifies_nothing(self):
+        from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+
+        pipeline = object.__new__(BasePipeline)
+        for exc in (ValueError("x"), MemoryError("x"), RuntimeError("x")):
+            assert pipeline.classify_request_failure(exc) is None
+
+    def test_cosmos3_opts_in(self):
+        pipeline = object.__new__(Cosmos3OmniMoTPipeline)
+        assert pipeline.classify_request_failure(ValueError("bad reference")) == "client"
+        assert pipeline.classify_request_failure(MemoryError("no room")) == "capacity"
+        assert (
+            pipeline.classify_request_failure(torch.cuda.OutOfMemoryError("no room")) == "capacity"
+        )
+        # Unclassified stays unclassified: an internal fault is not the
+        # caller's fault.
+        assert pipeline.classify_request_failure(RuntimeError("internal")) is None

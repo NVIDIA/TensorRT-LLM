@@ -83,6 +83,7 @@ def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
         audio_gen=False,
         action_gen=False,
         sampling=Cosmos3SamplingPolicy(),
+        default_use_system_prompt=False,
     )
     defaults.update(attrs)
     for key, value in defaults.items():
@@ -464,26 +465,33 @@ class TestWarmupAndForwardValidation:
         with pytest.raises(ValueError, match="distilled"):
             pipeline.forward(prompt="x", seed=0, use_guardrails=False, **bad_kwargs)
 
-    def test_distilled_rejects_image_conditioning(self):
-        """Without per-step re-anchoring, the stochastic scheduler corrupts the
-        conditioned frame; the request must fail rather than degrade silently."""
-        pipeline = _bare_pipeline(sampling=_distilled_policy())
-        with pytest.raises(ValueError, match="re-anchor"):
+    @pytest.mark.parametrize(
+        "policy_factory, sampling_kwargs",
+        [
+            (_base_policy, {}),
+            (
+                _distilled_policy,
+                {"num_inference_steps": 4, "guidance_scale": DISTILLED_GUIDANCE_SCALE},
+            ),
+        ],
+    )
+    def test_image_conditioning_passes_validation(self, policy_factory, sampling_kwargs):
+        """No sampling policy rejects image conditioning by checkpoint kind.
+
+        Distilled checkpoints keep the conditioned frame clean by re-anchoring
+        it after every scheduler step (see TestDistilledConditioningAnchor)
+        rather than by refusing the request. forward() therefore gets past
+        validation for both policies and only fails later on the bare double.
+        """
+        pipeline = _bare_pipeline(sampling=policy_factory())
+        with pytest.raises(AttributeError):
             pipeline.forward(
                 prompt="x",
                 seed=0,
                 use_guardrails=False,
                 image="frame.png",
-                num_inference_steps=4,
-                guidance_scale=1.0,
+                **sampling_kwargs,
             )
-
-    def test_base_still_accepts_image_conditioning_path(self):
-        """Base checkpoints must not be caught by the distilled image rejection:
-        forward proceeds past validation (fails later on the bare test double)."""
-        pipeline = _bare_pipeline(sampling=_base_policy())
-        with pytest.raises(AttributeError):
-            pipeline.forward(prompt="x", seed=0, use_guardrails=False, image="frame.png")
 
     @pytest.mark.parametrize("bad_output_type", ["imgae", "png", "", "both"])
     def test_invalid_output_type_raises(self, bad_output_type):
@@ -590,6 +598,344 @@ class TestDistilledDenoiseLoop:
         assert torch.all(result == 2.0)
 
 
+class _PerturbingScheduler(_AdditiveScheduler):
+    """step(v, t, x) = x + v + 1.0 — every position moves every step even
+    where the velocity is zero, emulating the distilled SDE step's
+    re-noising. A conditioned frame stays clean only if something re-anchors
+    it after each step."""
+
+    def step(self, model_output, timestep, sample, return_dict=False):
+        assert return_dict is False
+        return (sample + model_output + 1.0,)
+
+
+class TestDistilledConditioningAnchor:
+    """Per-step re-anchoring of image-conditioned frames under SDE sampling."""
+
+    CLEAN = 7.0  # conditioned-frame latent value; drift is detected against it
+
+    def _clean_frame(self):
+        return torch.full((1, 4, 1, 2, 2), self.CLEAN)
+
+    def test_anchor_gating(self):
+        image_latent = self._clean_frame()
+        distilled = _bare_pipeline(sampling=_distilled_policy())
+        assert callable(distilled._conditioning_anchor_post_step(image_latent))
+        assert distilled._conditioning_anchor_post_step(None) is None
+        assert (
+            _bare_pipeline(sampling=_base_policy())._conditioning_anchor_post_step(image_latent)
+            is None
+        )
+        assert _bare_pipeline()._conditioning_anchor_post_step(image_latent) is None
+
+    def test_anchor_writes_only_frame_zero_in_place(self):
+        pipeline = _bare_pipeline(sampling=_distilled_policy())
+        post_step_fn = pipeline._conditioning_anchor_post_step(self._clean_frame())
+
+        latents = torch.arange(48, dtype=torch.float32).reshape(1, 4, 3, 2, 2)
+        untouched = latents[:, :, 1:].clone()
+        returned = post_step_fn(latents)
+
+        assert returned is latents, "must write in place, not copy"
+        assert torch.all(latents[:, :, 0:1] == self.CLEAN)
+        assert torch.equal(latents[:, :, 1:], untouched)
+
+    def _run_denoise(self, with_anchor: bool):
+        """Run the real BasePipeline.denoise loop with a perturbing scheduler,
+        recording what the transformer receives at every step."""
+        pipeline = _denoise_ready_pipeline()
+        pipeline.sampling = _distilled_policy()
+        timesteps = torch.tensor([s * 1000.0 for s in DISTILLED_SIGMAS])
+        scheduler = _PerturbingScheduler(timesteps)
+
+        seen = []
+
+        def forward_fn(latent_input, extra_streams, step_index, timestep, embeds, extras):
+            seen.append(latent_input.clone())
+            return torch.full_like(latent_input, 0.5)
+
+        latents = torch.zeros(1, 4, 3, 2, 2)
+        latents[:, :, 0:1] = self.CLEAN  # frame 0 pinned clean, rest noise-like
+        image_latent = self._clean_frame()
+
+        post_step_fn = (
+            pipeline._conditioning_anchor_post_step(image_latent) if with_anchor else None
+        )
+        result = pipeline.denoise(
+            latents=latents,
+            scheduler=scheduler,
+            prompt_embeds=torch.arange(8).unsqueeze(0),
+            neg_prompt_embeds=torch.arange(8).unsqueeze(0) + 100,
+            guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            forward_fn=forward_fn,
+            extra_cfg_tensors={},
+            post_step_fn=post_step_fn,
+        )
+        return result, seen
+
+    def test_every_forward_sees_clean_conditioned_frame(self):
+        result, seen = self._run_denoise(with_anchor=True)
+
+        assert len(seen) == 4
+        for step, latent_input in enumerate(seen):
+            assert torch.all(latent_input[:, :, 0:1] == self.CLEAN), (
+                f"transformer input at step {step} lost the clean conditioning frame"
+            )
+        # The perturbing step really moved everything else: unconditioned
+        # frames accumulate (velocity 0.5 + drift 1.0) per completed step.
+        for step, latent_input in enumerate(seen):
+            assert torch.all(latent_input[:, :, 1:] == step * 1.5)
+        assert torch.all(result[:, :, 0:1] == self.CLEAN)
+        assert torch.all(result[:, :, 1:] == 4 * 1.5)
+
+    def test_without_anchor_the_conditioned_frame_drifts(self):
+        """Control: the same loop without the anchor corrupts frame 0 from the
+        second forward on — the exact failure mode the anchor exists for."""
+        _, seen = self._run_denoise(with_anchor=False)
+
+        assert torch.all(seen[0][:, :, 0:1] == self.CLEAN)
+        for step, latent_input in enumerate(seen[1:], start=1):
+            assert torch.all(latent_input[:, :, 0:1] == self.CLEAN + step * 1.5)
+
+
+def _forward_ready_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
+    """A pipeline stubbed just enough for forward() to run end to end."""
+    defaults = dict(
+        sampling=_distilled_policy(),
+        pipeline_config=SimpleNamespace(torch_dtype=torch.float32, visual_gen_mapping=None),
+        transformer=SimpleNamespace(
+            latent_channel_size=4,
+            reset_cache=lambda: None,
+            device=torch.device("cpu"),
+        ),
+        vae_scale_factor_temporal=4,
+        vae_scale_factor_spatial=16,
+        scheduler=SimpleNamespace(
+            set_timesteps=lambda *args, **kwargs: None,
+            config=SimpleNamespace(num_train_timesteps=1000),
+        ),
+    )
+    defaults.update(attrs)
+    pipeline = _bare_pipeline(**defaults)
+    pipeline._tokenize_prompt = lambda *args, **kwargs: (
+        torch.ones(1, 4, dtype=torch.long),
+        torch.ones(1, 4, dtype=torch.long),
+    )
+    return pipeline
+
+
+class TestForwardConditioningWiring:
+    """forward() must hand the denoise loop the anchor exactly when the
+    checkpoint is distilled and the request carries image conditioning."""
+
+    T_LAT, H_LAT, W_LAT = 2, 2, 2  # from num_frames=5, 32x32, scale 4/16
+    CLEAN = 7.0
+
+    def _wiring_pipeline(self):
+        pipeline = _forward_ready_pipeline()
+        pipeline._encode_conditioning_video = lambda *args, **kwargs: torch.full(
+            (1, 4, self.T_LAT, self.H_LAT, self.W_LAT), self.CLEAN
+        )
+        pipeline.decode_latents = lambda latents, decode_fn: torch.zeros(1, 5, 32, 32, 3)
+
+        captured = {}
+
+        def denoise(**kwargs):
+            captured.update(kwargs)
+            return kwargs["latents"]
+
+        pipeline.denoise = denoise
+        return pipeline, captured
+
+    def _forward(self, pipeline, image):
+        return pipeline.forward(
+            prompt="x",
+            seed=0,
+            image=image,
+            height=32,
+            width=32,
+            num_frames=5,
+            num_inference_steps=4,
+            guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            use_guardrails=False,
+            enable_audio=False,
+        )
+
+    def test_i2v_request_wires_anchor_and_seeded_steps(self):
+        pipeline, captured = self._wiring_pipeline()
+        self._forward(pipeline, image=torch.zeros(3, 32, 32))
+
+        post_step_fn = captured["post_step_fn"]
+        assert post_step_fn is not None
+        latents = torch.zeros(1, 4, self.T_LAT, self.H_LAT, self.W_LAT)
+        post_step_fn(latents)
+        assert torch.all(latents[:, :, 0:1] == self.CLEAN)
+        assert torch.all(latents[:, :, 1:] == 0.0)
+
+        assert isinstance(captured["scheduler_step_kwargs"]["generator"], torch.Generator)
+        # Initial latents enter the loop with the clean frame already pinned.
+        assert torch.all(captured["latents"][:, :, 0:1] == self.CLEAN)
+
+    def test_t2v_request_wires_no_anchor(self):
+        pipeline, captured = self._wiring_pipeline()
+        self._forward(pipeline, image=None)
+        assert captured["post_step_fn"] is None
+
+
+class TestSystemPromptDefault:
+    """use_system_prompt defaults are checkpoint-declared via model_index.json."""
+
+    def _write_model_index(self, checkpoint_dir: Path, content: dict) -> None:
+        with open(checkpoint_dir / "model_index.json", "w") as f:
+            json.dump(content, f)
+
+    def _loaded_pipeline(self, tmp_path) -> Cosmos3OmniMoTPipeline:
+        _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        pipeline = _bare_pipeline()
+        pipeline.load_standard_components(
+            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
+        )
+        return pipeline
+
+    def test_checkpoint_declared_true(self, tmp_path):
+        self._write_model_index(tmp_path, {"default_use_system_prompt": True})
+        pipeline = self._loaded_pipeline(tmp_path)
+
+        assert pipeline.default_use_system_prompt is True
+        # The published spec default stays None ("model decides"): the executor
+        # materializes spec defaults into every request, so publishing the
+        # checkpoint boolean here would destroy "unset" before forward() could
+        # resolve it by mode. The checkpoint value lives on the pipeline.
+        assert pipeline.extra_param_specs["use_system_prompt"].default is None
+        # The shared spec table must stay untouched.
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        assert COSMOS3_EXTRA_SPECS["use_system_prompt"].default is None
+
+    def test_missing_model_index_keeps_false(self, tmp_path):
+        pipeline = self._loaded_pipeline(tmp_path)
+        assert pipeline.default_use_system_prompt is False
+        assert pipeline.extra_param_specs["use_system_prompt"].default is None
+
+    def test_model_index_without_field_keeps_false(self, tmp_path):
+        self._write_model_index(tmp_path, {"_class_name": "Cosmos3OmniPipeline"})
+        pipeline = self._loaded_pipeline(tmp_path)
+        assert pipeline.default_use_system_prompt is False
+
+    def _captured_use_system_prompt(self, pipeline, extra_params):
+        captured = {}
+        pipeline.forward = lambda **kwargs: captured.update(kwargs)
+        pipeline.infer(_fake_request("video", extra_params=extra_params))
+        return captured["use_system_prompt"]
+
+    def test_infer_passes_unset_key_through_as_none(self):
+        """forward() owns the resolution, so infer() must forward "unset"
+        rather than pre-resolving it — otherwise the two entry points can
+        drift apart again."""
+        pipeline = _bare_pipeline(default_use_system_prompt=True)
+        assert self._captured_use_system_prompt(pipeline, {"output_type": "video"}) is None
+
+    def test_infer_passes_explicit_false_through(self):
+        pipeline = _bare_pipeline(default_use_system_prompt=True)
+        got = self._captured_use_system_prompt(
+            pipeline, {"output_type": "video", "use_system_prompt": False}
+        )
+        assert got is False
+
+    def _tokenized_use_system_prompt(self, pipeline, **forward_kwargs):
+        """Run forward() far enough to observe what it hands the tokenizer."""
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def fake_tokenize(prompt, max_sequence_length, use_system_prompt, system_prompt=None):
+            seen["value"] = use_system_prompt
+            raise _Stop
+
+        pipeline._tokenize_prompt = fake_tokenize
+        with pytest.raises(_Stop):
+            pipeline.forward(
+                prompt="x",
+                seed=0,
+                use_guardrails=False,
+                num_inference_steps=4,
+                guidance_scale=DISTILLED_GUIDANCE_SCALE,
+                **forward_kwargs,
+            )
+        return seen["value"]
+
+    def test_forward_unset_resolves_to_checkpoint_default(self):
+        """Direct forward() callers (warmup included) must build the same
+        prompt as served requests."""
+        pipeline = _forward_ready_pipeline(default_use_system_prompt=True)
+        assert self._tokenized_use_system_prompt(pipeline) is True
+
+    def test_forward_explicit_false_overrides_checkpoint_default(self):
+        pipeline = _forward_ready_pipeline(default_use_system_prompt=True)
+        assert self._tokenized_use_system_prompt(pipeline, use_system_prompt=False) is False
+
+    def test_forward_default_false_checkpoint_unchanged(self):
+        pipeline = _forward_ready_pipeline(default_use_system_prompt=False)
+        assert self._tokenized_use_system_prompt(pipeline) is False
+
+    def test_warmup_leaves_system_prompt_unset(self):
+        """_run_warmup must not pin the historical False: leaving it unset is
+        what lets forward() resolve the checkpoint default."""
+        pipeline = _bare_pipeline(sampling=_distilled_policy(), default_use_system_prompt=True)
+        captured = {}
+        pipeline.forward = lambda **kwargs: captured.update(kwargs)
+
+        pipeline._run_warmup(height=720, width=1280, num_frames=9, steps=4)
+
+        assert captured.get("use_system_prompt") is None
+
+
+class TestAudioWeightPresenceGuard:
+    """enable_audio=True must fail loudly when the checkpoint ships no audio
+    tower — a weight-presence guard, not a workflow restriction."""
+
+    def _pipeline(self, **attrs):
+        return _bare_pipeline(sampling=_distilled_policy(), scheduler=None, **attrs)
+
+    def test_explicit_audio_on_audioless_checkpoint_raises(self):
+        with pytest.raises(ValueError, match="audio tower"):
+            self._pipeline().forward(
+                prompt="x",
+                seed=0,
+                use_guardrails=False,
+                enable_audio=True,
+                num_inference_steps=4,
+                guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            )
+
+    def test_t2i_disables_audio_before_the_guard(self):
+        """T2I force-disables audio for every checkpoint (existing semantics);
+        the guard must not fire for it. The batch error proves forward got
+        past the guard."""
+        with pytest.raises(ValueError, match="Batch generation"):
+            self._pipeline().forward(
+                prompt=["a", "b"],
+                seed=0,
+                use_guardrails=False,
+                enable_audio=True,
+                output_type="image",
+                num_inference_steps=4,
+                guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            )
+
+    def test_audio_capable_checkpoint_passes_the_guard(self):
+        with pytest.raises(ValueError, match="Batch generation"):
+            self._pipeline(audio_gen=True).forward(
+                prompt=["a", "b"],
+                seed=0,
+                use_guardrails=False,
+                enable_audio=True,
+                num_inference_steps=4,
+                guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            )
+
+
 class TestRegistryDispatch:
     def test_model_index_class_name_dispatches(self, tmp_path):
         with open(tmp_path / "model_index.json", "w") as f:
@@ -599,6 +945,7 @@ class TestRegistryDispatch:
     def test_hf_id_registered(self):
         entry = PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"]
         assert "nvidia/Cosmos3-Super-Text2Image-4Step" in entry.hf_ids
+        assert "nvidia/Cosmos3-Super-Image2Video-4Step" in entry.hf_ids
 
 
 class TestDistilledForwardDefaults:
@@ -692,3 +1039,37 @@ class TestDistilledForwardDefaults:
         dims = next(line for line in lines if "Cosmos3 generation dims" in line)
         assert f"num_inference_steps={COSMOS3_720P_PARAMS['num_inference_steps']}" in dims
         assert f"guidance_scale={COSMOS3_720P_PARAMS['guidance_scale']:.2f}" in dims
+
+
+class TestSystemPromptSurvivesDefaultMerge:
+    """The executor materializes every extra-param spec default into the
+    request before ``infer()`` runs. If Cosmos3 published a boolean default for
+    ``use_system_prompt``, an omitted value would arrive at ``forward()`` as
+    that boolean instead of ``None``, and the mode-dependent resolution (V2V
+    uses the system prompt) would never run. Tests that call ``infer()`` or
+    ``forward()`` directly skip this merge, so it needs covering here.
+    """
+
+    def _merged_extra_params(self, extra_params):
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor
+        from tensorrt_llm.visual_gen.params import VisualGenParams
+
+        pipeline = _bare_pipeline()
+        pipeline.default_use_system_prompt = False  # base checkpoint
+        pipeline.derive_output_size_from_reference = False
+        executor = object.__new__(DiffusionExecutor)
+        executor.pipeline = pipeline
+
+        params = VisualGenParams()
+        params.extra_params = dict(extra_params)
+        req = SimpleNamespace(params=params, request_id=1)
+        DiffusionExecutor._merge_defaults(executor, req)
+        return req.params.extra_params
+
+    def test_omitted_value_stays_unset_through_the_merge(self):
+        merged = self._merged_extra_params({"video": b"fake"})
+        assert merged["use_system_prompt"] is None
+
+    def test_explicit_value_survives_the_merge(self):
+        merged = self._merged_extra_params({"video": b"fake", "use_system_prompt": False})
+        assert merged["use_system_prompt"] is False

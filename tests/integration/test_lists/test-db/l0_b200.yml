@@ -212,6 +212,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_flux_transformer.py
   - unittest/_torch/visual_gen/test_flux_attention.py
   - unittest/_torch/visual_gen/test_flux_pipeline.py
+  - unittest/_torch/visual_gen/test_flux2_image_conditioning.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
@@ -234,6 +235,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_wan_t2v_example
   - examples/visual_gen/test_visual_gen.py::test_flux1_example
   - examples/visual_gen/test_visual_gen.py::test_flux2_example
+  - examples/visual_gen/test_visual_gen.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_example
@@ -269,6 +271,7 @@ l0_b200:
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/disaggregated/test_openai_server_info.py
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
 - condition:
     ranges:
       system_gpu_count:
@@ -345,6 +348,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_v2v_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_lpips_against_golden TIMEOUT (20)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----
