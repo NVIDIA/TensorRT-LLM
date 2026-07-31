@@ -159,7 +159,7 @@ def test_decode_chunk_slices_reject_invalid_chunk_size(chunk_size: int) -> None:
     ],
 )
 def test_native_decode_chunk_size_uses_tuned_or_conservative_value(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     parallel_size: int,
     dtype: torch.dtype,
     expected: int,
@@ -168,14 +168,16 @@ def test_native_decode_chunk_size_uses_tuned_or_conservative_value(
     assert _native_decode_chunk_size(parallel_size, dtype) == expected
 
 
-def test_native_decode_chunk_size_honors_env_override(monkeypatch):
+def test_native_decode_chunk_size_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv(TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE, "5")
     assert _native_decode_chunk_size(1, torch.bfloat16) == 5
 
 
 @pytest.mark.parametrize("override", ["0", "-1", "invalid"])
 def test_native_decode_chunk_size_rejects_invalid_env_override(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     override: str,
 ) -> None:
     monkeypatch.setenv(TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE, override)
@@ -304,7 +306,7 @@ def test_wan21_t2v_vae_matches_diffusers_decode_checkpoint():
     _assert_close_metrics(wan_decoded, reference_decoded, max_abs=4e-3, relative_mean=1e-3)
 
 
-def test_wan22_temporal_chunk4_matches_chunk1_checkpoint():
+def test_wan22_temporal_chunk4_matches_chunk1_checkpoint() -> None:
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
     _, wan_vae = _make_reference_and_wan_vae(checkpoint_dir)
 
