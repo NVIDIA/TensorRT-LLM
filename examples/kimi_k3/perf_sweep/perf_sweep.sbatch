@@ -49,30 +49,38 @@ done
 
 # Per-mode batch shape and the tuned env. MAX_BATCH_SIZE is PER-RANK for
 # dep16 (attention DP), GLOBAL for the TEP modes.
+#   KIMI_K3_FP8_WEIGHT_READ=1  opt-in FP8 (lossy) read of the replicated
+#       BF16 weights — default OFF in the loader, so every mode sets it
+#       explicitly: all recipes below were tuned and measured with it on.
+#   KIMI_K3_FP8_WEIGHT_READ_KDA=0  keep the KDA q/k/v/g/o projections in
+#       BF16 within the enabled master (the most precision-sensitive slice).
 #   KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1  FP8 shared-expert gate_up read at TEP
-#       (default only under attention DP): +8-9% with stream_interval >= 10.
+#       (with the master on it defaults on only under attention DP): +8-9%
+#       with stream_interval >= 10.
 #   TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1  host-side routing; the in-cubin
 #       top-k tier register-spills at decode batch 5-64 (33 us/layer).
 case "$MODE" in
     dep16)
         TP_SIZE=16; MAX_BATCH_SIZE=64
         DEFAULT_CONCURRENCIES="16 32 64 128 256 512 1024"
-        MODE_ENV=""
+        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1"
         ;;
     tep16)
         TP_SIZE=16; MAX_BATCH_SIZE=16
         DEFAULT_CONCURRENCIES="1 2 4 8 16"
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ_KDA=0 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1"
+        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_KDA=0 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1"
         # bf16 KDA read + FP8 gate_up at tp16: c1 77.0 tps/user (12.98 ms) vs
         # 55.1 bare, GSM8K 96.85 (also 96.82 for KDA=0 alone, 96.63 gate_up
-        # alone, 96.44 bare). Do NOT add the separated-routing env here: alone
-        # it scores 94.05 at tp16 and combined with gate_up it destroys
+        # alone, 96.44 bare). "Bare" = the master FP8 stack with no overrides
+        # (measured when the FP8 read was default-on; the master env is now
+        # set explicitly instead). Do NOT add the separated-routing env here:
+        # alone it scores 94.05 at tp16 and combined with gate_up it destroys
         # accuracy (8.49-9.36); that pair is tep8-only (96.59).
         ;;
     tep8)
         TP_SIZE=8; MAX_BATCH_SIZE=16
         DEFAULT_CONCURRENCIES="1 2 4 8 16"
-        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1 TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1"
+        MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1 TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1"
         ;;
     *) echo "error: unknown --mode: $MODE (dep16|tep16|tep8)" >&2; exit 2 ;;
 esac
