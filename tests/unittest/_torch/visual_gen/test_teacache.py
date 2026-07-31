@@ -360,6 +360,8 @@ class TestQwenImageTeacacheTable:
             BasePipeline._apply_teacache_coefficients(pipeline, QWEN_IMAGE_TEACACHE_COEFFICIENTS)
             BasePipeline._setup_cache_acceleration(pipeline)
         assert pipeline.model_config.teacache.coefficients == [1.0, 2.0, 3.0]
+
+
 class _TupleTransformer(torch.nn.Module):
     def forward(
         self,
