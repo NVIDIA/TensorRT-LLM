@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -807,65 +808,106 @@ def test_empty_pass_runs_the_timeout_check_the_pp_loop_used_to_skip():
     executor._process_iter_stats.assert_not_called()
 
 
-def _executed_batch_empty_pass_guards():
-    """Return the guard expressions of the empty-pass calls in _executor_loop_pp."""
-    import ast
-    import inspect
-    import textwrap
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(PyExecutor._executor_loop_pp)))
-    guards = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        for inner in ast.walk(node):
-            if (
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Attribute)
-                and inner.func.attr == "_handle_executed_batch"
-                and len(inner.args) == 1
-                and isinstance(inner.args[0], ast.Constant)
-                and inner.args[0].value is None
-            ):
-                guards.append(node.test)
-    return guards
-
-
-def test_pp_loop_makes_one_empty_pass_when_the_pipeline_is_drained():
-    """The drained PP loop must still make a single pass through the tail."""
-    guards = _executed_batch_empty_pass_guards()
-
-    assert len(guards) == 1, (
-        "expected exactly one guarded _handle_executed_batch(None) empty pass in "
-        f"_executor_loop_pp, found {len(guards)}"
+def _make_dispatch_executor(rank, queued_batches, has_transceiver=True):
+    executor = object.__new__(PyExecutor)
+    executor.dist = SimpleNamespace(rank=rank)
+    executor.unhandled_batch_counter = 0
+    executor.kv_cache_transceiver = Mock() if has_transceiver else None
+    executor.executed_batch_response_queue = SimpleNamespace(
+        get=Mock(side_effect=list(queued_batches))
     )
+    executor._handle_executed_batch = Mock()
+    return executor
 
 
-def test_empty_pass_is_guarded_only_by_the_broadcast_consensus_value():
-    """Rank symmetry: the guard may depend on nothing rank-local.
+@pytest.mark.parametrize("executed_batch_num", [0, 1, 2])
+def test_executed_batch_dispatch_is_rank_symmetric(executed_batch_num):
+    """The tail must run the same number of times on every rank role.
 
-    ``executed_batch_num`` is the ring-broadcast consensus value and is identical
-    on every rank, so guarding on it alone means the empty pass -- and the
-    ``tp_allgather`` collectives inside the tail -- is taken by all ranks or by
-    none. Any rank-local term here (``self.dist.rank``, ``executed_batches``,
-    ``unhandled_batch_counter``, ...) would desync the collectives and deadlock
-    every PP job, disagg or not.
+    ``_handle_executed_batch`` enters ``tp_allgather`` via
+    ``_handle_kv_transfer_timeouts_synced`` and ``_flush_iter_stats_synced``, so
+    the call count must be a pure function of the ring-broadcast consensus
+    value ``executed_batch_num`` -- identical on rank 0 and on every other rank.
+    A desync here deadlocks every PP job, disagg or not.
     """
-    import ast
+    batches = [object() for _ in range(executed_batch_num)]
 
-    (guard,) = _executed_batch_empty_pass_guards()
+    rank0 = _make_dispatch_executor(0, [])
+    PyExecutor._dispatch_executed_batches(rank0, executed_batch_num, batches)
 
-    names = {node.id for node in ast.walk(guard) if isinstance(node, ast.Name)}
-    attributes = {node.attr for node in ast.walk(guard) if isinstance(node, ast.Attribute)}
+    other = _make_dispatch_executor(3, batches)
+    PyExecutor._dispatch_executed_batches(other, executed_batch_num, [])
 
-    assert names == {"executed_batch_num"}, f"guard reads rank-local names: {names}"
-    assert not attributes, f"guard reads rank-local attributes: {attributes}"
+    rank0_calls = rank0._handle_executed_batch.call_count
+    other_calls = other._handle_executed_batch.call_count
+
+    assert rank0_calls == other_calls, (
+        f"rank 0 ran the tail {rank0_calls}x but a non-zero rank ran it "
+        f"{other_calls}x for executed_batch_num={executed_batch_num}"
+    )
+    assert rank0_calls == max(executed_batch_num, 1)
+    # The consensus count is still decremented identically on both roles.
+    assert rank0.unhandled_batch_counter == other.unhandled_batch_counter
+    assert rank0.unhandled_batch_counter == -executed_batch_num
 
 
-def _make_watchdog_executor(num_scheduled_requests=0, in_transfer=(), active=()):
+@pytest.mark.parametrize("rank", [0, 3])
+def test_drained_pipeline_makes_exactly_one_empty_pass(rank):
+    """A drained pipeline must still reach the tail once, with no real batch."""
+    executor = _make_dispatch_executor(rank, [])
+
+    PyExecutor._dispatch_executed_batches(executor, 0, [])
+
+    executor._handle_executed_batch.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize("executed_batch_num", [1, 2])
+def test_non_drained_pipeline_makes_no_empty_pass(executed_batch_num):
+    """No double-call: the empty pass fires only when the tail ran zero times."""
+    batches = [object() for _ in range(executed_batch_num)]
+    executor = _make_dispatch_executor(0, [])
+
+    PyExecutor._dispatch_executed_batches(executor, executed_batch_num, batches)
+
+    assert executor._handle_executed_batch.call_args_list == [call(b) for b in batches]
+
+
+@pytest.mark.parametrize("rank", [0, 3])
+def test_non_disagg_pipeline_takes_no_empty_pass(rank):
+    """Non-disagg PP jobs must keep taking zero collectives when drained.
+
+    ``_handle_kv_transfer_timeouts_synced`` gates only on attention-DP, with no
+    transceiver check, so an unconditional empty pass would add a
+    ``tp_allgather`` to every drained iteration of *any* ADP+PP job. Drained
+    iterations are a recurring steady state when
+    ``pp_async_broadcast_sample_state`` is on, so that is hot-path cost for
+    jobs this fix has nothing to do with.
+    """
+    executor = _make_dispatch_executor(rank, [], has_transceiver=False)
+
+    PyExecutor._dispatch_executed_batches(executor, 0, [])
+
+    executor._handle_executed_batch.assert_not_called()
+
+
+_TIMEOUT_MS = 60_000
+_HANG_TIMEOUT_S = 300
+
+
+def _make_watchdog_executor(
+    num_scheduled_requests=0,
+    in_transfer=(),
+    active=(),
+    timeout_ms=_TIMEOUT_MS,
+):
     executor = object.__new__(PyExecutor)
     executor.num_scheduled_requests = num_scheduled_requests
+    executor.iter_counter = 0
+    executor._wedged_kv_transfer_iter = -1
+    executor._wedged_kv_transfer_result = False
+    executor.hang_detector = SimpleNamespace(timeout=_HANG_TIMEOUT_S)
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.kv_transfer_timeout_ms = timeout_ms
     executor.active_requests = list(active)
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.requests_in_transfer.return_value = {
@@ -874,25 +916,48 @@ def _make_watchdog_executor(num_scheduled_requests=0, in_transfer=(), active=())
     return executor
 
 
+def _make_wedged_request(elapsed_s, request_id=11, timed_out=True):
+    request = _make_ctx_only_request(request_id=request_id)
+    request.py_kv_transfer_timed_out = timed_out
+    request.py_kv_transfer_start_time = time.monotonic() - elapsed_s
+    return request
+
+
 def test_watchdog_predicate_fires_on_wedged_ctx_transfer():
-    request = _make_ctx_only_request()
-    request.py_kv_transfer_timed_out = True
+    request = _make_wedged_request(elapsed_s=_HANG_TIMEOUT_S + 120)
     executor = _make_watchdog_executor(in_transfer=[request])
 
     assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is True
 
 
 def test_watchdog_predicate_fires_on_wedged_gen_transfer():
-    request = _make_timeout_request()
+    request = _make_wedged_request(elapsed_s=_HANG_TIMEOUT_S + 120)
     executor = _make_watchdog_executor(active=[request])
 
     assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is True
 
 
+def test_watchdog_predicate_spares_a_slow_but_live_transfer():
+    """The whole point of the give-up margin.
+
+    ``kv_transfer_timeout_ms`` defaults to 60s and only means "start trying to
+    cancel". On main a transfer that blows it but cannot be cancelled is left
+    alone and allowed to finish. Killing every rank via ``MPI_Abort`` for a
+    transfer that is merely slow would be a new outage class, so a flagged
+    transfer keeps a full ``hang_detection_timeout`` of grace.
+    """
+    request = _make_wedged_request(elapsed_s=_HANG_TIMEOUT_S - 60)
+
+    for executor in (
+        _make_watchdog_executor(in_transfer=[request]),
+        _make_watchdog_executor(active=[request]),
+    ):
+        assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is False
+
+
 def test_watchdog_predicate_ignores_a_healthy_idle_server():
-    """An idle server with nothing past its deadline must never be killed."""
-    request = _make_ctx_only_request()
-    assert request.py_kv_transfer_timed_out is False
+    """An idle server with nothing flagged must never be killed."""
+    request = _make_wedged_request(elapsed_s=100_000, timed_out=False)
     executor = _make_watchdog_executor(in_transfer=[request], active=[request])
 
     assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is False
@@ -906,8 +971,7 @@ def test_watchdog_predicate_ignores_a_completely_idle_server():
 
 def test_watchdog_predicate_requires_an_empty_batch():
     """A loop that is still scheduling work is making progress, not wedged."""
-    request = _make_ctx_only_request()
-    request.py_kv_transfer_timed_out = True
+    request = _make_wedged_request(elapsed_s=_HANG_TIMEOUT_S + 120)
     executor = _make_watchdog_executor(num_scheduled_requests=4, in_transfer=[request])
 
     assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is False
@@ -919,3 +983,26 @@ def test_watchdog_predicate_is_inert_without_a_transceiver():
     executor.kv_cache_transceiver = None
 
     assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is False
+
+
+def test_watchdog_predicate_is_inert_without_a_configured_timeout():
+    executor = _make_watchdog_executor(
+        in_transfer=[_make_wedged_request(elapsed_s=100_000)], timeout_ms=None
+    )
+
+    assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is False
+
+
+def test_watchdog_predicate_is_evaluated_once_per_iteration():
+    """It runs on every checkpoint() and pause(); the walks touch C++ bindings."""
+    request = _make_wedged_request(elapsed_s=_HANG_TIMEOUT_S + 120)
+    executor = _make_watchdog_executor(in_transfer=[request])
+    walks = executor.async_transfer_manager.requests_in_transfer
+
+    for _ in range(4):
+        assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is True
+    assert walks.call_count == 1
+
+    executor.iter_counter += 1
+    assert PyExecutor._is_wedged_on_timed_out_kv_transfer(executor) is True
+    assert walks.call_count == 2

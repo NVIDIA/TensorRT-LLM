@@ -134,7 +134,8 @@ class HangDetector:
         ``_suppress_rearm``). Callers must supply a cheap, nonblocking
         predicate -- it runs on the executor thread on every checkpoint.
         """
-        self._rearm_suppressor = suppressor
+        with self.lock:
+            self._rearm_suppressor = suppressor
 
     def is_armed(self) -> bool:
         """Whether a hang detection is currently pending."""
@@ -146,10 +147,12 @@ class HangDetector:
         Never suppresses while unarmed, so the detector cannot be disabled by
         this path -- only prevented from having its deadline pushed forward.
         """
-        if self._rearm_suppressor is None or not self.is_armed():
+        with self.lock:
+            suppressor = self._rearm_suppressor
+        if suppressor is None or not self.is_armed():
             return False
         try:
-            return bool(self._rearm_suppressor())
+            return bool(suppressor())
         except Exception as error:  # noqa: BLE001 - isolate the caller's predicate
             _best_effort_log_error(
                 f"HangDetector: re-arm suppressor failed with {type(error).__name__}: {error}"
@@ -222,6 +225,10 @@ class HangDetector:
     def stop(self):
         """Stop hang detection."""
         self.active = False
+        # Drop the suppressor with the rest of the detector state so a stopped
+        # detector cannot keep calling back into a torn-down executor.
+        with self.lock:
+            self._rearm_suppressor = None
         self.cancel_task()
         if self.loop is not None:
             # Cancel all pending tasks before stopping the loop

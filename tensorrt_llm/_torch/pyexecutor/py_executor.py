@@ -921,6 +921,8 @@ class PyExecutor:
         if kv_cache_transceiver is not None:
             self.hang_detector.register_status_provider(
                 kv_cache_transceiver.get_status_dump)
+            self._wedged_kv_transfer_iter = -1
+            self._wedged_kv_transfer_result = False
             self.hang_detector.set_rearm_suppressor(
                 self._is_wedged_on_timed_out_kv_transfer)
         cache_transceiver_config = getattr(self.llm_args,
@@ -2798,20 +2800,7 @@ class PyExecutor:
                                 )
                     return executed_batch_num
 
-                def handle_executed_batches(executed_batch_num: int):
-                    if self.dist.rank != 0:
-                        dequeue_counter = 0
-                        while dequeue_counter < executed_batch_num:
-                            with nvtx_range("get_executed_batch"):
-                                executed_batch = self.executed_batch_response_queue.get(
-                                )
-                            self._handle_executed_batch(executed_batch)
-                            dequeue_counter += 1
-                    else:
-                        for executed_batch in executed_batches:
-                            self._handle_executed_batch(executed_batch)
-                    self.unhandled_batch_counter -= executed_batch_num
-
+                executed_batches = []
                 executed_batch_num = 0
 
                 # Stage 3.1: The first rank determines the number of executed batches.
@@ -2824,26 +2813,8 @@ class PyExecutor:
                     executed_batch_num)
 
                 # Stage 3.3: Handle executed batches.
-                handle_executed_batches(executed_batch_num)
-
-                # Once the pipeline drains, executed_batch_num is 0 and the
-                # loop above stops calling _handle_executed_batch entirely --
-                # taking out its ungated tail (the KV-transfer timeout check
-                # and the synced-collective drains) along with it. A disagg
-                # KV transfer wedged at that point would then never be flagged
-                # and this loop would spin until the harness timeout. Make one
-                # empty pass so the tail runs every iteration, mirroring the
-                # loop-body drains in _executor_loop_overlap.
-                #
-                # Rank symmetry: executed_batch_num is the ring-broadcast
-                # consensus value and is identical on every rank, so this
-                # branch is taken by all ranks or by none. Combined with
-                # handle_executed_batches (which calls _handle_executed_batch
-                # exactly executed_batch_num times on every rank) the tail runs
-                # max(executed_batch_num, 1) times per iteration everywhere,
-                # keeping the collectives inside it in lockstep.
-                if executed_batch_num == 0:
-                    self._handle_executed_batch(None)
+                self._dispatch_executed_batches(executed_batch_num,
+                                                executed_batches)
 
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -3138,6 +3109,49 @@ class PyExecutor:
                     dest=self.dist.next_pp_rank,
                     tag=tag,
                 )
+
+    def _dispatch_executed_batches(self, executed_batch_num: int,
+                                   executed_batches: List[BatchStatePP]):
+        """Run ``_handle_executed_batch`` once per executed batch, plus one
+        empty pass when the pipeline has drained.
+
+        ``executed_batch_num`` is the ring-broadcast consensus value from
+        ``ring_broadcast_executed_batch_num`` and is therefore identical on
+        every rank.  Both rank roles below run exactly ``executed_batch_num``
+        iterations, so the number of ``_handle_executed_batch`` calls -- and
+        with it the ``tp_allgather`` collectives in its tail -- is a pure
+        function of that consensus value and stays in lockstep across ranks.
+
+        The empty pass exists because once the pipeline drains
+        ``executed_batch_num`` is 0 and the loops below stop calling
+        ``_handle_executed_batch`` entirely, taking out its ungated tail (the
+        KV-transfer timeout check and the synced-collective drains) along with
+        it.  A disagg KV transfer wedged at that point would then never be
+        flagged and ``_executor_loop_pp`` would spin until the harness timeout.
+        This mirrors the loop-body drains in ``_executor_loop_overlap``.
+
+        The pass is confined to disagg runs.  ``_handle_kv_transfer_timeouts_synced``
+        gates only on attention-DP, so without the transceiver conjunct every
+        ADP+PP job -- disagg or not -- would take a ``tp_allgather`` on each
+        drained iteration where ``main`` took none, and drained iterations are a
+        recurring steady state whenever ``pp_async_broadcast_sample_state`` is on.
+        ``kv_cache_transceiver`` is built from rank-uniform ``LlmArgs``, so
+        adding it to the guard keeps the branch rank-symmetric.
+        """
+        if self.dist.rank != 0:
+            dequeue_counter = 0
+            while dequeue_counter < executed_batch_num:
+                with nvtx_range("get_executed_batch"):
+                    executed_batch = self.executed_batch_response_queue.get()
+                self._handle_executed_batch(executed_batch)
+                dequeue_counter += 1
+        else:
+            for executed_batch in executed_batches:
+                self._handle_executed_batch(executed_batch)
+        self.unhandled_batch_counter -= executed_batch_num
+
+        if executed_batch_num == 0 and self.kv_cache_transceiver is not None:
+            self._handle_executed_batch(None)
 
     def _handle_executed_batch(self, executed_batch: Optional[BatchStatePP]):
         finished_requests = []
@@ -5625,42 +5639,82 @@ class PyExecutor:
                             charge_budget=False)
 
     def _is_wedged_on_timed_out_kv_transfer(self) -> bool:
-        """Whether this loop is idling behind a KV transfer that blew its deadline.
+        """Whether this loop is idling behind a KV transfer that has given up.
 
-        Installed as the hang detector's re-arm suppressor. Two conditions,
-        both required:
+        Installed as the hang detector's re-arm suppressor.  Requires an empty
+        batch *and* a transfer that is past the give-up threshold defined in
+        ``_compute_wedged_on_timed_out_kv_transfer``.
 
-        * nothing was scheduled on the last iteration, and
-        * some request is flagged ``py_kv_transfer_timed_out``.
-
-        The flag is deliberately the only transfer-side signal used here. It is
-        set solely by ``_check_kv_transfer_timeout``, and only after
-        ``elapsed > kv_transfer_timeout_ms`` -- i.e. after the deadline the
-        operator declared has already been missed -- so there is no legitimate
-        state beyond it. Keying on elapsed time or on schedulability instead
-        would re-admit false positives that this loop must tolerate: a genuine
-        128k-context transfer running for minutes, attention-DP dummy padding,
-        and PP microbatch drain all leave the loop idle without anything being
-        wrong.
-
-        When both hold, the executor is in the disagg livelock: it spins with
-        an empty batch at sub-millisecond period -- re-arming the watchdog
-        thousands of times a second -- while a wedged transfer holds a request
-        the transceiver refuses to cancel. Freezing the watchdog deadline turns
-        that into a hard kill one hang-detection timeout later instead of a run
-        to the harness timeout.
+        The predicate is consulted several times per iteration -- on every
+        ``checkpoint()`` and every ``pause()``, and ``RequestBroadcaster``
+        pauses once per iteration on top of the loop-top checkpoint -- while
+        the request walks below touch C++-backed bindings.  The empty-batch
+        test short-circuits a busy loop cheaply, but a CTX server idling
+        between batches reaches the walks, so the result is memoised per
+        executor iteration.  One-iteration granularity is far finer than the
+        hang-detection timeout being decided.
         """
         if self.num_scheduled_requests != 0:
             return False
         if self.kv_cache_transceiver is None:
             return False
-        transfer_manager = getattr(self, "async_transfer_manager", None)
-        if transfer_manager is not None:
-            for request in transfer_manager.requests_in_transfer().values():
-                if request.py_kv_transfer_timed_out:
-                    return True
+        if self._wedged_kv_transfer_iter != self.iter_counter:
+            self._wedged_kv_transfer_iter = self.iter_counter
+            self._wedged_kv_transfer_result = (
+                self._compute_wedged_on_timed_out_kv_transfer())
+        return self._wedged_kv_transfer_result
+
+    def _compute_wedged_on_timed_out_kv_transfer(self) -> bool:
+        """Whether some transfer is past the point where it can still succeed.
+
+        ``py_kv_transfer_timed_out`` alone is *not* a safe trigger, despite
+        being named like one.  ``kv_transfer_timeout_ms`` defaults to 60s and
+        is a *start-trying-to-cancel* threshold, not a *give-up* threshold: on
+        ``main`` a transfer that blows it but that the transceiver refuses to
+        cancel is left alone and allowed to complete
+        (``_check_disagg_ctx_cache_transfer_status`` does ``continue``).
+        Suppressing on the flag alone would hard-kill every rank -- via
+        ``MPI_Abort``, taking the healthy generation side and every other
+        in-flight request with it -- for a transfer that was merely slow.  A
+        legitimate 128k-context transfer can run past 60s.
+
+        So the trigger is the flag *plus* a further ``hang_detection_timeout``
+        of grace.  A transfer still has the whole grace window to complete
+        normally, and only a transfer that has burned
+        ``kv_transfer_timeout_ms + hang_detection_timeout`` without finishing
+        or being cancellable is treated as wedged.
+
+        The truer signal would be "cancellation was attempted and refused" --
+        the ``if not is_cancelled: continue`` branch of
+        ``_check_disagg_ctx_cache_transfer_status``.  It is deliberately not
+        used: that function is reached only from the ``executed_batch is not
+        None`` path, so on a drained PP CTX loop -- exactly the case this fix
+        targets -- cancellation is never attempted and the refusal would never
+        be recorded.  Keying on it would make the fix silently inert on the
+        server that actually hangs.  Elapsed time is the best signal available
+        without also driving cancellation from the empty pass, which would put
+        a C++ cancellation request on every drained iteration.
+        """
+        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return False
+        give_up_ms = timeout_ms + self.hang_detector.timeout * 1000
+        now = time.monotonic()
+
+        def is_past_give_up(request: LlmRequest) -> bool:
+            if not request.py_kv_transfer_timed_out:
+                return False
+            start_time = request.py_kv_transfer_start_time
+            if start_time is None:
+                return False
+            return (now - start_time) * 1000 > give_up_ms
+
+        for request in self.async_transfer_manager.requests_in_transfer(
+        ).values():
+            if is_past_give_up(request):
+                return True
         for request in self.active_requests:
-            if request.py_kv_transfer_timed_out:
+            if is_past_give_up(request):
                 return True
         return False
 
