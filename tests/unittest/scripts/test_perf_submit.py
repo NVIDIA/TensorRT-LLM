@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import importlib.util
+import json
 from pathlib import Path
 from types import ModuleType
 
@@ -62,6 +63,11 @@ def test_get_benchmark_config_accepts_positive_integer(submit_module: ModuleType
     assert benchmark_config["concurrency"] == int(concurrency)
 
 
+@pytest.fixture
+def ci_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    return _load_module(SUBMIT_PATHS[0], monkeypatch)
+
+
 @pytest.mark.parametrize(
     "concurrency",
     (True, 1.5, [], {}, "0", 0, "-1", -1, "1.5", "not-an-integer", None),
@@ -102,3 +108,57 @@ def test_example_worker_environment_exports_positive_concurrency(example_submit_
     )
 
     assert worker_environment["TLLM_BENCHMARK_REQ_QUEUES_SIZE"] == "4301"
+
+
+def test_ci_submit_selects_same_least_duration_shard_as_pytest_split(ci_submit_module, tmp_path):
+    test_lines = [
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-r1] TIMEOUT (90)",
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_kimi-k25] TIMEOUT (90)",
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-r1] TIMEOUT (90)",
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_kimi-k25] TIMEOUT (90)",
+    ]
+    test_list_path = tmp_path / "test_list.txt"
+    test_list_path.write_text("\n".join(test_lines), encoding="utf-8")
+
+    durations_dir = tmp_path / "tests" / "integration" / "defs"
+    durations_dir.mkdir(parents=True)
+    durations = {
+        ci_submit_module._test_nodeid(test_lines[0]): 836.268,
+        ci_submit_module._test_nodeid(test_lines[1]): 1462.754,
+        ci_submit_module._test_nodeid(test_lines[2]): 2211.1548,
+        ci_submit_module._test_nodeid(test_lines[3]): 2548.912,
+    }
+    (durations_dir / ".test_durations").write_text(json.dumps(durations), encoding="utf-8")
+    script_prefix_lines = [
+        'export pytestCommand="pytest --splitting-algorithm least_duration '
+        "--splits 4 --group 3 "
+        '--durations-path /remote/tests/integration/defs/.test_durations"'
+    ]
+
+    selected = ci_submit_module.select_test_case_line(
+        test_list_path,
+        tmp_path,
+        script_prefix_lines,
+        split_group=3,
+    )
+
+    assert selected == test_lines[1]
+
+
+def test_ci_submit_rejects_split_group_disagreement(ci_submit_module, tmp_path):
+    test_list_path = tmp_path / "test_list.txt"
+    test_list_path.write_text(
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300-kimi]\n",
+        encoding="utf-8",
+    )
+    script_prefix_lines = [
+        'export pytestCommand="pytest --splitting-algorithm least_duration --splits 1 --group 1"'
+    ]
+
+    with pytest.raises(ValueError, match="disagrees with pytest --group"):
+        ci_submit_module.select_test_case_line(
+            test_list_path,
+            tmp_path,
+            script_prefix_lines,
+            split_group=2,
+        )
