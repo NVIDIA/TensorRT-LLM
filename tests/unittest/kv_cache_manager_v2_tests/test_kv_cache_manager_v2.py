@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
-from typing import TYPE_CHECKING, Iterator, NamedTuple, cast, get_type_hints
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, cast, get_type_hints
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
@@ -148,8 +148,19 @@ with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
     from kernels import HostGate, enable_kernel_delay
 
 
+KV_CACHE_MANAGER_V2_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
+
+# Gate for white-box tests that reach into the pure-Python implementation's objects
+# (e.g. mutating a CommittedPage field). Prefer `_introspection`, which works on both
+# backends; use this only when the behaviour under test cannot be reached through it.
+requires_python_backend = unittest.skipIf(
+    KV_CACHE_MANAGER_V2_BACKEND == "cpp",
+    "white-box test over pure-Python KVCacheManagerV2 internals",
+)
+
+
 def get_cached_cuda_event_type():
-    backend = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
+    backend = KV_CACHE_MANAGER_V2_BACKEND
     if backend == "cpp":
         try:
             from bindings.internal.batch_manager.kv_cache_manager_v2 import CachedCudaEvent
@@ -745,7 +756,11 @@ class TestNoBatching(TestKVCacheManagerV2):
         with self.assertRaisesRegex(ValueError, "already been dropped"):
             long_handle.drop()
 
+    @requires_python_backend
     def test_planned_drop_handle_rejects_partial_coverage(self) -> None:
+        # plan_committed_block_drop() rejects via _prune_match, which clamps the match to
+        # the page's recorded token count, so the endpoint no longer matches exactly.
+        # Forcing that state needs a direct write to the page, hence the backend gate.
         window_size = 8
         tokens_per_block = 8
         self.prepare(16 << 20, 0, 0, 2, window_size, 0, tokens_per_block=tokens_per_block)
@@ -2538,8 +2553,8 @@ class TestSSMSupport(unittest.TestCase):
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
         prompt = [self.next_token() for _ in range(96)]
-        assert self.manager._life_cycles.ssm_life_cycle_id is not None
-        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        ssm_lc_id = _introspection.ssm_life_cycle_id(self.manager)
+        assert ssm_lc_id is not None
 
         # Turn 1 ends at 48 tokens, i.e. 16 tokens into block 1.
         kv1 = self.manager.create_kv_cache()
@@ -2559,13 +2574,21 @@ class TestSSMSupport(unittest.TestCase):
         kv2.commit(prompt[kv2.num_committed_tokens :])
         kv2.close()
 
-        match = self.manager._radix_tree.match(ReuseScope(), prompt[:48], True)
-        self.assertEqual(match.num_tokens, 48)
-        block = match.blocks[-1]
-        self.assertEqual(len(block.tokens), tokens_per_block)
-        self.assertEqual(block.page_coverage(ssm_lc_id), 16)
+        num_tokens, pages = _introspection.reuse_match_pages(
+            self.manager, ReuseScope(), prompt[:48], ssm_lc_id, True
+        )
+        self.assertEqual(num_tokens, 48)
+        self.assertEqual(len(pages), 2)
+        self.assertIsNotNone(pages[-1])
+        self.assertEqual(cast(tuple, pages[-1])[1], 16)
+        # Block 1 is the full 32-token sibling, not the original 16-token block: the
+        # 96-token prompt still matches end to end through it.
+        full_match, _ = _introspection.reuse_match_pages(
+            self.manager, ReuseScope(), prompt, ssm_lc_id, True
+        )
+        self.assertEqual(full_match, len(prompt))
 
-        del match, block, kv1, kv2
+        del kv1, kv2
         gc.collect()
         stream_holder.synchronize()
 
@@ -3897,20 +3920,17 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         self.manager = KVCacheManager(self.cfg)
 
     @property
-    def _full_attn_lc_id(self) -> LayerGroupId:
+    def _full_attn_lc_id(self) -> int:
+        swa = set(_introspection.swa_life_cycle_ids(self.manager))
         return next(
             lc_id
-            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
-            if lc.window_size is None
+            for lc_id in _introspection.attention_life_cycle_ids(self.manager)
+            if lc_id not in swa
         )
 
     @property
-    def _swa_lc_id(self) -> LayerGroupId:
-        return next(
-            lc_id
-            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
-            if lc.window_size is not None
-        )
+    def _swa_lc_id(self) -> int:
+        return _introspection.swa_life_cycle_ids(self.manager)[0]
 
     def run_turn(self, prompt: list[TokenIdExt], refcheck: bool = False) -> int:
         """Reuse what we can, prefill the rest, commit, close. Returns the reused count.
@@ -3938,10 +3958,106 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         s.take_finish_event().synchronize()
         return num_reused
 
-    def _partial_block(self, prompt: list[TokenIdExt]):
-        """The tree block holding the tail of `prompt` (block 2 in these tests)."""
-        match = self.manager._radix_tree.match(ReuseScope(), prompt, True)
-        return match.blocks[-1]
+    def _tail_coverage(self, prompt: list[TokenIdExt], lc_id: int) -> int:
+        """Recorded token count of `lc_id`'s page on the last block matching `prompt`.
+
+        Zero when that block holds no page for the life cycle. This is the tree block
+        holding the tail of `prompt` (block 2 in these tests).
+        """
+        _, pages = _introspection.reuse_match_pages(self.manager, ReuseScope(), prompt, lc_id, True)
+        self.assertTrue(pages)
+        page = pages[-1]
+        if page is None:
+            return 0
+        self.assertIsNotNone(page[1])
+        return cast(int, page[1])
+
+    def _assert_page_unlinked(self, kv_cache: Any, ordinal: int) -> None:
+        """Every attention page the sequence holds at `ordinal` must be off the tree.
+
+        A page pushed out of its slot keeps no pointer to the block, so nothing
+        dereferences that block once it dies.
+        """
+        for lc_id in _introspection.attention_life_cycle_ids(self.manager):
+            self.assertIs(
+                _introspection.committed_page_is_linked(kv_cache, ordinal, lc_id),
+                False,
+                f"page at ordinal {ordinal} lc {lc_id} still points at a block",
+            )
+
+    def test_replaced_page_does_not_outlive_its_block(self) -> None:
+        """A page pushed out of a slot must not keep a pointer to a block that dies first.
+
+        turn1 ends inside block 2 and stays open, holding the 8-token pages it committed.
+        turn2 grows that block to 16 tokens and commits over them; turn3 replaces the
+        block with a 32-token one and destroys it.
+        """
+        self.prepare_partial()
+        tpb = self.TOKENS_PER_BLOCK
+        prompt = [TokenId(i) for i in range(3 * tpb)]
+        turn1, turn2 = prompt[: 2 * tpb + 8], prompt[: 2 * tpb + 16]
+
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            kv1 = self.manager.create_kv_cache(input_tokens=turn1)
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv1.resize(len(turn1), len(turn1)))
+            kv1.commit(turn1[kv1.num_committed_tokens :], is_end=True)
+            # kv1 stays open, holding block 2's 8-token pages.
+
+            kv2 = self.manager.create_kv_cache(input_tokens=turn2)
+            self.assertEqual(kv2.num_committed_tokens, len(turn1))
+            self.assertTrue(kv2.resume(stream))
+            self.assertTrue(kv2.resize(len(turn2), len(turn2)))
+            # Block 2 becomes a 16-token block that commits over kv1's 8-token pages,
+            # pushing them out of the slot while kv1 still holds them.
+            kv2.commit(turn2[kv2.num_committed_tokens :], is_end=True)
+            kv2.close()
+
+            try:
+                # kv1's 8-token pages left the slot but kv1 still holds them.
+                self._assert_page_unlinked(kv1, 2)
+
+                # A 32-token block replaces the 16-token one, which is then destroyed.
+                self.run_turn(prompt)
+                self._assert_page_unlinked(kv1, 2)
+            finally:
+                # Must run even on failure: leaving a sequence open makes teardown abort
+                # the process, which would bury the assertion message.
+                # Dereferences CommittedPage::block for the surviving 8-token pages.
+                kv1.close()
+        s.take_finish_event().synchronize()
+
+    def test_replaced_reused_page_does_not_outlive_its_block(self) -> None:
+        """Same defect as above, reached through reuse rather than through commit.
+
+        The holder matches the 8-token endpoint and holds the tree's pages. It must not
+        resume: resume()'s deferred copy swaps a reused partial page for a private one and
+        drops the holder.
+        """
+        self.prepare_partial()
+        tpb = self.TOKENS_PER_BLOCK
+        prompt = [TokenId(i) for i in range(3 * tpb)]
+        short, mid = prompt[: 2 * tpb + 8], prompt[: 2 * tpb + 16]
+
+        self.assertEqual(self.run_turn(short), 0)
+
+        with TemporaryCudaStream([]) as s:
+            holder = self.manager.create_kv_cache(input_tokens=short)
+            self.assertEqual(holder.num_committed_tokens, len(short))
+
+            # Block 2 grows to 16 tokens, adopting the 8-token pages and then committing
+            # over them while `holder` still holds them.
+            try:
+                self.assertEqual(self.run_turn(mid), len(short))
+                self._assert_page_unlinked(holder, 2)
+                # A 32-token block replaces the 16-token one, which is then destroyed.
+                self.assertEqual(self.run_turn(prompt), len(mid))
+                self._assert_page_unlinked(holder, 2)
+            finally:
+                # Must run even on failure -- see the note in the sibling test.
+                holder.close()
+        s.take_finish_event().synchronize()
 
     def test_rewind_endpoint_survives_longer_sibling_created_after(self) -> None:
         self.prepare_partial()
@@ -3952,12 +4068,13 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         self.assertEqual(self.run_turn(base), 0)
         self.assertEqual(self.run_turn(extended), len(base))
         # The 16-token endpoint block is gone, but its SWA page moved into the full
-        # 32-token sibling and still covers the first 16 tokens.
-        block = self._partial_block(rewind)
-        self.assertEqual(len(block.tokens), self.TOKENS_PER_BLOCK)
-        self.assertEqual(block.page_coverage(self._full_attn_lc_id), self.TOKENS_PER_BLOCK)
-        self.assertEqual(block.page_coverage(self._swa_lc_id), len(base) % self.TOKENS_PER_BLOCK)
-        del block
+        # 32-token sibling and still covers the first 16 tokens. Full coverage of
+        # TOKENS_PER_BLOCK also proves the block now spans a whole block, since a page
+        # never records more tokens than its block holds.
+        self.assertEqual(self._tail_coverage(rewind, self._full_attn_lc_id), self.TOKENS_PER_BLOCK)
+        self.assertEqual(
+            self._tail_coverage(rewind, self._swa_lc_id), len(base) % self.TOKENS_PER_BLOCK
+        )
         self.assertEqual(self.manager.probe_reuse(input_tokens=rewind), len(base))
         # The partial SWA page is stale at the longer endpoint and must not constrain
         # the full-attention lifecycle's reusable prefix.
@@ -3996,10 +4113,10 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         self.assertEqual(self.run_turn(base), 0)
         self.assertEqual(self.run_turn(boundary), len(base))
 
-        block = self._partial_block(boundary)
-        self.assertEqual(block.page_coverage(self._full_attn_lc_id), self.TOKENS_PER_BLOCK)
-        self.assertEqual(block.page_coverage(self._swa_lc_id), 16)
-        del block
+        self.assertEqual(
+            self._tail_coverage(boundary, self._full_attn_lc_id), self.TOKENS_PER_BLOCK
+        )
+        self.assertEqual(self._tail_coverage(boundary, self._swa_lc_id), 16)
         # At the 96-token boundary the input token is the entire size-1 SWA window, so no
         # historical SWA block is active. The partial SWA page must not constrain the full
         # attention lifecycle's reusable prefix.
@@ -4012,16 +4129,12 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         rewind = base + [TokenId(2000)]
 
         self.run_turn(base)
-        block = self._partial_block(rewind)
-        self.assertEqual(block.page_coverage(self._swa_lc_id), 16)
-        del block
+        self.assertEqual(self._tail_coverage(rewind, self._swa_lc_id), 16)
 
         self.run_turn(longer_partial)
-        block = self._partial_block(rewind)
         # A slot keeps only the widest page. The 24-token snapshot supersedes the 16-token
         # one, and it still covers the shorter rewind endpoint.
-        self.assertEqual(block.page_coverage(self._swa_lc_id), 24)
-        del block
+        self.assertEqual(self._tail_coverage(rewind, self._swa_lc_id), 24)
         self.assertEqual(self.manager.probe_reuse(input_tokens=rewind), len(base))
         self.assertEqual(
             self.manager.probe_reuse(input_tokens=longer_partial + [TokenId(2000)]),
@@ -4030,9 +4143,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
 
         # A later shorter snapshot cannot replace the wider page.
         self.assertEqual(self.run_turn(base), len(base))
-        block = self._partial_block(rewind)
-        self.assertEqual(block.page_coverage(self._swa_lc_id), 24)
-        del block
+        self.assertEqual(self._tail_coverage(rewind, self._swa_lc_id), 24)
         self.assertEqual(
             self.manager.probe_reuse(input_tokens=longer_partial + [TokenId(2000)]),
             len(longer_partial),

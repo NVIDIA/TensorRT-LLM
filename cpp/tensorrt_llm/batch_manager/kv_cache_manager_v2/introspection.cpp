@@ -21,6 +21,7 @@
 
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
+#include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/storageManager.h"
 
 #include <utility>
@@ -77,6 +78,21 @@ KvCacheIntrospection::ActivePageStats KvCacheIntrospection::activePageStats(KvCa
     }
 
     return {std::move(counts), std::move(unscheduledEvictable)};
+}
+
+std::optional<bool> KvCacheIntrospection::committedPageIsLinked(KvCache const& kvCache, int ordinal, int lcId)
+{
+    auto page = kvCache._page(BlockOrdinal{ordinal}, kDefaultBeamIndex, LifeCycleId{lcId});
+    if (!page)
+    {
+        return std::nullopt;
+    }
+    auto committed = dynamicPointerCast<CommittedPage>(page);
+    if (!committed)
+    {
+        return std::nullopt;
+    }
+    return committed->block != nullptr;
 }
 
 TypedVec<PoolGroupIndex, StorageStatistics> KvCacheIntrospection::storageStatistics(

@@ -57,14 +57,12 @@ uint64_t hash64Mix(int64_t input, uint64_t seed)
     return seed ^ (value + static_cast<uint64_t>(kHashCombineConst) + (seed << 6U) + (seed >> 2U));
 }
 
+// A page whose recorded token count is short of the block's span cannot be announced: the
+// event payload carries the block's full token list and cannot express a shorter valid
+// prefix.
 bool pageCoversBlock(CommittedPage const* page, Block const& block)
 {
-    if (page == nullptr)
-    {
-        return false;
-    }
-    auto const* ssmPage = dynamic_cast<SsmCommittedPage const*>(page);
-    return ssmPage == nullptr || ssmPage->numTokensInBlock >= static_cast<int>(block.tokens.size());
+    return page != nullptr && page->numTokensInBlock >= static_cast<int>(block.tokens.size());
 }
 
 } // namespace
