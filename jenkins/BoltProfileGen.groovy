@@ -272,7 +272,8 @@ def submitProfileGen(pipeline)
         //    the BOLT POST_INSTALL_HOOK swapping in instrumented libs so the run
         //    emits .fdata under $FDATA_ROOT/<workload>/<host>. submit.py sizes the
         //    SLURM allocation from the config, so we don't pass node counts.
-        def modelsRoot = env.boltModelsRoot ?: "${scratch}/llm-models"        def trtllmSrc = "${ws}/TensorRT-LLM/src"
+        def modelsRoot = env.boltModelsRoot ?: "${scratch}/llm-models"
+        def trtllmSrc = "${ws}/TensorRT-LLM/src"
         def imageEnroot = (LLM_DOCKER_IMAGE ?: "").replace("urm.nvidia.com/", "urm.nvidia.com#")
         // Cluster values for the harness .conf, AUTO-DERIVED from the same resolved
         // SLURM partition the merge job uses -- so a plain `/bot run` works with
