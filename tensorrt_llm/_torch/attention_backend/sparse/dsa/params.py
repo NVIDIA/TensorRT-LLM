@@ -40,6 +40,7 @@ class DSAMetadataParams(SparseMetadataParams):
     use_cute_dsl_paged_mqa_logits: bool
     q_split_threshold: int
     has_shared_indexer_layers: bool = False
+    mtp_index_share: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,7 @@ class DSAParams(SparseParams):
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
     # Shared layers reuse the preceding full layer's top-k.
     is_full_indexer_layer: bool = True
+    mtp_index_share: bool = False
 
     @property
     def indices_block_size(self) -> int:

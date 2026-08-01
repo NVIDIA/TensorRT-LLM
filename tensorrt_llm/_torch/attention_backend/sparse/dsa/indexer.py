@@ -688,6 +688,7 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (
             sparse_params.enable_heuristic_topk and get_sm_version() >= 100
         )
+        self.mtp_index_share = sparse_params.mtp_index_share
 
         if self._enable_heuristic_topk and layer_idx == 0:
             # Populate static caches (sm_count, L2 cache size) inside the C++
@@ -1587,7 +1588,17 @@ class Indexer(nn.Module):
                 local_layer, num_generations : num_generations + num_contexts
             ].copy_(topk_indices_buffer[last_ctx_idx, :])
 
-        if has_decode and not metadata.skip_indexer_for_gen_reqs:
+        reuse_topk = (
+            self.mtp_index_share
+            and metadata.indexer_skip_topk
+            and metadata.shared_topk_indices is not None
+        )
+
+        if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_topk:
+            topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
+                metadata.shared_topk_indices[:num_generations, :]
+            )
+        elif has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
             max_decode_len = gen_seq_lens.max().item()
@@ -1841,7 +1852,45 @@ class Indexer(nn.Module):
             topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
             )
+
+        if self.mtp_index_share and metadata.in_mtp_draft_loop and not reuse_topk:
+            rows = None
+            if num_generations > 0:
+                next_n = num_gen_tokens // num_generations
+                gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
+                rows = self._mtp_last_accepted_rows(
+                    gen_topk, metadata, num_contexts, num_generations, next_n
+                )
+            if num_contexts > 0:
+                ctx_last = (
+                    torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
+                )
+                ctx_rows = topk_indices_buffer[ctx_last]
+                rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+            if rows is not None:
+                shared_topk_indices = metadata.shared_topk_indices
+                if shared_topk_indices is None:
+                    metadata.shared_topk_indices = rows.contiguous()
+                else:
+                    shared_topk_indices[: rows.shape[0], : rows.shape[1]].copy_(rows)
         return topk_indices_buffer
+
+    def _mtp_last_accepted_rows(
+        self,
+        gen_topk: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        num_contexts: int,
+        num_generations: int,
+        next_n: int,
+    ) -> torch.Tensor:
+        """Select each generation request's last accepted TopK row."""
+        num_accepted = metadata.mtp_num_accepted
+        if num_accepted is None:
+            return gen_topk[next_n - 1 :: next_n]
+        gen_num_accepted = num_accepted[num_contexts : num_contexts + num_generations]
+        base = torch.arange(num_generations, device=gen_topk.device, dtype=torch.long) * next_n
+        offset = (gen_num_accepted - 1).clamp(0, next_n - 1)
+        return gen_topk[base + offset]
 
     def _weight_scale(self, weights: torch.Tensor, q_scale: torch.Tensor) -> torch.Tensor:
         """Apply quantization scale to indexer attention weights."""

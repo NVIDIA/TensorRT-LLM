@@ -118,7 +118,8 @@ class DSATrtllmAttention(TrtllmAttention):
                 indexer_intermediates,
                 is_generation=is_generation,
             )
-            if shared_topk_indices is not None:
+            preserve_mtp_topk = metadata.in_mtp_draft_loop and self.indexer.mtp_index_share
+            if shared_topk_indices is not None and not preserve_mtp_topk:
                 shared_topk_indices[
                     phase_start : phase_start + topk_indices.shape[0],
                     : topk_indices.shape[1],

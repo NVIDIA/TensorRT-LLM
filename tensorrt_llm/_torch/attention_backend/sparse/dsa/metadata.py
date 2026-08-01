@@ -70,6 +70,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     indexer_quant_block_size: int = 128
     # Enable indexer skip for short sequences
     enable_indexer_skip: bool = False
+    shared_topk_indices: Optional[torch.Tensor] = None
+    indexer_skip_topk: bool = False
+    in_mtp_draft_loop: bool = False
+    mtp_num_accepted: Optional[torch.Tensor] = None
     # Whether skip the indexer for context requests
     skip_indexer_for_ctx_reqs: bool = False
     # Whether skip the indexer for generation requests
@@ -509,8 +513,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
-        # Phase-specific local TopK reused by following shared-indexer layers.
-        if sparse_metadata_params.has_shared_indexer_layers:
+        # Local TopK reused across layers or MTP draft steps.
+        if (
+            sparse_metadata_params.has_shared_indexer_layers
+            or sparse_metadata_params.mtp_index_share
+        ):
             self.shared_topk_indices = self.get_empty(
                 self.cuda_graph_buffers,
                 (self.max_num_tokens, self.num_sparse_topk),
@@ -520,6 +527,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         else:
             self.shared_topk_indices = None
+
+        self.indexer_skip_topk = False
+        self.in_mtp_draft_loop = False
+        self.mtp_num_accepted = None
 
         # Indexer metadata
         # Separate slot mappings for non-interleaved layout (flat byte indices)
@@ -808,6 +819,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Clamp for safety: handles garbage padding from torch.empty in uninitialized slots
         pool_indices = pool_indices.clamp(min=0, max=max_pool_idx).to(torch.int32)
         return pool_indices
+
+    def set_skip_topk(self, skip: bool) -> None:
+        self.indexer_skip_topk = skip
+
+    def set_in_mtp_draft_loop(self, active: bool) -> None:
+        self.in_mtp_draft_loop = active
+
+    def set_mtp_num_accepted(self, num_accepted: Optional[torch.Tensor]) -> None:
+        self.mtp_num_accepted = num_accepted
 
     def _invalidate_pool_view_cache(self):
         """Invalidate the cached pool view and related step-invariant values.
