@@ -66,6 +66,81 @@ if TYPE_CHECKING:
         TrtllmAttentionMetadata,
     )
 
+
+def _patch_flashinfer_dynamic_tensor_spec_eq() -> None:
+    """Work around a hash/eq inconsistency in flashinfer 0.6.15's autotuner.
+
+    ``DynamicTensorSpec`` defines a custom ``__hash__`` that skips
+    ``tensor_initializers`` (and hashes callables by identity), but keeps the
+    dataclass-generated ``__eq__``, which compares all fields by value.
+    Callers such as ``trtllm_batch_decode_with_kv_cache_mla`` build a fresh
+    ``TuningConfig`` per call with fresh initializer closures, so the
+    ``lru_cache`` on ``AutoTuner._find_nearest_profile`` accumulates
+    hash-equal but eq-unequal keys up to the cache cap; every autotuner cache
+    probe on the MLA decode path then walks the entire collision chain in
+    Python ``__eq__`` (tens of milliseconds per attention call, per layer).
+
+    The workaround replaces ``__eq__`` with one consistent with the existing
+    ``__hash__``: ignore ``tensor_initializers``, compare
+    ``map_to_tuning_buckets`` by identity, and ``gen_tuning_buckets`` by
+    value if it is a tuple and by identity otherwise. Keys equal under this
+    ``__eq__`` produce identical nearest profiles, so cached results stay
+    correct, and hash/eq consistency is restored (equal objects hash equal).
+
+    The bug is upstream in flashinfer; the patch is applied only when a
+    behavioral probe shows the inconsistency (two specs differing only in
+    initializer closures that hash equal but compare unequal), so a fixed
+    flashinfer release degrades this to a no-op.
+    """
+    try:
+        from flashinfer.autotuner.autotuner import DynamicTensorSpec
+
+        def _probe_spec():
+            return DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(1,),
+                map_to_tuning_buckets=_probe_spec,  # any stable callable
+                tensor_initializers=[lambda shapes, dtype, device: None],
+            )
+
+        a, b = _probe_spec(), _probe_spec()
+        if not (hash(a) == hash(b) and a != b):
+            return  # flashinfer without the inconsistency; nothing to do
+
+        def _hash_consistent_eq(self, other):
+            if self is other:
+                return True
+            if not isinstance(other, DynamicTensorSpec):
+                return NotImplemented
+            if isinstance(self.gen_tuning_buckets, tuple) and isinstance(
+                other.gen_tuning_buckets, tuple
+            ):
+                buckets_equal = self.gen_tuning_buckets == other.gen_tuning_buckets
+            else:
+                buckets_equal = self.gen_tuning_buckets is other.gen_tuning_buckets
+            return (
+                self.input_idx == other.input_idx
+                and self.dim_idx == other.dim_idx
+                and buckets_equal
+                and self.map_to_tuning_buckets is other.map_to_tuning_buckets
+            )
+
+        DynamicTensorSpec.__eq__ = _hash_consistent_eq
+        logger.debug(
+            "Patched flashinfer DynamicTensorSpec.__eq__ to be hash-consistent "
+            "(autotuner cache collision-chain workaround)."
+        )
+    except Exception:
+        # A future flashinfer refactor (moved class, changed fields) must not
+        # break attention; it just loses the workaround.
+        logger.debug("Skipping flashinfer DynamicTensorSpec.__eq__ workaround.", exc_info=True)
+
+
+if IS_FLASHINFER_AVAILABLE:
+    _patch_flashinfer_dynamic_tensor_spec_eq()
+
+
 _SUPPORTED_MLA_BACKENDS = {"cute-dsl", "trtllm-gen"}
 
 
