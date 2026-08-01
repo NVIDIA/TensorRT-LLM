@@ -12,7 +12,7 @@ Use [Docker](https://www.docker.com) to build and run TensorRT LLM. Instructions
 TensorRT LLM uses git-lfs, which needs to be installed in advance:
 
 ```bash
-apt-get update && apt-get -y install git git-lfs
+sudo apt-get update && sudo apt-get -y install git git-lfs
 git lfs install
 ```
 
