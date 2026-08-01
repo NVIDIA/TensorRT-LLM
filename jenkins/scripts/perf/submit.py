@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Generate the SLURM launch script for multi-node PerfSanity tests (CI mode).
 
 Unified replacement for jenkins/scripts/perf/aggregated/submit.py and
@@ -24,6 +39,8 @@ import re
 import sys
 
 import yaml
+from benchmark_utils import parse_positive_concurrency
+from cluster_env import get_ucx_tls_cmd, gpu_type_from_stage_name
 
 
 def _import_precheck_config(llm_src):
@@ -296,31 +313,11 @@ def get_env_config(config, runtime_mode, benchmark_mode, server_name):
 
 def get_benchmark_config(config):
     benchmark = config.get("benchmark", {}) or {}
-    concurrency_str = benchmark.get("concurrency_list", "1")
-    concurrency = int(concurrency_str) if isinstance(concurrency_str, str) else concurrency_str
+    concurrency = parse_positive_concurrency(benchmark.get("concurrency_list", "1"))
     return {
         "mode": benchmark.get("mode", ""),
         "concurrency": concurrency,
     }
-
-
-def get_benchmark_request_queue_size(config, concurrency):
-    """Cap the gen-only fill target to the GEN executor's active capacity."""
-    gen_config = (config.get("worker_config", {}) or {}).get("gen", {}) or {}
-    concurrency = int(concurrency)
-    max_batch_size = int(gen_config.get("max_batch_size", concurrency))
-    enable_attention_dp = gen_config.get("enable_attention_dp", False)
-    tp_size = int(gen_config.get("tensor_parallel_size", 1))
-    max_capacity = max_batch_size * tp_size if enable_attention_dp else max_batch_size
-    queue_size = min(max_capacity, concurrency)
-    if queue_size < concurrency:
-        print(
-            "[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
-            f"{queue_size} (max_batch_size={max_batch_size}, tp_size={tp_size}, "
-            f"attention_dp={enable_attention_dp}) instead of concurrency={concurrency}. "
-            "The fill loop cannot reach a target above the GEN executor capacity."
-        )
-    return queue_size
 
 
 # --------------------------------------------------------------------------- #
@@ -490,6 +487,13 @@ def main():
         help="1-indexed split group id. Selects the N-th test from the test list.",
     )
     parser.add_argument("--stage-name", default="", help="Stage name (for logging / GPU detect)")
+    parser.add_argument(
+        "--cluster-name",
+        default="",
+        help="Slurm cluster name as resolved by the Jenkins pipeline "
+        "(bloom SlurmPartition.clusterName, e.g. gcp-nrt, aws-cmh). "
+        "Used with the GPU type to pick UCX env settings.",
+    )
 
     args = parser.parse_args()
 
@@ -534,8 +538,7 @@ def main():
     ) = get_pytest_commands(script_prefix_lines, runtime_mode)
     test_output_dir = get_test_output_dir(script_prefix_lines, test_case_name)
 
-    is_gb300 = "GB300" in args.stage_name.upper()
-    is_b200 = "B200" in args.stage_name.upper() and "GB200" not in args.stage_name.upper()
+    gpu_type = gpu_type_from_stage_name(args.stage_name)
 
     if runtime_mode == "aggregated":
         # Aggregated (incl. ctx_only): single pytestCommand built from the
@@ -588,21 +591,16 @@ def main():
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif benchmark_mode == "gen_only":
             concurrency = benchmark_config.get("concurrency", 1)
-            queue_size = get_benchmark_request_queue_size(config, concurrency)
             ctx_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
             )
             gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
-                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size} {gen_worker_env_vars}"
+                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
-        if is_gb300:
-            ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        elif is_b200:
-            ucx_tls_cmd = "export UCX_TLS=^ib &&"
-        else:
-            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
+        ucx_tls_cmd = get_ucx_tls_cmd(args.cluster_name, gpu_type)
+        print(f"UCX env: cluster={args.cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         ucx_tls_server_cmd = ucx_tls_cmd
 
         pytest_common_vars = ""

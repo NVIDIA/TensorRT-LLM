@@ -275,9 +275,8 @@ class ConfigurableMoE(MoE):
         """Build the MoE backend, mirror EPLB attrs, then create weights.
 
         Why this dance:
-        - ``init_load_balancer=False`` / ``without_comm=True``: the backend
-          would otherwise re-register itself with the load balancer and
-          initialize its own communication; ConfigurableMoE owns both.
+        - ``init_load_balancer=False``: the backend would otherwise
+          re-register itself with the load balancer; ConfigurableMoE owns it.
         - ``layer_idx=None``: the wrapper passes the real ``layer_idx`` to
           ``MoE.__init__`` to drive load-balancer setup. The backend
           receives ``None`` so its own EPLB hooks no-op until we sync the
@@ -324,7 +323,6 @@ class ConfigurableMoE(MoE):
                 swiglu_limit=kwargs.get("swiglu_limit"),
                 swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
-                without_comm=True,
                 activation_type=self.activation_type,
             )
 

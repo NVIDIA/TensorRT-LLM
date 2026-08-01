@@ -1859,7 +1859,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         --script-prefix ${scriptLaunchPrefixPathLocal} \\
                         --srun-args ${scriptLaunchSrunArgsPathLocal} \\
                         --split-group ${splitId} \\
-                        --stage-name ${stageName}
+                        --stage-name ${stageName} \\
+                        --cluster-name ${partition.clusterName}
                     """
                 } else {
                     if(nodeCount > 1) {
@@ -2866,7 +2867,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def extraDeviceEnv = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -4276,11 +4277,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
             withCredentials([
                 string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
-                usernamePassword(
-                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                    usernameVariable: 'GITLAB_API_USER',
-                    passwordVariable: 'GITLAB_API_TOKEN'
-                ),
                 string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
@@ -5191,6 +5187,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
