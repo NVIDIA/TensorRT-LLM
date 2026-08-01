@@ -438,7 +438,7 @@ pipeline {
                     }
                     steps {
                         script {
-                            //generateLockFiles(env.LLM_REPO, env.REF)
+                            generateLockFiles(env.LLM_REPO, env.REF)
                             pulseScanSourceCode(env.LLM_REPO, env.REF)
                         }
                     }
