@@ -1157,7 +1157,7 @@ class TestResolveSeed:
 class TestEngineFailureTransport:
     """Validation is enforced at :meth:`VisualGen.generate_async` entry, so
     by the time a request reaches ``process_request`` only runtime
-    failures from ``pipeline.infer()`` can produce an error response.
+    failures from ``pipeline.run_inference()`` can produce an error response.
     The error message rides back on ``DiffusionResponse.error_msg``.
     """
 
@@ -1187,7 +1187,7 @@ class TestEngineFailureTransport:
         executor._merge_defaults = lambda req: DiffusionExecutor._merge_defaults(executor, req)
         executor.pipeline.request_warmup_cache_key = MagicMock(return_value=(1024, 1024, None))
         executor.pipeline._warmed_up_shapes = None
-        executor.pipeline.infer = MagicMock(side_effect=RuntimeError("oops"))
+        executor.pipeline.run_inference = MagicMock(side_effect=RuntimeError("oops"))
 
         req = DiffusionRequest(
             request_id=7,
@@ -1225,7 +1225,7 @@ class TestEngineFailureTransport:
         executor.pipeline.prepare_request = MagicMock(side_effect=prepare_request)
         executor.pipeline.request_warmup_cache_key = MagicMock(side_effect=request_warmup_cache_key)
         executor.pipeline._warmed_up_shapes = {(1024, 1024)}
-        executor.pipeline.infer = MagicMock(
+        executor.pipeline.run_inference = MagicMock(
             side_effect=lambda _req: events.append("infer") or MagicMock()
         )
         req = DiffusionRequest(
@@ -1238,4 +1238,4 @@ class TestEngineFailureTransport:
 
         assert events == ["prepare", "warmup_cache_key", "infer"]
         executor.pipeline.request_warmup_cache_key.assert_called_once_with(req)
-        executor.pipeline.infer.assert_called_once_with(req)
+        executor.pipeline.run_inference.assert_called_once_with(req)

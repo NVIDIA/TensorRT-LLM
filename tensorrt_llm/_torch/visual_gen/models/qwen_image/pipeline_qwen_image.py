@@ -568,7 +568,7 @@ class QwenImagePipeline(BasePipeline):
         timer.mark_denoise_start()
         logger.info("Denoising (%d steps)...", len(timesteps))
         cuda_graph_enabled = self.pipeline_config.cuda_graph.enable
-        for i, t in enumerate(timesteps):
+        for i, t in self._profile_denoise_steps(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             if do_cfg_parallel:
                 local_embeds, local_mask = self._select_cfg_inputs(
