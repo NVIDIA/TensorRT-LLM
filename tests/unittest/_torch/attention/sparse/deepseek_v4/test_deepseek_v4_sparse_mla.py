@@ -106,6 +106,11 @@ class RopeConfig:
 # Layers to test: layer 0 → compress_ratio=1, layer 1 → ratio=4, layer 2 → ratio=128
 TEST_LAYERS = [0, 1, 2]
 
+# The widest generation window the parameterized test exercises, i.e. the static
+# ceiling the DSA metadata sizes its expanded buffers from. Matches
+# DeepSeek-V4-Pro-DSpark's max_draft_len=5 -> next_n=6.
+MAX_GENERATION_SEQ_LEN_Q = 6
+
 
 # RoPE helpers
 def rotate_half(x):
@@ -399,6 +404,33 @@ def calculate_deepseek_v4_ref_ctx_sparse(
     return torch.cat(ref_results, dim=0)
 
 
+def _seq_lens_q_or_uniform(
+    num_query_tokens: int, num_requests: int, seq_lens_q: Optional[List[int]]
+) -> List[int]:
+    """Per-request query-token counts, defaulting to the uniform split.
+
+    The reference implementations below used to derive this as
+    ``num_query_tokens // num_requests``. That is the assumption under test once
+    a scheduler can hand each request its own verify window, so it is a
+    parameter now; passing None keeps the historical behavior for callers whose
+    batches really are uniform.
+    """
+    if seq_lens_q is not None:
+        assert len(seq_lens_q) == num_requests, (
+            f"got {len(seq_lens_q)} query lengths for {num_requests} requests"
+        )
+        assert sum(seq_lens_q) == num_query_tokens, (
+            f"query lengths sum to {sum(seq_lens_q)} but {num_query_tokens} "
+            f"query tokens were supplied"
+        )
+        return [int(v) for v in seq_lens_q]
+    assert num_query_tokens % num_requests == 0, (
+        f"{num_query_tokens} query tokens do not split evenly across "
+        f"{num_requests} requests; pass seq_lens_q explicitly"
+    )
+    return [num_query_tokens // num_requests] * num_requests
+
+
 def _rotate_gen_inputs(
     fused_q: torch.Tensor,
     q_pe: torch.Tensor,
@@ -409,23 +441,29 @@ def _rotate_gen_inputs(
     num_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    seq_lens_q: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     fused_head_dim = kv_lora_rank + qk_rope_head_dim
     num_requests = len(seq_lens_kv)
-    seq_len_q = fused_q.shape[0] // num_requests
+    q_lens = _seq_lens_q_or_uniform(fused_q.shape[0], num_requests, seq_lens_q)
+    q_starts = [0]
+    for q_len in q_lens:
+        q_starts.append(q_starts[-1] + q_len)
 
     fused_q_rot = fused_q.clone()
     new_latent_list = []
 
     for i in range(num_requests):
         past_len = seq_lens_kv[i]
+        seq_len_q = q_lens[i]
+        lo, hi = q_starts[i], q_starts[i + 1]
 
-        fused_q_seq = fused_q_rot[i * seq_len_q : (i + 1) * seq_len_q].unflatten(
+        fused_q_seq = fused_q_rot[lo:hi].unflatten(
             -1, [num_heads, fused_head_dim]
         )
-        q_pe_seq = q_pe[i * seq_len_q : (i + 1) * seq_len_q]
-        compressed_kv_seq = compressed_kv[i * seq_len_q : (i + 1) * seq_len_q]
-        k_pe_seq = k_pe[i * seq_len_q : (i + 1) * seq_len_q].unsqueeze(-2)
+        q_pe_seq = q_pe[lo:hi]
+        compressed_kv_seq = compressed_kv[lo:hi]
+        k_pe_seq = k_pe[lo:hi].unsqueeze(-2)
 
         cos, sin = rope_cos_sin[past_len : past_len + seq_len_q].chunk(2, dim=-2)
 
@@ -465,25 +503,33 @@ def calculate_deepseek_v4_ref_gen_sparse(
     q_scaling: float,
     compress_ratio: int,
     attn_sink: Optional[torch.Tensor] = None,
+    seq_lens_q: Optional[List[int]] = None,
 ):
     """Reference attention for DeepSeek-V4 generation phase."""
     fused_head_dim = kv_lora_rank + qk_rope_head_dim
     bmm1_scale = 1 / (math.sqrt(qk_nope_head_dim + qk_rope_head_dim) * q_scaling)
     num_requests = len(seq_lens_kv)
-    seq_len_q = fused_q_rot.shape[0] // num_requests
+    q_lens = _seq_lens_q_or_uniform(
+        fused_q_rot.shape[0], num_requests, seq_lens_q
+    )
+    q_starts = [0]
+    for q_len in q_lens:
+        q_starts.append(q_starts[-1] + q_len)
 
     ref_results = []
     latent_cache_list = []
     total_past_tokens = 0
     for i in range(num_requests):
         past_len = seq_lens_kv[i]
+        seq_len_q = q_lens[i]
+        lo, hi = q_starts[i], q_starts[i + 1]
 
-        fused_q_seq = fused_q_rot[i * seq_len_q : (i + 1) * seq_len_q].unflatten(
+        fused_q_seq = fused_q_rot[lo:hi].unflatten(
             -1, [num_heads, fused_head_dim]
         )
 
         # New token's latent cache
-        new_token_latent = new_latent_cache[i * seq_len_q : (i + 1) * seq_len_q].unsqueeze(
+        new_token_latent = new_latent_cache[lo:hi].unsqueeze(
             -2
         )  # [seq_len_q, 1, head_dim]
 
@@ -510,7 +556,7 @@ def calculate_deepseek_v4_ref_gen_sparse(
             # Compressed KV
             if compress_ratio > 1 and compressed_ref_data is not None:
                 if compress_ratio == 4 and compressed_topk_indices is not None:
-                    row = i * seq_len_q + qi
+                    row = lo + qi
                     indices_row = compressed_topk_indices[row]
                     valid = indices_row[indices_row >= 0]
                     comp_kv = compressed_ref_data[i][valid.long()]
@@ -821,8 +867,17 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("context_lengths", [[4399], [14, 508, 3947], [2, 1406, 3327]])
 @pytest.mark.parametrize("num_generation_steps", [2])
-def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps: int):
-    generation_seq_len_q = 1
+# The query width per generation request. Speculative decoding makes this the
+# batch-wide `1 + draft_len`, and DSpark's confidence scheduler moves it between
+# steps along a captured tier ladder -- `[1, 3, 5]` for max_draft_len=5, i.e.
+# widths 2, 4 and 6. Pinning it at 1 left every width-dependent stride in the
+# DSA generation path untested: buffers are laid out at the static ceiling while
+# the kernels are launched at the runtime width, and when the two disagree the
+# result is either misattributed rows or a hang, never an error.
+@pytest.mark.parametrize("generation_seq_len_q", [1, 2, 4, 6])
+def test_deepseek_v4_sparse_mla(
+    context_lengths: List[int], num_generation_steps: int, generation_seq_len_q: int
+):
     scenario = Scenario()
     device = torch.device("cuda")
     dtype = scenario.dtype
@@ -1183,6 +1238,17 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
             mapping=mapping,
             enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
             sparse_attention_config=sparse_config,
+            # Reproduce the split the engine actually runs with rather than
+            # sizing everything to the current width. `max_draft_tokens` is the
+            # static ceiling: the engine hands it `tokens_per_gen_step - 1` once
+            # and never moves it, and every expanded buffer is sized from it so
+            # a shorter step cannot trigger a reallocation mid-capture. The
+            # per-step width arrives separately. Letting the two differ here is
+            # the whole point -- when they were conflated, a step narrower than
+            # the ceiling wrote its kv_lens and block table one stride apart and
+            # read them back at another.
+            max_draft_tokens=MAX_GENERATION_SEQ_LEN_Q - 1,
+            runtime_tokens_per_gen_step=generation_seq_len_q,
         )
         gen_metadata.prepare()
 
@@ -1216,11 +1282,19 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
                 None,  # quant_q_buffer
             )
 
-            # Build topk_indices for ratio=4
+            # Build topk_indices for ratio=4. One row per *query token*, not
+            # per request: query token j of a request cached at L sits at
+            # position L + j and so sees a different number of compressed
+            # tokens. Collapsing that to one row per request is the same
+            # uniform-window assumption this test is parameterized to break.
             topk_indices = None
             if ratio == 4:
                 topk_indices = _build_compressed_topk_indices(
-                    [kv - 1 for kv in kv_lens],
+                    [
+                        cached_len + j
+                        for cached_len in cached_lens
+                        for j in range(generation_seq_len_q)
+                    ],
                     ratio,
                     scenario.index_topk,
                     device,
