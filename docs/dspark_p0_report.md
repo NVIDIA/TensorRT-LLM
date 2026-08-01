@@ -193,7 +193,7 @@ goal doc 说得对：**贪婪 GSM8K 观察不到这一点**，所以只能从代
 | `test_deepseek_v4_sparse_mla` 按每请求 q 长度参数化（宽度 1/2/4/6） | **12/12 通过**，但见 §0.3 的覆盖限制 |
 | compressor ragged 差分（`test_compressor_ragged.py`，新增） | **4/4 通过** |
 | C++ ragged top-k（`test_indexer_topk_ragged.py`，PR 已有） | 见 §5 |
-| A3 布局一致性断言（`TLLM_DSPARK_ASSERT_LAYOUT=1`） | 已加，e2e 运行中启用 |
+| A3 布局一致性断言（`TLLM_DSPARK_ASSERT_LAYOUT=1`） | 已加；e2e run 全程启用，**57 个 graph 的两轮 warmup/capture 无一触发** |
 | A4 时序断言 | 已加（无条件，代价是一次 host 求和） |
 | A6 planner 计数并入 ragged stats summary | 已加 |
 
@@ -334,5 +334,6 @@ B2 的结果（§1）说明 expanded 路径**没有**吞吐问题，所以采用
 3. **两个并发点**（goal doc §6.5）—— 一个都没跑。
 4. **G2 逐 token 等价**、**A2 `cap-accept` 差分**。
 5. **B2 在 B≥64 且 tier≥3 的点**（§1 末尾）。
-6. `scripts/generate_llm_args_golden_manifest.py`：本轮没有新增 llm_args **字段**
-   （只加了 validator 和一个私有方法），预期 manifest 不变，但**未实际运行确认**。
+6. ~~`scripts/generate_llm_args_golden_manifest.py`~~ —— **已确认**：在容器内重跑该脚本后
+   `tensorrt_llm/usage/llm_args_golden_manifest.json` 无 diff。本轮只加了 validator 和一个
+   私有方法，没有新增用户可见字段，所以不需要 telemetry/privacy CODEOWNER 审批。
