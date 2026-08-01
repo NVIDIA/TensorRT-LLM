@@ -66,9 +66,15 @@ def _register_ops() -> None:
 _register_ops()
 
 HEAD_DIM = 512
-STATE_DIM = HEAD_DIM
 PAGE_SIZE = 64
 COMPRESS_RATIO = 4
+# The paged state is twice as wide as the head for compress_ratio=4: that ratio
+# selects the kernel's "overlap" layout, where `STATE_DIM = 2 * HEAD_DIM` (see
+# compressorKernels.cu, `IS_OVERLAP`). `kv_score` is twice as wide again -- it
+# carries the kv and the score side by side. Getting these wrong does not
+# produce a shape error anywhere; the kernel simply reads past the end.
+STATE_DIM = 2 * HEAD_DIM if COMPRESS_RATIO == 4 else HEAD_DIM
+KV_SCORE_DIM = 2 * STATE_DIM
 
 
 class _CompressorCase:
@@ -109,7 +115,7 @@ class _CompressorCase:
         # kv_score is indexed by the flat token offsets in cu_seq_lens, so it has
         # to cover every request's appended tokens.
         total_new = sum(new_tokens)
-        self.kv_score = torch.empty([max(total_new, 1), 2 * STATE_DIM],
+        self.kv_score = torch.empty([max(total_new, 1), KV_SCORE_DIM],
                                     dtype=dtype).uniform_(
                                         -1, 1, generator=generator).to(device)
         self.ape = torch.empty([COMPRESS_RATIO, STATE_DIM],
