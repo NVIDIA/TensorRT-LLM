@@ -4136,10 +4136,21 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         """
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
-        spec_config = DSparkDecodingConfig(max_draft_len=5,
-                                           speculative_model=self.MODEL_PATH,
-                                           enable_confidence_scheduling=True,
-                                           enable_ragged_verify=True)
+        # Without a cost table the planner is provably unable to trim: a flat
+        # table short-circuits `decide_verify_lens` before confidence is even
+        # read, so the ragged path stays dark and this test degenerates into the
+        # uniform baseline while still scoring the same. Point this at a table to
+        # exercise the real decision path. A table need not be *accurate* to be
+        # useful here -- scheduling only chooses how many drafted positions are
+        # submitted, and acceptance is unchanged, so an approximate table cannot
+        # change the output distribution, only the throughput it was picked for.
+        sps_table_path = os.environ.get("TLLM_DSPARK_SPS_TABLE") or None
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model=self.MODEL_PATH,
+            enable_confidence_scheduling=True,
+            enable_ragged_verify=True,
+            confidence_sps_table_path=sps_table_path)
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  tensor_parallel_size=8,
