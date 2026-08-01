@@ -488,7 +488,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
         timer.mark_denoise_start()
         logger.info("Denoising edit (%d steps)...", len(timesteps))
-        for t in timesteps:
+        for _, t in self._profile_denoise_steps(timesteps):
             latent_model_input = torch.cat([latents, image_latents], dim=1)
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
