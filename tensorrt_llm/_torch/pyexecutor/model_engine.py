@@ -5448,6 +5448,17 @@ class PyTorchModelEngine(ModelEngine):
         # from. The setter already copies in place under CUDA graphs (see its
         # comment: "The seqlens can change if we are doing spec decode"), so
         # this reallocates nothing as long as the row count is unchanged.
+        # Publish before the refresh decision below, not after: that decision
+        # asks whether this is a ragged step, and asking `attn_metadata` before
+        # this step's windows are on it reads the *previous* step's answer --
+        # None on a freshly copied per-key graph metadata. The refresh is then
+        # skipped and `seq_lens` keeps the uniform `ones(bs) * (1 +
+        # max_draft_tokens)` that `create_cuda_graph_metadata` seeded it with,
+        # so the layout claims bs*(top_tier+1) tokens while the windows describe
+        # the trimmed bucket.
+        self._publish_gen_token_layout(attn_metadata,
+                                       scheduled_requests.generation_requests)
+
         refresh_seq_lens = not attn_metadata.is_cuda_graph
         if (not refresh_seq_lens
                 and getattr(attn_metadata, "is_ragged_verify", False)
@@ -5508,14 +5519,12 @@ class PyTorchModelEngine(ModelEngine):
         # pre-prepare counts so the steady-gen recording below stores values
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
-        # prepare() is the only consumer of the gen-token layout, so it has to
-        # be published first: it decides the DSA expanded-buffer layout, strides
-        # the expansions by this step's per-request token count, builds the
-        # per-row causal extents, and derives DeepSeek-V4's per-request
-        # compressor token counts. The rest of the layout is attached later,
-        # once the spec metadata exists.
-        self._publish_gen_token_layout(attn_metadata,
-                                       scheduled_requests.generation_requests)
+        # The gen-token layout was published above, before the seq_lens refresh
+        # that depends on it. prepare() is its other consumer: it decides the DSA
+        # expanded-buffer layout, strides the expansions by this step's
+        # per-request token count, builds the per-row causal extents, and derives
+        # DeepSeek-V4's per-request compressor token counts. The rest of the
+        # layout is attached later, once the spec metadata exists.
         attn_metadata.prepare()
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,

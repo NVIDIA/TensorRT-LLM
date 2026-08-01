@@ -763,3 +763,69 @@ def test_cross_rank_reduction_is_max_not_min():
     confs = [torch.full((8, BLOCK), -6.0), torch.full((8, BLOCK), 6.0)]
     chosen, locals_ = _simulated_ranks(confs, tiers, table)
     assert chosen[0] == max(locals_)
+
+
+def test_forced_verify_lens_accepts_a_uniform_window(monkeypatch):
+    """``TLLM_DSPARK_FORCE_VERIFY_LENS=<tier>`` pins every request to one window.
+
+    This is the form SPS profiling needs. Sweeping the verify length by shrinking
+    ``block_size`` shrinks the draft pass too, and that draft term is bilinear in
+    (batch, verify_len) -- exactly the column space the additive cost fit spans,
+    so it is absorbed into theta/alpha instead of showing up as residual. Forcing
+    the window leaves block_size alone, so the draft cost is constant across the
+    sweep.
+    """
+    from tensorrt_llm._torch.speculative.dspark_observability import (
+        FORCE_VERIFY_LENS_ENV, forced_verify_lens)
+
+    monkeypatch.setenv(FORCE_VERIFY_LENS_ENV, "3")
+    lens = forced_verify_lens(num_gen_requests=5, tiers=[1, 3, 5],
+                              min_verify_len=1)
+    assert lens == [3, 3, 3, 3, 3]
+
+
+def test_forced_verify_lens_rotates_on_the_boolean_form(monkeypatch):
+    """``=1`` keeps its original meaning: rotate, i.e. deliberately non-uniform."""
+    from tensorrt_llm._torch.speculative.dspark_observability import (
+        FORCE_VERIFY_LENS_ENV, forced_verify_lens)
+
+    monkeypatch.setenv(FORCE_VERIFY_LENS_ENV, "1")
+    lens = forced_verify_lens(num_gen_requests=5, tiers=[1, 3, 5],
+                              min_verify_len=1)
+    assert lens == [1, 3, 5, 1, 3]
+    assert len(set(lens)) > 1, "the rotating form must not be uniform"
+
+
+def test_forced_verify_lens_rejects_an_uncaptured_window(monkeypatch):
+    """A window off the ladder must raise, not be quietly ignored.
+
+    It has no captured CUDA graph, so it would not fail loudly at runtime -- it
+    would drop every step into eager, which costs more than the trimmed tokens
+    save and makes any measurement taken with it meaningless.
+    """
+    import pytest
+
+    from tensorrt_llm._torch.speculative.dspark_observability import (
+        FORCE_VERIFY_LENS_ENV, forced_verify_lens)
+
+    monkeypatch.setenv(FORCE_VERIFY_LENS_ENV, "4")
+    with pytest.raises(ValueError, match="not a captured tier"):
+        forced_verify_lens(num_gen_requests=2, tiers=[1, 3, 5],
+                           min_verify_len=1)
+
+    monkeypatch.setenv(FORCE_VERIFY_LENS_ENV, "banana")
+    with pytest.raises(ValueError, match="expected 1"):
+        forced_verify_lens(num_gen_requests=2, tiers=[1, 3, 5],
+                           min_verify_len=1)
+
+
+def test_forced_verify_lens_off_by_default(monkeypatch):
+    from tensorrt_llm._torch.speculative.dspark_observability import (
+        FORCE_VERIFY_LENS_ENV, forced_verify_lens)
+
+    monkeypatch.delenv(FORCE_VERIFY_LENS_ENV, raising=False)
+    assert forced_verify_lens(num_gen_requests=3, tiers=[1, 3, 5],
+                              min_verify_len=1) is None
+    monkeypatch.setenv(FORCE_VERIFY_LENS_ENV, "0")
+    assert forced_verify_lens(num_gen_requests=3, tiers=[1, 3, 5],
+                              min_verify_len=1) is None
