@@ -641,25 +641,56 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # host because the expansions are built host-side and copied in; reading
     # the repeats off a device tensor would sync.
     ragged_verify_lens: Optional[List[int]] = None
+    # Query tokens per generation request on a *uniform* batch this step, i.e.
+    # `1 + runtime_draft_len`. Zero means "not published", and every expansion
+    # below falls back to the static `1 + max_draft_tokens` -- which is what
+    # every caller that never shortens its draft length wants, and keeps them
+    # bit-identical.
+    #
+    # This is deliberately NOT `max_draft_tokens`. That field is the static
+    # ceiling: it sizes every expanded buffer (see `create_expanded_buffers`)
+    # and must stay at the maximum so a shorter step never reallocates inside a
+    # CUDA-graph capture. The *stride* has to follow the runtime tier instead,
+    # because `Indexer.forward` slices the very same buffers by the true token
+    # count (`num_gen_tokens // num_generations`, see the decode branch). Left
+    # at the ceiling, a step that verifies fewer positions writes each
+    # request's kv_len/block-table row `1 + max_draft_tokens` apart and then
+    # reads them back `1 + runtime_draft_len` apart, so every request past the
+    # first silently picks up a neighbour's rows.
+    runtime_tokens_per_gen_step: int = 0
 
     @property
     def is_ragged_verify(self) -> bool:
         """Whether generation requests have per-request query lengths."""
         return self.ragged_verify_lens is not None
 
+    @property
+    def gen_token_stride(self) -> int:
+        """Query tokens contributed by one generation request, uniform batches.
+
+        The runtime tier when the engine published one, else the static
+        ceiling. Capacity questions must keep using `1 + max_draft_tokens`;
+        only the stride follows the tier.
+        """
+        stride = int(self.runtime_tokens_per_gen_step)
+        if stride <= 0:
+            return 1 + self.max_draft_tokens
+        return stride
+
     def gen_token_repeat_list(self) -> List[int]:
         """Per-generation-request query-token counts, on the host.
 
-        Uniform batches get `1 + max_draft_tokens` for every request, so the
-        callers below stay bit-identical; ragged batches get the scheduler's
-        per-request windows.
+        Uniform batches get `gen_token_stride` for every request, so the
+        callers below stay bit-identical whenever the runtime draft length is
+        the static maximum; ragged batches get the scheduler's per-request
+        windows.
 
         Host-side on purpose: the expanded token count derived from these feeds
         buffer slicing, and reducing it off a device tensor would be a
         device->host sync on every step of the *uniform* path too.
         """
         if self.ragged_verify_lens is None:
-            return [1 + self.max_draft_tokens] * self.num_generations
+            return [self.gen_token_stride] * self.num_generations
         return list(self.ragged_verify_lens)
 
     def gen_token_repeats(self, device=None) -> torch.Tensor:
@@ -693,7 +724,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         repeats = self.gen_token_repeat_list()
         num_tokens = sum(repeats)
         if self.ragged_verify_lens is None:
-            stride = 1 + self.max_draft_tokens
+            stride = self.gen_token_stride
             return values.repeat_interleave(stride, dim=dim), num_tokens
         repeats_host = torch.tensor(
             repeats,
@@ -1010,7 +1041,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # num_generations alone is only correct for next_n == 2; for next_n == 1
         # it engages inside the measured regression band, and for next_n == 4 it
         # misses the win region between 2*num_sms and 4*num_sms rows.
-        next_n = 1 + self.max_draft_tokens
+        # Runtime stride, not the static ceiling: this is a row-count threshold,
+        # and at a shorter verify tier the static value overstates the rows by
+        # the tier ratio, engaging GVR outside its measured win region.
+        next_n = self.gen_token_stride
         if (self.enable_heuristic_topk and self.use_cute_dsl_topk
                 and self.num_generations * next_n >= 2 * self.num_sms):
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
@@ -1615,6 +1649,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # ragged batch. The expanded path already materializes one row per
             # token, which is exactly the ragged layout, so route there.
             use_dsl = False
+        # Deliberately keyed on the static ceiling rather than this step's tier.
+        # Whether DeepGEMM supports a given next_n natively is a per-step
+        # question, so a shorter tier could sometimes take the cheaper strided
+        # path -- but that would make the *layout regime* a function of the tier,
+        # and the expanded path is the general one (one kernel row per query
+        # token) that is correct at every tier and required for ragged batches
+        # anyway. Holding the regime fixed keeps the tiers, and the ragged path
+        # built on top of them, comparable to each other.
         self.use_expanded_buffers_for_mtp = (
             not use_dsl
             and (self.is_ragged_verify or
@@ -1654,7 +1696,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.expand_for_dsl = (use_dsl and self.kv_cache_manager is not None
                                and self.max_draft_tokens >= 1)
         if self.expand_for_dsl and self.num_generations > 0:
-            next_n = 1 + self.max_draft_tokens
+            # `Indexer.forward` validates the cached split against the runtime
+            # next_n (`factor * atom == next_n`), so the picker has to be fed the
+            # same value or the split is silently declined on every trimmed step.
+            next_n = self.gen_token_stride
             kernel_atoms = (1, 2,
                             3) if self.kv_cache_manager.use_fp4 else (1, 2, 3,
                                                                       4)
@@ -1692,7 +1737,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.block_table_expanded.clamp_(min=0)
         else:
             self.dsl_expand_factor = 1
-            self.dsl_atom = 1 + self.max_draft_tokens
+            self.dsl_atom = self.gen_token_stride
 
     def _prepare_ragged_row_kv_lens(self, kv_lens: torch.Tensor) -> None:
         """Populate ``row_kv_lens_cuda``: how far back each query row may attend.
@@ -2476,7 +2521,14 @@ class Indexer(nn.Module):
                 metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
                                               num_generations])
             metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
-            next_n_cap = metadata.kv_lens_cuda_2d.shape[1]
+            # The 2D DeepGEMM metadata API encodes next_n into the schedule, and
+            # `Indexer.forward` launches the strided path with the *runtime*
+            # next_n (`num_gen_tokens // num_generations`). Building the
+            # schedule at the buffer's full static width instead would describe
+            # more query positions than the kernel is given whenever a shorter
+            # verify tier is in play.
+            next_n_cap = min(metadata.gen_token_stride,
+                             metadata.kv_lens_cuda_2d.shape[1])
             metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
                 gen_seq_lens.unsqueeze(-1).expand(-1, next_n_cap))
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
@@ -2493,8 +2545,16 @@ class Indexer(nn.Module):
         else:
             # Expand schedule metadata buffer (only generation). The DeepGEMM
             # API requires 2D; each expanded token becomes a (1,) row.
-            num_tokens = metadata.num_generations * (1 +
-                                                     metadata.max_draft_tokens)
+            #
+            # The row count has to be the one the expansions actually populated,
+            # which is what `gen_token_repeat_list` reports: the runtime tier on
+            # a uniform batch, the scheduler's windows on a ragged one. Deriving
+            # it from `1 + max_draft_tokens` instead described `num_generations *
+            # (1 + max_draft_tokens)` rows while `Indexer.forward` handed the
+            # kernel only `num_gen_tokens` of them -- the schedule and the logits
+            # then disagree about how much work exists, which is a hang rather
+            # than an error because the kernel waits on tiles nobody produces.
+            num_tokens = sum(metadata.gen_token_repeat_list())
             scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
                 metadata.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
                 _DG_SCHEDULE_BLOCK_KV, metadata.num_sms)

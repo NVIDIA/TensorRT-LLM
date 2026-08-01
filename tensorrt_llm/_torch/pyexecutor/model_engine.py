@@ -3803,9 +3803,10 @@ class PyTorchModelEngine(ModelEngine):
             return None
         return [1 + int(v) for v in verify_lens]
 
-    def _publish_ragged_verify_lens(self, attn_metadata,
-                                    generation_requests) -> None:
-        """Hand the attention metadata this step's windows, before it prepares.
+    def _publish_gen_token_layout(self, attn_metadata,
+                                  generation_requests) -> None:
+        """Hand the attention metadata this step's gen-token layout, before it
+        prepares.
 
         Split out of :meth:`_attach_ragged_verify_layout` because of ordering:
         ``attn_metadata.prepare()`` is the *only* consumer of
@@ -3817,12 +3818,30 @@ class PyTorchModelEngine(ModelEngine):
 
         The spec-metadata half stays where it was; it is consumed later and has
         no such constraint.
+
+        The uniform stride is published for the same reason and at the same
+        moment. ``prepare()`` expands kv_lens and the block table once per query
+        token, and the only value that describes how many tokens a request
+        actually contributes this step is ``1 + runtime_draft_len``. The
+        attention metadata's own ``max_draft_tokens`` cannot stand in for it: it
+        is the static ceiling that sizes those buffers, and for the parallel-draft
+        modes it is pinned to ``tokens_per_gen_step - 1`` for the engine's whole
+        lifetime (see the ``update_spec_dec_param`` call in :meth:`forward`), so
+        it does not move when a shorter tier is chosen.
+
+        Note this has to happen here rather than in ``update_spec_dec_param``:
+        that runs against the base metadata, while ``prepare()`` runs against the
+        per-key CUDA-graph copy taken later, and a plain attribute set on the
+        base is invisible to the copy.
         """
-        if attn_metadata is None or not hasattr(attn_metadata,
-                                                "ragged_verify_lens"):
+        if attn_metadata is None:
             return
-        attn_metadata.ragged_verify_lens = self._ragged_token_lens(
-            generation_requests)
+        if hasattr(attn_metadata, "runtime_tokens_per_gen_step"):
+            attn_metadata.runtime_tokens_per_gen_step = (
+                self.get_runtime_tokens_per_gen_step(self.runtime_draft_len))
+        if hasattr(attn_metadata, "ragged_verify_lens"):
+            attn_metadata.ragged_verify_lens = self._ragged_token_lens(
+                generation_requests)
 
     def _attach_ragged_verify_layout(self, spec_metadata, attn_metadata,
                                      generation_requests) -> None:
@@ -5402,13 +5421,14 @@ class PyTorchModelEngine(ModelEngine):
         # pre-prepare counts so the steady-gen recording below stores values
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
-        # prepare() is the only consumer of the ragged windows, so they have to
-        # be published first: it decides the DSA expanded-buffer layout, builds
-        # the per-row causal extents, and derives DeepSeek-V4's per-request
+        # prepare() is the only consumer of the gen-token layout, so it has to
+        # be published first: it decides the DSA expanded-buffer layout, strides
+        # the expansions by this step's per-request token count, builds the
+        # per-row causal extents, and derives DeepSeek-V4's per-request
         # compressor token counts. The rest of the layout is attached later,
         # once the spec metadata exists.
-        self._publish_ragged_verify_lens(attn_metadata,
-                                         scheduled_requests.generation_requests)
+        self._publish_gen_token_layout(attn_metadata,
+                                       scheduled_requests.generation_requests)
         attn_metadata.prepare()
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
