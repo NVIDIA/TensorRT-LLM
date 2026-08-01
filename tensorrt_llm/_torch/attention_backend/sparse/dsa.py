@@ -1649,6 +1649,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # ragged batch. The expanded path already materializes one row per
             # token, which is exactly the ragged layout, so route there.
             use_dsl = False
+            # goal doc K13. The dense XQA spec-dec metadata
+            # (`spec_decoding_generation_lengths`, packed mask) is written by
+            # scalar `fill_` at every Python call site, so it can only describe a
+            # uniform window -- even though the C++ side would accept a
+            # per-request vector. Today that block is unreachable here twice
+            # over: `update_spec_dec_param` forces `is_spec_decoding_enabled`
+            # False on the Blackwell trtllm-gen kernels for a linear tree, and
+            # MLA generation reads `mlaGeneration` state instead. Both are
+            # incidental. Assert the property that actually matters so a future
+            # SM, or a change to that gate, fails here rather than silently
+            # verifying every request at the batch-wide window.
+            assert not self.is_spec_decoding_enabled, (
+                "ragged verification requires the dense spec-decoding metadata "
+                "to be off: spec_decoding_generation_lengths and the packed "
+                "mask are filled with a single scalar window, which cannot "
+                "describe per-request verify lengths")
         # Deliberately keyed on the static ceiling rather than this step's tier.
         # Whether DeepGEMM supports a given next_n natively is a per-step
         # question, so a shorter tier could sometimes take the cheaper strided

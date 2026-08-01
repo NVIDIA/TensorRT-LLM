@@ -5484,6 +5484,73 @@ class TorchLlmArgs(BaseLlmArgs):
                 "graphs or disable enable_piecewise_cuda_graph.")
         return self
 
+    def _validate_dspark_ragged_verify_environment(self) -> None:
+        """Reject the configurations ragged verification cannot honour.
+
+        Every check here guards a path that would otherwise degrade *silently*:
+        the run comes up, produces plausible text, and either never takes the
+        ragged path at all or takes it with a kernel that mis-attributes rows.
+        A hard error at construction is the only signal that survives.
+        """
+        cuda_graph_config = self.cuda_graph_config
+        # `fit_ragged_verify_lens` plans against the padded row count and
+        # reserves tokens for the CUDA-graph padding rows, so it presumes those
+        # rows exist. With padding off, `_get_padded_batch` adds none: the batch
+        # then carries a token total that keys into a graph nobody captured and
+        # drops to eager on every ragged step -- which costs far more than the
+        # trimmed tokens save -- while real requests were still shrunk to leave
+        # room for padding that never arrived.
+        if cuda_graph_config is None:
+            raise ValueError(
+                "speculative_config.enable_ragged_verify=True requires "
+                "cuda_graph_config to be set with enable_padding=True. Ragged "
+                "verification fits each step's token total onto a captured "
+                "CUDA-graph bucket; with no graphs there is no bucket to fit "
+                "and every step would silently run eager.")
+        if not cuda_graph_config.enable_padding:
+            raise ValueError(
+                "speculative_config.enable_ragged_verify=True requires "
+                "cuda_graph_config.enable_padding=True (it defaults to False). "
+                "The ragged token budget is planned against the padded batch "
+                "size and reserves tokens for the padding rows; without padding "
+                "those rows never appear, so the step's token total misses its "
+                "captured bucket and falls out of graph replay.")
+
+        sparse_attention_config = self.sparse_attention_config
+        if sparse_attention_config is not None:
+            # Both recover "which request is this row" from a fixed next_n --
+            # GVR indexes its previous-step top-k hint by request and strides it
+            # by next_n, and the CuTe-DSL kernel takes next_n as a compile-time
+            # constant and JIT cache key. Neither can express per-request
+            # windows. The C++ launcher already refuses the combination
+            # (indexerTopK.cu, "ragged rowKvLens is incompatible with the GVR
+            # preIdx hint"), but that fires deep in a decode step; say so here.
+            incompatible = [
+                name for name in ("enable_heuristic_topk", "use_cute_dsl_topk")
+                if getattr(sparse_attention_config, name, False)
+            ]
+            if incompatible:
+                raise ValueError(
+                    "speculative_config.enable_ragged_verify=True is "
+                    "incompatible with sparse_attention_config."
+                    f"{' / '.join(incompatible)}=True: those top-k paths "
+                    "reconstruct each row's request and window position from a "
+                    "single batch-wide next_n, which a ragged batch does not "
+                    "have. Disable them, or disable ragged verification.")
+            # Not an error: the DSL paged-MQA-logits path is structurally
+            # uniform too, but the expanded (one row per query token) path it
+            # falls back to is numerically equivalent, and it is the default on
+            # DeepSeek-V4 anyway. Still worth saying out loud, since the knob
+            # will read as honoured otherwise.
+            if getattr(sparse_attention_config,
+                       "use_cute_dsl_paged_mqa_logits", False):
+                logger.warning(
+                    "sparse_attention_config.use_cute_dsl_paged_mqa_logits=True "
+                    "is ignored on ragged-verification steps: the DSL kernel "
+                    "broadcasts one KV length per request across a fixed next_n. "
+                    "Those steps use the expanded DeepGEMM path instead, which "
+                    "is numerically equivalent.")
+
     @model_validator(mode="after")
     def validate_speculative_config(self):
         if self.speculative_config:
@@ -5742,6 +5809,8 @@ class TorchLlmArgs(BaseLlmArgs):
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "
                         f"max_draft_len={spec_cfg.max_draft_len}")
+                if spec_cfg.enable_ragged_verify:
+                    self._validate_dspark_ragged_verify_environment()
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size
