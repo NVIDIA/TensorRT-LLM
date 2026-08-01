@@ -64,12 +64,12 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
 
 # Parser keys backed by DeepSeekR1Parser whose stream starts inside the
 # reasoning block (`reasoning_at_start=True`).
-R1_AT_START_KEYS = [
+_R1_AT_START_KEYS = [
     "deepseek-r1", "qwen3_5", "minimax_m2", "minimax_m2_append_think"
 ]
 
 
-@pytest.mark.parametrize("parser_key", R1_AT_START_KEYS)
+@pytest.mark.parametrize("parser_key", _R1_AT_START_KEYS)
 @pytest.mark.parametrize(("delta_texts", "flushed"), [
     (["a <"], "<"),
     (["a", "</thin"], "</thin"),
@@ -78,7 +78,7 @@ R1_AT_START_KEYS = [
     ([f"a{R1_END}b"], ""),
 ])
 def test_deepseek_r1_reasoning_parser_finish_flushes_reasoning(
-        parser_key: str, delta_texts: list, flushed: str):
+        parser_key: str, delta_texts: list[str], flushed: str) -> None:
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         parser_key)
     for delta_text in delta_texts:
@@ -95,7 +95,7 @@ def test_deepseek_r1_reasoning_parser_finish_flushes_reasoning(
     (["a"], ""),
 ])
 def test_deepseek_r1_reasoning_parser_finish_flushes_content(
-        parser_key: str, delta_texts: list, flushed: str):
+        parser_key: str, delta_texts: list[str], flushed: str) -> None:
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         parser_key)
     for delta_text in delta_texts:
@@ -108,7 +108,7 @@ def test_deepseek_r1_reasoning_parser_finish_flushes_content(
 @pytest.mark.parametrize("parser_key", ["deepseek-r1", "qwen3"])
 @pytest.mark.parametrize("tag", [R1_START, R1_END])
 def test_deepseek_r1_reasoning_parser_finish_drops_complete_tag(
-        parser_key: str, tag: str):
+        parser_key: str, tag: str) -> None:
     """A buffer holding only a delimiter must not leak into the output."""
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         parser_key)
@@ -118,7 +118,7 @@ def test_deepseek_r1_reasoning_parser_finish_drops_complete_tag(
     assert result.reasoning_content == ""
 
 
-def test_deepseek_r1_reasoning_parser_finish_is_idempotent():
+def test_deepseek_r1_reasoning_parser_finish_is_idempotent() -> None:
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         "deepseek-r1")
     reasoning_parser.parse_delta("a <")
@@ -134,7 +134,8 @@ def test_deepseek_r1_reasoning_parser_finish_is_idempotent():
     "a </thin",
     "a b",
 ])
-def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(text: str):
+def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(
+        text: str) -> None:
     """Streaming char-by-char then finishing must match a non-streaming parse."""
     expected = ReasoningParserFactory.create_reasoning_parser(
         "deepseek-r1").parse(text)
