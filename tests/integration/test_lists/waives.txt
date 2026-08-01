@@ -131,7 +131,6 @@ disaggregated/test_workers.py::test_workers_conversation_router[TinyLlama-1.1B-C
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6162322)
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6162322)
 examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[trtllm-torch-cudagraph] SKIP (https://nvbugs/6426841)
-examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b] SKIP (https://nvbugs/6517834)
 examples/test_ray.py::test_llm_inference_distributed_ray[pp2] SKIP (https://nvbugs/6427411)
 examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2] SKIP (https://nvbugs/6427411)
 examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5612502)
