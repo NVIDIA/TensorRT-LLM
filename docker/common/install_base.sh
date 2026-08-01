@@ -94,11 +94,9 @@ init_ubuntu() {
     python-is-python3 \
     wget \
     pigz \
-    libzmq3-dev
-  # WAR against CVE-2026-45447: upgrade OpenSSL runtime libraries
-  apt-get install -y --no-install-recommends \
-    libssl3t64=3.0.13-0ubuntu3.11 \
-    openssl=3.0.13-0ubuntu3.11
+    libzmq3-dev \
+    libssl3t64 \
+    openssl
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
