@@ -997,7 +997,12 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
         self._ctx_block_counts = None
-        max_batch = spec_metadata.max_num_requests
+        # Worker-owned and allocated once, then reused for every later batch
+        # shape, so this must span the full seq-slot pool. max_num_requests is
+        # shrunk to the captured graph bucket by create_cuda_graph_metadata,
+        # which would pin the pool to whichever bucket drafts first and leave
+        # _dummy_slot aliasing a live request's row.
+        max_batch = spec_metadata.num_seq_slots or spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
         # max_position_embeddings does not: K3's drafter advertises 1048576,
