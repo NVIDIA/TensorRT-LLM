@@ -206,7 +206,7 @@ class TestWarmupCleanup(unittest.TestCase):
             patch.object(model_engine, "_capture_mixed_encoder_decoder_cuda_graphs") as mixed,
             patch.object(
                 model_engine,
-                "_capture_encoder_decoder_encoder_cuda_graphs",
+                "_capture_encoder_cuda_graphs_enc_dec",
                 side_effect=lambda _: warmup_states.append(runner.is_warmup_only),
             ) as encoder,
         ):
@@ -214,7 +214,7 @@ class TestWarmupCleanup(unittest.TestCase):
             generation.assert_called_once_with(resource_manager)
             mixed.assert_called_once_with(resource_manager)
             encoder.assert_not_called()
-            model_engine._warmup_encoder_decoder_encoder_cuda_graphs(resource_manager)
+            model_engine._warmup_encoder_cuda_graphs_enc_dec(resource_manager)
 
         assert encoder.call_count == 2
         assert warmup_states == [True, False]

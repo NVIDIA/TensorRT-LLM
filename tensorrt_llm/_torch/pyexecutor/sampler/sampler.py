@@ -3859,12 +3859,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             and scheduled_requests.num_context_requests == 0
             and len(generation_requests) <= raw_logits_cuda.shape[0]
             and model_outputs.get("d2t") is None
+            and all(
+                not request.is_dummy and get_draft_token_length(request) == 0
+                for request in generation_requests
+            )
             and (
                 has_stable_request_ids
                 or all(
-                    not request.is_dummy
-                    and get_draft_token_length(request) == 0
-                    and request._py_embedding_bias_1d is None
+                    request._py_embedding_bias_1d is None
                     and not getattr(request, "py_bad_words", None)
                     and not getattr(request, "py_no_repeat_ngram_size", None)
                     and not request.py_min_length

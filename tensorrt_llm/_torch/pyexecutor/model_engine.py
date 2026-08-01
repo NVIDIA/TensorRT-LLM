@@ -1865,8 +1865,9 @@ class PyTorchModelEngine(ModelEngine):
         if not self.cuda_graph_runner.is_warmup_only:
             self._capture_piecewise_cuda_graphs(resource_manager)
 
+    @torch.inference_mode()
     @with_warmup_flag
-    def _warmup_encoder_decoder_encoder_cuda_graphs(
+    def _warmup_encoder_cuda_graphs_enc_dec(
             self, resource_manager: ResourceManager) -> None:
         """Capture encoder-decoder encoder graphs on their runtime host thread."""
         runner = self.encoder_cuda_graph_runner
@@ -1874,7 +1875,7 @@ class PyTorchModelEngine(ModelEngine):
             return
 
         capture = functools.partial(
-            self._capture_encoder_decoder_encoder_cuda_graphs,
+            self._capture_encoder_cuda_graphs_enc_dec,
             resource_manager,
         )
         self._warmup_and_capture_encoder_cuda_graphs(capture)
@@ -1894,7 +1895,7 @@ class PyTorchModelEngine(ModelEngine):
                 runner.is_warmup_only = False
             capture()
 
-    def _capture_encoder_decoder_encoder_cuda_graphs(
+    def _capture_encoder_cuda_graphs_enc_dec(
             self, resource_manager: ResourceManager) -> None:
         """Warm up or capture encoder graphs used by encoder-decoder models."""
         runner = self.encoder_cuda_graph_runner
@@ -1926,7 +1927,7 @@ class PyTorchModelEngine(ModelEngine):
 
             logger.info("Encoder-decoder encoder CUDA graph "
                         f"{operation}: key={key}")
-            self._forward_encoder_with_cuda_graph(inputs)
+            self._encoder_forward_enc_dec(inputs)
             torch.cuda.synchronize()
             num_processed += 1
 
@@ -6561,7 +6562,7 @@ class PyTorchModelEngine(ModelEngine):
         num_processed = 0
         logger.info(f"Running encoder CUDA graph {operation} ...")
         for bs in batch_sizes:
-            if bs > self.batch_size:
+            if bs > self.encoder_batch_size:
                 continue
             for sl_idx, sl in reversed(list(enumerate(seq_lens_list))):
                 prev_sl = seq_lens_list[sl_idx - 1] if sl_idx > 0 else 0
@@ -7331,11 +7332,11 @@ class PyTorchModelEngine(ModelEngine):
             inputs.get('resource_manager'),
         })
 
-    def _forward_encoder_with_cuda_graph(
+    def _encoder_forward_enc_dec(
         self,
         inputs: Dict[str, Any],
     ) -> torch.Tensor:
-        """Replay a bucketed dynamic-layout graph when the encoder is eligible."""
+        """Run the encoder-decoder encoder, using a CUDA graph when eligible."""
         input_ids = inputs.get('encoder_input_ids_host')
         position_ids = inputs.get('encoder_position_ids_host')
         seq_lens = inputs['encoder_seq_lens']
@@ -7426,8 +7427,7 @@ class PyTorchModelEngine(ModelEngine):
         with torch.inference_mode():
             inputs = self._prepare_tp_inputs_encoder(
                 encoder_requests, resource_manager=resource_manager)
-            encoder_hidden_states = self._forward_encoder_with_cuda_graph(
-                inputs)
+            encoder_hidden_states = self._encoder_forward_enc_dec(inputs)
 
         return encoder_hidden_states, inputs['encoder_seq_lens']
 

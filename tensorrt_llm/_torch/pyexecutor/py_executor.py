@@ -836,7 +836,7 @@ class PyExecutor:
             # on the same single worker that owns every runtime encoder replay.
             self.encoder_stream.wait_stream(self.execution_stream)
             self.encoder_launch_executor.submit(
-                self._warmup_encoder_decoder_encoder_cuda_graphs).result()
+                self._warmup_encoder_cuda_graphs_enc_dec).result()
 
         self.is_warmup = False
 
@@ -5471,11 +5471,11 @@ class PyExecutor:
     # micro-batch; this preserves the cross-KV lifecycle and the
     # dual-pool budget.
     # ---------------------------------------------------------------
-    def _warmup_encoder_decoder_encoder_cuda_graphs(self) -> None:
+    def _warmup_encoder_cuda_graphs_enc_dec(self) -> None:
         """Capture encoder graphs on the worker used for runtime replay."""
         warmup = getattr(
             self.model_engine,
-            "_warmup_encoder_decoder_encoder_cuda_graphs",
+            "_warmup_encoder_cuda_graphs_enc_dec",
             None,
         )
         if not callable(warmup):
@@ -5579,7 +5579,12 @@ class PyExecutor:
 
     def _run_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
         try:
-            result = self._run_encoder_step_unchecked(encoder_requests)
+            executor = self.encoder_launch_executor
+            if executor is None:
+                raise RuntimeError("Encoder launch executor is unavailable.")
+            future = executor.submit(self._run_encoder_step_unchecked,
+                                     encoder_requests)
+            result = future.result()
             self._publish_encoder_step(encoder_requests, result)
         except Exception as e:
             self._finish_failed_encoder_step(encoder_requests, e)

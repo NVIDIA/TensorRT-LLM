@@ -202,11 +202,11 @@ def test_encoder_graph_warmup_uses_runtime_encoder_stream():
         patch("torch.cuda.set_device") as set_device,
         patch("torch.cuda.stream", return_value=stream_context) as cuda_stream,
     ):
-        executor._warmup_encoder_decoder_encoder_cuda_graphs()
+        executor._warmup_encoder_cuda_graphs_enc_dec()
 
     set_device.assert_called_once_with(3)
     cuda_stream.assert_called_once_with(executor.encoder_stream)
-    executor.model_engine._warmup_encoder_decoder_encoder_cuda_graphs.assert_called_once_with(
+    executor.model_engine._warmup_encoder_cuda_graphs_enc_dec.assert_called_once_with(
         executor.resource_manager
     )
 
