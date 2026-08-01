@@ -4052,6 +4052,107 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 f"the recorded reference {acc_params.ref_accuracy:.3f}; the "
                 f"scheduler must not change the output distribution")
 
+    def _run_gsm8k(self, llm):
+        task = GSM8K(self.MODEL_NAME)
+        acc_params = task.get_hypothesis_testing_params(
+            dtype=llm.args.dtype,
+            quant_algo=llm.args.quant_config.quant_algo,
+            kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+            spec_dec_algo=llm.args.speculative_config.decoding_type)
+        assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+        with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+            score = task.evaluate(
+                llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+        return score, acc_params
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_dep8_megamoe_deepgemm_confidence_scheduling_overlap(self):
+        """Confidence scheduling with the overlap scheduler ON.
+
+        The sibling test above pins ``disable_overlap_scheduler=True``, which
+        makes it a weaker test than it looks: with overlap off,
+        ``_prepare_tp_inputs`` takes the branch that has no previous-batch
+        tensors, and the whole previous-step relay -- the KV-length correction,
+        the draft-token gather, the rewind -- is simply not exercised. Overlap
+        on is also the configuration anyone would actually serve.
+
+        Cross-rank agreement is the other reason this matters. Under
+        attention-DP the draft length is part of the CUDA-graph key but is not
+        covered by the graph-eligibility allgather, so ranks that disagree pick
+        different graphs and their collectives diverge into a hang rather than a
+        wrong answer.
+        """
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           speculative_model=self.MODEL_PATH,
+                                           enable_confidence_scheduling=True)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True),
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=False,
+                 custom_tokenizer="deepseek_v4",
+                 speculative_config=spec_config) as llm:
+            score, acc_params = self._run_gsm8k(llm)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} with confidence scheduling and the "
+                f"overlap scheduler is below the recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_dep8_megamoe_deepgemm_ragged_verify(self):
+        """Per-request verify windows, overlap scheduler on.
+
+        ``enable_padding=True`` is required rather than incidental: the ragged
+        token budget is planned against the padded batch and reserves tokens for
+        the padding rows, so without them the step's total misses its captured
+        bucket. The config validator refuses the combination outright, which is
+        what this passes.
+
+        Accuracy alone would not establish much here -- the planner declines to
+        trim without a profiled SPS cost table, and a run where it declined on
+        every step is a uniform baseline wearing a different config, scoring
+        exactly the same. ``TLLM_DSPARK_FORCE_VERIFY_LENS`` exists for that
+        reason: it hands out windows from the captured ladder deterministically,
+        which separates "is the ragged packing correct" from "does the planner
+        choose to trim". Set it in the environment when running this to test the
+        former.
+        """
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        spec_config = DSparkDecodingConfig(max_draft_len=5,
+                                           speculative_model=self.MODEL_PATH,
+                                           enable_confidence_scheduling=True,
+                                           enable_ragged_verify=True)
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=8,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(enable_padding=True),
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=False,
+                 custom_tokenizer="deepseek_v4",
+                 speculative_config=spec_config) as llm:
+            score, acc_params = self._run_gsm8k(llm)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} with ragged verification is below "
+                f"the recorded reference {acc_params.ref_accuracy:.3f}")
+
 
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device_memory(140000)
