@@ -174,6 +174,13 @@ class DSparkRaggedStats:
     def __init__(self, *, mode: RaggedVerifyMode, max_draft_len: int):
         self.mode = mode
         self.max_draft_len = int(max_draft_len)
+        #: The planner's own decision counters, attached by the worker once the
+        #: planner exists (goal doc A6). They answer a question these counters
+        #: cannot: *why* a step declined to trim. `fallback_flat_cost` in
+        #: particular means the run had no profiled SPS table, under which the
+        #: budget search is constructionally incapable of trimming -- so a run
+        #: can look entirely healthy here and still have delivered nothing.
+        self.planner_stats: Optional[Dict[str, int]] = None
 
         self.steps_total = 0
         #: Steps where per-request windows were produced AND differed from each
@@ -305,6 +312,7 @@ class DSparkRaggedStats:
             "graph_replays": self.graph_replays,
             "graph_eager": self.graph_eager,
             "fallbacks": dict(self.fallbacks),
+            "planner": dict(self.planner_stats) if self.planner_stats else {},
         }
 
     def log_summary(self, *, prefix: str = "DSpark ragged verify") -> None:

@@ -1787,6 +1787,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         assert len(gen_kv_lens) == len(verify_lens), (
             f"ragged verify lengths {len(verify_lens)} != generation requests "
             f"{len(gen_kv_lens)}")
+        # goal doc A4. `seq_lens` is rebuilt from this step's requests, so its
+        # generation half is by definition current; `ragged_verify_lens` is
+        # published separately and used to be published *after* prepare(), which
+        # meant reading the previous step's split -- and under CUDA graphs
+        # "previous step" really meant "whenever this key last ran". Checking
+        # the two against each other tests the property (these windows describe
+        # this step) rather than the mechanism (publish happens before prepare).
+        expected_gen_tokens = self.num_tokens - self.num_ctx_tokens
+        assert sum(verify_lens) == expected_gen_tokens, (
+            f"ragged verify windows sum to {sum(verify_lens)} but this step's "
+            f"token layout has {expected_gen_tokens} generation tokens; the "
+            f"windows belong to a different step than seq_lens does")
 
         # Row o of a request verifying v positions sees kv_len - v + o + 1
         # tokens: the last row sees the request's full KV, each earlier row one

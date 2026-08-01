@@ -477,6 +477,9 @@ class DSparkWorker(SpecWorkerBase):
                 "'compact'.")
         self.ragged_stats = DSparkRaggedStats(mode=self.ragged_verify_mode,
                                               max_draft_len=block_size)
+        # goal doc A6: the ragged counters say what happened, the planner's say
+        # why. Sharing the dict (not copying it) keeps the summary live.
+        self.ragged_stats.planner_stats = self.verify_planner.stats
         logger.info(
             f"DSpark verify planner: tiers={self.verify_planner.tiers}, "
             f"profiled_cost_table={not cost_table.is_flat}, "

@@ -259,6 +259,14 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
 
 _DEEP_GEMM_PDL_CONFIGURED = False
 
+# goal doc A3/A4. Ragged-verification layout bugs are silent by construction --
+# the token totals stay integer multiples of the row count, so every
+# divisibility check inside the kernels still passes and rows are merely
+# attributed to the wrong requests. These assertions make that class of bug
+# loud, at the cost of walking the batch on the hot path, so they are opt-in.
+_DSPARK_ASSERT_LAYOUT = os.environ.get("TLLM_DSPARK_ASSERT_LAYOUT",
+                                       "0") in ("1", "true", "True")
+
 
 def _configure_deep_gemm_pdl() -> None:
     global _DEEP_GEMM_PDL_CONFIGURED
@@ -3843,6 +3851,63 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.ragged_verify_lens = self._ragged_token_lens(
                 generation_requests)
 
+    def _assert_ragged_layout_consistent(self, spec_metadata, attn_metadata,
+                                         scheduled_requests) -> None:
+        """goal doc A3: one identity that catches H0, H5 and H8 at once.
+
+        Four independent descriptions of "how many generation tokens are in this
+        step" have to agree:
+
+          sum(1 + py_verify_len)   the requests, as the scheduler fitted them
+          num_tokens - num_ctx_tokens   the flat input layout the kernels see
+          total_verify_tokens      what acceptance will slice by
+          the ragged bucket        the CUDA-graph key's token axis
+
+        Each of the bugs this guards against breaks exactly one of these while
+        leaving the others self-consistent, which is why none of them raise on
+        their own: the token totals are always an integer multiple of the row
+        count, so the divisibility checks inside the kernels still pass and the
+        rows are simply attributed to the wrong requests.
+
+        Off by default -- it walks the batch on the hot path. Enable with
+        TLLM_DSPARK_ASSERT_LAYOUT=1 for correctness runs.
+        """
+        verify_lens = self._ragged_token_lens(
+            scheduled_requests.generation_requests)
+        if verify_lens is None:
+            # Uniform step: assert the converse, that nothing ragged leaked
+            # through. A half-published layout is the dangerous state.
+            assert getattr(spec_metadata, "total_verify_tokens", None) is None, (
+                "uniform batch left a stale total_verify_tokens on the spec "
+                f"metadata: {spec_metadata.total_verify_tokens}")
+            assert getattr(attn_metadata, "ragged_verify_lens", None) is None, (
+                "uniform batch left stale ragged_verify_lens on the attention "
+                f"metadata: {attn_metadata.ragged_verify_lens}")
+            return
+
+        from_requests = sum(verify_lens)
+        from_layout = attn_metadata.num_tokens - attn_metadata.num_ctx_tokens
+        from_spec = int(spec_metadata.total_verify_tokens)
+        bucket = self.cuda_graph_runner._ragged_verify_bucket(
+            scheduled_requests)
+
+        assert from_requests == from_layout, (
+            f"ragged layout mismatch: requests carry {from_requests} generation "
+            f"tokens but the flat input layout has {from_layout} "
+            f"(attn_metadata.num_tokens={attn_metadata.num_tokens}, "
+            f"num_ctx_tokens={attn_metadata.num_ctx_tokens}). The token layout "
+            f"and the verify windows were built from different values.")
+        assert from_requests == from_spec, (
+            f"ragged layout mismatch: requests carry {from_requests} generation "
+            f"tokens but spec_metadata.total_verify_tokens is {from_spec}; "
+            f"acceptance would slice the target logits at the wrong offsets.")
+        if bucket is not None:
+            assert from_requests == int(bucket), (
+                f"ragged layout mismatch: requests carry {from_requests} "
+                f"generation tokens but the CUDA-graph key's token axis is "
+                f"{bucket}; the replayed graph was captured at a different "
+                f"width and nothing downstream would notice.")
+
     def _attach_ragged_verify_layout(self, spec_metadata, attn_metadata,
                                      generation_requests) -> None:
         """Publish this step's per-request verify windows to both metadatas.
@@ -5528,6 +5593,9 @@ class PyTorchModelEngine(ModelEngine):
             self._attach_ragged_verify_layout(
                 spec_metadata, attn_metadata,
                 scheduled_requests.generation_requests)
+            if _DSPARK_ASSERT_LAYOUT:
+                self._assert_ragged_layout_consistent(
+                    spec_metadata, attn_metadata, scheduled_requests)
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
             # No-op for non 1-model
