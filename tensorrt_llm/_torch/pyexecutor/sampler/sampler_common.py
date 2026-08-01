@@ -46,6 +46,7 @@ class UtilsSamplingParams:
         temperature: The temperature to use for sampling.
         top_p: The top-p to use for sampling.
         top_k: The top-k to use for sampling.
+        min_p: The min-p to use for sampling.
         use_beam_search: Whether to use beam search.
         beam_width_in: The beam_width of a request before the sampling step.
         beam_width_out: The beam_width of a request after the sampling step.
@@ -59,6 +60,7 @@ class UtilsSamplingParams:
     top_p: Optional[float]
     top_k: Optional[int]
     use_beam_search: Optional[bool]
+    min_p: Optional[float] = None
     beam_width_in: Optional[int] = None
     beam_width_out: Optional[int] = None
     top_p_decay: Optional[float] = None
@@ -123,6 +125,7 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
     top_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p))
     top_k = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_k))
+    min_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.min_p))
     top_p_decay = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_decay))
     top_p_min = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_min))
     top_p_reset_ids = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_p_reset_ids))
@@ -134,6 +137,7 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        min_p=min_p,
         beam_width_in=beam_width_in,
         beam_width_out=beam_width_out,
         use_beam_search=use_beam_search,
