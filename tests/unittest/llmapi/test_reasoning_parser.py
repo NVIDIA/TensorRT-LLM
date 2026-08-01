@@ -62,6 +62,96 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
         assert result.reasoning_content == reasoning_context[i]
 
 
+# Parser keys backed by DeepSeekR1Parser whose stream starts inside the
+# reasoning block (`reasoning_at_start=True`).
+R1_AT_START_KEYS = [
+    "deepseek-r1", "qwen3_5", "minimax_m2", "minimax_m2_append_think"
+]
+
+
+@pytest.mark.parametrize("parser_key", R1_AT_START_KEYS)
+@pytest.mark.parametrize(("delta_texts", "flushed"), [
+    (["a <"], "<"),
+    (["a", "</thin"], "</thin"),
+    (["a</thin", "k"], "</think"),
+    (["a b"], ""),
+    ([f"a{R1_END}b"], ""),
+])
+def test_deepseek_r1_reasoning_parser_finish_flushes_reasoning(
+        parser_key: str, delta_texts: list, flushed: str):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        parser_key)
+    for delta_text in delta_texts:
+        reasoning_parser.parse_delta(delta_text)
+    result = reasoning_parser.finish()
+    assert result.reasoning_content == flushed
+    assert result.content == ""
+
+
+@pytest.mark.parametrize("parser_key", ["qwen3", "laguna"])
+@pytest.mark.parametrize(("delta_texts", "flushed"), [
+    (["a", "<"], "<"),
+    (["a", "<thin"], "<thin"),
+    (["a"], ""),
+])
+def test_deepseek_r1_reasoning_parser_finish_flushes_content(
+        parser_key: str, delta_texts: list, flushed: str):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        parser_key)
+    for delta_text in delta_texts:
+        reasoning_parser.parse_delta(delta_text)
+    result = reasoning_parser.finish()
+    assert result.content == flushed
+    assert result.reasoning_content == ""
+
+
+@pytest.mark.parametrize("parser_key", ["deepseek-r1", "qwen3"])
+@pytest.mark.parametrize("tag", [R1_START, R1_END])
+def test_deepseek_r1_reasoning_parser_finish_drops_complete_tag(
+        parser_key: str, tag: str):
+    """A buffer holding only a delimiter must not leak into the output."""
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        parser_key)
+    reasoning_parser.parse_delta(tag)
+    result = reasoning_parser.finish()
+    assert result.content == ""
+    assert result.reasoning_content == ""
+
+
+def test_deepseek_r1_reasoning_parser_finish_is_idempotent():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek-r1")
+    reasoning_parser.parse_delta("a <")
+    assert reasoning_parser.finish().reasoning_content == "<"
+    assert reasoning_parser.finish().reasoning_content == ""
+
+
+@pytest.mark.parametrize("text", [
+    f"a{R1_END}b",
+    f"a{R1_END}",
+    f"{R1_END}b",
+    "a <",
+    "a </thin",
+    "a b",
+])
+def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(text: str):
+    """Streaming char-by-char then finishing must match a non-streaming parse."""
+    expected = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek-r1").parse(text)
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek-r1")
+    content, reasoning_context = "", ""
+    for char in text:
+        result = reasoning_parser.parse_delta(char)
+        content += result.content
+        reasoning_context += result.reasoning_content
+    result = reasoning_parser.finish()
+    content += result.content
+    reasoning_context += result.reasoning_content
+    assert content == expected.content
+    assert reasoning_context == expected.reasoning_content
+
+
 @pytest.mark.parametrize("chat_template_kwargs", [{
     "thinking": True
 }, {
