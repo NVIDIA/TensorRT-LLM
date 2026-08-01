@@ -235,7 +235,7 @@ def sonarScan()
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
         withSonarQubeEnv() {
-          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.ref} -Dsonar.exclusions=**/*.cubin"
+          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName} -Dsonar.exclusions=cpp/build/**,**/*.lock,**/*.cubin,**/*.zst,**/*.tar.zst,**/cubin/**,3rdparty/**,docs/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.ico,**/*.pdf,**/*.whl,**/*.egg-info/**"
         }
     }
 }
