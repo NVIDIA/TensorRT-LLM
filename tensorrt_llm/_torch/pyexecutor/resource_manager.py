@@ -973,59 +973,85 @@ class KVCacheManager(BaseResourceManager):
                 _populate_dummy_mrope_config(req, token_num, is_gen)
             requests.append(req)
 
-        # Use add_sequence_batch for all dummy requests, then add extra tokens.
-        # This must happen before is_gen state modifications below, which may
-        # set prompt_len to 0 and trigger assertion in setPrepopulatedPromptLen.
-        if batch_request_infos:
-            self.impl.add_sequence_batch(batch_request_infos,
-                                         batch_llm_requests)
-            for req_id, token_num, _ in batch_request_infos:
-                for _ in range(self.num_extra_kv_tokens):
-                    self.impl.add_token(req_id)
-                for _ in range(num_extra_decoding_steps):
-                    self.impl.add_token(req_id)
+        try:
+            # Use add_sequence_batch for all dummy requests, then add extra tokens.
+            # This must happen before is_gen state modifications below, which may
+            # set prompt_len to 0 and trigger assertion in setPrepopulatedPromptLen.
+            if batch_request_infos:
+                self.impl.add_sequence_batch(batch_request_infos,
+                                             batch_llm_requests)
+                for req_id, token_num, _ in batch_request_infos:
+                    for _ in range(self.num_extra_kv_tokens):
+                        self.impl.add_token(req_id)
+                    for _ in range(num_extra_decoding_steps):
+                        self.impl.add_token(req_id)
 
-        if draft_batch_request_infos and draft_kv_cache_manager is not None:
-            draft_kv_cache_manager.impl.add_sequence_batch(
-                draft_batch_request_infos, draft_batch_llm_requests)
-            for req_id, _, _ in draft_batch_request_infos:
-                for _ in range(self.num_extra_kv_tokens):
-                    draft_kv_cache_manager.impl.add_token(req_id)
+            if draft_batch_request_infos and draft_kv_cache_manager is not None:
+                draft_kv_cache_manager.impl.add_sequence_batch(
+                    draft_batch_request_infos, draft_batch_llm_requests)
+                for req_id, _, _ in draft_batch_request_infos:
+                    for _ in range(self.num_extra_kv_tokens):
+                        draft_kv_cache_manager.impl.add_token(req_id)
 
-        # Set is_gen state after add_sequence_batch to avoid modifying
-        # prompt_len before the C++ side reads it.
-        if is_gen:
-            for i, req in enumerate(requests):
-                token_num = token_nums[
-                    i] if token_nums is not None else 1 + max_num_draft_tokens
-                if self.mapping.has_cp_helix():
-                    token_num = max(token_num, 2)
-                req.state = LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1
-                req.py_prompt_len = req.prompt_len
-                if self.mapping.has_cp_helix():
-                    if self.mapping.cp_size - 1 == self.mapping.cp_rank:
-                        req.py_helix_is_inactive_rank = False
-                        req.prompt_len = token_num - 1
-                        req.py_prompt_len = req.prompt_len
-                        req.seqlen_this_rank_cp = req.prompt_len
-                        req.total_input_len_cp = token_num * self.mapping.cp_size - 1
-                        req.py_decoding_iter = 1
-                    else:
-                        req.py_helix_is_inactive_rank = True
-                        req.prompt_len = token_num
-                        req.py_prompt_len = req.prompt_len
-                        req.seqlen_this_rank_cp = req.prompt_len
-                        req.total_input_len_cp = token_num * self.mapping.cp_size - 1
-                        req.py_decoding_iter = 1
-                req.py_draft_tokens = [1] * max_num_draft_tokens
-                if prepare_resource:
-                    for _ in range(_kv_draft):
-                        self.impl.add_token(req.request_id)
-                    if draft_kv_cache_manager is not None:
+            # Set is_gen state after add_sequence_batch to avoid modifying
+            # prompt_len before the C++ side reads it.
+            if is_gen:
+                for i, req in enumerate(requests):
+                    token_num = token_nums[
+                        i] if token_nums is not None else 1 + max_num_draft_tokens
+                    if self.mapping.has_cp_helix():
+                        token_num = max(token_num, 2)
+                    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                    req.prompt_len = token_num - 1
+                    req.py_prompt_len = req.prompt_len
+                    if self.mapping.has_cp_helix():
+                        if self.mapping.cp_size - 1 == self.mapping.cp_rank:
+                            req.py_helix_is_inactive_rank = False
+                            req.prompt_len = token_num - 1
+                            req.py_prompt_len = req.prompt_len
+                            req.seqlen_this_rank_cp = req.prompt_len
+                            req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                            req.py_decoding_iter = 1
+                        else:
+                            req.py_helix_is_inactive_rank = True
+                            req.prompt_len = token_num
+                            req.py_prompt_len = req.prompt_len
+                            req.seqlen_this_rank_cp = req.prompt_len
+                            req.total_input_len_cp = token_num * self.mapping.cp_size - 1
+                            req.py_decoding_iter = 1
+                    req.py_draft_tokens = [1] * max_num_draft_tokens
+                    if prepare_resource:
                         for _ in range(_kv_draft):
-                            draft_kv_cache_manager.impl.add_token(
-                                req.request_id)
+                            self.impl.add_token(req.request_id)
+                        if draft_kv_cache_manager is not None:
+                            for _ in range(_kv_draft):
+                                draft_kv_cache_manager.impl.add_token(
+                                    req.request_id)
+        except Exception:
+            # A partial allocation failure (e.g. add_token raising "no free
+            # blocks left" after add_sequence_batch succeeded) must not leak
+            # the sequences already registered. On the minimal KV pool built
+            # for cache-size estimation, such a leak leaves too few blocks
+            # for the estimation requests themselves, so the executor loop
+            # spins forever without ever scheduling them and LLM startup
+            # hangs (TRTLLM-14903). Best-effort removal, then re-raise so
+            # callers keep their existing skip-on-failure semantics.
+            for freeing_impl, freeing_requests in (
+                (self.impl, batch_llm_requests),
+                (draft_kv_cache_manager.impl if draft_kv_cache_manager
+                 is not None else None, draft_batch_llm_requests),
+            ):
+                if freeing_impl is None:
+                    continue
+                for req in freeing_requests:
+                    try:
+                        freeing_impl.remove_sequence(req.py_request_id, req,
+                                                     False)
+                    except Exception:
+                        # The sequence may never have been registered (the
+                        # batched add itself failed); nothing to clean up.
+                        pass
+            raise
 
         return requests
 
