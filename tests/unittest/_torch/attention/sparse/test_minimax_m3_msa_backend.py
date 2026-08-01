@@ -547,9 +547,11 @@ def _resolution_metadata(
         implementation="msa"
     ).to_sparse_metadata_params()
     metadata.mapping = None
+    # Assigned behind the seq_lens property, whose setter would stage a device
+    # copy the resolver never reads; num_seqs derives from it. The num_contexts
+    # setter then runs on_update() over both, as it does in a real step.
+    metadata._seq_lens = torch.tensor(qo_lens, dtype=torch.int32)
     metadata.num_contexts = num_contexts
-    metadata.num_seqs = len(qo_lens)
-    metadata.seq_lens = torch.tensor(qo_lens, dtype=torch.int32)
     metadata.kv_lens = torch.tensor(kv_lens, dtype=torch.int32)
     metadata.kv_cache_params = None
     metadata.is_cuda_graph = is_cuda_graph
@@ -583,30 +585,109 @@ def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
     assert metadata._msa_runs_no_fmha() is True
     assert metadata.msa_decode_query_len == 1
     assert metadata.msa_max_kv_len == 11
+    # The whole batch is the span, so nothing is left for fmha_sm100.
+    span = metadata.msa_decode_span
+    assert (span.row_first, span.row_last) == (0, 2)
+    assert (span.token_first, span.token_last) == (0, 2)
+    assert span.is_mixed is False
 
 
-@pytest.mark.parametrize(
-    ("num_contexts", "qo_lens"),
-    [
-        # A context request in the batch: not a decode step at all.
-        (1, (5, 1)),
-        # Ragged decode: the ported kernels' token -> request mapping breaks.
-        (0, (1, 3)),
-    ],
-)
-def test_resolve_decode_kernels_declines_non_uniform_steps(monkeypatch, num_contexts, qo_lens):
+def test_resolve_decode_kernels_commits_the_generation_span_of_a_mixed_step(monkeypatch):
+    """A context request no longer disqualifies the whole step.
+
+    The generation requests are the batch's row and token suffix, so the ported
+    main-attention kernels take that span and fmha_sm100 keeps the context
+    prefix. The indexer scorer stays on the proxy for the whole batch, which is
+    Phase 1's deliberate limit.
+    """
     for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
         monkeypatch.delenv(var, raising=False)
-    metadata = _resolution_metadata(num_contexts=num_contexts, qo_lens=qo_lens)
+    # Two context requests (7 and 5 query tokens, the first a chunk of a long
+    # prompt) ahead of two decode rows.
+    metadata = _resolution_metadata(num_contexts=2, qo_lens=(7, 5, 1, 1), kv_lens=(4096, 5, 40, 33))
     monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
 
     metadata._resolve_decode_kernels()
 
+    span = metadata.msa_decode_span
+    assert (span.row_first, span.row_last) == (2, 4)
+    assert (span.token_first, span.token_last) == (12, 14)
+    assert span.query_len == 1
+    assert span.is_mixed is True
+    assert metadata._msa_use_triton_sparse is True
+    assert metadata._msa_use_trtllm_gen_dense is True
+    # max_score carries the query tokens in its last dimension, so the context
+    # and generation ranges are not separable sub-blocks the proxy and the
+    # scorer could each write half of. The proxy keeps the whole batch.
+    assert metadata._msa_use_cutedsl_indexer is False
+    # fmha_sm100 still runs the context prefix, so its page table stays live.
+    assert metadata._msa_runs_no_fmha() is False
+    # The trtllm-gen scheduling bound must come from the span's own rows: the
+    # 4096-token context row here would inflate a whole-batch maximum by 100x.
+    assert metadata.msa_max_kv_len == 40
+
+
+@pytest.mark.parametrize(
+    ("num_contexts", "qo_lens", "kv_lens"),
+    [
+        # Ragged decode: the ported kernels' token -> request mapping breaks.
+        (0, (1, 3), (9, 11)),
+        # Ragged generation rows behind a context request. The context request
+        # is fine, but these rows still have no single query length.
+        (1, (5, 1, 2), (5, 9, 11)),
+        # Pure prefill: no generation row for a ported kernel to own.
+        (2, (5, 7), (5, 7)),
+    ],
+    ids=["ragged-decode", "ragged-mixed", "pure-prefill"],
+)
+def test_resolve_decode_kernels_declines_without_a_uniform_span(
+    monkeypatch, num_contexts, qo_lens, kv_lens
+):
+    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
+        monkeypatch.delenv(var, raising=False)
+    metadata = _resolution_metadata(num_contexts=num_contexts, qo_lens=qo_lens, kv_lens=kv_lens)
+    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
+
+    metadata._resolve_decode_kernels()
+
+    assert metadata.msa_decode_span is None
+    assert metadata.msa_decode_query_len is None
     assert metadata._msa_use_cutedsl_indexer is False
     assert metadata._msa_use_triton_sparse is False
     assert metadata._msa_use_trtllm_gen_dense is False
     # Every fmha_sm100 plan is still built, so the page table is still needed.
     assert metadata._msa_runs_no_fmha() is False
+
+
+def test_fmha_plan_rows_narrow_to_the_context_prefix(monkeypatch):
+    """Each site's plan must cover exactly the rows fmha_sm100 still runs.
+
+    on_update_kv_lens patches a plan's length mirrors against the requests it
+    was built from, so a plan that claimed the whole batch while only the
+    context prefix ran would write the wrong lengths into the kernel.
+    """
+    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        MiniMaxM3MsaSparseAttention.Metadata,
+        "_cutedsl_indexer_supported",
+        lambda self, **kw: True,
+    )
+
+    mixed = _resolution_metadata(num_contexts=2, qo_lens=(7, 5, 1, 1), kv_lens=(4096, 5, 40, 33))
+    mixed._msa_live_batch = 4
+    mixed._resolve_decode_kernels()
+    # A site fmha_sm100 still owns entirely is planned over the whole batch.
+    assert mixed._msa_fmha_plan_rows(False) == (0, 4)
+    # A site whose ported kernel took the span is planned over the prefix.
+    assert mixed._msa_fmha_plan_rows(True) == (0, 2)
+
+    decode = _resolution_metadata()
+    decode._msa_live_batch = 2
+    decode._resolve_decode_kernels()
+    assert decode._msa_fmha_plan_rows(False) == (0, 2)
+    # Nothing is left to plan on a pure-decode step the kernel fully owns.
+    assert decode._msa_fmha_plan_rows(True) is None
 
 
 def test_resolve_decode_kernels_honors_the_msa_kill_switch(monkeypatch):
@@ -712,7 +793,9 @@ def test_paged_gqa_raises_when_a_committed_dense_step_declines():
             )
         ),
         _msa_use_trtllm_gen_dense=True,
-        _msa_decode_query_len=1,
+        # A resolved pure-decode span, so the decline is the only thing that
+        # can send this call to fmha_sm100.
+        msa_decode_query_len=1,
     )
 
     with pytest.raises(RuntimeError, match=r"skipped the fmha_sm100 dense plan"):
@@ -902,3 +985,158 @@ def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
 
     torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
     torch.testing.assert_close(idx_pool, ref_idx_pool)
+
+
+def _mixed_batch_sparse_gqa_case(*, page_size, head_dim, num_kv_heads, group, topk, seed):
+    """A one-context-plus-three-decode batch for run_msa_paged_gqa.
+
+    Returns the attention stub, the metadata fields both runs share, q, the
+    per-query top-k table, and the batch's context token count. Pages are
+    shuffled so a kernel that ignored the block table and indexed the cache by
+    logical block would not pass.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        build_kv_page_indices,
+        per_token_valid_blocks,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    num_heads = num_kv_heads * group
+    # Row 0 prefills a fresh 260-token prompt; rows 1-3 decode one token each.
+    qo_lens_cpu = torch.tensor([260, 1, 1, 1], dtype=torch.int32)
+    kv_lens_cpu = torch.tensor([260, 300, 1500, 129], dtype=torch.int32)
+    qo_offset_cpu = kv_lens_cpu - qo_lens_cpu
+    batch = int(qo_lens_cpu.shape[0])
+    total_q = int(qo_lens_cpu.sum())
+    max_blocks = int((kv_lens_cpu.max().item() + page_size - 1) // page_size)
+    num_pages = batch * max_blocks
+
+    block_table = (
+        torch.randperm(num_pages, device="cuda", generator=generator)
+        .to(torch.int32)
+        .reshape(batch, max_blocks)
+    )
+    pool = torch.randn(
+        num_pages,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        device="cuda",
+        generator=generator,
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+
+    q = torch.randn(
+        total_q, num_heads * head_dim, device="cuda", generator=generator, dtype=torch.float32
+    ).to(torch.bfloat16)
+
+    # Select each token's earliest valid blocks, ascending with a -1 tail, as
+    # the indexer emits them. Deterministic, and valid for the context rows,
+    # whose causal extent grows token by token.
+    n_valid = per_token_valid_blocks(
+        qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
+    )
+    table = torch.full((total_q, num_kv_heads, topk), -1, dtype=torch.int32)
+    for token, valid in enumerate(n_valid.tolist()):
+        real = min(topk, max(int(valid), 0))
+        table[token, :, :real] = torch.arange(real, dtype=torch.int32)
+    # Head-major backing, so the .permute(1, 0, 2) in run_msa_paged_gqa is the
+    # zero-copy view it is in production.
+    head_major = table.permute(1, 0, 2).contiguous().cuda()
+
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 0
+    attention.head_dim = head_dim
+    attention.num_heads = num_heads
+    attention.q_scaling = 1.0
+
+    fields = dict(
+        kv_cache_manager=SimpleNamespace(
+            tokens_per_block=page_size,
+            get_buffers=lambda layer_idx, kv_layout=None: pool,
+        ),
+        msa_block_table=block_table,
+        msa_seq_lens_cuda=kv_lens_cpu.cuda(),
+        msa_kv_indices=build_kv_page_indices(block_table.cpu(), kv_lens_cpu, page_size).cuda(),
+        msa_qo_lens_cpu=qo_lens_cpu,
+        msa_kv_lens_cpu=kv_lens_cpu,
+        msa_qo_offset_cpu=qo_offset_cpu,
+        msa_max_kv_len=int(kv_lens_cpu[1:].max()),
+        max_num_requests=batch,
+    )
+    return attention, fields, q, head_major.permute(1, 0, 2), int(qo_lens_cpu[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mixed_batch_generation_span_matches_the_whole_batch_msa_path():
+    """Splitting a mixed batch by phase must not change any row's answer.
+
+    The generation rows move off fmha_sm100 and onto the Triton sparse decode
+    kernel while the context rows stay behind under a context-only plan, so the
+    correctness gate is that both halves still agree with the whole-batch
+    fmha_sm100 run that TLLM_M3_SPARSE_DECODE=msa forces. This is the only test
+    that covers which kernel produced which output rows.
+    """
+    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        MSA_REQUIRED_TOPK,
+        msa_package_available,
+    )
+    from tensorrt_llm._utils import get_sm_version
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA submodule) required")
+    if get_sm_version() not in (100, 103):
+        pytest.skip("fmha_sm100 requires SM100/SM103")
+
+    page_size, head_dim = 128, 128
+    attention, fields, q, kv_block_indexes, num_ctx_tokens = _mixed_batch_sparse_gqa_case(
+        page_size=page_size,
+        head_dim=head_dim,
+        num_kv_heads=1,
+        group=8,
+        topk=MSA_REQUIRED_TOPK,
+        seed=61,
+    )
+    total_q = int(q.shape[0])
+
+    def run(**resolution):
+        output = torch.zeros_like(q)
+        run_msa_paged_gqa(
+            attention,
+            q,
+            None,
+            None,
+            SimpleNamespace(**fields, **resolution),
+            output,
+            kv_block_indexes=kv_block_indexes,
+            plan=None,
+        )
+        torch.cuda.synchronize()
+        return output.view(total_q, attention.num_heads, head_dim).float()
+
+    reference = run(_msa_use_triton_sparse=False, msa_decode_span=None)
+    split = run(
+        _msa_use_triton_sparse=True,
+        msa_decode_span=_MsaDecodeSpan(
+            row_first=1,
+            row_last=4,
+            token_first=num_ctx_tokens,
+            token_last=total_q,
+            query_len=1,
+        ),
+    )
+
+    assert torch.isfinite(split).all()
+    # The context prefix runs on fmha_sm100 either way, but under a 1-row plan
+    # rather than a 4-row one, so its work partitioning differs.
+    torch.testing.assert_close(
+        split[:num_ctx_tokens], reference[:num_ctx_tokens], rtol=1e-2, atol=1e-2
+    )
+    # The generation rows change kernel outright, so they carry the wider
+    # tolerance the Triton-vs-fmha_sm100 A/B uses elsewhere.
+    torch.testing.assert_close(
+        split[num_ctx_tokens:], reference[num_ctx_tokens:], rtol=6e-2, atol=6e-2
+    )

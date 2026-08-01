@@ -124,8 +124,18 @@ def run_msa_paged_gqa(
     with the sparse plan) and the dense layers (kv_block_indexes None, with the
     dense plan, attending the full page table). fmha_sm100 reads the paged cache
     directly, so the new-token K/V must be resident before the run.
+
+    This is also where a step splits by request phase. TensorRT-LLM orders a
+    batch context-first, so the generation requests are its token suffix: a
+    ported decode kernel takes that suffix and fmha_sm100 keeps the context
+    prefix, running under the plan prepare() built over those rows alone (see
+    _msa_fmha_plan_rows). The prefix is empty on a pure-decode step, so one code
+    path covers both. The split lives here rather than in a PhasedFmha subclass
+    because MiniMaxM3MsaSparseAttention.forward_prepopulated_kv also calls this
+    helper directly, bypassing TrtllmAttention.forward.
     """
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_decode_span_bounds,
         msa_paged_kv,
         msa_triton_sparse_decode_active,
         msa_trtllm_gen_dense_decode_active,
@@ -157,34 +167,43 @@ def run_msa_paged_gqa(
     k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
     sm_scale = (head_dim**-0.5) / float(attn.q_scaling)
 
+    # Query tokens and batch rows the ported kernels own; (num_tokens, batch)
+    # of them on a pure-decode step, the trailing generation slice on a mixed
+    # one. gen_tok0 is 0 whenever nothing is ported.
+    gen_tok0, gen_row0, gen_row1, decode_query_len = msa_decode_span_bounds(metadata, num_tokens)
+    # Leading query tokens fmha_sm100 must still run: the whole batch until a
+    # ported kernel takes the generation slice, then the context prefix alone.
+    fmha_tokens = num_tokens
+
     if kv_block_indexes is not None and msa_triton_sparse_decode_active(metadata):
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
             minimax_m3_sparse_attn_decode,
         )
 
-        decode_query_len = int(metadata.msa_decode_query_len)
-        batch = num_tokens // decode_query_len
         # The Triton kernel dequantizes the FP8 cache into q's dtype, so q stays
         # wide here. An already-E4M3 q from the fused producer widens exactly,
         # leaving the same values the fmha_sm100 path would have used.
-        if q_view.dtype != out_view.dtype:
-            q_view = q_view.to(out_view.dtype)
+        gen_q = q_view[gen_tok0:]
+        if gen_q.dtype != out_view.dtype:
+            gen_q = gen_q.to(out_view.dtype)
         minimax_m3_sparse_attn_decode(
-            q_view,
+            gen_q,
             k_paged,
             v_paged,
             # [total_q, num_kv_heads, topk] -> head-major, contiguous when the
-            # indexer emitted a head-major table (see msa_triton_sparse_decode_active).
-            kv_block_indexes.permute(1, 0, 2),
-            metadata.msa_block_table[:batch],
-            metadata.msa_seq_lens_cuda[:batch],
+            # indexer emitted a head-major table and the slice is the whole
+            # batch (see msa_triton_sparse_decode_active). The kernel takes
+            # every stride, so a mixed step's strided suffix is fine.
+            kv_block_indexes[gen_tok0:].permute(1, 0, 2),
+            metadata.msa_block_table[gen_row0:gen_row1],
+            metadata.msa_seq_lens_cuda[gen_row0:gen_row1],
             sm_scale=sm_scale,
-            output=out_view,
+            output=out_view[gen_tok0:],
             decode_query_len=decode_query_len,
         )
-        return
+        fmha_tokens = gen_tok0
 
-    if kv_block_indexes is None and msa_trtllm_gen_dense_decode_active(metadata):
+    elif kv_block_indexes is None and msa_trtllm_gen_dense_decode_active(metadata):
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
             dense_decode_sm_scale,
             dense_decode_supported,
@@ -200,63 +219,87 @@ def run_msa_paged_gqa(
                 "TLLM_M3_DENSE_DECODE=msa to keep the plan."
             )
         if unsupported is None:
-            decode_query_len = int(metadata.msa_decode_query_len)
-            batch = num_tokens // decode_query_len
             minimax_m3_trtllm_gen_dense_decode(
-                q_view,
+                q_view[gen_tok0:],
                 kv_cache_manager,
                 layer_idx,
-                metadata.msa_block_table[:batch],
-                metadata.msa_seq_lens_cuda[:batch],
+                metadata.msa_block_table[gen_row0:gen_row1],
+                metadata.msa_seq_lens_cuda[gen_row0:gen_row1],
                 sm_scale=dense_decode_sm_scale(head_dim, float(attn.q_scaling)),
-                output=out_view,
+                output=out_view[gen_tok0:],
                 decode_query_len=decode_query_len,
+                # Bounded by the span's own rows, so a long context request
+                # cannot inflate the kernel's scheduling hint.
                 max_seq_len=int(metadata.msa_max_kv_len),
                 max_num_requests=int(metadata.max_num_requests),
             )
-            return
+            fmha_tokens = gen_tok0
 
-    # Reaching fmha_sm100 for a layer prepare() promised to a ported kernel
-    # means the branch above declined after prepare had already skipped that
-    # layer's plan and, on a fully ported step, the flattened page table the
-    # call below reads. Fail loudly: running on with a stale msa_kv_indices
-    # would silently attend the wrong pages. The flag is absent on metadata
-    # built without prepare(), where nothing was skipped.
-    committed = (
-        "_msa_use_triton_sparse" if kv_block_indexes is not None else "_msa_use_trtllm_gen_dense"
-    )
-    if getattr(metadata, committed, None):
-        raise RuntimeError(
-            "MiniMax-M3 paged GQA reached fmha_sm100 with no plan for a "
-            f"{'sparse' if kv_block_indexes is not None else 'dense'} layer. "
-            "prepare() resolved this step to the ported decode kernels; see "
-            "_resolve_decode_kernels. Set TLLM_M3_SPARSE_DECODE=msa and "
-            "TLLM_M3_DENSE_DECODE=msa to keep the fmha_sm100 plans."
+    if fmha_tokens == 0:
+        return
+
+    if fmha_tokens == num_tokens:
+        # Reaching fmha_sm100 for the whole batch when prepare() promised a
+        # layer to a ported kernel means the branch above declined after
+        # prepare had already skipped that layer's plan and, on a fully ported
+        # step, the flattened page table the call below reads. Fail loudly:
+        # running on with a stale msa_kv_indices would silently attend the
+        # wrong pages. The flag is absent on metadata built without prepare(),
+        # where nothing was skipped.
+        committed = (
+            "_msa_use_triton_sparse"
+            if kv_block_indexes is not None
+            else "_msa_use_trtllm_gen_dense"
         )
+        if getattr(metadata, committed, None):
+            raise RuntimeError(
+                "MiniMax-M3 paged GQA reached fmha_sm100 with no plan for a "
+                f"{'sparse' if kv_block_indexes is not None else 'dense'} layer. "
+                "prepare() resolved this step to the ported decode kernels; see "
+                "_resolve_decode_kernels. Set TLLM_M3_SPARSE_DECODE=msa and "
+                "TLLM_M3_DENSE_DECODE=msa to keep the fmha_sm100 plans."
+            )
+        fmha_rows = None
+    else:
+        # The context prefix, matching the rows `plan` was built over. The
+        # flattened page table needs no slice: context pages are its prefix and
+        # the plan implies how many of them to read.
+        fmha_rows = gen_row0
 
     # The fmha_sm100 variant is chosen from q.dtype and shares one dtype across
     # q/k/v, so q must be FP8 to match an FP8 paged K/V. MiniMax-M3 has no
     # KV-cache scales, so the scale is 1.0 and this is a plain E4M3 cast. When the
     # model's fused QK-norm+RoPE already emitted FP8 q/k/v (the FP8-KV fast path),
     # this .to() is a no-op; it stays as a safety net for callers that pass bf16 q.
+    fmha_q = q_view[:fmha_tokens]
     use_fp8 = k_paged.dtype == torch.float8_e4m3fn
-    if use_fp8 and q_view.dtype != torch.float8_e4m3fn:
-        q_view = q_view.to(torch.float8_e4m3fn)
+    if use_fp8 and fmha_q.dtype != torch.float8_e4m3fn:
+        fmha_q = fmha_q.to(torch.float8_e4m3fn)
+
+    def rows_of(lens: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Narrow a per-request host length tensor to the rows fmha_sm100 runs.
+
+        Slicing a pinned tensor keeps the pinned backing, so the inline planner
+        still stages these with non-blocking copies.
+        """
+        if lens is None or fmha_rows is None:
+            return lens
+        return lens[:fmha_rows]
 
     run_msa_sparse_gqa(
-        q_view,
+        fmha_q,
         k_paged,
         v_paged,
-        kv_block_indexes,
+        None if kv_block_indexes is None else kv_block_indexes[:fmha_tokens],
         kv_indices=metadata.msa_kv_indices,
         sm_scale=sm_scale,
-        qo_lens_cpu=metadata.msa_qo_lens_cpu,
-        kv_lens_cpu=metadata.msa_kv_lens_cpu,
-        qo_offset_cpu=metadata.msa_qo_offset_cpu,
+        qo_lens_cpu=rows_of(metadata.msa_qo_lens_cpu),
+        kv_lens_cpu=rows_of(metadata.msa_kv_lens_cpu),
+        qo_offset_cpu=rows_of(metadata.msa_qo_offset_cpu),
         causal=True,
         head_dim=head_dim,
         plan=plan,
-        out=out_view,
+        out=out_view[:fmha_tokens],
         use_fp8=use_fp8,
     )
 
@@ -269,11 +312,13 @@ class MsaSparseGqaFmha(Fmha):
     and attend those blocks; dense layers leave the indices None and attend the
     full page table.
 
-        Inherits Fmha rather than PhasedFmha: fmha_sm100 takes a single plan and
-        the selected block indices span the whole batch, so it handles a mixed
-        context and generation batch in one call and there is no
-        context/generation split from PhasedFmha to reuse. Requires head_dim 128
-        and 4-D HND paged K/V.
+        Inherits Fmha rather than PhasedFmha even though a mixed batch is split
+        by phase, because that split has to happen in run_msa_paged_gqa rather
+        than in forward: MiniMaxM3MsaSparseAttention.forward_prepopulated_kv
+        calls that helper directly, so a split placed in PhasedFmha.forward
+        would miss it. PhasedFmha also cannot reach the third ported kernel, the
+        indexer scorer, which runs before forward from run_indexer. Requires
+        head_dim 128 and 4-D HND paged K/V.
     """
 
     @classmethod

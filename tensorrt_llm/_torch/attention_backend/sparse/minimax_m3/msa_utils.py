@@ -28,8 +28,8 @@ _MSA_PYTHON_RELPATH = Path("3rdparty") / "MSA" / "python"
 
 # Per-kernel implementation switches for the M3 decode path. The first entry of
 # each tuple is the default: the dedicated decode kernel, which the gating below
-# then narrows to uniform pure-decode steps, leaving every mixed or prefill step
-# on fmha_sm100. Setting a variable to "msa" is the kill switch. These are env
+# then narrows to the generation rows of a step whose query lengths are uniform
+# across them. Setting a variable to "msa" is the kill switch. These are env
 # vars rather than MiniMaxM3SparseAttentionConfig fields because the config is
 # user-facing Pydantic: adding fields there would need a golden-manifest
 # regeneration plus telemetry CODEOWNER review, which is disproportionate for a
@@ -60,17 +60,41 @@ def msa_kernel_choice(env_var: str) -> str:
 
 
 def _uniform_decode_step(metadata) -> bool:
-    """Whether the step is pure decode with one query length and a block table.
+    """Whether a generation span was resolved, with a block table to address it.
 
     The ported kernels derive the request id as ``token // decode_query_len``,
-    so a ragged step (mixed draft lengths, or any batch holding a context
-    request) keeps using the fmha_sm100 plans.
+    so a step whose generation rows are ragged (mixed speculative draft lengths)
+    resolves no span and keeps using the fmha_sm100 plans. A context request in
+    the batch does not disqualify the step: the span covers the generation rows
+    alone and fmha_sm100 keeps the context prefix.
     """
     return (
         getattr(metadata, "msa_decode_query_len", None) is not None
         and getattr(metadata, "msa_block_table", None) is not None
         and getattr(metadata, "msa_seq_lens_cuda", None) is not None
     )
+
+
+def msa_decode_span_bounds(metadata, num_tokens: int) -> Tuple[int, int, int, int]:
+    """Bounds of the generation span, as (token_first, row_first, row_last, query_len).
+
+    The span is what the ported decode kernels own this step; see
+    _MsaDecodeSpan in msa_backend. Reading it through getattr keeps this module
+    free of an import back into the backend, and covers the standalone kernel
+    tests, whose metadata never ran prepare() and so carries no span: there the
+    whole batch is the span, derived from the query length alone.
+
+    Returns zeros when no query length is resolved either, in which case every
+    caller is on the fmha_sm100 path and ignores these bounds.
+    """
+    span = getattr(metadata, "msa_decode_span", None)
+    if span is not None:
+        return span.token_first, span.row_first, span.row_last, span.query_len
+    query_len = getattr(metadata, "msa_decode_query_len", None)
+    if query_len is None:
+        return 0, 0, 0, 0
+    query_len = int(query_len)
+    return 0, 0, num_tokens // query_len, query_len
 
 
 def _resolved_kernel_flag(metadata, attr: str, recompute) -> bool:
@@ -106,6 +130,9 @@ def msa_cutedsl_indexer_active(metadata) -> bool:
 def msa_triton_sparse_decode_active(metadata) -> bool:
     """Whether this step's sparse layers should run the Triton decode kernel.
 
+    True means the kernel owns the generation span, which is the whole batch on
+    a pure-decode step and its token suffix on a mixed one.
+
     Both the indexer (which orients its top-k table) and the attention call
     consult this, so they can never disagree about the layout within a step.
     """
@@ -118,7 +145,14 @@ def msa_triton_sparse_decode_active(metadata) -> bool:
 
 
 def msa_trtllm_gen_dense_decode_active(metadata) -> bool:
-    """Whether this step's dense layers should run trtllm-gen decode."""
+    """Whether this step's dense layers should run trtllm-gen decode.
+
+    As with the sparse kernel, this covers the generation span rather than the
+    whole batch. It matters most on a mixed step: fmha_sm100 declines to split a
+    dense plan in TensorRT-LLM's prefill-first order (see _mixed_batch_split in
+    fmha_sm100/api.py), so without this every generation row would otherwise
+    ride the context schedule alongside the prefill rows.
+    """
     return _resolved_kernel_flag(
         metadata,
         "_msa_use_trtllm_gen_dense",
@@ -351,6 +385,7 @@ __all__ = [
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
     "msa_cutedsl_indexer_active",
+    "msa_decode_span_bounds",
     "msa_kernel_choice",
     "msa_package_available",
     "msa_paged_kv",
