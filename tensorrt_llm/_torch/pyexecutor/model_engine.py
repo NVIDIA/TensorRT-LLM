@@ -95,6 +95,54 @@ from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 
 
+def _make_single_token_context_graph_batch(
+    scheduled_requests: ScheduledRequests,
+    is_multimodal_decode_compatible: Optional[Callable[[LlmRequest],
+                                                       bool]] = None,
+) -> tuple[ScheduledRequests, frozenset[int]]:
+    """Build a decode-shaped graph candidate for final one-token contexts.
+
+    Multimodal rows remain fail-closed unless the engine proves that their one
+    remaining prompt token is representable by the existing decode provider.
+    """
+    if scheduled_requests.num_context_requests == 0:
+        return scheduled_requests, frozenset()
+
+    context_requests = scheduled_requests.context_requests_last_chunk
+    if (scheduled_requests.encoder_requests
+            or scheduled_requests.context_requests_chunking):
+        return scheduled_requests, frozenset()
+
+    for request in context_requests:
+        if (request.context_chunk_size != 1
+                or request.context_remaining_length != 1
+                or request.context_current_position + 1 != request.py_prompt_len
+                or request.py_beam_width != 1
+                or get_draft_token_length(request) > 0
+                or request.py_is_first_draft or request.is_context_only_request
+                or request.is_generation_only_request()
+                or request.py_disaggregated_params is not None
+                or request.py_mm_encoder_event is not None
+                or (request.py_multimodal_data is not None and
+                    (is_multimodal_decode_compatible is None
+                     or not is_multimodal_decode_compatible(request)))):
+            return scheduled_requests, frozenset()
+
+    for request in scheduled_requests.generation_requests:
+        if (request.py_beam_width != 1 or get_draft_token_length(request) > 0
+                or request.py_is_first_draft
+                or request.py_disaggregated_params is not None):
+            return scheduled_requests, frozenset()
+
+    graph_batch = ScheduledRequests()
+    graph_batch.generation_requests = list(context_requests) + list(
+        scheduled_requests.generation_requests)
+    graph_batch.paused_requests = list(scheduled_requests.paused_requests)
+    promoted_context_request_ids = frozenset(request.py_request_id
+                                             for request in context_requests)
+    return graph_batch, promoted_context_request_ids
+
+
 class ModelEngine(ABC):
 
     @abstractmethod
@@ -3371,6 +3419,29 @@ class PyTorchModelEngine(ModelEngine):
             input_ids, vocab_size=vocab_size, mm_token_ids=mm_token_ids)
         return text_token_indices, mm_token_indices
 
+    def _is_final_multimodal_context_decode_compatible(
+            self, request: LlmRequest) -> bool:
+        """Return whether the final prompt token uses the decode input path.
+
+        KV reuse has already materialized every preceding prompt token. A
+        multimodal final-context row therefore needs its prepared embedding
+        only when the one remaining token is itself an MM placeholder. Text
+        tokens can use the existing decode provider; MRoPE deltas are seeded
+        into the per-sequence cache before graph lookup. An MRoPE request with
+        real MM payload remains eager until its delta is available.
+        """
+        final_prompt_token = request.get_tokens(0)[
+            request.context_current_position]
+        _, mm_token_indices = self._prepare_multimodal_indices(
+            [final_prompt_token])
+        if mm_token_indices.numel() != 0:
+            return False
+
+        multimodal_data = request.py_multimodal_data
+        if not self.use_mrope or not _has_mm_payload_keys(multimodal_data):
+            return True
+        return CUDAGraphRunner._get_mrope_position_delta(request) is not None
+
     def _is_encoder_decoder_model(self) -> bool:
         return bool(
             getattr(getattr(self.model, "model_config", None),
@@ -4437,17 +4508,19 @@ class PyTorchModelEngine(ModelEngine):
         return inputs, None
 
     def _prepare_tp_inputs(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None,
-            req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-            resource_manager: Optional[ResourceManager] = None,
-            maybe_graph: bool = False):
+        self,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+        attn_metadata: AttentionMetadata,
+        spec_metadata: Optional[SpecMetadata] = None,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        cache_indirection_buffer: Optional[torch.Tensor] = None,
+        num_accepted_tokens_device: Optional[torch.Tensor] = None,
+        req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
+        resource_manager: Optional[ResourceManager] = None,
+        maybe_graph: bool = False,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
         """
         Prepare inputs for Pytorch Model.
         """
@@ -4469,9 +4542,10 @@ class PyTorchModelEngine(ModelEngine):
                 new_tokens=new_tokens_device,
                 runtime_draft_len=self.runtime_draft_len)
 
-        if self._can_use_incremental_update(scheduled_requests,
-                                            new_tokens_device,
-                                            next_draft_tokens_device):
+        if (not promoted_context_request_ids
+                and self._can_use_incremental_update(scheduled_requests,
+                                                     new_tokens_device,
+                                                     next_draft_tokens_device)):
             # Spec engines never record the steady-gen cache, but invalidate
             # defensively so the two fast paths can never interleave if the
             # gates ever evolve.
@@ -4483,7 +4557,8 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_tokens_device, req_id_to_old_request,
                 resource_manager)
 
-        if (type(attn_metadata) is TrtllmAttentionMetadata
+        if (not promoted_context_request_ids
+                and type(attn_metadata) is TrtllmAttentionMetadata
                 and self._can_use_encoder_decoder_input_fast_path(
                     scheduled_requests, new_tokens_device,
                     next_draft_tokens_device)):
@@ -4492,10 +4567,10 @@ class PyTorchModelEngine(ModelEngine):
                 new_tokens_device, resource_manager)
 
         self._encoder_decoder_staged_request_ids = None
-        if self._can_use_steady_gen_fast_prepare(scheduled_requests,
-                                                 new_tokens_device,
-                                                 next_draft_tokens_device,
-                                                 spec_metadata):
+        if (not promoted_context_request_ids
+                and self._can_use_steady_gen_fast_prepare(
+                    scheduled_requests, new_tokens_device,
+                    next_draft_tokens_device, spec_metadata)):
             return self._apply_steady_gen_fast_prepare(kv_cache_manager,
                                                        attn_metadata,
                                                        new_tensors_device,
@@ -4764,9 +4839,23 @@ class PyTorchModelEngine(ModelEngine):
         # a separate iteration over scheduled_requests.generation_requests later.
         all_gen_request_ids = []
         for request in scheduled_requests.generation_requests:
-            all_gen_request_ids.append(request.py_request_id)
-            if get_draft_token_length(
-                    request) > 0 or next_draft_tokens_device is not None:
+            is_promoted_context = (request.py_request_id
+                                   in promoted_context_request_ids)
+            if not is_promoted_context:
+                all_gen_request_ids.append(request.py_request_id)
+            # In speculative iterations, keep promoted rows ahead of existing
+            # generation rows in the extend-request packing order. Although
+            # their q_len is one, this category provides the "no previous
+            # speculative tensor" branch needed to source their prompt token
+            # without disturbing the overlap offsets of ordinary generation
+            # siblings. Non-speculative promoted rows retain the established
+            # ordinary generation path below.
+            if is_promoted_context and self.enable_spec_decode:
+                extend_requests.append(request)
+            elif is_promoted_context:
+                generation_requests.append(request)
+            elif (get_draft_token_length(request) > 0
+                  or next_draft_tokens_device is not None):
                 if request.is_dummy:
                     extend_dummy_requests.append(request)
                 else:
@@ -4794,6 +4883,8 @@ class PyTorchModelEngine(ModelEngine):
             self.runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
+            is_promoted_context = (request.py_request_id
+                                   in promoted_context_request_ids)
             if getattr(request, "py_needs_onehot_draft_probs", False):
                 if request.py_seq_slot is not None:
                     padding_gen_slots.append(request.py_seq_slot)
@@ -4806,17 +4897,25 @@ class PyTorchModelEngine(ModelEngine):
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
             # (3) the first step in the generation server of disaggregated serving
-            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+            if (is_promoted_context or next_draft_tokens_device is None
+                    or request.is_dummy or request.py_batch_idx is None):
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
                 if not (request.is_attention_dp_dummy
                         or request.is_cuda_graph_dummy):
-                    input_ids.append(request.get_last_tokens(0))
+                    if is_promoted_context:
+                        input_ids.append(
+                            request.get_tokens(0)[
+                                request.context_current_position])
+                    else:
+                        input_ids.append(request.get_last_tokens(0))
                     input_ids.extend(request.py_draft_tokens)
                     draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
                 num_draft_tokens = get_draft_token_length(request)
-                past_seen_token_num = request.max_beam_num_tokens - 1
+                past_seen_token_num = (request.context_current_position
+                                       if is_promoted_context else
+                                       request.max_beam_num_tokens - 1)
                 draft_lens.append(num_draft_tokens)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
@@ -4960,11 +5059,17 @@ class PyTorchModelEngine(ModelEngine):
 
             for request in generation_requests:
                 request_ids.append(request.py_request_id)
-                # the request has no previous tensor:
+                is_promoted_context = (request.py_request_id
+                                       in promoted_context_request_ids)
+                if is_promoted_context:
+                    input_ids.append(
+                        request.get_tokens(0)[request.context_current_position])
+                    past_seen_token_num = request.context_current_position
+                # The request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
-                # (3) the first step in the generation server of disaggregated serving
-                if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                # (3) the first step in the generation server of disaggregated serving.
+                elif new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                     # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                     # can be aligned to the correct positions.
                     if not request.is_cuda_graph_dummy:
@@ -6244,17 +6349,19 @@ class PyTorchModelEngine(ModelEngine):
 
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
-            attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            cache_indirection_buffer: Optional[torch.Tensor] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None,
-            req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-            resource_manager: Optional[ResourceManager] = None,
-            maybe_graph: bool = False):
+        self,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+        attn_metadata: AttentionMetadata,
+        spec_metadata: Optional[SpecMetadata] = None,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        cache_indirection_buffer: Optional[torch.Tensor] = None,
+        num_accepted_tokens_device: Optional[torch.Tensor] = None,
+        req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
+        resource_manager: Optional[ResourceManager] = None,
+        maybe_graph: bool = False,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
@@ -6295,7 +6402,7 @@ class PyTorchModelEngine(ModelEngine):
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
             new_tensors_device, cache_indirection_buffer,
             num_accepted_tokens_device, req_id_to_old_request, resource_manager,
-            maybe_graph)
+            maybe_graph, promoted_context_request_ids)
 
     def _prepare_encoder_inputs(
         self,
@@ -6770,14 +6877,42 @@ class PyTorchModelEngine(ModelEngine):
                         inputs,
                         gather_ids=gather_ids,
                         gather_context_logits=gather_context_logits)
+
+        graph_requests = scheduled_requests
+        promoted_context_request_ids: frozenset[int] = frozenset()
+        # Non-linear tree input preparation expands runtime_draft_len to the
+        # total tree width after graph selection. Only linear-tree zero-draft
+        # iterations can therefore safely reuse a zero-draft graph.
+        can_promote_spec_decode = (not self.enable_spec_decode
+                                   or (not self.is_draft_model
+                                       and self.runtime_draft_len == 0
+                                       and self.spec_config is not None
+                                       and self.spec_config.is_linear_tree))
+        # TODO: Generalize these conservative gates as actual-draft, beam, and
+        # context-parallel providers for decoder-only LLMs gain support for
+        # promoted final-context rows. Each relaxation must preserve whole-batch
+        # fallback on graph miss and prove parity with the provider's native
+        # q_len=1 path. Encoder-decoder and non-LLM engines remain out of scope.
+        if (scheduled_requests.num_context_requests > 0
+                and self.cuda_graph_runner.enabled and can_promote_spec_decode
+                and not self.use_beam_search
+                and not self._is_encoder_decoder_model()
+                and not self._is_encode_only
+                and not self.llm_args.mm_encoder_only
+                and self.mapping.cp_size == 1):
+            graph_requests, promoted_context_request_ids = \
+                _make_single_token_context_graph_batch(
+                    scheduled_requests,
+                    self._is_final_multimodal_context_decode_compatible)
+
         with self.cuda_graph_runner.pad_batch(
-                scheduled_requests, resource_manager,
-                self.runtime_draft_len) as padded_requests:
+                graph_requests, resource_manager,
+                self.runtime_draft_len) as padded_graph_requests:
             # Callee already no-ops when use_mrope=False, but the Python call /
             # frame setup itself is non-trivial under high concurrency. Gating
             # at the caller avoids that overhead for non-mrope models.
             if self.use_mrope:
-                self._pad_batch_seed_mrope_delta_cache(padded_requests)
+                self._pad_batch_seed_mrope_delta_cache(padded_graph_requests)
 
             # Refresh is_all_greedy_sample for the *current* batch BEFORE the
             # CUDA graph key is built below. The key includes this flag to pick
@@ -6788,13 +6923,13 @@ class PyTorchModelEngine(ModelEngine):
             # unpopulated (greedy) buffers, hanging the run (e.g. MTP nextn>=2).
             if spec_metadata is not None:
                 spec_metadata.update_is_all_greedy_sample(
-                    padded_requests.all_requests())
+                    padded_graph_requests.all_requests())
                 self._sync_group_all_greedy_sample(spec_metadata)
 
             allow_mixed_encoder_decoder_graph = (
                 self.cuda_graph_runner.enable_encoder_decoder_mixed_cuda_graph)
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
-                padded_requests,
+                padded_graph_requests,
                 enable_spec_decode=self.enable_spec_decode,
                 attn_metadata=attn_metadata,
                 spec_metadata=spec_metadata,
@@ -6803,33 +6938,46 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device=new_tensors_device,
                 spec_resource_manager=spec_resource_manager,
                 allow_mixed_encoder_decoder=(allow_mixed_encoder_decoder_graph),
+                promoted_context_request_ids=promoted_context_request_ids,
             )
 
             can_run_graph = key is not None
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
+                execution_requests = padded_graph_requests
+                execution_promoted_context_ids = promoted_context_request_ids
             else:
                 attn_metadata = self.attn_metadata
                 if self.enable_spec_decode:
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None
+                execution_requests = scheduled_requests
+                execution_promoted_context_ids = frozenset()
 
             # Fill slot-ID buffer for scatter inside draft loop
             if (self.enable_spec_decode and spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
                 spec_tree_manager.slot_storage.fill_all_slot_ids(
-                    padded_requests.context_requests,
-                    padded_requests.generation_requests,
+                    execution_requests.context_requests,
+                    execution_requests.generation_requests,
                 )
 
             inputs, gather_ids = self._prepare_inputs(
-                padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
-                new_tensors_device, cache_indirection_buffer,
+                execution_requests, kv_cache_manager, attn_metadata,
+                spec_metadata, new_tensors_device, cache_indirection_buffer,
                 num_accepted_tokens_device, req_id_to_old_request,
-                resource_manager, can_run_graph)
+                resource_manager, can_run_graph, execution_promoted_context_ids)
+            if execution_promoted_context_ids:
+                self.iter_states[
+                    'num_ctx_requests'] = scheduled_requests.num_context_requests
+                self.iter_states['num_ctx_tokens'] = sum(
+                    request.context_chunk_size
+                    for request in scheduled_requests.context_requests)
+                self.iter_states[
+                    'num_generation_tokens'] = scheduled_requests.num_generation_requests
             self._prepare_inputs_event = torch.cuda.Event()
             self._prepare_inputs_event.record()
 

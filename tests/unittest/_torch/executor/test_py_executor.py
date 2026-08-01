@@ -1576,6 +1576,8 @@ class _StubADPExecutor:
         enable_attention_dp=True,
         kv_cache_transceiver=object(),
         max_num_tokens=8192,
+        max_seq_len=8192,
+        kv_manager_max_seq_len=None,
         is_warmup=False,
         benchmark_req_queues_size=0,
         enable_dsv4_adp_dummy_fixes=True,
@@ -1594,6 +1596,7 @@ class _StubADPExecutor:
         self._pending_adp_dummy_request = None
         self._enable_dsv4_adp_dummy_fixes = enable_dsv4_adp_dummy_fixes
         self.add_dummy_calls = []
+        self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
 
         self.dist = Mock()
         self.dist.tp_size = 1
@@ -1602,6 +1605,11 @@ class _StubADPExecutor:
         kv_cache_manager = Mock()
         kv_cache_manager.mapping.has_cp_helix.return_value = False
         kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+        kv_cache_manager.max_seq_len = (
+            max_seq_len if kv_manager_max_seq_len is None else kv_manager_max_seq_len
+        )
+        kv_cache_manager.num_extra_kv_tokens = 0
+        kv_cache_manager.tokens_per_block = 128
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
@@ -1770,6 +1778,19 @@ def test_pad_dummy_allocation_failure_skips_padding():
 
     assert len(stub.active_requests) == 1
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
+
+
+def test_disabled_dsv4_gate_checks_full_generation_capacity():
+    stub = _StubADPExecutor(enable_dsv4_adp_dummy_fixes=False)
+    stub.max_total_draft_tokens = 4
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 4
+
+    _run_pad(stub)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=5, max_num_draft_tokens=4
+    )
+    stub.kv_cache_manager.add_dummy_requests.assert_not_called()
 
 
 def test_dsv4_pad_dummy_checks_full_context_capacity():
