@@ -558,6 +558,9 @@ class PyExecutor:
         self.peft_cache_config = peft_cache_config
 
         self.iter_counter = 0
+        # TLLM_DSPARK_SYNC_DEBUG bookkeeping; see _maybe_arm_dspark_sync_debug.
+        self._dspark_sync_debug_iters = 0
+        self._dspark_sync_debug_armed = False
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
@@ -2399,6 +2402,48 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
 
+    def _maybe_arm_dspark_sync_debug(self) -> None:
+        """Turn on CUDA sync detection once decode is in steady state.
+
+        The overlap scheduler's entire value is that the host runs ahead of the
+        device, so one device->host sync per decode step gives it back. Static
+        review can show the code *looks* sync-free; only the allocator's own
+        detector shows that it *is*.
+
+        Armed late on purpose. Warmup, CUDA-graph capture and the first steady
+        steps legitimately synchronize, so arming at startup would bury the
+        signal in expected hits. ``TLLM_DSPARK_SYNC_DEBUG=<n>`` arms after ``n``
+        DSpark decode iterations (``1`` means "on", which arms after the default
+        64). Each subsequent sync emits a Python warning with a stack, which is
+        what makes the offender identifiable rather than merely countable.
+
+        Diagnostic only: never on by default, and 'warn' rather than 'error' so
+        a run surfaces every offender instead of dying at the first.
+        """
+        if self._dspark_sync_debug_armed:
+            return
+        raw = os.environ.get("TLLM_DSPARK_SYNC_DEBUG", "")
+        if not raw or raw in ("0", "false", "False"):
+            return
+        try:
+            after = 64 if raw in ("1", "true", "True") else int(raw)
+        except ValueError:
+            logger.warning(
+                f"ignoring TLLM_DSPARK_SYNC_DEBUG={raw!r}: expected an integer "
+                f"iteration count, or 1 for the default")
+            self._dspark_sync_debug_armed = True
+            return
+        self._dspark_sync_debug_iters += 1
+        if self._dspark_sync_debug_iters < after:
+            return
+        torch.cuda.set_sync_debug_mode("warn")
+        self._dspark_sync_debug_armed = True
+        logger.warning(
+            f"DSpark: CUDA sync detection armed after "
+            f"{self._dspark_sync_debug_iters} decode iterations. Any "
+            f"device->host synchronization from here on emits a warning with a "
+            f"stack; on the overlap-scheduler path there should be none.")
+
     def _report_dspark_ragged_stats(self) -> None:
         """Final DSpark scheduling summary, and optionally a hard gate on it.
 
@@ -3239,6 +3284,8 @@ class PyExecutor:
         planner = getattr(worker, "verify_planner", None)
         if planner is None:
             return max_draft_len
+
+        self._maybe_arm_dspark_sync_debug()
 
         gen_requests = scheduled_batch.generation_requests
         num_gen_requests = len(gen_requests)
