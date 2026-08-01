@@ -8,47 +8,29 @@ import torch
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range, nvtx_range_debug
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
+                                 nvtx_range_debug)
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    AttentionMetadata,
-    FlashInferAttentionMetadata,
-    TrtllmAttention,
-    TrtllmAttentionMetadata,
-)
-from ..attention_backend.interface import (
-    AttentionBackend,
-    AttentionMask,
-    CustomAttentionMask,
-    PositionalEmbeddingParams,
-    PredefinedAttentionMask,
-)
+from ..attention_backend import (AttentionForwardArgs, AttentionInputType,
+                                 AttentionMetadata, FlashInferAttentionMetadata,
+                                 TrtllmAttention, TrtllmAttentionMetadata)
+from ..attention_backend.interface import (AttentionBackend, AttentionMask,
+                                           CustomAttentionMask,
+                                           PositionalEmbeddingParams,
+                                           PredefinedAttentionMask)
 from ..attention_backend.sparse.dsa import (
-    DSAtrtllmAttentionMetadata,
-    transform_local_topk_and_prepare_pool_view,
-)
+    DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import (
-    AllReduceParams,
-    HelixAllToAllNative,
-    alltoall_helix,
-    cp_allgather,
-    reducescatter,
-)
+from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
+                           cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import (
-    Fp4QuantizedTensor,
-    get_model_extra_attrs,
-    is_torch_compiling,
-    maybe_compiled_cat,
-    maybe_compiled_copy_,
-)
+from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+                     is_torch_compiling, maybe_compiled_cat,
+                     maybe_compiled_copy_)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -59,7 +41,6 @@ try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
 except ImportError:
     flash_mla_sparse_fwd = None
-
 
 # === TRTLLM_DIFF_TRACE instrumentation (issue #15503 root-cause tracing) ===
 # Activated by env var TRTLLM_DIFF_TRACE=1.
@@ -81,11 +62,14 @@ except ImportError:
 # prompt 6 times in one process and inspects the diff. Reset state by restarting
 # the process.
 _DIFF_TRACE_ENABLED = os.environ.get("TRTLLM_DIFF_TRACE", "0") == "1"
-_DIFF_TRACE_DIR = os.environ.get("TRTLLM_DIFF_TRACE_DIR", "/tmp/trtllm_diff_trace")
+_DIFF_TRACE_DIR = os.environ.get("TRTLLM_DIFF_TRACE_DIR",
+                                 "/tmp/trtllm_diff_trace")
 _DIFF_PRIORITY = ["A_qkv", "B_q", "B_k", "B_v", "C_attn_output", "D_o_proj"]
-_DIFF_FIRST_RUN = {}          # name -> Run 1 tensor (CPU, last-token slice)
-_DIFF_FIRST_DIFFER = [None]   # name of the first tensor (in priority order) found to differ
-_DIFF_RUN_COUNTER = [0]       # context-forward counter, purely for log labels
+_DIFF_FIRST_RUN = {}  # name -> Run 1 tensor (CPU, last-token slice)
+_DIFF_FIRST_DIFFER = [
+    None
+]  # name of the first tensor (in priority order) found to differ
+_DIFF_RUN_COUNTER = [0]  # context-forward counter, purely for log labels
 
 
 def _diff_is_context(attn_metadata):
@@ -3088,7 +3072,7 @@ class MLA(nn.Module):
         has_fp8_block_scales = (
             self.kv_b_proj.quant_config
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
-        is_sm120 = get_sm_version() == 120
+        is_sm120 = get_sm_version() in (120, 121)
         if is_sm120 and has_fp8_block_scales:
             self.k_b_proj_trans, self.k_b_proj_trans_scale = self.resmooth_parameters(
                 self.k_b_proj_trans,

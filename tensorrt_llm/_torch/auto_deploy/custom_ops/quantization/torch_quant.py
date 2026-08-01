@@ -647,7 +647,7 @@ def trtllm_finegrained_fp8_linear(
     input_2d = input.reshape(-1, input_shape[-1])
 
     # SM version-specific activation quantization
-    if get_sm_version() == 120:
+    if get_sm_version() in (120, 121):
         from tensorrt_llm._torch.modules.linear import per_token_quant_and_transform
 
         act_fp8, act_sf = per_token_quant_and_transform(input_2d)

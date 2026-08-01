@@ -1118,7 +1118,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                     module.weight_scale,
                     disable_ue8m0_cast=True,
                 )
-        elif get_sm_version() == 120:
+        elif get_sm_version() in (120, 121):
             act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
@@ -1245,7 +1245,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         super().post_load_weights(module)
         if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
                                  or module.disable_deep_gemm)) or \
-           get_sm_version() == 120:
+           get_sm_version() in (120, 121):
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
             transformed_scale = transform_sf_into_required_layout(
