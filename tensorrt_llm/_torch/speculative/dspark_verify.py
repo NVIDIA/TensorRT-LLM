@@ -43,6 +43,7 @@ import numpy as np
 import torch
 
 from ..._utils import prefer_pinned
+from .dspark_observability import forced_verify_lens
 from .dspark_planner import SpsCostTable, budget_argmax_over_uniform_lens
 from .dspark_schedule import DSparkScheduleConfig, compute_survival, schedule_verify_lens_topk
 
@@ -233,6 +234,25 @@ class DSparkVerifyPlanner:
         """
         if num_gen_requests <= 0:
             return None
+
+        forced = forced_verify_lens(num_gen_requests=num_gen_requests,
+                                    tiers=self.tiers,
+                                    min_verify_len=self.cfg.min_verify_len)
+        if forced is not None:
+            # Deliberately ahead of the cost-table gate. Without a profiled
+            # table the planner correctly refuses to trim, which means the
+            # ragged layout is never built and a correctness run silently
+            # degenerates into a uniform one -- so the two questions "is the
+            # ragged packing correct" and "does the planner choose to trim"
+            # cannot be answered by the same run. This override answers the
+            # first without needing an answer to the second.
+            #
+            # Safe by construction: it only decides how many drafted positions
+            # are sent to the target. Acceptance still runs unchanged against
+            # whatever is sent, so the output distribution is untouched.
+            self.stats["forced_lens"] = self.stats.get("forced_lens", 0) + 1
+            return forced
+
         if self.cost_table is None or self.cost_table.is_flat:
             self.stats["fallback_flat_cost"] += 1
             return None

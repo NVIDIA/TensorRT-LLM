@@ -897,6 +897,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Per-step state for cross-layer indexer sharing; clear at the step
         # boundary so a "shared" layer never reuses a stale top-k.
         self.shared_topk_indices = None
+        # kv_lens_cuda may have just been corrected; the ragged per-row extent
+        # is derived from it and has to follow.
+        self.refresh_ragged_row_kv_lens()
 
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
@@ -1328,6 +1331,61 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             pin_memory=prefer_pinned(),
         )
+        # Per-row causal KV extent for the decode top-k, in *uncompressed* token
+        # space (the kernel divides by compress_ratio itself). Only populated on
+        # ragged batches: the uniform kernel reconstructs the same quantity from
+        # next_n, and passing nullptr keeps that path bit-identical.
+        #
+        # Distinct from kv_lens_expanded_cuda, which carries indexer (possibly
+        # compressed) lengths for the paged-MQA-logits call. The top-k kernel is
+        # handed kv_lens_cuda_runtime instead, so mixing the two would apply the
+        # compression divisor twice.
+        self.row_kv_lens_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences * (1 + self.max_draft_tokens), ),
+            cache_name="row_kv_lens_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.row_kv_lens_host = torch.zeros_like(
+            self.row_kv_lens_cuda,
+            device='cpu',
+            pin_memory=prefer_pinned(),
+        )
+        # The per-row offset `-verify_len + position + 1`, kept separately so
+        # the extent can be rebuilt from a corrected kv_lens without going back
+        # to the host. It depends only on the verify windows, which do not move
+        # after prepare(); the kv lengths do.
+        self.row_kv_correction_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences * (1 + self.max_draft_tokens), ),
+            cache_name="row_kv_correction_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.row_kv_correction_host = torch.zeros_like(
+            self.row_kv_correction_cuda,
+            device='cpu',
+            pin_memory=prefer_pinned(),
+        )
+        # Which request each query row belongs to. Persistent because the
+        # refresh below runs inside the CUDA-graph capture body: building this
+        # per call would record a memcpy from a Python temporary that is freed
+        # before the first replay.
+        self.row_req_idx_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences * (1 + self.max_draft_tokens), ),
+            cache_name="row_req_idx_cuda",
+            dtype=torch.long,
+            capture_graph=capture_graph,
+        )
+        self.row_req_idx_host = torch.zeros_like(
+            self.row_req_idx_cuda,
+            device='cpu',
+            pin_memory=prefer_pinned(),
+        )
+        # Rows covered by the current step's ragged layout; 0 on uniform steps.
+        self._ragged_num_rows = 0
         self.block_table_expanded = self.get_empty(
             self.cuda_graph_buffers,
             [
@@ -1544,6 +1602,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # - No distinction between sm90 and sm100 is needed once MTP3 is supported on sm90.
         # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
         use_dsl = self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
+        if not self.is_ragged_verify:
+            # A uniform step must not inherit a previous ragged step's row
+            # count: refresh_ragged_row_kv_lens and ragged_row_kv_lens both key
+            # off it, and this covers every uniform path, not just the one that
+            # skips the expanded buffers.
+            self._ragged_num_rows = 0
         if self.is_ragged_verify:
             # The DSL paged-MQA path reshapes (num_gen, next_n) -> (num_gen *
             # factor, atom) and broadcasts a single 1-D kv_lens per request, so
@@ -1583,6 +1647,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     self.host_block_table_expanded[:num_tokens],
                     non_blocking=True)
                 self.block_table_expanded.clamp_(min=0)
+
+            if self.is_ragged_verify:
+                self._prepare_ragged_row_kv_lens(kv_lens)
 
         self.expand_for_dsl = (use_dsl and self.kv_cache_manager is not None
                                and self.max_draft_tokens >= 1)
@@ -1626,6 +1693,106 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             self.dsl_expand_factor = 1
             self.dsl_atom = 1 + self.max_draft_tokens
+
+    def _prepare_ragged_row_kv_lens(self, kv_lens: torch.Tensor) -> None:
+        """Populate ``row_kv_lens_cuda``: how far back each query row may attend.
+
+        The decode top-k kernel normally reconstructs this from ``next_n``::
+
+            actual_kv_len = seq_len - next_n + (row % next_n) + 1
+
+        which is only meaningful while every request contributes the same number
+        of rows. Under ragged verification neither ``row // next_n`` (which
+        request) nor ``row % next_n`` (which position in its window) holds, so
+        the extent is materialized per row instead.
+
+        The generalization is exact: for a request verifying ``v`` positions,
+        row ``o`` of its window may attend to ``kv_len - v + o + 1`` tokens.
+        Substituting ``v = next_n`` recovers the formula above, which is why the
+        uniform path can keep passing ``nullptr`` and stay bit-identical.
+
+        Sync-free by construction: ``kv_lens`` is already a host tensor here
+        (:meth:`prepare` builds it from ``num_cached_tokens_per_seq``, which
+        lives on the CPU), so the whole vector is assembled on the host and
+        crosses once, through pinned memory so the copy does not serialize the
+        stream. Reading it on the device instead would mean a D2H sync, and
+        combining the two halves on the device would mean adding a CPU tensor to
+        a CUDA one.
+        """
+        verify_lens = self.ragged_verify_lens
+        if not verify_lens:
+            return
+        gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs].tolist()
+        assert len(gen_kv_lens) == len(verify_lens), (
+            f"ragged verify lengths {len(verify_lens)} != generation requests "
+            f"{len(gen_kv_lens)}")
+
+        # Row o of a request verifying v positions sees kv_len - v + o + 1
+        # tokens: the last row sees the request's full KV, each earlier row one
+        # token less.
+        rows: List[int] = []
+        for kv_len, verify_len in zip(gen_kv_lens, verify_lens):
+            base = int(kv_len) - int(verify_len) + 1
+            rows.extend(range(base, base + int(verify_len)))
+
+        corrections: List[int] = []
+        req_idx: List[int] = []
+        for request_pos, verify_len in enumerate(verify_lens):
+            corrections.extend(range(1 - int(verify_len), 1))
+            req_idx.extend([request_pos] * int(verify_len))
+
+        num_tokens = len(rows)
+        self._ragged_num_rows = num_tokens
+        self.row_kv_lens_host[:num_tokens].copy_(
+            torch.tensor(rows, dtype=torch.int32))
+        self.row_kv_lens_cuda[:num_tokens].copy_(
+            self.row_kv_lens_host[:num_tokens], non_blocking=True)
+        self.row_kv_correction_host[:num_tokens].copy_(
+            torch.tensor(corrections, dtype=torch.int32))
+        self.row_kv_correction_cuda[:num_tokens].copy_(
+            self.row_kv_correction_host[:num_tokens], non_blocking=True)
+        self.row_req_idx_host[:num_tokens].copy_(
+            torch.tensor(req_idx, dtype=torch.long))
+        self.row_req_idx_cuda[:num_tokens].copy_(
+            self.row_req_idx_host[:num_tokens], non_blocking=True)
+
+    def refresh_ragged_row_kv_lens(self) -> None:
+        """Rebuild the per-row extent from the corrected ``kv_lens_cuda``.
+
+        ``prepare()`` builds the extent from the host-side kv lengths, but under
+        the overlap scheduler ``_preprocess_inputs`` corrects ``kv_lens_cuda``
+        afterwards to account for how many draft tokens were actually accepted.
+        Leaving the extent at its prepare-time value would make the top-k kernel
+        and ``gen_kv_lens_cuda`` -- both arguments of the same op call -- disagree
+        about the same quantity.
+
+        Stays on the device: the correction term was staged at prepare time and
+        does not move, so this is one gather plus one add, with no sync.
+        """
+        num_tokens = self._ragged_num_rows
+        if not self.is_ragged_verify or num_tokens <= 0:
+            return
+        gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
+        # Gather, not repeat_interleave: this runs inside the capture body, and
+        # a tensor-repeats interleave both allocates and (without output_size)
+        # reads the cumulative sum back to the host. The row->request map and
+        # the correction were staged at prepare() time and are pinned by the
+        # graph key, so all that is left is one gather plus one add.
+        row_kv_lens = self.row_kv_lens_cuda[:num_tokens]
+        torch.index_select(gen_kv_lens, 0,
+                           self.row_req_idx_cuda[:num_tokens],
+                           out=row_kv_lens)
+        row_kv_lens.add_(self.row_kv_correction_cuda[:num_tokens])
+
+    def ragged_row_kv_lens(self, num_tokens: int) -> Optional[torch.Tensor]:
+        """The per-row extent slice for this step, or None on a uniform batch."""
+        if not self.is_ragged_verify:
+            return None
+        assert num_tokens == self._ragged_num_rows, (
+            f"ragged row count moved between prepare ({self._ragged_num_rows}) "
+            f"and forward ({num_tokens}); the per-row extents would be read "
+            f"past what was populated")
+        return self.row_kv_lens_cuda[:num_tokens]
 
     def prepare_for_indexer_k_cache(self):
         # Build indexer_k_cache_block_offsets using pool block indices derived
@@ -2980,7 +3147,32 @@ class Indexer(nn.Module):
                             metadata.heuristic_scratch_values[
                                 :num_gen_tokens]
 
-                if self.use_cute_dsl_topk and self._enable_heuristic_topk:
+                # Ragged batches carry a per-row causal extent instead of
+                # deriving one from next_n. Both CuTe DSL top-k kernels still
+                # take next_n as a compile-time-ish scalar and reconstruct the
+                # row->request map from it, and GVR additionally indexes its
+                # previous-step hint the same way, so neither can express a
+                # ragged batch. Route to the C++ kernel, which now accepts the
+                # extent directly.
+                ragged_row_kv_lens = metadata.ragged_row_kv_lens(num_gen_tokens)
+                if ragged_row_kv_lens is not None:
+                    torch.ops.trtllm.indexer_topk_decode(
+                        logits_decode,
+                        gen_kv_lens_cuda,
+                        topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                            num_gen_tokens, :],
+                        # Dead on this path: the kernel reads the extent out of
+                        # row_kv_lens rather than rebuilding it. Pass 1 so a
+                        # stale next_n cannot quietly come back into use.
+                        1,
+                        self.index_topk,
+                        pre_idx=None,
+                        heuristic_scratch=None,
+                        compress_ratio=self.compress_ratio,
+                        radix_aux_indices=metadata.radix_aux_indices,
+                        radix_aux_logits=metadata.radix_aux_logits,
+                        row_kv_lens=ragged_row_kv_lens)
+                elif self.use_cute_dsl_topk and self._enable_heuristic_topk:
                     # GVR DSL: supports all compress_ratio and next_n values.
                     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                         logits_decode,

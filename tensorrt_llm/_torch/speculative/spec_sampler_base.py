@@ -55,6 +55,12 @@ class SampleStateSpec(SampleState):
 
     device: SampleStateTensorsSpec
     host: SampleStateTensorsSpec
+    #: This step's per-request verify windows, keyed by request id. Snapshotted
+    #: because ``update_requests`` for step N-1 runs *after* the scheduler has
+    #: already stamped step N's windows onto the same LlmRequest objects, so
+    #: reading ``request.py_verify_len`` live rewinds by the wrong amount under
+    #: the overlap scheduler. None on every uniform path.
+    verify_lens_snapshot: Optional[dict] = None
 
 
 class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -176,7 +182,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         request.py_decoding_iter += 1
 
     @staticmethod
-    def _verified_len(request: LlmRequest, runtime_draft_len: int) -> int:
+    def _verified_len(request: LlmRequest, runtime_draft_len: int,
+                      verify_lens_snapshot: Optional[dict] = None) -> int:
         """How many draft positions THIS request was given to verify.
 
         Uniform scheduling gives every request the batch-wide
@@ -192,7 +199,13 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         ``py_verify_len`` is set only by the ragged path, so this is exactly
         today's behavior for every other speculation mode.
         """
-        per_request = getattr(request, "py_verify_len", None)
+        # Prefer the snapshot taken when this step's tokens were sampled. The
+        # live attribute already belongs to the NEXT step by the time the
+        # overlap scheduler rewinds this one.
+        if verify_lens_snapshot is not None:
+            per_request = verify_lens_snapshot.get(request.py_request_id)
+        else:
+            per_request = getattr(request, "py_verify_len", None)
         return runtime_draft_len if per_request is None else int(per_request)
 
     def update_requests(
@@ -229,7 +242,9 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             req.py_rewind_len = (
-                self._verified_len(req, runtime_draft_len) - req.py_num_accepted_draft_tokens
+                self._verified_len(req, runtime_draft_len,
+                                   state.verify_lens_snapshot)
+                - req.py_num_accepted_draft_tokens
             )
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
@@ -321,10 +336,20 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             for request in finished_context_requests:
                 request.py_draft_tokens = [1] * self.draft_len
 
+        # Cheap (a few ints) and only populated when the ragged path is live.
+        verify_lens_snapshot = None
+        for request in sampling_requests:
+            window = getattr(request, "py_verify_len", None)
+            if window is not None:
+                if verify_lens_snapshot is None:
+                    verify_lens_snapshot = {}
+                verify_lens_snapshot[request.py_request_id] = int(window)
+
         return SampleStateSpec(
             requests=sampling_requests,
             device=device_tensors,
             host=host_tensors,
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
+            verify_lens_snapshot=verify_lens_snapshot,
         )

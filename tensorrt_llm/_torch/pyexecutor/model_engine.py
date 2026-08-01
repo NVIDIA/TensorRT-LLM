@@ -3624,6 +3624,23 @@ class PyTorchModelEngine(ModelEngine):
         })
         return [int(padded_bs) * (t + 1) for t in tiers]
 
+    def _record_dspark_graph_use(self, *, replayed: bool) -> None:
+        """Count graph replay vs eager for the DSpark ragged stats, if enabled.
+
+        Deliberately tolerant: this runs on the hot path for every model, and a
+        non-DSpark engine has no worker, no planner and no stats object. Guard
+        rather than branch on config so the cost is one attribute lookup.
+        """
+        stats = self._dspark_ragged_stats
+        if stats is not None:
+            stats.record_graph(replayed=replayed)
+
+    @property
+    def _dspark_ragged_stats(self):
+        """The DSpark worker's stats object, or None on every other path."""
+        worker = self._get_spec_worker()
+        return getattr(worker, "ragged_stats", None) if worker else None
+
     def fit_ragged_verify_lens(
             self,
             generation_requests,
@@ -3766,6 +3783,47 @@ class PyTorchModelEngine(ModelEngine):
             request.py_verify_len = int(tokens) - 1
         return int(bucket)
 
+    @staticmethod
+    def _ragged_token_lens(generation_requests) -> Optional[List[int]]:
+        """Each generation request's token window, or None if the batch is uniform.
+
+        ``py_verify_len`` counts drafted positions; a request also verifies its
+        bonus position, so its token window is one wider.
+
+        Returns None unless *every* request carries a window. A partially
+        windowed batch is worse than an unwindowed one: the flat token layout
+        would go ragged while the spec metadata stayed uniform, which is silent
+        token misattribution rather than a crash.
+        """
+        verify_lens = [
+            getattr(request, "py_verify_len", None)
+            for request in generation_requests
+        ]
+        if not verify_lens or any(v is None for v in verify_lens):
+            return None
+        return [1 + int(v) for v in verify_lens]
+
+    def _publish_ragged_verify_lens(self, attn_metadata,
+                                    generation_requests) -> None:
+        """Hand the attention metadata this step's windows, before it prepares.
+
+        Split out of :meth:`_attach_ragged_verify_layout` because of ordering:
+        ``attn_metadata.prepare()`` is the *only* consumer of
+        ``ragged_verify_lens`` -- it drives the DSA expanded-buffer decision, the
+        per-row causal extents, and DeepSeek-V4's per-request compressor token
+        counts -- and it runs well before the spec metadata is assembled.
+        Publishing both together meant ``prepare()`` read the previous step's
+        split every time, and None on the first ragged step.
+
+        The spec-metadata half stays where it was; it is consumed later and has
+        no such constraint.
+        """
+        if attn_metadata is None or not hasattr(attn_metadata,
+                                                "ragged_verify_lens"):
+            return
+        attn_metadata.ragged_verify_lens = self._ragged_token_lens(
+            generation_requests)
+
     def _attach_ragged_verify_layout(self, spec_metadata, attn_metadata,
                                      generation_requests) -> None:
         """Publish this step's per-request verify windows to both metadatas.
@@ -3777,11 +3835,8 @@ class PyTorchModelEngine(ModelEngine):
         right place, and the DSA indexer has to expand kv_lens/block tables one
         row per query token instead of a fixed count per request.
         """
-        verify_lens = [
-            getattr(request, "py_verify_len", None)
-            for request in generation_requests
-        ]
-        if not verify_lens or any(v is None for v in verify_lens):
+        token_lens = self._ragged_token_lens(generation_requests)
+        if token_lens is None:
             spec_metadata.verify_lens = None
             spec_metadata.qo_indptr = None
             spec_metadata.total_verify_tokens = None
@@ -3792,9 +3847,6 @@ class PyTorchModelEngine(ModelEngine):
 
         from ..speculative.dspark_ragged import build_qo_indptr
 
-        # py_verify_len counts draft positions; a request also verifies its
-        # bonus position, so its token window is one wider.
-        token_lens = [1 + int(v) for v in verify_lens]
         n = len(token_lens)
         # Write through the persistent buffers rather than binding a fresh
         # tensor: a captured graph baked in the address it saw at capture time,
@@ -4606,13 +4658,24 @@ class PyTorchModelEngine(ModelEngine):
             if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
+                # Under ragged verification the block is still drafted in full,
+                # but only the request's own window is submitted to the target.
+                # This branch runs whenever the overlap scheduler is off -- i.e.
+                # on every step of the accuracy configuration -- so taking the
+                # full drafted length here would leave the flat token layout
+                # uniform while the spec metadata and the CUDA-graph key both
+                # believe it is ragged: silent token misattribution rather than
+                # a crash. Mirrors the overlap branch below, which already
+                # derives every length from the same per-request value.
+                num_draft_tokens = get_request_tokens_per_gen_step(
+                    request, 1 + get_draft_token_length(request)) - 1
                 if not (request.is_attention_dp_dummy
                         or request.is_cuda_graph_dummy):
                     input_ids.append(request.get_last_tokens(0))
-                    input_ids.extend(request.py_draft_tokens)
-                    draft_tokens.extend(request.py_draft_tokens)
+                    input_ids.extend(request.py_draft_tokens[:num_draft_tokens])
+                    draft_tokens.extend(
+                        request.py_draft_tokens[:num_draft_tokens])
                 # get other ids and lengths
-                num_draft_tokens = get_draft_token_length(request)
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
@@ -5269,7 +5332,23 @@ class PyTorchModelEngine(ModelEngine):
                 helix_is_inactive_rank=helix_is_inactive_rank,
             )
 
-        if not attn_metadata.is_cuda_graph:
+        # Ragged verification is the one case where the per-request lengths
+        # genuinely move between replays of the same graph: the row count and
+        # the padded token total are both pinned by the key, but how the tokens
+        # are split across rows is not. Leaving the captured ones(bs)*(1+top)
+        # in place would make attn_metadata.num_tokens (== seq_lens.sum(),
+        # interface.py) disagree with the input_ids width on every trimmed step
+        # -- and that sum is what attention-DP all-gathers and the MoE chunks
+        # from. The setter already copies in place under CUDA graphs (see its
+        # comment: "The seqlens can change if we are doing spec decode"), so
+        # this reallocates nothing as long as the row count is unchanged.
+        refresh_seq_lens = not attn_metadata.is_cuda_graph
+        if (not refresh_seq_lens
+                and getattr(attn_metadata, "is_ragged_verify", False)
+                and attn_metadata.seq_lens is not None
+                and len(sequence_lengths) == attn_metadata.seq_lens.shape[0]):
+            refresh_seq_lens = True
+        if refresh_seq_lens:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
             # to draft sequences too. This means that all draft sequences must be padded.
             attn_metadata.seq_lens = torch.tensor(
@@ -5323,6 +5402,13 @@ class PyTorchModelEngine(ModelEngine):
         # pre-prepare counts so the steady-gen recording below stores values
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
+        # prepare() is the only consumer of the ragged windows, so they have to
+        # be published first: it decides the DSA expanded-buffer layout, builds
+        # the per-row causal extents, and derives DeepSeek-V4's per-request
+        # compressor token counts. The rest of the layout is attached later,
+        # once the spec metadata exists.
+        self._publish_ragged_verify_lens(attn_metadata,
+                                         scheduled_requests.generation_requests)
         attn_metadata.prepare()
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
@@ -6679,6 +6765,11 @@ class PyTorchModelEngine(ModelEngine):
             )
 
             can_run_graph = key is not None
+            # A ragged step that misses its captured shape does not raise -- it
+            # quietly runs eager, which costs far more than the tokens it
+            # trimmed. Record it so the miss is a counter rather than something
+            # only a profiler would reveal.
+            self._record_dspark_graph_use(replayed=can_run_graph)
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata

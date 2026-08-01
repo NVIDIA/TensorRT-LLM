@@ -40,11 +40,18 @@ int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitW
 ///   - Insertion sort   (N < kSortingAlgorithmThreshold)
 ///   - Radix sort       (kSortingAlgorithmThreshold ≤ N < splitWork)
 ///   - Radix split-work (N ≥ splitWork — uses outLogitsAux / outIndicesAux)
+///
+/// @param rowKvLens  optional [numRows] per-row causal KV extent, in uncompressed
+///   token space. Non-null selects the ragged layout: rows no longer map to
+///   requests by `rowIdx / next_n`, so the extent every row may attend to is
+///   supplied directly instead of being reconstructed from `next_n`. Null keeps
+///   the uniform arithmetic, bit-identical to before. Mutually exclusive with
+///   `preIdx` (GVR's hint is request-indexed through `next_n` as well).
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK = 2048, int const* preIdx = nullptr, int const preIdxStride = 0,
     int const preIdxCount = 0, float* heuristicScratch = nullptr, int const compressRatio = 1,
-    cudaStream_t const stream = 0);
+    int const* rowKvLens = nullptr, cudaStream_t const stream = 0);
 
 /// bf16 indexer TopK decode — same dispatch axes as the fp32 entry, except
 /// kBsL2 uses sizeof(__nv_bfloat16) bytes/elem (L2 footprint is half) and
@@ -59,13 +66,14 @@ void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, in
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
     int const next_n, int const topK = 2048, int const* preIdx = nullptr, int const preIdxStride = 0,
     int const preIdxCount = 0, __nv_bfloat16* heuristicScratch = nullptr, int const compressRatio = 1,
-    cudaStream_t const stream = 0);
+    int const* rowKvLens = nullptr, cudaStream_t const stream = 0);
 
 /// fp16 indexer TopK decode — see bf16 overload for dispatcher contract.
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n,
     int const topK = 2048, int const* preIdx = nullptr, int const preIdxStride = 0, int const preIdxCount = 0,
-    __half* heuristicScratch = nullptr, int const compressRatio = 1, cudaStream_t const stream = 0);
+    __half* heuristicScratch = nullptr, int const compressRatio = 1, int const* rowKvLens = nullptr,
+    cudaStream_t const stream = 0);
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const topK = 2048,

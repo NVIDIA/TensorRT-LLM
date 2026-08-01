@@ -454,10 +454,46 @@ class DSparkWorker(SpecWorkerBase):
             tiers=tiers,
             apply_calibration=apply_calibration,
         )
+
+        # The config knob says what was asked for; the environment overrides it
+        # so a mode can be swapped without editing a serving config. `static`
+        # unless ragged was explicitly requested, matching the shipped default.
+        from .dspark_observability import (DSparkRaggedStats, RaggedVerifyMode,
+                                           read_ragged_verify_mode)
+
+        configured = (RaggedVerifyMode.COMPACT if getattr(
+            self.spec_config, "enable_ragged_verify", False) else
+                      RaggedVerifyMode.STATIC)
+        self.ragged_verify_mode = read_ragged_verify_mode(default=configured)
+        if self.ragged_verify_mode is RaggedVerifyMode.CAP_ACCEPT:
+            # Deliberately not aliased onto `compact`. The whole value of
+            # cap-accept is that its output must be bit-identical to `static`
+            # while the windows still drive commitment; silently running it as
+            # `compact` would make that comparison meaningless.
+            raise NotImplementedError(
+                "TLLM_DSPARK_RAGGED_VERIFY_MODE='cap-accept' is not implemented "
+                "yet: it requires submitting the full block to the target while "
+                "committing only each request's window. Use 'static' or "
+                "'compact'.")
+        self.ragged_stats = DSparkRaggedStats(mode=self.ragged_verify_mode,
+                                              max_draft_len=block_size)
         logger.info(
             f"DSpark verify planner: tiers={self.verify_planner.tiers}, "
-            f"profiled_cost_table={not cost_table.is_flat}"
+            f"profiled_cost_table={not cost_table.is_flat}, "
+            f"ragged_verify_mode={self.ragged_verify_mode.value}"
         )
+        if (self.ragged_verify_mode.trims_submitted_tokens
+                and cost_table.is_flat):
+            # Not a warning about a tuning choice -- in this combination the
+            # feature cannot do anything at all, and the run would look like a
+            # successful `compact` run in every log line.
+            logger.warning(
+                "DSpark ragged verify is set to 'compact' but the cost table is "
+                "flat, so the planner's budget degenerates to verify-all and "
+                "every request will receive the same full window. Profile a "
+                "cost table and pass confidence_sps_table_path, or the ragged "
+                "path will not be exercised."
+            )
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
         """Get (or refresh) the slot for a request; reset clears its window."""
@@ -584,9 +620,21 @@ class DSparkWorker(SpecWorkerBase):
 
         # Captured target hidden at the bonus position within each request's Kp1
         # processed tokens.
-        arange_g = torch.arange(num_gens, device=device)
-        base = gen_start + arange_g * Kp1  # [G]
-        main_hidden = captured[base + gidx]  # [G, ncap*hidden]
+        # Where each request's processed tokens start inside `captured`, which
+        # is indexed by flat token position. A uniform batch strides by Kp1;
+        # under ragged verification requests contribute different numbers of
+        # tokens, so the offsets come from the same qo_indptr the input layout
+        # was packed with. Striding by Kp1 there would have request r read from
+        # request r-1's tail -- no error, just a silent acceptance collapse.
+        qo_indptr = getattr(spec_metadata, "qo_indptr", None)
+        if getattr(spec_metadata, "verify_lens", None) is not None and qo_indptr is not None:
+            base = gen_start + qo_indptr[:num_gens].to(device=device, dtype=torch.long)
+        else:
+            arange_g = torch.arange(num_gens, device=device)
+            base = gen_start + arange_g * Kp1  # [G]
+        # Clamped like interim_base below: gidx comes from a device-side accept
+        # count, so a bad one must not turn into an out-of-bounds read.
+        main_hidden = captured[(base + gidx).clamp(min=0, max=captured.shape[0] - 1)]
 
         # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
         # (everything but the bonus) into the rolling window — same frames as the

@@ -334,6 +334,22 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.cu_seq_lens[0] = 0
 
+        # Tokens each generation request appends this step. Only populated under
+        # ragged verification; a uniform batch leaves it unused and the
+        # compressor keeps deriving the count from its next_n template bound.
+        self.gen_new_tokens_per_seq_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences,),
+            dtype=torch.int,
+            cache_name="gen_new_tokens_per_seq_cuda",
+            capture_graph=capture_graph,
+        )
+        self.gen_new_tokens_per_seq_host = torch.empty_like(
+            self.gen_new_tokens_per_seq_cuda, device="cpu", pin_memory=prefer_pinned()
+        )
+        # Set per step by prepare(); None means "uniform, use next_n".
+        self.gen_new_tokens_per_seq: Optional[torch.Tensor] = None
+
         # new_comp_kv_lens_cuda is the number of new compressed tokens for the requests
         self.new_comp_kv_lens_cuda = {
             compress_ratio: self.get_empty(
@@ -729,10 +745,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # --- Per-ratio metadata ---
         # 1) CPU-side: compute scalar metadata (num_total_compressed_tokens, etc.)
         # 2) CUDA-side: fill *_cuda buffers via prepare_compressed_kv_metadata()
-        num_gen_tokens_per_seq = (
-            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
-        )
-        self.num_gen_tokens_per_seq = num_gen_tokens_per_seq
+        # Under ragged verification requests append different numbers of tokens,
+        # so the integer division below is meaningless. The compressor kernel
+        # still needs a compile-time loop bound, and its loops are already
+        # guarded, so the batch MAXIMUM is the correct scalar to hand it -- the
+        # exact per-request counts ride along in gen_new_tokens_per_seq.
+        num_gen_tokens_per_seq = self._sync_gen_tokens_per_seq(num_gen_tokens)
         num_contexts = self.num_contexts
         num_generations = self.num_generations
         kv_lens_slice = kv_lens[:num_requests]
@@ -786,6 +804,39 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.num_total_compressed_tokens,
             self._compress_ratios_sorted,
         )
+
+    def _sync_gen_tokens_per_seq(self, num_gen_tokens: int) -> int:
+        """Set ``num_gen_tokens_per_seq`` / ``gen_new_tokens_per_seq`` together.
+
+        Uniform batches divide the flat generation-token count by the request
+        count. Ragged batches have no such quotient, so the scalar becomes the
+        batch *maximum* -- which is exactly what the compressor kernel wants,
+        since ``NEXT_N`` is a template loop bound whose iterations are already
+        guarded -- and the true per-request counts travel beside it on the
+        device.
+
+        Single writer on purpose: the scalar and the vector describe the same
+        thing, and every place that recomputed one without the other was a way
+        for them to disagree.
+        """
+        if self.is_ragged_verify and self.num_generations > 0:
+            gen_token_counts = self.gen_token_repeat_list()
+            self.num_gen_tokens_per_seq = max(gen_token_counts)
+            n = self.num_generations
+            self.gen_new_tokens_per_seq_host[:n].copy_(
+                torch.tensor(gen_token_counts, dtype=torch.int32)
+            )
+            gen_new_tokens = self.gen_new_tokens_per_seq_cuda[:n]
+            gen_new_tokens.copy_(
+                self.gen_new_tokens_per_seq_host[:n], non_blocking=True
+            )
+            self.gen_new_tokens_per_seq = gen_new_tokens
+        else:
+            self.num_gen_tokens_per_seq = (
+                num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
+            )
+            self.gen_new_tokens_per_seq = None
+        return self.num_gen_tokens_per_seq
 
     def prepare_compressed_kv_metadata(
         self,
@@ -862,9 +913,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cached_tokens = kv_lens - seq_lens
 
         num_gen_tokens = num_tokens - self.num_ctx_tokens
-        self.num_gen_tokens_per_seq = (
-            num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
-        )
+        # Must go through the same helper as prepare(): a plain integer division
+        # here would silently undo the ragged batch maximum, and the compressor
+        # reads this value as its next_n loop bound. A bound below a request's
+        # real window truncates Phase 1 and the tail KV/score state is never
+        # written -- no error, just corrupted compression windows from then on.
+        self._sync_gen_tokens_per_seq(num_gen_tokens)
 
         # Reuse prepare()'s host-computed ctx sizes unless the extend_ctx path
         # (num_chunked_ctx_requests > 0) may have mutated ctx-row kv_lens on

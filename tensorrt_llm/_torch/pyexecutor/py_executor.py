@@ -3235,13 +3235,27 @@ class PyExecutor:
             def all_rank_max(value: int) -> int:
                 return max(int(v) for v in self.dist.tp_allgather(int(value)))
 
+        # The mode, not the config flag, decides whether windows are computed:
+        # the environment override exists so a run can be switched between
+        # `static` and `compact` without editing the serving config, and every
+        # counter below is keyed off the same decision.
+        stats = getattr(worker, "ragged_stats", None)
+        mode = getattr(worker, "ragged_verify_mode", None)
+        compute_windows = (mode.computes_windows if mode is not None else
+                           getattr(self.model_engine.spec_config,
+                                   "enable_ragged_verify", False))
+
         ragged_lens = None
-        if getattr(self.model_engine.spec_config, "enable_ragged_verify",
-                   False):
+        fallback_reason = None
+        if compute_windows:
             ragged_lens = planner.decide_verify_lens(
                 num_gen_requests=num_gen_requests,
                 rows=confidence_rows,
                 all_rank_max=all_rank_max)
+            if ragged_lens is None:
+                fallback_reason = "planner_declined"
+        else:
+            fallback_reason = "mode_static"
 
         # Land the batch's token total on a captured bucket before the graph key
         # is built, spending the rounding slack on real verification. A batch
@@ -3261,6 +3275,33 @@ class PyExecutor:
                      sum(1 + int(v) for v in ragged_lens)])
             bucket = self.model_engine.fit_ragged_verify_lens(
                 gen_requests, ragged_lens, peer_stats=peer_stats)
+            if bucket is None:
+                fallback_reason = "no_captured_shape"
+
+        # Record what the step actually decided, reading the windows back off
+        # the requests rather than off `ragged_lens`: fit_ragged_verify_lens
+        # spends the bucket's rounding slack on real verification, so the
+        # fitted windows are what the target will see.
+        if stats is not None:
+            # The stats object lives in the worker process; under TP the caller
+            # that wants to assert on it is on the far side of an MPI boundary
+            # and cannot reach it. Emit a periodic summary so the decision is
+            # recoverable from the log, which is the only shared channel.
+            if stats.steps_total and stats.steps_total % 32 == 0:
+                stats.log_summary(prefix="DSpark ragged verify [periodic]")
+            fitted = None
+            if bucket is not None:
+                fitted = [
+                    int(request.py_verify_len) for request in gen_requests
+                    if getattr(request, "py_verify_len", None) is not None
+                ]
+                if len(fitted) != num_gen_requests:
+                    fitted = None
+            stats.record_step(num_gen_requests=num_gen_requests,
+                              verify_lens=fitted,
+                              bucket=bucket,
+                              padded_bs=None,
+                              fallback=fallback_reason)
 
         if bucket is not None:
             # The block is always drafted in full -- only verification is

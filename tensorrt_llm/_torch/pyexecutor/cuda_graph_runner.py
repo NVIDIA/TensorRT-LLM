@@ -449,7 +449,18 @@ class CUDAGraphRunner:
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
         max_draft_len = key[1]
         token_per_request = max_draft_len + 1
-        num_tokens_for_capture = (batch_size * self.max_beam_width *
+        # Ragged keys carry the flat token total as a sixth element (see
+        # _get_graph_key). It is exactly the width the captured graph will be
+        # replayed at, and it is NOT batch_size * (draft_len + 1): the block is
+        # still drafted in full, so draft_len stays at the top tier while the
+        # verified total shrinks. Sizing the static slices from the product
+        # instead would capture a graph whose input_ids are wider than the
+        # attention metadata's num_tokens on every trimmed replay -- and the
+        # widest bucket happens to match the product, which is what warmup
+        # captures, so it would capture clean and diverge on the first real
+        # trimmed step.
+        num_tokens_for_capture = (key[5] if len(key) > 5 else
+                                  batch_size * self.max_beam_width *
                                   token_per_request)
 
         sliced_static_tensors = {

@@ -297,7 +297,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
     int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
     int32_t const* __restrict__ cu_seq_lens, int32_t const* __restrict__ cu_kv_comp, int page_size, int max_blocks,
-    int out_elem_bytes)
+    int out_elem_bytes, int32_t const* __restrict__ new_tokens_per_seq = nullptr)
 {
     using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
@@ -337,7 +337,16 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     int const eff_tid = head_blk * NTHRD_INNER + tid;
 
     int const kv_len = kv_lens[batch_idx];
-    int const sp = kv_len - NEXT_N;
+    // How many tokens this request appended this step. Uniform batches append
+    // NEXT_N each, which is what the template bound encodes. Under DSpark's
+    // ragged verification each request appends its own window instead, so the
+    // count is read per request and NEXT_N degrades to a compile-time *upper*
+    // bound -- which is all the loops below need it to be, because both are
+    // already guarded (Phase 1 by token_idx < kv_len, Phase 3 by
+    // num_compressions). Keeping NEXT_N as the bound is what preserves the
+    // full unroll on the uniform path.
+    int const nn = (new_tokens_per_seq != nullptr) ? new_tokens_per_seq[batch_idx] : NEXT_N;
+    int const sp = kv_len - nn;
     int const in_off = cu_seq_lens[batch_idx];
     int const out_off = cu_kv_comp[batch_idx];
     int64_t const page_sd = static_cast<int64_t>(page_size) * STATE_DIM;
@@ -413,7 +422,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     // ================================================================
     // Phase 2: Count how many complete compression windows finished.
     // ================================================================
-    int last_token_idx = sp + NEXT_N - 1;
+    int last_token_idx = sp + nn - 1;
     int num_compressions = (last_token_idx + 1) / COMPRESS_RATIO - sp / COMPRESS_RATIO;
 
     // ================================================================
@@ -663,7 +672,8 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 // Generate explicit template instantiations.
 #define INST_DECODE(HD, KV_EB, STATE_EB, CR, NN, NRW)                                                                  \
     template __global__ void pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW>(void const*, float const*, void*, \
-        void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int);
+        void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int,   \
+        int32_t const*);
 FOREACH_DECODE_CONFIG(INST_DECODE)
 #undef INST_DECODE
 
@@ -680,6 +690,7 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
     int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size, int max_blocks, int head_dim,
     int compress_ratio, int next_n, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes,
+    int32_t const* new_tokens_per_seq,
     cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(
@@ -731,7 +742,7 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     {                                                                                                                  \
         pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW><<<grid, nthreads, smem_bytes, stream>>>(kv_score, ape, \
             paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp,        \
-            page_size, max_blocks, out_elem_bytes);                                                                    \
+            page_size, max_blocks, out_elem_bytes, new_tokens_per_seq);                                                \
         return;                                                                                                        \
     }
     FOREACH_DECODE_CONFIG(TRY_LAUNCH)
