@@ -253,7 +253,33 @@ TEST_EXIT=124
 
 （graph 数从 102 变 57 是因为本轮配置的 batch-size 桶只有 19 个，与 hang 无关。）
 
-### 4.2 三个候选的判定
+### 4.2 修完 hang 之后立刻暴露出来的第二个 bug（新发现）
+
+hang 消失之后，run 走到了**从来没有人到达过的地方**，于是撞上了下一个问题：
+
+```
+Run generation-only CUDA graph capture (advanced sampling) for batch size=1, draft_len=1   ← 57 个 graph 全部 capture 完成
+Run warmup with 4096 tokens, include 0 generation tokens
+Run warmup with 128 tokens, include 128 generation tokens
+RuntimeError: shape '[128, 1]' is invalid for input of size 640
+```
+
+`640 = 128 × 5`。根因：capture 循环给每个 graph 盖上
+`self.runtime_draft_len = draft_len`（`model_engine.py:2056`），**结束后不还原**
+（`:2081-2082` 只还原了 `enable_spec_decode`）。
+
+只有一个 draft length 要 capture 时这无害 —— 留下的值就是原本的值。
+但 **tier ladder 结束在它最小的 tier 上**，于是 engine 带着 `runtime_draft_len=1`
+走出 capture，而紧接着的通用 token warmup 按完整 draft 长度造 dummy 请求。
+acceptance 把 draft 重塑成 `[num_gens, runtime_draft_len]`，就成了 640 → `[128, 1]`。
+
+这个泄漏**早于本 feature**（随 dynamic draft length 一起进来的），
+但只有多 tier 阶梯才会让泄漏值与正确值不同。已修（commit `e59c8101f2`）。
+
+**这条本身就是 P0 阶段的一个论据**：capture 跑通不等于 feature 跑通，
+而在 hang 被修掉之前，这个 bug 在物理上不可能被观察到。
+
+### 4.3 三个候选的判定
 
 | 候选 | 判定 | 依据 |
 |---|---|---|
