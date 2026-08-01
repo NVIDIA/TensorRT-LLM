@@ -19,6 +19,9 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import write
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_scatter import (
     fused_write_layer_caches,
 )
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+    msa_ported_decode_active,
+)
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
@@ -567,21 +570,28 @@ def _resolution_metadata(
     return metadata
 
 
+def _force_cutedsl_supported(monkeypatch):
+    """Force the CuTe DSL geometry verdict, which otherwise needs an SM100 host.
+
+    The resolver raises on an unsupported geometry, so without this every
+    resolution test would be a test of the runner's availability.
+    """
+    monkeypatch.setattr(
+        MiniMaxM3MsaSparseAttention.Metadata,
+        "_cutedsl_indexer_supported",
+        lambda self, **kw: True,
+    )
+
+
 def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
-    """A uniform pure-decode step under the defaults hands every site to a
-    ported kernel, which is what lets prepare() skip the fmha_sm100 plans."""
-    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
-        monkeypatch.delenv(var, raising=False)
+    """A uniform pure-decode step resolves a span over the whole batch, which is
+    what lets prepare() skip the fmha_sm100 plans entirely."""
+    _force_cutedsl_supported(monkeypatch)
     metadata = _resolution_metadata()
-    # The CuTe DSL runner needs SM100; force the geometry verdict so the test
-    # covers the resolution logic on any host.
-    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
 
     metadata._resolve_decode_kernels()
 
-    assert metadata._msa_use_cutedsl_indexer is True
-    assert metadata._msa_use_triton_sparse is True
-    assert metadata._msa_use_trtllm_gen_dense is True
+    assert msa_ported_decode_active(metadata) is True
     assert metadata._msa_runs_no_fmha() is True
     assert metadata.msa_decode_query_len == 1
     assert metadata.msa_max_kv_len == 11
@@ -593,19 +603,15 @@ def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
 
 
 def test_resolve_decode_kernels_commits_the_generation_span_of_a_mixed_step(monkeypatch):
-    """A context request no longer disqualifies the whole step.
+    """A context request does not disqualify the step.
 
     The generation requests are the batch's row and token suffix, so the ported
-    main-attention kernels take that span and fmha_sm100 keeps the context
-    prefix. The indexer scorer stays on the proxy for the whole batch, which is
-    Phase 1's deliberate limit.
+    kernels take that span and fmha_sm100 keeps the context prefix.
     """
-    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
-        monkeypatch.delenv(var, raising=False)
+    _force_cutedsl_supported(monkeypatch)
     # Two context requests (7 and 5 query tokens, the first a chunk of a long
     # prompt) ahead of two decode rows.
     metadata = _resolution_metadata(num_contexts=2, qo_lens=(7, 5, 1, 1), kv_lens=(4096, 5, 40, 33))
-    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
 
     metadata._resolve_decode_kernels()
 
@@ -614,17 +620,26 @@ def test_resolve_decode_kernels_commits_the_generation_span_of_a_mixed_step(monk
     assert (span.token_first, span.token_last) == (12, 14)
     assert span.query_len == 1
     assert span.is_mixed is True
-    assert metadata._msa_use_triton_sparse is True
-    assert metadata._msa_use_trtllm_gen_dense is True
-    # max_score carries the query tokens in its last dimension, so the context
-    # and generation ranges are not separable sub-blocks the proxy and the
-    # scorer could each write half of. The proxy keeps the whole batch.
-    assert metadata._msa_use_cutedsl_indexer is False
+    assert msa_ported_decode_active(metadata) is True
     # fmha_sm100 still runs the context prefix, so its page table stays live.
     assert metadata._msa_runs_no_fmha() is False
     # The trtllm-gen scheduling bound must come from the span's own rows: the
     # 4096-token context row here would inflate a whole-batch maximum by 100x.
     assert metadata.msa_max_kv_len == 40
+
+
+def test_resolve_decode_kernels_resolves_no_span_for_a_pure_prefill(monkeypatch):
+    """A step with no generation row has nothing for the ported kernels, and
+    fmha_sm100 keeps every plan and the page table they read."""
+    _force_cutedsl_supported(monkeypatch)
+    metadata = _resolution_metadata(num_contexts=2, qo_lens=(5, 7), kv_lens=(5, 7))
+
+    metadata._resolve_decode_kernels()
+
+    assert metadata.msa_decode_span is None
+    assert metadata.msa_decode_query_len is None
+    assert msa_ported_decode_active(metadata) is False
+    assert metadata._msa_runs_no_fmha() is False
 
 
 @pytest.mark.parametrize(
@@ -635,100 +650,81 @@ def test_resolve_decode_kernels_commits_the_generation_span_of_a_mixed_step(monk
         # Ragged generation rows behind a context request. The context request
         # is fine, but these rows still have no single query length.
         (1, (5, 1, 2), (5, 9, 11)),
-        # Pure prefill: no generation row for a ported kernel to own.
-        (2, (5, 7), (5, 7)),
     ],
-    ids=["ragged-decode", "ragged-mixed", "pure-prefill"],
+    ids=["ragged-decode", "ragged-mixed"],
 )
-def test_resolve_decode_kernels_declines_without_a_uniform_span(
+def test_resolve_decode_kernels_raises_on_ragged_generation_rows(
     monkeypatch, num_contexts, qo_lens, kv_lens
 ):
-    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
-        monkeypatch.delenv(var, raising=False)
+    """There is no fmha_sm100 decode path left to fall back to, so a span the
+    ported kernels cannot serve has to surface rather than cost the step its
+    decode throughput silently."""
+    _force_cutedsl_supported(monkeypatch)
     metadata = _resolution_metadata(num_contexts=num_contexts, qo_lens=qo_lens, kv_lens=kv_lens)
-    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
 
-    metadata._resolve_decode_kernels()
+    with pytest.raises(NotImplementedError, match=r"one query length"):
+        metadata._resolve_decode_kernels()
 
     assert metadata.msa_decode_span is None
-    assert metadata.msa_decode_query_len is None
-    assert metadata._msa_use_cutedsl_indexer is False
-    assert metadata._msa_use_triton_sparse is False
-    assert metadata._msa_use_trtllm_gen_dense is False
-    # Every fmha_sm100 plan is still built, so the page table is still needed.
-    assert metadata._msa_runs_no_fmha() is False
+
+
+def test_resolve_decode_kernels_raises_without_the_dense_subpage_pool(monkeypatch):
+    """trtllm-gen needs the flat sub-page pool, and its dense plan is gone, so a
+    manager without one cannot serve the dense layers at all."""
+    _force_cutedsl_supported(monkeypatch)
+    metadata = _resolution_metadata()
+    del metadata.kv_cache_manager.get_kv_subpage_pool
+
+    with pytest.raises(NotImplementedError, match=r"sub-page pool"):
+        metadata._resolve_decode_kernels()
+
+
+def test_resolve_decode_kernels_raises_when_the_scorer_declines_the_geometry(monkeypatch):
+    """Same for the indexer: the proxy pass over the span is gone with it."""
+    monkeypatch.setattr(
+        MiniMaxM3MsaSparseAttention.Metadata,
+        "_cutedsl_indexer_supported",
+        lambda self, **kw: False,
+    )
+    metadata = _resolution_metadata()
+
+    with pytest.raises(NotImplementedError, match=r"CuTe DSL indexer scorer"):
+        metadata._resolve_decode_kernels()
 
 
 def test_fmha_plan_rows_narrow_to_the_context_prefix(monkeypatch):
-    """Each site's plan must cover exactly the rows fmha_sm100 still runs.
+    """The plans must cover exactly the rows fmha_sm100 still runs.
 
     on_update_kv_lens patches a plan's length mirrors against the requests it
     was built from, so a plan that claimed the whole batch while only the
     context prefix ran would write the wrong lengths into the kernel.
     """
-    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(
-        MiniMaxM3MsaSparseAttention.Metadata,
-        "_cutedsl_indexer_supported",
-        lambda self, **kw: True,
-    )
+    _force_cutedsl_supported(monkeypatch)
 
     mixed = _resolution_metadata(num_contexts=2, qo_lens=(7, 5, 1, 1), kv_lens=(4096, 5, 40, 33))
     mixed._msa_live_batch = 4
     mixed._resolve_decode_kernels()
-    # A site fmha_sm100 still owns entirely is planned over the whole batch.
-    assert mixed._msa_fmha_plan_rows(False) == (0, 4)
-    # A site whose ported kernel took the span is planned over the prefix.
-    assert mixed._msa_fmha_plan_rows(True) == (0, 2)
+    # The span took the generation suffix, so the plans cover the prefix.
+    assert mixed._msa_fmha_plan_rows() == (0, 2)
 
     decode = _resolution_metadata()
     decode._msa_live_batch = 2
     decode._resolve_decode_kernels()
-    assert decode._msa_fmha_plan_rows(False) == (0, 2)
-    # Nothing is left to plan on a pure-decode step the kernel fully owns.
-    assert decode._msa_fmha_plan_rows(True) is None
+    # Nothing is left to plan on a pure-decode step the kernels fully own.
+    assert decode._msa_fmha_plan_rows() is None
 
-
-def test_resolve_decode_kernels_honors_the_msa_kill_switch(monkeypatch):
-    """TLLM_M3_*=msa must put the plans back, since it is the only way to
-    recover the fmha_sm100 path once prepare() has learned to skip it."""
-    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
-        monkeypatch.setenv(var, "msa")
-    metadata = _resolution_metadata()
-    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
-
-    metadata._resolve_decode_kernels()
-
-    assert metadata._msa_use_cutedsl_indexer is False
-    assert metadata._msa_use_triton_sparse is False
-    assert metadata._msa_use_trtllm_gen_dense is False
-    assert metadata._msa_runs_no_fmha() is False
-
-
-def test_resolve_decode_kernels_declines_dense_without_subpage_pool(monkeypatch):
-    """trtllm-gen needs the flat sub-page pool, and a manager without one must
-    keep its dense plan even though the other two sites are ported."""
-    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
-        monkeypatch.delenv(var, raising=False)
-    metadata = _resolution_metadata()
-    del metadata.kv_cache_manager.get_kv_subpage_pool
-    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
-
-    metadata._resolve_decode_kernels()
-
-    assert metadata._msa_use_trtllm_gen_dense is False
-    # One site still on fmha_sm100 keeps the shared page table alive.
-    assert metadata._msa_runs_no_fmha() is False
+    prefill = _resolution_metadata(num_contexts=2, qo_lens=(5, 7), kv_lens=(5, 7))
+    prefill._msa_live_batch = 2
+    prefill._resolve_decode_kernels()
+    # No span, so fmha_sm100 runs every row and is planned over all of them.
+    assert prefill._msa_fmha_plan_rows() == (0, 2)
 
 
 def test_resolution_must_not_change_under_a_captured_graph(monkeypatch):
     """The kernels inside a captured graph are fixed, so a later step that
     resolves differently would stage inputs for a kernel that never runs."""
-    for var in ("TLLM_M3_INDEXER_SCORE", "TLLM_M3_SPARSE_DECODE", "TLLM_M3_DENSE_DECODE"):
-        monkeypatch.delenv(var, raising=False)
+    _force_cutedsl_supported(monkeypatch)
     metadata = _resolution_metadata(is_cuda_graph=True)
-    monkeypatch.setattr(type(metadata), "_cutedsl_indexer_supported", lambda self, **kw: True)
 
     def _step():
         metadata._resolve_decode_kernels()
@@ -738,14 +734,22 @@ def test_resolution_must_not_change_under_a_captured_graph(monkeypatch):
     # Same inputs: the replay agrees with the capture.
     _step()
 
-    monkeypatch.setenv("TLLM_M3_SPARSE_DECODE", "msa")
+    # A replay whose batch turned mixed. The graph was captured with no
+    # fmha_sm100 plans at all, so the context prefix this step resolves has
+    # nothing to run under.
+    metadata._seq_lens = torch.tensor([5, 1, 1], dtype=torch.int32)
+    metadata.kv_lens = torch.tensor([5, 9, 11], dtype=torch.int32)
+    metadata.num_contexts = 1
+    metadata.msa_block_table = torch.zeros(3, 4, dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.zeros(3, dtype=torch.int32)
     with pytest.raises(RuntimeError, match=r"changed under a captured CUDA graph"):
         _step()
 
 
 def test_indexer_raises_when_a_committed_cutedsl_scorer_declines():
-    """prepare() skipped the proxy plan on this step, so a decline has no
-    fallback and must surface instead of silently reading a stale page table."""
+    """prepare() left the proxy plan covering nothing but this step's context
+    prefix, so a decline has no fallback for the generation span and must
+    surface instead of silently reading a stale page table."""
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import MsaIndexer
 
@@ -761,7 +765,7 @@ def test_indexer_raises_when_a_committed_cutedsl_scorer_declines():
         )
     )
     # block_table/seq_lens left None, so the scorer cannot even be attempted.
-    with pytest.raises(RuntimeError, match=r"resolved this step to the CuTe DSL"):
+    with pytest.raises(RuntimeError, match=r"CuTe DSL indexer scorer declined the span"):
         indexer.select_blocks(
             torch.zeros(2, 4, 128),
             torch.zeros(4, 1, 128, 128),
@@ -772,10 +776,36 @@ def test_indexer_raises_when_a_committed_cutedsl_scorer_declines():
         )
 
 
+@pytest.mark.parametrize("head_major", [False, True])
+def test_combined_topk_table_preserves_the_requested_backing(head_major):
+    """Joining the two halves of a mixed step's table must not change its layout.
+
+    The Triton sparse decode kernel reads the top-k table head-major, so a
+    joined table has to permute to a contiguous [num_kv_heads, total_q, topk]
+    exactly as the selector's own output does; a token-major join would silently
+    hand the kernel a strided view where production hands it a dense one.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import (
+        _combined_topk_table,
+    )
+
+    num_kv_heads, topk = 2, 16
+    ctx = torch.arange(5 * num_kv_heads * topk, dtype=torch.int32).reshape(5, num_kv_heads, topk)
+    gen = -ctx[:3] - 1
+
+    combined = _combined_topk_table(ctx, gen, head_major=head_major)
+
+    assert combined.shape == (8, num_kv_heads, topk)
+    assert torch.equal(combined[:5], ctx)
+    assert torch.equal(combined[5:], gen)
+    assert combined.permute(1, 0, 2).is_contiguous() is head_major
+    assert combined.is_contiguous() is not head_major
+
+
 def test_paged_gqa_raises_when_a_committed_dense_step_declines():
-    """The mirror of the indexer guard on the attention side. prepare()
-    promised trtllm-gen and dropped the dense plan, so a call site that finds
-    the geometry unsupported has nothing left to fall back to."""
+    """The mirror of the indexer guard on the attention side. The step resolved
+    a span and dropped the dense plan, so a call site that finds the geometry
+    unsupported has nothing left to fall back to."""
     from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
 
     num_heads, head_dim, num_pages, page_size = 8, 128, 4, 16
@@ -792,10 +822,11 @@ def test_paged_gqa_raises_when_a_committed_dense_step_declines():
                 num_pages, 2, 1, page_size, head_dim
             )
         ),
-        _msa_use_trtllm_gen_dense=True,
         # A resolved pure-decode span, so the decline is the only thing that
         # can send this call to fmha_sm100.
         msa_decode_query_len=1,
+        msa_block_table=torch.zeros(2, 1, dtype=torch.int32),
+        msa_seq_lens_cuda=torch.zeros(2, dtype=torch.int32),
     )
 
     with pytest.raises(RuntimeError, match=r"skipped the fmha_sm100 dense plan"):
@@ -1074,9 +1105,9 @@ def test_mixed_batch_generation_span_matches_the_whole_batch_msa_path():
 
     The generation rows move off fmha_sm100 and onto the Triton sparse decode
     kernel while the context rows stay behind under a context-only plan, so the
-    correctness gate is that both halves still agree with the whole-batch
-    fmha_sm100 run that TLLM_M3_SPARSE_DECODE=msa forces. This is the only test
-    that covers which kernel produced which output rows.
+    correctness gate is that both halves still agree with a whole-batch
+    fmha_sm100 run, which a metadata carrying no span still takes. This is the
+    only test that covers which kernel produced which output rows.
     """
     from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
@@ -1117,9 +1148,11 @@ def test_mixed_batch_generation_span_matches_the_whole_batch_msa_path():
         torch.cuda.synchronize()
         return output.view(total_q, attention.num_heads, head_dim).float()
 
-    reference = run(_msa_use_triton_sparse=False, msa_decode_span=None)
+    reference = run(msa_decode_span=None)
     split = run(
-        _msa_use_triton_sparse=True,
+        # A property of the span on real metadata, and what
+        # msa_ported_decode_active reads; this fake carries both.
+        msa_decode_query_len=1,
         msa_decode_span=_MsaDecodeSpan(
             row_first=1,
             row_last=4,

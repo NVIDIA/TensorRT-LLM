@@ -45,9 +45,8 @@ from .msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
-    msa_cutedsl_indexer_active,
-    msa_kernel_choice,
-    msa_triton_sparse_decode_active,
+    msa_decode_span_bounds,
+    msa_ported_decode_active,
     per_token_valid_blocks,
     require_msa_module,
 )
@@ -332,23 +331,16 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # persistent backing store for the view.
     _msa_eager_n_valid_buf: Optional[torch.Tensor] = None
     _msa_eager_n_valid_blocks: Optional[torch.Tensor] = None
-    # The generation rows and tokens the ported decode kernels own this step;
-    # None when no generation row qualifies, in which case fmha_sm100 runs the
-    # whole batch. See _MsaDecodeSpan and _resolve_decode_kernels.
+    # The generation rows and tokens the ported decode kernels own this step,
+    # resolved once by _resolve_decode_kernels() before any preparation work
+    # and the whole of this step's kernel resolution: every site reads it
+    # through msa_ported_decode_active, so none of them can disagree about
+    # which kernel ran or therefore about which preparation was needed. None
+    # only when the step has no generation row at all. See _MsaDecodeSpan.
     _msa_decode_span: Optional[_MsaDecodeSpan] = None
     # Staged max per-request KV length over the span's generation rows, a
     # scheduling upper bound for the ported decode kernels.
     _msa_max_kv_len: int = 0
-    # This step's kernel choice per decode site, resolved once by
-    # _resolve_decode_kernels() before any preparation work. True is a
-    # commitment, not a preference: prepare() then skips the fmha_sm100
-    # preparation that kernel replaces, leaving a call site that declines
-    # afterwards with nothing to fall back to (see the raises at the call
-    # sites). None means prepare() never ran, so nothing was skipped and the
-    # gating helpers may recompute; the helpers in msa_utils read these.
-    _msa_use_cutedsl_indexer: Optional[bool] = None
-    _msa_use_triton_sparse: Optional[bool] = None
-    _msa_use_trtllm_gen_dense: Optional[bool] = None
     # max_k_tiles of a proxy plan at the manager's worst case, kept from the
     # one-off buffer sizing so the indexer can shape its max_score view
     # without a per-step proxy plan to read it from.
@@ -459,8 +451,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def msa_decode_query_len(self) -> Optional[int]:
         """Uniform per-request query length over this step's generation rows.
 
-        None when no span was resolved, which is what the gating helpers in
-        msa_utils test to keep a step on fmha_sm100.
+        None when no span was resolved, which is what msa_ported_decode_active
+        tests to keep a step on fmha_sm100.
         """
         span = self._msa_decode_span
         return span.query_len if span is not None else None
@@ -736,36 +728,42 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._build_step_plans()
 
     def _clear_decode_kernel_resolution(self) -> None:
-        """Resolve every decode site to fmha_sm100 for this step."""
+        """Drop any resolved span, leaving this step's rows to fmha_sm100."""
         self._msa_decode_span = None
         self._msa_max_kv_len = 0
-        self._msa_use_cutedsl_indexer = False
-        self._msa_use_triton_sparse = False
-        self._msa_use_trtllm_gen_dense = False
 
     def _resolve_decode_kernels(self) -> None:
-        """Choose this step's decode kernels once, before any preparation work.
+        """Resolve this step's generation span once, before any preparation work.
 
-        prepare() and the per-layer call sites both read the result, so they
-        cannot disagree about which kernel runs -- and therefore cannot
-        disagree about which preparation was needed. Every input is a
-        host-side fact that is either fixed for the whole run (static kernel
-        support, cache geometry) or fixed for the whole step (batch
-        composition, query-length uniformity); nothing here may depend on a
-        per-layer tensor, which a call site could see differently.
+        Every generation row of every step runs on the ported decode kernels:
+        the Triton sparse kernel, the trtllm-gen dense kernel and the CuTe DSL
+        indexer scorer. There is no second decode implementation to choose
+        between and nothing to fall back to, so this either commits a span or
+        raises. Falling back would not be a small cost -- fmha_sm100 schedules
+        a generation row like a context row, and on a mixed step cannot even
+        split the two apart (see _mixed_batch_split in fmha_sm100/api.py), so
+        every decode row would ride the prefill schedule.
 
         The generation requests are the row suffix of the batch, so they form a
-        span the ported kernels can own on a mixed step just as on a pure
-        decode step, leaving the context prefix to fmha_sm100; see
-        _MsaDecodeSpan. Only query-length uniformity within the span matters,
-        not whether context requests precede it.
+        span the kernels own on a mixed step just as on a pure decode step,
+        leaving the context prefix to fmha_sm100; see _MsaDecodeSpan. Only
+        query-length uniformity within the span matters, not whether context
+        requests precede it.
 
-        The geometry checks mirror the ones the call sites still make. They
-        are exact rather than optimistic: the MSA backend rejects any
-        head_dim, sparse_index_dim or topk other than the MSA_REQUIRED_*
-        values at construction (see MiniMaxM3MsaSparseAttention.__init__), and
-        the index Q/K dtype is the cache's, so prepare can evaluate them
-        without a live tensor.
+        prepare() and the per-layer call sites both read the span, so they
+        cannot disagree about which kernel runs -- and therefore cannot
+        disagree about which preparation was needed. Every input is a host-side
+        fact that is either fixed for the whole run (static kernel support,
+        cache geometry) or fixed for the whole step (batch composition,
+        query-length uniformity); nothing here may depend on a per-layer
+        tensor, which a call site could see differently.
+
+        The geometry checks mirror the ones the call sites still make. They are
+        exact rather than optimistic: the MSA backend rejects any head_dim,
+        sparse_index_dim or topk other than the MSA_REQUIRED_* values at
+        construction (see MiniMaxM3MsaSparseAttention.__init__), and the index
+        Q/K dtype is the cache's, so prepare can evaluate them without a live
+        tensor.
         """
         self._clear_decode_kernel_resolution()
         params = self._msa_params
@@ -779,29 +777,54 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         row_first = int(self.num_contexts or 0)
         row_last = int(qo_lens_cpu.shape[0])
         if row_first >= row_last:
-            # Pure prefill: no generation row for a ported kernel to own.
+            # Pure prefill: no generation row to place.
+            return
+        # The ported kernels address the page table and lengths directly, so
+        # they need those buffers allocated even though the plans are not. They
+        # are, from __post_init__, for every manager that carries an index-K
+        # cache -- i.e. every real MiniMax-M3 run; see _create_msa_buffers.
+        if self.msa_block_table is None or self.msa_seq_lens_cuda is None:
             return
         # Host-side tensors, so these reads do not sync the device.
         gen_qo_lens = qo_lens_cpu[row_first:]
         qo_min, qo_max = int(gen_qo_lens.min()), int(gen_qo_lens.max())
+        if qo_min != qo_max or qo_max <= 0:
+            raise NotImplementedError(
+                "MiniMax-M3 decode requires one query length across a step's "
+                f"generation rows, got lengths {gen_qo_lens.tolist()} for rows "
+                f"[{row_first}, {row_last}). The ported decode kernels derive "
+                "the request id as token // query_len, which needs a uniform "
+                "positive length."
+            )
+        num_index_heads = params.sharded_index_head_count(self.mapping)
+        page_size = int(kv_cache_manager.tokens_per_block)
+        if not self._cutedsl_indexer_supported(
+            num_index_heads=num_index_heads,
+            page_size=page_size,
+            decode_query_len=qo_max,
+        ):
+            raise NotImplementedError(
+                "MiniMax-M3 decode requires the CuTe DSL indexer scorer, which "
+                f"does not support this geometry: {num_index_heads} index heads, "
+                f"page size {page_size}, query length {qo_max}, index dtype "
+                f"{self._msa_index_kv_dtype()}. See is_supported on the runner in "
+                "cute_dsl_custom_ops."
+            )
+        dense_unsupported = dense_decode_unsupported_reason(kv_cache_manager, MSA_REQUIRED_HEAD_DIM)
+        if dense_unsupported is not None:
+            raise NotImplementedError(
+                "MiniMax-M3 decode requires the trtllm-gen dense kernel for its "
+                f"dense layers, but {dense_unsupported}"
+            )
         # Staged, i.e. before the overlap scheduler's correction, which only
         # shrinks lengths. That keeps it a valid upper bound for the ported
         # kernels' scheduling hints even when it is baked into a CUDA graph.
         # Taken over the span alone, so a long context request cannot inflate
         # the generation kernels' scheduling bound.
         self._msa_max_kv_len = int(kv_lens_cpu[row_first:].max())
-        if qo_min != qo_max or qo_max <= 0:
-            # Ragged, or a batch of empty rows: the ported kernels' token ->
-            # request mapping does not hold (and is not invertible at all at
-            # length 0), so every site stays on fmha_sm100.
-            return
-        # The ported kernels address the page table and lengths directly, so
-        # they need those buffers allocated even though the plans are not.
-        if self.msa_block_table is None or self.msa_seq_lens_cuda is None:
-            return
-        # Derived from the same host lengths the plans are built from rather
-        # than from num_ctx_tokens, so the token boundary cannot drift from the
-        # plan the context prefix runs under.
+        # token_first is derived from the same host lengths the plans are built
+        # from rather than from num_ctx_tokens, so the token boundary cannot
+        # drift from the plan the context prefix runs under.
         token_first = int(qo_lens_cpu[:row_first].sum())
         self._msa_decode_span = _MsaDecodeSpan(
             row_first=row_first,
@@ -811,62 +834,38 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             query_len=qo_max,
         )
 
-        page_size = int(kv_cache_manager.tokens_per_block)
-        self._msa_use_cutedsl_indexer = (
-            msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
-            # The proxy writes a contiguous [heads, k_tiles, total_q] block, so
-            # the context and generation token ranges are not separable
-            # sub-blocks of one max_score buffer and the two scorers cannot
-            # share it. A mixed step keeps the whole batch on the proxy.
-            and not self._msa_decode_span.is_mixed
-            and self._cutedsl_indexer_supported(
-                num_index_heads=params.sharded_index_head_count(self.mapping),
-                page_size=page_size,
-                decode_query_len=qo_max,
-            )
-        )
-        self._msa_use_triton_sparse = msa_kernel_choice("TLLM_M3_SPARSE_DECODE") == "triton"
-        self._msa_use_trtllm_gen_dense = (
-            msa_kernel_choice("TLLM_M3_DENSE_DECODE") == "trtllm_gen"
-            and dense_decode_unsupported_reason(kv_cache_manager, MSA_REQUIRED_HEAD_DIM) is None
-        )
-
     def _check_capture_stable_resolution(self) -> None:
-        """Fail if the kernel choice moved after a CUDA graph captured it.
+        """Fail if the resolved span moved after a CUDA graph captured it.
 
         A replay reruns prepare() to restage the graph's input buffers, but the
-        kernels inside the graph are fixed at capture. A resolution that
-        changed afterwards would stage inputs for one kernel while the graph
-        ran another, so it has to be caught rather than tolerated. Every input
-        to the resolution is stable across a graph's replays -- the env vars,
-        the static support checks, and the bucket's own decode_query_len --
-        which is what makes this a check and not a re-capture.
+        kernels inside the graph are fixed at capture. A span that changed
+        afterwards would stage inputs for one kernel while the graph ran
+        another, so it has to be caught rather than tolerated. Every input to
+        the resolution is stable across a graph's replays -- the static support
+        checks and the bucket's own decode_query_len -- which is what makes this
+        a check and not a re-capture.
 
-        The three booleans decide which kernel each site runs, and whether the
-        span is mixed decides how much of the batch the plans that survive were
-        built over, so those four are what must hold. The span's row and token
-        bounds feed them but are otherwise the graph bucket's business. A
-        captured batch is pure decode, so is_mixed is False at both capture and
-        replay; comparing it makes that an assertion rather than an assumption.
+        Whether a span exists decides whether any fmha_sm100 work runs at all,
+        and whether it is mixed decides how much of the batch the plans that
+        survive were built over, so those two are what must hold. The span's row
+        and token bounds feed them but are otherwise the graph bucket's
+        business. A captured batch is pure decode, so is_mixed is False at both
+        capture and replay; comparing it makes that an assertion rather than an
+        assumption.
         """
         if not self.is_cuda_graph:
             return
         span = self._msa_decode_span
-        resolution = (
-            self._msa_use_cutedsl_indexer,
-            self._msa_use_triton_sparse,
-            self._msa_use_trtllm_gen_dense,
-            span is not None and span.is_mixed,
-        )
+        resolution = (span is not None, span is not None and span.is_mixed)
         captured = self._msa_captured_resolution
         if captured is None:
             self._msa_captured_resolution = resolution
         elif captured != resolution:
             raise RuntimeError(
-                "MiniMax-M3 decode kernel choice changed under a captured CUDA "
-                f"graph: (cutedsl, triton, trtllm_gen, mixed) was {captured} at "
-                f"capture and is {resolution} now. It must hold for every "
-                "replay; see _resolve_decode_kernels."
+                "MiniMax-M3 decode span changed under a captured CUDA graph: "
+                f"(resolved, mixed) was {captured} at capture and is "
+                f"{resolution} now. It must hold for every replay; see "
+                "_resolve_decode_kernels."
             )
 
     def _msa_runs_no_fmha(self) -> bool:
@@ -875,41 +874,33 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         When True the whole of its per-step preparation is dead: the three
         plans, the graph-safe mirrors of their worklists, the length mirrors
         on_update_kv_lens patches into them, and the flattened msa_kv_indices
-        page table. All three flags are required because the fall-through in
-        run_msa_paged_gqa is shared -- dense layers that decline trtllm-gen
-        land on the same fmha_sm100 call, and the same msa_kv_indices, as the
-        sparse ones.
+        page table.
 
-        A mixed step never qualifies however the sites resolved: the ported
-        kernels own only the generation span, so fmha_sm100 still runs the
-        context prefix and needs its plans and page table.
+        That is every pure-decode step, since the ported kernels own all of its
+        rows. A mixed step never qualifies: they own only the generation span,
+        so fmha_sm100 still runs the context prefix and needs its plans and page
+        table.
         """
         span = self._msa_decode_span
-        return bool(
-            span is not None
-            and not span.is_mixed
-            and self._msa_use_cutedsl_indexer
-            and self._msa_use_triton_sparse
-            and self._msa_use_trtllm_gen_dense
-        )
+        return span is not None and not span.is_mixed
 
-    def _msa_fmha_plan_rows(self, ported: bool) -> Optional[Tuple[int, int]]:
-        """Batch rows the fmha_sm100 plan for one decode site must cover.
+    def _msa_fmha_plan_rows(self) -> Optional[Tuple[int, int]]:
+        """Batch rows this step's fmha_sm100 plans must cover.
 
-        ``ported`` is that site's resolution: True when a ported kernel owns
-        this step's generation span. The three outcomes are
+        One answer for all three plans, because one span decides all three
+        sites. The outcomes are
 
-        * not ported -- the whole batch, as fmha_sm100 runs every row;
-        * ported on a mixed step -- the context prefix only, since the span
-          takes the generation suffix;
-        * ported on a pure-decode step -- None, no rows left to plan.
+        * no span -- the whole batch, as fmha_sm100 runs every row;
+        * a mixed span -- the context prefix only, since the span takes the
+          generation suffix;
+        * a pure-decode span -- None, no rows left to plan.
 
         Returning the row range rather than a bare "context only" flag keeps
         on_update_kv_lens able to patch each plan's length mirrors against the
         rows it was actually built from.
         """
         span = self._msa_decode_span
-        if not ported or span is None:
+        if span is None:
             return (0, self._msa_live_batch)
         return (0, span.row_first) if span.is_mixed else None
 
@@ -947,27 +938,25 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         Yields ``(plan, row_first, row_last)``. Decode steps populate the
         graph-safe owners, prefill and mixed steps the plain eager tuples;
         _build_step_plans clears whichever set does not apply, so only one set
-        is ever live per site. The row range is the site's own, since a site
-        whose ported kernel took the generation span was planned over the
-        context prefix alone (see _msa_fmha_plan_rows).
+        is ever live per site. The row range is narrower than the batch when the
+        ported kernels took the generation span (see _msa_fmha_plan_rows).
         """
+        rows = self._msa_fmha_plan_rows()
+        if rows is None:
+            # The ported kernels took the whole step, so any plan still held is
+            # stale and must not be patched.
+            return ()
         live = []
-        for owner, eager, ported in (
-            (self._msa_proxy_plan, self._msa_eager_proxy_plan, self._msa_use_cutedsl_indexer),
-            (self._msa_gqa_plan, self._msa_eager_gqa_plan, self._msa_use_triton_sparse),
-            (self._msa_dense_plan, self._msa_eager_dense_plan, self._msa_use_trtllm_gen_dense),
+        for owner, eager in (
+            (self._msa_proxy_plan, self._msa_eager_proxy_plan),
+            (self._msa_gqa_plan, self._msa_eager_gqa_plan),
+            (self._msa_dense_plan, self._msa_eager_dense_plan),
         ):
             plan = owner.plan if owner is not None else None
             if plan is None:
                 plan = eager
-            if plan is None:
-                continue
-            rows = self._msa_fmha_plan_rows(bool(ported))
-            if rows is None:
-                # The site resolved to a ported kernel for the whole step, so
-                # any plan still held is stale and must not be patched.
-                continue
-            live.append((plan, rows[0], rows[1]))
+            if plan is not None:
+                live.append((plan, rows[0], rows[1]))
         return tuple(live)
 
     def on_update_kv_lens(self) -> None:
@@ -1097,14 +1086,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
           captured), so the plans are stored as plain tuples (msa_eager_*_plan)
           that every sparse and dense layer reuses.
 
-        Each plan covers only the rows fmha_sm100 still owns at that site (see
-        _msa_fmha_plan_rows). A site whose ported kernel took the whole step is
-        not planned at all: planning is host work on the critical path, and the
-        plan tuple, its graph-safe mirror and the per-step length patching in
-        on_update_kv_lens all fall away with it. A site whose ported kernel
-        took only the generation span of a mixed step is planned over the
-        context prefix, which is also the half fmha_sm100 would have planned
-        into its own sub-plan (see _mixed_batch_split in fmha_sm100/api.py).
+        Each plan covers only the rows fmha_sm100 still owns (see
+        _msa_fmha_plan_rows). A pure-decode step is not planned at all, since
+        the ported kernels took every row: planning is host work on the critical
+        path, and the plan tuple, its graph-safe mirror and the per-step length
+        patching in on_update_kv_lens all fall away with it. A mixed step is
+        planned over the context prefix, which is also the half fmha_sm100 would
+        have planned into its own sub-plan (see _mixed_batch_split in
+        fmha_sm100/api.py).
         """
         # Drop any plan tuples from the previous step; the msa_decode_*_plan and
         # msa_eager_*_plan properties then report None until rebuilt below.
@@ -1144,16 +1133,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # bf16 index-K cache, so it never needs the flag.
         use_fp8 = self._msa_main_kv_is_fp8()
 
-        def plan_for(ported: bool, **plan_kwargs) -> Optional[tuple]:
+        plan_rows = self._msa_fmha_plan_rows()
+
+        def plan_for(**plan_kwargs) -> Optional[tuple]:
             """Plan one site over the rows fmha_sm100 still owns, or None.
 
             Slicing a pinned length tensor keeps the pinned backing, so a
             context-only plan stages just as cheaply as a whole-batch one.
             """
-            rows = self._msa_fmha_plan_rows(ported)
-            if rows is None:
+            if plan_rows is None:
                 return None
-            first, last = rows
+            first, last = plan_rows
             whole = (first, last) == (0, int(qo_lens_cpu.shape[0]))
             return fmha_sm100.fmha_sm100_plan(
                 qo_lens_cpu if whole else qo_lens_cpu[first:last],
@@ -1168,14 +1158,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Proxy plan: MQA (num_kv_heads=1) max-score pass over the index
         # branch; output_maxscore feeds the indexer's top-k block selection.
         proxy_plan = plan_for(
-            self._msa_use_cutedsl_indexer,
             num_qo_heads=num_index_heads,
             num_kv_heads=1,
             output_maxscore=True,
         )
         # Sparse-layer plan: kv_block_num=topk limits attention to top-k blocks.
         gqa_plan = plan_for(
-            self._msa_use_triton_sparse,
             num_qo_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
             kv_block_num=topk,
@@ -1183,7 +1171,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
         # Dense-layer plan: no kv_block_num, so it attends the full page table.
         dense_plan = plan_for(
-            self._msa_use_trtllm_gen_dense,
             num_qo_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
             use_fp8_kvcache=use_fp8,
@@ -1570,9 +1557,13 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
         num_tokens = int(idx_q.shape[0])
+        # Whether the ported kernels own this step's generation span, which
+        # decides both the layout the top-k table is produced in and how the
+        # scoring below is split.
+        ported = msa_ported_decode_active(metadata)
         head_major_output = (
             int(metadata.num_contexts or 0) > 0 and int(metadata.num_generations or 0) == 0
-        ) or msa_triton_sparse_decode_active(metadata)
+        ) or ported
         # idx_q and idx_k may be strided column-views of a fused buffer, so
         # reshape to keep them zero-copy. The proxy fmha_sm100 and the index-K
         # scatter below both honor the source strides.
@@ -1606,18 +1597,34 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             if idx_q_view.dtype != torch.float8_e4m3fn:
                 idx_q_view = idx_q_view.to(torch.float8_e4m3fn)
 
-        # One selection path. Decode passes the proxy scratch shaped to the live
-        # query count, plus the graph-safe proxy plan when one was built.
-        # Prefill and mixed batches pass the eager proxy plan and the
-        # device-staged valid-block count. When neither is present (a standalone
-        # test that skips prepare) select_blocks plans inline and computes the
-        # valid-block count itself.
-        use_cutedsl = msa_cutedsl_indexer_active(metadata)
-        proxy_plan = metadata.msa_decode_proxy_plan
+        # Alternate inputs for the CuTe DSL scorer, which owns this step's
+        # generation span. Left as None on a step that resolved no span (a pure
+        # prefill) so the scorer declines and the proxy plan runs the whole
+        # batch instead.
         block_table = None
         seq_lens_cuda = None
         decode_query_len = None
-        if proxy_plan is not None or use_cutedsl:
+        # gen_first is the span's first query token: the scorer takes
+        # [gen_first, num_tokens) over rows [ctx_rows, row_last) and the proxy
+        # the context prefix ahead of both, which is empty on a pure-decode step.
+        gen_first = 0
+        ctx_rows = 0
+        if ported:
+            gen_first, ctx_rows, row_last, decode_query_len = msa_decode_span_bounds(
+                metadata, num_tokens
+            )
+            block_table = metadata.msa_block_table[ctx_rows:row_last]
+            seq_lens_cuda = metadata.msa_seq_lens_cuda[ctx_rows:row_last]
+        # One selection path, and one thing decides which scratch it reads:
+        # only a pure-decode step is CUDA-graph captured, so only there did
+        # prepare() mirror the plans into the graph-safe buffers and refresh the
+        # decode valid-block scratch. Everything else runs eagerly off the
+        # per-step eager plan and count. When neither is present (a standalone
+        # test that skips prepare) select_blocks plans inline and computes the
+        # valid-block count itself.
+        pure_decode = int(metadata.num_contexts or 0) == 0
+        proxy_plan = metadata.msa_decode_proxy_plan
+        if pure_decode and (proxy_plan is not None or ported):
             # proxy_plan is (has_mixed, split, batch, decode_dict, prefill);
             # decode_dict carries max_k_tiles for the contiguous score view. A
             # step that resolved to the CuTe DSL scorer has no proxy plan to
@@ -1632,27 +1639,29 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 config.num_index_heads, plan_max_k_tiles, num_tokens
             )
             n_valid_blocks = metadata.msa_n_valid_blocks[:num_tokens]
-            # Alternate inputs for the CuTe DSL scorer. Left as None on a
-            # ragged step so it declines and the proxy plan runs instead.
-            # A mixed step is also left to the proxy: max_score is
-            # [heads, k_tiles, total_q] with the query tokens last, so the
-            # context and generation ranges are not separable sub-blocks that
-            # the proxy and the scorer could each write half of. Splitting the
-            # indexer is Phase 2.
-            span = metadata.msa_decode_span
-            if span is not None and not span.is_mixed:
-                decode_query_len = span.query_len
-                block_table = metadata.msa_block_table[span.row_first : span.row_last]
-                seq_lens_cuda = metadata.msa_seq_lens_cuda[span.row_first : span.row_last]
         else:
             proxy_plan = metadata.msa_eager_proxy_plan
-            max_score = None
             # No host-side empty check: the staged counts are clamped to at
             # least one block, and the kernel masks each query to its own
             # valid-block extent.
             n_valid_blocks = metadata.msa_eager_n_valid_blocks
             if n_valid_blocks is not None:
                 n_valid_blocks = n_valid_blocks[:num_tokens]
+            # The scorer never allocates: it fills the buffer it is handed.
+            # Shaped to the span's tokens alone, because the proxy writes its
+            # own half as a contiguous [heads, k_tiles, tokens] block (see
+            # msa_proxy_max_score_view) and so cannot take a slice of this one.
+            # The span's tokens are at most a decode step's worth, which is what
+            # the store was sized for.
+            max_score = (
+                metadata.msa_proxy_max_score_view(
+                    config.num_index_heads,
+                    metadata.msa_worst_case_max_k_tiles,
+                    num_tokens - gen_first,
+                )
+                if ported
+                else None
+            )
         return self.indexer.select_blocks(
             idx_q_view,
             idx_k_cache,
@@ -1664,11 +1673,13 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             proxy_plan=proxy_plan,
             max_score=max_score,
             n_valid_blocks=n_valid_blocks,
-            require_cutedsl=use_cutedsl,
+            require_cutedsl=ported,
             head_major_output=head_major_output,
             block_table=block_table,
             seq_lens_cuda=seq_lens_cuda,
             decode_query_len=decode_query_len,
+            gen_token_first=gen_first,
+            ctx_rows=ctx_rows,
         )
 
     def sparse_attn_predict(

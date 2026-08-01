@@ -137,8 +137,7 @@ def run_msa_paged_gqa(
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_decode_span_bounds,
         msa_paged_kv,
-        msa_triton_sparse_decode_active,
-        msa_trtllm_gen_dense_decode_active,
+        msa_ported_decode_active,
         write_msa_main_kv,
     )
 
@@ -174,8 +173,9 @@ def run_msa_paged_gqa(
     # Leading query tokens fmha_sm100 must still run: the whole batch until a
     # ported kernel takes the generation slice, then the context prefix alone.
     fmha_tokens = num_tokens
+    ported = msa_ported_decode_active(metadata)
 
-    if kv_block_indexes is not None and msa_triton_sparse_decode_active(metadata):
+    if kv_block_indexes is not None and ported:
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
             minimax_m3_sparse_attn_decode,
         )
@@ -192,8 +192,8 @@ def run_msa_paged_gqa(
             v_paged,
             # [total_q, num_kv_heads, topk] -> head-major, contiguous when the
             # indexer emitted a head-major table and the slice is the whole
-            # batch (see msa_triton_sparse_decode_active). The kernel takes
-            # every stride, so a mixed step's strided suffix is fine.
+            # batch (see msa_ported_decode_active, which both sites read). The
+            # kernel takes every stride, so a mixed step's strided suffix is fine.
             kv_block_indexes[gen_tok0:].permute(1, 0, 2),
             metadata.msa_block_table[gen_row0:gen_row1],
             metadata.msa_seq_lens_cuda[gen_row0:gen_row1],
@@ -203,7 +203,7 @@ def run_msa_paged_gqa(
         )
         fmha_tokens = gen_tok0
 
-    elif kv_block_indexes is None and msa_trtllm_gen_dense_decode_active(metadata):
+    elif kv_block_indexes is None and ported:
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
             dense_decode_sm_scale,
             dense_decode_supported,
@@ -211,53 +211,44 @@ def run_msa_paged_gqa(
         )
 
         unsupported = dense_decode_supported(kv_cache_manager, q_view)
-        if unsupported is not None and getattr(metadata, "_msa_use_trtllm_gen_dense", None):
+        if unsupported is not None:
             raise RuntimeError(
-                "MiniMax-M3 prepare() resolved this step's dense layers to "
-                f"trtllm-gen and skipped the fmha_sm100 dense plan, but {unsupported} "
-                "The two must agree; see _resolve_decode_kernels. Set "
-                "TLLM_M3_DENSE_DECODE=msa to keep the plan."
+                "MiniMax-M3 resolved a generation span for this step's dense "
+                f"layers and skipped the fmha_sm100 dense plan, but {unsupported} "
+                "The two must agree, and there is no plan left to run the span; "
+                "see _resolve_decode_kernels."
             )
-        if unsupported is None:
-            minimax_m3_trtllm_gen_dense_decode(
-                q_view[gen_tok0:],
-                kv_cache_manager,
-                layer_idx,
-                metadata.msa_block_table[gen_row0:gen_row1],
-                metadata.msa_seq_lens_cuda[gen_row0:gen_row1],
-                sm_scale=dense_decode_sm_scale(head_dim, float(attn.q_scaling)),
-                output=out_view[gen_tok0:],
-                decode_query_len=decode_query_len,
-                # Bounded by the span's own rows, so a long context request
-                # cannot inflate the kernel's scheduling hint.
-                max_seq_len=int(metadata.msa_max_kv_len),
-                max_num_requests=int(metadata.max_num_requests),
-            )
-            fmha_tokens = gen_tok0
+        minimax_m3_trtllm_gen_dense_decode(
+            q_view[gen_tok0:],
+            kv_cache_manager,
+            layer_idx,
+            metadata.msa_block_table[gen_row0:gen_row1],
+            metadata.msa_seq_lens_cuda[gen_row0:gen_row1],
+            sm_scale=dense_decode_sm_scale(head_dim, float(attn.q_scaling)),
+            output=out_view[gen_tok0:],
+            decode_query_len=decode_query_len,
+            # Bounded by the span's own rows, so a long context request
+            # cannot inflate the kernel's scheduling hint.
+            max_seq_len=int(metadata.msa_max_kv_len),
+            max_num_requests=int(metadata.max_num_requests),
+        )
+        fmha_tokens = gen_tok0
 
     if fmha_tokens == 0:
         return
 
     if fmha_tokens == num_tokens:
-        # Reaching fmha_sm100 for the whole batch when prepare() promised a
-        # layer to a ported kernel means the branch above declined after
-        # prepare had already skipped that layer's plan and, on a fully ported
-        # step, the flattened page table the call below reads. Fail loudly:
-        # running on with a stale msa_kv_indices would silently attend the
-        # wrong pages. The flag is absent on metadata built without prepare(),
-        # where nothing was skipped.
-        committed = (
-            "_msa_use_triton_sparse"
-            if kv_block_indexes is not None
-            else "_msa_use_trtllm_gen_dense"
-        )
-        if getattr(metadata, committed, None):
+        # Reaching fmha_sm100 for the whole batch when a span was resolved means
+        # neither branch above took it, after prepare had already skipped this
+        # layer's plan and, on a pure-decode step, the flattened page table the
+        # call below reads. Fail loudly: running on with a stale msa_kv_indices
+        # would silently attend the wrong pages.
+        if ported:
             raise RuntimeError(
                 "MiniMax-M3 paged GQA reached fmha_sm100 with no plan for a "
                 f"{'sparse' if kv_block_indexes is not None else 'dense'} layer. "
-                "prepare() resolved this step to the ported decode kernels; see "
-                "_resolve_decode_kernels. Set TLLM_M3_SPARSE_DECODE=msa and "
-                "TLLM_M3_DENSE_DECODE=msa to keep the fmha_sm100 plans."
+                "The step resolved a generation span, which the ported decode "
+                "kernels own; see _resolve_decode_kernels."
             )
         fmha_rows = None
     else:

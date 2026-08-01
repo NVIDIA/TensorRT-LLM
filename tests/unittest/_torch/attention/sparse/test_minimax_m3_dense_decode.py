@@ -31,7 +31,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
-    msa_trtllm_gen_dense_decode_active,
+    msa_ported_decode_active,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
     _subpage_block_table,
@@ -346,29 +346,18 @@ class _FakeMeta:
 
 
 @pytest.mark.parametrize(
-    "value,decode_query_len,expected",
+    "decode_query_len,expected",
     [
-        (None, 1, True),
-        ("msa", 1, False),
-        ("trtllm_gen", 1, True),
-        ("TRTLLM_GEN", 2, True),
-        ("trtllm_gen", None, False),
-        # A ragged step declines on the default too, not just when asked for.
-        (None, None, False),
+        # A resolved span, single-token or speculative: the kernel owns it
+        # either way, and no switch can hand it back to fmha_sm100.
+        (1, True),
+        (2, True),
+        # No span, so this is a pure prefill and fmha_sm100 runs every row.
+        (None, False),
     ],
 )
-def test_gating(monkeypatch, value, decode_query_len, expected):
-    if value is None:
-        monkeypatch.delenv("TLLM_M3_DENSE_DECODE", raising=False)
-    else:
-        monkeypatch.setenv("TLLM_M3_DENSE_DECODE", value)
-    assert msa_trtllm_gen_dense_decode_active(_FakeMeta(decode_query_len)) is expected
-
-
-def test_gating_rejects_unknown_value(monkeypatch):
-    monkeypatch.setenv("TLLM_M3_DENSE_DECODE", "cutedsl")
-    with pytest.raises(ValueError, match="TLLM_M3_DENSE_DECODE"):
-        msa_trtllm_gen_dense_decode_active(_FakeMeta(1))
+def test_gating(decode_query_len, expected):
+    assert msa_ported_decode_active(_FakeMeta(decode_query_len)) is expected
 
 
 def test_declines_unsupported_geometry():

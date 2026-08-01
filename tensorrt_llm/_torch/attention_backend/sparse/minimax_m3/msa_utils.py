@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -26,47 +25,27 @@ MSA_REQUIRED_HEAD_DIM = 128
 # repository root (see 3rdparty/MSA/LICENSE and 3rdparty/MSA/NOTICE).
 _MSA_PYTHON_RELPATH = Path("3rdparty") / "MSA" / "python"
 
-# Per-kernel implementation switches for the M3 decode path. The first entry of
-# each tuple is the default: the dedicated decode kernel, which the gating below
-# then narrows to the generation rows of a step whose query lengths are uniform
-# across them. Setting a variable to "msa" is the kill switch. These are env
-# vars rather than MiniMaxM3SparseAttentionConfig fields because the config is
-# user-facing Pydantic: adding fields there would need a golden-manifest
-# regeneration plus telemetry CODEOWNER review, which is disproportionate for a
-# kill switch.
-# Read per call, like TLLM_FMHA_LIBS, so tests can flip them with monkeypatch.
-_M3_KERNEL_CHOICES = {
-    "TLLM_M3_INDEXER_SCORE": ("cutedsl", "msa"),
-    "TLLM_M3_SPARSE_DECODE": ("triton", "msa"),
-    "TLLM_M3_DENSE_DECODE": ("trtllm_gen", "msa"),
-}
 
+def msa_ported_decode_active(metadata) -> bool:
+    """Whether this step's generation rows run on the ported decode kernels.
 
-def msa_kernel_choice(env_var: str) -> str:
-    """Return the selected implementation for one of the M3 decode kernels.
+    They always do, when the step has generation rows at all: the Triton sparse
+    kernel, the trtllm-gen dense kernel and the CuTe DSL indexer scorer own the
+    generation span together -- the whole of a pure-decode batch, or the row and
+    token suffix of a mixed one -- and fmha_sm100 is left with the context
+    prefix. There is no per-kernel switch and no fallback for a generation row:
+    a geometry the span's kernels cannot serve raises in prepare() instead of
+    being routed back to fmha_sm100 at several times the decode cost. See
+    _resolve_decode_kernels.
 
-    A dedicated kernel is only a request, whether it came from the default or
-    from the environment: each call site still checks that the geometry is
-    supported and silently falls back to MSA when it is not.
-    """
-    choices = _M3_KERNEL_CHOICES[env_var]
-    value = os.environ.get(env_var)
-    if value is None or not value.strip():
-        return choices[0]
-    value = value.strip().lower()
-    if value not in choices:
-        raise ValueError(f"{env_var}={value!r} is not one of {', '.join(choices)}.")
-    return value
+    So False means only that this step has no span: a pure-prefill step, or --
+    in the standalone kernel tests, whose metadata never ran prepare() -- one
+    that opted out by leaving the query length or the buffers the ported kernels
+    address unset.
 
-
-def _uniform_decode_step(metadata) -> bool:
-    """Whether a generation span was resolved, with a block table to address it.
-
-    The ported kernels derive the request id as ``token // decode_query_len``,
-    so a step whose generation rows are ragged (mixed speculative draft lengths)
-    resolves no span and keeps using the fmha_sm100 plans. A context request in
-    the batch does not disqualify the step: the span covers the generation rows
-    alone and fmha_sm100 keeps the context prefix.
+    One predicate serves every site that has to agree on the span: both
+    attention branches and the indexer, which additionally orients its top-k
+    table for whichever of them consumes it.
     """
     return (
         getattr(metadata, "msa_decode_query_len", None) is not None
@@ -95,70 +74,6 @@ def msa_decode_span_bounds(metadata, num_tokens: int) -> Tuple[int, int, int, in
         return 0, 0, 0, 0
     query_len = int(query_len)
     return 0, 0, num_tokens // query_len, query_len
-
-
-def _resolved_kernel_flag(metadata, attr: str, recompute) -> bool:
-    """Read a prepare()-resolved kernel flag, recomputing only if unresolved.
-
-    prepare() decides once per step and then skips the fmha_sm100 preparation
-    the chosen kernel replaces, so where it resolved a value that value is the
-    only admissible answer: recomputing here could pick a kernel whose inputs
-    were never staged, or decline one whose plan was never built. ``None``
-    means prepare() never ran (the standalone kernel tests build metadata
-    directly), and nothing was skipped, so recomputing is safe there.
-    """
-    resolved = getattr(metadata, attr, None)
-    if resolved is not None:
-        return bool(resolved)
-    return recompute()
-
-
-def msa_cutedsl_indexer_active(metadata) -> bool:
-    """Whether this step's indexer should run the CuTe DSL scorer.
-
-    When True, prepare() skipped the fmha_sm100 proxy plan, so the scorer is
-    the only way to fill max_score and a decline is a hard error.
-    """
-    return _resolved_kernel_flag(
-        metadata,
-        "_msa_use_cutedsl_indexer",
-        lambda: msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
-        and _uniform_decode_step(metadata),
-    )
-
-
-def msa_triton_sparse_decode_active(metadata) -> bool:
-    """Whether this step's sparse layers should run the Triton decode kernel.
-
-    True means the kernel owns the generation span, which is the whole batch on
-    a pure-decode step and its token suffix on a mixed one.
-
-    Both the indexer (which orients its top-k table) and the attention call
-    consult this, so they can never disagree about the layout within a step.
-    """
-    return _resolved_kernel_flag(
-        metadata,
-        "_msa_use_triton_sparse",
-        lambda: msa_kernel_choice("TLLM_M3_SPARSE_DECODE") == "triton"
-        and _uniform_decode_step(metadata),
-    )
-
-
-def msa_trtllm_gen_dense_decode_active(metadata) -> bool:
-    """Whether this step's dense layers should run trtllm-gen decode.
-
-    As with the sparse kernel, this covers the generation span rather than the
-    whole batch. It matters most on a mixed step: fmha_sm100 declines to split a
-    dense plan in TensorRT-LLM's prefill-first order (see _mixed_batch_split in
-    fmha_sm100/api.py), so without this every generation row would otherwise
-    ride the context schedule alongside the prefill rows.
-    """
-    return _resolved_kernel_flag(
-        metadata,
-        "_msa_use_trtllm_gen_dense",
-        lambda: msa_kernel_choice("TLLM_M3_DENSE_DECODE") == "trtllm_gen"
-        and _uniform_decode_step(metadata),
-    )
 
 
 def _find_msa_python_dir() -> Optional[Path]:
@@ -384,13 +299,10 @@ __all__ = [
     "MSA_REQUIRED_HEAD_DIM",
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
-    "msa_cutedsl_indexer_active",
     "msa_decode_span_bounds",
-    "msa_kernel_choice",
     "msa_package_available",
     "msa_paged_kv",
-    "msa_triton_sparse_decode_active",
-    "msa_trtllm_gen_dense_decode_active",
+    "msa_ported_decode_active",
     "per_token_valid_blocks",
     "require_msa_module",
     "select_blocks_from_maxscore",

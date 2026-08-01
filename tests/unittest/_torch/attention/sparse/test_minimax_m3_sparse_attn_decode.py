@@ -17,7 +17,7 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
-    msa_triton_sparse_decode_active,
+    msa_ported_decode_active,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
     SPARSE_BLOCK_SIZE,
@@ -369,27 +369,23 @@ class _FakeMetadata:
 
 
 @pytest.mark.parametrize(
-    ("env", "decode_query_len", "expected"),
+    ("decode_query_len", "expected"),
     [
-        (None, 1, True),
-        ("msa", 1, False),
-        ("triton", 1, True),
-        # A ragged step has no uniform query length, so the kernel's
-        # token -> request mapping does not hold and MSA must run.
-        ("triton", None, False),
-        (None, None, False),
+        # A resolved span, which is every step with generation rows: there is no
+        # switch that can send them to fmha_sm100 instead.
+        (1, True),
+        # No span was resolved, so the step is a pure prefill (or a caller that
+        # opted out) and fmha_sm100 runs every row.
+        (None, False),
     ],
 )
-def test_triton_sparse_decode_gating(monkeypatch, env, decode_query_len, expected):
-    if env is None:
-        monkeypatch.delenv("TLLM_M3_SPARSE_DECODE", raising=False)
-    else:
-        monkeypatch.setenv("TLLM_M3_SPARSE_DECODE", env)
+def test_triton_sparse_decode_gating(decode_query_len, expected):
     metadata = _FakeMetadata(decode_query_len, torch.zeros(1), torch.zeros(1))
-    assert msa_triton_sparse_decode_active(metadata) is expected
+    assert msa_ported_decode_active(metadata) is expected
 
 
-def test_triton_sparse_decode_gating_rejects_missing_buffers(monkeypatch):
-    monkeypatch.setenv("TLLM_M3_SPARSE_DECODE", "triton")
-    assert not msa_triton_sparse_decode_active(_FakeMetadata(1, None, torch.zeros(1)))
-    assert not msa_triton_sparse_decode_active(_FakeMetadata(1, torch.zeros(1), None))
+def test_triton_sparse_decode_gating_rejects_missing_buffers():
+    """The kernel addresses the page table and lengths directly, so a span
+    without them staged is not one it can run."""
+    assert not msa_ported_decode_active(_FakeMetadata(1, None, torch.zeros(1)))
+    assert not msa_ported_decode_active(_FakeMetadata(1, torch.zeros(1), None))

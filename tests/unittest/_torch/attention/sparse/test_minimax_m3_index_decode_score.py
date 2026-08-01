@@ -9,6 +9,8 @@ The PyTorch oracle is ported from the vLLM reference linked in the file header
 (v0.26.1rc0-77-g6f91edf96).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -16,8 +18,8 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
-    msa_kernel_choice,
     msa_package_available,
+    msa_ported_decode_active,
     select_blocks_from_maxscore,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -294,6 +296,101 @@ def test_index_decode_score_matches_msa_proxy(dtype):
 
 
 @skip_not_sm100
+@pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
+@pytest.mark.parametrize("head_major_output", [False, True])
+def test_mixed_batch_split_selects_the_same_blocks_as_the_whole_batch_proxy(head_major_output):
+    """A mixed batch must select the same blocks however it was scored.
+
+    The generation rows move onto the CuTe DSL scorer while the context row
+    stays on the fmha_sm100 proxy, now planned over its row alone, so the two
+    halves are scored into separate buffers and their tables joined. The gate is
+    that the joined table is the one the whole-batch proxy would have produced.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import MsaIndexer
+
+    _runner()
+
+    # One context request prefilling a fresh 300-token prompt, then three decode
+    # rows. Their KV lengths span 2 to 33 blocks, so top-k of 16 is a real choice
+    # for the longest of them.
+    qo_lens_cpu = torch.tensor([300, 1, 1, 1], dtype=torch.int32)
+    kv_lens_cpu = torch.tensor([300, 1025, 4097, 130], dtype=torch.int32)
+    qo_offset_cpu = kv_lens_cpu - qo_lens_cpu
+    ctx_rows, ctx_tokens = 1, 300
+    batch, total_q = int(qo_lens_cpu.shape[0]), int(qo_lens_cpu.sum())
+
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    max_blocks = int((kv_lens_cpu.max().item() + PAGE_SIZE - 1) // PAGE_SIZE)
+    num_pages = batch * max_blocks
+    block_table = (
+        torch.randperm(num_pages, device="cuda", generator=generator)
+        .to(torch.int32)
+        .reshape(batch, max_blocks)
+    )
+    # Four index heads over two KV heads, so the amax reduce to KV-head
+    # granularity runs on both halves and the two output layouts differ.
+    num_index_heads, num_kv_heads = 4, 2
+    idx_q = torch.randn(
+        total_q, num_index_heads, HEAD_DIM, device="cuda", generator=generator
+    ).bfloat16()
+    idx_k_paged = torch.randn(
+        num_pages, PAGE_SIZE, HEAD_DIM, device="cuda", generator=generator
+    ).bfloat16()[:, None]
+    kv_indices = build_kv_page_indices(block_table.cpu(), kv_lens_cpu, PAGE_SIZE).cuda()
+
+    indexer = MsaIndexer(
+        MiniMaxM3SparseConfig(
+            num_q_heads=8,
+            num_kv_heads=num_kv_heads,
+            head_dim=HEAD_DIM,
+            num_index_heads=num_index_heads,
+            sparse_index_dim=HEAD_DIM,
+            block_size=PAGE_SIZE,
+            topk=MSA_REQUIRED_TOPK,
+        )
+    )
+    common = dict(
+        idx_sm_scale=HEAD_DIM**-0.5,
+        kv_indices=kv_indices,
+        qo_lens_cpu=qo_lens_cpu,
+        kv_lens_cpu=kv_lens_cpu,
+        qo_offset_cpu=qo_offset_cpu,
+        head_major_output=head_major_output,
+    )
+
+    # No score buffer, so the scorer is not even attempted and the proxy plans
+    # the whole batch inline: the pre-split behaviour of every mixed step.
+    reference = indexer.select_blocks(idx_q, idx_k_paged, **common)
+
+    # Mirrors the plan's max_k_tiles alignment, so the span's buffer is wider
+    # than any one request's block count, as it is in production.
+    max_score = torch.full(
+        (num_index_heads, ((max_blocks + 15) // 16) * 16, total_q - ctx_tokens),
+        -float("inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    split = indexer.select_blocks(
+        idx_q,
+        idx_k_paged,
+        max_score=max_score,
+        block_table=block_table[ctx_rows:],
+        seq_lens_cuda=kv_lens_cpu[ctx_rows:].cuda(),
+        decode_query_len=1,
+        require_cutedsl=True,
+        gen_token_first=ctx_tokens,
+        ctx_rows=ctx_rows,
+        **common,
+    )
+
+    assert torch.equal(split, reference)
+    # The Triton sparse decode kernel reads the table head-major, so a joined
+    # table must permute to a contiguous view exactly as an unjoined one does.
+    assert split.permute(1, 0, 2).is_contiguous() is head_major_output
+
+
+@skip_not_sm100
 def test_index_decode_score_cuda_graph_replay_tracks_inputs():
     seq_lens = [1025, 4097]
     idx_q, k_cache, block_table, seq_lens_dev, backing, score, _ = _make_inputs(
@@ -378,23 +475,15 @@ def test_cutedsl_score_helper_falls_back_on_unsupported_geometry():
     )
 
 
-def test_msa_kernel_choice_defaults_and_overrides(monkeypatch):
-    monkeypatch.delenv("TLLM_M3_INDEXER_SCORE", raising=False)
-    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
+def test_scorer_inputs_alone_decide_that_it_runs():
+    """The scorer runs on whatever span it is handed, with nothing else to
+    consult: prepare() passes the buffers exactly when it resolved one."""
+    metadata = SimpleNamespace(
+        msa_decode_query_len=1,
+        msa_block_table=object(),
+        msa_seq_lens_cuda=object(),
+    )
+    assert msa_ported_decode_active(metadata) is True
 
-    monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "cutedsl")
-    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
-
-    # The kill switch, and that it survives the same normalization.
-    monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "msa")
-    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "msa"
-
-    monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "  MSA ")
-    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "msa"
-
-    monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "")
-    assert msa_kernel_choice("TLLM_M3_INDEXER_SCORE") == "cutedsl"
-
-    monkeypatch.setenv("TLLM_M3_INDEXER_SCORE", "nope")
-    with pytest.raises(ValueError, match="TLLM_M3_INDEXER_SCORE"):
-        msa_kernel_choice("TLLM_M3_INDEXER_SCORE")
+    metadata.msa_decode_query_len = None
+    assert msa_ported_decode_active(metadata) is False
