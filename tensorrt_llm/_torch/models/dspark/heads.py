@@ -276,11 +276,30 @@ class DSparkConfidenceHead(nn.Module):
         without the transfer that is a device-mismatch ``RuntimeError`` on the
         first step that reaches calibration. The branch is host-side and the
         devices match on the in-graph path, so nothing extra is captured.
+
+        The host copy is cached rather than re-fetched. Transferring the table
+        per call is a device->host copy into pageable memory, which serializes
+        the stream, and it lands on the planner's path once per decode step --
+        and only once a profiled cost table exists, i.e. exactly in the
+        configuration where the feature is supposed to pay for itself. The table
+        is written only through :meth:`load_sts_temperatures`, which refreshes
+        this cache, so it cannot go stale.
         """
         temperatures = self.sts_temperatures
         if temperatures.device != confidence_logits.device:
-            temperatures = temperatures.to(confidence_logits.device)
+            if confidence_logits.device.type == "cpu":
+                temperatures = self._host_sts_temperatures()
+            else:
+                temperatures = temperatures.to(confidence_logits.device)
         return torch.sigmoid(confidence_logits.float() / temperatures)
+
+    def _host_sts_temperatures(self) -> torch.Tensor:
+        """CPU mirror of ``sts_temperatures``, materialized at most once."""
+        cached = getattr(self, "_sts_temperatures_host", None)
+        if cached is None:
+            cached = self.sts_temperatures.detach().to("cpu")
+            self._sts_temperatures_host = cached
+        return cached
 
     @torch.no_grad()
     def load_sts_temperatures(self, temperatures: torch.Tensor) -> None:
@@ -294,6 +313,8 @@ class DSparkConfidenceHead(nn.Module):
         if not bool(torch.all(flat > 0.0)):
             raise ValueError("STS temperatures must be strictly positive")
         self.sts_temperatures.copy_(flat)
+        # Drop the CPU mirror; apply_sts rebuilds it on next use.
+        self._sts_temperatures_host = None
 
     def load_weights(self, weights: list) -> None:
         """Strict loader that refuses to silently drop a checkpoint bias.

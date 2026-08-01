@@ -3984,8 +3984,18 @@ class PyTorchModelEngine(ModelEngine):
                 dtype=torch.long,
                 pin_memory=prefer_pinned()).to(new_tokens_lens_device.device,
                                                non_blocking=True)
+            # `output_size` is not optional here. With a tensor `repeats`,
+            # repeat_interleave has to know the output length before it can
+            # allocate, and without this it gets it by reading the cumulative
+            # sum back to the host -- a device->host sync on every ragged step,
+            # inside the overlap scheduler's window, which is precisely what
+            # overlap exists to avoid. The total is already known on the host:
+            # the caller derived `total_num_tokens` as
+            # `sum(tokens_per_extend_request)`.
             previous_pos_indices = torch.repeat_interleave(
-                previous_slots, tokens_per_request_device)
+                previous_slots,
+                tokens_per_request_device,
+                output_size=total_num_tokens)
             previous_kv_len_offsets = (new_tokens_lens_device[previous_slots] -
                                        tokens_per_request_device)
         else:
