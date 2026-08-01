@@ -2467,11 +2467,32 @@ class PyExecutor:
         if stats is None or not getattr(stats, "steps_total", 0):
             return
         stats.log_summary(prefix="DSpark ragged verify [final]")
-        if os.environ.get("TLLM_DSPARK_ASSERT_ACTIVE", "") in ("1", "true",
-                                                              "True"):
-            # require_trim is deliberately on: a run that produced windows but
-            # never shortened one delivered the uniform baseline.
-            stats.assert_ragged_active(require_trim=True)
+        raw = os.environ.get("TLLM_DSPARK_ASSERT_ACTIVE", "")
+        if not raw or raw in ("0", "false", "False"):
+            return
+        # The value is a MINIMUM STEP COUNT, not a boolean. An engine build
+        # spins up more than one executor -- KV-cache estimation runs a
+        # throwaway one that completes a couple of decode steps and shuts down
+        # -- and asserting on that one kills the run before the real work
+        # starts, reporting "the feature did nothing" about an executor that was
+        # never asked to do anything. Requiring a floor is what distinguishes
+        # "the scheduler declined" from "this executor barely ran".
+        try:
+            min_steps = 32 if raw in ("1", "true", "True") else int(raw)
+        except ValueError:
+            logger.warning(
+                f"ignoring TLLM_DSPARK_ASSERT_ACTIVE={raw!r}: expected a "
+                f"minimum decode-step count, or 1 for the default")
+            return
+        if stats.steps_total < min_steps:
+            logger.info(
+                f"DSpark ragged verify: skipping the active-path assertion, "
+                f"this executor ran {stats.steps_total} decode step(s) "
+                f"(< {min_steps}).")
+            return
+        # require_trim is deliberately on: a run that produced windows but
+        # never shortened one delivered the uniform baseline.
+        stats.assert_ragged_active(require_trim=True)
 
     def _executor_loop_cleanup(self):
         try:
