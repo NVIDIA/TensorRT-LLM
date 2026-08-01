@@ -296,7 +296,7 @@ class GvrTopKKernel:
         p4_exact_tail: Optional[bool] = None,
         p4_tail_fast: Optional[bool] = None,  # [p4tt]
         p4_tail_v3: Optional[bool] = None,
-        p1r_rescue: Optional[bool] = None,
+        p1r_rescue: bool = True,
         num_bins: Optional[int] = None,
         p4_warp_redundant: bool = True,
         p2_warp_redundant: bool = True,
@@ -760,13 +760,10 @@ class GvrTopKKernel:
             )
         self.p4_tail_v3 = bool(p4_tail_v3)
         # p1r_rescue: rebuild the refine bracket from the row when the
-        # seed bracket is degenerate - the assisted tiers seed from the
-        # previous step's topk, and a request's first decode step feeds a
-        # zero-init prev_topk, so they need it. Defaults to the tiers
-        # only: on the stock path it would add ~450 PTX instructions
-        # (3.3%) for a case that path cannot reach the same way.
-        if p1r_rescue is None:
-            p1r_rescue = bool(use_ext_counts or use_ext_cand or ext_rungs or self_scan)
+        # seed bracket is degenerate. ON by default - upstream's identity
+        # shortcut is wrong on real data (every request's first decode
+        # step feeds a zero-init prev_topk). The knob exists to measure
+        # its cost, not to ship it off.
         self.p1r_rescue = bool(p1r_rescue)
 
     # ------------------------------------------------------------------
