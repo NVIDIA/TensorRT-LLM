@@ -116,7 +116,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         )
     )
 
-    monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(model_loader_mod, "timing_metric", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
     monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
     # These tests stub ModelConfig, while SourceIdentity has dedicated
@@ -151,11 +151,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     )
     monkeypatch.setattr(model_loader_mod, "get_rank_model_storage", lambda _model: 0)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda: SimpleNamespace(synchronize=lambda: None),
-    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     return loader
 
 
