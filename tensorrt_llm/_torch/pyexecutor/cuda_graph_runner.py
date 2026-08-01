@@ -307,6 +307,21 @@ class CUDAGraphRunner:
         return total if total else None
 
     @staticmethod
+    def _local_draft_len(batch: ScheduledRequests) -> int:
+        """This rank's draft length, for the attention-DP shape comparison.
+
+        Deliberately tolerant where :meth:`get_graph_key` asserts: this runs
+        before the batch is known to be graphable, and a batch whose requests
+        disagree has no single draft length to compare. Reporting the maximum
+        makes such a batch differ from a well-formed peer, which is the
+        conservative answer -- the gate then declines the graph.
+        """
+        return max(
+            (len(request.py_draft_tokens)
+             for request in batch.generation_requests),
+            default=0)
+
+    @staticmethod
     def _get_mrope_position_delta(request: Any) -> Optional[Any]:
         mrope_position_delta = getattr(request, "py_mrope_position_delta", None)
         if mrope_position_delta is not None:
@@ -360,15 +375,36 @@ class CUDAGraphRunner:
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            all_can_graph_batch = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
+            # goal doc §4.4. Comparing only "all generation" and the batch size
+            # is not enough once the token count stops being a function of the
+            # row count. Under ragged verification a rank that fell back to
+            # uniform scheduling produces the same batch size but a different
+            # token total, so this gate used to pass and let one rank replay a
+            # graph full of collectives while another ran a different width.
+            # That mismatch is undetectable at replay time: `all_rank_num_tokens`
+            # is a host list read inside forward, so the captured graph keeps
+            # using the value it saw at capture. Compare every component of the
+            # key that a rank can decide for itself.
+            #
+            # `draft_len` is agreed by the DSpark planner's single collective,
+            # but it is also settable rank-locally by the acceptance-rate
+            # speculation gate, so it is compared here too rather than assumed.
+            # -1 stands in for "uniform batch" / "not applicable" so the payload
+            # is plain ints on every rank and compares elementwise.
+            local_bucket = self._ragged_verify_bucket(
+                batch) if can_run_cuda_graph else None
+            all_can_graph_batch = self.config.dist.tp_allgather([
+                can_run_cuda_graph, batch_size,
+                -1 if local_bucket is None else int(local_bucket),
+                self._local_draft_len(batch) if can_run_cuda_graph else -1
+            ])
             is_all_gen_only = all(all_can_graph[0]
                                   for all_can_graph in all_can_graph_batch)
-            all_batch_size_equal = all(
-                all_gen_only[1] == all_can_graph_batch[0][1]
-                for all_gen_only in all_can_graph_batch)
+            all_shapes_equal = all(
+                peer[1:] == all_can_graph_batch[0][1:]
+                for peer in all_can_graph_batch)
 
-            if not is_all_gen_only or not all_batch_size_equal:
+            if not is_all_gen_only or not all_shapes_equal:
                 return None, None, None
 
         if not self.enabled or not can_run_cuda_graph:

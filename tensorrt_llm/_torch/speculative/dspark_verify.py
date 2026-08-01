@@ -171,12 +171,26 @@ class DSparkVerifyPlanner:
             return None
         return selected
 
+    def snap_to_tier(self, value: int) -> int:
+        """Round ``value`` up to a captured tier.
+
+        Callers that reduce across ranks themselves need this: the reduced value
+        is a maximum over per-rank choices and so is already a tier, but a caller
+        combining it with anything else has to land back on the ladder before it
+        can be used as a graph key.
+        """
+        value = int(value)
+        if value in self.tiers:
+            return value
+        return min((t for t in self.tiers if t >= value), default=self.max_tier)
+
     def decide_draft_len(
         self,
         *,
         num_gen_requests: int,
         rows: Optional[Sequence[int]] = None,
         all_rank_max: Optional[Callable[[int], int]] = None,
+        reduce_across_ranks: bool = True,
     ) -> int:
         """Choose this iteration's draft length, agreed across all ranks.
 
@@ -189,9 +203,17 @@ class DSparkVerifyPlanner:
         :meth:`_gather_rows`. ``all_rank_max`` overrides the constructor's
         reduction; the caller that owns the distributed handle usually supplies
         it here.
+
+        ``reduce_across_ranks=False`` returns the *local* choice and issues no
+        collective, leaving the agreement to a caller that batches it with its
+        other cross-rank traffic. Since the reduction is a max over tiers, and
+        every local choice is already a tier, the caller only has to reduce and
+        pass the result through :meth:`snap_to_tier`.
         """
         self.stats["decisions"] += 1
         chosen = self._decide_local(num_gen_requests=num_gen_requests, rows=rows)
+        if not reduce_across_ranks:
+            return int(chosen)
         all_rank_max = all_rank_max or self.all_rank_max
         if all_rank_max is not None:
             # Max, not min: a rank that wanted to trim more simply verifies a few
@@ -208,6 +230,7 @@ class DSparkVerifyPlanner:
         num_gen_requests: int,
         rows: Optional[Sequence[int]] = None,
         all_rank_max: Optional[Callable[[int], int]] = None,
+        reduce_across_ranks: bool = True,
     ) -> Optional[List[int]]:
         """Per-request verify lengths for a ragged step, or None to stay uniform.
 
@@ -273,10 +296,19 @@ class DSparkVerifyPlanner:
         budget = int(num_gen_requests) * (int(uniform_len) - self.cfg.min_verify_len)
         lens = schedule_verify_lens_topk(survival=survival, budget=budget, cfg=self.cfg).tolist()
 
-        all_rank_max = all_rank_max or self.all_rank_max
-        if all_rank_max is not None:
-            agreed_max = int(all_rank_max(int(max(lens))))
-            lens = [min(int(v), agreed_max) for v in lens]
+        # `reduce_across_ranks=False` means the caller is doing the cross-rank
+        # agreement itself. That is not just an optimization here: every early
+        # return above is rank-local (an empty batch, an unprofiled cost table,
+        # a confidence snapshot whose copy event has not landed yet -- that last
+        # one is timing-dependent), so a collective issued *after* them is issued
+        # by some ranks and not others. Deciding locally and reducing once,
+        # unconditionally, at a point every rank reaches is the only shape of
+        # this that cannot deadlock.
+        if reduce_across_ranks:
+            all_rank_max = all_rank_max or self.all_rank_max
+            if all_rank_max is not None:
+                agreed_max = int(all_rank_max(int(max(lens))))
+                lens = [min(int(v), agreed_max) for v in lens]
         assert len(lens) == num_gen_requests, (
             f"internal: produced {len(lens)} verify lengths for {num_gen_requests} requests"
         )

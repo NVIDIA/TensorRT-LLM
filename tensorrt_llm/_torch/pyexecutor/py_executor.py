@@ -3217,24 +3217,6 @@ class PyExecutor:
             for request in gen_requests
         ]
 
-        # Cross-rank agreement: draft_len is part of the CUDA-graph key but is
-        # NOT covered by the attention-DP consistency allgather, so ranks that
-        # pick different lengths select different graphs -- one replays, one
-        # falls back to eager -- and their collectives diverge. Reduce here.
-        #
-        # This costs one extra blocking host collective per decode step under
-        # ADP. ``_can_queue`` already runs ``tp_allgather(batch_size)`` just
-        # before this hook, so the two could be fused into a single
-        # ``[batch_size, local_draft_len]`` gather -- but that means computing
-        # the local draft length inside ``_can_queue``, which is a hot generic
-        # path shared by every speculation mode. Left separate deliberately;
-        # fuse only if the extra collective shows up in a profile.
-        all_rank_max = None
-        if self.dist is not None and getattr(self.dist, "tp_size", 1) > 1:
-
-            def all_rank_max(value: int) -> int:
-                return max(int(v) for v in self.dist.tp_allgather(int(value)))
-
         # The mode, not the config flag, decides whether windows are computed:
         # the environment override exists so a run can be switched between
         # `static` and `compact` without editing the serving config, and every
@@ -3245,34 +3227,97 @@ class PyExecutor:
                            getattr(self.model_engine.spec_config,
                                    "enable_ragged_verify", False))
 
+        is_distributed = (self.dist is not None
+                          and getattr(self.dist, "tp_size", 1) > 1)
+
+        # --- Phase 1: decide locally, issue nothing ---------------------------
+        #
+        # goal doc H9. Every reason to give up on a ragged split is rank-local,
+        # and one of them -- whether the confidence snapshot's copy event has
+        # landed (`_ready_snapshot`) -- is timing-dependent, so it can differ
+        # between ranks on the same step for no reason the ranks can see. A
+        # collective placed after those checks is therefore entered by some
+        # ranks and skipped by others: the rank that went ragged used to issue
+        # two (the planner's max, then `peer_stats`), a rank that declined
+        # issued one, and a rank that declined only at the bucket fit issued
+        # three. That is a deadlock, and it is a timing-dependent one.
+        #
+        # So: nothing below this point may branch on rank-local state before the
+        # single collective, and nothing after it may issue another one.
         ragged_lens = None
         fallback_reason = None
+        local_tier = planner.max_tier
         if compute_windows:
             ragged_lens = planner.decide_verify_lens(
                 num_gen_requests=num_gen_requests,
                 rows=confidence_rows,
-                all_rank_max=all_rank_max)
+                reduce_across_ranks=False)
             if ragged_lens is None:
                 fallback_reason = "planner_declined"
         else:
             fallback_reason = "mode_static"
+            # Only computed on the uniform path so the planner's fallback
+            # counters keep meaning "this step declined to trim" exactly once.
+            # On the ragged path the placeholder above is the largest tier --
+            # i.e. verify everything -- which is the documented safe answer for
+            # the case this value is actually used: some *other* rank declined
+            # and dragged the whole group back to a uniform step.
+            local_tier = planner.decide_draft_len(
+                num_gen_requests=num_gen_requests,
+                rows=confidence_rows,
+                reduce_across_ranks=False)
 
+        # --- Phase 2: one collective, same shape on every rank, every step ----
+        #
+        # Carries everything the rest of the step needs, so the `peer_stats`
+        # gather that used to follow is folded in here rather than added to it:
+        #   [wants_ragged, num_rows, total_verify_tokens, max_window, tier]
+        # `_can_queue` already runs `tp_allgather(batch_size)` just before this
+        # hook and could absorb this too, but that would mean computing the
+        # local draft length inside a hot path shared by every speculation mode.
+        local_rows = len(ragged_lens) if ragged_lens is not None else 0
+        local_tokens = (sum(1 + int(v)
+                            for v in ragged_lens) if ragged_lens else 0)
+        local_max_window = max(ragged_lens) if ragged_lens else 0
+        peer_stats = None
+        if is_distributed:
+            payloads = self.dist.tp_allgather([
+                1 if ragged_lens is not None else 0,
+                local_rows,
+                local_tokens,
+                local_max_window,
+                int(local_tier),
+            ])
+            if not all(int(payload[0]) for payload in payloads):
+                # Any rank that cannot go ragged takes the whole group with it:
+                # a mixed step means one rank replays a ragged graph while
+                # another runs a different token count, and `all_rank_num_tokens`
+                # is frozen into the captured graph, so the mismatch would not
+                # even be observable at replay time.
+                if ragged_lens is not None:
+                    fallback_reason = "peer_declined"
+                ragged_lens = None
+            else:
+                agreed_max = max(int(payload[3]) for payload in payloads)
+                ragged_lens = [min(int(v), agreed_max) for v in ragged_lens]
+                peer_stats = [[int(payload[1]),
+                               int(payload[2])] for payload in payloads]
+            agreed_tier = max(int(payload[4]) for payload in payloads)
+        else:
+            agreed_tier = int(local_tier)
+
+        # --- Phase 3: no more collectives -------------------------------------
+        #
         # Land the batch's token total on a captured bucket before the graph key
         # is built, spending the rounding slack on real verification. A batch
         # with no captured shape gets None back and falls through to uniform,
         # which always has a graph -- running ragged without one would cost far
-        # more than the trimmed tokens save.
+        # more than the trimmed tokens save. This can still come out differently
+        # on different ranks (the pad-row fit is sized from the local request
+        # count), which is why the attention-DP graph gate compares the token
+        # bucket and not just the batch size.
         bucket = None
         if ragged_lens is not None:
-            # Under ADP the batch is padded to the widest rank's request count,
-            # so the shape has to be chosen from every rank's (rows, tokens) --
-            # sizing it locally makes each rank pick a different bucket, i.e.
-            # a different graph.
-            peer_stats = None
-            if self.dist is not None and getattr(self.dist, "tp_size", 1) > 1:
-                peer_stats = self.dist.tp_allgather(
-                    [len(ragged_lens),
-                     sum(1 + int(v) for v in ragged_lens)])
             bucket = self.model_engine.fit_ragged_verify_lens(
                 gen_requests, ragged_lens, peer_stats=peer_stats)
             if bucket is None:
@@ -3322,10 +3367,8 @@ class PyExecutor:
             # layout with uniform acceptance -- silent token misattribution.
             for request in gen_requests:
                 request.py_verify_len = None
-            runtime_draft_len = planner.decide_draft_len(
-                num_gen_requests=num_gen_requests,
-                rows=confidence_rows,
-                all_rank_max=all_rank_max)
+            # Already agreed in phase 2 -- deliberately not another collective.
+            runtime_draft_len = planner.snap_to_tier(agreed_tier)
 
         # Stage this step's confidence for the *next* decision. Non-blocking; if
         # it has not landed by then the planner just verifies the full block.
