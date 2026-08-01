@@ -397,6 +397,7 @@ def _decode_packed_int32_ue8m0(packed_int32):
     (16, 7168),
     (127, 4096),
     (1024, 7168),
+    pytest.param(262141, 128, id="grid-y-overflow"),
 ])
 def test_fp8_quantize_1x128_packed_ue8m0_matches_legacy(m, k):
     """The fused packed op should produce the same FP8 output and UE8M0

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from functools import partial
+import os
 from typing import Any, Dict, List, Optional, Tuple
 from typing import Mapping as TMapping
 
@@ -46,13 +46,20 @@ from ..attention_backend.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
-from ..distributed import AllReduce, AllReduceParams, MiniMaxAllReduceRMS
+from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
+from ..modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+    copy_weight,
+    load_weight_shard,
+)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import (
@@ -64,7 +71,13 @@ from ..utils import (
 )
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    ModelConfig,
+    filter_weights,
+    register_auto_model,
+)
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
@@ -246,11 +259,18 @@ def _build_swiglu_oai_dense_mlp(
     # MoE composition) carries its own reduction unless ADP collapses
     # TP to 1.
     reduce_output = False if is_shared_expert else (not enable_adp)
+    # SwiGLU-OAI is plain SwiGLU with an alpha gain and an (up + 1) offset, so
+    # the fused silu_and_mul kernel runs it in one launch with an optional fp8
+    # epilogue. Mirrors the routed-expert SwigluBias path; the math lives in
+    # _minimax_m3_swiglu_oai.
     return GatedMLP(
         hidden_size=config.hidden_size,
         intermediate_size=intermediate_size,
         bias=False,
-        activation=partial(_minimax_m3_swiglu_oai, alpha=swiglu_alpha, limit=swiglu_limit),
+        activation=torch.nn.functional.silu,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=1.0,
+        swiglu_limit=swiglu_limit,
         dtype=config.torch_dtype,
         config=model_config,
         overridden_tp_size=1 if enable_adp else None,
@@ -629,7 +649,7 @@ def minimax_m3_attn_custom_op_inplace(
     """Run MiniMax-M3 cache and attention work behind a compile boundary."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     num_tokens = attn_metadata.num_tokens
-    attn_layer._attention_core(
+    attn_layer._dispatch_attention_backend(
         q[:num_tokens],
         k[:num_tokens],
         v[:num_tokens],
@@ -645,12 +665,10 @@ class MiniMaxM3Attention(Attention):
 
     Both branches share the same dense GQA scaffolding (``qkv_proj`` +
     ``o_proj`` + per-head Gemma Q/K norm + partial RoPE). Sparse layers
-    additionally carry the MiniMax index branch (``index_q_proj``,
-    ``index_k_proj`` and their per-head norms). The index value/output
-    branch is omitted because the M3 checkpoint sets
-    ``sparse_disable_index_value=True`` on every sparse layer; if a
-    future config variant flips that flag the gate will catch the
-    unmapped keys.
+    additionally carry the MiniMax index branch: a fused index_qk_proj that
+    outputs [idx_q | idx_k], plus per-head index norms. The index value and
+    output branch is omitted because the M3 checkpoint sets
+    sparse_disable_index_value=True on every sparse layer.
     """
 
     def __init__(
@@ -660,6 +678,7 @@ class MiniMaxM3Attention(Attention):
         layer_idx: Optional[int] = None,
         is_sparse_attention_layer: bool = False,
         disable_index_value: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -691,6 +710,10 @@ class MiniMaxM3Attention(Attention):
             getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         )
 
+        # Dtype of the q/k/v activations fed into norm and RoPE. KV-cache
+        # quantization changes cache storage only, so this stays the compute dtype.
+        self.attn_activation_dtype = config.torch_dtype
+
         # Per-head Gemma RMSNorm — one set of weights shared across heads.
         self.q_norm = RMSNorm(
             hidden_size=self.head_dim_value,
@@ -705,6 +728,12 @@ class MiniMaxM3Attention(Attention):
             use_gemma=self.use_gemma_norm,
         )
 
+        # Stream and events used to overlap independent projection/norm/RoPE
+        # work. The stream is shared across layers via aux_stream_dict, matching
+        # DeepSeekV3; a private stream is used when no stream is supplied.
+        self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream()
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
         self.disable_index_value = bool(disable_index_value)
         if self.is_sparse_attention_layer:
@@ -717,33 +746,23 @@ class MiniMaxM3Attention(Attention):
             self.sparse_local_block = int(sparse_cfg.get("sparse_local_block", 1))
             self.sparse_score_type = str(sparse_cfg.get("sparse_score_type", "max"))
 
-            # index_q_proj is **replicated** across TP ranks. The sparse
-            # forward reshapes idx_q to
-            # ``[num_tokens, sparse_num_index_heads, sparse_index_dim]``,
-            # which requires the rank-local idx_q to carry all heads.
-            index_q_total = self.sparse_num_index_heads * self.sparse_index_dim
-            self.index_q_proj = Linear(
+            # Index Q and K are both replicated and project the same
+            # hidden_states, so fuse them into one GEMM with output
+            # [idx_q | idx_k]. idx_q holds all index heads; idx_k is a single K
+            # per token, broadcast across heads when scoring.
+            self.index_q_size = self.sparse_num_index_heads * self.sparse_index_dim
+            self.index_k_size = self.sparse_index_dim
+            self.index_qk_proj = Linear(
                 config.hidden_size,
-                index_q_total,
+                self.index_q_size + self.index_k_size,
                 bias=False,
                 dtype=config.torch_dtype,
                 mapping=model_config.mapping,
                 tensor_parallel_mode=None,
                 quant_config=None,
-                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-            )
-            # index_k_proj is also replicated across TP ranks and
-            # outputs ``sparse_index_dim`` channels — a single K per
-            # token (not per-head), broadcast across index heads when
-            # scoring blocks.
-            self.index_k_proj = Linear(
-                config.hidden_size,
-                self.sparse_index_dim,
-                bias=False,
-                dtype=config.torch_dtype,
-                mapping=model_config.mapping,
-                tensor_parallel_mode=None,
-                quant_config=None,
+                weights_loading_config=WeightsLoadingConfig(
+                    weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
+                ),
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
             # Per-head Gemma RMSNorm of width ``sparse_index_dim``;
@@ -774,8 +793,23 @@ class MiniMaxM3Attention(Attention):
         """
         q_shape = q.shape
         k_shape = k.shape
-        q = self.q_norm(q.reshape(-1, self.head_dim_value)).reshape(q_shape)
-        k = self.k_norm(k.reshape(-1, self.head_dim_value)).reshape(k_shape)
+
+        def _q_norm():
+            return self.q_norm(q.reshape(-1, self.head_dim_value)).reshape(q_shape)
+
+        def _k_norm():
+            return self.k_norm(k.reshape(-1, self.head_dim_value)).reshape(k_shape)
+
+        # The q-norm and k-norm are independent, so overlap them on the aux
+        # stream. Multi-stream is disabled under torch.compile.
+        q, k = maybe_execute_in_parallel(
+            _q_norm,
+            _k_norm,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
         return q, k
 
     def apply_index_qk_norm(
@@ -802,32 +836,101 @@ class MiniMaxM3Attention(Attention):
             )
         idx_q_shape = idx_q.shape
         idx_k_shape = idx_k.shape
-        idx_q = self.index_q_norm(idx_q.reshape(-1, self.sparse_index_dim)).reshape(idx_q_shape)
-        idx_k = self.index_k_norm(idx_k.reshape(-1, self.sparse_index_dim)).reshape(idx_k_shape)
+
+        def _idx_q_norm():
+            return self.index_q_norm(idx_q.reshape(-1, self.sparse_index_dim)).reshape(idx_q_shape)
+
+        def _idx_k_norm():
+            return self.index_k_norm(idx_k.reshape(-1, self.sparse_index_dim)).reshape(idx_k_shape)
+
+        idx_q, idx_k = maybe_execute_in_parallel(
+            _idx_q_norm,
+            _idx_k_norm,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
         return idx_q, idx_k
 
-    def apply_rope(
+    def _fused_qk_norm_rope(
         self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        position_ids: torch.Tensor,
-    ):
-        """Run per-head QK norm before partial RoPE.
+        qkv: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        *,
+        num_heads_q: int,
+        num_heads_k: int,
+        num_heads_v: int,
+        head_dim: int,
+        q_norm: RMSNorm,
+        k_norm: RMSNorm,
+    ) -> Optional[torch.Tensor]:
+        """Fuse per-head Gemma RMSNorm and partial RoPE into one kernel.
 
-        The base ``Attention.apply_rope`` consumes split q/k/v. We split,
-        apply per-head QK norm, then defer to the base partial-RoPE
-        implementation (driven by ``RopeParams.dim < head_dim``).
+        Runs torch.ops.trtllm.fused_qk_norm_rope over the packed
+        [Q heads, K heads, optional V heads] layout and returns the mutated
+        tensor, which aliases qkv when qkv is already contiguous. The kernel
+        norms the full head_dim and rotates only the leading rotary_dim
+        channels, matching M3's whole-head norm with front partial RoPE, and
+        leaves the V heads untouched.
+
+        Returns None with qkv unmodified when the kernel does not apply, so the
+        caller runs norm and RoPE separately: non-bf16 activations (the kernel
+        is bf16-only), missing position_ids, or no rotary embedding.
         """
-        q, k, v = self.split_qkv(q, k, v)
-        q, k = self.apply_qk_norm(q, k)
-        return super().apply_rope(q, k, v, position_ids)
+        if position_ids is None or qkv.dtype != torch.bfloat16:
+            return None
+        if (
+            self.rotary_emb is None
+            or self.pos_embd_params is None
+            or self.pos_embd_params.rope is None
+        ):
+            return None
+
+        # Partial-RoPE dim comes from RopeParams (M3 rotates 64 of 128).
+        rotary_dim = int(self.pos_embd_params.rope.dim)
+        # The kernel assumes a contiguous [num_tokens, total_heads * head_dim].
+        qkv = qkv.contiguous()
+        torch.ops.trtllm.fused_qk_norm_rope(
+            qkv,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_dim,
+            rotary_dim,
+            q_norm.variance_epsilon,
+            q_norm.weight,
+            k_norm.weight,
+            self.pos_embd_params.rope.theta,
+            self.pos_embd_params.is_neox,
+            position_ids.reshape(-1).contiguous().to(torch.int32),
+            1.0,  # factor: no YARN (M3 has no rope_scaling)
+            0.0,  # low
+            0.0,  # high
+            1.0,  # attention_factor
+            True,  # is_qk_norm
+            self.use_gemma_norm,  # use_gemma
+            False,  # use_mrope
+            0,  # mrope_section1
+            0,  # mrope_section2
+        )
+        return qkv
+
+    def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
+        """Whether the fused kernel is expected to run instead of the fallback.
+
+        Every M3 config keeps bf16 attention activations, so with position_ids
+        present a fallback means the fused kernel silently stopped applying.
+        The forward paths assert on this.
+        """
+        return self.attn_activation_dtype == torch.bfloat16 and position_ids is not None
 
     def forward(
         self,
         position_ids: Optional[torch.IntTensor] = None,
         hidden_states: Optional[torch.Tensor] = None,
         attn_metadata: Optional[AttentionMetadata] = None,
+        all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ):
         """Dispatch sparse layers to the MiniMax-M3 sparse algorithm.
@@ -847,14 +950,27 @@ class MiniMaxM3Attention(Attention):
         side index-K buffer.
         """
         if not self.is_sparse_attention_layer:
-            return self._dense_forward(position_ids, hidden_states, attn_metadata, **kwargs)
-        return self._sparse_forward(position_ids, hidden_states, attn_metadata, **kwargs)
+            return self._dense_forward(
+                position_ids,
+                hidden_states,
+                attn_metadata,
+                all_reduce_params=all_reduce_params,
+                **kwargs,
+            )
+        return self._sparse_forward(
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            all_reduce_params=all_reduce_params,
+            **kwargs,
+        )
 
     def _dense_forward(
         self,
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Dense MiniMax-M3 attention for layers 0-2.
@@ -870,9 +986,8 @@ class MiniMaxM3Attention(Attention):
 
         Steps:
           1. Project Q/K/V via fused ``qkv_proj``.
-          2. Apply per-head Gemma RMSNorm to Q/K (same as
-             :meth:`_sparse_forward` step 2 minus the index branch).
-          3. Apply partial RoPE.
+          2-3. Apply per-head Gemma RMSNorm and partial RoPE to Q/K, fused
+             into one kernel by :meth:`_fused_qk_norm_rope` when it applies.
           4. Pull the paged main K/V cache from the M3 cache manager.
           5. Read the pre-built :class:`MiniMaxM3SparseAttentionMetadata`
              from ``attn_metadata.minimax_m3``. Production code paths
@@ -897,24 +1012,47 @@ class MiniMaxM3Attention(Attention):
                 "attn_metadata; received None."
             )
 
-        # 1. Projections (no index branch).
+        # Projections (no index branch).
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # 2. Per-head Gemma RMSNorm on Q/K (no index norm).
-        q, k = self.apply_qk_norm(q, k)
-
-        # 3. Partial RoPE on Q/K (no index branch).
-        if self.rotary_emb is not None and position_ids is not None:
-            q, k = self.rotary_emb(position_ids, [q, k])
+        # Per-head Gemma RMSNorm and partial RoPE on Q/K.
+        fused_qkv = self._fused_qk_norm_rope(
+            qkv,
+            position_ids,
+            num_heads_q=self.num_heads,
+            num_heads_k=self.num_key_value_heads,
+            num_heads_v=self.num_key_value_heads,
+            head_dim=self.head_dim,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+        )
+        if fused_qkv is not None:
+            q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Match the contiguity of the separate path; V stays a column-slice view.
+            q, k = q.contiguous(), k.contiguous()
+        else:
+            assert not self._expect_fused_qk_norm_rope(position_ids), (
+                f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
+                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
+                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
+                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.apply_qk_norm(q, k)
+            if self.rotary_emb is not None and position_ids is not None:
+                q, k = self.rotary_emb(position_ids, [q, k])
 
         # Keep token-wise projections and the output projection visible to
         # torch.compile. Only the metadata/cache-dependent attention core is
         # hidden behind the inplace custom op.
         o = self._forward_attention_core(q, k, v, None, None, attn_metadata)
-        return self.o_proj(o)
+        # all_reduce_params lets the decoder defer the o_proj output AllReduce so
+        # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
+        # Passing None preserves the standalone o_proj reduction used by the
+        # single-GPU, attention-DP, and fusion-disabled paths.
+        return self.o_proj(o, all_reduce_params=all_reduce_params)
 
-    def _dense_attention_core(
+    def _sdpa_dense_attention_core(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -922,7 +1060,7 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run dense cache updates and attention into ``output``."""
+        """Run dense cache updates and attention into ``output`` (SDPA path)."""
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
             raise RuntimeError(
@@ -1111,10 +1249,10 @@ class MiniMaxM3Attention(Attention):
                 output,
             )
         else:
-            self._attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+            self._dispatch_attention_backend(q, k, v, idx_q, idx_k, attn_metadata, output)
         return output
 
-    def _attention_core(
+    def _dispatch_attention_backend(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -1124,33 +1262,58 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        # The MSA backend runs the sparse GQA or dense paged GQA through its
-        # inherited forward; this layer selects the top-k blocks (sparse only)
-        # and builds the forward_args the FMHA reads.
+        """Route the attention core to the configured backend.
+
+        self.attn is either a :class:`MiniMaxM3MsaSparseAttention`, which
+        handles both dense and sparse layers, or a
+        :class:`MiniMaxM3SparseRuntimeBackend` (Triton).
+
+        * MSA → :meth:`_msa_attention_core`
+        * Triton sparse → :meth:`_triton_sparse_attention_core`
+        * SDPA dense → :meth:`_sdpa_dense_attention_core`
+        """
         if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
-            if self.is_sparse_attention_layer:
-                assert idx_q is not None and idx_k is not None
-                # Publish the selected blocks so the FMHA runs the sparse path.
-                kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
-                forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
-            else:
-                assert idx_q is None and idx_k is None
-                # No top-k selection means the FMHA attends the full page table.
-                forward_args = AttentionForwardArgs(output=output)
-            self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
-            return output
+            return self._msa_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+        if self.is_sparse_attention_layer:
+            assert idx_q is not None and idx_k is not None
+            return self._triton_sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+        assert idx_q is None and idx_k is None
+        return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+
+    def _msa_attention_core(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: Optional[torch.Tensor],
+        idx_k: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the MSA backend (:class:`MiniMaxM3MsaSparseAttention`).
+
+        The backend runs the sparse GQA or dense paged GQA through its inherited
+        FMHA forward; this layer selects the top-k blocks (sparse only) and
+        builds the forward_args the FMHA reads.
+        """
+        if self.is_sparse_attention_layer:
+            assert idx_q is not None and idx_k is not None
+            # Publish the selected blocks so the FMHA runs the sparse path.
+            kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
+            forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
         else:
-            if self.is_sparse_attention_layer:
-                assert idx_q is not None and idx_k is not None
-                return self._sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
             assert idx_q is None and idx_k is None
-            return self._dense_attention_core(q, k, v, attn_metadata, output)
+            # No top-k selection means the FMHA attends the full page table.
+            forward_args = AttentionForwardArgs(output=output)
+        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+        return output
 
     def _sparse_forward(
         self,
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run a MiniMax-M3 sparse attention forward end-to-end.
@@ -1158,9 +1321,10 @@ class MiniMaxM3Attention(Attention):
         Steps:
           1. Project ``hidden_states`` to Q/K/V (fused ``qkv_proj``)
              plus index Q (per-head) and index K (single replicated).
-          2. Apply per-head Gemma RMSNorm to both branches.
-          3. Apply partial RoPE (``rotary_dim`` channels of ``head_dim``)
-             to both branches.
+          2-3. Apply per-head Gemma RMSNorm and partial RoPE to the main and
+             index branches, each fused into one kernel by
+             :meth:`_fused_qk_norm_rope` when it applies. The index branch
+             passes num_heads_v=0 because it carries no value heads.
           4. Pull paged main K/V cache (reshaped to flat-slot view) and
              paged side index-K cache from the
              :class:`MiniMaxM3KVCacheManagerV2`.
@@ -1191,27 +1355,81 @@ class MiniMaxM3Attention(Attention):
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
                 "attn_metadata; received None."
             )
-        # 1. Projections.
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        idx_q = self.index_q_proj(hidden_states)
-        idx_k = self.index_k_proj(hidden_states)
 
-        # 2. Per-head Gemma RMSNorm on both branches.
-        q, k = self.apply_qk_norm(q, k)
-        idx_q, idx_k = self.apply_index_qk_norm(idx_q, idx_k)
+        # Project, norm, and apply RoPE for the main and index branches. Both
+        # read only hidden_states and write disjoint outputs, so they overlap on
+        # the aux stream and join before the attention core.
+        def _main_norm_rope():
+            qkv = self.qkv_proj(hidden_states)
+            fused_qkv = self._fused_qk_norm_rope(
+                qkv,
+                position_ids,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_key_value_heads,
+                num_heads_v=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+            )
+            if fused_qkv is not None:
+                q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                return q.contiguous(), k.contiguous(), v
+            assert not self._expect_fused_qk_norm_rope(position_ids), (
+                f"MiniMax-M3 sparse attention (layer {self.layer_idx}) expected the "
+                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
+                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
+                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.apply_qk_norm(q, k)
+            if self.rotary_emb is not None and position_ids is not None:
+                q, k = self.rotary_emb(position_ids, [q, k])
+            return q, k, v
 
-        # 3. Partial RoPE on both branches. The base ``Attention``
-        # constructor created ``self.rotary_emb`` for the configured
-        # partial ``rotary_dim`` because ``rope_fusion=False``.
-        if self.rotary_emb is not None and position_ids is not None:
-            q, k = self.rotary_emb(position_ids, [q, k])
-            idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
+        def _index_norm_rope():
+            idx_qk = self.index_qk_proj(hidden_states)
+            fused_idx = self._fused_qk_norm_rope(
+                idx_qk,
+                position_ids,
+                num_heads_q=self.sparse_num_index_heads,
+                num_heads_k=1,
+                num_heads_v=0,
+                head_dim=self.sparse_index_dim,
+                q_norm=self.index_q_norm,
+                k_norm=self.index_k_norm,
+            )
+            if fused_idx is not None:
+                idx_q, idx_k = fused_idx.split([self.index_q_size, self.index_k_size], dim=-1)
+                return idx_q.contiguous(), idx_k.contiguous()
+            assert not self._expect_fused_qk_norm_rope(position_ids), (
+                f"MiniMax-M3 sparse index branch (layer {self.layer_idx}) expected the "
+                f"fused QK-norm+RoPE kernel (bf16 activations, index_dim="
+                f"{self.sparse_index_dim}) but fell back to the separate path; idx "
+                f"dtype is {idx_qk.dtype} (expected {self.attn_activation_dtype})."
+            )
+            idx_q, idx_k = idx_qk.split([self.index_q_size, self.index_k_size], dim=-1)
+            idx_q, idx_k = self.apply_index_qk_norm(idx_q, idx_k)
+            if self.rotary_emb is not None and position_ids is not None:
+                idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
+            return idx_q, idx_k
+
+        (q, k, v), (idx_q, idx_k) = maybe_execute_in_parallel(
+            _main_norm_rope,
+            _index_norm_rope,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
 
         o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
-        return self.o_proj(o)
+        # all_reduce_params lets the decoder defer the o_proj output AllReduce so
+        # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
+        # Passing None preserves the standalone o_proj reduction used by the
+        # single-GPU, attention-DP, and fusion-disabled paths.
+        return self.o_proj(o, all_reduce_params=all_reduce_params)
 
-    def _sparse_attention_core(
+    def _triton_sparse_attention_core(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -1332,6 +1550,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
 
         _, sparse_layer_ids = get_sparse_layer_ids(config)
         disable_index_value_ids = set(get_sparse_disable_index_value_layer_ids(config))
@@ -1343,6 +1562,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
             is_sparse_attention_layer=is_sparse,
             disable_index_value=disable_index_value,
+            aux_stream=aux_stream_dict[AuxStreamType.Attention],
         )
 
         _, moe_layer_ids = get_moe_layer_ids(config)
@@ -1362,18 +1582,54 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             )
             self.block_sparse_moe = None
 
+        # Layer-boundary RMSNorms are plain (non-Gemma) norms so they can drive
+        # the fused AllReduce+residual+RMSNorm epilogue
+        # (AllReduceFusionOp.RESIDUAL_RMS_NORM), whose kernel applies a plain
+        # weight * x scaling with no Gemma (1 + weight) offset. When the
+        # checkpoint stores Gemma norms (use_gemma_norm=True), the loader folds
+        # (1 + weight) into the stored weight at load time (see
+        # _fold_gemma_boundary_norm_weights), so the runtime norm is numerically
+        # identical to the original Gemma norm on every path. The per-head
+        # q/k/index norms keep use_gemma because they are consumed by the
+        # separate fused_qk_norm_rope kernel, which handles Gemma directly.
         self.input_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
-            use_gemma=bool(getattr(config, "use_gemma_norm", False)),
+            use_gemma=False,
         )
         self.post_attention_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
-            use_gemma=bool(getattr(config, "use_gemma_norm", False)),
+            use_gemma=False,
         )
+
+        # DeepSeek-V3-style layer-boundary AllReduce fusion. Each layer folds
+        # the attention o_proj output AllReduce into post_attention_layernorm
+        # (PRE fusion) and the MoE/MLP output AllReduce into the next layer's
+        # input_layernorm (POST fusion, wired via next_layer_layernorm in
+        # setup_aliases). Fusion is only meaningful when there is a real
+        # cross-rank reduction to fold, i.e. TP>1 and not attention-DP (each DP
+        # rank owns independent tokens, so no attention/MoE AllReduce happens
+        # there). An env override matches the DeepSeek-V3 escape hatch.
+        self.enable_fusion = os.environ.get("TRTLLM_MINIMAX_M3_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion &= (not self.enable_attention_dp) and self.mapping.tp_size > 1
+        self.pre_feed_forward_fusion = self.enable_fusion
+        self.post_feed_forward_fusion = self.enable_fusion
+
+        self.allreduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.allreduce = AllReduce(
+                mapping=model_config.mapping,
+                strategy=model_config.allreduce_strategy,
+                dtype=config.torch_dtype,
+            )
+
+        # Wired by MiniMaxM3ForCausalLM.setup_aliases after weight load to the
+        # next layer's input_layernorm (or the final model norm for the last
+        # layer). None disables POST fusion and boundary-norm folding.
+        self.next_layer_layernorm: Optional[RMSNorm] = None
 
     def forward(
         self,
@@ -1383,24 +1639,131 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         residual: Optional[torch.Tensor],
         **kwargs,
     ) -> torch.Tensor:
+        # Layer-0 prologue only. For every subsequent layer the input_layernorm
+        # (an add+RMSNorm at the layer boundary) was already applied by the
+        # previous layer as its next_layer_layernorm, so residual is not None
+        # here and this block is skipped (matches DeepSeek-V3).
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        # When PRE fusion is active the attention defers its o_proj AllReduce so
+        # it can be fused into post_attention_layernorm below; otherwise the
+        # o_proj reduces as usual (all_reduce_params=None preserves the
+        # single-GPU, attention-DP, and fusion-disabled behavior exactly).
+        attn_all_reduce_params = (
+            AllReduceParams(enable_allreduce=False) if self.pre_feed_forward_fusion else None
+        )
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            all_reduce_params=attn_all_reduce_params,
             **kwargs,
         )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if self.block_sparse_moe is not None:
-            hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
+            hidden_states, residual = self.forward_MoE(hidden_states, attn_metadata, residual)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states, residual = self.forward_mlp(hidden_states, residual)
+
+        return hidden_states, residual
+
+    def _apply_pre_feed_forward_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """AllReduce(+residual+RMSNorm) between attention and the feed-forward.
+
+        On the PRE-fusion path the deferred attention o_proj AllReduce is fused
+        with post_attention_layernorm into one kernel; otherwise it is the plain
+        add+RMSNorm and the attention already reduced its own output.
+        """
+        if self.pre_feed_forward_fusion:
+            return self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ),
+            )
+        return self.post_attention_layernorm(hidden_states, residual)
+
+    def _apply_next_layer_layernorm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply the next layer's input_layernorm at the layer boundary.
+
+        On the POST-fusion path the deferred feed-forward output AllReduce is
+        fused with next_layer_layernorm (the next layer's input_layernorm, or
+        the final model norm for the last layer). Off the fusion path it is the
+        plain add+RMSNorm. When next_layer_layernorm has not been wired (e.g. a
+        standalone unit test that never ran setup_aliases) the
+        (hidden_states, residual) pair is returned unchanged so the model can
+        apply the final norm itself.
+        """
+        if self.next_layer_layernorm is None:
+            return hidden_states, residual
+        if self.post_feed_forward_fusion:
+            return self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ),
+            )
+        return self.next_layer_layernorm(hidden_states, residual)
+
+    def _feed_forward_all_reduce_params(self) -> Optional[AllReduceParams]:
+        """AllReduce params handed to the MoE or dense-MLP output projection.
+
+        Disables the module's internal output AllReduce when POST fusion will
+        fold it into next_layer_layernorm; otherwise None preserves the module's
+        own reduction (single-GPU, attention-DP, fusion-disabled).
+        """
+        if self.post_feed_forward_fusion:
+            return AllReduceParams(enable_allreduce=False)
+        return None
+
+    def forward_MoE(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+
+        hidden_states = self.block_sparse_moe(
+            hidden_states,
+            attn_metadata,
+            final_all_reduce_params=self._feed_forward_all_reduce_params(),
+        )
+
+        hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    def forward_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+
+        hidden_states = self.mlp(
+            hidden_states,
+            final_all_reduce_params=self._feed_forward_all_reduce_params(),
+        )
+
+        hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1417,10 +1780,11 @@ class MiniMaxM3Model(DecoderModel):
             model_config.pretrained_config.torch_dtype = torch.bfloat16
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
-        # Two aux streams: one for MoE shared/routed parallel execution,
-        # one for MoE chunking overlap inside the fused MoE kernel.
-        # Matches the DeepSeekV3 convention.
+        # Aux streams shared across layers, matching the DeepSeekV3 convention:
+        # one for attention branch overlap, one for MoE shared/routed parallel
+        # execution, and one for MoE chunking overlap inside the fused MoE kernel.
         self.aux_stream_dict = {
+            AuxStreamType.Attention: torch.cuda.Stream(),
             AuxStreamType.MoeShared: torch.cuda.Stream(),
             AuxStreamType.MoeChunkingOverlap: torch.cuda.Stream(),
         }
@@ -1438,11 +1802,17 @@ class MiniMaxM3Model(DecoderModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        # Final norm is a plain (non-Gemma) RMSNorm for the same reason as the
+        # layer-boundary norms (see MiniMaxM3DecoderLayer.__init__): it doubles
+        # as the last layer's next_layer_layernorm, so the last MoE/MLP output
+        # AllReduce folds into it via RESIDUAL_RMS_NORM. The Gemma (1 + weight)
+        # offset is folded into the stored weight at load time (see
+        # _fold_gemma_boundary_norm_weights).
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
-            use_gemma=bool(getattr(config, "use_gemma_norm", False)),
+            use_gemma=False,
         )
 
     def forward(
@@ -1469,8 +1839,80 @@ class MiniMaxM3Model(DecoderModel):
                 residual=residual,
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # When setup_aliases has chained the final norm into the last decoder
+        # layer (next_layer_layernorm = self.norm), the last layer's boundary
+        # step already applied it (fused or plain), so hidden_states is normed
+        # and this is skipped. The fallback covers paths that never ran
+        # setup_aliases (e.g. standalone unit tests): there the last layer
+        # returns the unnormed (hidden_states, residual) pair and the final
+        # add+RMSNorm is applied here.
+        if self.layers[-1].next_layer_layernorm is None:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+
+def _load_index_qk_proj_weights(model: nn.Module, weights) -> None:
+    """Fuse checkpoint index_q_proj and index_k_proj into index_qk_proj.
+
+    The shared weight loader fuses only qkv_proj and gate_up_proj by name, so
+    load the sibling checkpoint tensors into each fused index module through the
+    FUSED_GATE_UP_LINEAR row-concatenation path and mark the sources consumed.
+    """
+    for name, module in model.named_modules():
+        if name.split(".")[-1] != "index_qk_proj":
+            continue
+        parent = name.rsplit(".", 1)[0]
+        q_weights = filter_weights(f"{parent}.index_q_proj", weights)
+        k_weights = filter_weights(f"{parent}.index_k_proj", weights)
+        # Missing sources make Linear.load_weights assert rather than leave
+        # the fused module silently uninitialized.
+        module.load_weights(weights=[q_weights, k_weights])
+        if hasattr(weights, "mark_consumed"):
+            weights.mark_consumed(f"{parent}.index_q_proj")
+            weights.mark_consumed(f"{parent}.index_k_proj")
+        else:
+            for key in list(weights.keys()):
+                if key.startswith(f"{parent}.index_q_proj.") or key.startswith(
+                    f"{parent}.index_k_proj."
+                ):
+                    del weights[key]
+
+
+# Layer-boundary RMSNorms whose Gemma (1 + weight) scaling is folded into the
+# stored weight at load time so the runtime norm is a plain RMSNorm (see
+# MiniMaxM3DecoderLayer.__init__ / MiniMaxM3Model.__init__). These are exactly
+# the norms that drive the DeepSeek-V3-style fused AllReduce+residual+RMSNorm
+# epilogue, whose kernel has no Gemma offset. The per-head q/k/index norms are
+# intentionally excluded: they feed the separate fused_qk_norm_rope kernel,
+# which handles Gemma directly and stays use_gemma=True.
+_M3_BOUNDARY_NORM_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+)
+_M3_FINAL_NORM_KEY = "model.norm.weight"
+
+
+def _fold_gemma_boundary_norm_weights(weights):
+    """Fold Gemma (1 + weight) into the layer-boundary RMSNorm weights.
+
+    MiniMax-M3 stores every RMSNorm as a Gemma norm (use_gemma_norm=True), which
+    computes (1 + weight) * x. The layer-boundary norms are constructed as plain
+    norms (use_gemma=False, weight * x) so they can drive the fused
+    AllReduce+RMSNorm kernels, so their stored weights must be pre-incremented by
+    1.0. This is a numerically exact, load-time-only rewrite; the resulting norm
+    is identical to the original Gemma norm on every path.
+
+    Only the decoder input_layernorm / post_attention_layernorm and the final
+    model.norm are touched. A no-op for keys that are absent (partial load) so it
+    is safe to call unconditionally, but it must only run when the checkpoint
+    actually uses Gemma norms (guarded by the caller).
+    """
+    for key in list(weights.keys()):
+        if key.endswith(_M3_BOUNDARY_NORM_SUFFIXES) or key == _M3_FINAL_NORM_KEY:
+            w = weights[key]
+            w = w[:] if hasattr(w, "__getitem__") else w
+            weights[key] = w + 1.0
+    return weights
 
 
 @register_auto_model("MiniMaxM3SparseForCausalLM")
@@ -1495,6 +1937,15 @@ class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedCon
         params_map: Optional[Dict[str, str]] = None,
         allow_partial_loading: bool = False,
     ) -> None:
+        # The generic loader has no rule for this fusion. The VL subclass routes
+        # its text weights through here, so both paths are covered.
+        _load_index_qk_proj_weights(self, weights)
+        # Fold Gemma (1 + weight) into the layer-boundary RMSNorm weights so the
+        # runtime norms can be plain (non-Gemma) and drive the fused
+        # AllReduce+residual+RMSNorm epilogue. Only when the checkpoint actually
+        # stores Gemma norms; otherwise the boundary norms are already plain.
+        if bool(getattr(self.config, "use_gemma_norm", False)):
+            weights = _fold_gemma_boundary_norm_weights(weights)
         if weight_mapper is None:
             weight_mapper = MiniMaxM3HfWeightMapper()
         weight_mapper.init_model_and_config(self, self.model_config)
@@ -1505,6 +1956,22 @@ class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedCon
             params_map=merged_params_map,
             allow_partial_loading=allow_partial_loading,
         )
+
+    def setup_aliases(self) -> None:
+        """Chain each decoder layer's next_layer_layernorm for POST fusion.
+
+        Wired after weight load (the generic loader skips next_layer_layernorm
+        aliases). Each layer's MoE/MLP output AllReduce is fused into the next
+        layer's input_layernorm; the last layer chains the final model norm so
+        its output AllReduce folds the final normalization too.
+        """
+        layers = self.model.layers
+        num_layers = len(layers)
+        for idx, layer in enumerate(layers):
+            if idx == num_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = layers[idx + 1].input_layernorm
 
 
 def _strip_language_model_prefix(

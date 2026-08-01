@@ -182,3 +182,43 @@ def test_llm_request_has_no_compression_consumer_marker() -> None:
 
     assert "py_kv_cache_kv_compression_manages_history" not in vars(request)
     assert "py_kv_cache_compaction" not in vars(request)
+
+
+def test_disagg_gen_transition_reserves_target_drafts_without_context_drafts():
+    manager = _manager(is_draft=False)
+    manager.max_total_draft_tokens = 4
+    request = SimpleNamespace(
+        py_draft_tokens=[],
+        is_disagg_generation_transmission_complete=True,
+        context_phase_params=SimpleNamespace(draft_tokens=None),
+        py_disable_speculative_decoding=False,
+    )
+
+    assert manager._effective_draft_len(request) == 4
+    assert manager._required_gen_capacity(request, 128) == 133
+
+
+def test_disagg_gen_transition_does_not_reserve_disabled_speculation():
+    manager = _manager(is_draft=False)
+    manager.max_total_draft_tokens = 4
+    request = SimpleNamespace(
+        py_draft_tokens=[],
+        is_disagg_generation_transmission_complete=True,
+        context_phase_params=SimpleNamespace(draft_tokens=None),
+        py_disable_speculative_decoding=True,
+    )
+
+    assert manager._effective_draft_len(request) == 0
+
+
+def test_disagg_gen_transition_prefers_context_drafts():
+    manager = _manager(is_draft=False)
+    manager.max_total_draft_tokens = 4
+    request = SimpleNamespace(
+        py_draft_tokens=[],
+        is_disagg_generation_transmission_complete=True,
+        context_phase_params=SimpleNamespace(draft_tokens=[1, 2]),
+        py_disable_speculative_decoding=False,
+    )
+
+    assert manager._effective_draft_len(request) == 2

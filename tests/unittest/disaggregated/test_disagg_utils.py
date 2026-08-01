@@ -127,6 +127,22 @@ def test_extract_disagg_cfg(sample_yaml_config):
     assert config.disagg_coordinator_url == "http://coordinator:7999"
 
 
+def test_extract_disagg_metrics_controls():
+    yaml_config = get_yaml_config()
+    yaml_config["context_servers"]["return_perf_metrics"] = False
+    yaml_config["generation_servers"]["return_perf_metrics"] = False
+    config = extract_disagg_cfg(
+        **yaml_config,
+        return_perf_metrics=True,
+        perf_metrics_output_dir="/tmp/perf",
+    )
+
+    assert config.return_perf_metrics is True
+    assert config.perf_metrics_output_dir == "/tmp/perf"
+    assert all("perf_metrics_output_dir" not in server.other_args
+               for server in config.server_configs)
+
+
 @pytest.mark.parametrize("node_id", [-1, 256])
 def test_extract_disagg_cfg_rejects_out_of_range_node_id(node_id):
     with pytest.raises(ValueError, match="node_id must be in range"):

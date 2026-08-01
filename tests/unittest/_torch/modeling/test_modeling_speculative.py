@@ -13,13 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for Eagle3ForCausalLM.apply_eagle3_fc fc_norm branch."""
+"""Unit tests for speculative modeling classes."""
+
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_speculative import (
+    Eagle3ForCausalLM,
+    SpecDecOneEngineForCausalLM,
+)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 
@@ -144,3 +151,73 @@ def test_apply_eagle3_fc_with_fc_norm(num_capture_layers):
         "fc_norm should apply per-chunk normalization which differs from "
         "whole-tensor normalization"
     )
+
+
+# ---------------------------------------------------------------------------
+# SpecDecOneEngineForCausalLM: optional hidden_size / vocab_size
+# ---------------------------------------------------------------------------
+
+_BASE_CLS = "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM"
+
+
+def _init_specdec_with_mocked_base(model_config, **kwargs):
+    """Instantiate SpecDecOneEngineForCausalLM with the base class stubbed out.
+
+    DecoderModelForCausalLM is built on the PostInitCaller metaclass, which
+    invokes __post_init__/__pp_init__ right after __init__ returns. Those
+    hooks must be stubbed too: the mocked __init__ never sets the attributes
+    (model_config, lm_head, ...) they rely on.
+
+    Returns the kwargs captured by the mocked base __init__.
+    """
+    with (
+        patch(f"{_BASE_CLS}.__init__", return_value=None) as mock_init,
+        patch(f"{_BASE_CLS}.__post_init__"),
+        patch(f"{_BASE_CLS}.__pp_init__"),
+    ):
+        SpecDecOneEngineForCausalLM(MagicMock(), model_config, **kwargs)
+    _, captured_kwargs = mock_init.call_args
+    return captured_kwargs
+
+
+def test_specdec_one_engine_reads_from_pretrained_config() -> None:
+    """Default path: hidden_size/vocab_size come from pretrained_config."""
+    hidden_size = 4096
+    vocab_size = 32000
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(hidden_size=hidden_size, vocab_size=vocab_size)
+    )
+
+    kwargs = _init_specdec_with_mocked_base(model_config)
+    assert kwargs["hidden_size"] == hidden_size
+    assert kwargs["vocab_size"] == vocab_size
+
+
+def test_specdec_one_engine_accepts_explicit_sizes() -> None:
+    """Composite configs (e.g. VL wrappers) can pass sizes explicitly."""
+    hidden_size = 8192
+    vocab_size = 128256
+    # Bare PretrainedConfig lacks hidden_size/vocab_size; the caller
+    # supplies them instead.
+    model_config = ModelConfig(pretrained_config=PretrainedConfig())
+
+    kwargs = _init_specdec_with_mocked_base(
+        model_config, hidden_size=hidden_size, vocab_size=vocab_size
+    )
+    assert kwargs["hidden_size"] == hidden_size
+    assert kwargs["vocab_size"] == vocab_size
+
+
+def test_specdec_one_engine_explicit_overrides_pretrained_config() -> None:
+    """Explicit args take precedence over pretrained_config when both present."""
+    hidden_size = 2048
+    vocab_size = 64000
+    model_config = ModelConfig(
+        pretrained_config=PretrainedConfig(hidden_size=4096, vocab_size=32000)
+    )
+
+    kwargs = _init_specdec_with_mocked_base(
+        model_config, hidden_size=hidden_size, vocab_size=vocab_size
+    )
+    assert kwargs["hidden_size"] == hidden_size
+    assert kwargs["vocab_size"] == vocab_size

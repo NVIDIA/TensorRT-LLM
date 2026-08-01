@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,11 +43,14 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "gtest/gtest.h"
+#include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <gmock/gmock.h>
 #include <memory>
 #include <random>
@@ -90,6 +93,42 @@ class UcxCommTest : public ::testing::Test
 
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using TransceiverTag = tensorrt_llm::batch_manager::TransceiverTag;
+
+TEST_F(UcxCommTest, recvConnectCancellation)
+{
+    try
+    {
+        auto connectionManager = makeOneUcxConnectionManager();
+        ASSERT_NE(connectionManager, nullptr);
+
+        std::atomic<bool> transferTerminate{false};
+        TransceiverTag::Id id;
+        auto receiveFuture = std::async(std::launch::async,
+            [&]() {
+                return connectionManager->recvConnect(
+                    DataContext{TransceiverTag::kID_TAG, transferTerminate}, &id, sizeof(id));
+            });
+
+        constexpr auto kReceiveStartPeriod = std::chrono::milliseconds{100};
+        constexpr auto kCancellationTimeout = std::chrono::seconds{5};
+        ASSERT_EQ(receiveFuture.wait_for(kReceiveStartPeriod), std::future_status::timeout);
+
+        transferTerminate.store(true, std::memory_order_relaxed);
+        ASSERT_EQ(receiveFuture.wait_for(kCancellationTimeout), std::future_status::ready);
+        EXPECT_EQ(receiveFuture.get(), nullptr);
+    }
+    catch (std::exception const& e)
+    {
+        std::string error = e.what();
+        if (error.find("UCX wrapper library is not open correctly") != std::string::npos
+            || error.find("Unable to load UCX wrapper library symbol") != std::string::npos)
+        {
+            GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
+        }
+
+        throw e;
+    }
+}
 
 TEST_F(UcxCommTest, Basic)
 {
