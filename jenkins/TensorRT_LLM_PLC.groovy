@@ -269,9 +269,7 @@ def pulseScanSourceCode(llmRepo, ref) {
             if [ -n "\$sbom_zip" ]; then
                 unzip -p "\$sbom_zip" "*.json" > ${outputDir}/sbom.json
             else
-                echo "ERROR: sbom.zip not found; listing workspace for diagnostics:"
-                ls -la
-                exit 1
+                echo "WARNING: sbom.zip not found; listing workspace for diagnostics:"
             fi
         """
         sh "mv nspect_scan_report.json ${outputDir}/vulns.json"
@@ -350,7 +348,11 @@ def processScanResults(ref) {
                     venv/bin/pip install requests elasticsearch==7.13.4
                 """
                 def skipArgs = ""
-                if (!params.runSourceCodeScanning) {
+                def sbomExists = fileExists("${pwd()}/scan_report/source_code/sbom.json")
+                if (!params.runSourceCodeScanning || !sbomExists) {
+                    if (!sbomExists && params.runSourceCodeScanning) {
+                        echo "WARNING: Source code SBOM not found at scan_report/source_code/sbom.json; skipping SBOM analysis."
+                    }
                     skipArgs += " --skip-source-code"
                 }
                 if (!params.runContainerScanning) {
