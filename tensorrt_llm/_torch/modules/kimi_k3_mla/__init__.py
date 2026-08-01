@@ -18,14 +18,8 @@ The module wraps the existing ``TrtllmAttention`` backend MLA path plus
 ``KVCacheManagerV2`` for both context and cached-decode.
 """
 
-from .kimi_k3_mla_attention import (
-    KimiK3MLAAttention,
-    KimiK3MLARuntimeInputs,
-    kimi_k3_mla_backend_params,
-)
+from .kimi_k3_mla_attention import KimiK3MLAAttention
 
 __all__ = [
     "KimiK3MLAAttention",
-    "KimiK3MLARuntimeInputs",
-    "kimi_k3_mla_backend_params",
 ]

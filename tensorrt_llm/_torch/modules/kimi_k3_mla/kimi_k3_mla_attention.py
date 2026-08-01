@@ -1,95 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""KimiK3MLAAttention — Kimi K3 multi-latent attention for the PyTorch backend.
+"""Kimi K3 specialization of the shared PyTorch-backend MLA module.
 
-Structural mirror of the HF reference ``KimiMLAAttention`` in
-``modeling_kimi.py``. Same parameter names, same layer shapes, same
-low-rank Q/KV geometry. The delta-rule attention math itself is delegated
-to the existing ``TrtllmAttention`` MLA backend path plus
-``KVCacheManagerV2`` for cached decode; the K3-specific deltas (NoPE,
-output gate before ``o_proj``, ``192 ** -0.5`` softmax scale) live in
-module code, not in the backend.
-
-Backend split (mirrors production ``_torch/modules/mla.py``)
-------------------------------------------------------------
-The C++ MLA path needs different ``(head_dim, num_kv_heads)`` for
-context and generation:
-
-* Context: ``head_dim = qk_nope + qk_rope = 192``,
-  ``num_kv_heads = num_heads`` (per-head Q/K/V).
-* Generation (absorbed): ``head_dim = kv_lora_rank + qk_rope = 576``,
-  ``num_kv_heads = 1`` (single MQA-shared latent head).
-
-Both backends share the same MLA params and KV cache manager, but own
-independent identity RoPE state so either backend can resize its table
-without invalidating the other's resize state.
-
-NoPE via identity cos/sin cache
--------------------------------
-The MLA context / generation kernels unconditionally read a rotary
-cos/sin cache and apply the rotation. K3's reference does not rotate.
-We install a real ``PositionalEmbeddingParams`` so the backend
-allocates the correct-shape cache, then overwrite the values in place
-with ``(cos=1, sin=0)`` — mathematically identity. A no-op patch on
-``_ensure_rope_table_size`` keeps the identity through metadata
-resizes.
-
-Cache layout
-------------
-MLA collapses the paged KV cache to a single MQA-style head of width
-``kv_lora_rank + qk_rope_head_dim`` (576 for real K3). The paged cache
-manager is constructed with ``num_kv_heads=1`` and
-``head_dim=kv_lora_rank + qk_rope_head_dim``. Every context write
-carries a ``latent_cache`` tensor of shape
-``[num_tokens, kv_lora_rank + qk_rope_head_dim]``; the backend appends
-it to the paged cache under the current request's slot.
-
-Absorbed cached decode
-----------------------
-For the generation-only path, the backend consumes a fused Q of shape
-``[num_tokens, num_heads * (kv_lora_rank + qk_rope_head_dim)]``: the
-first ``kv_lora_rank`` positions are ``q_nope @ kv_b_proj_absorb_k``
-(the "absorbed" projection into the compressed KV space); the trailing
-``qk_rope_head_dim`` positions are ``q_rot`` unchanged (NoPE keeps it
-identity). The backend runs attention in the compressed space and
-returns ``[num_tokens, num_heads * kv_lora_rank]``, which we unabsorb
-via ``kv_b_proj_absorb_v`` to recover
-``[num_tokens, num_heads * v_head_dim]``. The output gate and
-``o_proj`` finish the module.
-
-Mutation controls (module-level)
---------------------------------
-* ``apply_rotary_mutation`` — rotates ``q_rot`` and ``k_rot`` slots by
-  a fixed non-identity block-rotation before feeding the backend. K3's
-  reference does not rotate; injecting one must diverge.
-* ``omit_output_gate_mutation`` — skips the sigmoid gate multiplication
-  when ``use_output_gate=True``. K3 always multiplies through when the
-  gate is configured; omission must diverge.
+The base ``MLA`` class owns context attention, cached/chunked prefill,
+absorbed generation, and paged-cache handling. This module only supplies the
+K3 projection topology, NoPE identity table, KV-B checkpoint layout, and
+gated output projection.
 """
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
-
 from ....functional import PositionEmbeddingType
 from ....models.modeling_utils import QuantConfig
-from ...attention_backend import TrtllmAttention, TrtllmAttentionMetadata
-from ...attention_backend.interface import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    MLAParams,
-    PositionalEmbeddingParams,
-    PredefinedAttentionMask,
-    RopeParams,
-)
-from ..rms_norm import RMSNorm
+from ...attention_backend import AttentionMetadata, TrtllmAttention
+from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ...model_config import ModelConfig
+from ..mla import MLA
 
 
 def _meta_safe_cast_dtype(module, dtype):
@@ -111,44 +42,6 @@ def _meta_safe_cast_dtype(module, dtype):
         return t.to(dtype=dtype)
 
     module._apply(_cast)
-
-
-# ---------------------------------------------------------------------------
-# Backend-parameter helpers.
-# ---------------------------------------------------------------------------
-
-
-def kimi_k3_mla_backend_params(
-    *,
-    num_heads: int,
-    q_lora_rank: int,
-    kv_lora_rank: int,
-    qk_nope_head_dim: int,
-    qk_rope_head_dim: int,
-    v_head_dim: int,
-    hidden_size: int,
-    predicted_tokens_per_seq: int = 1,
-) -> "Tuple[MLAParams]":
-    """Return the ``MLAParams`` for the K3 backends.
-
-    The C++ ``AttentionOp::initialize()`` asserts MLA(Deepseek v2) only
-    supports ``qk_rope_head_dim=64`` with ``kv_lora_rank=512 +
-    rope_append=True`` (DeepSeek-V3) or ``kv_lora_rank=448 +
-    rope_append=False`` (DeepSeek-V4). K3 uses ``kv_lora_rank=512`` +
-    ``qk_rope_head_dim=64`` so we take the DeepSeek-V3-shaped path with
-    ``rope_append=True``. K3's NoPE contract is enforced by writing an
-    identity RoPE cos/sin table into the backend after construction.
-    """
-    return MLAParams(
-        q_lora_rank=q_lora_rank,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        qk_nope_head_dim=qk_nope_head_dim,
-        v_head_dim=v_head_dim,
-        hidden_size=hidden_size,
-        rope_append=True,
-        predicted_tokens_per_seq=predicted_tokens_per_seq,
-    )
 
 
 def _make_pos_embd_params(
@@ -183,63 +76,6 @@ def _make_pos_embd_params(
         # standard non-neox layout.
         is_neox=False,
     )
-
-
-# ---------------------------------------------------------------------------
-# Runtime-input dataclass for the module.
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class KimiK3MLARuntimeInputs:
-    """Metadata/buffer bundle for one ``KimiK3MLAAttention`` forward call.
-
-    Provides the pre-built ``TrtllmAttentionMetadata`` and cache-manager
-    state that both prefill and cached-decode paths need. Test harnesses
-    populate this once per step and feed it to ``forward_prefill`` /
-    ``forward_decode``.
-    """
-
-    metadata: TrtllmAttentionMetadata
-    request_ids: List[int]
-    seq_lens: List[int]
-    num_cached_tokens_per_seq: List[int]
-
-
-def _supports_mla_prefill_direct_output(
-    rt: KimiK3MLARuntimeInputs,
-    num_tokens: int,
-) -> bool:
-    """Whether native generation preprocessing accepts this packed batch."""
-    num_generations = rt.metadata.num_generations
-    query_len = rt.seq_lens[0]
-    return query_len * num_generations == num_tokens and all(
-        seq_len == query_len for seq_len in rt.seq_lens
-    )
-
-
-# ---------------------------------------------------------------------------
-# Fixed rotation matrix for the mutation control.
-# ---------------------------------------------------------------------------
-
-
-def _make_fixed_rotation(dim: int) -> torch.Tensor:
-    """Deterministic 90° block rotation used only by the mutation control.
-
-    The `(2i, 2i+1)` pair rotates by 90° — cycle length 4 through the
-    token axis so short prefill lengths exhibit visible attention drift.
-    """
-    assert dim % 2 == 0, "rope head dim must be even for the block rotation"
-    theta = torch.tensor(1.5707963267948966)  # 90°
-    c = torch.cos(theta)
-    s = torch.sin(theta)
-    R = torch.zeros(dim, dim)
-    for i in range(0, dim, 2):
-        R[i, i] = c
-        R[i, i + 1] = -s
-        R[i + 1, i] = s
-        R[i + 1, i + 1] = c
-    return R
 
 
 def _write_identity_rope_values(cos_sin: torch.Tensor) -> None:
@@ -299,17 +135,12 @@ def _install_identity_rope_table(backend: TrtllmAttention) -> None:
 # ---------------------------------------------------------------------------
 
 
-class KimiK3MLAAttention(nn.Module):
-    """Kimi K3 MLA module — in-tree production version.
+class KimiK3MLAAttention(MLA):
+    """Kimi K3 MLA implemented as a thin specialization of :class:`MLA`.
 
-    Wraps the existing ``TrtllmAttention`` MLA backend for both context
-    and cached-decode paths. Normal prefill uses an unabsorbed context
-    backend; decode uses an absorbed generation backend, with a second
-    trtllm-gen absorbed instance retained for multi-token fallback and
-    prefill A/B diagnostics. K3's NoPE + output-gate deltas stay at the
-    module boundary.
-    Parameter names mirror HF ``KimiMLAAttention`` exactly so a
-    random-weight parity test can use identity name mapping.
+    K3 keeps the standard dense MLA attention/cache flow and only changes the
+    checkpoint projection topology, positional encoding, KV-B runtime layout,
+    and gated output projection.
     """
 
     def __init__(
@@ -322,1004 +153,89 @@ class KimiK3MLAAttention(nn.Module):
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
         v_head_dim: int,
-        rms_norm_eps: float = 1e-6,
+        rms_norm_eps: Optional[float] = None,
         dtype: Optional[torch.dtype] = None,
         layer_idx: int = 0,
         use_output_gate: bool = True,
         max_position_embeddings: int = 8192,
-        apply_rotary_mutation: bool = False,
-        omit_output_gate_mutation: bool = False,
         quant_config: Optional[QuantConfig] = None,
     ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_key_value_heads = num_heads
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.q_head_dim = qk_nope_head_dim + qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.rms_norm_eps = rms_norm_eps
-        self.layer_idx = layer_idx
-        self.use_output_gate = use_output_gate
-        self.max_position_embeddings = max_position_embeddings
-        self.apply_rotary_mutation = apply_rotary_mutation
-        self.omit_output_gate_mutation = omit_output_gate_mutation
-        # The checkpoint stores per-head interleaved KV-B rows. Weight
-        # loading rewrites them to the DeepSeek-style runtime layout
-        # [all-heads K | all-heads V].
-        self._weights_transformed = False
-
-        self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
-        self.q_a_layernorm = RMSNorm(hidden_size=q_lora_rank, eps=rms_norm_eps, dtype=dtype)
-        self.q_b_proj = nn.Linear(q_lora_rank, num_heads * self.q_head_dim, bias=False)
-        self.kv_a_proj_with_mqa = nn.Linear(
-            hidden_size, kv_lora_rank + qk_rope_head_dim, bias=False
+        pos_embd_params = _make_pos_embd_params(
+            qk_rope_head_dim=qk_rope_head_dim,
+            max_position_embeddings=max_position_embeddings,
         )
-        self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank, eps=rms_norm_eps, dtype=dtype)
-        self.kv_b_proj = nn.Linear(
-            kv_lora_rank,
-            num_heads * (qk_nope_head_dim + v_head_dim),
-            bias=False,
+        model_config = ModelConfig(
+            quant_config=quant_config if quant_config is not None else QuantConfig()
         )
-        self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=False)
-        if use_output_gate:
-            self.g_proj = nn.Linear(hidden_size, num_heads * v_head_dim, bias=False)
-
-        # NoPE — matches HF ``KimiMLAAttention`` which sets ``rotary_emb = None``.
-        self.rotary_emb = None
-
-        # Context uses the normal unabsorbed MLA geometry (per-head
-        # Q/K/V); generation uses the absorbed MQA geometry. Keep a
-        # separate trtllm-gen absorbed backend for the diagnostic
-        # prefill A/B path and multi-token generation fallback.
-        mla_params = kimi_k3_mla_backend_params(
-            num_heads=num_heads,
-            q_lora_rank=q_lora_rank,
-            kv_lora_rank=kv_lora_rank,
+        super().__init__(
+            hidden_size=hidden_size,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
             qk_nope_head_dim=qk_nope_head_dim,
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=v_head_dim,
-            hidden_size=hidden_size,
-        )
-        ctx_pos_embd_params = _make_pos_embd_params(
-            qk_rope_head_dim=qk_rope_head_dim,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            predicted_tokens_per_seq=1,
             max_position_embeddings=max_position_embeddings,
+            bias=False,
+            pos_embd_params=pos_embd_params,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            dense_bias=False,
+            config=model_config,
+            reduce_output=False,
+            fuse_qkv_a_proj=False,
+            rms_norm_eps=rms_norm_eps,
         )
-        gen_pos_embd_params = _make_pos_embd_params(
-            qk_rope_head_dim=qk_rope_head_dim,
-            max_position_embeddings=max_position_embeddings,
-        )
+        # K3 calls forward_impl() directly to insert its output gate before
+        # the base row-parallel o_proj. The original executor metadata remains
+        # intact, so MLA performs its native mixed context/generation split.
+        self.register_to_config = False
 
-        gen_mla_backend = os.environ.get("TLLM_K3_MLA_GEN_BACKEND", "cute-dsl")
-        # FP8 KV cache is accuracy-validated on K3 with the kv-scale
-        # plumbing fix in ``TrtllmAttention.mla_rope_generation``: GSM8K
-        # 96.89 vs 96.44 bf16 control (the pre-fix 74.45 that motivated a
-        # hard error here was the severed None kv-scale delivery, not the
-        # fp8 cache itself).
-        self.has_fp8_kv_cache = bool(
-            quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache()
-        )
-        if self.has_fp8_kv_cache and gen_mla_backend != "trtllm-gen":
-            # cute-dsl rejects fp8 KV device scales; trtllm-gen decode is
-            # accuracy-equivalent to cute-dsl on K3 (96.59 vs 96.44).
-            logger.info(
-                "Kimi K3 MLA: FP8 KV cache requires the trtllm-gen MLA "
-                "generation backend; overriding "
-                f"'{gen_mla_backend}' -> 'trtllm-gen'."
+        self.use_output_gate = use_output_gate
+
+        if use_output_gate:
+            self.g_proj = nn.Linear(
+                hidden_size,
+                num_heads * v_head_dim,
+                bias=False,
             )
-            gen_mla_backend = "trtllm-gen"
 
-        # Normal context backend: per-head Q/K/V, matching the regular
-        # MLA context path in ``modules/mla.py``.
-        self._backend_prefill = TrtllmAttention(
-            layer_idx=layer_idx,
-            num_heads=num_heads,
-            head_dim=qk_nope_head_dim + qk_rope_head_dim,
-            num_kv_heads=num_heads,
-            quant_config=quant_config,
-            mla_params=mla_params,
-            pos_embd_params=ctx_pos_embd_params,
-            flashinfer_mla_backend="trtllm-gen",
-        )
-        # Absorbed trtllm-gen backend retained for the prefill A/B path
-        # and multi-token generation fallback.
-        self._backend_ctx = TrtllmAttention(
-            layer_idx=layer_idx,
-            num_heads=num_heads,
-            head_dim=kv_lora_rank + qk_rope_head_dim,
-            num_kv_heads=1,
-            quant_config=quant_config,
-            mla_params=mla_params,
-            pos_embd_params=ctx_pos_embd_params,
-            flashinfer_mla_backend="trtllm-gen",
-        )
-        # Generation backend: absorbed MQA path (same config as ctx).
-        # Called by ``forward_decode`` for single-token cached decode only;
-        # multi-token generation (spec-dec verify) falls back to
-        # ``_backend_ctx`` (trtllm-gen) — see ``forward_decode``.
-        # ``TLLM_K3_MLA_GEN_BACKEND`` (A/B experiment knob) selects the
-        # FlashInfer MLA generation kernel: ``cute-dsl`` (default; needs
-        # the customized FlashInfer revision from examples/kimi_k3/README.md
-        # for full performance) or ``trtllm-gen``.
-        self._backend_gen = TrtllmAttention(
-            layer_idx=layer_idx,
-            num_heads=num_heads,
-            head_dim=kv_lora_rank + qk_rope_head_dim,
-            num_kv_heads=1,
-            quant_config=quant_config,
-            mla_params=mla_params,
-            pos_embd_params=gen_pos_embd_params,
-            flashinfer_mla_backend=gen_mla_backend,
-        )
-
-        # K3 NoPE contract — overwrite the actual cos/sin values with
-        # identity while keeping the tensor SHAPE that the C++ kernel
-        # expects. Freeze via ``_ensure_rope_table_size`` no-op.
-        _install_identity_rope_table(self._backend_prefill)
-        _install_identity_rope_table(self._backend_ctx)
-        _install_identity_rope_table(self._backend_gen)
+        # K3 is NoPE. The base MLA backends still require real RoPE tables, so
+        # retain their expected shape and replace every rotation with identity.
+        assert isinstance(self.mha, TrtllmAttention)
+        assert isinstance(self.mqa, TrtllmAttention)
+        _install_identity_rope_table(self.mha)
+        _install_identity_rope_table(self.mqa)
+        self.rotary_emb = None
+        self.apply_rotary_emb = False
 
         if dtype is not None:
             _meta_safe_cast_dtype(self, dtype)
 
-        # Register the mutation rotation as a non-trainable buffer so
-        # `.to(device, dtype)` moves it transparently.
-        rot = _make_fixed_rotation(qk_rope_head_dim)
-        self.register_buffer("_mutation_rot", rot, persistent=False)
-
-    # ------------------------------------------------------------------
-    # Runtime KV-B weight layout and absorbed views.
-    # ------------------------------------------------------------------
-
-    def pre_reload_weights(self) -> None:
-        """Mark incoming KV-B bytes as checkpoint-layout data."""
-        self._weights_transformed = False
-
-    @torch.no_grad()
-    def transform_weights(self) -> None:
-        """Rewrite KV-B from HF interleaved rows to ``[all K | all V]``.
-
-        DeepSeek MLA performs this conversion during checkpoint loading.
-        Keeping the grouped representation in the parameter itself lets the
-        context GEMM write the required combined KV backing directly, while
-        absorbed decode uses zero-copy K/V views of the same storage.
-        """
-        if self._weights_transformed:
-            return
-
-        weight = self.kv_b_proj.weight
-        if weight.device.type == "meta":
-            raise RuntimeError("Kimi K3 MLA KV-B layout transform requires materialized weights")
-
-        H = self.num_heads
-        n = self.qk_nope_head_dim
-        v = self.v_head_dim
-        kv = self.kv_lora_rank
-        weight_view = weight.view(H, n + v, kv)
-        grouped = torch.cat(
-            [
-                weight_view[:, :n, :].reshape(H * n, kv),
-                weight_view[:, n:, :].reshape(H * v, kv),
-            ],
-            dim=0,
-        ).contiguous()
-        weight.data.copy_(grouped)
-        self._weights_transformed = True
-
-    def post_load_weights(self) -> None:
-        """Apply the runtime layout after checkpoint loading."""
-        self.transform_weights()
-
-    def cache_derived_state(self) -> None:
-        """The runtime layout has no separate Python-side cache."""
-
-    def _kv_b_absorb_split(
-        self,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return zero-copy K/V absorb views of grouped ``kv_b_proj``."""
-        if not self._weights_transformed:
-            raise RuntimeError("Kimi K3 MLA weights must be transformed after checkpoint loading")
-
-        weight = self.kv_b_proj.weight
-        H = self.num_heads
-        n = self.qk_nope_head_dim
-        v = self.v_head_dim
-        kv = self.kv_lora_rank
-        k_weight, v_weight = weight.split(
-            [H * n, H * v],
-            dim=0,
-        )
-        return k_weight.view(H, n, kv), v_weight.view(H, v, kv)
-
-    # ------------------------------------------------------------------
-    # Introspection helpers.
-    # ------------------------------------------------------------------
-
-    def softmax_scale(self) -> float:
-        return self.q_head_dim**-0.5
-
-    def backend_kind(self) -> str:
-        return "TrtllmAttention"
-
-    # ------------------------------------------------------------------
-    # Weight-copy helper.
-    # ------------------------------------------------------------------
-
-    def load_hf_state_dict(
-        self, state_dict: "dict[str, torch.Tensor]"
-    ) -> "dict[str, Tuple[Tuple[int, ...], str]]":
-        """Copy every named parameter/buffer from ``state_dict`` into the module.
-
-        Because ``KimiK3MLAAttention`` mirrors HF ``KimiMLAAttention``
-        parameter names 1:1, the mapping is identity. Only HF-owned
-        names are copied; any purely-internal buffer on the K3 side
-        (e.g. ``_mutation_rot``) is ignored. Shape mismatches raise.
-        """
-        self.pre_reload_weights()
-        dst: "dict[str, torch.Tensor]" = {}
-        for name, p in self.named_parameters(recurse=True):
-            dst[name] = p.data
-        for name, buf in self.named_buffers(recurse=True):
-            if name.endswith("_mutation_rot"):
-                continue
-            dst[name] = buf
-
-        # Only include HF-namespace params/bufs; skip anything that
-        # lives under our internal ``_backend_ctx`` / ``_backend_gen``
-        # scopes (rotary tables, KV cache scales, etc.).
-        hf_dst = {name: t for name, t in dst.items() if not name.startswith("_backend_")}
-
-        missing_on_dst = sorted(set(state_dict) - set(hf_dst))
-        missing_on_hf = sorted(set(hf_dst) - set(state_dict))
-        if missing_on_dst:
-            raise KeyError(f"load_hf_state_dict: HF params missing on module: {missing_on_dst[:5]}")
-        if missing_on_hf:
-            raise KeyError(f"load_hf_state_dict: module params missing on HF: {missing_on_hf[:5]}")
-
-        provenance: "dict[str, Tuple[Tuple[int, ...], str]]" = {}
-        for name, src in state_dict.items():
-            dstt = hf_dst[name]
-            if src.shape != dstt.shape:
-                raise ValueError(
-                    f"shape mismatch for {name}: HF {tuple(src.shape)} "
-                    f"vs module {tuple(dstt.shape)}"
-                )
-            dstt.copy_(src.to(dtype=dstt.dtype, device=dstt.device))
-            provenance[name] = (tuple(src.shape), str(src.dtype))
-        self.transform_weights()
-        return provenance
-
-    # ------------------------------------------------------------------
-    # Projection helpers (shared between prefill and decode).
-    # ------------------------------------------------------------------
-
-    def _project_q_unabsorbed(
-        self, hidden_states_2d: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(q_nope, q_rot)`` shaped ``[num_tokens, num_heads, ...]``.
-
-        ``hidden_states_2d`` shape ``[num_tokens, hidden_size]``.
-        """
-        num_tokens = hidden_states_2d.shape[0]
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states_2d)))
-        q = q.view(num_tokens, self.num_heads, self.q_head_dim)
-        q_nope, q_rot = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        return q_nope, q_rot
-
-    def _project_kv_and_latent(
-        self, hidden_states_2d: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return ``(normed_kv, k_pe, latent_cache)``.
-
-        ``latent_cache`` shape ``[num_tokens, kv_lora_rank + qk_rope_head_dim]``
-        is the tensor the paged cache writes.
-        """
-        compressed = self.kv_a_proj_with_mqa(hidden_states_2d)
-        compressed_kv, k_pe = torch.split(
-            compressed, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-        normed_kv = self.kv_a_layernorm(compressed_kv)
-        latent_cache = torch.cat([normed_kv, k_pe], dim=-1)
-        return normed_kv, k_pe, latent_cache
-
-    def _maybe_rotate_qk(
-        self,
-        q_rot: torch.Tensor,
-        k_rot: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Apply the mutation rotation to ``q_rot`` (and optionally ``k_rot``).
-
-        For NoPE the reference sends q_rot/k_rot through unchanged; a
-        non-identity rotation must break parity.
-        """
-        if not self.apply_rotary_mutation:
-            return q_rot, k_rot
-        rot = self._mutation_rot.to(dtype=q_rot.dtype, device=q_rot.device)
-        # For a fixed rotation (not position-dependent) applying the same
-        # rotation R to both q_rot and k_rot leaves Q @ K^T unchanged, so
-        # break the symmetry by rotating q_rot with R and k_rot with R^T.
-        q_rot_mut = q_rot @ rot
-        k_rot_mut = None if k_rot is None else k_rot @ rot.T
-        return q_rot_mut, k_rot_mut
-
-    # ------------------------------------------------------------------
-    # Prefill (context) path.
-    # ------------------------------------------------------------------
-
-    def _project_context_qkv(
-        self,
-        hidden_states_2d: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project normal context Q/K/V plus the latent cache payload.
-
-        The returned V is deliberately a non-contiguous view into the
-        combined grouped-by-dim KV projection. For K3 H96 its 2D stride
-        is ``(24576, 1)``, not the compact ``(12288, 1)``.
-        """
-        num_tokens = hidden_states_2d.shape[0]
-        q_nope, q_rot = self._project_q_unabsorbed(hidden_states_2d)
-        normed_kv, k_pe, latent_cache = self._project_kv_and_latent(hidden_states_2d)
-        q_rot_use, k_pe_use = self._maybe_rotate_qk(q_rot, k_pe)
-        assert k_pe_use is not None
-
-        q = torch.cat([q_nope, q_rot_use], dim=-1).reshape(
-            num_tokens,
-            self.num_heads * self.q_head_dim,
-        )
-
-        if not self._weights_transformed:
-            raise RuntimeError("Kimi K3 MLA weights must be transformed after checkpoint loading")
-        kv = self.kv_b_proj(normed_kv)
-        k_nope, v = kv.split(
-            [
-                self.num_heads * self.qk_nope_head_dim,
-                self.num_heads * self.v_head_dim,
-            ],
-            dim=-1,
-        )
-        k = torch.cat(
-            [
-                k_nope.view(num_tokens, self.num_heads, self.qk_nope_head_dim),
-                k_pe_use[:, None, :].expand(-1, self.num_heads, -1),
-            ],
-            dim=-1,
-        ).reshape(num_tokens, self.num_heads * self.q_head_dim)
-        return q, k, v, latent_cache.contiguous()
-
-    def forward_prefill(
-        self,
-        hidden_states: torch.Tensor,
-        rt: KimiK3MLARuntimeInputs,
-    ) -> torch.Tensor:
-        """Run K3 prefill through the normal unabsorbed context FMHA."""
-        num_tokens = hidden_states.shape[0]
-        q, k, v, latent_cache = self._project_context_qkv(hidden_states)
-        metadata = rt.metadata
-        if self._backend_prefill.has_cached_kv_for_mla_context(metadata):
-            if metadata.runtime_features.chunked_prefill:
-                attn_out = self._forward_prefill_with_chunked_cache(
-                    q,
-                    k,
-                    v,
-                    latent_cache,
-                    metadata,
-                )
-            else:
-                attn_out = self._forward_prefill_with_cached_kv(
-                    q,
-                    latent_cache,
-                    metadata,
-                )
-        else:
-            attn_out = self._backend_prefill.forward(
-                q,
-                k,
-                v,
-                metadata,
-                forward_args=AttentionForwardArgs(
-                    latent_cache=latent_cache,
-                    attention_input_type=AttentionInputType.context_only,
-                    attention_mask=PredefinedAttentionMask.CAUSAL,
-                ),
-            )
-        if isinstance(attn_out, tuple):
-            attn_out = attn_out[0]
-        attn_out = attn_out[:num_tokens].reshape(
-            num_tokens,
-            self.num_heads * self.v_head_dim,
-        )
-        return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
-
-    def _expand_context_kv(
-        self,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Up-project latent KV into the normal context FMHA layout."""
-        kv = self.kv_b_proj(compressed_kv)
-        k_nope, v = kv.split(
-            [
-                self.num_heads * self.qk_nope_head_dim,
-                self.num_heads * self.v_head_dim,
-            ],
-            dim=-1,
-        )
-        k = torch.cat(
-            [
-                k_nope.view(-1, self.num_heads, self.qk_nope_head_dim),
-                k_pe.view(-1, 1, self.qk_rope_head_dim).expand(
-                    -1, self.num_heads, -1
-                ),
-            ],
-            dim=-1,
-        ).view(-1, self.num_heads * self.q_head_dim)
-        return k, v
-
-    def _forward_prefill_with_cached_kv(
-        self,
-        q: torch.Tensor,
-        latent_cache: torch.Tensor,
-        metadata: TrtllmAttentionMetadata,
-    ) -> torch.Tensor:
-        """Run a context chunk against the complete paged latent prefix."""
-        backend = self._backend_prefill
-        backend.mla_rope_append_paged_kv_assign_q(q, latent_cache, metadata)
-        compressed_kv, k_pe = backend.load_paged_kv_cache_for_mla(
-            metadata,
-            q.dtype,
-        )
-        k, v = self._expand_context_kv(compressed_kv, k_pe)
-        output = q.new_empty((q.shape[0], self.num_heads * self.v_head_dim))
-        return backend.forward(
-            q,
-            k,
-            v,
-            metadata,
-            forward_args=AttentionForwardArgs(
-                latent_cache=None,
-                attention_input_type=AttentionInputType.context_only,
-                attention_mask=PredefinedAttentionMask.CAUSAL,
-                output=output,
-            ),
-        )
-
-    def _forward_prefill_with_chunked_cache(
-        self,
-        q: torch.Tensor,
-        current_k: torch.Tensor,
-        current_v: torch.Tensor,
-        latent_cache: torch.Tensor,
-        metadata: TrtllmAttentionMetadata,
-    ) -> torch.Tensor:
-        """Merge normal context FMHA over paged history chunks and current KV."""
-        backend = self._backend_prefill
-        backend.mla_rope_append_paged_kv_assign_q(q, latent_cache, metadata)
-
-        output = q.new_empty((q.shape[0], self.num_heads * self.v_head_dim))
-        temp_output = torch.empty_like(output)
-        softmax_stats = torch.empty(
-            (metadata.num_ctx_tokens, self.num_heads, 2),
-            dtype=torch.float,
-            device=q.device,
-        )
-        temp_softmax_stats = torch.empty_like(softmax_stats)
-
-        original_kv_lens_cuda = metadata.kv_lens_cuda_runtime
-        original_kv_lens = metadata.kv_lens_runtime
-        original_total_kv_len = metadata.host_total_kv_lens[0].item()
-        try:
-            for loop_idx in range(metadata.chunked_loop_num):
-                chunked_token_count = metadata.host_cu_chunked_seq_len[
-                    loop_idx, metadata.num_contexts
-                ].item()
-                compressed_kv, k_pe = backend.load_chunked_kv_cache_for_mla(
-                    metadata=metadata,
-                    num_ctx_cached_tokens=chunked_token_count,
-                    cu_chunked_seq_len=metadata.cu_chunked_seq_len[loop_idx],
-                    chunked_global_offset=metadata.chunked_global_offset[loop_idx],
-                    chunked_max_seq_len=metadata.max_chunk_len_per_loop[loop_idx],
-                    out_dtype=q.dtype,
-                )
-                chunked_k, chunked_v = self._expand_context_kv(
-                    compressed_kv,
-                    k_pe,
-                )
-
-                metadata.kv_lens_runtime = metadata.host_chunked_seq_len[
-                    loop_idx
-                ]
-                metadata.kv_lens_cuda_runtime = metadata.chunked_seq_len[
-                    loop_idx
-                ]
-                metadata.host_total_kv_lens[0] = chunked_token_count
-                chunk_output = backend.forward(
-                    q,
-                    chunked_k,
-                    chunked_v,
-                    metadata,
-                    forward_args=AttentionForwardArgs(
-                        latent_cache=None,
-                        attention_input_type=AttentionInputType.context_only,
-                        attention_mask=PredefinedAttentionMask.FULL,
-                        softmax_stats_tensor=temp_softmax_stats,
-                        chunked_prefill_buffer_batch_size=(
-                            metadata.runtime_features.chunked_prefill_buffer_batch_size
-                        ),
-                        output=temp_output,
-                    ),
-                )
-                if isinstance(chunk_output, tuple):
-                    chunk_output = chunk_output[0]
-                backend.merge_attention_for_mla(
-                    output,
-                    chunk_output,
-                    softmax_stats,
-                    temp_softmax_stats,
-                    metadata.merge_op_tensor[loop_idx],
-                    metadata,
-                )
-
-            metadata.kv_lens_runtime = metadata.prompt_lens_cpu_runtime
-            metadata.kv_lens_cuda_runtime = metadata.prompt_lens_cuda_runtime
-            metadata.host_total_kv_lens[0] = metadata.num_ctx_tokens
-            current_output = backend.forward(
-                q,
-                current_k,
-                current_v,
-                metadata,
-                forward_args=AttentionForwardArgs(
-                    latent_cache=None,
-                    attention_input_type=AttentionInputType.context_only,
-                    attention_mask=PredefinedAttentionMask.CAUSAL,
-                    softmax_stats_tensor=temp_softmax_stats,
-                    chunked_prefill_buffer_batch_size=(
-                        metadata.runtime_features.chunked_prefill_buffer_batch_size
-                    ),
-                    output=temp_output,
-                ),
-            )
-            if isinstance(current_output, tuple):
-                current_output = current_output[0]
-            backend.merge_attention_for_mla(
-                output,
-                current_output,
-                softmax_stats,
-                temp_softmax_stats,
-                metadata.merge_op_tensor[metadata.chunked_loop_num],
-                metadata,
-            )
-        finally:
-            metadata.kv_lens_runtime = original_kv_lens
-            metadata.kv_lens_cuda_runtime = original_kv_lens_cuda
-            metadata.host_total_kv_lens[0] = original_total_kv_len
-        return output
-
-    def _project_absorbed_q(
-        self,
-        hidden_states_2d: torch.Tensor,
-        *,
-        direct_output: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute the absorbed fused Q for the MLA generation FMHA.
-
-        Returns ``(q_fused_flat, q_pe_3d, latent_cache)`` shaped for the
-        backend generation path. ``q_fused_flat`` has shape
-        ``[num_tokens, num_heads * (kv_lora_rank + qk_rope_head_dim)]``
-        with ``[q_nope @ k_absorb, q_rot]`` per head. ``q_pe_3d`` is the
-        rope portion of Q shaped ``[num_tokens, num_heads,
-        qk_rope_head_dim]`` (the C++ backend requires this shape sentinel
-        even under ``skip_mla_rope_generation=True``, cf.
-        ``attentionOp.cpp:558``). ``latent_cache`` is
-        ``[num_tokens, kv_lora_rank + qk_rope_head_dim]`` — the tensor
-        the backend will append to the paged KV cache.
-
-        ``direct_output`` leaves the RoPE tail for native preprocessing.
-        """
-        num_tokens = hidden_states_2d.shape[0]
-        q_nope, q_rot = self._project_q_unabsorbed(hidden_states_2d)
-        _, _, latent_cache = self._project_kv_and_latent(hidden_states_2d)
-
-        k_absorb, _ = self._kv_b_absorb_split()
-        k_absorb = k_absorb.to(dtype=q_nope.dtype, device=q_nope.device)
-
-        if direct_output:
-            q_fused = torch.empty(
-                num_tokens,
-                self.num_heads,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-                dtype=q_nope.dtype,
-                device=q_nope.device,
-            )
-            q_nope_out = q_fused[..., : k_absorb.shape[-1]].transpose(0, 1)
-            torch.ops.trtllm.bmm_out(
-                q_nope.transpose(0, 1),
-                k_absorb,
-                q_nope_out,
-            )
-        else:
-            # Absorb: [T, H, m] × [H, m, kv] -> [T, H, kv]. (m = qk_nope_head_dim)
-            q_absorbed_nope = torch.einsum("thm,hmk->thk", q_nope, k_absorb)
-
-        # Mutation rotation on q_rot only (k side is cached latent, cannot
-        # be rotated post-hoc).
-        q_rot_use, _ = self._maybe_rotate_qk(q_rot, None)
-
-        if not direct_output:
-            q_fused = torch.cat([q_absorbed_nope, q_rot_use], dim=-1)
-        q_fused_flat = q_fused.reshape(
-            num_tokens,
-            self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim),
-        ).contiguous()
-        q_pe_3d = q_rot_use.reshape(num_tokens, self.num_heads, self.qk_rope_head_dim).contiguous()
-        return q_fused_flat, q_pe_3d, latent_cache.contiguous()
-
-    def _forward_prefill_absorbed_generation(
-        self,
-        hidden_states: torch.Tensor,
-        rt: KimiK3MLARuntimeInputs,
-    ) -> torch.Tensor:
-        """Diagnostic prefill path through absorbed generation FMHA.
-
-        ``hidden_states`` shape ``[num_tokens, hidden_size]``.
-        Returns ``[num_tokens, hidden_size]``.
-
-        Retains the former production implementation for numerical A/B.
-        Executes attention through ``_backend_ctx.forward`` with
-        ``attention_input_type=generation_only`` and a multi-token /
-        MTP-style causal mask.
-
-        Under an MTP causal mask with ``kv_len == q_len == T``, the
-        query at position ``i`` sees KV positions ``[0, i]`` — which
-        exactly matches causal prefill semantics. The DSv3 MLA test
-        at ``tests/unittest/_torch/attention/test_attention_mla.py``
-        exercises this path with ``generation_seq_len_q=4`` on SM100
-        and passes. K3 uses the same underlying cubin dispatch.
-
-        Concrete flow:
-
-        1. Preallocate final fused Q and write ``q_nope @ k_absorb`` directly
-           into its leading slice.
-        2. Run native ``mla_rope_generation`` to write the identity-RoPE tail,
-           append ``latent_cache``, and initialize scheduler buffers. Then
-           call ``_backend_ctx.forward`` with those buffers and run the
-           working MLA generation FMHA with T queries against T KV positions.
-        3. Un-absorb the ``[T, H * kv_lora]`` result to
-           ``[T, H * v_head_dim]`` via ``kv_b_proj_absorb_v``.
-        4. Apply K3 output gate then ``o_proj``.
-
-        The metadata carried by ``rt`` must be shaped as a generation
-        step (``num_contexts=0, num_generations=1, seq_lens=[T],
-        num_cached_tokens_per_seq=[0]``); the harness handles that. A future
-        ragged or mismatched batch retains the existing concatenation path.
-        """
-        num_tokens = hidden_states.shape[0]
-        direct_output = _supports_mla_prefill_direct_output(rt, num_tokens)
-        q_fused_flat, q_pe_3d, latent_cache = self._project_absorbed_q(
-            hidden_states,
-            direct_output=direct_output,
-        )
-        if direct_output:
-            device = q_fused_flat.device
-            num_seqs = rt.metadata.num_seqs
-            forward_args = AttentionForwardArgs(
-                latent_cache=latent_cache,
-                q_pe=q_pe_3d,
-                attention_input_type=AttentionInputType.generation_only,
-                attention_mask=PredefinedAttentionMask.CAUSAL,
-                cu_q_seqlens=torch.empty(num_seqs + 1, dtype=torch.int32, device=device),
-                cu_kv_seqlens=torch.empty(num_seqs + 1, dtype=torch.int32, device=device),
-                fmha_scheduler_counter=torch.empty(1, dtype=torch.uint32, device=device),
-            )
-            if getattr(self._backend_ctx, "has_fp8_kv_cache", False):
-                forward_args.mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
-                forward_args.mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
-                forward_args.quant_q_buffer = torch.empty(
-                    num_tokens,
-                    self.num_heads,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                    dtype=torch.uint8,
-                    device=device,
-                )
-            self._backend_ctx.mla_rope_generation(
-                q_fused_flat.view(
-                    num_tokens,
-                    self.num_heads,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                ),
-                q_pe_3d,
-                latent_cache,
-                rt.metadata,
-                forward_args.cu_q_seqlens,
-                forward_args.cu_kv_seqlens,
-                forward_args.fmha_scheduler_counter,
-                forward_args.mla_bmm1_scale,
-                forward_args.mla_bmm2_scale,
-                forward_args.quant_q_buffer,
-            )
-        else:
-            if (
-                getattr(self._backend_ctx, "has_fp8_kv_cache", False)
-                and rt.metadata.kv_cache_manager is not None
-            ):
-                raise NotImplementedError(
-                    "Kimi K3 MLA prefill fallback (ragged/mismatched batch) "
-                    "does not support FP8 KV cache: the python latent-append "
-                    "helper writes unquantized BF16 rows into the FP8 pool."
-                )
-            forward_args = AttentionForwardArgs(
-                latent_cache=latent_cache,
-                attention_input_type=AttentionInputType.generation_only,
-                attention_mask=PredefinedAttentionMask.CAUSAL,
-                q_pe=q_pe_3d,
-                skip_mla_rope_generation=True,
-            )
-
-        _, v_absorb = self._kv_b_absorb_split()
-        v_absorb = v_absorb.to(dtype=q_fused_flat.dtype, device=q_fused_flat.device)
-
-        attn_absorbed = self._backend_ctx.forward(
-            q_fused_flat, None, None, rt.metadata, forward_args=forward_args
-        )
-        # ``attn_absorbed`` shape: ``[num_tokens, num_heads * kv_lora_rank]``.
-        attn_absorbed = attn_absorbed.view(num_tokens, self.num_heads, self.kv_lora_rank)
-        # Un-absorb: [T, H, kv] × [H, v, kv] -> [T, H, v].
-        attn_out_3d = torch.einsum("thk,hvk->thv", attn_absorbed, v_absorb)
-        attn_out = attn_out_3d.reshape(num_tokens, self.num_heads * self.v_head_dim)
-        return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
-
-    # ------------------------------------------------------------------
-    # Cached decode (absorbed generation) path.
-    # ------------------------------------------------------------------
-
-    def forward_decode(
-        self,
-        hidden_states: torch.Tensor,
-        rt: KimiK3MLARuntimeInputs,
-    ) -> torch.Tensor:
-        """Cached decode via absorbed generation.
-
-        ``hidden_states`` shape ``[num_tokens, hidden_size]``. Returns
-        ``[num_tokens, hidden_size]``.
-
-        Plain decode batches (one token per generation request — the
-        TPOT/CUDA-graph hot path) take the fused DeepSeek-pattern path;
-        speculative-verification batches (q_len > 1 per request) keep the
-        legacy python path, whose latent-append helper handles q_len > 1.
-        """
-        metadata = rt.metadata
-        if (
-            hidden_states.shape[0] == metadata.num_generations
-            and metadata.kv_cache_manager is not None
-        ):
-            return self._forward_decode_fused(hidden_states, rt)
-        return self._forward_decode_legacy(hidden_states, rt)
-
-    def _forward_decode_fused(
-        self,
-        hidden_states: torch.Tensor,
-        rt: KimiK3MLARuntimeInputs,
-    ) -> torch.Tensor:
-        """Absorbed decode, DeepSeek ``forward_absorption_generation`` pattern.
-
-        Removes ~20 tiny per-layer device kernels vs the legacy path (all of
-        which replay inside the decode CUDA graph and are pure serial latency
-        at small batch):
-
-        * ``bmm_out`` writes the absorbed ``q_nope @ k_absorb`` straight into
-          the latent slice of a preallocated ``fused_q`` (no einsum permute
-          copies, no ``torch.cat``, no ``.contiguous()``).
-        * One fused C++ op, ``mla_rope_generation``, rotates ``q_pe``/``k_pe``
-          by the identity table (a copy — NoPE preserved), writes ``q_pe``
-          into ``fused_q``'s rope tail, appends the latent row to the paged
-          cache, and fills the trtllm-gen scheduler buffers
-          (cu_q/cu_kv/counter) in-kernel — replacing the ~10-kernel python
-          ``skip_mla_rope_generation`` block in ``TrtllmAttention.forward``.
-        * ``bmm_out`` un-absorbs the FMHA output straight into the
-          gate/o_proj input buffer.
-        """
-        num_tokens = hidden_states.shape[0]
-        metadata = rt.metadata
-        q_nope, q_rot = self._project_q_unabsorbed(hidden_states)
-        _, _, latent_cache = self._project_kv_and_latent(hidden_states)
-
-        k_absorb, v_absorb = self._kv_b_absorb_split()
-
-        # Mutation rotation on q_rot only (k side is the cached latent,
-        # we cannot rotate that without breaking the cache contract).
-        q_rot_use, _ = self._maybe_rotate_qk(q_rot, None)
-
-        fused_q = hidden_states.new_empty(
-            (num_tokens, self.num_heads, self.kv_lora_rank + self.qk_rope_head_dim)
-        )
-        # Absorb: [H, T, m] × [H, m, kv] -> [H, T, kv] (m = qk_nope_head_dim),
-        # written directly into fused_q's latent slice.
-        torch.ops.trtllm.bmm_out(
-            q_nope.transpose(0, 1), k_absorb, fused_q[..., : self.kv_lora_rank].transpose(0, 1)
-        )
-
-        num_seqs = metadata.num_seqs
-        cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=hidden_states.device)
-        cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=hidden_states.device)
-        fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=hidden_states.device)
-        # FP8 KV cache: the rope-generation op additionally quantizes the
-        # appended latent row and fused_q, emitting the FMHA dequant scales
-        # and the quantized-Q buffer (same contract as the DeepSeek MLA
-        # decode path in mla.py).
-        mla_bmm1_scale = None
-        mla_bmm2_scale = None
-        quant_q_buffer = None
-        if getattr(self._backend_gen, "has_fp8_kv_cache", False):
-            mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=hidden_states.device)
-            mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
-            quant_q_buffer = torch.empty(
-                num_tokens,
-                self.num_heads,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-                dtype=torch.uint8,
-                device=hidden_states.device,
-            )
-        # Identity rope (NoPE): writes q_rot into fused_q's rope tail,
-        # appends the latent row to the paged cache, and fills the
-        # scheduler buffers — one op, CUDA-graph-safe (the DeepSeek MLA
-        # generation path uses it under graphs in production).
-        self._backend_gen.mla_rope_generation(
-            fused_q,
-            q_rot_use,
-            latent_cache,
-            metadata,
-            cu_q_seqlens,
-            cu_kv_seqlens,
-            fmha_scheduler_counter,
-            mla_bmm1_scale,
-            mla_bmm2_scale,
-            quant_q_buffer,
-        )
-
-        forward_args = AttentionForwardArgs(
-            latent_cache=latent_cache,
-            attention_input_type=AttentionInputType.generation_only,
-            attention_mask=PredefinedAttentionMask.CAUSAL,
-            q_pe=q_rot_use,
-            cu_q_seqlens=cu_q_seqlens,
-            cu_kv_seqlens=cu_kv_seqlens,
-            fmha_scheduler_counter=fmha_scheduler_counter,
-            mla_bmm1_scale=mla_bmm1_scale,
-            mla_bmm2_scale=mla_bmm2_scale,
-            quant_q_buffer=quant_q_buffer,
-        )
-        attn_absorbed = self._backend_gen.forward(
-            fused_q.view(num_tokens, -1),
-            None,
-            None,
-            metadata,
-            forward_args=forward_args,
-        )
-        # ``attn_absorbed`` shape: ``[num_tokens, num_heads * kv_lora_rank]``.
-        attn_absorbed = attn_absorbed.view(num_tokens, self.num_heads, self.kv_lora_rank)
-        attn_out = hidden_states.new_empty((num_tokens, self.num_heads * self.v_head_dim))
-        # Un-absorb: [H, T, kv] × [H, kv, v] -> [H, T, v], written directly
-        # into the gate/o_proj input buffer.
-        torch.ops.trtllm.bmm_out(
-            attn_absorbed.transpose(0, 1),
-            v_absorb.transpose(1, 2),
-            attn_out.view(num_tokens, self.num_heads, self.v_head_dim).transpose(0, 1),
-        )
-        return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
-
-    def _forward_decode_legacy(
-        self,
-        hidden_states: torch.Tensor,
-        rt: KimiK3MLARuntimeInputs,
-    ) -> torch.Tensor:
-        """Legacy absorbed decode (einsum + python latent-append path).
-
-        Kept for speculative-verification batches (q_len > 1 per request),
-        where ``append_mla_latent_cache_generation_cuda_graph_safe`` handles
-        the multi-token append.
-        """
-        if (
-            getattr(self._backend_gen, "has_fp8_kv_cache", False)
-            and rt.metadata.kv_cache_manager is not None
-        ):
-            raise NotImplementedError(
-                "Kimi K3 MLA legacy decode (speculative-verification, "
-                "q_len > 1) does not support FP8 KV cache: the python "
-                "latent-append helper writes unquantized BF16 rows into "
-                "the FP8 pool."
-            )
-        num_tokens = hidden_states.shape[0]
-        q_nope, q_rot = self._project_q_unabsorbed(hidden_states)
-        normed_kv, k_pe, latent_cache = self._project_kv_and_latent(hidden_states)
-
-        k_absorb, v_absorb = self._kv_b_absorb_split()
-        k_absorb = k_absorb.to(dtype=q_nope.dtype, device=q_nope.device)
-        v_absorb = v_absorb.to(dtype=q_nope.dtype, device=q_nope.device)
-
-        # Absorb q_nope by k_absorb: [T, H, m] × [H, m, kv] → [T, H, kv]. (m = qk_nope_head_dim)
-        q_absorbed_nope = torch.einsum("thm,hmk->thk", q_nope, k_absorb)
-
-        # Mutation rotation on q_rot only (k side is the cached latent,
-        # we cannot rotate that without breaking the cache contract).
-        q_rot_use, _ = self._maybe_rotate_qk(q_rot, None)
-
-        q_fused = torch.cat([q_absorbed_nope, q_rot_use], dim=-1)
-        q_fused_flat = q_fused.reshape(
-            num_tokens, self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
-        ).contiguous()
-
-        # The C++ generation MLA path validates ``q_pe.has_value()`` even
-        # when ``skip_mla_rope_generation=True`` (attentionOp.cpp:558).
-        # Provide the rope portion of q as a 3D tensor
-        # ``[num_tokens, num_heads, qk_rope_head_dim]``. Since we skip the
-        # rope kernel, the values are used only as a shape sentinel by
-        # the backend's downstream code; the actual rotated Q values are
-        # already in ``q_fused_flat[..., kv_lora_rank:]``.
-        q_pe_3d = q_rot_use.reshape(num_tokens, self.num_heads, self.qk_rope_head_dim).contiguous()
-
-        forward_args = AttentionForwardArgs(
-            latent_cache=latent_cache.contiguous(),
-            attention_input_type=AttentionInputType.generation_only,
-            attention_mask=PredefinedAttentionMask.CAUSAL,
-            q_pe=q_pe_3d,
-            # We are feeding pre-rotated fused_q (identity rotation via
-            # our identity cos/sin table), so ask the backend to skip
-            # the rope-generation step but still handle the paged-cache
-            # append + scheduler-buffer setup.
-            skip_mla_rope_generation=True,
-        )
-        # cute-dsl MLA decode folds seq_len_q into the 128-wide head tile;
-        # with K3's 128 (padded) query heads it can only implement T=1.
-        # Multi-token generation batches (spec-dec verify: SA, DFlash) go
-        # through the trtllm-gen backend, which supports q_len_per_req > 1.
-        num_gens = rt.metadata.num_generations
-        backend = (
-            self._backend_gen if num_gens > 0 and num_tokens == num_gens else self._backend_ctx
-        )
-        attn_absorbed = backend.forward(
-            q_fused_flat, None, None, rt.metadata, forward_args=forward_args
-        )
-        # ``attn_absorbed`` shape: ``[num_tokens, num_heads * kv_lora_rank]``.
-        attn_absorbed = attn_absorbed.view(num_tokens, self.num_heads, self.kv_lora_rank)
-        # Unabsorb: [T, H, kv] × [H, v, kv] → [T, H, v].
-        attn_out_3d = torch.einsum("thk,hvk->thv", attn_absorbed, v_absorb)
-        attn_out = attn_out_3d.reshape(num_tokens, self.num_heads * self.v_head_dim)
-        return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
-
-    # ------------------------------------------------------------------
-    # Output gate + o_proj (shared).
-    # ------------------------------------------------------------------
-
     def _apply_output_gate_and_o_proj(
-        self, hidden_states: torch.Tensor, attn_out: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        attn_out: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply K3 output gate then ``o_proj`` and return the module output.
-
-        ``attn_out`` shape: ``[num_tokens, num_heads * v_head_dim]``.
-        ``hidden_states`` shape: ``[num_tokens, hidden_size]``.
-        Returns ``[num_tokens, hidden_size]``.
-        """
-        if self.use_output_gate and not self.omit_output_gate_mutation:
-            g = self.g_proj(hidden_states).sigmoid()
-            attn_out = attn_out * g
+        if self.use_output_gate:
+            attn_out = attn_out * self.g_proj(hidden_states).sigmoid()
         return self.o_proj(attn_out)
-
-    # ------------------------------------------------------------------
-    # Convenience entry point.
-    # ------------------------------------------------------------------
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        rt: KimiK3MLARuntimeInputs,
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        """Dispatch to prefill or decode based on ``rt.metadata`` counts.
-
-        ``num_generations > 0`` selects the absorbed-decode path;
-        otherwise the context path is used.
-        """
-        if rt.metadata.num_generations > 0 and rt.metadata.num_contexts == 0:
-            return self.forward_decode(hidden_states, rt)
-        return self.forward_prefill(hidden_states, rt)
+        attn_out = self.create_output(
+            hidden_states,
+            attn_metadata.num_contexts,
+        )
+        super().forward_impl(
+            None,
+            hidden_states,
+            attn_metadata,
+            output=attn_out,
+        )
+        return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
