@@ -223,6 +223,7 @@ def identity_from(
     *,
     model_name: Optional[str] = None,
     artifact_key: str = "same",
+    transform_abi_id: Optional[str] = None,
 ) -> SourceIdentity:
     """Build a :class:`SourceIdentity` from a fake config and derived model."""
     return SourceIdentity.from_model_config(
@@ -230,6 +231,7 @@ def identity_from(
         FakeModel(config.pretrained_config),
         artifact_identity=make_artifact_identity(artifact_key),
         model_name=model_name,
+        transform_abi_id=transform_abi_id,
     )
 
 

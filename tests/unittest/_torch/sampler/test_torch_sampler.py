@@ -2823,8 +2823,8 @@ class TestBatchedSampling:
             ).unsqueeze(1)  # Add a dimension for beam width
 
             batched_sampling_result = _BatchedSamplingResult(
-                batch_req_indices=batch_req_indices.clone(),
-                batch_next_tokens_cuda_int=batch_next_tokens_cuda_int.clone(),
+                req_indices=batch_req_indices.clone(),
+                next_tokens_cuda_int=batch_next_tokens_cuda_int.clone(),
             )
             seq_slots_tensor_snapshot = seq_slots_tensor.clone()
 
@@ -2868,9 +2868,9 @@ class TestBatchedSampling:
                     new_tokens_cuda_snapshot[:, slot], new_tokens_cuda[:, slot]
                 )
             torch.testing.assert_close(
-                batch_next_tokens_cuda_int, batched_sampling_result.batch_next_tokens_cuda_int
+                batch_next_tokens_cuda_int, batched_sampling_result.next_tokens_cuda_int
             )
-            torch.testing.assert_close(batch_req_indices, batched_sampling_result.batch_req_indices)
+            torch.testing.assert_close(batch_req_indices, batched_sampling_result.req_indices)
             torch.testing.assert_close(seq_slots_tensor, seq_slots_tensor_snapshot)
 
             # validate tokens returned
