@@ -28,7 +28,7 @@ sentencepiece>=0.1.99
 torch>=2.13.0a0,<2.14.0
 torchvision
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-07.html#rel-26-07 uses 2.30.7
-nvidia-nccl-cu13>=2.29.7,<=2.30.7
+nvidia-nccl-cu13==2.29.7
 # NcclEP uses nccl4py's nccl.ep package without changing the NCCL wheel constraint.
 nccl4py>=0.3.1,<0.4
 nvidia-cuda-nvrtc
