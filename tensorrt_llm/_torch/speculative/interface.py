@@ -1704,9 +1704,32 @@ class SpecWorkerBase(nn.Module, ABC):
             return False
         if draft_tokens.dim() != 2 or draft_tokens.shape[0] != num_gens:
             return False
-        # logits must cover context rows (1 each) + gen rows (draft_len + 1 each).
+        # logits must cover context rows (1 each) + however many gen rows the
+        # target was actually given.
+        #
+        # goal doc H7. Under ragged verification that is `total_verify_tokens`,
+        # not `num_gens * (draft_len + 1)` -- and the two differ by exactly the
+        # amount the scheduler trimmed, so requiring the uniform count made this
+        # guard fail whenever the feature did anything. Rejection sampling then
+        # fell back to strict acceptance silently, changing the sampled
+        # distribution for temperature > 0 while leaving the ragged branch below
+        # (which is complete: it scatters to the padded rectangle, fills the pad
+        # rows one-hot, and clamps the accepted count back to `verify_lens`)
+        # unreachable. Greedy GSM8K cannot see any of this.
         logits_rows = logits.shape[0] if logits.dim() > 1 else 1
-        if logits_rows < num_contexts + num_gens * (draft_len + 1):
+        if getattr(spec_metadata, "is_ragged_verify", False):
+            # Fail closed on a half-built ragged layout: the branch below
+            # dereferences all three of these.
+            total_verify_tokens = getattr(spec_metadata, "total_verify_tokens",
+                                          None)
+            if (total_verify_tokens is None
+                    or getattr(spec_metadata, "verify_lens", None) is None
+                    or getattr(spec_metadata, "qo_indptr", None) is None):
+                return False
+            required_gen_rows = int(total_verify_tokens)
+        else:
+            required_gen_rows = num_gens * (draft_len + 1)
+        if logits_rows < num_contexts + required_gen_rows:
             return False
         # Slot ids for the gen subset must exist (range safety is guaranteed by
         # construction).
