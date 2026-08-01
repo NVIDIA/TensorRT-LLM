@@ -417,7 +417,9 @@ class MambaPolicy:
                     "enabled on both sides."
                 )
 
-        _check_global("ssm slot_bytes", self_mlg.ssm_states.slot_bytes, peer_mlg.ssm_states.slot_bytes)
+        _check_global(
+            "ssm slot_bytes", self_mlg.ssm_states.slot_bytes, peer_mlg.ssm_states.slot_bytes
+        )
         _check_global(
             "conv slot_bytes", self_mlg.conv_states.slot_bytes, peer_mlg.conv_states.slot_bytes
         )

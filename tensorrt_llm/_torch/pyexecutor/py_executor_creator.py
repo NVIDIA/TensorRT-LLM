@@ -361,9 +361,28 @@ def create_py_executor(
         A fully initialized PyExecutor instance.
     """
 
-    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
     llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
+
+    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    if llm_args.speculative_config is not None and not skip_est:
+        # TEMPORARY workaround for TRTLLM-14903: force-skip the KV cache
+        # size estimation phase whenever speculative decoding is enabled.
+        # With spec decoding
+        # and a self-spawned MPI session, the estimation executor's warmup
+        # hangs indefinitely while exercising the q>1 generation-path
+        # attention kernels that only its spec-mode dummy requests reach;
+        # the pre-merge branch tip (ec52c6418b) passes the identical run.
+        # The skip path sizes the cache analytically via
+        # configure_kv_cache_capacity() — the same path KVCacheManagerV2
+        # uses for its memory quota. Non-speculative runs keep the normal
+        # estimation behavior. Remove this override once the
+        # estimation-phase hang (TRTLLM-14903) is fixed.
+        logger.info(
+            "Skipping KV cache size estimation with speculative decoding "
+            "enabled (TRTLLM-14903 estimation-phase hang workaround); the "
+            "cache is sized analytically instead.")
+        skip_est = True
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config

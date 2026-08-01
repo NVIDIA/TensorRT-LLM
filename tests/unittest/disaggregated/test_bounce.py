@@ -623,13 +623,18 @@ _K3_MLA_BLOCK_BYTES = 32 * 576 * 2 * 24  # tpb x (kv_lora_rank+rope) x bf16 x 24
 _K3_KDA_LAYERS = 69
 _K3_CONV_SLOT_BYTES = 294_912  # [3*H*hd, W] bf16 per layer
 _K3_SSM_SLOT_BYTES = 6_291_456  # [H, hd, hd] fp32 per layer (95.5% of the state)
-_K3_KDA_PAYLOAD_BYTES = 454_459_392  # 69 x (conv + delta) per request per rank, from the geometry above
+_K3_KDA_PAYLOAD_BYTES = (
+    454_459_392  # 69 x (conv + delta) per request per rank, from the geometry above
+)
 
 
 def _k3_page_table() -> KVCachePageTable:
-    """A K3-shaped page table exactly as the builders produce it: attention layer group(s)
-    first and the mamba layer group appended LAST (kv_extractor.py, both ``build_page_table``
-    and ``_build_page_table_v2``, append it after every attention group)."""
+    """A K3-shaped page table exactly as the builders produce it.
+
+    Attention layer group(s) first and the mamba layer group appended LAST
+    (kv_extractor.py, both ``build_page_table`` and ``_build_page_table_v2``,
+    append it after every attention group).
+    """
     attn = AttentionLayerGroup(
         pool_group_idx=0,
         kv_head_num_per_rank=1,

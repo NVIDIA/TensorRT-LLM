@@ -193,6 +193,26 @@ decoding requires the default cache manager, which cannot reuse blocks.
 ## Current limitations
 
 - Pipeline parallelism is not supported.
+- **KV cache size estimation is temporarily skipped whenever speculative
+  decoding is enabled** (TRTLLM-14903; see the note in
+  `py_executor_creator.py`; non-speculative runs keep the normal
+  estimation behavior and the `TRTLLM_SKIP_KV_CACHE_ESTIMATION` gate).
+  Background: with speculative decoding and a self-spawned MPI session,
+  the estimation executor's warmup hangs indefinitely while exercising the
+  q>1 generation-path attention kernels that only its spec-mode dummy
+  requests reach; the pre-merge branch tip (`ec52c6418b`) passes the
+  identical run. While skipped, the cache is sized analytically from
+  `kv_cache_config.free_gpu_memory_fraction` (or explicitly via
+  `kv_cache_config.max_tokens`) without a measurement forward pass, which
+  can be slightly more conservative than the estimated size. The override
+  is removed once TRTLLM-14903 is fixed.
+- **Known performance regression at DEP16 saturation** (attention-DP +
+  EP16 throughput recipe): relative to the pre-merge branch tip
+  (`ec52c6418b`), the 8K/1K serving sweep reproducibly loses ~15% output
+  throughput at concurrency 1024 and 4–5% at concurrency 128–256;
+  concurrency ≤ 64 and the TEP16/TEP8 latency recipes are at parity
+  (within ±2%). Developers investigating can A/B against `ec52c6418b`,
+  which is the last commit before this merge. Tracked as TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is supported and forces the
   trtllm-gen MLA generation backend (the default cute-dsl backend does not
   accept fp8 KV device scales); accuracy matches the bf16 KV baseline on

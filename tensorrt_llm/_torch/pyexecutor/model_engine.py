@@ -1470,11 +1470,9 @@ class PyTorchModelEngine(ModelEngine):
             # not compile the optimized single-sequence K123 variant. A
             # non-aligned five-chunk context enters the pure K123 path.
             _KIMI_KDA_PREFILL_WARMUP_TOKENS = 257
-            logger.info(
-                "Adding Kimi KDA pure-prefill warmup with "
-                f"{_KIMI_KDA_PREFILL_WARMUP_TOKENS} context tokens")
-            warmup_requests_configs.append(
-                (_KIMI_KDA_PREFILL_WARMUP_TOKENS, 0))
+            logger.info("Adding Kimi KDA pure-prefill warmup with "
+                        f"{_KIMI_KDA_PREFILL_WARMUP_TOKENS} context tokens")
+            warmup_requests_configs.append((_KIMI_KDA_PREFILL_WARMUP_TOKENS, 0))
 
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(

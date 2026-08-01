@@ -10,3 +10,10 @@ kv_cache_config:
   # allocations OOM during executor creation on GB300 (executor_extra with
   # only ~32 GiB free after the KV pool).
   free_gpu_memory_fraction: 0.5
+  # Restore the pre-rework snapshot cadence: upstream deprecated
+  # mamba_state_cache_interval (default 256) into
+  # mamba_state_config.periodic_snapshot_interval (default 0 = snapshots
+  # off), and hybrid models only expose reusable prefixes at snapshot
+  # boundaries — without this, block reuse silently never engages.
+  mamba_state_config:
+    periodic_snapshot_interval: 256

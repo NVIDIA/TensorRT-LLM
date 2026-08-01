@@ -1675,12 +1675,12 @@ def test_disaggregated_sa(disaggregated_test_root, llm_venv,
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
-                                 disaggregated_example_root,
-                                 llama_model_root):
-    """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver
-    path (NIXL + transceiver_runtime PYTHON).
-    The existing test_disaggregated_sa covers this split only on the C++
-    DEFAULT backend."""
+                                 disaggregated_example_root, llama_model_root):
+    """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver path.
+
+    NIXL + transceiver_runtime PYTHON. The existing test_disaggregated_sa
+    covers this split only on the C++ DEFAULT backend.
+    """
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
@@ -2695,9 +2695,9 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
 def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                                disaggregated_example_root,
                                                llm_venv, model_path):
-    """
+    """Reproduce the KV cache buffer overflow bug with long context.
+
     RCCA: https://nvbugspro.nvidia.com/bug/5555681
-    Test to reproduce KV cache buffer overflow bug with long context.
     """
     models_root = llm_models_root()
     llama4_model_root = os.path.join(models_root, model_path)
@@ -2928,9 +2928,10 @@ def run_cancel_stress_test(server_url: str,
                            requests_per_burst: int = 32,
                            prompt_len_range: tuple = (2000, 8000),
                            cancel_after_range: tuple = (0.01, 0.1)):
-    """
-    Stress test that sends requests with large contexts and cancels them
-    during prefill to test resource cleanup under cancellation.
+    """Stress test cancelling large-context requests mid-prefill.
+
+    Sends requests with large contexts and cancels them during prefill to
+    test resource cleanup under cancellation.
 
     Args:
         server_url: The server URL (e.g., "http://localhost:8000")

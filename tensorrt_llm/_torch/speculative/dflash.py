@@ -54,9 +54,7 @@ def dflash_draft_slot_ids(
     used, and slot 0 — the anchor token slot — predicts the first draft
     token.
     """
-    request_bases = (
-        torch.arange(num_gens, dtype=torch.long, device=device) * block_size
-    )
+    request_bases = torch.arange(num_gens, dtype=torch.long, device=device) * block_size
     offsets = torch.arange(num_draft_tokens, dtype=torch.long, device=device)
     first_slot = 0 if shift_label else 1
     return (request_bases.unsqueeze(1) + first_slot + offsets.unsqueeze(0)).flatten()
@@ -225,11 +223,12 @@ class DFlashWorker(SpecWorkerBase):
         # TLLM_DFLASH_ACCEPT_STATS_DIR is set; see accept_stats.py). Only
         # consulted behind `is not None` checks — zero overhead when off.
         self._accept_stats = maybe_create_recorder(
-            spec_config.max_draft_len, getattr(mapping, "rank", 0) or 0)
+            spec_config.max_draft_len, getattr(mapping, "rank", 0) or 0
+        )
         if self._accept_stats is not None:
             logger.info(
-                f"DFlash: acceptance-statistics recording enabled -> "
-                f"{self._accept_stats.path}")
+                f"DFlash: acceptance-statistics recording enabled -> {self._accept_stats.path}"
+            )
 
         logger.info(
             f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
@@ -502,13 +501,17 @@ class DFlashWorker(SpecWorkerBase):
         # Opt-in acceptance recording (env-gated; eager-mode measurement
         # runs only). Skipped for CUDA-graph batches (capture/replay/warmup
         # use synthetic requests and forbid the host sync).
-        if (self._accept_stats is not None and num_gens > 0
-                and not spec_metadata.is_cuda_graph
-                and not torch.cuda.is_current_stream_capturing()
-                and spec_metadata.request_ids is not None):
+        if (
+            self._accept_stats is not None
+            and num_gens > 0
+            and not spec_metadata.is_cuda_graph
+            and not torch.cuda.is_current_stream_capturing()
+            and spec_metadata.request_ids is not None
+        ):
             self._accept_stats.on_accept(
                 spec_metadata.request_ids[num_contexts:batch_size],
-                num_accepted_tokens[num_contexts:batch_size].tolist())
+                num_accepted_tokens[num_contexts:batch_size].tolist(),
+            )
 
         # Update GDN/Mamba recurrent states to the accepted token's state.
         if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
@@ -613,18 +616,21 @@ class DFlashWorker(SpecWorkerBase):
                 # DSpark confidence-scheduled verification MR supplies the
                 # real provider, see accept_stats.py). Guarded off for
                 # CUDA-graph batches and d2t vocab-mapped drafters.
-                if (self._accept_stats is not None
-                        and self._accept_stats.confidence_provider is not None
-                        and not spec_metadata.is_cuda_graph
-                        and not torch.cuda.is_current_stream_capturing()
-                        and spec_metadata.request_ids is not None
-                        and self._d2t is None):
+                if (
+                    self._accept_stats is not None
+                    and self._accept_stats.confidence_provider is not None
+                    and not spec_metadata.is_cuda_graph
+                    and not torch.cuda.is_current_stream_capturing()
+                    and spec_metadata.request_ids is not None
+                    and self._d2t is None
+                ):
                     self._accept_stats.record_draft_confidence(
                         spec_metadata.request_ids[num_contexts:batch_size],
                         draft_model,
-                        hidden_states_out[gen_gather_ids].reshape(
-                            num_gens, K, -1),
-                        inputs["first_prev_tokens"], gen_draft_tokens)
+                        hidden_states_out[gen_gather_ids].reshape(num_gens, K, -1),
+                        inputs["first_prev_tokens"],
+                        gen_draft_tokens,
+                    )
 
         else:
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")

@@ -183,6 +183,7 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
         export HF_HOME=\${HF_HOME:-$CACHE_DIR/hf_home}
         mkdir -p \"\$FLASHINFER_WORKSPACE_BASE\" \"\$FLASHINFER_CUBIN_DIR\" \"\$HF_HOME\"
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
+        export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' trtllm-serve \
             \"$MODEL\" \
             --backend pytorch --host 0.0.0.0 --port $PORT \
