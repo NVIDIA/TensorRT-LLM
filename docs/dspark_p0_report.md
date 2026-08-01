@@ -192,10 +192,19 @@ goal doc 说得对：**贪婪 GSM8K 观察不到这一点**，所以只能从代
 |---|---|
 | `test_deepseek_v4_sparse_mla` 按每请求 q 长度参数化（宽度 1/2/4/6） | **12/12 通过**，但见 §0.3 的覆盖限制 |
 | compressor ragged 差分（`test_compressor_ragged.py`，新增） | **4/4 通过** |
-| C++ ragged top-k（`test_indexer_topk_ragged.py`，PR 已有） | 见 §5 |
+| C++ ragged top-k（`test_indexer_topk_ragged.py`，PR 已有） | **通过** |
+| DSpark hw_agnostic 全套（confidence_schedule / ragged / worker / overlap_layout / heads / cuda_graph） | **通过** |
 | A3 布局一致性断言（`TLLM_DSPARK_ASSERT_LAYOUT=1`） | 已加；e2e run 全程启用，**57 个 graph 的两轮 warmup/capture 无一触发** |
 | A4 时序断言 | 已加（无条件，代价是一次 host 求和） |
 | A6 planner 计数并入 ragged stats summary | 已加 |
+
+上述 DSpark 相关单测合并跑：**202 passed**（B300，13 秒）。
+
+> 注意：`tests/unittest/_torch/speculative/hw_agnostic/` 整目录跑会有大量失败，
+> 但全部是环境问题 —— 该目录里有需要 llama-3.1 / Qwen3 / EAGLE3 / DeepSeek-V3-Lite
+> 权重的用例，而本轮的 `LLM_MODELS_ROOT` 只软链了 DeepSeek-V4-Pro-DSpark；
+> 另有若干用例会自己起 `MpiPoolSession`，在已有 MPI world 里 spawn 失败。
+> 与本轮改动无关。
 
 ### 3.1 参数化过程中抓到的两个测试自身的 bug
 
