@@ -6888,7 +6888,15 @@ class PyTorchModelEngine(ModelEngine):
             # quietly runs eager, which costs far more than the tokens it
             # trimmed. Record it so the miss is a counter rather than something
             # only a profiler would reveal.
-            self._record_dspark_graph_use(replayed=can_run_graph)
+            #
+            # Only generation-only steps count. A batch carrying context
+            # requests has no generation graph to miss, so recording it as an
+            # eager fallback would make `graph_eager` a prefill counter -- and
+            # `assert_ragged_active` refuses a run with any eager step, so that
+            # miscount alone makes the check unsatisfiable on every real
+            # workload.
+            if padded_requests.can_run_cuda_graph:
+                self._record_dspark_graph_use(replayed=can_run_graph)
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata

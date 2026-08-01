@@ -2399,7 +2399,42 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
 
+    def _report_dspark_ragged_stats(self) -> None:
+        """Final DSpark scheduling summary, and optionally a hard gate on it.
+
+        The counters live in the worker process. Under TP8 + attention-DP the
+        driver cannot reach them -- ``collective_rpc`` refuses a multi-rank
+        world -- so a test can assert on a GSM8K score and nothing else. But a
+        run where the planner declined on every step scores *exactly* the same
+        as one where it worked, so that assertion is evidence-free: the known
+        failure mode here is not a wrong answer, it is a feature that quietly
+        did nothing.
+
+        Two things close that. The summary is logged unconditionally at
+        shutdown, so the numbers are in the log of every run rather than only in
+        whatever the 32-step periodic emit happened to catch. And with
+        ``TLLM_DSPARK_ASSERT_ACTIVE=1`` the worker asserts on its own counters
+        here -- an exception in the worker does propagate to the driver, which
+        is the one channel that crosses the MPI boundary reliably.
+        """
+        worker = getattr(self.model_engine, "_get_spec_worker", None)
+        stats = getattr(worker(), "ragged_stats", None) if worker else None
+        if stats is None or not getattr(stats, "steps_total", 0):
+            return
+        stats.log_summary(prefix="DSpark ragged verify [final]")
+        if os.environ.get("TLLM_DSPARK_ASSERT_ACTIVE", "") in ("1", "true",
+                                                              "True"):
+            # require_trim is deliberately on: a run that produced windows but
+            # never shortened one delivered the uniform baseline.
+            stats.assert_ragged_active(require_trim=True)
+
     def _executor_loop_cleanup(self):
+        try:
+            self._report_dspark_ragged_stats()
+        except AssertionError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - never block shutdown on stats
+            logger.warning(f"DSpark ragged stats reporting failed: {exc}")
         # Wake any waiters in await_responses BEFORE potentially-blocking
         # work below. If wait_on_pp_send_handles hangs (e.g. after a
         # crash leaves PP send handles in a bad state), the await loop
