@@ -127,7 +127,15 @@ class PresentationHarness:
         self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         self.num_heads = 64
 
-        max_seq_len = max(cached_lens) + seq_len_q + 1
+        # The pool is sized `max_seq_len * num_requests`, but allocation is by
+        # whole blocks, so each request really consumes
+        # `ceil(len / block) * block`. Round up and add a block of slack, or the
+        # token-major layout -- which has `next_n` times as many requests, and so
+        # pays the rounding `next_n` times as often -- runs the pool dry and the
+        # cache manager refuses the context before it is ever measured.
+        block = scenario.kv_cache_tokens_per_block
+        raw_max_seq_len = max(cached_lens) + seq_len_q + 1
+        max_seq_len = ((raw_max_seq_len + block - 1) // block + 1) * block
         # The cache manager sizes its pool from the *context* lengths it is
         # handed, so pass the per-request KV lengths as if they were prompts.
         self.cache_manager, self.sparse_config = _create_cache_manager(
