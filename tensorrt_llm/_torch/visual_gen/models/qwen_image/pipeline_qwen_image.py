@@ -625,7 +625,7 @@ class QwenImagePipeline(BasePipeline):
             separate_cfg = use_negative_prompt_cfg and not do_cfg_parallel
             cache_acc.refresh(len(timesteps), separate_cfg=separate_cfg)
 
-        for i, t in enumerate(timesteps):
+        for i, t in self._profile_denoise_steps(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             if do_cfg_parallel:
                 if cache_acc is not None:

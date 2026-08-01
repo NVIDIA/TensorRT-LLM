@@ -907,7 +907,7 @@ class QwenImageLayeredPipeline(BasePipeline):
         additional_t_cond = torch.zeros(batch_size, device=device, dtype=torch.long)
         timer.mark_denoise_start()
         logger.info("Denoising layered output (%d steps)...", len(timesteps))
-        for t in timesteps:
+        for _, t in self._profile_denoise_steps(timesteps):
             latent_model_input = torch.cat([latents, image_latents], dim=1)
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             noise_pred = self.transformer(
