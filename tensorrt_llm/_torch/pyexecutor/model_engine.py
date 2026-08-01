@@ -2064,6 +2064,17 @@ class PyTorchModelEngine(ModelEngine):
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
 
+        # The capture loop stamps `self.runtime_draft_len` per graph so each
+        # captured shape is built at its own draft length. Nothing puts it back,
+        # which was harmless while there was one draft length to capture: the
+        # value it was left at was the value it started with. A tier ladder ends
+        # on its *smallest* tier, so the engine comes out of capture claiming a
+        # draft length it is not going to use, and the very next thing that runs
+        # -- the generic token warmup -- builds dummy requests at the full draft
+        # length while the spec metadata still says otherwise. Acceptance then
+        # reshapes `[num_gens * max_draft_len]` drafts into
+        # `[num_gens, smallest_tier]` and raises.
+        saved_runtime_draft_len = self.runtime_draft_len
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
         _run_capture_pass(force_non_greedy=False, label="greedy")
@@ -2080,6 +2091,7 @@ class PyTorchModelEngine(ModelEngine):
             _run_capture_pass(force_non_greedy=True, label="advanced sampling")
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
+        self.runtime_draft_len = saved_runtime_draft_len
         # The advanced-sampling capture pass above leaves is_all_greedy_sample
         # set to False on spec_metadata. Reset it to the default so the first
         # real iteration's graph-key selection is not seeded with this
