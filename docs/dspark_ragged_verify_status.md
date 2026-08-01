@@ -8,6 +8,38 @@
 
 ---
 
+## 0. 观测范围 —— 所有实测数字只适用于 x86 DGX B300
+
+本文档里每一个耗时、吞吐、显存、page-cache 数字都是在**一台机器**上量的：
+
+| | |
+|---|---|
+| 节点 | `umb-b300-001` |
+| 分区 | `b300@ts6/dgx-b300@ts1/8gpu-256cpu-2048gb` |
+| 架构 | **x86_64** + NVIDIA B300 SXM6，compute_cap **10.3（SM103）**，275 GB/卡 |
+| 主机内存 | 2015 GB |
+| 权重存储 | `/home/scratch.trt_llm_data`，共享 **NFS** |
+
+**换集群这些数字全部作废，尤其是 GB300 / `b300-nvl8` / `gb300`**：那是
+Grace-Blackwell，**aarch64** 架构、CPU 与 GPU 之间是 NVLink-C2C 统一内存、
+主机内存容量与存储后端都不同。具体会变的：
+
+- **编译目标**：`103-real` 是为 x86 B300 编的。GB300 需要 aarch64 工具链和对应镜像
+  （`LLM_SBSA_DOCKER_IMAGE`，见 `jenkins/current_image_tags.properties`），
+  不能直接复用本仓库现有的 `cpp/build`。
+- **加载耗时结构**（§6.4b 那张表）：预取 2 h / 装配 40 min 是这台机器的 NFS 和
+  x86 内存带宽决定的。Grace 的内存带宽和统一内存寻址会改变整个比例。
+- **page cache 复用策略**：依赖 2 TB 主机内存能装下 835 GB 权重。GB300 的内存
+  配置不同，这个前提要重新验证。
+- **显存余量**：275 GB/卡 是 B300 SXM6 的数字。
+- **Slurm 账号与分区**：`trt-llm_b300` 对应 x86；GB300 走 `trt-llm_gb300`。
+
+**结论性的东西（六条 P0 的定位、kernel 的 next_n 假设、可观测性设计、
+"空输出不是通过"那几条教训）与平台无关，可以直接迁移。
+所有带具体数字的运行特征都不行。**
+
+---
+
 ## 1. 目标
 
 主线：让 **ragged verify**（每个 request 各自的 verify 长度）在 TensorRT-LLM 里真正跑通。
@@ -228,12 +260,15 @@ python3 scripts/build_wheel.py --cuda_architectures "100-real" -j $(nproc)
   cmake 报 `No CUDA compiler found`。
 - **配置失败后必须 `rm -rf cpp/build`**：CMake 会把失败的编译器探测缓存成
   `CMAKE_CUDA_COMPILER:FILEPATH=NOTFOUND` 并在下次复用，环境修好了也不会重新探测。
-- **目标平台是 B300（SM103），编译用 `--cuda_architectures "103-real"`。**
+- **目标平台是 x86 DGX B300（SM103），编译用 `--cuda_architectures "103-real"`。**
+  GB300（`gb300` / `b300-nvl8`）是 aarch64，需要 SBSA 镜像和单独的编译产物。
   B200 是 SM100；`100-real` 纯 SASS 无 PTX，装不进 B300。B300 有 275 GB/卡，
   B200 只有 178 GB —— DSv4-Pro 权重 104 GB/卡，B200 上余量很紧。
 - 容器需 `--user $(id -u):$(id -g)`（scratch 是 NFS root_squash）。
 
 ### 6.4b DSv4-Pro 的加载时间结构 —— 复用同一节点的 page cache
+
+> **仅适用于 x86 DGX B300 + NFS（见 §0）。GB300 等其他平台需重新实测。**
 
 冷启动实测（`umb-b300-001`，权重在 `/home/scratch.trt_llm_data`，NFS）：
 
