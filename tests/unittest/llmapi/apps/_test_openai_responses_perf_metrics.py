@@ -212,13 +212,13 @@ async def test_incomplete_streaming_responses_does_not_populate_perf_metrics(
 
     got_partial_event = False
     try:
-        async for _ in stream:
+        async for event in stream:
             got_partial_event = True
-            assert not isinstance(_, ResponseCompletedEvent), (
+            assert not isinstance(event, ResponseCompletedEvent), (
                 "Expected a non-terminal delta event before cancellation, "
                 "but received the completed response event instead"
             )
-            assert isinstance(_, (ResponseTextDeltaEvent, ResponseReasoningTextDeltaEvent)), (
+            assert isinstance(event, (ResponseTextDeltaEvent, ResponseReasoningTextDeltaEvent)), (
                 "Expected a streamed delta event before cancellation"
             )
             assert len(_fetch_perf_metrics(server)) == count_before, (

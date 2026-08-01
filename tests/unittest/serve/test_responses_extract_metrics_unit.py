@@ -256,7 +256,6 @@ async def test_non_streaming_extract_called_after_aresult():
 @pytest.mark.asyncio
 async def test_non_streaming_and_streaming_are_independent():
     """_extract_metrics call counts are independent across both code paths."""
-    """Verify that non-streaming and streaming call counts are tracked independently."""
     ns_calls = []
     st_calls = []
 
