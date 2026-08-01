@@ -543,7 +543,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._publish_position_ceiling(draft_model, attn_metadata, block_size)
 
         if not self._win_inited:
-            max_batch = spec_metadata.max_num_requests
+            # Worker-owned and allocated once, so this must span the full seq-slot
+            # pool rather than max_num_requests, which create_cuda_graph_metadata
+            # shrinks to the captured graph bucket (see the DFlash counterpart).
+            max_batch = spec_metadata.num_seq_slots or spec_metadata.max_num_requests
             self._output_verify_lens = torch.empty(max_batch, dtype=torch.int32, device="cuda")
             num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
