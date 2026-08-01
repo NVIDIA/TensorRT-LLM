@@ -4066,7 +4066,8 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         return score, acc_params
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_dep8_megamoe_deepgemm_confidence_scheduling_overlap(self):
+    @parametrize_with_ids("moe_backend", ["MEGAMOE_DEEPGEMM", "TRTLLM"])
+    def test_gsm8k_dep8_confidence_scheduling_overlap(self, moe_backend):
         """Confidence scheduling with the overlap scheduler ON.
 
         The sibling test above pins ``disable_overlap_scheduler=True``, which
@@ -4081,6 +4082,11 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         covered by the graph-eligibility allgather, so ranks that disagree pick
         different graphs and their collectives diverge into a hang rather than a
         wrong answer.
+
+        Parameterized over both MoE backends. The scheduler changes how many
+        tokens reach the target, and the MoE chunks from that same count, so a
+        backend is a plausible place for a token-count assumption to hide even
+        though neither is supposed to know about speculation.
         """
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
@@ -4092,7 +4098,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=8,
                  moe_expert_parallel_size=8,
                  enable_attention_dp=True,
-                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 moe_config=MoeConfig(backend=moe_backend),
                  max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
                  max_seq_len=4096,
                  max_num_tokens=4096,
@@ -4109,7 +4115,8 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 f"{acc_params.ref_accuracy:.3f}")
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_dep8_megamoe_deepgemm_ragged_verify(self):
+    @parametrize_with_ids("moe_backend", ["MEGAMOE_DEEPGEMM", "TRTLLM"])
+    def test_gsm8k_dep8_ragged_verify(self, moe_backend):
         """Per-request verify windows, overlap scheduler on.
 
         ``enable_padding=True`` is required rather than incidental: the ragged
@@ -4138,7 +4145,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=8,
                  moe_expert_parallel_size=8,
                  enable_attention_dp=True,
-                 moe_config=MoeConfig(backend="MEGAMOE_DEEPGEMM"),
+                 moe_config=MoeConfig(backend=moe_backend),
                  max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
                  max_seq_len=4096,
                  max_num_tokens=4096,
