@@ -146,6 +146,15 @@ class PresentationHarness:
             self.cache_manager.prepare_context(request)
             self.cache_manager.resize_context(request,
                                               request.context_chunk_size)
+        # The context allocation covers the cached tokens only. Each query token
+        # this step appends one more, which can cross a page boundary and needs
+        # a block the block table does not have yet -- reading it is an illegal
+        # access, not a graceful failure.
+        for _ in range(seq_len_q):
+            for request in self.requests:
+                assert self.cache_manager.try_allocate_generation(request), (
+                    f"could not extend request {request.py_request_id} for "
+                    f"generation")
 
         self.mapping = Mapping(world_size=1, tp_size=1, rank=0)
         self.rope_cos_sin = _create_rope_cos_sin(scenario, device)

@@ -593,11 +593,21 @@ def calculate_deepseek_v4_ref_gen_sparse(
     return ref_result, new_latent_cache_out
 
 
-def _allocate_kv_cache_for_generation(cache_manager, requests: List[LlmRequest]):
-    for req in requests:
-        assert cache_manager.try_allocate_generation(req), (
-            f"Failed to allocate generation KV cache for request {req.py_request_id}"
-        )
+def _allocate_kv_cache_for_generation(
+    cache_manager, requests: List[LlmRequest], num_new_tokens: int = 1
+):
+    """Extend each request's KV allocation by ``num_new_tokens``.
+
+    One call covers one token. A speculative step appends `1 + draft_len` of
+    them, and the shortfall only bites once a request crosses a page boundary --
+    at which point the block table has no entry for the new block and the read
+    is an illegal access rather than a clean failure.
+    """
+    for _ in range(num_new_tokens):
+        for req in requests:
+            assert cache_manager.try_allocate_generation(req), (
+                f"Failed to allocate generation KV cache for request {req.py_request_id}"
+            )
 
 
 def _create_rope_config(scenario: Scenario) -> RopeConfig:
@@ -874,6 +884,16 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
 # DSA generation path untested: buffers are laid out at the static ceiling while
 # the kernels are launched at the runtime width, and when the two disagree the
 # result is either misattributed rows or a hang, never an error.
+#
+# Coverage limit, stated because it is not obvious and it matters: this test
+# supplies `topk_indices` directly for the compress_ratio=4 layer, so
+# `Indexer.forward` -- the paged-MQA-logits plus top-k path that consumes
+# `kv_lens_expanded` / `block_table_expanded` / the DeepGEMM schedule -- never
+# runs here. Those buffers are exactly where a wrong stride misattributes rows,
+# so widening this parameterization does NOT by itself cover that. Verified
+# empirically: reverting the stride fix leaves all twelve cases green. What this
+# does cover is the RoPE, KV-write, sparse-MLA and compressor paths at widths
+# other than one, which was previously nothing at all.
 @pytest.mark.parametrize("generation_seq_len_q", [1, 2, 4, 6])
 def test_deepseek_v4_sparse_mla(
     context_lengths: List[int], num_generation_steps: int, generation_seq_len_q: int
@@ -1201,7 +1221,9 @@ def test_deepseek_v4_sparse_mla(
     # 8. Generation steps
     for step in range(num_generation_steps):
         print(f"\n=== Generation step {step + 1} ===")
-        _allocate_kv_cache_for_generation(cache_manager, requests)
+        _allocate_kv_cache_for_generation(
+            cache_manager, requests, num_new_tokens=generation_seq_len_q
+        )
 
         cached_lens = [ctx_len + step * generation_seq_len_q for ctx_len in context_lengths]
         kv_lens = [cl + generation_seq_len_q for cl in cached_lens]
@@ -1238,18 +1260,22 @@ def test_deepseek_v4_sparse_mla(
             mapping=mapping,
             enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
             sparse_attention_config=sparse_config,
-            # Reproduce the split the engine actually runs with rather than
-            # sizing everything to the current width. `max_draft_tokens` is the
-            # static ceiling: the engine hands it `tokens_per_gen_step - 1` once
-            # and never moves it, and every expanded buffer is sized from it so
-            # a shorter step cannot trigger a reallocation mid-capture. The
-            # per-step width arrives separately. Letting the two differ here is
-            # the whole point -- when they were conflated, a step narrower than
-            # the ceiling wrote its kv_lens and block table one stride apart and
-            # read them back at another.
-            max_draft_tokens=MAX_GENERATION_SEQ_LEN_Q - 1,
-            runtime_tokens_per_gen_step=generation_seq_len_q,
         )
+        # Reproduce the split the engine actually runs with rather than sizing
+        # everything to the current width. `max_draft_tokens` is the static
+        # ceiling: the engine hands it `tokens_per_gen_step - 1` once (via
+        # update_spec_dec_param) and never moves it, and every expanded buffer
+        # is sized from it so a shorter step cannot trigger a reallocation
+        # mid-capture. The per-step width arrives separately, through
+        # `runtime_tokens_per_gen_step`. Letting the two differ is the whole
+        # point: when they were conflated, a step narrower than the ceiling
+        # wrote its kv_lens and block table one stride apart and read them back
+        # at another. Set post-construction and rebuild the width-dependent
+        # buffers, which is exactly what update_spec_dec_param does.
+        gen_metadata.max_draft_tokens = MAX_GENERATION_SEQ_LEN_Q - 1
+        gen_metadata.runtime_tokens_per_gen_step = generation_seq_len_q
+        gen_metadata._create_kv_lens_2d_buffer()
+        gen_metadata.create_expanded_buffers()
         gen_metadata.prepare()
 
         for layer_idx in TEST_LAYERS:
