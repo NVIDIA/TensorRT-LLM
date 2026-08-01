@@ -1,8 +1,8 @@
 #!/bin/bash
 set -ex
 
-UCX_VERSION="v1.20.x"
-UCX_COMMIT="f656dbdf93e72e60b5d6ca78b9e3d9e744e789bd"
+UCX_VERSION="v1.21.x"
+UCX_COMMIT="167a4c6a311d9a42e30a37dcc01b8a3e73ea2826"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
 UCX_REPO="https://github.com/openucx/ucx.git"

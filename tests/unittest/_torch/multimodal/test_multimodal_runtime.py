@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    find_input_mm_embeds, get_multimodal_embeddings)
+    find_input_mm_embeds, get_attached_multimodal_embeddings,
+    get_multimodal_embeddings)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             _as_cpu_tensor, _compute_mm_masks,
@@ -44,6 +45,32 @@ def _make_multimodal_params(
 
 class TestFindInputMmEmbed:
     """Test cases for find_input_mm_embeds — slicing embeddings per chunk."""
+
+    def test_attached_param_embeddings_can_feed_slicer(self):
+        """Disagg prefill passes encoder outputs through multimodal params."""
+        cached_emb1 = torch.randn(5, _EMBED_DIM)
+        cached_emb2 = torch.randn(4, _EMBED_DIM)
+        multimodal_params = [
+            MultimodalParams(
+                multimodal_data={"multimodal_embedding": cached_emb1},
+                multimodal_runtime=_make_runtime(1, 4, [5])),
+            MultimodalParams(
+                multimodal_data={"multimodal_embedding": cached_emb2},
+                multimodal_runtime=_make_runtime(2, 2, [4])),
+        ]
+
+        mm_embeds = get_attached_multimodal_embeddings(multimodal_params)
+        result = find_input_mm_embeds(mm_embeds, multimodal_params)
+
+        assert len(result) == 1
+        torch.testing.assert_close(
+            result[0], torch.cat([cached_emb1[1:5], cached_emb2[2:4]], dim=0))
+
+    def test_empty_mm_embeds_rejected_for_active_tokens(self):
+        multimodal_params = [_make_multimodal_params(0, 3, [3])]
+
+        with pytest.raises(ValueError, match="No multimodal embeddings"):
+            find_input_mm_embeds([], multimodal_params)
 
     def test_mm_embed_not_batched(self):
         """Individual batching: len(mm_embeds) == len(multimodal_params) > 1."""
@@ -240,6 +267,33 @@ class TestFindInputMmEmbed:
         assert len(result) == 1
         assert result[0].shape == (5, _EMBED_DIM)
         torch.testing.assert_close(result[0], mm_embeds[0][5:10])
+
+    def test_single_batch_chunked_prefill_regression(self):
+        """
+        Reproduce the NVILA-style case where a single request carries the full
+        image embedding cache, but only the current chunk should be fused.
+        The 3072 -> 781 split mirrors the reported failure mode:
+        3072 is the full image embedding length for the request, while 781 is
+        the active multimodal token span in the current chunk.
+        """
+        total_mm_tokens = 3072
+        num_mm_tokens_in_chunk = 781
+        num_unseen_mm_tokens = total_mm_tokens - num_mm_tokens_in_chunk
+
+        mm_embeds = [torch.randn(total_mm_tokens, _EMBED_DIM)]
+        multimodal_params = [
+            _make_multimodal_params(num_unseen_mm_tokens,
+                                    num_mm_tokens_in_chunk, [total_mm_tokens])
+        ]
+
+        result = find_input_mm_embeds(mm_embeds, multimodal_params)
+
+        assert len(result) == 1
+        assert result[0].shape == (num_mm_tokens_in_chunk, _EMBED_DIM)
+        torch.testing.assert_close(
+            result[0],
+            mm_embeds[0][num_unseen_mm_tokens:total_mm_tokens],
+        )
 
     def test_noncontiguous_individual_batching_mixed_gaps(self):
         """
@@ -781,7 +835,7 @@ class _FakeMultimodalInputProcessor(BaseMultimodalInputProcessor):
     def dtype(self):
         return torch.float32
 
-    def __call__(self, inputs, sampling_params):
+    def call_with_text_prompt(self, inputs, sampling_params):
         raise NotImplementedError("This fake only supports token queries.")
 
     def get_vocab_size(self):

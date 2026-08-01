@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import gc
 import importlib
@@ -13,11 +16,12 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
-                                          GuidedDecodingConfig, LoadFormat,
+                                          GuidedDecodingConfig, KvCacheConfig,
+                                          LoadFormat, SpeculativeConfig,
                                           TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
@@ -36,13 +40,22 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear
+from .config_utils import is_hybrid_linear, is_minimax_m3
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
+
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
+    f"SM{sm_version}"
+    for sm_version in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
+    f"SM{sm_version}"
+    for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 
 
 class _ExecutorMemoryMonitor:
@@ -206,6 +219,31 @@ def update_sampler_max_seq_len(max_seq_len, sampler):
         sampler.max_seq_len = max_seq_len
 
 
+def _extend_full_attention_windows_for_spec_decode(
+    kv_cache_config: KvCacheConfig,
+    spec_config: Optional[SpeculativeConfig],
+    net_max_seq_len: int,
+    model_engine_max_seq_len: int,
+) -> None:
+    max_attention_window = kv_cache_config.max_attention_window
+    if spec_config is None or max_attention_window is None:
+        return
+    if model_engine_max_seq_len <= net_max_seq_len:
+        return
+
+    adjusted_max_attention_window = [
+        model_engine_max_seq_len if window >= net_max_seq_len else window
+        for window in max_attention_window
+    ]
+    if adjusted_max_attention_window == max_attention_window:
+        return
+
+    logger.info("Extending full-attention max_attention_window entries for "
+                f"speculative decoding from {max_attention_window} to "
+                f"{adjusted_max_attention_window}.")
+    kv_cache_config.max_attention_window = adjusted_max_attention_window
+
+
 def get_guided_decoding_config(guided_decoding_backend: str,
                                tokenizer: Optional[TokenizerBase] = None):
     guided_decoding_config = None
@@ -300,6 +338,7 @@ def create_py_executor(
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
+    resource_governor_queue=None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -314,6 +353,9 @@ def create_py_executor(
         tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
         profiling_stage_data: Optional dict for collecting per-stage memory
             profiling data during executor construction.
+        resource_governor_queue: Optional queue for resource governor
+            requests. When provided, it is installed before the worker thread
+            starts so all ranks observe the same collective sequence.
 
     Returns:
         A fully initialized PyExecutor instance.
@@ -378,6 +420,13 @@ def create_py_executor(
     if llm_args.attn_backend == "VANILLA":
         tokens_per_block = max_num_tokens
 
+    # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
+    # of 32.
+    m3_sparse_config = llm_args.sparse_attention_config
+    if is_minimax_m3(m3_sparse_config):
+        tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
+        kv_cache_config.tokens_per_block = tokens_per_block
+
     if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
         # Workaround for flashinfer and star attention
         if kv_cache_config.enable_block_reuse:
@@ -402,12 +451,6 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
-        if not spec_config.allow_advanced_sampling:
-            logger.warning(
-                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
-                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
-            )
         # Check FLASHINFER compatibility with one-engine speculative decoding
         if llm_args.attn_backend == "FLASHINFER":
             raise ValueError(
@@ -428,6 +471,24 @@ def create_py_executor(
             "when only processing vision encoder inputs.")
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+
+    # Bridge DwdpConfig -> Mapping: ParallelConfig.to_mapping() doesn't know
+    # about dwdp_size/dwdp_rank, so inject them here (before anything reads
+    # mapping.dwdp_enabled / moe_ep_rank).
+    #
+    # dwdp_rank MUST be derived from the global MPI rank, not mapping.rank:
+    # in disaggregated serving each context worker is its own TP=1 instance
+    # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
+    # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
+    # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
+    if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
+        dwdp_size = llm_args.dwdp_config.dwdp_size
+        dwdp_rank = global_mpi_rank() % dwdp_size
+        mapping = Mapping(**{
+            **mapping.to_dict(), "dwdp_size": dwdp_size,
+            "dwdp_rank": dwdp_rank
+        })
+
     dist = Distributed.get(mapping)
 
     vm_pools = {}
@@ -442,9 +503,13 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        if hasattr(spec_config,
-                   'max_batch_size') and spec_config.max_batch_size is None:
-            spec_config.max_batch_size = max_batch_size
+        # Eagle3DecodingConfig._max_batch_size is internally managed: the
+        # dynamic-tree worker pre-allocates batch-indexed CUDA buffers sized
+        # by this value, and runtime indexes them with no bounds check. It
+        # MUST equal the global max_batch_size to avoid OOB; we populate it
+        # here as the single source of truth.
+        if hasattr(spec_config, '_max_batch_size'):
+            spec_config._max_batch_size = max_batch_size
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
@@ -465,7 +530,9 @@ def create_py_executor(
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
         assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
-        dwdp_manager = DwdpManager(config=llm_args.dwdp_config, dist=dist)
+        dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
+                                   dist=dist,
+                                   mapping=mapping)
         dwdp_manager.__enter__()
         logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 
@@ -601,6 +668,13 @@ def create_py_executor(
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
         model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
 
+    _extend_full_attention_windows_for_spec_decode(
+        kv_cache_config=kv_cache_config,
+        spec_config=spec_config,
+        net_max_seq_len=net_max_seq_len,
+        model_engine_max_seq_len=model_engine_max_seq_len,
+    )
+
     if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
         logger.warning(
             "Overlap scheduler is enabled for two-model speculative decoding. Rejection sampling will fallback to greedy sampling."
@@ -610,20 +684,9 @@ def create_py_executor(
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
-    # Set default value for cache_transceiver_config.max_tokens_in_buffer
-    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
-        cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
-
     config = model_engine.model.model_config.pretrained_config
-    if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
-            spec_config is not None or cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None):
-        logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when MTP or disagg is enabled"
-        )
-        kv_cache_config.enable_block_reuse = False
-        _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                       False)
+    max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
+                                max_batch_size * getattr(mapping, "pp_size", 1))
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
@@ -643,13 +706,14 @@ def create_py_executor(
             )
 
         sm_version = get_sm_version()
-        if kv_cache_config.enable_block_reuse and sm_version not in [
-                90, 100, 103, 120
-        ]:
-            logger.warning(
-                f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120, "
-                f"disable enable_block_reuse for SM{sm_version}")
+        if (kv_cache_config.enable_block_reuse and sm_version
+                not in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS):
+            logger.warning("KV cache reuse for MLA can only be enabled on "
+                           f"{_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR}, "
+                           f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
+            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                           False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
         if kv_cache_config.enable_block_reuse and not (
@@ -660,14 +724,28 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
-        if enable_chunked_context and sm_version not in [90, 100, 103, 120]:
-            logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
-                f"disable enable_chunked_context for SM{sm_version}")
+            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                           False)
+        if (enable_chunked_context and sm_version
+                not in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS):
+            logger.warning("Chunked Prefill for MLA can only be enabled on "
+                           f"{_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR}, "
+                           f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
+
+    # Set default value for cache_transceiver_config.max_tokens_in_buffer.
+    # Placed after the FlashMLA tokens_per_block override and rounded up to a
+    # tokens_per_block multiple: CacheTransBufferManager requires
+    # max_tokens_in_buffer % tokens_per_block == 0 (cacheTransBuffer.cpp),
+    # and net_max_seq_len is in general not aligned (e.g. max_seq_len plus a
+    # non-power-of-two seq_len offset).
+    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
+        cache_transceiver_config.max_tokens_in_buffer = (
+            (net_max_seq_len + tokens_per_block - 1) // tokens_per_block *
+            tokens_per_block)
 
     if enable_chunked_context:
         chunk_unit_size = tokens_per_block
@@ -689,16 +767,22 @@ def create_py_executor(
         ctx_chunk_config = None
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
-        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
-                            kv_cache_config.mamba_state_cache_interval)
+        # Snapshot boundaries come from expect_snapshot_points.  The unit is
+        # only used to align chunks shortened by the scheduling budget.
+        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
+                guided_decoder_slots = (max_num_seq_slots if getattr(
+                    model_engine, "_enable_dsv4_overlap_headroom", False) else
+                                        max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    "max_num_sequences": max_batch_size,
+                    # The scoped DeepSeek-V4 path follows the expanded slot
+                    # pool. Other configurations retain max_batch_size.
+                    "max_num_sequences": guided_decoder_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
@@ -736,7 +820,7 @@ def create_py_executor(
             speculative_config=spec_config,
             decoding_config=decoding_config,
             kv_cache_config=kv_cache_config,
-            disable_flashinfer_sampling=llm_args.disable_flashinfer_sampling,
+            max_num_sequences=max_num_seq_slots,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
@@ -813,22 +897,23 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
-        # Use C++ MambaCacheManager by default for Disaggregated serving with hybrid model.
-        config = model_engine.model.model_config.pretrained_config
-
         is_disagg = (cache_transceiver_config is not None
                      and cache_transceiver_config.backend is not None)
-        is_hybrid = is_hybrid_linear(config)
+        is_hybrid = is_hybrid_linear(
+            model_engine.model.model_config.pretrained_config)
 
         if is_disagg and is_hybrid:
-            if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
-                    "TRTLLM_USE_CPP_MAMBA") == "1":
-                logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling C++ MambaCacheManager.")
-                os.environ["TRTLLM_USE_CPP_MAMBA"] = "1"
+            # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
+            # no effect in disagg. The disagg manager choice is driven by
+            # get_kv_cache_manager_cls and cache_transceiver_config.
+            if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
+                logger.warning(
+                    "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
+                    "configure transceiver_runtime='PYTHON' with backend='NIXL' "
+                    "to select MixedMambaHybridCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling Python MambaCacheManager.")
+                            "Using the configured Mamba cache manager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
@@ -869,10 +954,10 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
-    # Exchange IPC Handles and Initialize Dwdp Prefetch Buffer
+    # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
+    # weight manager + MoE backend fixup (single entry point).
     if dwdp_manager is not None:
-        dwdp_manager.exchange_all_handles()
-        dwdp_manager.initialize_prefetch_buffer()
+        dwdp_manager.setup(model_engine.model)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -913,7 +998,8 @@ def create_py_executor(
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
-            max_seq_len=max_seq_len,
+            resource_governor_queue=resource_governor_queue,
+            max_seq_len=net_max_seq_len,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
             max_num_tokens=max_num_tokens,
@@ -922,6 +1008,7 @@ def create_py_executor(
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
+            max_num_sequences=max_num_seq_slots,
         )
 
         # Originally, peft_cache_config might be mutated inside
@@ -932,6 +1019,7 @@ def create_py_executor(
         assert kv_cache_creator is not None
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
+
         # Shut down the transceiver before tearing down KV cache managers so
         # that NIXL-registered (pinned) GPU memory is deregistered first;
         # otherwise the old KV cache memory stays pinned and the subsequent
@@ -943,17 +1031,16 @@ def create_py_executor(
         finally:
             kv_cache_creator.teardown_managers(resources)
 
-        # Release Phase-1 CUDA graph pools before final KV allocation to avoid overshoot.
+        # configure_kv_cache_capacity shuts down the Phase-1 executor, which
+        # releases its CUDA graphs before its resource managers. Only the
+        # profiling attention metadata remains to be discarded here.
         for eng in [model_engine, draft_model_engine]:
-            if eng is None:
-                continue
-            if eng.attn_metadata is not None:
-                if llm_args.cuda_graph_config is not None:
-                    eng._release_cuda_graphs()
+            if eng is not None:
                 eng.attn_metadata = None
 
         del py_executor  # free before constructing new
         gc.collect()
+        torch.cuda.empty_cache()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
@@ -985,7 +1072,8 @@ def create_py_executor(
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
-                max_seq_len=max_seq_len,
+                resource_governor_queue=resource_governor_queue,
+                max_seq_len=net_max_seq_len,
                 max_batch_size=max_batch_size,
                 max_beam_width=max_beam_width,
                 max_num_tokens=max_num_tokens,
@@ -995,6 +1083,7 @@ def create_py_executor(
                 virtual_memory_pools=vm_pools,
                 execution_stream=execution_stream,
                 dwdp_manager=dwdp_manager,
+                max_num_sequences=max_num_seq_slots,
             )
 
     _adjust_torch_mem_fraction()

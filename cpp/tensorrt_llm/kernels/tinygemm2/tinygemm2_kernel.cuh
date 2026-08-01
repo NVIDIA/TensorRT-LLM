@@ -236,7 +236,6 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
         if (!weight_warp)
         {
             cudaGridDependencySynchronize();
-            cudaTriggerProgrammaticLaunchCompletion();
         }
 
         for (int ki = 0; ki < K_LOOPS_DMA; ki++)
@@ -359,8 +358,8 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
 
             while (!weight_ready || !act_ready)
             {
-                weight_ready = bar_try_wait(bar_ptr_wt, phase);
-                act_ready = bar_try_wait(bar_ptr_act, phase);
+                weight_ready = bar_try_wait(__cvta_generic_to_shared(&bar_wt_ready[stage]), phase);
+                act_ready = bar_try_wait(__cvta_generic_to_shared(&bar_act_ready[stage]), phase);
             }
 
             if (PROFILE && blockIdx.y == 0 && threadIdx.x == 0 && ki == 0)
@@ -421,6 +420,11 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
         reduction_buffer[threadIdx.x] = accum4;
 
         __syncthreads();
+
+        if (threadIdx.x == 0) // one thread per block suffices according to official code examples
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
 
         if (warp_id == 0)
         {

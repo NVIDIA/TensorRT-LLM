@@ -6,7 +6,7 @@ This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1/D
 
 To benchmark the model with best configurations, refer to [DeepSeek R1 benchmarking blog](../../../../docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md).
 
-Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container.
+Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for how to build TensorRT LLM from source and start a TRT-LLM docker container.
 
 > [!NOTE]
 > This guide assumes that you replace placeholder values (e.g. `<YOUR_MODEL_DIR>`) with the appropriate paths.
@@ -863,10 +863,10 @@ echo "All processes completed!"
 The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by other commands.
 
 ### KV Cache Reuse
-KV cache reuse is supported for MLA on SM90, SM100 and SM120. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
+KV cache reuse is supported for MLA on SM90, SM100, SM103, SM120 and SM121. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
 
 ### Chunked Prefill
-Chunked Prefill is supported for MLA only on SM90 and SM100 currently. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
+Chunked Prefill is supported for MLA on SM90, SM100, SM103 and SM120. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
 
 More specifically, we can imitate what we did in the [Quick Start](#quick-start):
 

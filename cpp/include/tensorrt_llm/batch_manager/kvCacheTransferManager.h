@@ -24,6 +24,11 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 
 #pragma once
 
+namespace tensorrt_llm::testing
+{
+class KVCacheTransferManagerTestAccess;
+} // namespace tensorrt_llm::testing
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
@@ -76,9 +81,14 @@ public:
     [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
 
 private:
+    friend class ::tensorrt_llm::testing::KVCacheTransferManagerTestAccess;
+
     //! \brief Get pointer to pool specified by cache block.
     static tr::ITensor::SharedPtr computeBlockPointer(
         BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx);
+
+    //! \brief Get pool-qualified index for pending transfer tracking.
+    [[nodiscard]] static kernels::KVCacheIndex::UnderlyingType getPendingTransferIndex(BlockPtr const& block);
 
     /*!
      * \brief The key method that copies the src block to the dst block.
@@ -107,8 +117,8 @@ private:
     runtime::BufferManager mOnboardManager;
     runtime::BufferManager mOffloadManager;
 
-    // Track reads and writes for blocks. Note that it is the memory pool index that
-    // identifies the raw memory blocks involved in I/O, not the block Id.
+    // Track reads and writes for blocks. Note that it is the pool-qualified memory pool index
+    // that identifies the raw memory blocks involved in I/O, not the block Id.
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingReads;
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingWrites;
     // Reference to parent loopback agent

@@ -14,7 +14,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Host overhead analysis for LLM inference loops using nsys SQLite traces.
 
 Compares inter-iteration overhead between two versions by:

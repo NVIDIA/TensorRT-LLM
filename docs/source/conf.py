@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 # Configuration file for the Sphinx documentation builder.
 #
 # For the full list of built-in configuration values, see the documentation:
@@ -67,6 +70,8 @@ extensions = [
     'sphinxcontrib.autodoc_pydantic',
     'sphinx_togglebutton',
     'sphinxcontrib.mermaid',
+    'trtllm_auto_deploy',
+    'llmapi_config_telemetry',
     'trtllm_config_selector',
 ]
 
@@ -100,6 +105,7 @@ myst_enable_extensions = [
     "substitution",
     "dollarmath",
     "amsmath",
+    "html_inline",
 ]
 
 myst_substitutions = {

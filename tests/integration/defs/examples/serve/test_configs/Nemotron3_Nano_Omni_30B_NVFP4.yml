@@ -1,0 +1,14 @@
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.80
+  mamba_ssm_cache_dtype: float32
+
+moe_config:
+  backend: CUTLASS
+
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 1
+
+enable_chunked_prefill: true
+max_batch_size: 1

@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for QKV GEMM fusion chained with TRT-LLM attention cache insertion.
 
 These tests are split from ``test_gemm_fusion.py`` because they depend on the
@@ -23,13 +37,16 @@ torch.manual_seed(0)
 
 
 def _count_split_output_nodes(gm):
-    """Count getitem nodes that extract slices from a split_output/split_with_sizes."""
+    """Count torch.narrow nodes produced by fuse_gemms_mixed_children.
+
+    These narrow calls split the fused GEMM output back into per-projection
+    slices. (The legacy split_output closure path was replaced by
+    ``torch.narrow + .contiguous`` in the GEMM fusion code.)
+    """
     count = 0
     for n in gm.graph.nodes:
-        if n.op == "call_function" and n.target is operator.getitem:
-            source = n.args[0]
-            if isinstance(source, torch.fx.Node) and source.op == "call_function":
-                count += 1
+        if n.op == "call_function" and n.target is torch.narrow:
+            count += 1
     return count
 
 

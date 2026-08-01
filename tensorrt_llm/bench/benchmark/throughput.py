@@ -25,6 +25,7 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
 from huggingface_hub import snapshot_download
 
 from tensorrt_llm.bench.benchmark import (GeneralExecSettings,
+                                          collect_explicit_cli_keys,
                                           generate_json_report,
                                           get_general_cli_options, get_llm)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
@@ -81,9 +82,9 @@ from tensorrt_llm.sampling_params import SamplingParams
     "extra_llm_api_options",
     type=str,
     default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
-    "Can be specified as either --config or --extra_llm_api_options.")
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file. Can be specified as either --config or "
+    "--extra_llm_api_options.")
 @optgroup.option("--sampler_options",
                  type=click.Path(exists=True,
                                  readable=True,
@@ -147,7 +148,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     "--custom_tokenizer",
     type=str,
     default=None,
-    help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+    help="Custom tokenizer alias (e.g., 'deepseek_v32') or "
     "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
     "is incompatible with AutoTokenizer.",
 )
@@ -192,6 +193,15 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Number of requests to cap benchmark run at. If not specified or set to 0, it will be the "
     "length of dataset.",
+)
+@optgroup.option(
+    "--duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help=
+    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration). "
+    "Requires --concurrency. Requests dropped at the deadline are excluded from the report, so the statistics "
+    "cover the requests that completed rather than the whole dataset.",
 )
 @optgroup.option(
     "--warmup",
@@ -327,6 +337,14 @@ def throughput_command(
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
+    # Checked before the model is loaded so the mistake is reported in seconds
+    # rather than after several minutes of startup.
+    if options.duration is not None and options.concurrency <= 0:
+        raise click.UsageError(
+            "--duration requires a concurrency limit. Without one every request "
+            "is submitted to the engine at once, so there is no point at which "
+            "the deadline can be applied and the full dataset would run. Pass "
+            "--concurrency N.")
     tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
@@ -437,6 +455,7 @@ def throughput_command(
     # LlmArgs
     exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
     exec_settings["iteration_log"] = options.iteration_log
+    exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
@@ -447,8 +466,23 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
         kwargs['backend'] = options.backend
+        if (options.modality is None and options.backend == "pytorch"
+                and "disable_mm_encoder" not in kwargs
+                and not kwargs.get("mm_encoder_only", False)):
+            # Text-only benchmark: skip a multimodal checkpoint's encoder so
+            # its GPU memory goes to the KV cache pool instead. Text-only
+            # models ignore this flag. Overridable via extra_llm_api_options.
+            kwargs["disable_mm_encoder"] = True
+            logger.info(
+                "Text-only benchmark (--modality not set): the multimodal "
+                "encoder, if the model has one, will not be loaded.")
         if bench_env.telemetry_config is not None:
             kwargs["telemetry_config"] = bench_env.telemetry_config
+
+        runtime_config.settings_config.max_batch_size = kwargs.get(
+            "max_batch_size", runtime_config.settings_config.max_batch_size)
+        runtime_config.settings_config.max_num_tokens = kwargs.get(
+            "max_num_tokens", runtime_config.settings_config.max_num_tokens)
 
         llm = get_llm(runtime_config, kwargs)
 
@@ -501,7 +535,8 @@ def throughput_command(
                                 options.concurrency,
                                 iteration_writer.full_address,
                                 modality=options.modality,
-                                tokenizer=multi_turn_tokenizer))
+                                tokenizer=multi_turn_tokenizer,
+                                duration=options.duration))
 
         logger.info("Benchmark done. Reporting results...")
         if options.modality is not None:

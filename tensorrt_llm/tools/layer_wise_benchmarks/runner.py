@@ -3,7 +3,6 @@ import functools
 import inspect
 import itertools
 import os
-import unittest.mock
 import weakref
 from enum import IntEnum
 from typing import Optional
@@ -17,7 +16,6 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputs
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -237,8 +235,8 @@ def make_balanced_routing_method(
     dp_rank,
     ep_size,
 ):
-    def balanced_routing_method(router_logits):
-        token_selected_experts, token_final_scales = apply_method_orig(router_logits)
+    def balanced_routing_method(router_logits, input_ids=None):
+        token_selected_experts, token_final_scales = apply_method_orig(router_logits, input_ids)
         assert moe_module._routing_results_replaced_at in [None, "make_balanced_routing_method"]
         if balance_method == BalanceMethod.Balanced:
             token_selected_experts = get_balanced_selection(
@@ -509,37 +507,9 @@ class Runner:
 
             return select_alltoall_method_type
 
-        def make_select_alltoall_method_type_2(select_alltoall_method_type_orig):
-            def select_alltoall_method_type(self):
-                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
-                # by replacing `top_k` with `fake_top_k`
-                top_k = self.routing_method.experts_per_token
-                if scaled_from <= top_k:
-                    fake_top_k = mapping.moe_ep_size + 1
-                else:
-                    fake_top_k = mapping.moe_ep_size - 1
-                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
-                with unittest.mock.patch.object(
-                    self.routing_method.__class__,
-                    "experts_per_token",
-                    new_callable=unittest.mock.PropertyMock,
-                ) as mock_top_k:
-                    mock_top_k.return_value = fake_top_k
-                    return select_alltoall_method_type_orig(self)
-
-            return select_alltoall_method_type
-
-        select_alltoall_method_type_cutlass = CutlassFusedMoE.select_alltoall_method_type
-        select_alltoall_method_type_trtllm_gen = TRTLLMGenFusedMoE.select_alltoall_method_type
         select_alltoall_method_type_wide_ep = WideEPMoE.select_alltoall_method_type
         tensorrt_llm._torch.model_config.load_pretrained_config = make_load_pretrained_config(
             mapping, load_pretrained_config
-        )
-        CutlassFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
-            select_alltoall_method_type_cutlass
-        )
-        TRTLLMGenFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
-            select_alltoall_method_type_trtllm_gen
         )
         WideEPMoE.select_alltoall_method_type = make_select_alltoall_method_type(
             select_alltoall_method_type_wide_ep
@@ -548,8 +518,6 @@ class Runner:
             yield
         finally:
             tensorrt_llm._torch.model_config.load_pretrained_config = load_pretrained_config
-            CutlassFusedMoE.select_alltoall_method_type = select_alltoall_method_type_cutlass
-            TRTLLMGenFusedMoE.select_alltoall_method_type = select_alltoall_method_type_trtllm_gen
             WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod
@@ -605,10 +573,22 @@ class Runner:
     ):
         world_size = mpi_world_size()
         pretrained_config = self.model_config.pretrained_config
-        AttentionCls = get_attention_backend(
-            self.model_config.attn_backend, self.model_config.sparse_attention_config
+        sparse_attention_config = self.model_config.sparse_attention_config
+        sparse_params = (
+            sparse_attention_config.to_sparse_params(pretrained_config=pretrained_config)
+            if sparse_attention_config is not None
+            else None
         )
-        attn_metadata = AttentionCls.Metadata(
+        AttentionCls = get_attention_backend(
+            self.model_config.attn_backend, sparse_params=sparse_params
+        )
+        metadata_cls = AttentionCls.Metadata
+        sparse_metadata_params = (
+            sparse_attention_config.to_sparse_metadata_params(pretrained_config=pretrained_config)
+            if sparse_attention_config is not None
+            else None
+        )
+        attn_metadata = metadata_cls(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
             max_num_requests=kv_cache_manager.max_batch_size,
@@ -631,7 +611,7 @@ class Runner:
             ),
             workspace=attn_workspace,
             mapping=self.model_config.mapping,
-            sparse_attention_config=self.model_config.sparse_attention_config,
+            sparse_metadata_params=sparse_metadata_params,
         )
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
         attn_metadata.prepare()
@@ -648,6 +628,21 @@ class Runner:
             (batch_size * seq_len_q, hidden_size), dtype=torch.bfloat16, device="cuda"
         )
         kwargs = {}
+
+        # DeepSeek-V4 (multi-head hyper-connection) decoder layers take the initial residual
+        # as ``hc_state`` shaped ``[num_tokens, hc_mult, hidden_size]`` (not a 2D hidden-states
+        # tensor), and their MoE routing requires ``input_ids``. Both are absent from the
+        # generic single-layer harness, so synthesize them when the model exposes ``hc_mult``.
+        hc_mult = getattr(pretrained_config, "hc_mult", None)
+        if hc_mult is not None:
+            hidden_states = hidden_states.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
+            kwargs["input_ids"] = torch.randint(
+                0,
+                pretrained_config.vocab_size,
+                (batch_size * seq_len_q,),
+                dtype=torch.int32,
+                device="cuda",
+            )
 
         if is_nemotron_hybrid(pretrained_config) or is_qwen3_hybrid(pretrained_config):
             mamba_metadata = Mamba2Metadata(
@@ -666,7 +661,7 @@ class Runner:
                     hidden_states_out, residual_out = self.model(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
                     )
-            if check:
+            if check and isinstance(hidden_states_out, torch.Tensor):
                 if hidden_states_out.isnan().any():
                     raise ValueError("Has nan, please fix weights initialization")
                 if hidden_states_out.isinf().any():
@@ -804,7 +799,9 @@ class Runner:
                 dtype=kv_cache_dtype,
                 spec_config=None,
                 layer_mask=layer_mask,
-                sparse_attn_config=model_config.sparse_attention_config,
+                vocab_size=config.vocab_size,
+                sparse_attention_config=model_config.sparse_attention_config,
+                pretrained_config=model_config.pretrained_config,
             )
         elif is_nemotron_hybrid(config):
             mamba_layer_mask = [
@@ -828,7 +825,6 @@ class Runner:
                 mamba_layer_mask,
                 config.torch_dtype,
                 model_config.quant_config.mamba_ssm_cache_dtype,
-                False,  # is_disagg
                 # kv cache parameters
                 kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -865,7 +861,6 @@ class Runner:
                 mamba_layer_mask,
                 config.torch_dtype,
                 model_config.quant_config.mamba_ssm_cache_dtype,
-                False,  # is_disagg
                 # kv cache parameters
                 kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,

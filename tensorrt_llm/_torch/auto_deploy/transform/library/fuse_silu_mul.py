@@ -16,14 +16,19 @@
 """Graph transform for fusing SiLU+Mul activation after GEMM fusion.
 
 After fuse_gemms_mixed_children or fuse_fp8_gemms fuses gate+up projections into a
-single GEMM, the graph contains:
+single GEMM, the graph contains a narrow- or split-based gate/up split:
 
     fused_out = gemm(x, gate_up_weight)
     gate = narrow(fused_out, -1, 0, intermediate_size)
     up = narrow(fused_out, -1, intermediate_size, intermediate_size)
     hidden = silu(gate) * up
 
-This transform replaces the narrow+silu+mul pattern with a single fused op:
+Each narrow may additionally be wrapped in a ``.contiguous()`` call when GEMM
+fusion runs with ``allow_not_contigous=False`` (the default for
+``fuse_gemms_mixed_children`` and the quantized fusion paths). Quantized
+closure-based splits use ``getitem(split_output(fused_out), idx)`` instead of
+narrow. All variants are normalized via ``_get_narrow_info`` /
+``_strip_contiguous`` and replaced with a single fused op:
 
     fused_out = gemm(x, gate_up_weight)
     hidden = silu_and_mul(fused_out)
@@ -62,15 +67,49 @@ _FP8_LINEAR_OPS = {
 }
 
 
+def _strip_contiguous(node: Node) -> Optional[Node]:
+    """Walk past any chain of ``.contiguous()`` calls.
+
+    Handles both forms:
+    - ``call_method("contiguous", (x,))``  — what ``_insert_fused_gemm`` emits
+      when ``allow_not_contigous=False`` (the default for fuse_gemms_mixed_children
+      and the quantized fusion paths).
+    - ``call_function(torch.ops.aten.contiguous.default, (x,))`` — the aten op form,
+      kept for forward compatibility with future torch.export decompositions.
+
+    Returns the underlying source node, or ``None`` if a chain link is malformed.
+    Mirrors the precedent helper in ``fuse_rope_into_trtllm_attention.py``.
+    """
+    current = node
+    while isinstance(current, Node):
+        is_method = current.op == "call_method" and current.target == "contiguous"
+        is_aten = current.op == "call_function" and is_op(
+            current, torch.ops.aten.contiguous.default
+        )
+        if not (is_method or is_aten):
+            break
+        if not current.args or not isinstance(current.args[0], Node):
+            return None
+        current = current.args[0]
+    return current
+
+
 def _get_narrow_info(node: Node) -> Optional[Tuple[Node, int, int]]:
     """Extract (parent, offset, length) from a narrow or split+getitem on dim=-1.
 
-    Handles two patterns:
+    Handles two patterns (each optionally wrapped in ``.contiguous()``):
     1. ``torch.narrow(input, -1, start, length)``
     2. ``getitem(split_or_split_output(input, sizes, -1), idx)``
 
     Returns ``(parent, offset, length)`` or None.
     """
+    # Strip any .contiguous() wrapper inserted by GEMM fusion with
+    # allow_not_contigous=False. After stripping, the underlying narrow / getitem
+    # is checked below.
+    node = _strip_contiguous(node)
+    if not isinstance(node, Node):
+        return None
+
     # Pattern 1: torch.narrow(input, dim, start, length)
     if is_op(node, torch.narrow):
         if len(node.args) < 4:

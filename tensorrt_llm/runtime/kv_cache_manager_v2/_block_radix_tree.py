@@ -13,116 +13,116 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
-from typing import TYPE_CHECKING, Iterator, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
-from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
+from ._cache_key import (  # noqa: F401
+    BlockKey,
+    Hasher,
+    TokenBlock,
+    gen_multimodal_cache_key_tokens,
+    reuse_scope_to_bytes,
+    sequence_to_blockchain_keys,
+)
+from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
-from ._utils import TypedIndexList, chunked, filled_list, unwrap_rawref
+from ._utils import (
+    TypedIndexList,
+    expect_type,
+    filled_list,
+    find_index,
+    map_optional,
+    typed_enumerate,
+    unwrap_rawref,
+)
 
 if TYPE_CHECKING:
+    from ._event_manager import KVCacheEventManager
     from ._page import CommittedPage
 
-BlockKey = bytes
+
+class ReuseScope(NamedTuple):
+    """Per-request namespace for prefix reuse."""
+
+    lora_id: int | None = None
+    salt: int | None = None
+
+    def to_bytes(self) -> bytes:
+        return reuse_scope_to_bytes(self)
 
 
-# id_offset is usually vocab_size
-def gen_multi_modal_tokens(
-    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int
-) -> list[TokenIdExt]:
-    assert num_tokens > 0
-    # Alternatively, we could also use (multi_modal_data_digest + i.to_bytes(8, 'little')) or its hash
-    # digest as token id.
-    # The implementation below is faster and also works because KV cache reuse of a token is with a
-    # precondition that all previous tokens also match. So only the first multi-modal token id needs to
-    # be unique.
-    return [
-        multi_modal_data_digest if i == 0 else TokenId(id_offset + i) for i in range(num_tokens)
-    ]
+class ReuseMatch(NamedTuple):
+    """Volatile result of a KV cache prefix match."""
 
-
-class Hasher:
-    __slots__ = "_hasher"
-    _hasher: "hashlib._Hash"
-
-    def __init__(self, data: int | bytes | None | Sequence[int | bytes] = None) -> None:
-        self._hasher = hashlib.sha256()
-        if data is not None:
-            self.update(data)
-
-    # This function is perf-critical. Expect compromised code quality.
-    def update(self, data: int | bytes | Sequence[int | bytes]) -> "Hasher":
-        if type(data) is int:
-            assert NDEBUG or (data >= 0 and data < (1 << 64))
-            self._hasher.update(data.to_bytes(8, "little"))
-        elif type(data) is bytes:
-            self._hasher.update(data)
-        else:
-            for item in data:  # type: ignore
-                assert (
-                    NDEBUG or (type(item) is int and (0 <= item < (1 << 64))) or type(item) is bytes
-                )
-                self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
-        return self
-
-    @property
-    def digest(self) -> bytes:
-        return self._hasher.digest()
-
-
-TokenBlock = list[TokenIdExt]
-
-
-def sequence_to_blockchain_keys(
-    tokens_per_block: int, lora_task_id: int | None, tokens: Sequence[TokenIdExt]
-) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(lora_task_id).digest
-    yield [], digest
-    for token_block in chunked(tokens, tokens_per_block):
-        digest = Hasher(digest).update(token_block).digest
-        yield token_block, digest
+    blocks: list["Block"]
+    num_tokens: int
+    num_lookup_tokens: int
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
 Children = dict[BlockKey, Child]
 
 
-def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
+def try_get_tree(block: "RootBlock | Block") -> "BlockRadixTree | None":
     node = block
     while not isinstance(node, BlockRadixTree):
-        node = node.prev
+        node = node._prev()
+        if node is None:
+            return None
     return node
 
 
-def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"]]:
+def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
+    tree = try_get_tree(block)
+    if tree is None:
+        raise ValueError("Dereferencing a dangling rawref")
+    return tree
+
+
+def detach_next(parent: "Block | RootBlock", key: BlockKey) -> "Block | None":
+    child = parent.next.pop(key, None)
+    if child is None:
+        return None
+
+    child._prev = rawref.NULL
+    if isinstance(parent, RootBlock) and not parent.next:
+        tree = parent._prev()
+        if tree is not None and parent.key in tree.next:
+            detached_root = tree.next.pop(parent.key)
+            parent._prev = rawref.NULL
+            assert detached_root is parent
+    return child
+
+
+def remove_subtree(root: "Block") -> None:
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
-    ret: list[rawref.ref["CommittedPage"]] = []
-    block: "RootBlock | Block" = root
+    # Each block's pages are reclaimed eagerly via _release_pages() while the
+    # StorageManager is still alive, rather than deferring to ~Block()/__del__().
+    # An external reference (e.g. a caller holding a matched Block) can keep a Block
+    # alive past StorageManager teardown, after which page.manager would be dangling.
+    removed_block_hashes: list[BlockKey] = []
+    tree = try_get_tree(root)
+    event_manager = tree.event_manager if tree is not None else None
+    block: Block = root
     while True:
         if block.next:
             block = next(iter(block.next.values()))
         else:
-            if isinstance(block, Block):
-                ret.extend(p for p in block.storage if p is not None)
-                block.storage = filled_list(None, block.num_life_cycles)
-            assert isinstance(block, RootBlock) or all(page is None for page in block.storage), (
-                "Storage is not cleared, yet"
-            )
+            block._release_pages()
+            removed_block_hashes.append(block.key)
             if block._prev() is None:
                 assert block is root
                 break
-            prev_block: Block | RootBlock | BlockRadixTree = block.prev
-            # Because Block.__del__() may remove RootBlock from BlockRadixTree, we need to check here.
-            # It may not be in prev_block.next when block is RootBlock.
-            if block.key in prev_block.next:
-                prev_block.next.pop(block.key)
+            prev_block: Block | RootBlock = block.prev
+            detached = detach_next(prev_block, block.key)
+            assert detached is block
             if block is root:
                 break
-            assert not isinstance(prev_block, BlockRadixTree)
+            assert isinstance(prev_block, Block)
             block = prev_block
-    return ret
+    if event_manager is not None:
+        event_manager.add_removed_event(removed_block_hashes)
 
 
 def traverse_post_order(root: "Block") -> Iterator["Block"]:
@@ -198,17 +198,17 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "lora_task_id", "__rawref__")
+    __slots__ = ("__rawref__", "_prev", "key", "next", "reuse_scope")
     key: BlockKey
-    lora_task_id: int | None
+    reuse_scope: ReuseScope
     _prev: rawref.ref["BlockRadixTree"]
     next: Children["Block"]
     __rawref__: rawref.ref["RootBlock"]
 
-    def __init__(self, lora_task_id: int | None, prev: "BlockRadixTree") -> None:
-        self.key = self.make_key(lora_task_id)
+    def __init__(self, reuse_scope: ReuseScope, prev: "BlockRadixTree") -> None:
+        self.key = self.make_key(reuse_scope)
         assert self.key not in prev.next, "Root block already exists"
-        self.lora_task_id = lora_task_id
+        self.reuse_scope = reuse_scope
         self._prev = rawref.ref(prev)
         self.next = {}
         self.__rawref__ = rawref.NULL
@@ -234,8 +234,8 @@ class RootBlock:
         return self.prev.tokens_per_block
 
     @staticmethod
-    def make_key(lora_task_id: int | None) -> BlockKey:
-        return Hasher(lora_task_id).digest
+    def make_key(reuse_scope: ReuseScope) -> BlockKey:
+        return Hasher(reuse_scope.to_bytes()).digest
 
 
 class Block:
@@ -243,7 +243,7 @@ class Block:
     A block of tokens. Manages data for all layers.
     """
 
-    __slots__ = ("key", "tokens", "ordinal", "_prev", "next", "storage", "__rawref__")
+    __slots__ = ("__rawref__", "_prev", "key", "next", "ordinal", "storage", "tokens")
     key: BlockKey
     tokens: Sequence[TokenIdExt]
     ordinal: BlockOrdinal
@@ -282,21 +282,43 @@ class Block:
             if len(b.tokens) < len(tokens) and tokens[: len(b.tokens)] == b.tokens:
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
                 to_remove.append(k)
+        event_manager = get_tree(prev).event_manager if to_remove else None
+        # Keep RootBlock attached while covered children are replaced.  Adding
+        # the replacement first prevents detach_next() from pruning an
+        # otherwise-empty root before this block becomes its new child.
+        prev.next[self.key] = self
         for k in to_remove:
-            b = prev.next.pop(k)
+            b = detach_next(prev, k)
+            assert isinstance(b, Block)
+            if event_manager is not None:
+                event_manager.add_removed_event(b.key)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
-        prev.next[self.key] = self
 
-    def __del__(self) -> None:
-        for ref in self.storage:
+    def _release_pages(self) -> None:
+        """Reclaim every page held by this block.
+
+        Nulls each page's back-pointer and, for pages still scheduled for eviction,
+        removes them from the eviction controller (releasing their storage slots).
+        Idempotent: afterwards ``storage`` holds no pages, so it is safe to call again
+        from ``__del__``.
+
+        This must run during radix-tree teardown (``remove_subtree``/``clear``) rather
+        than being deferred to ``__del__``, so that page reclamation does not depend on
+        this ``Block`` object's destruction timing. An external reference can keep the
+        ``Block`` alive past ``StorageManager`` teardown, after which ``page.manager``
+        would be a dangling reference.
+        """
+        for lc_idx, ref in typed_enumerate(self.storage):
             if ref is not None and ref() is not None:
                 page = unwrap_rawref(ref)
+                self.unlink_page(lc_idx)
                 if page.status == PageStatus.DROPPABLE:
                     if page.scheduled_for_eviction:
                         page.manager.exclude_from_eviction(page)
-        if self._prev() is not None and isinstance(self.prev, RootBlock) and not self.prev.next:
-            self.prev.prev.next.pop(self.prev.key)
+
+    def __del__(self) -> None:
+        self._release_pages()
         self.__rawref__.invalidate()
 
     def _partial_match_this_node(self, tokens: TokenBlock) -> int:
@@ -316,31 +338,53 @@ class Block:
     def prev(self) -> "Block | RootBlock":
         return unwrap_rawref(self._prev)
 
-    def unset_page(self, lc_idx: LifeCycleId, lc: LifeCycle) -> None:
-        if self.storage[lc_idx] is None:
-            return
-        ordinal = self.ordinal
+    def get_page(self, lc_idx: LifeCycleId) -> "CommittedPage | None":
+        return map_optional(self.storage[lc_idx], lambda f: f())
+
+    def unlink_page(
+        self, lc_idx: LifeCycleId, expected_page: "CommittedPage | None" = None
+    ) -> bool:
+        page_ref = self.storage[lc_idx]
+        if page_ref is None:
+            return False
+        # Only unlink when the slot still holds the expected page. During rebase
+        # another block with the same key may have replaced the stored page, and
+        # unlinking then would clobber the newer page's back-pointer.
+        if expected_page is not None and page_ref() is not expected_page:
+            return False
+        page = page_ref()
+        if page is not None:
+            page.block = rawref.NULL
         self.storage[lc_idx] = None
+        return True
+
+    @staticmethod
+    def clear_stale_blocks_after_page_unlink(
+        start: "Block", lc_idx: LifeCycleId, lc: LifeCycle
+    ) -> None:
+        assert start.storage[lc_idx] is None
+        ordinal = start.ordinal
+        tree = try_get_tree(start)
+        event_manager = tree.event_manager if tree is not None else None
         if type(lc) is AttnLifeCycle and (lc.window_size is None or ordinal < lc.num_sink_blocks):
-            pages = remove_subtree(self)
-            for r in pages:
-                if r() is not None:
-                    page = unwrap_rawref(r)
-                    assert page.status == PageStatus.DROPPABLE
-                    if page.scheduled_for_eviction:
-                        page.manager.exclude_from_eviction(page)
+            remove_subtree(start)
+        elif event_manager is not None:
+            event_manager.add_removed_life_cycle_event(start.key, int(lc_idx))
         # It's possible to implement more sophisticated logic to remove useless blocks for SWA, e.g.
         # check if consecutive available blocks is sufficient for window_size. (TRTLLM-8802)
         # But for simplicity, we leave it for now.
-        curr = self
+        curr = start
         while (
             (isinstance(curr, Block) and curr.storage[lc_idx] is None)
             and not curr.next
             and curr._prev() is not None
         ):
-            if curr.key in curr.prev.next:
-                curr.prev.next.pop(curr.key)
-            curr = curr.prev
+            prev = curr.prev
+            detached = detach_next(prev, curr.key)
+            assert detached is curr
+            if event_manager is not None:
+                event_manager.add_removed_event(curr.key)
+            curr = prev
 
     @property
     def tokens_per_block(self) -> int:
@@ -354,30 +398,45 @@ class Block:
 
     @property
     def is_orphan(self) -> bool:
-        return self.key not in self.prev.next or self.prev.next[self.key] is not self
+        prev = self._prev()
+        assert prev is None or (self.key in prev.next and prev.next[self.key] is self)
+        return prev is None
 
 
 class BlockRadixTree:
-    __slots__ = ("_life_cycles", "_tokens_per_block", "next", "__rawref__")
+    __slots__ = (
+        "__rawref__",
+        "_event_manager",
+        "_life_cycles",
+        "_tokens_per_block",
+        "next",
+    )
     _life_cycles: LifeCycleRegistry
     _tokens_per_block: int
+    _event_manager: "KVCacheEventManager | None"
     next: Children[RootBlock]
     __rawref__: rawref.ref["BlockRadixTree"]
 
-    def __init__(self, life_cycles: LifeCycleRegistry, tokens_per_block: int) -> None:
+    def __init__(
+        self,
+        life_cycles: LifeCycleRegistry,
+        tokens_per_block: int,
+        event_manager: "KVCacheEventManager | None" = None,
+    ) -> None:
         self._life_cycles = life_cycles
         self._tokens_per_block = tokens_per_block
+        self._event_manager = event_manager
         self.next = {}
         self.__rawref__ = rawref.NULL
 
     def __del__(self) -> None:
         self.__rawref__.invalidate()
 
-    def add_or_get_existing(self, lora_task_id: int | None) -> RootBlock:
-        key = RootBlock.make_key(lora_task_id)
+    def add_or_get_existing(self, reuse_scope: ReuseScope) -> RootBlock:
+        key = RootBlock.make_key(reuse_scope)
         if key in self.next:
             return self.next[key]
-        return RootBlock(lora_task_id, self)
+        return RootBlock(reuse_scope, self)
 
     @property
     def tokens_per_block(self) -> int:
@@ -388,31 +447,49 @@ class BlockRadixTree:
         return self._life_cycles
 
     @property
+    def event_manager(self) -> "KVCacheEventManager | None":
+        return self._event_manager
+
+    @property
     def num_life_cycles(self) -> LifeCycleId:
         return self.life_cycles.size
 
-    def clear(self) -> list[rawref.ref["CommittedPage"]]:
+    def clear(self) -> None:
         # taking O(1) space
         # remove leaf blocks one by one, in post-order
-        ret: list[rawref.ref["CommittedPage"]] = []
+        # ~Block() / __del__() handles page cleanup.
+        # detach_next() auto-prunes empty RootBlocks from the tree.
         while self.next:
-            block = next(iter(self.next.values()))
-            ret.extend(remove_subtree(block))
+            root = next(iter(self.next.values()))
+            while root.next:
+                remove_subtree(next(iter(root.next.values())))
         assert not self.next
-        return ret
+
+    def _num_matched_tokens(self, matched: list[tuple[Block, int]]) -> int:
+        if not matched:
+            return 0
+        return self._tokens_per_block * (len(matched) - 1) + matched[-1][1]
+
+    @staticmethod
+    def _has_pages(block: Block, lc_list: Iterable[LifeCycleId]) -> bool:
+        return all(block.storage[lc] is not None for lc in lc_list)
+
+    @staticmethod
+    def _has_page(block: Block, lc: LifeCycleId) -> bool:
+        return block.storage[lc] is not None
 
     # yields tuples of (block, num_matched_tokens). num_matched_tokens should be equal to
     # tokens_per_block except the last one.
-    def match(
+    def _match_token_path(
         self,
-        lora_task_id: int | None,
+        reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
     ) -> Iterator[tuple[Block, int]]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
         for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, lora_task_id, tokens
+            self._tokens_per_block, reuse_scope, tokens
         ):
             if key in block.next:
                 block = block.next[key]
@@ -429,6 +506,108 @@ class BlockRadixTree:
             if partial_block is not None:
                 block = partial_block
                 yield block, match_len
+
+    def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
+        tokens_per_block = self._tokens_per_block
+        assert all(b[1] == tokens_per_block for b in matched[:-1])
+
+        life_cycles = self._life_cycles
+
+        # check for full attention layers
+        attn_life_cycles = list(life_cycles.attention_life_cycles())
+        if any(lc.window_size is None for _, lc in attn_life_cycles):
+            lc_list = [lc_idx for lc_idx, lc in attn_life_cycles if lc.window_size is None]
+
+            def check_no_pages(b: tuple[Block, int]) -> bool:
+                return not BlockRadixTree._has_pages(b[0], lc_list)
+
+            n = find_index(matched, check_no_pages)
+            matched = matched[:n]
+
+        swa_life_cycles = tuple(
+            (lc_idx, lc) for lc_idx, lc in attn_life_cycles if lc.window_size is not None
+        )
+        # check for SWA sink
+        for lc_idx, lc in swa_life_cycles:
+
+            def check_no_page_lc(b: tuple[Block, int]) -> bool:
+                return not BlockRadixTree._has_page(b[0], lc_idx)
+
+            n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
+            if n < lc.num_sink_blocks:
+                matched = matched[:n]
+        # Check SSM snapshot availability before SWA window constraints.
+        # Truncating to the last reusable SSM snapshot can change the matched
+        # length used by the SWA check.
+        ssm_lc_id = life_cycles.ssm_life_cycle_id
+        if ssm_lc_id is not None:
+            from ._page import SsmCommittedPage
+
+        while matched:
+            if ssm_lc_id is not None:
+                ssm_trunc = 0
+                ssm_match_len = 0
+                for i in reversed(range(len(matched))):
+                    block = matched[i][0]
+                    page = map_optional(block.storage[ssm_lc_id], lambda f: f())
+                    if page is None:
+                        continue
+                    page = expect_type(SsmCommittedPage, page)
+                    snapshot_len = page.num_tokens_in_block
+                    if matched[i][1] >= snapshot_len:
+                        ssm_trunc = i + 1
+                        ssm_match_len = snapshot_len
+                        break
+                matched = matched[:ssm_trunc]
+                if not matched:
+                    break
+                matched[-1] = (matched[-1][0], ssm_match_len)
+            # SWA window check
+            num_tokens = self._num_matched_tokens(matched)
+            for lc_idx, lc in swa_life_cycles:
+                if lc.window_size is None:
+                    continue
+
+                def check_has_page_lc(b: tuple[Block, int]) -> bool:
+                    return BlockRadixTree._has_page(b[0], lc_idx)
+
+                n = find_index(reversed(matched), check_has_page_lc)
+                if n != 0:
+                    matched = matched[:-n]
+                    break
+                _, stale_end = lc.get_stale_range(num_tokens, tokens_per_block)
+
+                def has_no_page(b: tuple[Block, int]) -> bool:
+                    return not BlockRadixTree._has_page(b[0], lc_idx)
+
+                n = find_index(reversed(matched[stale_end:]), has_no_page)
+                if len(matched) - n > stale_end:
+                    matched = matched[: len(matched) - n - 1]
+                    break
+            else:
+                break
+        return matched
+
+    def match(
+        self,
+        reuse_scope: ReuseScope,
+        tokens: Sequence[TokenIdExt],
+        enable_partial_match: bool = False,
+    ) -> ReuseMatch:
+        """
+        Return the currently reusable prefix match without holding pages.
+
+        The result is volatile: callers that need to reuse the returned blocks must
+        acquire ownership of the pages before depending on them.
+        """
+        matched = self._prune_match(
+            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        )
+        return ReuseMatch(
+            [block for block, _ in matched],
+            self._num_matched_tokens(matched),
+            len(tokens),
+        )
 
     def _check_sanity(self) -> bool:
         raise NotImplementedError(

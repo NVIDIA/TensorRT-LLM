@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Default multimodal prompt tokenization exceeds the dashboard default 512
+# sequence length for this checkpoint.
+max_seq_len: 1024

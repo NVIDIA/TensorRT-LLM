@@ -37,6 +37,7 @@ import torch
 sys.modules["triton_python_backend_utils"] = MagicMock()
 
 from helpers import (convert_request_input_to_dict,
+                     get_lora_request_from_request,
                      get_output_config_from_request, get_parameter,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
@@ -74,6 +75,10 @@ class MockTritonTensor:
 @dataclass
 class MockTritonError:
     message: str
+
+
+class MockTritonModelException(Exception):
+    """Stands in for pb_utils.TritonModelException in tests."""
 
 
 @dataclass
@@ -129,7 +134,8 @@ def apply_patches():
     patch("model.pb_utils.InferenceRequest", new=MockTritonRequest).start()
     patch("model.pb_utils.get_input_tensor_by_name",
           new=mock_pb_utils_get_input_tensor_by_name_side_effect).start()
-    patch("model.pb_utils.TritonModelException", new=Exception).start()
+    patch("model.pb_utils.TritonModelException",
+          new=MockTritonModelException).start()
 
 
 def inputs(streaming=False):
@@ -214,6 +220,108 @@ def test_convert_request_input_to_dict():
         "mapped_b": True,
         "mapped_c": "default_value"
     }
+
+
+def test_get_lora_request_from_request(tmp_path):
+    # Mock the deferred `from tensorrt_llm.executor.request import LoRARequest`
+    # inside the helper so the test doesn't require a built TRT-LLM.
+    fake_lora_request_cls = MagicMock()
+    trtllm_mod = MagicMock()
+    executor_mod = MagicMock()
+    request_mod = MagicMock()
+    request_mod.LoRARequest = fake_lora_request_cls
+    # Real existing path so the helper's eager os.path.exists check passes.
+    adapter_dir = str(tmp_path)
+
+    with patch.dict(
+            sys.modules, {
+                "tensorrt_llm": trtllm_mod,
+                "tensorrt_llm.executor": executor_mod,
+                "tensorrt_llm.executor.request": request_mod,
+            }):
+        # No LoRA inputs -> returns None (backwards-compatible default)
+        request = make_mock_triton_request({"text_input": ["hi"]})
+        assert get_lora_request_from_request(request) is None
+
+        # All three inputs (bytes STRING tensors, like dtype=object) ->
+        # constructs LoRARequest with decoded strings + default ckpt source.
+        fake_lora_request_cls.reset_mock()
+        request = make_mock_triton_request({
+            "lora_id": [42],
+            "lora_name": [b"my-adapter"],
+            "lora_path": [adapter_dir.encode("utf-8")],
+        })
+        result = get_lora_request_from_request(request)
+        fake_lora_request_cls.assert_called_once_with(lora_name="my-adapter",
+                                                      lora_int_id=42,
+                                                      lora_path=adapter_dir,
+                                                      lora_ckpt_source="hf")
+        assert result is fake_lora_request_cls.return_value
+
+        # Same inputs but unicode STRING tensors (dtype='<U...') -> still
+        # decodes through _decode_string_scalar's str fall-through.
+        fake_lora_request_cls.reset_mock()
+        request = make_mock_triton_request({
+            "lora_id": [42],
+            "lora_name": ["unicode-adapter"],
+            "lora_path": [adapter_dir],
+        })
+        get_lora_request_from_request(request)
+        fake_lora_request_cls.assert_called_once_with(
+            lora_name="unicode-adapter",
+            lora_int_id=42,
+            lora_path=adapter_dir,
+            lora_ckpt_source="hf")
+
+        # Explicit lora_ckpt_source="nemo" propagates through.
+        fake_lora_request_cls.reset_mock()
+        request = make_mock_triton_request({
+            "lora_id": [42],
+            "lora_name": [b"nemo-adapter"],
+            "lora_path": [adapter_dir.encode("utf-8")],
+            "lora_ckpt_source": [b"nemo"],
+        })
+        get_lora_request_from_request(request)
+        fake_lora_request_cls.assert_called_once_with(lora_name="nemo-adapter",
+                                                      lora_int_id=42,
+                                                      lora_path=adapter_dir,
+                                                      lora_ckpt_source="nemo")
+
+        # Invalid lora_ckpt_source -> raises (must be hf or nemo).
+        request = make_mock_triton_request({
+            "lora_id": [42],
+            "lora_name": [b"a"],
+            "lora_path": [adapter_dir.encode("utf-8")],
+            "lora_ckpt_source": [b"bogus"],
+        })
+        with pytest.raises(MockTritonModelException):
+            get_lora_request_from_request(request)
+
+        # All three partial-input permutations -> raise TritonModelException.
+        for partial in (
+            {
+                "lora_id": [42]
+            },
+            {
+                "lora_name": [b"adapter"],
+                "lora_path": [adapter_dir.encode("utf-8")]
+            },
+            {
+                "lora_path": [adapter_dir.encode("utf-8")]
+            },
+        ):
+            with pytest.raises(MockTritonModelException):
+                get_lora_request_from_request(make_mock_triton_request(partial))
+
+        # lora_path that doesn't exist -> raises TritonModelException (not
+        # raw ValueError from LoRARequest.__post_init__).
+        request = make_mock_triton_request({
+            "lora_id": [42],
+            "lora_name": [b"a"],
+            "lora_path": [b"/nonexistent-path-xyzzy"],
+        })
+        with pytest.raises(MockTritonModelException):
+            get_lora_request_from_request(request)
 
 
 def test_get_parameter():

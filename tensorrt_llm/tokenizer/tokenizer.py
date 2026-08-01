@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib
 import os
 import pickle  # nosec B403
@@ -10,16 +25,34 @@ from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
 from .._utils import nvtx_range_debug
 from ..logger import logger
 
+# Transformers 5.x moved ``bytes_to_unicode`` out of
+# ``transformers.models.gpt2.tokenization_gpt2`` into
+# ``transformers.convert_slow_tokenizer``. Some ``trust_remote_code=True``
+# checkpoints (e.g. Kimi-K2's ``tokenization_kimi.py``) still import it from
+# the legacy location; re-export the symbol so those tokenizers keep loading.
+try:
+    from transformers.models.gpt2 import tokenization_gpt2 as _gpt2_mod
+    if not hasattr(_gpt2_mod, "bytes_to_unicode"):
+        from transformers.convert_slow_tokenizer import bytes_to_unicode
+        _gpt2_mod.bytes_to_unicode = bytes_to_unicode
+except ImportError:
+    pass
+
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
-    "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
-    "glm_moe_dsa": "tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer",
+    "deepseek_v32":
+    "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
+    "deepseek_v4":
+    "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
+    "mistral_common":
+    "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer.MistralTokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
     "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", "HF")
 TLLM_STREAM_INTERVAL_THRESHOLD = int(
     os.environ.get("TLLM_STREAM_INTERVAL_THRESHOLD", "24"))
+_HF_DECODE_STREAM_INVALID_PREFIX_ERROR = "Invalid prefix encountered"
 try:
     from tokenizers.decoders import DecodeStream  # noqa
 except ImportError:
@@ -58,6 +91,68 @@ def _tokenizer_json_uses_byte_level(pretrained_model_dir: str) -> bool:
             sub.get("type") == "ByteLevel"
             for sub in pt.get("pretokenizers", []))
     return False
+
+
+# Keys forwarded from tokenizer_config.json to PreTrainedTokenizerFast when
+# falling back. LlamaTokenizerFast-style flags the bare fast tokenizer does
+# not read by default but AutoTokenizer would have honored.
+_TOKENIZER_CONFIG_INHERIT_KEYS = (
+    "add_bos_token",
+    "add_eos_token",
+    "padding_side",
+    "truncation_side",
+    "model_max_length",
+    "clean_up_tokenization_spaces",
+)
+
+
+def _load_tokenizer_config_inherits(
+        pretrained_model_dir: str) -> Dict[str, Any]:
+    """Return a dict of LlamaTokenizerFast-style flags from tokenizer_config.json."""
+    import json
+    tcfg_path = os.path.join(pretrained_model_dir, "tokenizer_config.json")
+    if not os.path.isfile(tcfg_path):
+        return {}
+    try:
+        with open(tcfg_path) as f:
+            tcfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {k: tcfg[k] for k in _TOKENIZER_CONFIG_INHERIT_KEYS if k in tcfg}
+
+
+def _fallback_to_fast_tokenizer(pretrained_model_dir: str,
+                                original_error: BaseException, **kwargs):
+    """Bypass AutoTokenizer's HF-config path with PreTrainedTokenizerFast.
+
+    transformers 5.x converted PreTrainedConfig to a dataclass: only declared
+    fields survive __post_init__'s RoPE standardization. When a model uses a
+    model_type not registered in CONFIG_MAPPING_NAMES (e.g. DeepSeek-V3.2's
+    ``deepseek_v32``), AutoTokenizer.from_pretrained falls back to a bare
+    PreTrainedConfig whose RoPE path reads self.max_position_embeddings,
+    raising AttributeError.
+
+    PreTrainedTokenizerFast doesn't go through AutoConfig — it reads
+    tokenizer.json via the Rust tokenizers library — so it sidesteps this
+    entirely. We forward LlamaTokenizerFast-style flags (add_bos_token,
+    padding_side, ...) from tokenizer_config.json so the fast tokenizer
+    matches the behavior AutoTokenizer would have had pre-regression.
+    """
+    inherited = _load_tokenizer_config_inherits(pretrained_model_dir)
+    fast_kwargs = {
+        k: v
+        for k, v in kwargs.items() if k not in ("trust_remote_code", "use_fast")
+    }
+    # caller kwargs win over tokenizer_config.json inherited values
+    merged = {**inherited, **fast_kwargs}
+    logger.warning(
+        f"AutoTokenizer.from_pretrained({pretrained_model_dir}) raised "
+        f"{type(original_error).__name__}: {original_error}. Falling back to "
+        f"PreTrainedTokenizerFast to bypass HF dataclass regression "
+        f"(model_type likely not registered in CONFIG_MAPPING_NAMES). "
+        f"Inherited from tokenizer_config.json: {sorted(inherited)}")
+    return PreTrainedTokenizerFast.from_pretrained(pretrained_model_dir,
+                                                   **merged)
 
 
 def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
@@ -101,6 +196,7 @@ def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
 
 class TransformersTokenizer(TokenizerBase):
     ''' A wrapper for the Transformers' tokenizer.
+
     This is the default tokenizer for LLM. '''
 
     def __init__(self, tokenizer):
@@ -170,6 +266,9 @@ class TransformersTokenizer(TokenizerBase):
     def decode(self, token_ids: List[int], *args, **kwargs) -> str:
         return self.tokenizer.decode(token_ids, *args, **kwargs)
 
+    def convert_tokens_to_ids(self, tokens, *args, **kwargs):
+        return self.tokenizer.convert_tokens_to_ids(tokens, *args, **kwargs)
+
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         # transformers 5.x removed batch_encode_plus; __call__ has the same signature.
         return self.tokenizer(texts, *args, **kwargs)
@@ -190,8 +289,25 @@ class TransformersTokenizer(TokenizerBase):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
-                                                  **kwargs)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
+                                                      **kwargs)
+        except Exception as e:
+            # Two transformers 5.x regressions for model_types not registered
+            # in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
+            # tokenizer.json directly and skips AutoConfig, so it sidesteps
+            # both:
+            #  - deepseek_v32: bare PreTrainedConfig fallback hits
+            #    modeling_rope_utils → self.max_position_embeddings →
+            #    AttributeError (PreTrainedConfig is now a dataclass with
+            #    declared fields). See deepseek-ai/DeepSeek-V3#1207.
+            #  - glm_moe_dsa: layer_types=['deepseek_sparse_attention', ...] is
+            #    rejected by validate_layer_type (not in ALLOWED_LAYER_TYPES).
+            msg = str(e)
+            if "max_position_embeddings" not in msg and "layer_types" not in msg:
+                raise
+            tokenizer = _fallback_to_fast_tokenizer(pretrained_model_dir, e,
+                                                    **kwargs)
         tokenizer = maybe_fix_byte_level_tokenizer(tokenizer,
                                                    pretrained_model_dir,
                                                    **kwargs)
@@ -395,11 +511,24 @@ class TransformersTokenizer(TokenizerBase):
             }
 
         decode_stream = states.get('decode_stream')
-        results = [
-            result for tid in token_ids
-            if (result := decode_stream.step(self.tokenizer._tokenizer, tid)
-                ) is not None
-        ]
+        results = []
+        for tid in token_ids:
+            try:
+                result = decode_stream.step(self.tokenizer._tokenizer, tid)
+            except Exception as error:
+                # PyO3 exposes tokenizers' DecodeStreamError as a plain Exception.
+                if not str(error).startswith(
+                        _HF_DECODE_STREAM_INVALID_PREFIX_ERROR):
+                    raise
+                logger.warning(
+                    "HF DecodeStream encountered an invalid prefix while decoding token %d. "
+                    "Resetting the decode stream.", tid)
+                decode_stream = DecodeStream(
+                    skip_special_tokens=skip_special_tokens)
+                states['decode_stream'] = decode_stream
+                result = decode_stream.step(self.tokenizer._tokenizer, tid)
+            if result is not None:
+                results.append(result)
         curr_new_text = "".join(results)
         if clean_up_tokenization_spaces is None:
             clean_up_tokenization_spaces = self.clean_up_tokenization_spaces
@@ -512,6 +641,24 @@ def maybe_register_transformers_modules_by_value():
                        f"serialization: {e}")
 
 
+def _ensure_gpt2_bytes_to_unicode_compat() -> None:
+    """Restore ``bytes_to_unicode`` on ``transformers.models.gpt2.tokenization_gpt2``.
+
+    transformers 5.x removed it from that module, but some ``trust_remote_code``
+    tokenizers (e.g. Kimi-K2's ``tokenization_kimi.py``) still import it from
+    the legacy location. The function survives under
+    ``transformers.convert_slow_tokenizer``.
+    """
+    try:
+        from transformers.models.gpt2 import tokenization_gpt2
+        if hasattr(tokenization_gpt2, "bytes_to_unicode"):
+            return
+        from transformers.convert_slow_tokenizer import bytes_to_unicode
+    except ImportError:
+        return
+    tokenization_gpt2.bytes_to_unicode = bytes_to_unicode
+
+
 def load_hf_tokenizer(model_dir: str,
                       trust_remote_code: bool = True,
                       use_fast: bool = True,
@@ -527,6 +674,8 @@ def load_hf_tokenizer(model_dir: str,
         A TransformersTokenizer object if the tokenizer is loaded successfully.
     '''
 
+    _ensure_gpt2_bytes_to_unicode_compat()
+
     try:
         tokenizer = TransformersTokenizer.from_pretrained(
             model_dir,
@@ -536,17 +685,38 @@ def load_hf_tokenizer(model_dir: str,
             trust_remote_code=trust_remote_code,
             use_fast=use_fast,
             **kwargs)
-
         if trust_remote_code:
             maybe_register_transformers_modules_by_value()
-
         return tokenizer
-
-    except Exception as e:
+    except (OSError, ValueError) as e:
         logger.warning(
-            f"Failed to load hf tokenizer from {model_dir}, encounter error: {e}"
+            f"Failed to load hf tokenizer from hub for {model_dir}: {e}. "
+            f"The model may be gated and the token is unavailable in this "
+            f"environment. Retrying with local cache...")
+    except Exception:
+        raise
+
+    # Same code block as before but with the specific usage of local_files_only to check if the tokenizer is available locally.
+    # Can come in handy in cases like when the model is in a gated repo, was correctly downloaded locally but the environment has no HF Auth Key present.
+    # See https://github.com/NVIDIA/TensorRT-LLM/issues/12805 for more details.
+    try:
+        kwargs['local_files_only'] = True
+        tokenizer = TransformersTokenizer.from_pretrained(
+            model_dir,
+            legacy=False,
+            padding_side='left',
+            truncation_side='left',
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast,
+            **kwargs)
+        if trust_remote_code:
+            maybe_register_transformers_modules_by_value()
+        return tokenizer
+    except (OSError, ValueError) as e:
+        logger.warning(
+            f"Failed to load hf tokenizer from local cache for {model_dir}: {e}"
         )
-        return None
+    return None
 
 
 def load_custom_tokenizer(

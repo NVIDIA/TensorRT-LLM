@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -81,6 +81,25 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
 }
 
 } // anonymous namespace
+
+bool appliesRoPEInXqaKernel(XQAParams const& xqaParams, bool isQGMMAKernel)
+{
+    // In-kernel RoPE is only implemented by the Hopper QGMMA kernel, and only for non-spec-dec, non-MLA
+    // cases.
+    if (!isQGMMAKernel || xqaParams.multi_query_tokens || xqaParams.isMLA())
+    {
+        return false;
+    }
+    // The in-kernel RoPE rotates the first rotary_embedding_dim head elements and copies the rest
+    // unrotated; it requires the rope region to be 16B-aligned for any supported cache dtype
+    // (rotary_embedding_dim a multiple of 16). Unsupported shapes fall back to invokeQKVPreprocessing.
+    bool const isSupportedRotary = xqaParams.rotary_embedding_dim > 0
+        && xqaParams.rotary_embedding_dim <= xqaParams.head_size && xqaParams.rotary_embedding_dim % 16 == 0;
+    return isSupportedRotary
+        && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
+                                              PositionEmbeddingType::kROPE_GPTJ},
+            xqaParams.position_embedding_type);
+}
 
 bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin)
 {

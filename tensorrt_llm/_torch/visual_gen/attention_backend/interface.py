@@ -78,4 +78,5 @@ class AttentionBackend(ABC):
 
     @classmethod
     def support_lse(cls) -> bool:
+        """Whether the backend supports returning the softmax log-sum-exp (LSE) of the attention weights."""
         return False

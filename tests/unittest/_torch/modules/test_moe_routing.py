@@ -7,16 +7,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
-    BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod, DefaultMoeRoutingMethod,
+    BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
+    DeepSeekV4MoeRoutingMethod, DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod, LoadBalancedMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod, RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod, SparseMixerMoeRoutingMethod,
     StaticMoeRoutingMethod, create_load_balanced_logits, create_moe)
+from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
 from tensorrt_llm._torch.modules.fused_moe.routing import \
     get_cached_perfect_router_logits
 from tensorrt_llm._utils import mpi_rank
@@ -149,6 +150,54 @@ def test_default_moe_routing(top_k):
             reference_scales[1, reference_indices[1, i]])
         assert scales[2, i] == pytest.approx(
             reference_scales[2, reference_indices[2, i]])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_tokens, num_experts, top_k", [
+    (32, 128, 8),
+    (1, 128, 8),
+    (8192, 128, 8),
+])
+def test_default_moe_routing_decode_anchor(num_tokens, num_experts, top_k):
+    """Numerics check for the ``default_moe_routing_op`` (softmax-before-topk)
+    path backed by ``customMoeRoutingKernel``.
+
+    This exercises the exact shapes the Qwen3-235B-A22B + EAGLE3 dyntree
+    decode path runs through (decode anchor num_tokens=32, num_experts=128,
+    top_k=8; plus the single-token and prefill corners). The kernel is
+    per-warp independent — each warp owns one token and computes the full
+    softmax + top-k for it — so its output is bit-identical regardless of the
+    block geometry. Lowering ``BLOCK_SIZE`` (1024 -> 128) and raising
+    ``maxNumBlocks`` (1024 -> 8192) only changes how warps are tiled across
+    SMs, never the per-token arithmetic; this test guards that invariant.
+    """
+    routing = DefaultMoeRoutingMethod(top_k=top_k)
+
+    # Unique logits per row so top-k selection has no tie ambiguity.
+    router_logits = gen_unique_logits(num_tokens, num_experts, torch.float32)
+
+    indices, scales = routing.apply(router_logits)
+    assert indices.shape == (num_tokens, top_k)
+    assert scales.shape == (num_tokens, top_k)
+    assert indices.dtype == torch.int32
+    assert scales.dtype == torch.float32
+
+    # Reference: softmax over all experts, then take the top-k.
+    probs = F.softmax(router_logits.float(), dim=1)
+    ref_scales, ref_indices = probs.topk(top_k, dim=1)
+
+    # Compare the selected expert set (order-independent) and the gathered
+    # softmax weights aligned by sorted expert id.
+    idx_sorted, perm = torch.sort(indices, dim=1)
+    ref_idx_sorted, ref_perm = torch.sort(ref_indices.to(torch.int32), dim=1)
+    assert torch.equal(idx_sorted.cpu(), ref_idx_sorted.cpu())
+
+    scales_sorted = torch.gather(scales, 1, perm)
+    ref_scales_sorted = torch.gather(ref_scales, 1, ref_perm)
+    torch.testing.assert_close(scales_sorted,
+                               ref_scales_sorted,
+                               rtol=1e-3,
+                               atol=1e-3)
 
 
 @pytest.mark.parametrize("top_k", [1, 2, 3])
@@ -348,6 +397,163 @@ def test_static_moe_routing():
             scales,
             torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
                          dtype=torch.float32))
+
+
+def _make_v3_routing(top_k, n_group, topk_group, num_experts):
+    """Build a DSv3 routing method (bias stored on routing_impl)."""
+    bias = torch.zeros(num_experts, dtype=torch.float32)
+    return DeepSeekV3MoeRoutingMethod(
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=1.0,
+        callable_e_score_correction_bias=lambda: bias,
+        is_fused=False,
+    )
+
+
+def _make_v4_routing(top_k, n_group, topk_group, num_experts, is_hashed):
+    """Build a DSv4 routing method.
+
+    ``is_hashed=True`` mirrors ``DeepseekV4Gate`` hashed gates, where the
+    bias callable returns ``None``. ``is_hashed=False`` returns a zero-bias
+    tensor, mirroring the dense gate path.
+    """
+    if is_hashed:
+        bias_callable = lambda: None  # noqa: E731
+    else:
+        bias = torch.zeros(num_experts, dtype=torch.float32)
+        bias_callable = lambda: bias  # noqa: E731
+    return DeepSeekV4MoeRoutingMethod(
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=1.0,
+        callable_e_score_correction_bias=bias_callable,
+        callable_tid2eid=lambda: torch.zeros(0, dtype=torch.int32),
+        is_hashed=is_hashed,
+    )
+
+
+# DSv4-Pro production: num_experts_per_tok=6, n_routed_experts=384, n_group=8,
+# topk_group=4 (verified against the deployed checkpoint config). n_group and
+# topk_group are not explicitly in the HF config; they fall back to the DSv3
+# defaults that ``DeepseekV4Gate`` consumes via ``config.n_group`` /
+# ``config.topk_group``.
+_DSV4_PRO_TOP_K = 6
+_DSV4_PRO_N_GROUP = 8
+_DSV4_PRO_TOPK_GROUP = 4
+
+
+@pytest.mark.parametrize(
+    "routing_cls", [DeepSeekV3MoeRoutingMethod, DeepSeekV4MoeRoutingMethod])
+def test_grouped_routing_exposes_n_group_topk_group(routing_cls):
+    """Unit regression: V3 and V4 routing both expose n_group/topk_group.
+
+    The DeepSeekV3 perfect-router planner reads
+    ``routing_method.n_group`` and ``routing_method.topk_group`` directly.
+    DeepSeekV3MoeRoutingMethod nests the settings on ``routing_impl`` and
+    exposes them via @property; DeepSeekV4MoeRoutingMethod stores them
+    directly on the instance. Both layouts must surface the same values.
+    """
+    n_group, topk_group = _DSV4_PRO_N_GROUP, _DSV4_PRO_TOPK_GROUP
+    num_experts = 64
+    if routing_cls is DeepSeekV4MoeRoutingMethod:
+        routing = _make_v4_routing(top_k=_DSV4_PRO_TOP_K,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts,
+                                   is_hashed=False)
+    else:
+        routing = _make_v3_routing(top_k=_DSV4_PRO_TOP_K,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts)
+
+    assert routing.n_group == n_group
+    assert routing.topk_group == topk_group
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # (num_experts, moe_ep_size) — small case for CI speed, plus the
+        # production DSv4-Pro shape (DEP=16 disagg-serving benchmark).
+        pytest.param((64, 1), id="small"),
+        pytest.param((384, 16), id="dsv4_pro_dep16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_name",
+    ["v3", "v4_dense", "v4_hashed"],
+)
+def test_perfect_router_get_cached_logits_e2e(routing_name, shape):
+    """End-to-end regression: synthesize perfect-router logits on CPU.
+
+    Exercises the full pipeline through ``get_cached_perfect_router_logits``
+    at ``top_k=6`` (DSv4-Pro ``num_experts_per_tok``):
+      - Group-aware planner reads ``n_group`` / ``topk_group`` correctly
+        (V3 nests them on ``routing_impl``, V4 stores them directly).
+      - ``_force_zero_routing_bias_in_place`` handles both Tensor and
+        ``None`` bias values. DSv4 hashed gates return ``None`` from their
+        bias callable, which previously crashed with ``zeros_like(None)``.
+      - Production DSv4-Pro shape (384 experts, EP=16) is covered alongside
+        a small case so CI remains fast while still exercising the
+        DEP=16 disagg-serving topology.
+    """
+    num_experts, moe_ep_size = shape
+    n_group, topk_group = _DSV4_PRO_N_GROUP, _DSV4_PRO_TOPK_GROUP
+    top_k = _DSV4_PRO_TOP_K
+    num_tokens = 16
+    ep_rank = 0
+    dtype = torch.float32
+    device = torch.device("cpu")
+
+    if routing_name == "v3":
+        routing = _make_v3_routing(top_k=top_k,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts)
+    elif routing_name == "v4_dense":
+        routing = _make_v4_routing(top_k=top_k,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts,
+                                   is_hashed=False)
+    else:  # v4_hashed
+        routing = _make_v4_routing(top_k=top_k,
+                                   n_group=n_group,
+                                   topk_group=topk_group,
+                                   num_experts=num_experts,
+                                   is_hashed=True)
+
+    # Isolate this case from the module-level cache populated by other tests.
+    moe_routing._PERFECT_ROUTER_LOGITS_CACHE.clear()
+
+    logits = get_cached_perfect_router_logits(num_tokens=num_tokens,
+                                              num_experts=num_experts,
+                                              experts_per_token=top_k,
+                                              moe_ep_size=moe_ep_size,
+                                              ep_rank=ep_rank,
+                                              device=device,
+                                              dtype=dtype,
+                                              routing_method=routing)
+
+    assert logits.shape == (num_tokens, num_experts)
+    assert logits.dtype == dtype
+    assert logits.device.type == "cpu"
+    # Cache hit on the second call must not crash either (covers the case
+    # where _force_zero_routing_bias_in_place runs again on an already-prepared
+    # routing method).
+    logits_2 = get_cached_perfect_router_logits(num_tokens=num_tokens,
+                                                num_experts=num_experts,
+                                                experts_per_token=top_k,
+                                                moe_ep_size=moe_ep_size,
+                                                ep_rank=ep_rank,
+                                                device=device,
+                                                dtype=dtype,
+                                                routing_method=routing)
+    assert torch.equal(logits, logits_2)
 
 
 # -----------------------------------------------------------------
@@ -588,15 +794,17 @@ def _perfect_router_worker(parallel_mode, routing_name, num_tokens, dtype,
 
         # Simulate per-rank token-count skew so each rank exercises a
         # different cache key (num_tokens, routing_method, dtype, ep_size).
-        # DEP processes its own share of tokens per rank; TEP replicates
-        # input across ranks so keep a uniform list there.
-        if parallel_mode == "DEP":
+        # When attention uses DP (parallel_mode starts with "D"), each rank
+        # processes its own token share; otherwise all ranks see the same
+        # token count so pass a single-element list.
+        if parallel_mode[0] == "D":
             all_rank_num_tokens = [
                 num_tokens + i for i in range(mapping.world_size)
             ]
+            my_num_tokens = all_rank_num_tokens[mapping.rank]
         else:
-            all_rank_num_tokens = [num_tokens] * mapping.world_size
-        my_num_tokens = all_rank_num_tokens[mapping.rank]
+            all_rank_num_tokens = [num_tokens]
+            my_num_tokens = num_tokens
 
         model_config = ModelConfig(pretrained_config=pretrained_config,
                                    mapping=mapping,
@@ -682,14 +890,66 @@ _PERFECT_ROUTER_ROUTING_SPECS = {
 _PERFECT_ROUTER_ROUTING_NAMES = list(_PERFECT_ROUTER_ROUTING_SPECS)
 
 
+def _reset_perfect_router_comm_state() -> None:
+    """Reset process-global router/comm state between reused-pool cases.
+
+    The shared module-scoped ``mpi_pool_executor`` keeps one set of worker
+    processes alive across cases, so process-global state that the original
+    per-case ``MPIPoolExecutor`` used to discard on teardown must be cleared
+    explicitly. This matches the fresh-process semantics of the previous
+    per-case executor (NVLink one-sided keeps a symmetric-memory workspace
+    singleton keyed by shape, which would otherwise be reused across cases
+    with different shapes).
+    """
+    import gc
+
+    from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
+
+    # Wait for any in-flight GPU work first. This teardown runs from a
+    # ``finally`` block, so on the error path a worker may raise while kernels
+    # are still running; clearing the cache / NVLink symmetric-memory
+    # workspaces before syncing could free memory that is still in use.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    moe_routing._PERFECT_ROUTER_LOGITS_CACHE.clear()
+    try:
+        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import \
+            NVLinkOneSided as _NVOS
+    except ImportError:
+        _NVOS = None
+    if _NVOS is not None:
+        for _attr in ("_WORKSPACES", "_WORKSPACE_REFCOUNTS"):
+            _d = getattr(_NVOS, _attr, None)
+            if isinstance(_d, dict):
+                _d.clear()
+        if hasattr(_NVOS, "_WORKSPACE"):
+            _NVOS._WORKSPACE = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _perfect_router_worker_entry(*worker_args) -> None:
+    """Run one perfect-router case, then reset state for the reused worker."""
+    try:
+        _perfect_router_worker(*worker_args)
+    finally:
+        _reset_perfect_router_comm_state()
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
+@pytest.mark.threadleak(
+    enabled=False)  # module-scoped MPIPoolExecutor persists by design
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
 @pytest.mark.parametrize("parallel_mode", ["DEP", "TEP"])
 @pytest.mark.parametrize("routing_name", _PERFECT_ROUTER_ROUTING_NAMES)
 @pytest.mark.parametrize("num_tokens", [8, 32, 64])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_perfect_router_load_balanced_multi_gpu(parallel_mode, routing_name,
-                                                num_tokens, dtype):
+                                                num_tokens, dtype,
+                                                mpi_pool_executor) -> None:
     """Verify ENABLE_PERFECT_ROUTER produces balanced EP dispatch on 4 GPUs.
 
     Covers both DEP (attention DP + MoE EP) and TEP (attention TP + MoE EP)
@@ -705,15 +965,14 @@ def test_perfect_router_load_balanced_multi_gpu(parallel_mode, routing_name,
       5. For flat routers, verifies the final receiver-GPU coverage without
          depending on a stable intra-token top-k order.
     """
-    world_size = 4
-    with MPIPoolExecutor(max_workers=world_size) as executor:
-        results = executor.map(
-            _perfect_router_worker,
-            *zip(*[(parallel_mode, routing_name, num_tokens, dtype,
-                    world_size)] * world_size),
-        )
-        for r in results:
-            assert r is None
+    world_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        _perfect_router_worker_entry,
+        *zip(*[(parallel_mode, routing_name, num_tokens, dtype, world_size)] *
+             world_size),
+    )
+    for r in results:
+        assert r is None
 
 
 if __name__ == '__main__':

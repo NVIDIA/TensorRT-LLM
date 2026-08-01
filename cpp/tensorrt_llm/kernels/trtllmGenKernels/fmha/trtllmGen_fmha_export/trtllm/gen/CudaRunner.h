@@ -60,7 +60,12 @@ public:
            void* cudaStream,
            Grid grid = Grid{},
            Cluster cluster = Cluster{},
-           int32_t instanceId = 0);
+           int32_t instanceId = 0
+#ifdef TLLM_TEST
+           ,
+           void* cudaEvent = nullptr
+#endif // TLLM_TEST
+  );
 
   // Set the kernel.
   void setKernel(Kernel const* kernel);

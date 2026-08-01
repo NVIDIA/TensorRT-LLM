@@ -1,0 +1,25 @@
+dataset_path: MMMU/MMMU_Pro
+test_split: test
+validation_split: null
+training_split: null
+output_type: generate_until
+doc_to_image: !function utils.doc_to_image
+doc_to_text: !function utils.doc_to_text
+doc_to_target: "answer"
+process_results: !function utils.process_results
+generation_kwargs:
+  until:
+    - "<|endoftext|>"
+  temperature: 0.0
+  do_sample: false
+  # Raised from 512 to 32000 so thinking-mode reasoning chains (typically
+  # 1.5-2.5K tokens) can complete instead of being truncated by the task
+  # yaml's max_gen_toks cap (which is fed into our SamplingParams even
+  # when sampling_override is set).
+  max_gen_toks: 32000
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 0.0

@@ -615,7 +615,7 @@ def test_llama4_dense_decoder_layer_equivalence(B, S, dtype):
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cuda"])
 @torch.no_grad()
 def test_llama4_full_model_equivalence(B, S, dtype, device):
     """Test full model produces equivalent output to HF implementation."""

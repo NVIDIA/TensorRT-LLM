@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 import torch
 from torch.export import Dim
@@ -5,7 +19,12 @@ from torch.export import Dim
 from tensorrt_llm._torch.auto_deploy.custom_ops.linear.swiglu import *  # noqa
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
+    collect_classification_hints,
+    extract_op_args,
+    is_op,
+    stamp_hints,
+)
 
 
 class SwiGLUMLP(torch.nn.Module):
@@ -186,3 +205,68 @@ def test_swiglu_pattern_match_only():
     y_matched = gm_matched(x)
     y_model = model(x)
     torch.testing.assert_close(y_matched, y_model, atol=1e-3, rtol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# layer_type (classification-hint) propagation across pattern rewrites
+#
+# These exercise the generic helpers used by the matcher infra to carry the
+# layer-level ``layer_type`` hint from the matched fine-grained ops onto a fused
+# replacement op (so downstream ``apply_sharding_hints`` / ``shard_layers`` still
+# sees it). They are graph-only and need no GPU. The end-to-end behaviour through
+# an actual matcher is covered on the NVFP4 path in ``test_nvfp4_swiglu.py``
+# (the BF16 SwiGLU matcher never fuses hint-carrying linears, since ``torch.export``
+# materializes the hints positionally, so there is no hint to lose there).
+# ---------------------------------------------------------------------------
+
+
+def test_collect_classification_hints_consensus_over_mixed_mechanics():
+    """Consensus recovers the shared layer_type even when constituents disagree on tp_mode."""
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    nodes = []
+    for tp in ("colwise", "colwise", "rowwise"):  # gate/up colwise, down rowwise
+        nodes.append(
+            g.call_function(
+                torch.ops.auto_deploy.torch_linear_simple.default,
+                args=(x, x, None),
+                kwargs={"tp_mode": tp, "layer_type": "shared_expert"},
+            )
+        )
+    # A node left at the default ("unknown") must not contribute to the consensus.
+    nodes.append(
+        g.call_function(torch.ops.auto_deploy.torch_linear_simple.default, args=(x, x, None))
+    )
+    assert collect_classification_hints(nodes) == {"layer_type": "shared_expert"}
+
+
+def test_collect_classification_hints_conflict_is_dropped():
+    """Conflicting layer_type values (a rewrite spanning layers) are dropped, not guessed."""
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    a = g.call_function(
+        torch.ops.auto_deploy.torch_linear_simple.default,
+        args=(x, x, None),
+        kwargs={"layer_type": "moe"},
+    )
+    b = g.call_function(
+        torch.ops.auto_deploy.torch_linear_simple.default,
+        args=(x, x, None),
+        kwargs={"layer_type": "mla"},
+    )
+    assert collect_classification_hints([a, b]) == {}
+
+
+def test_stamp_hints_only_on_declaring_ops():
+    """stamp_hints sets a hint only on ops whose schema declares it (aten.silu is skipped)."""
+    g = torch.fx.Graph()
+    x = g.placeholder("x")
+    swiglu = g.call_function(
+        torch.ops.auto_deploy.torch_swiglu_mlp.default,
+        args=(x, x, x, x, None, None, None),
+    )
+    silu = g.call_function(torch.ops.aten.silu.default, args=(x,))
+
+    assert stamp_hints([swiglu, silu], {"layer_type": "shared_expert"}) == 1
+    [lt] = extract_op_args(swiglu, "layer_type")
+    assert lt == "shared_expert"

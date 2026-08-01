@@ -46,7 +46,13 @@ class TestFeaturesJsonPayload:
     def test_features_json_round_trips_through_gxt_payload(self):
         """FeaturesJson survives full JSON serialization round-trip."""
         features = '{"lora":true,"speculative_decoding":false,"data_parallel_size":4}'
-        report = schema.TrtllmInitialReport(featuresJson=features)
+        llm_api_config = '{"tensor_parallel_size":2}'
+        llm_api_config_meta = '{"capture_succeeded":true}'
+        report = schema.TrtllmInitialReport(
+            featuresJson=features,
+            llmApiConfigJson=llm_api_config,
+            llmApiConfigMetaJson=llm_api_config_meta,
+        )
         payload = schema.build_gxt_payload(
             event=report,
             session_id="test",
@@ -58,12 +64,16 @@ class TestFeaturesJsonPayload:
         assert inner["lora"] is True
         assert inner["speculative_decoding"] is False
         assert inner["data_parallel_size"] == 4
+        assert parsed["events"][0]["parameters"]["llmApiConfigJson"] == llm_api_config
+        assert parsed["events"][0]["parameters"]["llmApiConfigMetaJson"] == llm_api_config_meta
 
     def test_features_json_default_is_empty_object(self):
         """Default featuresJson value is '{}'."""
         report = schema.TrtllmInitialReport()
         data = report.model_dump(by_alias=True)
         assert data["featuresJson"] == "{}"
+        assert data["llmApiConfigJson"] == "{}"
+        assert data["llmApiConfigMetaJson"] == "{}"
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +213,8 @@ class TestSchemaConstants:
         assert schema.EVENT_PROTOCOL == "1.6"
 
     def test_event_schema_ver(self):
-        """EVENT_SCHEMA_VER is 0.1 (matches SMS schema schemaVersion)."""
-        assert schema.EVENT_SCHEMA_VER == "0.1"
+        """EVENT_SCHEMA_VER is 0.2 (matches SMS schema schemaVersion)."""
+        assert schema.EVENT_SCHEMA_VER == "0.2"
 
     def test_event_sys_ver(self):
         """EVENT_SYS_VER identifies the telemetry subsystem."""
@@ -442,6 +452,8 @@ class TestSchemaCompliance:
             "kvCacheDtype",
             "ingressPoint",
             "featuresJson",
+            "llmApiConfigJson",
+            "llmApiConfigMetaJson",
             "disaggRole",
             "deploymentId",
         }
@@ -655,6 +667,8 @@ class TestSchemaCompliance:
             kvCacheDtype="",
             ingressPoint="llm_class",
             featuresJson='{"lora":false}',
+            llmApiConfigJson='{"tensor_parallel_size":1}',
+            llmApiConfigMetaJson='{"capture_succeeded":true}',
             disaggRole="",
             deploymentId="",
         )

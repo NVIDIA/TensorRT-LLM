@@ -92,4 +92,4 @@ python ../summarize.py --engine_dir tllm_engine_dir --hf_model_dir hf_model_dir 
 
 ## Reference
 
-It's recommended to read the workflow[./workflow.md] and checkpoint[./checkpoint.md] documents for more details.
+It's recommended to read the [workflow](./workflow.md) and [checkpoint](./checkpoint.md) documents for more details.

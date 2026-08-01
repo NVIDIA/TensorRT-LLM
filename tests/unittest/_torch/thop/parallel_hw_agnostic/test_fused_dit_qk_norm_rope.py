@@ -465,3 +465,245 @@ def test_per_head_v_unchanged(head_dim):
         -1,
     )
     torch.testing.assert_close(qkv[:, -v_size:], v_original, rtol=0, atol=0)
+
+
+# ============================================================================
+# Full-dim norm tests (LTX-2 / WAN packed FUSE_QKV)
+# weight is [num_heads*head_dim] (full-dim per-token norm), no dual-stream,
+# cos/sin can be [num_tokens, num_heads*head_dim] (per-head) or
+# broadcast [num_tokens/B, num_heads*head_dim] (kernel modulo over B).
+# ============================================================================
+
+
+@torch.inference_mode()
+def torch_ref_full_dim(
+    qkv,
+    num_heads,
+    head_dim,
+    eps,
+    q_weight,
+    k_weight,
+    cos_emb,
+    sin_emb,
+    interleave,
+):
+    """Reference: full-dim RMSNorm (weight shape [num_heads*head_dim]) on Q and K
+    of a packed qkv tensor [N, 3*num_heads*head_dim], then rope; V untouched.
+
+    cos/sin shape: [num_tokens, num_heads*head_dim] (per-head, full-dim layout).
+    """
+    num_tokens = qkv.shape[0]
+    hidden = num_heads * head_dim
+    q = qkv[:, :hidden].float()
+    k = qkv[:, hidden : 2 * hidden].float()
+    v = qkv[:, 2 * hidden :]
+
+    # full-dim norm: stat over all num_heads*head_dim elements per token.
+    # Keep everything in fp32 through norm + rope to match kernel internal
+    # precision (single bf16 cast at the end).
+    var_q = q.pow(2).mean(-1, keepdim=True)
+    q = q * torch.rsqrt(var_q + eps) * q_weight.float()
+    var_k = k.pow(2).mean(-1, keepdim=True)
+    k = k * torch.rsqrt(var_k + eps) * k_weight.float()
+
+    cos_3d = cos_emb.float().view(num_tokens, num_heads, head_dim)
+    sin_3d = sin_emb.float().view(num_tokens, num_heads, head_dim)
+    q_4d = q.view(num_tokens, num_heads, head_dim)
+    k_4d = k.view(num_tokens, num_heads, head_dim)
+    if interleave:
+        # pair (2i, 2i+1) — INTERLEAVED rope
+        def _rope_interleaved(x_4d):
+            rot = torch.empty_like(x_4d)
+            rot[..., 0::2] = -x_4d[..., 1::2]
+            rot[..., 1::2] = x_4d[..., 0::2]
+            return x_4d * cos_3d + rot * sin_3d
+
+        q_4d = _rope_interleaved(q_4d)
+        k_4d = _rope_interleaved(k_4d)
+    else:
+        # rotate-half: pair (i, i+D/2) within head — LTX-2 SPLIT
+        half = head_dim // 2
+
+        def _rope_rotate_half(x_4d):
+            x1 = x_4d[..., :half]
+            x2 = x_4d[..., half:]
+            rot = torch.cat([-x2, x1], dim=-1)
+            return x_4d * cos_3d + rot * sin_3d
+
+        q_4d = _rope_rotate_half(q_4d)
+        k_4d = _rope_rotate_half(k_4d)
+
+    q_out = q_4d.reshape(num_tokens, -1).to(qkv.dtype)
+    k_out = k_4d.reshape(num_tokens, -1).to(qkv.dtype)
+    return torch.cat([q_out, k_out, v], dim=1)
+
+
+def _make_per_head_cos_full_dim(num_tokens, num_heads, head_dim, device, dtype=torch.float32):
+    """Per-head cos: [num_tokens, num_heads*head_dim] with rotate-half block-duplicate pattern.
+
+    cos/sin generated as (num_heads, num_tokens, head_dim/2) and block-duplicated
+    along the last dim (cos = cat([cos_half, cos_half], -1)) so the kernel's
+    rotate-half read pattern works on the flat 2D layout.
+    """
+    half = head_dim // 2
+    freqs = torch.randn(num_tokens, num_heads, half, device=device, dtype=torch.float32)
+    cos_h = freqs.cos()
+    sin_h = freqs.sin()
+    cos = torch.cat([cos_h, cos_h], dim=-1)  # [N, H, D]
+    sin = torch.cat([sin_h, sin_h], dim=-1)
+    cos_2d = cos.reshape(num_tokens, num_heads * head_dim).contiguous().to(dtype)
+    sin_2d = sin.reshape(num_tokens, num_heads * head_dim).contiguous().to(dtype)
+    return cos_2d, sin_2d
+
+
+@pytest.mark.parametrize("cos_dtype", [torch.float32, torch.bfloat16], ids=["fp32cos", "bf16cos"])
+@pytest.mark.parametrize(
+    "label,B,T,num_heads,head_dim",
+    [
+        # LTX-2 video self-attn (FUSE_QKV packed, full-dim norm, rotate-half)
+        ("ltx2_video_self_attn", 2, 12288, 32, 128),
+        # LTX-2 audio self-attn
+        ("ltx2_audio_self_attn", 2, 504, 32, 64),
+        # B=1 sanity (no broadcast)
+        ("ltx2_video_b1", 1, 12288, 32, 128),
+    ],
+)
+def test_full_dim_norm_packed_rotate_half(label, B, T, num_heads, head_dim, cos_dtype):
+    """LTX-2 packed FUSE_QKV full-dim norm + rotate-half rope (no broadcast)."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+
+    hidden = num_heads * head_dim
+    num_tokens = B * T
+    qkv = torch.randn(num_tokens, 3 * hidden, dtype=torch.bfloat16, device=device) * 0.5
+    qkv_copy = qkv.clone()
+    q_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    k_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    # Tile cos/sin to num_tokens (no kernel-side broadcast in this test)
+    cos_2d_T, sin_2d_T = _make_per_head_cos_full_dim(
+        T, num_heads, head_dim, device, dtype=cos_dtype
+    )
+    if B > 1:
+        cos_2d = cos_2d_T.repeat(B, 1)
+        sin_2d = sin_2d_T.repeat(B, 1)
+    else:
+        cos_2d, sin_2d = cos_2d_T, sin_2d_T
+
+    _call_fused_kernel(
+        qkv,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        None,
+        None,
+        cos_2d,
+        sin_2d,
+        -1,
+        interleave=False,
+    )
+    ref = torch_ref_full_dim(
+        qkv_copy,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos_2d,
+        sin_2d,
+        interleave=False,
+    )
+    torch.testing.assert_close(qkv, ref, rtol=2e-2, atol=5e-3)
+
+
+@pytest.mark.parametrize("cos_dtype", [torch.float32, torch.bfloat16], ids=["fp32cos", "bf16cos"])
+@pytest.mark.parametrize(
+    "label,B,T,num_heads,head_dim",
+    [
+        # C7 broadcast: cos has T rows, qkv has B*T tokens; kernel does tokenIdx % T
+        ("ltx2_video_bcast", 2, 12288, 32, 128),
+        ("ltx2_audio_bcast", 2, 504, 32, 64),
+    ],
+)
+def test_full_dim_norm_packed_rotate_half_broadcast(label, B, T, num_heads, head_dim, cos_dtype):
+    """C7: kernel-side cos broadcast over B (cos.size(0) == T, not B*T)."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+
+    hidden = num_heads * head_dim
+    num_tokens = B * T
+    qkv = torch.randn(num_tokens, 3 * hidden, dtype=torch.bfloat16, device=device) * 0.5
+    qkv_copy = qkv.clone()
+    q_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    k_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    cos_2d_T, sin_2d_T = _make_per_head_cos_full_dim(
+        T, num_heads, head_dim, device, dtype=cos_dtype
+    )
+
+    # Reference: tile cos to B*T tokens (kernel does this in-place via modulo)
+    cos_2d_full = cos_2d_T.repeat(B, 1)
+    sin_2d_full = sin_2d_T.repeat(B, 1)
+
+    # Call kernel with the unbroadcast T-row cos (kernel detects via cos.size(0) != num_tokens)
+    _call_fused_kernel(
+        qkv,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        None,
+        None,
+        cos_2d_T,
+        sin_2d_T,
+        -1,
+        interleave=False,
+    )
+    ref = torch_ref_full_dim(
+        qkv_copy,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos_2d_full,
+        sin_2d_full,
+        interleave=False,
+    )
+    torch.testing.assert_close(qkv, ref, rtol=2e-2, atol=5e-3)
+
+
+def test_full_dim_norm_packed_v_unchanged():
+    """Full-dim path leaves V slice untouched (sanity)."""
+    device = "cuda"
+    torch.random.manual_seed(0)
+    num_heads, head_dim, num_tokens = 32, 128, 256
+    hidden = num_heads * head_dim
+    qkv = torch.randn(num_tokens, 3 * hidden, dtype=torch.bfloat16, device=device) * 0.5
+    v_original = qkv[:, 2 * hidden :].clone()
+    q_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    k_weight = torch.randn(hidden, dtype=torch.bfloat16, device=device) * 5.0
+    cos_2d, sin_2d = _make_per_head_cos_full_dim(num_tokens, num_heads, head_dim, device)
+
+    _call_fused_kernel(
+        qkv,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        None,
+        None,
+        cos_2d,
+        sin_2d,
+        -1,
+        interleave=False,
+    )
+    torch.testing.assert_close(qkv[:, 2 * hidden :], v_original, rtol=0, atol=0)

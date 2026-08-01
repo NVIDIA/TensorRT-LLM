@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,17 +41,28 @@ struct MlaMetaParams
     int32_t v_head_dim = 0;
     int32_t predicted_tokens_per_seq = 1;
     int32_t num_layers = 0;
+    int32_t rope_append = 1;
 
     auto data() const
     {
         return std::make_tuple(q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
-            predicted_tokens_per_seq, num_layers);
+            predicted_tokens_per_seq, num_layers, rope_append);
     }
 };
 
 template <typename T>
 struct MlaParams
 {
+    struct Dsv4EpilogueFusionParams
+    {
+        // Enable DSv4 inverse-RoPE + FP8 quant epilogue fusion.
+        bool enabled = false;
+        // The cos/sin cache used by the fused inverse-RoPE epilogue.
+        float const* cos_sin_cache = nullptr;
+        // The physical token stride of the FP32 output scale tensor.
+        int32_t scale_buf_m = 0;
+    };
+
     T const* latent_cache; // cKV + k_pe
     // Tensor Q for both context and generation MLA, contiguous. Pre-process kernel will apply RoPE and modify it
     // in-place. For context MLA, shape: [total_q_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
@@ -110,6 +121,14 @@ struct MlaParams
     // For FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
 
+    // Fused FP8-Q-quant in the absorption-mode context RoPE kernel: the rope
+    // STG goes to `quant_q_buf` as FP8 and the standalone quantize pass is
+    // skipped. Nope segment must be pre-filled (see deepseek_v4_q_norm_fused_fp8).
+    bool fuse_q_fp8_in_rope = false;
+
+    // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
+    Dsv4EpilogueFusionParams dsv4_epilogue_fusion;
+
     // for Helix parallelism: the rotary position offsets [b]
     int32_t const* helix_position_offsets{nullptr};
 
@@ -137,6 +156,16 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
     int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
     float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
     float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
+
+// Apply neox-style RoPE in-place to only the last rope_dim elements of each head,
+// leaving the first nope_dim elements untouched.
+// data shape: [num_tokens, num_heads, nope_dim + rope_dim]
+// cos_sin_cache shape: [max_positions, 2, rope_dim/2] (float)
+// position_ids shape: [num_tokens]
+template <typename T>
+void invokeMLARoPEInplace(T* data, int32_t const* position_ids, float const* cos_sin_cache, int num_tokens,
+    int num_heads, int nope_dim, int rope_dim, bool inverse, bool is_neox, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

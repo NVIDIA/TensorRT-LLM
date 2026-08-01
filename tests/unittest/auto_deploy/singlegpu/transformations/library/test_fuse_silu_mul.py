@@ -52,6 +52,31 @@ def _build_narrow_silu_mul_graph():
     return gm, fused_size
 
 
+def _build_narrow_contig_silu_mul_graph():
+    """Build a tiny FX graph with narrow + .contiguous() + silu + mul (Variant 1b).
+
+    Mirrors the graph emitted by ``_insert_fused_gemm(allow_not_contigous=False)``:
+    each ``torch.narrow`` is followed by a ``call_method("contiguous", ...)`` node.
+    """
+    fused_size = _HALF * 2
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    gate_narrow = graph.call_function(torch.narrow, args=(x, -1, 0, _HALF))
+    up_narrow = graph.call_function(torch.narrow, args=(x, -1, _HALF, _HALF))
+    gate = graph.call_method("contiguous", args=(gate_narrow,))
+    up = graph.call_method("contiguous", args=(up_narrow,))
+    silu = graph.call_function(torch.ops.aten.silu.default, args=(gate,))
+    mul = graph.call_function(torch.ops.aten.mul.Tensor, args=(silu, up))
+    graph.output(mul)
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    for n in gm.graph.nodes:
+        if n.op == "placeholder":
+            n.meta["val"] = torch.empty(2, fused_size, dtype=torch.float16, device="meta")
+        if n.op == "call_function" and n.target == torch.ops.aten.mul.Tensor:
+            n.meta["val"] = torch.empty(2, _HALF, dtype=torch.float16, device="meta")
+    return gm, fused_size
+
+
 def _build_getitem_silu_mul_graph():
     """Build a tiny FX graph with the split+getitem+silu+mul pattern (Variant 2)."""
     fused_size = _HALF * 2
@@ -94,6 +119,25 @@ def test_fuse_silu_mul_narrow_variant():
     assert _count_ops(gm, torch.ops.auto_deploy.flashinfer_silu_and_mul.default) == 1
     assert _count_ops(gm, torch.ops.aten.silu.default) == 0
     assert _count_ops(gm, torch.ops.aten.mul.Tensor) == 0
+
+
+def test_fuse_silu_mul_narrow_contig_variant():
+    """Variant 1b: narrow + .contiguous() + silu + mul → flashinfer_silu_and_mul.
+
+    This shape is what ``fuse_gemms_mixed_children`` and the quantized fusion
+    paths emit (``allow_not_contigous=False``). The fuse_silu_mul transform must
+    walk past the ``call_method('contiguous')`` nodes to recover the pre-narrow
+    fused tensor. Without that, SwiGLU fusion silently no-ops.
+    """
+    gm, _ = _build_narrow_contig_silu_mul_graph()
+    gm, info = _run_fuse_silu_mul(gm)
+    assert info.num_matches == 1
+    assert _count_ops(gm, torch.ops.auto_deploy.flashinfer_silu_and_mul.default) == 1
+    assert _count_ops(gm, torch.ops.aten.silu.default) == 0
+    assert _count_ops(gm, torch.ops.aten.mul.Tensor) == 0
+    # The narrow + contiguous chain must be DCE'd.
+    assert _count_ops(gm, torch.narrow) == 0
+    assert sum(1 for n in gm.graph.nodes if n.op == "call_method") == 0
 
 
 def test_fuse_silu_mul_getitem_variant():

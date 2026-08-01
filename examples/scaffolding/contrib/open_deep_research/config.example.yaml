@@ -1,0 +1,29 @@
+# ---- API keys (MCP servers with --config read these top-level keys) ----
+tavily_api_key: ""
+tavily_api_url: "https://api.tavily.com/search"
+search_api_key: ""
+search_api_url: "https://serpapi.com/search"
+jina_api_key: ""
+scraper_api_key: ""
+
+
+# ---- Per-tool MCP ----
+mcp_tools:
+  tavily_search:
+    host: "0.0.0.0"
+    port: 8087
+  fetch_webpage:
+    host: "0.0.0.0"
+    port: 8085
+  coder_mcp: # Apiary-backed Python/shell/file tools
+    host: "0.0.0.0"
+    port: 8086
+
+mcp_client_host: "127.0.0.1"
+
+# ---- Runner (run_deep_research.py, etc.) ----
+openai_api_key: "tensorrt_llm"
+base_url: "http://localhost:8000/v1"
+model: "Qwen/Qwen2.5-72B-Instruct"
+max_turn: 25
+max_tokens: 16384

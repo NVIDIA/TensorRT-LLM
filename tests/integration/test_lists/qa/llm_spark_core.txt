@@ -26,3 +26,10 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutl
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
 
 test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
+examples/serve/test_serve.py::test_nemotron3_super_120b_nvfp4
+examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_on]
+examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_reasoning_off]
+examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[text_streaming]
+examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[tool_calling]
+examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[image]
+examples/serve/test_serve.py::test_nemotron3_nano_omni_nvfp4[video]

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cuda_runtime.h>
+#include <torch/extension.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -60,38 +61,50 @@ void invokeBuildDynamicTree(int64_t const* parentList, int64_t const* selectedIn
     runtime::SizeType32 topK, runtime::SizeType32 depth, runtime::SizeType32 numDraftTokens, TreeMaskMode treeMaskMode,
     cudaStream_t stream, runtime::SizeType32 numInt32PerRow);
 
-//! \brief Verify dynamic tree using greedy strategy
-//! Verifies draft tokens against target model predictions using tree traversal.
-//! All index/token pointer parameters use int64.
-//! \param predicts output buffer [seqLensSum], on GPU. int64.
-//! Verified token predictions.
-//! \param acceptIndex output buffer [batchSize, numSpecStep], on GPU. int64.
-//! Indices of accepted tokens.
-//! \param acceptTokenNum output buffer [batchSize], on GPU. int64.
-//! Number of accepted tokens per request.
-//! \param acceptToken output buffer [batchSize, numSpecStep], on GPU. int64.
-//! Contiguous accepted token ids along the accepted path (root prediction,
-//! accepted draft predictions, bonus token). Entry count per request =
-//! acceptTokenNum + 1.
-//! \param candidates [batchSize, numDraftTokens], on GPU. int64.
-//! Candidate draft tokens.
-//! \param retrieveIndex [batchSize, numDraftTokens], on GPU. int32.
-//! Indices for retrieving tokens.
-//! \param retrieveNextToken [batchSize, numDraftTokens], on GPU. int32.
-//! Index of the first child token.
-//! \param retrieveNextSibling [batchSize, numDraftTokens], on GPU. int32.
-//! Index of the next sibling token.
-//! \param targetPredict [batchSize, numDraftTokens], on GPU. int64.
-//! Target model predictions.
+//! \brief Verify dynamic tree using greedy strategy with packed retrieve buffers.
+//! \param acceptIndex output buffer [batchSize, numSpecStep], on GPU. int32.
+//! \param acceptTokenNum output buffer [batchSize], on GPU. int32.
+//! \param acceptToken output buffer [batchSize, numSpecStep], on GPU. int32.
+//! \param candidates [batchSize, numDraftTokens], on GPU. int32.
+//! \param retrievePacked [batchSize, numDraftTokens, 3], on GPU. int32.
+//! \param targetPredict [batchSize, numDraftTokens], on GPU. int32.
+//! \param treeValid [batchSize], on GPU. bool.
 //! \param batchSize runtime::SizeType32. Batch size.
-//! \param numDraftTokens runtime::SizeType32. Total number of draft tokens.
+//! \param numDraftTokens runtime::SizeType32. Total tree nodes per batch (including root).
 //! \param numSpecStep runtime::SizeType32. Number of speculative steps.
-//! \param stream cuda stream
-void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, int64_t const* targetPredict, bool const* treeValid,
+//! \param stream cuda stream.
+void invokeVerifyDynamicTreeGreedyPacked(int32_t* acceptIndex, int32_t* acceptTokenNum, int32_t* acceptToken,
+    int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict, bool const* treeValid,
     runtime::SizeType32 batchSize, runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep,
     cudaStream_t stream);
+
+//! \brief Verify dynamic tree using rejection sampling.
+//! Accepts draft tokens by accumulating cumulative target probability across siblings.
+//! The first sibling whose cumulative target prob exceeds the random coin is accepted.
+//! When all siblings are rejected, a correction token is sampled from the residual
+//! target distribution (target prob for tokens not tried as siblings).
+//! No draft probabilities are needed. Always uses full-vocab path.
+//!
+//! \param acceptIndex    output [batchSize, numSpecStep] int64 — tree positions of accepted tokens.
+//! \param acceptTokenNum output [batchSize] int64 — # accepted draft tokens (excl. root).
+//! \param acceptToken    output [batchSize, numSpecStep] int64 — accepted/correction token ids.
+//! \param draftTokens    [batchSize, numDraftTokens-1] int64; draft token ids (excluding root).
+//! \param targetProbs    [batchSize, numDraftTokens, vocabSize] float32; index 0 = root.
+//! \param retrieveNextToken   [batchSize, numDraftTokens] int32 first-child pointer, -1=none.
+//! \param retrieveNextSibling [batchSize, numDraftTokens] int32 next-sibling pointer, -1=none.
+//! \param treeValid      [batchSize] bool; false means no valid tree exists for this request.
+//! \param batchSize      runtime::SizeType32.
+//! \param numDraftTokens runtime::SizeType32. Total tree nodes per request (including root).
+//! \param numSpecStep    runtime::SizeType32. Second dim of acceptIndex/acceptToken.
+//! \param vocabSize      runtime::SizeType32. Vocabulary size.
+//! \param seed           [1] int64 on GPU. Philox RNG seed.
+//! \param offset         [1] int64 on GPU. Philox RNG offset.
+//! \param stream         cudaStream_t.
+void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
+    int64_t const* draftTokens, float const* targetProbs, int32_t const* retrieveNextToken,
+    int32_t const* retrieveNextSibling, bool const* treeValid, runtime::SizeType32 batchSize,
+    runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep, runtime::SizeType32 vocabSize,
+    int64_t const* seed, int64_t const* offset, cudaStream_t stream);
 
 } // namespace kernels::speculative_decoding
 

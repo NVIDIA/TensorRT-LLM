@@ -4,6 +4,7 @@
 
 import asyncio
 from dataclasses import fields, is_dataclass
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -323,6 +324,69 @@ def test_save_no_media_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# VisualGenOutput.save batch routing (list of paths)
+# ---------------------------------------------------------------------------
+
+
+def test_save_image_list_routes_to_save_images(tmp_path):
+    """Passing a list routes the image output to media.encoding.save_images."""
+    out = VisualGenOutput(
+        request_id=1,
+        image=torch.zeros(3, 8, 8, 3, dtype=torch.uint8),
+    )
+    paths_in = [tmp_path / f"img_{i}.png" for i in range(3)]
+    with patch("tensorrt_llm.media.encoding.save_images") as mock_save:
+        mock_save.return_value = [str(p) for p in paths_in]
+        paths = out.save(paths_in)
+        mock_save.assert_called_once()
+        args, _ = mock_save.call_args
+        assert args[0] is out.image
+        assert args[1] == [str(p) for p in paths_in]
+        assert all(isinstance(p, Path) for p in paths)
+        assert len(paths) == 3
+
+
+def test_save_video_list_routes_with_rate(tmp_path):
+    """Passing a list routes the video output to save_videos with self.frame_rate."""
+    out = VisualGenOutput(
+        request_id=2,
+        video=torch.zeros(2, 4, 8, 8, 3, dtype=torch.uint8),
+        frame_rate=16.0,
+    )
+    paths_in = [tmp_path / f"vid_{i}.mp4" for i in range(2)]
+    with patch("tensorrt_llm.media.encoding.save_videos") as mock_save:
+        mock_save.return_value = [str(p) for p in paths_in]
+        out.save(paths_in)
+        mock_save.assert_called_once()
+        _, kwargs = mock_save.call_args
+        assert kwargs["frame_rate"] == 16.0
+
+
+def test_save_errored_output_with_list_raises(tmp_path):
+    """save() with a list on an errored output still raises RuntimeError."""
+    out = VisualGenOutput(request_id=3, error="kernel launch failed")
+    with pytest.raises(RuntimeError, match="kernel launch failed"):
+        out.save([tmp_path / "x_0.png"])
+
+
+def test_save_video_list_without_rate_raises(tmp_path):
+    """Batched video without frame_rate still raises ValueError."""
+    out = VisualGenOutput(
+        request_id=4,
+        video=torch.zeros(2, 4, 8, 8, 3, dtype=torch.uint8),
+    )
+    with pytest.raises(ValueError, match="frame_rate"):
+        out.save([tmp_path / f"v_{i}.mp4" for i in range(2)])
+
+
+def test_save_no_media_with_list_raises(tmp_path):
+    """save() with a list on a no-media output raises ValueError."""
+    out = VisualGenOutput(request_id=5)
+    with pytest.raises(ValueError, match="no media"):
+        out.save([tmp_path / "x_0.png"])
+
+
+# ---------------------------------------------------------------------------
 # VisualGenResult Future-like awaitable
 # ---------------------------------------------------------------------------
 
@@ -576,13 +640,20 @@ def _make_minimal_client_state():
 
     Carries only the dict + lock state that abandon_request_id and
     _store_response touch, without spawning the worker process or
-    background thread.
+    background thread. Also stubs ``_iter_stats`` and ``pending_requests``
+    because ``_store_response`` records lifecycle snapshots and reads the
+    queue depth on every completion.
     """
+    import queue
+
+    from tensorrt_llm._torch.visual_gen.executor import _IterationStatsTracker
     from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient
 
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client.completed_responses = {}
     client._abandoned_request_ids = set()
+    client._iter_stats = _IterationStatsTracker()
+    client.pending_requests = queue.Queue()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

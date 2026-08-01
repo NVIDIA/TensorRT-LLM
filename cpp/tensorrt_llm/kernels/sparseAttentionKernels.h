@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,8 +33,14 @@ struct SparseAttentionParams
     int32_t* sparse_attn_indices{nullptr}; // [num_kv_heads, num_sparse_attn_indices]
     int32_t* sparse_kv_offsets{nullptr};   // [num_contexts + 1]
     int32_t* sparse_attn_offsets{nullptr}; // [num_generations + 1]
-    int32_t sparse_topk{0};
+    int32_t num_sparse_topk{0};            // topK for token sparse attention
+    // Primary KV pool for sparse MQA/GQA. For dynamic sparse MLA this is the optional compressed
+    // KV pool: nullptr for ratio == 1, compressed KV for ratio > 1.
     void* sparse_kv_cache_pool{nullptr};
+    // SWA KV pool for dynamic sparse MLA. This is the host KV cache pool pointer for V4 and is
+    // wired to trtllm-gen's sliding-window KV pool TMA descriptor.
+    void* sliding_window_kv_cache_pool{nullptr};
+    int32_t* sparse_mla_topk_lens{nullptr}; // [num_tokens]
 
     int32_t sparse_attn_indices_block_size{1};
     int32_t sparse_attn_indices_stride{0};
@@ -46,8 +52,10 @@ struct SparseAttentionParams
            << "sparse_attn_indices: " << this->sparse_attn_indices << std::endl
            << "sparse_kv_offsets: " << this->sparse_kv_offsets << std::endl
            << "sparse_attn_offsets: " << this->sparse_attn_offsets << std::endl
-           << "sparse_topk: " << this->sparse_topk << std::endl
+           << "num_sparse_topk: " << this->num_sparse_topk << std::endl
            << "sparse_kv_cache_pool: " << this->sparse_kv_cache_pool << std::endl
+           << "sliding_window_kv_cache_pool: " << this->sliding_window_kv_cache_pool << std::endl
+           << "sparse_mla_topk_lens: " << this->sparse_mla_topk_lens << std::endl
            << "sparse_attn_indices_block_size: " << this->sparse_attn_indices_block_size << std::endl
            << "sparse_attn_indices_stride: " << this->sparse_attn_indices_stride << std::endl;
         return ss.str();

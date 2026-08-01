@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include <memory>
 #include <mutex>
@@ -537,15 +538,15 @@ void LoraCache::splitTransposeCpu(ITensor& output, ITensor const& input, SizeTyp
 
     switch (input.getDataType())
     {
-    case nvinfer1::DataType::kINT32: splitTransposeCpuInner<SizeType32>(output, input, tpSize, tpRank); break;
-    case nvinfer1::DataType::kFLOAT: splitTransposeCpuInner<float>(output, input, tpSize, tpRank); break;
-    case nvinfer1::DataType::kHALF: splitTransposeCpuInner<half>(output, input, tpSize, tpRank); break;
-    case nvinfer1::DataType::kINT8: splitTransposeCpuInner<int8_t>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kINT32: splitTransposeCpuInner<SizeType32>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kFLOAT: splitTransposeCpuInner<float>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kHALF: splitTransposeCpuInner<half>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kINT8: splitTransposeCpuInner<int8_t>(output, input, tpSize, tpRank); break;
 #ifdef ENABLE_FP8
-    case nvinfer1::DataType::kFP8: splitTransposeCpuInner<__nv_fp8_e4m3>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kFP8: splitTransposeCpuInner<__nv_fp8_e4m3>(output, input, tpSize, tpRank); break;
 #endif // ENABLE_FP8
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: splitTransposeCpuInner<__nv_bfloat16>(output, input, tpSize, tpRank); break;
+    case tensorrt_llm::DataType::kBF16: splitTransposeCpuInner<__nv_bfloat16>(output, input, tpSize, tpRank); break;
 #endif // ENABLE_BF16
     default: TLLM_CHECK_WITH_INFO(false, "data type not supported");
     }

@@ -11,16 +11,20 @@ In this blog, we introduce **NVLinkOneSided AlltoAll**, the MoE communication ke
   - [Design Overview](#design-overview)
     - [NVLink Symmetric Memory](#nvlink-symmetric-memory)
     - [One-Sided Communication](#one-sided-communication)
-    - [Token-Major Data Layout](#token-major-data-layout)
+    - [Rank-Major Buffer Layout](#rank-major-buffer-layout)
+    - [Interface Between Communication and MoE](#interface-between-communication-and-moe)
     - [Quantization-Agnostic Communication](#quantization-agnostic-communication)
   - [Implementation Details](#implementation-details)
-    - [Interface Between Communication and MoE](#interface-between-communication-and-moe)
-    - [Dispatch Put and Combine Get](#dispatch-put-and-combine-get)
+    - [Dispatch Kernel](#dispatch-kernel)
+    - [Combine Kernel](#combine-kernel)
     - [Synchronization](#synchronization)
     - [Saturating NVLink Bandwidth](#saturating-nvlink-bandwidth)
   - [Performance Benchmark](#performance-benchmark)
+    - [Methodology](#methodology)
+    - [Scaling With Batch Size and EP Size](#scaling-with-batch-size-and-ep-size)
+    - [Post-Quant Dispatch](#post-quant-dispatch)
     - [Reproduction](#reproduction)
-  - [Future Work And Conclusion](#future-work-and-conclusion)
+  - [Conclusion](#conclusion)
 
 ## Background
 
@@ -35,61 +39,57 @@ Concretely, the total message size of AllGather/ReduceScatter scales as `ep_size
 
 ## Design Overview
 
-NVLinkOneSided AlltoAll is built around three key design ideas: a shared memory substrate for direct GPU-to-GPU access, a one-sided communication model that eliminates intermediate copies, and a token-major data layout that enables deduplication. We discuss each in turn.
+NVLinkOneSided AlltoAll rests on three design ideas:
+
+- **One-sided data movement** — each kernel only reads OR only writes peer memory, eliminating cooperative send/recv and the extra copies it implies.
+- **Rank-major recv buffer** — slots are indexed by source rank with no `top_k` duplication, shrinking buffer size and saving redundant communication.
+- **Flexible interface** — quantization-agnostic data path, with a small API that exposes the recv buffer directly to the MoE module.
+
+The remainder of this section walks through the NVLink symmetric memory substrate that the kernels are built on, then each of the three ideas in turn.
 
 ### NVLink Symmetric Memory
 
-Communication across GPUs is enabled by CUDA's Virtual Memory Management (VMM) APIs. Each GPU allocates a piece of physical memory and exports a shareable handle for its allocation. These handles are then exchanged across all participating GPUs, allowing each GPU to import the remote handles and map the remote memory into its own virtual address space. The result is a **symmetric memory workspace**: any GPU can read from or write to any other GPU's portion of this workspace via NVLink using standard instructions in kernels, as if they were normal global memory pointers. This works within a single NVLink domain — 8 GPUs on a DGX B200, or all 72 GPUs on a GB200 NVL72 rack.
+Communication across GPUs is enabled by CUDA's Virtual Memory Management (VMM) APIs. Each GPU allocates a piece of physical memory and exports a shareable handle for its allocation. These handles are then exchanged across all participating GPUs, allowing each GPU to import the remote handles and map the remote memory into its own virtual address space. The result is **symmetric memory**: any GPU can read from or write to any other GPU's portion of it via NVLink using standard instructions in kernels, as if they were normal global memory pointers. This works within a single NVLink domain — 8 GPUs on a DGX B200, or all 72 GPUs on a GB200 NVL72 rack.
 
 <p align="center"><img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_symmetric_memory.png" alt="Symmetric memory across GPUs" width="600"/></p>
 <p align="center"><em>Symmetric memory registration across GPUs. (Image courtesy: <a href="https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/">NVIDIA NCCL 2.27 Blog</a>)</em></p>
 
 ### One-Sided Communication
 
-Typically, collective communication employs a **two-sided** model: each rank acts as both sender and receiver. The sender loads data from local memory and stores it into a FIFO buffer in the receiver's local memory. The receiver then loads the data from the FIFO and stores it into its local output buffer. This has two shortcomings:
+NVLinkOneSided eliminates the send/recv pairing typical of collective communication.
 
-- **Extra data movement.** The receiver performs additional data movement after the data has already arrived over NVLink and resides in the target GPU's memory.
-- **Data dependency.** The receiver's work depends on the arrival of the sender's data. For example, the FIFO has a fixed capacity, so the sender (producer) or receiver (consumer) may block when the FIFO is full or empty.
+**Two-sided communication** uses a send/recv model: the sender and receiver must cooperate. With direct NVLink put, the sender writes into the target rank's symmetric memory, but the receiver still has to perform an **additional data movement** before the data lands in its final recv buffer. Common reasons for this extra step include:
 
-**NVLinkOneSided** eliminates both issues by simplifying the communication model:
+- **Layout reconciliation.** The data lands in symmetric memory in an intermediate layout; the receiver re-permutes or repacks it into the final layout the downstream kernel expects.
+- **FIFO drain.** Symmetric memory may be too small to hold the entire recv buffer, so it is used as a fixed-capacity FIFO; the receiver continuously drains it into local memory.
 
-- The **dispatch** kernel only *puts*: it loads token data from local memory and writes it directly into the target rank's workspace.
-- The **combine** kernel only *gets*: it reads data from source ranks' workspaces, reduces, and writes to local memory.
-
-The workspace itself serves as the recv buffer — no intermediate FIFO, no extra copy on the receiver side. The dispatch OP returns **tensor views** directly into the workspace rather than allocating new tensors, so the MoE module could directly take the data on the workspace as input. Each direction of communication involves one less data movement step compared to two-sided.
+**One-sided communication** drops the cooperation entirely. Symmetric memory **is** the recv buffer, and the dispatch op returns **tensor views** directly into symmetric memory rather than allocating new tensors, so the MoE module consumes the dispatched data in place. In this way, extra local data movement on the receiver side is eliminated.
 
 <p align="center">
 <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_one_sided_vs_two_sided.png" alt="One-sided vs two-sided communication" width="700"/>
 </p>
 
-### Token-Major Data Layout
+### Rank-Major Buffer Layout
 
+NVLinkOneSided uses a **rank-major** recv buffer: a tensor of shape `[ep_size, max_tokens_per_rank, ...]` split by source rank, where each rank's slice holds the tokens that source sent to this rank. Each token is sent **at most once per (src → tgt) pair** — even if multiple of its `top_k` experts land on the same target rank — so within a slice, no token appears more than once. Some slots may be empty after dispatch, depending on routing.
 
-Some AlltoAll implementations (e.g., [DeepEP Low Latency](https://github.com/deepseek-ai/DeepEP)) use an **expert-major layout**: the recv buffer is shaped as `[num_experts_per_rank, max_num_tokens, ...]`, so that each expert gets its assigned tokens. If a token routes to multiple experts on the same rank, it is sent and stored multiple times — once per expert. Note that `max_num_tokens = ep_size * max_tokens_per_rank`, which is enough for accommodating tokens from all the ranks.
-
-NVLinkOneSided uses a **token-major layout**: the recv buffer is shaped as `[max_num_tokens, ...]`, indexed by source rank. The transformation from token-major to expert-major layout is known as expert **permutation**. By directly employing token-major layout, the recv buffer size is shrunk by `num_experts_per_rank`. When a token routes to multiple experts on the same rank, the token data is **sent only once**. This deduplication reduces communication volume, which is especially beneficial when `top_k` is large, e.g., if `top_k > ep_size` then duplication is guaranteed to occur. The figure below shows the permutation from token-major to expert-major layout for 6 tokens routed to 4 experts with `top_k=2`. NVLinkOneSided requires only `1/num_experts_per_rank` of the pre-allocated recv buffer compared to expert-major implementations like DeepEP Low Latency.
+The figure below contrasts this layout against the **expert-major** layout used by some other implementations (e.g. [DeepEP Low Latency](https://github.com/deepseek-ai/DeepEP)) on a small example: `ep_size = 2`, `top_k = 2`, 3 tokens per rank, 2 experts per rank. T2 is routed to one expert on each rank, so the rank-major recv buffer (left) holds it once, while the expert-major recv buffer (right) duplicates it across both expert sub-rows.
 
 <p align="center">
-<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_token_major_vs_expert_major.png" alt="Token-major vs expert-major layout" width="700"/>
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_rank_major_vs_expert_major.png" alt="Rank-major vs expert-major recv buffer layout" width="700"/>
 </p>
 
-The MoE module directly consumes the token-major recv buffer, and it is up to the MoE module to decide whether expert permutation is needed for GroupGEMM. For example, [trtllm-gen MoE](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py) can efficiently operate on token-major input without additional permutation.
+Rank-major layout has two advantages:
 
+- **Smaller buffer.** The pre-allocated recv buffer is `1 / num_experts_per_rank` of an expert-major buffer.
+- **Save duplicated communication.** When `top_k > ep_size` it is impossible to avoid duplication in an expert-major layout.
 
-### Quantization-Agnostic Communication
+The MoE module consumes the rank-major recv buffer directly, and it is up to the MoE module to decide whether explicit expert permutation is needed for GroupGEMM. For example, [trtllm-gen MoE](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py) can efficiently load tokens from the raw rank-major buffer without additional permutation.
 
-NVLinkOneSided is **quantization-agnostic**. It does not perform any quantization internally — instead, the quantization happens *before* dispatch (post-quant dispatch). This design has two advantages:
-
-- **Flexibility.** Any quantization recipe works — FP8 block scales, NVFP4, or no quantization at all. The AlltoAll kernel does not need to change when the quantization format changes.
-- **Bandwidth savings.** Communicating quantized data (e.g., NVFP4 reduces data to ~28% of BF16) directly reduces the bytes transferred over NVLink, unlike implementations that must communicate in BF16 and quantize afterward.
-
-Note that pre-dispatch quantization is naturally aligned with the model's quantization recipe — the activations need to be quantized anyway before the MoE GEMMs. Pre-combine quantization, on the other hand, would be an additional step that alters the model's numerical output. For this reason, combine currently communicates in BF16. Optionally, FP8 static per-tensor quantization can be applied before combine — this is fast and introduces minimal accuracy impact.
-
-## Implementation Details
 
 ### Interface Between Communication and MoE
 
-In TensorRT LLM, the MoE module takes 4 payloads as input. The dispatch kernel communicates all of them to target ranks at once; the combine kernel performs the reverse — gathering results back and reducing them with router weights:
+Dispatch feeds the MoE module; combine collects its outputs. In TensorRT LLM, the MoE module takes 4 payloads as input. The dispatch kernel communicates all of them to target ranks at once; the combine kernel performs the reverse — gathering results back and reducing them with router weights:
 
 ```python
 # Dispatch: scatter local tokens to all ranks
@@ -103,11 +103,11 @@ def dispatch(
     # Returns same 4 payloads, each reshaped to [ep_size * max_tokens_per_rank, ...]
 ```
 
-Here `hidden_states` is the (possibly quantized) activation tensor with `hidden_size` elements per token (or packed elements for certain quantization schemes — e.g., FP4 packs two elements per byte). `hidden_states_sf` carries the optional blockwise quantization scales. `token_selected_experts` contains the `top_k` routed expert ids per token, and `token_final_scales` holds the corresponding router weights. 
+Here `hidden_states` is the (possibly quantized) activation tensor with `hidden_size` elements per token (or packed elements for certain quantization schemes — e.g., FP4 packs two elements per byte). `hidden_states_sf` carries the optional blockwise quantization scales. `token_selected_experts` contains the `top_k` routed expert ids per token, and `token_final_scales` holds the corresponding router weights.
 
-The recv buffer is pre-allocated with `ep_size * max_tokens_per_rank` slots to accommodate the maximum number of tokens from all ranks, as described in [Token-Major Data Layout](#token-major-data-layout). The MoE module then performs GroupGEMM on the received payloads. Two points are worth noting:
+The dispatch outputs are **tensor views** into symmetric memory — no allocation, no copy. The recv buffer is pre-allocated with `ep_size * max_tokens_per_rank` slots to accommodate the maximum number of tokens from all ranks, as described in [Rank-Major Buffer Layout](#rank-major-buffer-layout). The MoE module then performs GroupGEMM on the received payloads. Two points are worth noting:
 - The MoE module only computes the experts on the local rank. For example, if a token's `token_selected_experts` is `[0, 1, 4, 7]` and only experts `[0, 1, 2, 3]` reside locally, the MoE output for that token is the weighted sum of experts `[0, 1]` only.
-- Some slots are empty after dispatch. The dispatch kernel sets `token_selected_experts` of empty slots to an invalid expert id (`-1`), so the MoE module knows to skip them.
+- Some slots are empty after dispatch. The dispatch kernel sets `token_selected_experts` of empty slots to an invalid expert id (`-1`), so the MoE module knows to skip them. (For instance, [trtllm-gen MoE](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py) consumes the raw-token recv buffer directly without re-permutation.)
 
 The MoE module writes its output for each token to the same slot in the recv buffer. To obtain the final result, each rank combines the partial results from peer ranks.
 
@@ -120,19 +120,36 @@ def combine(
     # Returns [local_num_tokens, hidden_size]
 ```
 
-### Dispatch Put and Combine Get
+### Quantization-Agnostic Communication
 
-The dispatch and combine kernels have complementary data movement patterns.
+NVLinkOneSided is **quantization-agnostic**. The AlltoAll kernel transports opaque bytes — quantization happens *before* dispatch (post-quant dispatch), and any recipe (FP8 block scales, MXFP8, NVFP4, BF16, …) plugs into the same code path. This has two consequences:
 
-**Dispatch (put).** For each payload tensor, the recv buffer on each rank has shape `[ep_size, max_num_tokens, ...]`. The split `[src_rank, :, :]` stores data received from `src_rank`, so different source ranks never race when writing to the same peer. Each CTA handles one token. For each of the `top_k` routed experts, the kernel computes `target_ranks` (the rank owning that expert, derived from `token_selected_experts`) and `target_indices` (the slot index within the `src_rank` split). To obtain a unique `target_indices`, the kernel maintains atomic counters `send_counters[ep_size]` that track how many tokens have been sent from the local rank to each target rank — an atomic increment yields the next available slot. In this way, the unique slot assignment can be accomplished while the rank does not need to know how are the tokens on other ranks are routed.
+- **Flexibility.** The kernel does not need to change when the quantization format changes; the model's recipe drives the dispatch payload size directly.
+- **Bandwidth savings.** Communicating quantized data (e.g., NVFP4 reduces dispatch payload to ~28% of BF16) directly reduces the bytes transferred over NVLink, unlike implementations that must communicate in BF16 and quantize afterward.
 
+Pre-dispatch quantization is naturally aligned with the model's quantization recipe — the activations need to be quantized anyway before the MoE GEMMs. The combine path, by contrast, communicates in BF16 by default to match the kernel's reduction behavior; pre-combine quantization would alter the model's numerical output. Additionally, an optional **low-precision combine** path is available: the sender quantizes to FP8 before pushing into combine and the receiver dequantizes after pull, recovering most of the bandwidth saving with a small numerical impact from the round-trip quantization.
 
-If multiple of a token's `top_k` experts map to the same rank, only the first gets a valid entry; duplicates are assigned `target_ranks` and `target_indices` of `-1`. For each payload, the kernel loads the token data from local memory once and stores it to up to `top_k` remote workspaces — one per unique target rank.
+## Implementation Details
 
-**Combine (get).** Each CTA handles one token in the reverse direction. The combine kernel reuses the `target_ranks` and `target_indices` recorded during dispatch to read from the exact same workspace slots. For each payload element, it loads from up to `top_k` remote workspaces into registers, performs a weighted reduction, and stores the result to local memory once. The reduction uses a pairwise tree pattern rather than sequential accumulation, keeping the dependency chain shallow.
-The MoE module can write its output directly into the symmetric memory workspace, so that the combine kernel can read peer ranks' MoE output without an intermediate copy. This **zero-copy** path avoids a staging copy before the combine kernel starts; it requires small modifications to the MoE ops to accept a provided output buffer instead of allocating their own in PyTorch.
+### Dispatch Kernel
 
-The following diagram illustrates the complete dispatch → MoE → combine flow with `ep_size = 2`, `top_k = 2` and `batch_size = 3`. Dispatch computes `target_ranks` and `target_indices` to put tokens into the correct slots in the recv buffer; combine reuses the same routing to get results back. Dashed arrows indicate deduplicated entries in the dispatch phase.
+The dispatch kernel **pushes** tokens from local memory into the target rank's symmetric memory. For each payload tensor, the recv buffer on each rank has shape `[ep_size, max_tokens_per_rank, ...]`. The slice `[src_rank, :, :]` stores data received from `src_rank`, so different source ranks never race when writing to the same peer.
+
+Each CTA handles one token. For each of the `top_k` routed experts, the kernel computes:
+- `target_rank` — the rank owning that expert, derived from `token_selected_experts`;
+- `target_index` — the slot index within the `src_rank` slice of the destination's recv buffer.
+
+To obtain a unique `target_index`, the kernel maintains atomic counters `send_counters[ep_size]` that track how many tokens have been sent from the local rank to each target rank — an atomic increment yields the next available slot. The slot assignment is local (decided by the sender's atomic state) and does not require knowing how tokens on other ranks are routed.
+
+If multiple of a token's `top_k` experts map to the same rank, only the first gets a valid entry; duplicates are assigned `(target_rank, target_index) = (-1, -1)` and the kernel skips transmission for those entries. For each payload, the kernel loads the token data from local memory once and stores it to up to `top_k` peers' symmetric memory — one per unique target rank.
+
+### Combine Kernel
+
+The combine kernel **pulls** MoE outputs from peers' symmetric memory in the reverse direction. Each CTA handles one (reduced) token. The combine kernel reuses the `(target_rank, target_index)` pairs recorded during dispatch to read from the exact same slots — no routing computation is repeated. For each payload element, it loads from up to `top_k` peers' symmetric memory into registers, performs the reduction, and stores the result to local memory once. The reduction uses a pairwise tree pattern rather than sequential accumulation, keeping the dependency chain shallow.
+
+The MoE module writes its output directly into symmetric memory, so that the combine kernel can read peer ranks' MoE output without an intermediate copy. This **zero-copy** path avoids a staging copy before the combine kernel starts; it requires small modifications to the MoE ops to accept a provided output buffer instead of allocating their own in PyTorch.
+
+The diagram below illustrates the complete dispatch → MoE → combine flow with `ep_size = 2`, `top_k = 2`, and `batch_size = 3`. Dispatch computes `target_ranks` and `target_indices` to push tokens into the correct slots in the recv buffer; combine reuses the same routing to pull results back. Dashed arrows indicate deduplicated entries in the dispatch phase.
 
 <p align="center">
 <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_dispatch_moe_combine.png" alt="Dispatch, MoE, and combine data flow with index calculation and deduplication" width="900"/>
@@ -140,16 +157,23 @@ The following diagram illustrates the complete dispatch → MoE → combine flow
 
 ### Synchronization
 
-One-sided communication requires explicit synchronization at two points:
+One-sided communication requires two producer-consumer barriers, scoped to the operations they belong to:
 
-**End of dispatch.** Before the MoE module can consume the dispatched data, all source ranks must have finished writing to the workspace.
-**Beginning of combine.** Before getting data from peer workspaces, the MoE module on each rank must have finished writing its output.
+- **Tail of dispatch.** Before the MoE module can consume the dispatched data, all source ranks must have finished writing to symmetric memory.
+- **Head of combine.** Before pulling MoE outputs from peer symmetric memory, every rank's MoE module must have finished writing its output.
 
-We implement **flag-based synchronization**. Each dispatch-combine round increments a monotonically increasing epoch counter, so flags never need to be reset between rounds — a rank simply waits until the polled value equals the current epoch.
+Both barriers share a common write+poll structure built on **flag-based synchronization**. Each rank holds an array of `ep_size` flag slots in its symmetric memory and a monotonically increasing epoch counter. To enter a barrier:
 
-At the **end of dispatch**, the kernel issues a release fence to ensure all preceding stores (token data written to peer workspaces) are globally visible, then writes the epoch value to every peer's flag entry. It then spin-polls its own flag entries until all peers have signaled completion — at that point, every rank has finished writing and the MoE module can safely consume the dispatched data.
+1. Each rank writes its current epoch into every peer's flag slot for itself.
+2. Each rank polls its own local flag slots until all `ep_size` peers have written the current epoch.
 
-A similar barrier is used at the **start of combine**: each rank signals readiness and polls until every peer has done the same. An acquire fence follows the polling loop to ensure that subsequent loads (reading MoE output from peer workspaces) observe the data written before each peer's release fence.
+
+The two barriers differ only in their **memory-fence semantics**:
+
+- The **dispatch barrier** issues a *release* membar BEFORE writing the flags, ensuring that all preceding peer-bound stores (token data written into peer symmetric memory) are globally visible by the time the flag store lands.
+- The **combine barrier** issues an *acquire* membar AFTER the polling loop completes, ensuring that subsequent loads (reading MoE output from peer symmetric memory) observe the data written before each peer's release membar.
+
+Together the release/acquire pair gives the producer-consumer ordering required between dispatch writes and MoE reads (and, symmetrically, between MoE writes and combine reads).
 
 ### Saturating NVLink Bandwidth
 
@@ -157,87 +181,94 @@ The key to high throughput is keeping bytes in flight across NVLink at all times
 
 - **Vectorized load/store.** The kernel uses the widest vector type (up to 128-bit) allowed by the payload data's alignment.
 - **Dispatch:** Load from local memory once, store to remote memory `top_k` times. The `top_k` loop is unrolled via template instantiation.
-- **Combine:** load from `top_k` remote workspaces (unrolled, kept in registers), reduce pairwise in a tree fashion rather than sequentially, and store to local memory once.
+- **Combine:** load from `top_k` peers' symmetric memory (unrolled, kept in registers), reduce pairwise in a tree fashion rather than sequentially, and store to local memory once.
 
 ## Performance Benchmark
 
-We benchmark the dispatch+combine communication kernels on **GB200 NVL72** using the DeepSeek-V3 model profile: `hidden_size=7168`, `top_k=8`, 256 total experts, FP8 blockwise quantization.
+We benchmark the dispatch+combine communication kernels on **GB200 NVL72** using the DeepSeek-V3 model profile: `hidden_size=7168`, `top_k=8`, 256 total experts.
 
-The tables below report the dispatch and combine kernel latency (µs) and achieved NVLink bandwidth (GB/s) for **NVLinkOneSided** across varying EP sizes and batch sizes. The achieved bandwidth is computed as:
+### Methodology
 
-```
+For each (ep_size, batch_size) configuration we report the dispatch and combine kernel latency (µs) and achieved NVLink bandwidth (GB/s). The achieved bandwidth is computed as:
+
+```text
 bandwidth = batch_size × min(ep_size, top_k) × bytes_per_token / latency
 ```
 
-where `bytes_per_token` takes the quantization into account. We neglect the smaller payloads (quantization scaling factors, expert IDs, and expert scales) as they are small compared to the hidden states. The `min(ep_size, top_k)` factor reflects deduplication.
+where `bytes_per_token` covers the activation payload **plus its scaling factors when present**. We neglect the smaller payloads (expert IDs and router weights) since they are an order of magnitude smaller than the hidden states. The `min(ep_size, top_k)` factor reflects the deduplication described in the [Rank-Major Buffer Layout](#rank-major-buffer-layout) section. Following the convention used by other MoE communication libraries (e.g. DeepEP), the reported bandwidth is **logical** — it includes the local-rank fraction of the traffic that does not actually traverse NVLink.
+
+
+### Scaling With Batch Size and EP Size
+
+We sweep ep_size ∈ {8, 16, 32, 64} with BF16 dispatch and combine:
 
 **ep_size=8:**
 
 | Batch Size | Dispatch (µs) | Dispatch (GB/s) | Combine (µs) | Combine (GB/s) |
 |:---:|:---:|:---:|:---:|:---:|
-| 1 | 18.9 | 3.03 | 31.0 | 3.70 |
-| 2 | 18.4 | 6.24 | 31.1 | 7.36 |
-| 4 | 18.1 | 12.67 | 31.4 | 14.59 |
-| 8 | 17.6 | 26.11 | 31.4 | 29.23 |
-| 16 | 18.5 | 49.67 | 32.6 | 56.31 |
-| 32 | 18.2 | 100.86 | 32.7 | 112.25 |
-| 64 | 22.3 | 164.34 | 34.1 | 215.18 |
-| 128 | 31.7 | 231.20 | 38.1 | 384.96 |
-| 256 | 50.8 | 289.09 | 53.0 | 554.44 |
-| 512 | 89.5 | 328.12 | 91.7 | 640.56 |
-| 1024 | 166.3 | 353.17 | 175.6 | 668.62 |
-| 2048 | 311.8 | 376.64 | 322.6 | 728.20 |
+| 1 | 18.9 | 6.07 | 31.0 | 3.70 |
+| 2 | 18.4 | 12.47 | 31.1 | 7.36 |
+| 4 | 18.1 | 25.34 | 31.4 | 14.59 |
+| 8 | 17.6 | 52.22 | 31.4 | 29.23 |
+| 16 | 18.5 | 99.34 | 32.6 | 56.31 |
+| 32 | 18.2 | 201.72 | 32.7 | 112.25 |
+| 64 | 22.3 | 328.68 | 34.1 | 215.18 |
+| 128 | 31.7 | 462.40 | 38.1 | 384.96 |
+| 256 | 50.8 | 578.18 | 53.0 | 554.44 |
+| 512 | 89.5 | 656.24 | 91.7 | 640.56 |
+| 1024 | 166.3 | 706.34 | 175.6 | 668.62 |
+| 2048 | 311.8 | 753.28 | 322.6 | 728.20 |
 
 **ep_size=16:**
 
 | Batch Size | Dispatch (µs) | Dispatch (GB/s) | Combine (µs) | Combine (GB/s) |
 |:---:|:---:|:---:|:---:|:---:|
-| 1 | 18.8 | 3.05 | 30.8 | 3.72 |
-| 2 | 19.1 | 6.01 | 31.4 | 7.31 |
-| 4 | 18.5 | 12.42 | 31.6 | 14.54 |
-| 8 | 18.9 | 24.31 | 31.8 | 28.86 |
-| 16 | 18.4 | 49.75 | 33.0 | 55.61 |
-| 32 | 20.2 | 90.99 | 34.2 | 107.46 |
-| 64 | 24.1 | 152.45 | 35.6 | 206.35 |
-| 128 | 34.6 | 212.05 | 39.9 | 367.72 |
-| 256 | 54.8 | 267.92 | 57.0 | 514.83 |
-| 512 | 97.1 | 302.27 | 98.2 | 597.79 |
-| 1024 | 181.2 | 324.00 | 188.2 | 624.15 |
-| 2048 | 343.3 | 342.05 | 348.4 | 674.15 |
+| 1 | 18.8 | 6.10 | 30.8 | 3.72 |
+| 2 | 19.1 | 12.02 | 31.4 | 7.31 |
+| 4 | 18.5 | 24.84 | 31.6 | 14.54 |
+| 8 | 18.9 | 48.62 | 31.8 | 28.86 |
+| 16 | 18.4 | 99.50 | 33.0 | 55.61 |
+| 32 | 20.2 | 181.98 | 34.2 | 107.46 |
+| 64 | 24.1 | 304.90 | 35.6 | 206.35 |
+| 128 | 34.6 | 424.10 | 39.9 | 367.72 |
+| 256 | 54.8 | 535.84 | 57.0 | 514.83 |
+| 512 | 97.1 | 604.54 | 98.2 | 597.79 |
+| 1024 | 181.2 | 648.00 | 188.2 | 624.15 |
+| 2048 | 343.3 | 684.10 | 348.4 | 674.15 |
 
 **ep_size=32:**
 
 | Batch Size | Dispatch (µs) | Dispatch (GB/s) | Combine (µs) | Combine (GB/s) |
 |:---:|:---:|:---:|:---:|:---:|
-| 1 | 19.8 | 2.89 | 31.4 | 3.65 |
-| 2 | 19.7 | 5.82 | 31.3 | 7.34 |
-| 4 | 19.6 | 11.72 | 31.4 | 14.60 |
-| 8 | 19.4 | 23.64 | 32.2 | 28.53 |
-| 16 | 18.9 | 48.58 | 33.4 | 54.89 |
-| 32 | 21.1 | 86.79 | 34.6 | 105.95 |
-| 64 | 26.2 | 139.83 | 36.4 | 201.45 |
-| 128 | 37.8 | 193.93 | 41.1 | 356.77 |
-| 256 | 61.5 | 238.55 | 59.7 | 492.00 |
-| 512 | 109.6 | 267.97 | 102.5 | 572.90 |
-| 1024 | 197.5 | 297.37 | 197.5 | 594.69 |
-| 2048 | 373.7 | 314.27 | 369.5 | 635.66 |
+| 1 | 19.8 | 5.78 | 31.4 | 3.65 |
+| 2 | 19.7 | 11.64 | 31.3 | 7.34 |
+| 4 | 19.6 | 23.44 | 31.4 | 14.60 |
+| 8 | 19.4 | 47.28 | 32.2 | 28.53 |
+| 16 | 18.9 | 97.16 | 33.4 | 54.89 |
+| 32 | 21.1 | 173.58 | 34.6 | 105.95 |
+| 64 | 26.2 | 279.66 | 36.4 | 201.45 |
+| 128 | 37.8 | 387.86 | 41.1 | 356.77 |
+| 256 | 61.5 | 477.10 | 59.7 | 492.00 |
+| 512 | 109.6 | 535.94 | 102.5 | 572.90 |
+| 1024 | 197.5 | 594.74 | 197.5 | 594.69 |
+| 2048 | 373.7 | 628.54 | 369.5 | 635.66 |
 
 **ep_size=64:**
 
 | Batch Size | Dispatch (µs) | Dispatch (GB/s) | Combine (µs) | Combine (GB/s) |
 |:---:|:---:|:---:|:---:|:---:|
-| 1 | 27.8 | 2.06 | 32.6 | 3.52 |
-| 2 | 24.8 | 4.62 | 32.2 | 7.13 |
-| 4 | 29.1 | 7.87 | 33.0 | 13.92 |
-| 8 | 20.4 | 22.51 | 33.3 | 27.53 |
-| 16 | 20.6 | 44.57 | 35.0 | 52.46 |
-| 32 | 23.1 | 79.60 | 36.1 | 101.68 |
-| 64 | 28.8 | 127.62 | 37.7 | 194.70 |
-| 128 | 41.6 | 176.35 | 44.5 | 330.08 |
-| 256 | 65.3 | 224.88 | 62.9 | 466.65 |
-| 512 | 115.7 | 253.67 | 106.7 | 550.16 |
-| 1024 | 209.4 | 280.38 | 199.2 | 589.48 |
-| 2048 | 399.2 | 294.17 | 372.1 | 631.18 |
+| 1 | 27.8 | 4.12 | 32.6 | 3.52 |
+| 2 | 24.8 | 9.24 | 32.2 | 7.13 |
+| 4 | 29.1 | 15.74 | 33.0 | 13.92 |
+| 8 | 20.4 | 45.02 | 33.3 | 27.53 |
+| 16 | 20.6 | 89.14 | 35.0 | 52.46 |
+| 32 | 23.1 | 159.20 | 36.1 | 101.68 |
+| 64 | 28.8 | 255.24 | 37.7 | 194.70 |
+| 128 | 41.6 | 352.70 | 44.5 | 330.08 |
+| 256 | 65.3 | 449.76 | 62.9 | 466.65 |
+| 512 | 115.7 | 507.34 | 106.7 | 550.16 |
+| 1024 | 209.4 | 560.76 | 199.2 | 589.48 |
+| 2048 | 399.2 | 588.34 | 372.1 | 631.18 |
 
 
 The uni-directional NVLink Bandwidth of GB200 NVL72 is **900GB/s**. We plot the achieved bandwidth below:
@@ -249,9 +280,29 @@ The uni-directional NVLink Bandwidth of GB200 NVL72 is **900GB/s**. We plot the 
 </p>
 
 **Key observations:**
-- Given sufficient batch size, the combine kernel achieves **~80%** of the peak NVLink bandwidth.
-- The achieved bandwidth of dispatch is lower than that of combine, since the dispatch kernel also performs token routing and slot index computation. The combine kernel, by contrast, is more communication-centric.
-- At small batch sizes, latency dominates the kernel execution time.
+- Given sufficient batch size, both dispatch and combine reach **~80%** of the peak NVLink bandwidth at `ep_size=8`. Dispatch lands slightly higher than combine at large batches despite carrying the routing/slot-index work, because combine does a top_k-way reduction on top of the same payload.
+- Bandwidth slightly degrades as EP grows, because of the increased synchronization overhead inside the larger communication domain.
+
+### Post-Quant Dispatch
+
+We test the perf benefit of post-quant dispatch, with FP8 and FP4 respectively:
+
+<p align="left">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_post_quant_dispatch.png" alt="Post-quant dispatch on B200" width="700"/>
+</p>
+
+At `bsz = 2048`:
+
+| Recipe | bytes/token | byte-ratio vs BF16 | Disp µs | Disp GB/s | Speedup vs BF16 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| BF16  | 14336 | 1.00× | 311.8 | 753.3 | 1.00× |
+| MXFP8 |  7392 | 1.94× | 172.2 | 703.4 | **1.81×** |
+| NVFP4 |  4032 | 3.56× | 101.7 | 649.3 | **3.06×** |
+
+**Key observations:**
+- Quantization mainly helps at large batch size, where the communication is bandwidth bound.
+- Dispatch speedup tracks the byte-ratio asymptote — quantization translates almost directly into faster dispatch.
+
 
 ### Reproduction
 
@@ -262,28 +313,6 @@ python tests/microbenchmarks/bench_moe_comm.py --backend NVLINK_ONE_SIDED --prof
 ```
 `srun` is required for multi-node NVLink benchmarking. See `python tests/microbenchmarks/bench_moe_comm.py --help` for the full set of options.
 
-## Future Work And Conclusion
+## Conclusion
 
-At small batch sizes, the performance bottleneck of NVLinkOneSided shifts from data movement bandwidth to **latency**. Besides the data movement itself, the flag writes and memory fences also contribute to this latency floor. To quantify the synchronization cost, we measure kernel latency with the barrier disabled (note: this breaks correctness due to potential data races):
-
-**ep_size=8:**
-
-| Batch Size | Dispatch w/ sync (µs) | Dispatch w/o sync (µs) | Combine w/ sync (µs) | Combine w/o sync (µs) |
-|:---:|:---:|:---:|:---:|:---:|
-| 1 | 18.9 | 11.3 | 31.0 | 28.1 |
-| 2 | 18.4 | 11.1 | 31.1 | 29.2 |
-| 4 | 18.1 | 11.5 | 31.4 | 28.6 |
-| 8 | 17.6 | 11.3 | 31.4 | 29.4 |
-| 16 | 18.5 | 11.6 | 32.6 | 32.2 |
-| 32 | 18.2 | 12.6 | 32.7 | 32.3 |
-| 64 | 22.3 | 16.8 | 34.1 | 33.2 |
-| 128 | 31.7 | 25.8 | 38.1 | 36.2 |
-| 256 | 50.8 | 43.8 | 53.0 | 50.3 |
-| 512 | 89.5 | 79.3 | 91.7 | 74.8 |
-| 1024 | 166.3 | 149.5 | 175.6 | 145.3 |
-| 2048 | 311.8 | 291.5 | 322.6 | 278.5 |
-
-In the future, we will continue to optimize the latency-bound scenarios and explore more aggressive MoE communication-computation overlap/fusion.
-
-
-In conclusion, NVLinkOneSided AlltoAll is a symmetric memory-based MoE communication kernel that combines a simple one-sided design with minimal overhead and a modular, quantization-agnostic interface. It is the default communication strategy within a single NVLink domain in TensorRT LLM and delivers the best performance among known MoE communication implementations for inference.
+NVLinkOneSided AlltoAll is a symmetric memory-based MoE communication kernel that combines a simple one-sided design with minimal overhead and a modular, quantization-agnostic interface. It is the default communication strategy within a single NVLink domain in TensorRT LLM and delivers the best performance among known MoE communication implementations for inference. NVLinkOneSided is also available in [FlashInfer](https://docs.flashinfer.ai/api/comm.html#flashinfer.comm.MoeAlltoAll).

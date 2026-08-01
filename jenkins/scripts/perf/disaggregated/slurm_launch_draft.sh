@@ -6,6 +6,7 @@ cleanup_on_failure() {
 }
 
 mkdir -p $jobWorkspace
+mkdir -p "$testOutputDir"
 chmod +x $runScript
 chmod +x $installScript
 
@@ -16,18 +17,67 @@ if ! srun "${srunArgs[@]}" $installScript &> $jobWorkspace/install.log; then
 fi
 echo "Installation completed on all nodes"
 
+# Deterministic node slices per server: gen servers take the first nodes,
+# then ctx servers (same order the steps are started in). Both the cache
+# transceiver precheck and the real server steps pin to these slices with
+# `srun -w`, so the precheck exercises exactly the node pairs / NICs the
+# real disaggregated test will use.
+mapfile -t allNodes < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+nodeCursor=0
+genNodeLists=()
+for i in $(seq 0 $((numGenServers - 1))); do
+    slice=("${allNodes[@]:$nodeCursor:$nodesPerGenServer}")
+    genNodeLists+=("$(IFS=,; echo "${slice[*]}")")
+    nodeCursor=$((nodeCursor + nodesPerGenServer))
+done
+ctxNodeLists=()
+if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" != "1" ]; then
+    for i in $(seq 0 $((numCtxServers - 1))); do
+        slice=("${allNodes[@]:$nodeCursor:$nodesPerCtxServer}")
+        ctxNodeLists+=("$(IFS=,; echo "${slice[*]}")")
+        nodeCursor=$((nodeCursor + nodesPerCtxServer))
+    done
+fi
+if [ "$nodeCursor" -gt "${#allNodes[@]}" ]; then
+    cleanup_on_failure "Node slicing needs $nodeCursor nodes but the job only has ${#allNodes[@]} ($SLURM_JOB_NODELIST)"
+fi
+
+# Cache transceiver network precheck: same instance count / node slices /
+# MPI topology / UCX env as the real ctx+gen server steps. On failure the
+# stage aborts HERE, with per-instance verdicts + a synthetic junit entry,
+# before any model bring-up. Functions come from slurm_ct_precheck_gate.sh,
+# spliced in above this draft by submit.py. No-op unless ctPrecheckEnabled=1.
+run_cache_transceiver_precheck
+
 # Start gen servers
 echo "Starting gen servers..."
 for i in $(seq 0 $((numGenServers - 1))); do
     gen_world_size=$((nodesPerGenServer * gpusPerNodePerGenServer))
     export DISAGG_SERVING_TYPE="GEN_$i"
     export pytestCommand="$pytestCommandGENWorker"
-    srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
-        -N $nodesPerGenServer \
-        --ntasks=$gen_world_size \
-        --ntasks-per-node=$gpusPerNodePerGenServer \
-        $runScript &> $jobWorkspace/gen_server_$i.log &
-    echo "Started gen server $i"
+    # End-of-write sentinel: gen_server_$i.log is the srun's &> aggregate of
+    # every gen-worker rank (the per-iter prev_device_step_time lines the
+    # benchmark parses live only here, not in trtllm-serve.GEN_*.log). The
+    # file descriptor is owned by this srun, so the log is only guaranteed
+    # fully flushed once the srun is reaped. Run srun in the foreground of a
+    # backgrounded subshell and touch gen_server_$i.done immediately after it
+    # returns: the benchmark srun blocks on that sentinel before parsing, so
+    # it never reads a truncated / not-yet-flushed log (nvbugs 6487036 /
+    # 6487040). A stale sentinel from a re-run output dir is removed first.
+    # Note: srun is foreground inside the subshell (not `srun ... &` + a
+    # `kill -0` poll) so `touch` runs strictly after reap, with no
+    # late-zombie race that could either skip or prematurely fire the signal.
+    rm -f "$testOutputDir/gen_server_$i.done"
+    (
+        srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
+            -N $nodesPerGenServer \
+            -w "${genNodeLists[$i]}" \
+            --ntasks=$gen_world_size \
+            --ntasks-per-node=$gpusPerNodePerGenServer \
+            $runScript &> $testOutputDir/gen_server_$i.log
+        touch "$testOutputDir/gen_server_$i.done"
+    ) &
+    echo "Started gen server $i on ${genNodeLists[$i]}"
     sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
 done
 
@@ -40,10 +90,11 @@ if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" != "1" ]; then
         export pytestCommand="$pytestCommandCTXWorker"
         srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
             -N $nodesPerCtxServer \
+            -w "${ctxNodeLists[$i]}" \
         --ntasks=$ctx_world_size \
         --ntasks-per-node=$gpusPerNodePerCtxServer \
-            $runScript &> $jobWorkspace/ctx_server_$i.log &
-        echo "Started ctx server $i"
+            $runScript &> $testOutputDir/ctx_server_$i.log &
+        echo "Started ctx server $i on ${ctxNodeLists[$i]}"
         sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
     done
 else
@@ -60,7 +111,7 @@ srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
     -N 1 \
     --ntasks=1 \
     --ntasks-per-node=1 \
-    $runScript &> $jobWorkspace/disagg_server.log &
+    $runScript &> $testOutputDir/disagg_server.log &
 echo "Started disagg server"
 sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
 
@@ -73,7 +124,7 @@ if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
     --ntasks=1 \
     --ntasks-per-node=1 \
     $runScript; then
-    cleanup_on_failure "Benchmark failed. Check logs in ${jobWorkspace} for details"
+    cleanup_on_failure "Benchmark failed. See slurm-${SLURM_JOB_ID}.out"
 fi
 
 echo "Disagg server and benchmark completed successfully"

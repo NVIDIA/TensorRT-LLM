@@ -66,6 +66,24 @@ class TokensPrompt(TypedDict):
     query_token_ids: NotRequired[List[int]]
     """The query input token IDs for star attention."""
 
+    multi_item_part_lens: NotRequired[List[int]]
+    """Metadata for multi-item scoring.
+
+    Specifying this enables the multi-item scoring mode.
+    In this mode, `prompt_token_ids` is assumed to consist of a prefix (or query) and
+    multiple items (or candidates). Each part of the prompt is assumed to be followed
+    by a delimiter token. The attention computation (masking and positional encodings)
+    is altered such that the prefill logits correspond to those that would
+    have been obtained upon running separate prefills for prefix + item1, prefix + item2,
+    and so on. Currently, this feature is only supported in prefill-only execution
+    via `LLM.encode`.
+
+    The list elements should correspond, in order, to prefix length and the length of
+    each following item to score (all lengths in tokens).
+    See https://github.com/flashinfer-ai/flashinfer/pull/1015 for details and nomenclature.
+    The length should not include the delimiter tokens.
+    """
+
 
 PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]
 
@@ -74,7 +92,7 @@ def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
     if isinstance(inputs, str):
         prompt_inputs = TextPrompt(prompt=inputs)
     elif isinstance(inputs, list):
-        assert isinstance(inputs[0], int)
+        assert len(inputs) == 0 or isinstance(inputs[0], int)
         prompt_inputs = TokensPrompt(prompt_token_ids=inputs)
     elif isinstance(inputs, dict):
         assert inputs.get("prompt") is not None \

@@ -35,13 +35,13 @@ import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
 
-from tensorrt_llm._torch.visual_gen.config import (
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
+from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     CacheDiTConfig,
     TorchCompileConfig,
     VisualGenArgs,
 )
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -95,10 +95,8 @@ def _load_trtllm_pipeline(checkpoint_path: str):
     if not os.path.exists(checkpoint_path):
         pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     args = VisualGenArgs(
-        checkpoint_path=checkpoint_path,
-        device="cuda",
-        dtype="bfloat16",
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        model=checkpoint_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
     )
     return PipelineLoader(args).load(skip_warmup=True)
 
@@ -275,27 +273,30 @@ class TestWan22_A14B_PipelineCorrectness:
 
 
 # ============================================================================
-# Two-stage feature fixtures (skip aux components, loaded once per module)
+# Two-stage feature fixtures (loaded once per module)
 # ============================================================================
 
-_SKIP_AUX = ["text_encoder", "vae", "tokenizer", "scheduler"]
+
+_SKIP_AUX = [
+    PipelineComponent.TEXT_ENCODER,
+    PipelineComponent.VAE,
+    PipelineComponent.TOKENIZER,
+    PipelineComponent.SCHEDULER,
+]
 
 
-def _make_wan22_t2v(quant_config=None, attention=None):
+def _make_wan22_t2v(quant_config=None, attention_config=None):
     if not os.path.exists(WAN22_A14B_PATH):
         pytest.skip(f"Checkpoint not found: {WAN22_A14B_PATH}")
     kwargs = dict(
-        checkpoint_path=WAN22_A14B_PATH,
-        device="cuda",
-        dtype="bfloat16",
-        skip_components=_SKIP_AUX,
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        model=WAN22_A14B_PATH,
+        torch_compile_config=TorchCompileConfig(enable=False),
     )
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
-    if attention is not None:
-        kwargs["attention"] = attention
-    return PipelineLoader(VisualGenArgs(**kwargs)).load(skip_warmup=True)
+    if attention_config is not None:
+        kwargs["attention_config"] = attention_config
+    return PipelineLoader(VisualGenArgs(**kwargs)).load(skip_warmup=True, skip_components=_SKIP_AUX)
 
 
 @pytest.fixture(scope="module")
@@ -309,7 +310,7 @@ def wan22_t2v_fp8():
 
 @pytest.fixture(scope="module")
 def wan22_t2v_trtllm():
-    pipeline = _make_wan22_t2v(attention=AttentionConfig(backend="TRTLLM"))
+    pipeline = _make_wan22_t2v(attention_config=AttentionConfig(backend="TRTLLM"))
     yield pipeline
     del pipeline
     gc.collect()
@@ -378,10 +379,8 @@ class TestWan22T2VBatchGeneration:
             pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH_WAN22_T2V.")
 
         args = VisualGenArgs(
-            checkpoint_path=WAN22_A14B_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            model=WAN22_A14B_PATH,
+            torch_compile_config=TorchCompileConfig(enable=False),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         yield pipeline
@@ -439,13 +438,11 @@ class TestWan22T2VCombinedOptimizations:
         if not os.path.exists(WAN22_A14B_PATH):
             pytest.skip(f"Checkpoint not found: {WAN22_A14B_PATH}")
         args = VisualGenArgs(
-            checkpoint_path=WAN22_A14B_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            model=WAN22_A14B_PATH,
+            torch_compile_config=TorchCompileConfig(enable=False),
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            attention=AttentionConfig(backend="TRTLLM"),
-            cache=CacheDiTConfig(),
+            attention_config=AttentionConfig(backend="TRTLLM"),
+            cache_config=CacheDiTConfig(),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:

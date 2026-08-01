@@ -14,14 +14,32 @@
 # limitations under the License.
 
 import os
+import platform
 import signal
 import subprocess
 import time
 
 import pytest
 import requests
+from defs.conftest import get_sm_version
 
 from tensorrt_llm.logger import logger
+
+
+def get_ucx_tls():
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    On some gb300 cluster, we need to set `cuda_copy,cuda_ipc,sm,self,tcp`
+    for UCX_TLS.
+    """
+    sm = get_sm_version()
+    if sm == 103 and "aarch" in platform.machine().lower():
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    return "^ib,gdr_copy"
+
 
 # Configuration file paths
 EXAMPLES_DIR = "examples/disaggregated"
@@ -69,6 +87,7 @@ def start_context_server(config,
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting CONTEXT server on GPU {gpu_id} (port {port})...")
     process = subprocess.Popen(cmd,
@@ -95,6 +114,7 @@ def start_generation_server(config,
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting GENERATION server on GPU {gpu_id} (port {port})...")
     process = subprocess.Popen(cmd,

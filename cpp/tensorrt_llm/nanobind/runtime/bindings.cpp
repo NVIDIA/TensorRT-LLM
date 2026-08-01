@@ -18,6 +18,7 @@
 #include "bindings.h"
 #include "hostfunc.h"
 #include "moeBindings.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
@@ -39,7 +40,6 @@
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
-#include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torchView.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
 
@@ -68,7 +68,7 @@ public:
     void setup(tr::SamplingConfig const& samplingConfig, size_t batchSize,
         tr::DecodingInput::TensorConstPtr const& batchSlots,
         std::optional<tr::DecodingOutput> const& output = std::nullopt,
-        std::optional<nvinfer1::DataType> explicitDraftTokensDType = std::nullopt,
+        std::optional<tensorrt_llm::DataType> explicitDraftTokensDType = std::nullopt,
         std::optional<std::vector<tr::ITensor::SharedConstPtr>> const& lookaheadPrompt = std::nullopt,
         std::optional<std::vector<te::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs = std::nullopt) override
     {
@@ -125,47 +125,6 @@ void initBindings(nb::module_& m)
         .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, nb::arg("tag"),
             nb::call_guard<nb::gil_scoped_release>());
 
-    nb::class_<tr::TllmRuntime>(m, "TllmRuntime")
-        .def(
-            "__init__",
-            [](tr::TllmRuntime* self, std::filesystem::path engine_path, float gpu_weights_percent = 1.0f,
-                bool use_shape_inference = true)
-            {
-                // Using default logger by passing nullptr
-                new (self)
-                    tr::TllmRuntime(tr::RawEngine(engine_path), nullptr, gpu_weights_percent, use_shape_inference);
-            },
-            nb::arg("engine_path"), nb::arg("gpu_weights_percent") = 1.0f, nb::arg("use_shape_inference") = true)
-        .def(
-            "__init__",
-            [](tr::TllmRuntime* self, nb::ndarray<nb::numpy, uint8_t> engine_buffer, float gpu_weights_percent = 1.0f,
-                bool use_shape_inference = true)
-            {
-                if (engine_buffer.ndim() != 1)
-                    throw std::runtime_error("Expected 1-D array for engine buffer");
-                new (self) tr::TllmRuntime(tr::RawEngine(engine_buffer.data(), engine_buffer.size()), nullptr,
-                    gpu_weights_percent, use_shape_inference);
-            },
-            nb::arg("engine_buffer"), nb::arg("gpu_weights_percent") = 1.0f, nb::arg("use_shape_inference") = true)
-        .def_prop_ro("num_contexts", &tr::TllmRuntime::getNbContexts)
-        .def_prop_ro("num_profiles", &tr::TllmRuntime::getNbProfiles)
-        .def("get_opt_profile_id", &tr::TllmRuntime::getOptProfileId, nb::arg("num_tokens"), nb::arg("split_points"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("clear_contexts", &tr::TllmRuntime::clearContexts, nb::call_guard<nb::gil_scoped_release>())
-        .def("execute_context", &tr::TllmRuntime::executeContext, nb::arg("context_id"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("stream_ptr", &tr::TllmRuntime::getStreamPtr)
-        .def_prop_ro("buffer_manager",
-            static_cast<tr::BufferManager& (tr::TllmRuntime::*) ()>(&tr::TllmRuntime::getBufferManager))
-        .def("set_layer_profiler", &tr::TllmRuntime::setLayerProfiler, nb::call_guard<nb::gil_scoped_release>())
-        .def("has_layer_profiler", &tr::TllmRuntime::hasLayerProfiler, nb::arg("context_id"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("layer_profiler_info", &tr::TllmRuntime::getLayerProfileInfo)
-        .def("report_to_profiler", &tr::TllmRuntime::reportToProfiler, nb::arg("context_id"),
-            nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("logits_dtype_from_engine",
-            [](tr::TllmRuntime& self) { return self.getEngine().getTensorDataType("logits"); });
-
     nb::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(nb::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), nb::arg("max_num_sequences"),
             nb::arg("max_tokens_per_step"), nb::arg("buffer_manager"), nb::call_guard<nb::gil_scoped_release>())
@@ -204,7 +163,7 @@ void initBindings(nb::module_& m)
             "setup",
             [](tr::IGptDecoder& self, tr::SamplingConfig const& samplingConfig, size_t batchSize,
                 at::Tensor const& batchSlots, std::optional<tr::DecodingOutput> const& output = std::nullopt,
-                std::optional<nvinfer1::DataType> explicitDraftTokensDType = std::nullopt,
+                std::optional<tensorrt_llm::DataType> explicitDraftTokensDType = std::nullopt,
                 std::optional<std::vector<tr::ITensor::SharedConstPtr>> const& lookaheadPrompt = std::nullopt,
                 std::optional<std::vector<te::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs = std::nullopt)
             {

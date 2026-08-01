@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 from typing import Callable, Dict, List, Optional
 
@@ -230,11 +244,15 @@ def run_sharding_pattern_detection_test(
         detected_transformations: List of detected transformation configurations
         expected_transformations: List of expected transformation configurations
     """
-    # Remove config field from transformations
+    # Remove non-identity fields (config, derived weight_name) before comparison:
+    # detected transforms carry a from_node-resolved weight_name; expected ones are
+    # hand-built without it, so normalize both to None.
     for transform in detected_transformations:
         transform.config = None
+        transform.weight_name = None
     for transform in expected_transformations:
         transform.config = None
+        transform.weight_name = None
 
     # Convert to sets for unordered comparison
     detected_set = set(detected_transformations)

@@ -1,10 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import json
 import time
+from typing import Literal
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
-                                 CudaGraphConfig, DraftTargetDecodingConfig,
+                                 CudaGraphConfig, DFlashDecodingConfig,
+                                 DraftTargetDecodingConfig,
                                  Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
@@ -14,6 +31,16 @@ example_prompts = [
     "The capital of France is",
     "The future of AI is",
 ]
+
+
+def _parse_kv_cache_manager_v2(value: str) -> bool | Literal["auto"]:
+    if value == "auto":
+        return "auto"
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected one of: auto, true, false")
 
 
 def add_llm_args(parser):
@@ -130,9 +157,11 @@ def add_llm_args(parser):
                         action='store_true')
     parser.add_argument(
         '--use_kv_cache_manager_v2',
-        default=False,
-        action='store_true',
-        help='Use KVCacheManagerV2 for KV cache management (PyTorch backend).',
+        default='auto',
+        type=_parse_kv_cache_manager_v2,
+        metavar='{auto,true,false}',
+        help=
+        'Whether to use KVCacheManagerV2 for KV cache management (PyTorch backend). Defaults to model-specific auto selection.',
     )
 
     # Runtime
@@ -165,6 +194,11 @@ def add_llm_args(parser):
     parser.add_argument('--apply_chat_template',
                         default=False,
                         action='store_true')
+    parser.add_argument('--custom_tokenizer',
+                        type=str,
+                        default=None,
+                        help='Override the tokenizer. Accepts a built-in alias '
+                        " or a fully-qualified class import path.")
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -189,9 +223,6 @@ def add_llm_args(parser):
                         default=False,
                         action='store_true')
     parser.add_argument('--dynamic_tree_max_topK', type=int, default=None)
-    parser.add_argument('--allow_advanced_sampling',
-                        default=False,
-                        action='store_true')
     parser.add_argument('--eagle3_model_arch',
                         type=str,
                         default="llama3",
@@ -284,6 +315,9 @@ def setup_llm(args, **kwargs):
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
             mtp_eagle_one_model=args.use_one_model,
+            use_dynamic_tree=args.use_dynamic_tree,
+            dynamic_tree_max_topK=args.dynamic_tree_max_topK,
+            max_total_draft_tokens=args.max_total_draft_tokens,
             speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = Eagle3DecodingConfig(
@@ -293,10 +327,12 @@ def setup_llm(args, **kwargs):
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
-            allow_advanced_sampling=args.allow_advanced_sampling,
             eagle3_model_arch=args.eagle3_model_arch,
-            max_total_draft_tokens=args.max_total_draft_tokens,
-            max_batch_size=args.max_batch_size)
+            max_total_draft_tokens=args.max_total_draft_tokens)
+    elif spec_decode_algo == "DFLASH":
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=args.spec_decode_max_draft_len,
+            speculative_model=args.draft_model_dir)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -359,6 +395,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        custom_tokenizer=args.custom_tokenizer,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1

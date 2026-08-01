@@ -21,7 +21,7 @@ from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import llm_models_root, skip_post_blackwell_ultra, skip_pre_blackwell
 from ..trt_test_alternative import popen
 from .accuracy_core import LlmapiAccuracyTestHarness
 from .test_disaggregated_serving import (
@@ -181,6 +181,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
+    @skip_post_blackwell_ultra
     def test_dwdp_accuracy(self):
         model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
 
@@ -221,6 +222,260 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "num_groups": 1,
                 "num_experts_per_worker": 36,
                 "num_prefetch_experts": 36,
+            },
+        }
+
+        gen_server_config = {
+            "num_instances": 1,
+            "urls": [f"localhost:{gen_port}"],
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "enable_autotuner": False,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "max_batch_size": 128,
+            "max_num_tokens": 1024,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+                "enable_partial_reuse": False,
+                "tokens_per_block": 32,
+            },
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+            "moe_config": {
+                "backend": "CUTEDSL",
+            },
+        }
+
+        worker_config = {
+            "model": model_path,
+            "hostname": "localhost",
+            "port": serve_port,
+            "backend": "pytorch",
+            "context_servers": ctx_server_config,
+            "generation_servers": gen_server_config,
+        }
+
+        frontend_config = {
+            "backend": "pytorch",
+            "hostname": "localhost",
+            "port": serve_port,
+            "context_servers": {
+                "num_instances": 2,
+                "urls": [
+                    f"localhost:{ctx_port_0}",
+                    f"localhost:{ctx_port_1}",
+                ],
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": [f"localhost:{gen_port}"],
+            },
+        }
+
+        with launch_dwdp_disaggregated_llm(
+            worker_config, frontend_config, model_path, total_gpus=4, max_workers=128
+        ) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @skip_post_blackwell_ultra
+    def test_dwdp_accuracy_contention_opt(self):
+        """End-to-end accuracy test with ``contention_opt=True``.
+
+        Mirrors ``test_dwdp_accuracy`` (uniform partition, dwdp_size=2,
+        GEN TP=2 on 4 GPU) but turns on the contention optimization so
+        that ``DWDPWeightManager.prefetch_layer`` exercises the batched
+        ``cudaMemcpyBatchAsync`` code path with 2 MiB sub-slices
+        round-robined across peers.  Pass criterion is the same GSM8K
+        threshold (61.537) — the batched path must produce
+        bit-for-bit equivalent results to the per-slice default path,
+        since the only difference is the schedule / launch shape of
+        the same set of D2D copies.
+        """
+        model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
+
+        ctx_port_0 = get_free_port()
+        ctx_port_1 = get_free_port()
+        gen_port = get_free_port()
+        serve_port = get_free_port()
+
+        ctx_server_config = {
+            "num_instances": 2,
+            "urls": [
+                f"localhost:{ctx_port_0}",
+                f"localhost:{ctx_port_1}",
+            ],
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "enable_autotuner": False,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "max_batch_size": 16,
+            "max_num_tokens": 8192,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.4,
+                "enable_block_reuse": False,
+                "enable_partial_reuse": False,
+                "tokens_per_block": 32,
+            },
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+            "moe_config": {
+                "backend": "CUTEDSL",
+            },
+            "dwdp_config": {
+                "dwdp_size": 2,
+                "num_groups": 1,
+                "num_experts_per_worker": 36,
+                "num_prefetch_experts": 36,
+                "contention_opt": True,
+            },
+        }
+
+        gen_server_config = {
+            "num_instances": 1,
+            "urls": [f"localhost:{gen_port}"],
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "enable_autotuner": False,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "max_batch_size": 128,
+            "max_num_tokens": 1024,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+                "enable_partial_reuse": False,
+                "tokens_per_block": 32,
+            },
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+            "moe_config": {
+                "backend": "CUTEDSL",
+            },
+        }
+
+        worker_config = {
+            "model": model_path,
+            "hostname": "localhost",
+            "port": serve_port,
+            "backend": "pytorch",
+            "context_servers": ctx_server_config,
+            "generation_servers": gen_server_config,
+        }
+
+        frontend_config = {
+            "backend": "pytorch",
+            "hostname": "localhost",
+            "port": serve_port,
+            "context_servers": {
+                "num_instances": 2,
+                "urls": [
+                    f"localhost:{ctx_port_0}",
+                    f"localhost:{ctx_port_1}",
+                ],
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": [f"localhost:{gen_port}"],
+            },
+        }
+
+        with launch_dwdp_disaggregated_llm(
+            worker_config, frontend_config, model_path, total_gpus=4, max_workers=128
+        ) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @skip_post_blackwell_ultra
+    def test_dwdp_accuracy_mode_b_overlap(self):
+        """End-to-end accuracy test for Phase 2's redundancy (overlap) path.
+
+        DSv3-Lite has 72 experts.  The companion ``test_dwdp_accuracy``
+        uses the uniform Mode-B-equality config (size=36, stride=36, 0
+        overlap).  This test deliberately uses ``size=40, stride=32``
+        (``(dwdp_size - 1) * stride + size = 1*32 + 40 == 72`` strict
+        equality, 8-expert overlap between rank 0 and rank 1) so that
+        the runtime exercises:
+
+          * ``_init_dwdp_expert_layout`` overrides
+            ``expert_size_per_partition`` to 40 (not 72 // 2 = 36);
+          * peer ranges ``[(0, 40), (32, 72)]`` have a non-empty
+            8-expert overlap, exercising ``lookup_owner``'s first-match
+            policy in fill_edge_bytes / weight_manager / scatter;
+          * ``_scatter_shards_to_full`` writes overlapping experts
+            (32..39) twice — once from rank 0 (lowest, wins) and once
+            from rank 1 — and values must agree because every rank that
+            owns expert ``e`` loaded ``e`` from the same checkpoint.
+
+        Passing GSM8K at the standard threshold is sufficient evidence
+        that the runtime fetches every remote expert from the right
+        peer and that ``fixup_moe_backends`` reconstructs the gate-side
+        scale tensors correctly under overlap.
+
+        Note: ``dwdp_size=2`` is kept (vs. the original dwdp=3 design)
+        to match the existing ``test_dwdp_accuracy``'s 4-GPU resource
+        footprint (2 CTX TP=1 + 1 GEN TP=2 = 4 GPUs) and to avoid an
+        unrelated UCX bug observed when running 3 CTX workers
+        (``libtensorrt_llm_ucx_wrapper.so`` bus error in the worker
+        progress thread; affects KV-cache transceiver, not DWDP).
+        """
+        model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
+
+        ctx_port_0 = get_free_port()
+        ctx_port_1 = get_free_port()
+        gen_port = get_free_port()
+        serve_port = get_free_port()
+
+        ctx_server_config = {
+            "num_instances": 2,
+            "urls": [
+                f"localhost:{ctx_port_0}",
+                f"localhost:{ctx_port_1}",
+            ],
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "enable_autotuner": False,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "max_batch_size": 16,
+            "max_num_tokens": 8192,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.4,
+                "enable_block_reuse": False,
+                "enable_partial_reuse": False,
+                "tokens_per_block": 32,
+            },
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+            "moe_config": {
+                "backend": "CUTEDSL",
+            },
+            "dwdp_config": {
+                "dwdp_size": 2,
+                "num_groups": 1,
+                # Mode B redundancy: stride=32 < size=40.  Strict
+                # equality 1*32 + 40 == 72 is enforced by
+                # _validate_partition_config; 8-expert overlap between
+                # rank 0's range [0, 40) and rank 1's range [32, 72).
+                "num_experts_per_worker": 40,
+                "num_prefetch_experts": 32,
             },
         }
 

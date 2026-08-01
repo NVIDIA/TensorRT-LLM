@@ -92,7 +92,8 @@ class QwenMoE(nn.Module):
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=False)
+            use_dp_padding=False,
+            lora_params=lora_params)
 
         shared_expert_output = self.shared_expert(
             hidden_states,

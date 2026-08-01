@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
     UsageInfo,
 )
+from tensorrt_llm.serve.perf_metrics import _PERF_METRICS_HEADER_BUDGET_BYTES, SSE_METRICS_EVENT
+from tensorrt_llm.serve.responses_utils import ResponseHooks
 from tensorrt_llm.serve.router import Router
 
 
@@ -117,6 +119,16 @@ class TestOpenAIHttpClient:
         assert client._max_retries == 5
 
     @pytest.mark.asyncio
+    async def test_internal_client_accepts_perf_metrics_header_size(self, mock_router):
+        with (
+            patch("tensorrt_llm.serve.openai_client.ClientMetricsCollector"),
+            patch("tensorrt_llm.serve.openai_client.aiohttp.ClientSession") as session,
+        ):
+            OpenAIHttpClient(router=mock_router, role=ServerRole.GENERATION)
+
+        assert session.call_args.kwargs["max_field_size"] == _PERF_METRICS_HEADER_BUDGET_BYTES
+
+    @pytest.mark.asyncio
     async def test_non_streaming_completion_request(
         self, openai_client, completion_request, mock_session, mock_router
     ):
@@ -141,7 +153,9 @@ class TestOpenAIHttpClient:
         assert isinstance(response, CompletionResponse)
         assert response.model == "test-model"
         mock_session.post.assert_called_once()
-        mock_router.finish_request.assert_called_once_with(completion_request)
+        mock_router.finish_request.assert_called_once_with(
+            completion_request, mock_session, success=True
+        )
 
     @pytest.mark.asyncio
     async def test_streaming_completion_request(
@@ -183,7 +197,48 @@ class TestOpenAIHttpClient:
         for i, chunk in enumerate(chunks):
             assert chunk == dummy_data[i]
         mock_session.post.assert_called_once()
-        mock_router.finish_request.assert_called_once_with(streaming_completion_request)
+        mock_router.finish_request.assert_called_once_with(
+            streaming_completion_request, mock_session, success=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_streaming_metrics_do_not_fail_request(
+        self, openai_client, streaming_completion_request, mock_session, mock_router
+    ):
+        openai_client._request_perf_metrics = True
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "text/event-stream"}
+
+        response_data = b'data: "Hello"\n\ndata: [DONE]\n\n'
+        metrics_data = f"event: {SSE_METRICS_EVENT}\ndata: not-json\n\n".encode()
+
+        async def mock_iter_any():
+            yield b""
+            yield response_data
+            yield metrics_data
+
+        mock_http_response.content = AsyncMock()
+        mock_http_response.content.iter_any = mock_iter_any
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+        hooks = MagicMock(spec=ResponseHooks)
+
+        response_generator = await openai_client.send_request(
+            streaming_completion_request, hooks=hooks
+        )
+        chunks = [chunk async for chunk in response_generator]
+
+        assert b"".join(chunks) == response_data
+        hooks.on_first_token.assert_called_once_with("localhost:8000", streaming_completion_request)
+        hooks.on_perf_metrics.assert_not_called()
+        hooks.on_resp_done.assert_called_once_with(
+            "localhost:8000", streaming_completion_request, None
+        )
+        mock_router.finish_request.assert_called_once_with(
+            streaming_completion_request, mock_session, success=True
+        )
 
     @pytest.mark.asyncio
     async def test_request_with_custom_server(
@@ -220,8 +275,11 @@ class TestOpenAIHttpClient:
         with pytest.raises(aiohttp.ClientError):
             await openai_client.send_request(completion_request)
 
-        # Should finish request on error
-        mock_router.finish_request.assert_called_once_with(completion_request)
+        # Should finish request on error with success=False so the router
+        # doesn't record routed-block cache state for a request that didn't complete.
+        mock_router.finish_request.assert_called_once_with(
+            completion_request, mock_session, success=False
+        )
 
     @pytest.mark.asyncio
     async def test_request_with_retry(
@@ -369,7 +427,11 @@ class TestDisaggIdRegenOnRetry:
     async def test_retry_regenerates_disagg_id(self):
         session = AsyncMock(spec=aiohttp.ClientSession)
         ids = iter(range(1000, 2000))
-        client = self._make_client(session, disagg_id_generator=lambda: next(ids))
+
+        async def next_id():
+            return next(ids)
+
+        client = self._make_client(session, disagg_id_generator=next_id)
 
         session.post.side_effect = [
             aiohttp.ClientError("transient"),
@@ -412,3 +474,146 @@ class TestDisaggIdRegenOnRetry:
             await client.send_request(req)
 
         assert req.disaggregated_params.disagg_request_id == 42
+
+
+class TestSelectiveTransientTcpRetry:
+    """Selective retry budget for transient TCP race symptoms.
+
+    ServerDisconnectedError and ConnectionResetError (which include
+    aiohttp.ClientConnectionResetError via MRO) get an extended retry budget
+    of up to 5 attempts; all other client errors keep the original
+    max_retries fail-fast behaviour.
+    """
+
+    def _ok_response(self):
+        return CompletionResponse(
+            id="cmpl-1",
+            object="text_completion",
+            created=0,
+            model="m",
+            choices=[CompletionResponseChoice(index=0, text="ok", finish_reason="stop")],
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    def _mock_http_ok(self, body):
+        r = AsyncMock()
+        r.status = 200
+        r.headers = {"Content-Type": "application/json"}
+        r.json = AsyncMock(return_value=body.model_dump())
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock()
+        return r
+
+    def _make_client(self, session, max_retries=1):
+        from prometheus_client.registry import REGISTRY
+
+        REGISTRY._names_to_collectors = {}
+        REGISTRY._collector_to_names = {}
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        return OpenAIHttpClient(
+            router=router,
+            role=ServerRole.CONTEXT,
+            timeout_secs=10,
+            max_retries=max_retries,
+            retry_interval_sec=0,
+            session=session,
+        )
+
+    def _make_request(self):
+        return CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=1
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_server_disconnected_gets_extra_retries(self):
+        """ServerDisconnectedError: even with max_retries=1, retry up to 5."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session, max_retries=1)
+
+        # 4 disconnect failures then success on the 5th attempt
+        session.post.side_effect = [
+            aiohttp.ServerDisconnectedError(),
+            aiohttp.ServerDisconnectedError(),
+            aiohttp.ServerDisconnectedError(),
+            aiohttp.ServerDisconnectedError(),
+            self._mock_http_ok(self._ok_response()),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(self._make_request())
+
+        # 1 original + 4 retries = 5 total attempts (extra budget kicked in)
+        assert session.post.call_count == 5
+
+    @pytest.mark.asyncio
+    async def test_connection_reset_gets_extra_retries(self):
+        """ConnectionResetError: same extra budget as ServerDisconnectedError."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session, max_retries=1)
+
+        session.post.side_effect = [
+            ConnectionResetError(),
+            ConnectionResetError(),
+            self._mock_http_ok(self._ok_response()),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(self._make_request())
+
+        # 1 original + 2 retries = 3 total attempts (within extra budget)
+        assert session.post.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_other_client_error_keeps_fail_fast(self):
+        """Generic aiohttp.ClientError still respects max_retries (=1)."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session, max_retries=1)
+
+        session.post.side_effect = aiohttp.ClientError("transient non-tcp")
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientError):
+                await client.send_request(self._make_request())
+
+        # Original + 1 retry = 2 attempts, NOT promoted to 5
+        assert session.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_max_retries_zero_still_gets_transient_tcp_budget(self):
+        """Even when max_retries=0, transient TCP races still retry up to 5."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session, max_retries=0)
+
+        session.post.side_effect = [
+            aiohttp.ServerDisconnectedError(),
+            self._mock_http_ok(self._ok_response()),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await client.send_request(self._make_request())
+
+        assert session.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_transient_tcp_capped_at_5_when_max_retries_smaller(self):
+        """If transient TCP keeps failing, give up after the extended budget."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session, max_retries=1)
+
+        # Always raise — must give up after extended (1 + 5) = 6 attempts
+        session.post.side_effect = aiohttp.ServerDisconnectedError()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ServerDisconnectedError):
+                await client.send_request(self._make_request())
+
+        # 1 original + 5 retries
+        assert session.post.call_count == 6
