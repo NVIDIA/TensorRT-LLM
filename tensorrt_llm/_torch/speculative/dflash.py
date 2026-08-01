@@ -215,7 +215,12 @@ class DFlashWorker(SpecWorkerBase):
         if self._ctx_buf_inited:
             return
 
-        max_batch = spec_metadata.max_num_requests
+        # Worker-owned and allocated once, then reused for every later batch
+        # shape, so this must span the full seq-slot pool. max_num_requests is
+        # shrunk to the captured graph bucket by create_cuda_graph_metadata,
+        # which would pin the pool to whichever bucket drafts first and leave
+        # _dummy_slot aliasing a live request's row.
+        max_batch = spec_metadata.num_seq_slots or spec_metadata.max_num_requests
 
         # Prefer runtime max_seq_len over max_position_embeddings: YaRN
         # models advertise 100k+ positions, which would OOM the ctx buffer

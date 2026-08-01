@@ -192,13 +192,12 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
 
     worker = _make_worker()
     draft_model = DraftModel()
-    metadata = types.SimpleNamespace(
-        max_num_requests=1,
-        request_ids=[100],
-        get_hidden_states=lambda _num_tokens: torch.zeros(
-            3, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
-        ),
-    )
+    # Real metadata rather than a bare SimpleNamespace: _lazy_init reads
+    # slot-pool sizing fields off it, and a sparse stub silently omits any
+    # field added later. Its own get_hidden_states serves the per-chunk
+    # captures, sized by the total_target_tokens passed below.
+    metadata = _make_metadata(max_num_requests=1)
+    metadata.request_ids = [100]
     worker._lazy_init(draft_model, metadata)
 
     first_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[3])
@@ -208,9 +207,6 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     slot = worker._req_to_slot[100]
     assert int(worker._ctx_len[slot]) == 3
 
-    metadata.get_hidden_states = lambda _num_tokens: torch.zeros(
-        2, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
-    )
     second_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[2])
     worker._seed_context_windows(
         draft_model, metadata, second_chunk, torch.tensor([[3, 4]], device="cuda"), 2

@@ -206,6 +206,7 @@ def get_spec_metadata(spec_config,
             dtype=model_config.torch_dtype,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
+            num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_dspark():
@@ -221,6 +222,7 @@ def get_spec_metadata(spec_config,
             dtype=model_config.torch_dtype,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
+            num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_draft_target_one_model():
