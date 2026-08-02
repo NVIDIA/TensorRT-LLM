@@ -155,10 +155,20 @@ def forced_verify_lens(*, num_gen_requests: int, tiers: Sequence[int],
     sweep and the bias is gone. SGLang solves the same problem with a runtime
     ``dspark_force_budget_frac`` knob.
 
-    Either form also breaks a circularity: the planner refuses to trim without a
-    profiled cost table -- correctly, since a flat model makes every extra token
-    look free -- so a run without one keeps the ragged path dark no matter what
-    the config says, and producing a table would require a working run.
+    Why this exists at all: the planner refuses to trim without a profiled cost
+    table -- correctly, since a flat model makes every extra token look free --
+    and even *with* one it declines whenever acceptance is high enough that
+    verifying the full block wins. On DeepSeek-V4-Pro-DSpark that is every
+    workload measured so far (GSM8K at accept_len 3.3, synthetic prompts at
+    4.1), so a planner-driven run leaves the trimming path unexecuted and
+    cannot answer whether that path is correct. Forcing the windows separates
+    "is trimming implemented correctly" from "should we trim here"; it is what
+    exposed a KV leak that every planner-driven run had missed.
+
+    NOT needed to produce a cost table. An earlier version of this note claimed
+    that, and it is wrong: dspark_sps_profiler pins RaggedVerifyMode.STATIC and
+    sweeps the verify length by rebuilding the engine per length, so table
+    collection never enables the ragged path.
 
     Neither form is a shortcut around the planner: both decide only *how many*
     drafted positions reach the target, exactly the quantity the planner decides.
