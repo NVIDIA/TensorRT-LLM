@@ -75,7 +75,23 @@ enum class MpiTag : int
 
     // Asynchronous context-transfer coordination.
     kContextTransferEvent = 1028,
-    kContextTransferUpdate = 1029
+    kContextTransferUpdate = 1029,
+
+    // Fault-tolerant NCCL communicator rendezvous. Each ownership path and
+    // protocol phase has a distinct tag so stale or simultaneous messages
+    // cannot be decoded as another phase's payload.
+    kNcclCommReady = 1030,
+    kNcclCommUniqueId = 1031,
+    kNcclCommAck = 1032,
+    kNcclPpReady = 1033,
+    kNcclPpUniqueId = 1034,
+    kNcclPpAck = 1035,
+
+    // Seeds used with the canonical group to derive MPI_Comm_create_group
+    // tags for dedicated, pre-failure NCCL rendezvous channels. These are
+    // separate from message tags and distinguish raw-op and PP ownership.
+    kNcclCommControl = 1036,
+    kNcclPpControl = 1037
 };
 
 } // namespace tensorrt_llm::mpi

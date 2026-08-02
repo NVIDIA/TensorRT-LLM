@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,10 +44,10 @@ public:
 
     int initialize()
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
         mNcclComm = getComm(mGroup);
         TLLM_CHECK_WITH_INFO(mGroup.size() > 0, "group size should be greater than 0");
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
         return 0;
     }
 
@@ -64,25 +64,37 @@ public:
             TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
         }
         std::vector<torch::Tensor> output_list(static_cast<size_t>(num_lists_));
+        for (int il = 0; il < num_lists_; ++il)
+        {
+            auto const off = il * num_ranks;
+            auto output_shape = input_list[off].sizes().vec();
+            output_shape.insert(output_shape.begin(), num_ranks);
+            output_list[il] = torch::empty(output_shape, input_list[off].options());
+        }
+
         auto stream = at::cuda::getCurrentCUDAStream(input_list[0].get_device());
-        ncclGroupStart();
+        auto commLease = acquireComm(mNcclComm);
+        auto const comm = commLease.get();
+        auto const watchdogToken = commLease.begin(stream, "ncclSend/ncclRecv(alltoall)");
+        commLease.groupStart("ncclGroupStart(alltoall)");
         for (int il = 0; il < num_lists_; ++il)
         {
             auto off = il * num_ranks;
-            auto output_shape = input_list[off].sizes().vec();
-            output_shape.insert(output_shape.begin(), num_ranks);
-            auto output = torch::empty(output_shape, input_list[off].options());
-            output_list[il] = output;
+            auto& output = output_list[il];
             auto type = tensorrt_llm::runtime::TorchUtils::dataType(input_list[off].scalar_type());
             auto nccl_type = (*getDtypeMap())[type];
             for (int r = 0; r < num_ranks; ++r)
             {
                 auto const& input = input_list[off + r];
-                ncclSend(input.data_ptr(), input.numel(), nccl_type, r, *mNcclComm, stream);
-                ncclRecv(output[r].mutable_data_ptr(), output[r].numel(), nccl_type, r, *mNcclComm, stream);
+                commLease.checkEnqueue(
+                    ncclSend(input.data_ptr(), input.numel(), nccl_type, r, comm, stream), "ncclSend(alltoall)");
+                commLease.checkEnqueue(
+                    ncclRecv(output[r].mutable_data_ptr(), output[r].numel(), nccl_type, r, comm, stream),
+                    "ncclRecv(alltoall)");
             }
         }
-        NCCLCHECK_THROW(ncclGroupEnd());
+        commLease.groupEnd("ncclGroupEnd(alltoall)");
+        commLease.track(watchdogToken, stream);
         return output_list;
     }
 

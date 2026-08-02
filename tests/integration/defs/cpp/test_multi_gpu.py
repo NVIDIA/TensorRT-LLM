@@ -1,6 +1,7 @@
 import os as _os
 import pathlib as _pl
 import platform
+import sys as _sys
 from enum import Enum, auto
 
 import defs.cpp.cpp_common as _cpp
@@ -147,6 +148,79 @@ def run_nccl_utils_tests(build_dir: _pl.Path, nprocs=2, timeout=300):
                      timeout=timeout)
 
 
+def run_nccl_rendezvous_recovery_tests(build_dir: _pl.Path, timeout=900):
+    tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"
+    report = build_dir / "results-nccl-rendezvous-recovery.xml"
+    test_filter = (r"^ncclUniqueIdRendezvousTest\."
+                   r"(mpi3|rawRecoveryMpi3|ppRecoveryMpi3|defaultOff)$")
+    ctest_command = [
+        "ctest",
+        "--output-on-failure",
+        "--no-tests=error",
+        "--parallel",
+        "1",
+        "--test-dir",
+        str(tests_dir),
+        "--tests-regex",
+        test_filter,
+        "--output-junit",
+        str(report),
+    ]
+
+    # The raw and PP cases intentionally replace process-global NCCL state.
+    # Their CTest definitions isolate the native processes; keep CTest itself
+    # serial so no two recovery cases share the node concurrently.
+    mgpu_env = get_multi_gpu_env()
+    # CTest owns the portable MPIEXEC command, so use OpenMPI's environment
+    # opt-in instead of injecting a launcher-specific command-line flag. This
+    # is required by the root CI container and is ignored by other MPI stacks.
+    mgpu_env["OMPI_ALLOW_RUN_AS_ROOT"] = "1"
+    mgpu_env["OMPI_ALLOW_RUN_AS_ROOT_CONFIRM"] = "1"
+    _cpp.parallel_run_ctest(
+        ctest_command,
+        cwd=build_dir,
+        env=mgpu_env,
+        timeout=timeout,
+        parallel=1,
+    )
+
+
+def run_nccl_allgather_reducescatter_recovery_test(timeout=300):
+    worker = _pl.Path(__file__).with_name(
+        "_nccl_rendezvous_recovery_mpi_worker.py")
+    repo_root = worker.resolve().parents[4]
+    thop_library = repo_root / "tensorrt_llm" / "libs" / "libth_common.so"
+    if not thop_library.is_file():
+        raise FileNotFoundError(
+            f"freshly built Torch operators are missing: {thop_library}")
+    command = [
+        "mpirun",
+        "-n",
+        "3",
+        "--allow-run-as-root",
+        _sys.executable,
+        str(worker),
+    ]
+    mgpu_env = get_multi_gpu_env()
+    mgpu_env["TLLM_FAULT_TOLERANCE_MODE"] = "1"
+    mgpu_env.pop("TLLM_DISABLE_MPI", None)
+    mgpu_env.pop("TRT_LLM_NO_LIB_INIT", None)
+    # Make the PR's Python sources authoritative even when the CI image also
+    # contains an installed TensorRT-LLM package.
+    previous_pythonpath = mgpu_env.get("PYTHONPATH")
+    pythonpath = [str(repo_root)]
+    if previous_pythonpath:
+        pythonpath.append(previous_pythonpath)
+    mgpu_env["PYTHONPATH"] = _os.pathsep.join(pythonpath)
+
+    _cpp.run_command(
+        command,
+        cwd=repo_root,
+        env=mgpu_env,
+        timeout=timeout,
+    )
+
+
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
 def test_mpi_utils(build_google_tests, build_dir):
@@ -195,3 +269,11 @@ def test_nccl_utils(build_google_tests, nprocs, build_dir):
 
     if platform.system() != "Windows":
         run_nccl_utils_tests(build_dir=build_dir, nprocs=nprocs, timeout=300)
+
+
+@pytest.mark.parametrize("build_google_tests", ["90"], indirect=True)
+def test_nccl_rendezvous_recovery(build_google_tests, build_dir):
+
+    if platform.system() != "Windows":
+        run_nccl_rendezvous_recovery_tests(build_dir=build_dir, timeout=900)
+        run_nccl_allgather_reducescatter_recovery_test(timeout=300)

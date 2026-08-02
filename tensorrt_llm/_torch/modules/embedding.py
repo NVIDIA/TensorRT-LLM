@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -5,12 +8,15 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
-from ..distributed import allgather
+from ..distributed import AllReduce, allgather
+from ..distributed.nccl_fault_tolerance import (
+    NCCL_FAULT_TOLERANCE_ENABLED, assert_nccl_group_not_reconfigured)
 from .linear import Linear, TensorParallelMode
 
 
@@ -282,6 +288,13 @@ class Embedding(LMHead):
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
+        # Column-parallel embeddings reduce masked vocabulary shards, whereas
+        # Linear only owns an allreduce for row-parallel projections.
+        if (self.all_reduce is None
+                and self.tp_mode == TensorParallelMode.COLUMN
+                and self.tp_size > 1 and self.reduce_output):
+            self.all_reduce = AllReduce(mapping=self.mapping, dtype=self.dtype)
+
         self.enable_torch_compile_for_embedding = enable_torch_compile_for_embedding
 
         if self.tp_size > 1:
@@ -294,6 +307,13 @@ class Embedding(LMHead):
             self.vocab_end_index = num_embeddings
 
     def forward(self, input):
+        if (NCCL_FAULT_TOLERANCE_ENABLED and self.tp_mode
+                in (TensorParallelMode.ROW, TensorParallelMode.COLUMN)
+                and self.tp_size > 1 and not mpi_disabled()):
+            assert_nccl_group_not_reconfigured(
+                self._tp_group_tuple,
+                f"{self.tp_mode.name.lower()}-parallel embedding")
+
         if self.tp_size > 1:
             # Run the ops before all_reduce/all_gather.
             # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.

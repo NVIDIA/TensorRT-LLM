@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,10 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/ncclCommunicator.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace th = torch;
 
@@ -34,6 +37,10 @@ public:
 
     void send(th::Tensor tensor, int64_t toRank) const;
     void recv(th::Tensor& tensor, int64_t fromRank) const;
+    void abort();
+    void abortAndReinit(std::vector<int64_t> const& activeRanks, int64_t rendezvousId);
+    [[nodiscard]] std::string getAsyncError() const;
+    [[nodiscard]] std::vector<int64_t> getActiveRanks() const;
 
 private:
     int32_t mRank;
