@@ -9,11 +9,9 @@ runs which "succeeded" having done nothing, detectable only from a counter
 (``steps_ragged: 0``) that nobody reads unless they already suspect the
 problem. Config errors belong at construction.
 
-``TLLM_DSPARK_FORCE_VERIFY_LENS`` is the deliberate exception -- not because
-table collection needs it (the profiler pins static mode and never enables
-ragged), but because the planner declines to trim whenever acceptance is high,
-which is every workload measured on this model. Without a way to impose
-windows the trimming path cannot be executed at all.
+There is no exception: a crafted (non-flat) cost table is how a test makes the
+planner trim, which exercises the real confidence-driven path rather than
+bypassing it. See tests/unittest/_torch/speculative/test_dspark_planner_trims.py.
 """
 
 import os
@@ -35,22 +33,13 @@ def _cfg(**kwargs):
 
 @patch.dict(os.environ, {}, clear=False)
 def test_ragged_without_a_cost_table_is_rejected():
-    os.environ.pop("TLLM_DSPARK_FORCE_VERIFY_LENS", None)
     with pytest.raises(ValueError, match="requires a profiled cost table"):
         _cfg()
 
 
 @patch.dict(os.environ, {}, clear=False)
 def test_ragged_with_an_sps_table_is_accepted():
-    os.environ.pop("TLLM_DSPARK_FORCE_VERIFY_LENS", None)
     cfg = _cfg(confidence_sps_table_path="/tmp/table.json")
-    assert cfg.enable_ragged_verify
-
-
-@patch.dict(os.environ, {"TLLM_DSPARK_FORCE_VERIFY_LENS": "1"}, clear=False)
-def test_forced_windows_bootstrap_without_a_table():
-    """The escape hatch must stay open, or trimming cannot be exercised."""
-    cfg = _cfg()
     assert cfg.enable_ragged_verify
 
 
@@ -62,7 +51,6 @@ def test_uniform_confidence_scheduling_still_needs_no_table():
     max tier, which is the pre-existing behaviour -- so requiring one there
     would break working configurations.
     """
-    os.environ.pop("TLLM_DSPARK_FORCE_VERIFY_LENS", None)
     cfg = DSparkDecodingConfig(max_draft_len=5,
                                speculative_model="/nonexistent/model",
                                enable_confidence_scheduling=True,

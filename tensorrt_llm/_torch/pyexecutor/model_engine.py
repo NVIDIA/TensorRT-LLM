@@ -2017,6 +2017,17 @@ class PyTorchModelEngine(ModelEngine):
                 # in this pass uses the non-greedy key; populate's override
                 # below will keep it False on every subsequent iteration.
                 spec_metadata.is_all_greedy_sample = False
+            # Measure what the captured graphs actually cost. Ragged keys graphs
+            # on (batch_size, token_bucket) rather than batch size alone, which
+            # multiplies the capture set -- 12.1 graphs per batch-size bucket
+            # against 4.1 uniform, measured. The graph count was easy to count
+            # from the log; the memory was not, and an OOM at max_batch_size=512
+            # reported 13.97 GiB in "private pools (e.g., CUDA Graphs)" without
+            # attributing it. Report the delta so the cost is a number rather
+            # than an inference.
+            _graph_mem_before = (torch.cuda.memory_reserved(),
+                                 torch.cuda.memory_allocated())
+            _graph_count = 0
             try:
                 for entry in graphs_to_capture:
                     # Ragged verification adds a token-count axis, so entries
@@ -2027,6 +2038,7 @@ class PyTorchModelEngine(ModelEngine):
                         continue
 
                     for max_seq_len in max_seq_len_list:
+                        _graph_count += 1
                         warmup_request = self._create_cuda_graph_warmup_request(
                             resource_manager, bs, draft_len, max_seq_len)
                         with self._release_batch_context(
@@ -2063,6 +2075,27 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
+                # Absolute private-pool size, not a delta. Deltas are useless
+                # here: an engine build runs several capture passes over a
+                # shared allocator, so the per-pass increments came out as
+                # +13.9 / +5.5 / -0.8 / +0.7 GiB for the same 19 graphs -- the
+                # later passes reuse pool memory the earlier ones reserved, and
+                # reserved can even fall. CUDA graphs live in private pools
+                # (segment_pool_id != (0, 0)), which is the same quantity
+                # PyTorch's OOM message reports as "allocated in private pools
+                # (e.g., CUDA Graphs)", so sum those directly.
+                _pool_bytes = 0
+                _pool_ids = set()
+                for _seg in torch.cuda.memory_snapshot():
+                    _pid = _seg.get("segment_pool_id", (0, 0))
+                    if _pid and tuple(_pid) != (0, 0):
+                        _pool_bytes += _seg.get("total_size", 0)
+                        _pool_ids.add(tuple(_pid))
+                logger.info(
+                    f"CUDA graph capture: {_graph_count} graphs this pass, "
+                    f"private pools now {_pool_bytes / (1 << 30):.3f} GiB "
+                    f"across {len(_pool_ids)} pool(s) "
+                    f"(ragged={getattr(self.spec_config, 'enable_ragged_verify', False)})")
 
         # The capture loop stamps `self.runtime_draft_len` per graph so each
         # captured shape is built at its own draft length. Nothing puts it back,

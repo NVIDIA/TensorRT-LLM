@@ -2868,8 +2868,7 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "per-request verify lengths are chosen from confidence-head "
                 "survival, which is only computed when scheduling is on")
         if (self.enable_ragged_verify and not self.confidence_sps_table_path
-                and not self.confidence_sts_path
-                and not os.environ.get("TLLM_DSPARK_FORCE_VERIFY_LENS")):
+                and not self.confidence_sts_path):
             # Without a profiled cost table the planner's budget degenerates to
             # verify-all -- correctly, since a flat model makes every extra
             # token look free -- so the ragged path silently never runs. That
@@ -2877,12 +2876,6 @@ class DSparkDecodingConfig(DecodingBaseConfig):
             # "succeeds" having done nothing and the only evidence is a counter
             # nobody reads. Fail at construction instead.
             #
-            # TLLM_DSPARK_FORCE_VERIFY_LENS is the deliberate exception. Not
-            # because table collection needs it -- dspark_sps_profiler pins
-            # STATIC mode and never enables ragged -- but because the planner
-            # declines to trim whenever acceptance is high, which is every
-            # workload measured on this model. Without a way to impose windows,
-            # the trimming path cannot be exercised or tested at all.
             raise ValueError(
                 "enable_ragged_verify=True requires a profiled cost table: pass "
                 "confidence_sps_table_path (produced by "

@@ -69,7 +69,6 @@ __all__ = [
     "RaggedVerifyMode",
     "read_ragged_verify_mode",
     "DSparkRaggedStats",
-    "forced_verify_lens",
 ]
 
 #: Overrides ``DSparkDecodingConfig`` so a mode can be selected without editing
@@ -121,100 +120,6 @@ def read_ragged_verify_mode(
     raise ValueError(
         f"invalid {RAGGED_VERIFY_MODE_ENV}={value!r}; expected one of "
         f"{', '.join(repr(m.value) for m in RaggedVerifyMode)}")
-
-
-#: Debug-only override that forces a deterministic non-uniform split. See
-#: :func:`forced_verify_lens`.
-FORCE_VERIFY_LENS_ENV = "TLLM_DSPARK_FORCE_VERIFY_LENS"
-
-
-def forced_verify_lens(*, num_gen_requests: int, tiers: Sequence[int],
-                       min_verify_len: int) -> Optional[List[int]]:
-    """A deterministic ragged split for correctness testing, or None.
-
-    Two forms:
-
-    ``TLLM_DSPARK_FORCE_VERIFY_LENS=1``
-        Every generation request takes a window from the captured tier ladder,
-        rotating by batch position -- a deliberately *non-uniform* split, which
-        is what exercises the ragged packing.
-
-    ``TLLM_DSPARK_FORCE_VERIFY_LENS=<n>`` (n a tier, e.g. ``3``)
-        Every request takes the same window ``n``. Uniform, so it exercises
-        nothing about raggedness -- its purpose is cost measurement.
-
-    The second form exists for SPS profiling. Sweeping the verify length by
-    shrinking ``block_size`` also shrinks the *draft* pass, but at deployment the
-    block is always drafted in full, so the measured step cost carries a draft
-    term that production does not pay. That term is bilinear in
-    ``(batch, verify_len)`` and therefore lies exactly in the column space the
-    additive fit spans, which means it is absorbed silently: theta comes out
-    inflated and alpha deflated, both biasing the planner toward over-trimming,
-    and the fit residual cannot see it. Forcing the window instead leaves
-    ``block_size`` at its full value, so the draft cost is constant across the
-    sweep and the bias is gone. SGLang solves the same problem with a runtime
-    ``dspark_force_budget_frac`` knob.
-
-    Why this exists at all: the planner refuses to trim without a profiled cost
-    table -- correctly, since a flat model makes every extra token look free --
-    and even *with* one it declines whenever acceptance is high enough that
-    verifying the full block wins. On DeepSeek-V4-Pro-DSpark that is every
-    workload measured so far (GSM8K at accept_len 3.3, synthetic prompts at
-    4.1), so a planner-driven run leaves the trimming path unexecuted and
-    cannot answer whether that path is correct. Forcing the windows separates
-    "is trimming implemented correctly" from "should we trim here"; it is what
-    exposed a KV leak that every planner-driven run had missed.
-
-    NOT needed to produce a cost table. An earlier version of this note claimed
-    that, and it is wrong: dspark_sps_profiler pins RaggedVerifyMode.STATIC and
-    sweeps the verify length by rebuilding the engine per length, so table
-    collection never enables the ragged path.
-
-    Neither form is a shortcut around the planner: both decide only *how many*
-    drafted positions reach the target, exactly the quantity the planner decides.
-    Acceptance is unchanged, so a forced split must produce the same answers as
-    ``static`` -- which is what makes it a usable correctness gate.
-
-    Returns:
-        One window per request, each drawn from ``tiers`` (so every choice has a
-        captured CUDA graph), or None when the override is off.
-
-    Raises:
-        ValueError: the value is neither a boolean form nor a captured tier.
-            Silently ignoring it would produce a run that looks forced and is
-            not -- the exact failure this override exists to rule out.
-    """
-    value = os.environ.get(FORCE_VERIFY_LENS_ENV, "").strip()
-    if not value or value in ("0", "false", "False"):
-        return None
-    ladder = sorted({int(t) for t in tiers if int(t) >= int(min_verify_len)})
-    if not ladder:
-        return None
-    if value in ("1", "true", "True"):
-        # Rotate through the ladder by position: deterministic, identical on
-        # every rank for a given batch position, and guaranteed to be non-uniform
-        # as soon as the batch is larger than one and the ladder has more than
-        # one entry.
-        #
-        # Note "1" is the rotating form, not the window 1. A single tier ladder
-        # makes the two coincide anyway, and the rotating form is the older
-        # meaning; spelling the uniform window as a value keeps both reachable.
-        return [ladder[i % len(ladder)] for i in range(int(num_gen_requests))]
-    try:
-        window = int(value)
-    except ValueError:
-        raise ValueError(
-            f"invalid {FORCE_VERIFY_LENS_ENV}={value!r}; expected 1 (rotate "
-            f"through the tier ladder) or one of the captured tiers {ladder}")
-    if window not in ladder:
-        raise ValueError(
-            f"{FORCE_VERIFY_LENS_ENV}={window} is not a captured tier; the "
-            f"available tiers are {ladder}. A window with no captured CUDA "
-            f"graph does not raise at runtime -- it silently drops every step "
-            f"out of graph replay, which costs far more than the trimmed "
-            f"tokens save and would make any measurement taken with it "
-            f"meaningless.")
-    return [window] * int(num_gen_requests)
 
 
 class DSparkRaggedStats:

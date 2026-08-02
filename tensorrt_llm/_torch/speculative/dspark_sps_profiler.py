@@ -22,7 +22,8 @@ table ``SpsCostTable.flat()`` is installed, ``is_flat`` is true, and
 ``DSparkVerifyPlanner.decide_verify_lens`` returns ``None`` on every step
 (``stats["fallback_flat_cost"]``) -- ragged verification is then a no-op that
 still produces correct output at baseline accuracy, i.e. it fails silently.
-``TLLM_DSPARK_FORCE_VERIFY_LENS=1`` unblocks *correctness* testing by bypassing
+A crafted (non-flat) cost table unblocks *correctness* testing by making the
+planner itself trim, rather than bypassing
 that gate, but it rotates a fixed ladder and knows nothing about cost, so it
 cannot answer "is trimming profitable here". Only a measured table can.
 
@@ -90,7 +91,7 @@ differences between candidate lengths and drags the argmax back to verify-all.
 Holding verification uniform
 ----------------------------
 The run pins ``TLLM_DSPARK_RAGGED_VERIFY_MODE=static`` and clears
-``TLLM_DSPARK_FORCE_VERIFY_LENS``. Under ``static`` the planner still chooses a
+a crafted cost table. Under ``static`` the planner still chooses a
 single batch-wide length, but the cost table it sees is the flat default, whose
 ``is_flat`` gate short-circuits to ``max_tier`` *before* any confidence is read
 -- so the length is deterministically ``max_draft_len`` on every step and
@@ -100,7 +101,7 @@ filed under, i.e. a moving target.
 
 That determinism is also why the ``L`` axis costs one engine build per value:
 nothing in the runtime pins a *uniform* verify length below the full block
-(``TLLM_DSPARK_FORCE_VERIFY_LENS`` produces a ragged rotation, and there is no
+(a ragged split would break the M = bs*(L+1) filing, and there is no
 analogue of SGLang's ``dspark_force_budget_frac``), so ``L`` is swept by
 rebuilding with ``max_draft_len = block_size = L``. Use ``--samples-out`` /
 ``--fit-only`` to split a long sweep across jobs and refit without a GPU.
@@ -175,7 +176,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .dspark_observability import FORCE_VERIFY_LENS_ENV, RAGGED_VERIFY_MODE_ENV, RaggedVerifyMode
+from .dspark_observability import RAGGED_VERIFY_MODE_ENV, RaggedVerifyMode
 from .dspark_planner import (
     SpsCostTable,
     budget_argmax_over_uniform_lens,
@@ -856,7 +857,7 @@ def profitability_probe(
     Runs :func:`~.dspark_planner.budget_argmax_over_uniform_lens` -- the actual
     production argmax, not a re-derivation -- against a geometric survival curve
     ``p**(j+1)``. This is the question the table exists to answer and the one
-    ``TLLM_DSPARK_FORCE_VERIFY_LENS`` cannot: at what acceptance rate does
+    a single sweep cannot: at what acceptance rate does
     trimming become the better trade, and does it ever?
     """
     table = load_cost_table(payload)
@@ -1108,14 +1109,6 @@ def _prepare_environment(config: SweepConfig) -> None:
     Set before the LLM is constructed because the worker processes inherit the
     environment at spawn and read these once.
     """
-    if os.environ.get(FORCE_VERIFY_LENS_ENV):
-        print(
-            f"[dspark-sps] clearing {FORCE_VERIFY_LENS_ENV}: it rotates a ragged "
-            f"split across the batch, so M would no longer be bs*(L+1) and every "
-            f"cell would be filed under the wrong token count.",
-            file=sys.stderr,
-        )
-        os.environ.pop(FORCE_VERIFY_LENS_ENV, None)
     os.environ[RAGGED_VERIFY_MODE_ENV] = RaggedVerifyMode.STATIC.value
     if config.pin_acceptance:
         from .interface import FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR

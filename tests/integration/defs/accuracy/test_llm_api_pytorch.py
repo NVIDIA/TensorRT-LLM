@@ -4136,7 +4136,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         Accuracy alone would not establish much here -- the planner declines to
         trim without a profiled SPS cost table, and a run where it declined on
         every step is a uniform baseline wearing a different config, scoring
-        exactly the same. ``TLLM_DSPARK_FORCE_VERIFY_LENS`` exists for that
+        exactly the same. A crafted non-flat cost table exists for that
         reason: it hands out windows from the captured ladder deterministically,
         which separates "is the ragged packing correct" from "does the planner
         choose to trim". Set it in the environment when running this to test the
