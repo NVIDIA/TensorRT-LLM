@@ -2708,3 +2708,40 @@ def test_cpp_hybrid_zero_local_mamba_layers():
         )
     )
     assert metadata.state_indices[0].item() == 0
+
+
+def test_hybrid_available_tokens_base_decode_token_is_v2_only(monkeypatch):
+    """RCCA: https://nvbugs/6529792.
+
+    ``KVCacheManagerV2.get_num_available_tokens`` charges the base decode token that
+    ``add_dummy_requests(is_gen=True)`` reserves, gated on ``batch_size``. Both hybrid
+    subclasses must stay on the correct side of that gate: the V2 one inherits the
+    charged budget (it delegates ``add_dummy_requests`` to V2, so an uncharged budget
+    would overshoot the pool by a whole block), while the Cpp one derives from V1 --
+    whose reservation has no such token -- so its override must keep passing
+    ``batch_size`` through untouched instead of deducting one.
+    """
+    # The V2 hybrid must resolve to V2's charged accessor itself; shadowing it here
+    # would silently reintroduce the bug. Identity is what carries the charged
+    # budget over, so the budget arithmetic needs testing only once, against
+    # KVCacheManagerV2 (see test_available_tokens_charges_base_decode_token_*).
+    assert (
+        MambaHybridCacheManagerV2.get_num_available_tokens
+        is KVCacheManagerV2.get_num_available_tokens
+    )
+
+    # V1 ignores batch_size, so the Cpp override must return the parent's value as-is.
+    assert issubclass(CppMambaHybridCacheManager, KVCacheManager)
+    pool_tokens = 1024
+    seen = {}
+
+    def fake_v1_accessor(self, token_num_upper_bound, max_num_draft_tokens=0, **kwargs):
+        seen.update(kwargs)
+        return pool_tokens
+
+    monkeypatch.setattr(KVCacheManager, "get_num_available_tokens", fake_v1_accessor)
+    cpp = object.__new__(CppMambaHybridCacheManager)
+    cpp.local_num_mamba_layers = 0
+    cpp.linear_attention_metadata = None
+    assert cpp.get_num_available_tokens(8192, batch_size=8) == pool_tokens
+    assert seen == {"batch_size": 8}

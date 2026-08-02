@@ -2099,13 +2099,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0
     ) -> int:
         extra_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
-        # A generation request also spends one base decode token: add_dummy_requests
-        # and try_allocate_generation grow capacity by ``1 + draft`` (see
-        # _required_gen_capacity), as does the max_blocks_per_seq sizing in __init__.
-        # Charge it so this budget is the exact inverse of that reservation, else a
-        # pool-bound caller overshoots by one token — a whole block past a boundary.
-        # Only multi-request callers pass batch_size, so the single-request default
-        # leaves context-phase budgets untouched.
+        # A generation request also spends one base decode token: _required_gen_capacity
+        # grows capacity by ``1 + draft``. Charge it so this budget is the exact inverse
+        # of that reservation, else a pool-bound caller overshoots by one token — a
+        # whole block past a boundary. Only multi-request callers pass batch_size, so
+        # the single-request default leaves context-phase budgets untouched.
         if batch_size > 1:
             extra_tokens += 1
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.

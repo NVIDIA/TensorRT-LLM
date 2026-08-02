@@ -558,7 +558,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
 
 @pytest.mark.parametrize("max_num_draft_tokens", [0, 4])
 def test_available_tokens_charges_base_decode_token_for_multi_request(max_num_draft_tokens):
-    """RCCA https://nvbugs/6529792.
+    """RCCA: https://nvbugs/6529792.
 
     ``add_dummy_requests(is_gen=True)`` grows capacity to
     ``token_num + num_extra_kv_tokens + kv_reserve_draft_tokens + 1``, so a budget
@@ -587,13 +587,12 @@ def test_available_tokens_charges_base_decode_token_for_multi_request(max_num_dr
         token_num_upper_bound=8192, batch_size=8, max_num_draft_tokens=max_num_draft_tokens
     )
 
-    # The multi-request budget must leave room for the base decode token...
-    assert multi == single - 1
-    # ...and the single-request default must keep its historical value.
-    assert single == pool_tokens - num_extra_kv_tokens - max_num_draft_tokens
-    # The budget is the exact inverse of the reservation it feeds (mirrors
+    # The single-request default keeps its historical value, and the multi-request
+    # budget leaves room for exactly one more token. Together these pin the budget
+    # as the exact inverse of the reservation it feeds (mirroring
     # _required_gen_capacity): tight, not merely safe — one more token overflows.
-    assert multi + num_extra_kv_tokens + max_num_draft_tokens + 1 == pool_tokens
+    assert single == pool_tokens - num_extra_kv_tokens - max_num_draft_tokens
+    assert multi == single - 1
 
 
 def test_disagg_role_mapper_kinds_default_to_indexed():
