@@ -23,7 +23,7 @@ unchanged avoids coupling the optimization to weight loading, quantization,
 LoRA, or attention-backend fallback behavior.
 """
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import triton
@@ -162,6 +162,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
         tl.store(output_base + head_offsets, value, mask=head_mask)
 
 
+@torch.library.custom_op("trtllm::fused_qkv_gemma_rmsnorm_rope_gate", mutates_args=())
 def fused_qkv_gemma_rmsnorm_rope_gate(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
@@ -173,7 +174,7 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
-    mrope_section: Optional[Tuple[int, int, int]] = None,
+    mrope_section: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Prepare packed QKV and gate with one Triton kernel.
 
@@ -191,7 +192,7 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
         head_dim: Per-head Q/K/V dimension.
         rotary_dim: Prefix dimension receiving NeoX RoPE.
         mrope_section: Temporal/height/width rotary-half dimensions. ``None``
-            selects plain RoPE; a tuple selects Qwen-style interleaved MRoPE.
+            selects plain RoPE; a list selects Qwen-style interleaved MRoPE.
 
     Returns:
         Packed QKV ``[num_tokens, q_size + 2 * kv_size]`` and gate
@@ -265,6 +266,28 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     return qkv_out, gate_out
 
 
+@fused_qkv_gemma_rmsnorm_rope_gate.register_fake
+def _(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    mrope_section: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = qkv.shape[0]
+    q_size = num_q_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    qkv_out = qkv.new_empty((num_tokens, q_size + 2 * kv_size))
+    gate_out = qkv.new_empty((num_tokens, num_q_heads, head_dim))
+    return qkv_out, gate_out
+
+
 @triton.jit
 def _fused_sigmoid_mul_kernel(
     output_ptr,
@@ -302,13 +325,9 @@ def _fused_sigmoid_mul_kernel(
     )
 
 
-def fused_sigmoid_mul(
-    attention_output: torch.Tensor,
-    gate: torch.Tensor,
-    *,
-    inplace: bool = False,
-) -> torch.Tensor:
-    """Compute ``attention_output * sigmoid(gate)`` in one kernel."""
+@torch.library.custom_op("trtllm::fused_sigmoid_mul", mutates_args=("attention_output",))
+def fused_sigmoid_mul(attention_output: torch.Tensor, gate: torch.Tensor) -> None:
+    """Compute ``attention_output *= sigmoid(gate)`` in one kernel, in place."""
     assert attention_output.dim() == 2 and attention_output.stride(-1) == 1
     num_tokens, hidden_size = attention_output.shape
     if gate.dim() == 3:
@@ -325,18 +344,17 @@ def fused_sigmoid_mul(
         gate_stride_token = gate.stride(0)
         gate_stride_head = hidden_size
 
-    output = attention_output if inplace else torch.empty_like(attention_output)
     if num_tokens == 0:
-        return output
+        return
 
     max_block_size = 1024 if num_tokens < 1024 else 2048
     block_size = min(triton.next_power_of_2(hidden_size), max_block_size)
     grid = (num_tokens, triton.cdiv(hidden_size, block_size))
     _fused_sigmoid_mul_kernel[grid](
-        output,
+        attention_output,
         attention_output,
         gate,
-        output.stride(0),
+        attention_output.stride(0),
         attention_output.stride(0),
         gate_stride_token,
         gate_stride_head,
@@ -345,4 +363,8 @@ def fused_sigmoid_mul(
         block_size=block_size,
         num_warps=4,
     )
-    return output
+
+
+@fused_sigmoid_mul.register_fake
+def _(attention_output: torch.Tensor, gate: torch.Tensor) -> None:
+    return None

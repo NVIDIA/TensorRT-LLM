@@ -84,6 +84,9 @@ def inplace_info():
         torch.ops.trtllm.fused_qk_norm_rope.default: {
             1: "qkv"
         },
+        torch.ops.trtllm.fused_sigmoid_mul.default: {
+            1: "attention_output"
+        },
         torch.ops.trtllm.fused_dit_qk_norm_rope.default: {
             1: "qkv"
         },
