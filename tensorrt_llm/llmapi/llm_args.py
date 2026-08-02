@@ -2891,8 +2891,9 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "the cost of extra verify tokens against their expected "
                 "acceptance, so it declines to trim and every request receives "
                 "the full window -- the ragged path runs but changes nothing. "
-                "To bootstrap a table, set TLLM_DSPARK_FORCE_VERIFY_LENS to "
-                "impose windows without the planner.")
+                "Collecting a table does NOT require this flag: the profiler "
+                "pins static mode and sweeps the verify length by rebuilding "
+                "the engine, so run it with ragged verification off.")
         return self
 
     @model_validator(mode="after")

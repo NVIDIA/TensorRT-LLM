@@ -9,8 +9,11 @@ runs which "succeeded" having done nothing, detectable only from a counter
 (``steps_ragged: 0``) that nobody reads unless they already suspect the
 problem. Config errors belong at construction.
 
-``TLLM_DSPARK_FORCE_VERIFY_LENS`` is the deliberate exception: producing a cost
-table requires a working ragged run, and that knob is what breaks the circle.
+``TLLM_DSPARK_FORCE_VERIFY_LENS`` is the deliberate exception -- not because
+table collection needs it (the profiler pins static mode and never enables
+ragged), but because the planner declines to trim whenever acceptance is high,
+which is every workload measured on this model. Without a way to impose
+windows the trimming path cannot be executed at all.
 """
 
 import os
@@ -46,7 +49,7 @@ def test_ragged_with_an_sps_table_is_accepted():
 
 @patch.dict(os.environ, {"TLLM_DSPARK_FORCE_VERIFY_LENS": "1"}, clear=False)
 def test_forced_windows_bootstrap_without_a_table():
-    """The escape hatch must stay open, or the table can never be produced."""
+    """The escape hatch must stay open, or trimming cannot be exercised."""
     cfg = _cfg()
     assert cfg.enable_ragged_verify
 
