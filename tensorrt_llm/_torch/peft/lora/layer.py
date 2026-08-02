@@ -562,6 +562,10 @@ class LoraLayer(torch.nn.Module):
             host_max_out_sizes, grouped_gemm_params.splitk_offsets,
             grouped_gemm_params.reordered_input.dtype, min_kn)
 
+        # PyTorch does not implement index_copy_ for FP8 tensors.
+        if output_buffer.dtype == torch.float8_e4m3fn:
+            output_buffer = output_buffer.to(torch.bfloat16)
+
         # TODO: move to kernel
         restored_output = torch.zeros_like(output_buffer)
         restored_output.index_copy_(0,
