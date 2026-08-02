@@ -1007,6 +1007,7 @@ class SweepConfig:
     input_len: int = 1024
     warmup_steps: int = 16
     measure_steps: int = 64
+    repeats: int = 1
     min_samples: int = 16
     max_seq_len: int = 4096
     max_num_tokens: int = 8192
@@ -1059,6 +1060,27 @@ class SweepConfig:
                 f"generated) but --max-seq-len is {self.max_seq_len}; raise it or "
                 f"lower --input-len / --measure-steps"
             )
+        # get_stats is served from a queue that retains on the order of 1000
+        # ROWS, and attention-DP publishes one row per rank per iteration. A
+        # cell longer than that window keeps only its tail, which is the drain
+        # phase -- every step there has ranks disagreeing on numGenRequests, so
+        # the cell yields nothing and looks like it never ran. Raising
+        # --measure-steps past the window therefore makes things strictly worse;
+        # use --repeats to get more samples instead.
+        rows_per_iteration = self.dp_size
+        window_iterations = _STATS_ROW_BUDGET // max(rows_per_iteration, 1)
+        cell_iterations = int(self.warmup_steps) + int(self.measure_steps)
+        if cell_iterations > window_iterations:
+            print(
+                f"[dspark-sps] WARNING: a cell runs {cell_iterations} iterations "
+                f"but only about {window_iterations} fit in the retained stats "
+                f"window ({_STATS_ROW_BUDGET} rows / {rows_per_iteration} ranks). "
+                f"Only the tail survives, and the tail is the drain phase, so "
+                f"cells will come back empty. Lower --measure-steps to "
+                f"<= {window_iterations - int(self.warmup_steps)} and raise "
+                f"--repeats instead.",
+                file=sys.stderr,
+            )
         if self.input_len > self.max_num_tokens:
             raise SweepGeometryError(
                 f"--input-len {self.input_len} exceeds --max-num-tokens "
@@ -1072,6 +1094,12 @@ class SweepConfig:
                 f"but --max-num-tokens is {self.max_num_tokens}; the batch would be "
                 f"split and no step would ever have the shape it is filed under"
             )
+
+
+#: Approximate number of stats rows ``get_stats`` retains for one drain. Not a
+#: constant the runtime exports; measured as 1001 rows surviving a 1300-step
+#: attention-DP cell, i.e. the last 125 of its iterations.
+_STATS_ROW_BUDGET = 1000
 
 
 def _prepare_environment(config: SweepConfig) -> None:
@@ -1235,7 +1263,13 @@ def run_sweep(config: SweepConfig) -> List[StepSample]:
         try:
             for batch_size in sorted(config.batch_sizes):
                 started = time.time()
-                cell = _run_cell(llm, config, batch_size=batch_size, verify_len=verify_len)
+                cell = []
+                for _ in range(max(1, int(config.repeats))):
+                    # Each repeat drains the stats queue again, so repeats add
+                    # samples where a longer single cell would only overflow the
+                    # retained window.
+                    cell.extend(_run_cell(llm, config, batch_size=batch_size,
+                                          verify_len=verify_len))
                 print(
                     f"[dspark-sps]   bs={batch_size:>5} L={verify_len} "
                     f"M={total_verify_tokens(batch_size, verify_len):>6} "
@@ -1360,6 +1394,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not force bonus-token-only acceptance. Leaves KV growth rate "
         "dependent on the block length, which contaminates theta(M).",
     )
+    parser.add_argument(
+        "--repeats", type=int, default=1,
+        help="run each cell this many times and pool the samples; the way to "
+             "get more samples per cell, since a longer cell overflows the "
+             "retained stats window and keeps only its drain phase")
     parser.set_defaults(pin_acceptance=True)
 
     fit = parser.add_argument_group("fit")
@@ -1444,6 +1483,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             input_len=args.input_len,
             warmup_steps=args.warmup_steps,
             measure_steps=args.measure_steps,
+            repeats=args.repeats,
             min_samples=args.min_samples,
             max_seq_len=args.max_seq_len,
             max_num_tokens=args.max_num_tokens,
