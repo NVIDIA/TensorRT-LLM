@@ -654,8 +654,21 @@ class LmEvalEvaluator(Evaluator):
                 f"lm-eval {self.task_name} {scores_filter} accuracy: {result_acc:.2f}"
             )
         else:
-            result_acc = np.mean(
-                [acc for m, acc in scores.items() if "_stderr" not in m])
+            # lm-eval mixes non-numeric entries into the score dict -- notably
+            # "alias", whose value is the task name -- so averaging everything
+            # that is not a stderr key fails with "resolved dtypes are not
+            # compatible with add.reduce" once one of them is a string. Keep
+            # only the numeric metrics.
+            numeric = [
+                acc for m, acc in scores.items()
+                if "_stderr" not in m and isinstance(acc, (int, float))
+                and not isinstance(acc, bool)
+            ]
+            if not numeric:
+                raise ValueError(
+                    f"lm-eval returned no numeric metrics for "
+                    f"{self.task_name}; got {sorted(scores)}")
+            result_acc = np.mean(numeric)
             logger.info(
                 f"lm-eval {self.task_name} average accuracy: {result_acc:.2f}")
         return result_acc
