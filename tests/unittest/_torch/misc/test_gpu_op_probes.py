@@ -30,12 +30,13 @@ import weakref
 
 import pytest
 import torch
-
-from _torch.gpu_op_probes import (alloc_with_recycled_id,
-                                  alloc_with_recycled_id_or_skip,
-                                  assert_delayed_stream_parity,
-                                  run_on_delayed_stream,
-                                  same_object_reuse_probe)
+from _torch.gpu_op_probes import (
+    alloc_with_recycled_id,
+    alloc_with_recycled_id_or_skip,
+    assert_delayed_stream_parity,
+    run_on_delayed_stream,
+    same_object_reuse_probe,
+)
 
 # ---------------------------------------------------------------------------
 # Toy id-keyed cache. The "op" doubles even tensors and negates odd ones,
@@ -46,7 +47,6 @@ from _torch.gpu_op_probes import (alloc_with_recycled_id,
 
 
 class ToyIdKeyedCacheOp:
-
     def __init__(self, prune_on_gc: bool):
         self._verdict_cache = {}
         self._prune_on_gc = prune_on_gc
@@ -97,8 +97,8 @@ def test_recycled_id_probe_detects_stale_cache_entry():
         pytest.skip("could not obtain a recycled id")
     assert id(t2) in op._verdict_cache  # the stale entry is still there
     assert not torch.equal(op(t2), toy_reference(t2)), (
-        "expected the deliberately unsound toy cache to be caught by the "
-        "recycled-id probe")
+        "expected the deliberately unsound toy cache to be caught by the recycled-id probe"
+    )
 
 
 def test_recycled_id_probe_passes_sound_cache():
@@ -128,17 +128,25 @@ def test_same_object_reuse_probe_detects_stale_cache_entry():
     op = ToyIdKeyedCacheOp(prune_on_gc=False)
     key_tensor = _make_even()
     with pytest.raises(AssertionError, match="call 1"):
-        same_object_reuse_probe(op, toy_reference, key_tensor,
-                                [_make_even(), _make_odd()],
-                                assert_close=_toy_assert_equal)
+        same_object_reuse_probe(
+            op,
+            toy_reference,
+            key_tensor,
+            [_make_even(), _make_odd()],
+            assert_close=_toy_assert_equal,
+        )
 
 
 def test_same_object_reuse_probe_passes_contents_keyed_op():
     """An op that derives its verdict from contents on every call (here: the
     reference itself) passes the same-object-reuse probe."""
-    same_object_reuse_probe(toy_reference, toy_reference, _make_even(),
-                            [_make_even(), _make_odd()],
-                            assert_close=_toy_assert_equal)
+    same_object_reuse_probe(
+        toy_reference,
+        toy_reference,
+        _make_even(),
+        [_make_even(), _make_odd()],
+        assert_close=_toy_assert_equal,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,8 +155,7 @@ def test_same_object_reuse_probe_passes_contents_keyed_op():
 # default stream instead of torch.cuda.current_stream()).
 # ---------------------------------------------------------------------------
 
-cuda_only = pytest.mark.skipif(not torch.cuda.is_available(),
-                               reason="requires CUDA")
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 def stream_correct_op(a, b):

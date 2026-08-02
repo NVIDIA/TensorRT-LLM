@@ -69,16 +69,16 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def alloc_with_recycled_id(target_id: int,
-                           make: Callable[[], Any],
-                           attempts: int = 512) -> Optional[Any]:
+def alloc_with_recycled_id(
+    target_id: int, make: Callable[[], Any], attempts: int = 512
+) -> Optional[Any]:
     """Allocate via ``make()`` until an object lands on address ``target_id``.
 
     Intended usage, given some tensor ``t1`` whose ``id`` was used as a cache
     key::
 
         old_id = id(t1)
-        del t1          # drop the *only* reference
+        del t1  # drop the *only* reference
         gc.collect()
         t2 = alloc_with_recycled_id(old_id, lambda: make_tensor(...))
 
@@ -102,9 +102,9 @@ def alloc_with_recycled_id(target_id: int,
     return None
 
 
-def alloc_with_recycled_id_or_skip(target_id: int,
-                                   make: Callable[[], Any],
-                                   attempts: int = 512) -> Any:
+def alloc_with_recycled_id_or_skip(
+    target_id: int, make: Callable[[], Any], attempts: int = 512
+) -> Any:
     """Like :func:`alloc_with_recycled_id`, but ``pytest.skip`` when the id
     cannot be recycled instead of returning ``None``.
 
@@ -114,17 +114,18 @@ def alloc_with_recycled_id_or_skip(target_id: int,
     gc.collect()  # make sure the target slot is actually free
     obj = alloc_with_recycled_id(target_id, make, attempts=attempts)
     if obj is None:
-        pytest.skip(f"could not land a new object on recycled id "
-                    f"{target_id:#x} within {attempts} attempts")
+        pytest.skip(
+            f"could not land a new object on recycled id {target_id:#x} within {attempts} attempts"
+        )
     return obj
 
 
 def same_object_reuse_probe(
-        op: Callable[[torch.Tensor], Any],
-        reference: Callable[[torch.Tensor], Any],
-        key_tensor: torch.Tensor,
-        payloads: Iterable[torch.Tensor],
-        assert_close: Callable[[Any, Any, str], None],
+    op: Callable[[torch.Tensor], Any],
+    reference: Callable[[torch.Tensor], Any],
+    key_tensor: torch.Tensor,
+    payloads: Iterable[torch.Tensor],
+    assert_close: Callable[[Any, Any, str], None],
 ) -> None:
     """Drive an op with the *same* tensor object carrying *different*
     contents on successive calls, checking each call against a reference.
@@ -164,9 +165,9 @@ def _map_tensors(fn, obj):
     return obj
 
 
-def run_on_delayed_stream(op: Callable[..., Any],
-                          inputs: Sequence[torch.Tensor],
-                          delay_cycles: int = 1 << 27) -> Any:
+def run_on_delayed_stream(
+    op: Callable[..., Any], inputs: Sequence[torch.Tensor], delay_cycles: int = 1 << 27
+) -> Any:
     """Run ``op(*inputs)`` on a fresh non-blocking CUDA stream whose queue is
     held back by a GPU sleep, with the input buffers written *behind* the
     sleep and the outputs consumed on that stream immediately after the call.
@@ -212,12 +213,13 @@ def run_on_delayed_stream(op: Callable[..., Any],
 
 
 def assert_delayed_stream_parity(
-        op: Callable[..., Any],
-        inputs: Sequence[torch.Tensor],
-        reference: Optional[Callable[..., Any]] = None,
-        delay_cycles: int = 1 << 27,
-        assert_close: Optional[Callable[[Any, Any, str], None]] = None,
-        warmup: bool = True) -> Tuple[Any, Any]:
+    op: Callable[..., Any],
+    inputs: Sequence[torch.Tensor],
+    reference: Optional[Callable[..., Any]] = None,
+    delay_cycles: int = 1 << 27,
+    assert_close: Optional[Callable[[Any, Any, str], None]] = None,
+    warmup: bool = True,
+) -> Tuple[Any, Any]:
     """Check that ``op`` produces the same result on a delayed non-default
     stream (see :func:`run_on_delayed_stream`) as ``reference`` does on the
     default stream. This is a deterministic detector for custom-op launchers
@@ -245,12 +247,9 @@ def assert_delayed_stream_parity(
     if assert_close is None:
 
         def assert_close(actual, expected, label):
-            torch.testing.assert_close(actual, expected, msg=lambda m:
-                                       f"[{label}] {m}")
+            torch.testing.assert_close(actual, expected, msg=lambda m: f"[{label}] {m}")
 
-    ref_inputs = [
-        x.clone() if isinstance(x, torch.Tensor) else x for x in inputs
-    ]
+    ref_inputs = [x.clone() if isinstance(x, torch.Tensor) else x for x in inputs]
     expected = reference(*ref_inputs)
     if warmup:
         op(*[x.clone() if isinstance(x, torch.Tensor) else x for x in inputs])
