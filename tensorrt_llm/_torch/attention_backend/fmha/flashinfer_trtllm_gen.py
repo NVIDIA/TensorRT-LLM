@@ -95,7 +95,7 @@ def _patch_flashinfer_dynamic_tensor_spec_eq() -> None:
     try:
         from flashinfer.autotuner.autotuner import DynamicTensorSpec
 
-        def _probe_spec():
+        def _probe_spec() -> DynamicTensorSpec:
             return DynamicTensorSpec(
                 input_idx=(0,),
                 dim_idx=(0,),
@@ -108,7 +108,7 @@ def _patch_flashinfer_dynamic_tensor_spec_eq() -> None:
         if not (hash(a) == hash(b) and a != b):
             return  # flashinfer without the inconsistency; nothing to do
 
-        def _hash_consistent_eq(self, other):
+        def _hash_consistent_eq(self: DynamicTensorSpec, other: object) -> bool:
             if self is other:
                 return True
             if not isinstance(other, DynamicTensorSpec):
@@ -131,7 +131,7 @@ def _patch_flashinfer_dynamic_tensor_spec_eq() -> None:
             "Patched flashinfer DynamicTensorSpec.__eq__ to be hash-consistent "
             "(autotuner cache collision-chain workaround)."
         )
-    except Exception:
+    except (ImportError, AttributeError, TypeError):
         # A future flashinfer refactor (moved class, changed fields) must not
         # break attention; it just loses the workaround.
         logger.debug("Skipping flashinfer DynamicTensorSpec.__eq__ workaround.", exc_info=True)
