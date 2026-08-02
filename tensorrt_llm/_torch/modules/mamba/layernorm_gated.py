@@ -16,6 +16,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -189,7 +191,7 @@ def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
             and ngroups == 1 and N <= _MULTIROW_MAX_N and (N & (N - 1)) == 0)
 
 
-def rms_norm_gated_token_major(x, z, weight, eps, out=None, fp8_scale=None):
+def _rms_norm_gated_token_major(x, z, weight, eps, out=None, fp8_scale=None):
     """rmsnorm(x) * silu(z) with z read in place from a 3D token-major view.
 
     x: [num_tokens * heads, N] with contiguous rows. z: [num_tokens, heads, N]
@@ -246,6 +248,34 @@ def rms_norm_gated_token_major(x, z, weight, eps, out=None, fp8_scale=None):
             num_warps=_MULTIROW_NUM_WARPS,
         )
     return out
+
+
+@torch.library.custom_op("trtllm::rms_norm_gated_token_major", mutates_args=())
+def rms_norm_gated_token_major(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    fp8_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return _rms_norm_gated_token_major(x,
+                                       z,
+                                       weight,
+                                       eps,
+                                       out=None,
+                                       fp8_scale=fp8_scale)
+
+
+@rms_norm_gated_token_major.register_fake
+def _(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    fp8_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
+    return torch.empty_like(x, dtype=out_dtype)
 
 
 def _layer_norm_fwd(
