@@ -51,6 +51,18 @@ from .interface import (Evaluator, dump_inference_results,
 LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER = "<image>"
 
 
+def _is_metric_key(key: str) -> bool:
+    """Whether a ``results[task]`` key is a metric rather than bookkeeping.
+
+    lm-eval keys every metric as ``"<metric>,<filter>"`` -- ``"exact_match,
+    strict-match"``, ``"acc,none"``. Entries without a comma are bookkeeping:
+    ``"alias"`` is the task name, ``"samples"`` is the example count. Both had
+    been treated as scores, which scaled gsm8k's 1319 samples to 131900 and
+    averaged it into the reported accuracy.
+    """
+    return "," in key
+
+
 class LmEvalWrapper(TemplateLM):
 
     def __init__(self,
@@ -635,10 +647,17 @@ class LmEvalEvaluator(Evaluator):
             system_instruction=self.system_prompt,
             log_samples=self.log_samples)
 
-        # Normalize scores to range 0~100
+        # Normalize scores to range 0~100.
+        #
+        # Only real metrics. lm-eval keys a metric as "<metric>,<filter>" (for
+        # example "exact_match,strict-match"); everything without a comma is
+        # bookkeeping -- "alias" holds the task name, "samples" holds the
+        # example count. Scaling those too turned gsm8k's 1319 samples into
+        # 131900, which then dominated the average below.
         scores = results["results"][self.task_name]
         for metric in scores.keys():
-            if isinstance(scores[metric], (float, int)):
+            if _is_metric_key(metric) and isinstance(scores[metric],
+                                                     (float, int)):
                 scores[metric] *= 100
         logger.info(
             f"lm-eval {self.task_name} results (scores normalized to range 0~100):\n{lm_eval.utils.make_table(results)}"
@@ -654,15 +673,18 @@ class LmEvalEvaluator(Evaluator):
                 f"lm-eval {self.task_name} {scores_filter} accuracy: {result_acc:.2f}"
             )
         else:
-            # lm-eval mixes non-numeric entries into the score dict -- notably
-            # "alias", whose value is the task name -- so averaging everything
-            # that is not a stderr key fails with "resolved dtypes are not
-            # compatible with add.reduce" once one of them is a string. Keep
-            # only the numeric metrics.
+            # Average the metrics only. The score dict also carries
+            # bookkeeping: "alias" is the task name (a string, which made
+            # numpy fail with "resolved dtypes are not compatible with
+            # add.reduce"), and "samples" is the example count -- for gsm8k
+            # that is 1319, and averaging it in produced 44030.98 against a
+            # reference of 96, which *passed* the accuracy assertion. A wrong
+            # number that clears the threshold is worse than the crash it
+            # replaced, so both are excluded structurally rather than by name.
             numeric = [
                 acc for m, acc in scores.items()
-                if "_stderr" not in m and isinstance(acc, (int, float))
-                and not isinstance(acc, bool)
+                if _is_metric_key(m) and "_stderr" not in m
+                and isinstance(acc, (int, float)) and not isinstance(acc, bool)
             ]
             if not numeric:
                 raise ValueError(
