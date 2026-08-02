@@ -481,8 +481,7 @@ TEST_F(CacheTransBufferTest, TestHybridRecurrentStatesPool)
             tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
             std::vector<SizeType32>{recurrentStatesWindow, maxAttentionWindow}, tensorrt_llm::DataType::kFP8,
             /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/false,
-            CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true,
-            nullptr,
+            CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr,
             /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
             /*indexerKCacheUseFp4=*/false, linearAttentionMetadata, poolConfigurations);
         cacheManager->allocatePools(/*useUvm=*/false);
@@ -503,8 +502,8 @@ TEST_F(CacheTransBufferTest, TestHybridRecurrentStatesPool)
         // Differing recurrent-states dtype: unsupported on the disagg KV wire; must
         // fail loudly at construction instead of stalling transfers at runtime.
         auto cacheManager = makeCacheManager(tensorrt_llm::DataType::kHALF);
-        EXPECT_THROW(std::make_unique<CacheTransBufferManager>(cacheManager.get(),
-                         std::optional<size_t>{tokensPerBlock * 4}),
+        EXPECT_THROW(
+            std::make_unique<CacheTransBufferManager>(cacheManager.get(), std::optional<size_t>{tokensPerBlock * 4}),
             tensorrt_llm::common::TllmException);
     }
 }
