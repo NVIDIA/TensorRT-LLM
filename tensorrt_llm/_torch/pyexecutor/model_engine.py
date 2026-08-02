@@ -3644,7 +3644,7 @@ class PyTorchModelEngine(ModelEngine):
         })
         return [int(padded_bs) * (t + 1) for t in tiers]
 
-    def _record_dspark_graph_use(self, *, replayed: bool) -> None:
+    def _record_dspark_graph_use(self, *, replayed: bool, shape=None) -> None:
         """Count graph replay vs eager for the DSpark ragged stats, if enabled.
 
         Deliberately tolerant: this runs on the hot path for every model, and a
@@ -3653,7 +3653,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         stats = self._dspark_ragged_stats
         if stats is not None:
-            stats.record_graph(replayed=replayed)
+            stats.record_graph(replayed=replayed, shape=shape)
 
     @property
     def _dspark_ragged_stats(self):
@@ -3739,6 +3739,9 @@ class PyTorchModelEngine(ModelEngine):
                          f"to uniform scheduling: {exc}")
             return None
         padded_bs, bucket = shape.padded_bs, shape.bucket
+        # Remembered so a graph miss can report the shape it actually submitted
+        # rather than just that one happened.
+        self._dspark_last_total_tokens = int(bucket)
 
         # The CUDA-graph padding rows are appended later by _get_padded_batch,
         # which appends a *single shared dummy object*, so every pad row
@@ -6915,7 +6918,11 @@ class PyTorchModelEngine(ModelEngine):
             # miscount alone makes the check unsatisfiable on every real
             # workload.
             if padded_requests.can_run_cuda_graph:
-                self._record_dspark_graph_use(replayed=can_run_graph)
+                self._record_dspark_graph_use(
+                    replayed=can_run_graph,
+                    shape=None if can_run_graph else
+                    (len(padded_requests.generation_requests),
+                     int(getattr(self, "_dspark_last_total_tokens", 0))))
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata

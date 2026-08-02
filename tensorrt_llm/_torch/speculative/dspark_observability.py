@@ -61,7 +61,7 @@ and the budget degenerates to verify-all -- ragged silently becomes uniform.
 import os
 from collections import Counter
 from enum import Enum
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from ...logger import logger
 
@@ -247,6 +247,8 @@ class DSparkRaggedStats:
         self.verify_len_hist: Counter = Counter()
         self.bucket_hist: Counter = Counter()
         self.padded_bs_hist: Counter = Counter()
+        #: (rows, total_tokens) -> count, for steps that found no captured graph.
+        self.graph_miss_shapes: Dict[Tuple[int, int], int] = {}
 
         #: Acceptance, split by whether the request's window was shortened.
         #: This is the term the trim/ceiling ratio needs and the one TRT-LLM
@@ -328,12 +330,22 @@ class DSparkRaggedStats:
         else:
             self.steps_uniform_windows += 1
 
-    def record_graph(self, *, replayed: bool) -> None:
-        """Record whether this step replayed a CUDA graph or ran eager."""
+    def record_graph(self, *, replayed: bool, shape=None) -> None:
+        """Record whether this step replayed a CUDA graph or ran eager.
+
+        ``shape`` is the ``(num_rows, total_verify_tokens)`` the step actually
+        submitted. It is kept only for misses, and only the distinct ones: a
+        miss means some shape was not captured, and knowing *which* is the
+        whole diagnosis. Counting misses without recording the shape leaves
+        only the options of guessing or re-running with a profiler.
+        """
         if replayed:
             self.graph_replays += 1
-        else:
-            self.graph_eager += 1
+            return
+        self.graph_eager += 1
+        if shape is not None:
+            key = (int(shape[0]), int(shape[1]))
+            self.graph_miss_shapes[key] = self.graph_miss_shapes.get(key, 0) + 1
 
     def merge_planner_stats(self, planner_stats: Dict[str, int]) -> None:
         """Fold in the planner's own fallback counters."""
@@ -408,6 +420,10 @@ class DSparkRaggedStats:
             "verify_len_hist": dict(sorted(self.verify_len_hist.items())),
             "bucket_hist": dict(sorted(self.bucket_hist.items())),
             "padded_bs_hist": dict(sorted(self.padded_bs_hist.items())),
+            "graph_miss_shapes": {
+                f"{rows}x{tok}": n
+                for (rows, tok), n in sorted(self.graph_miss_shapes.items())
+            },
             "accept_len": round(self.accept_len, 4),
             "requests_scored": self.requests_scored,
             "requests_trimmed": self.requests_trimmed,
