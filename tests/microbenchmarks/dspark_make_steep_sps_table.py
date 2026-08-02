@@ -67,6 +67,50 @@ def _default_grid(max_batch_size: int, width: int):
     return ladder, tokens
 
 
+
+def _preview_with_real_planner(*, path, batch_sizes, accept, max_verify_len):
+    """What budget_argmax_over_uniform_lens actually picks for this table.
+
+    Returns True if any previewed batch size trims, False if none do, or None
+    when the planner cannot be imported (outside the container), so the caller
+    can distinguish "checked and fine" from "not checked".
+    """
+    try:
+        import numpy as np
+        from tensorrt_llm._torch.speculative.dspark_planner import (
+            SpsCostTable, budget_argmax_over_uniform_lens)
+    except Exception:
+        return None
+
+    table = SpsCostTable.from_json_file(path) if hasattr(
+        SpsCostTable, "from_json_file") else None
+    if table is None:
+        with open(path, encoding="utf-8") as handle:
+            table = SpsCostTable(**{
+                k: v for k, v in json.load(handle).items()
+                if not k.startswith("_") and k != "SYNTHETIC"
+            })
+
+    tiers = sorted({1, max(1, (max_verify_len + 1) // 2), max_verify_len})
+    print()
+    print(f"planner's actual choice at acceptance {accept} "
+          f"(L = verify length, {max_verify_len} = no trim), tiers {tiers}:")
+    any_trim = False
+    for bs in [int(b) for b in str(batch_sizes).split(",") if str(b).strip()]:
+        # survival[r, k] = P(first k+1 drafted tokens all accepted)
+        survival = np.array(
+            [[accept**(k + 1) for k in range(max_verify_len)]] * bs,
+            dtype=np.float64)
+        chosen = budget_argmax_over_uniform_lens(
+            survival=survival, num_gen_requests=bs, cost_table=table,
+            allowed_lens=tiers, min_verify_len=1)
+        trims = int(chosen) < max_verify_len
+        any_trim = any_trim or trims
+        print(f"  bs={bs:<5} -> L={chosen}"
+              f"{'  TRIM' if trims else '   (full window)'}")
+    return any_trim
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--out", required=True)
@@ -140,30 +184,23 @@ def main() -> int:
         json.dump(table, handle, indent=2)
         handle.write("\n")
 
-    # Predict the decision the planner will make. Its argmax is roughly
-    #   (bs + sum of top-K survival) / T(bs, K),  T = fixed + theta(M)
-    # so a table can be steep and still never induce trimming if the fixed
-    # floor swamps theta at the token counts the deployment actually uses.
-    # That is exactly what happened with a 5 ms floor against theta(48) = 1.6
-    # ms: the planner correctly kept the full window and the run proved
-    # nothing.
-    def _theta(m):
-        return args.peak_ms * (min(m, peak) / peak)**args.exponent
-
-    print()
-    print(f"predicted choice at acceptance {args.preview_accept} "
-          f"(K = verify positions kept, {args.max_verify_len} = no trim):")
-    any_trim = False
-    for bs in [int(b) for b in args.preview_bs.split(",") if b.strip()]:
-        best_k, best_rate = None, -1.0
-        for k in range(1, args.max_verify_len + 1):
-            m = bs * (k + 1)
-            gain = bs + sum(args.preview_accept**(i + 1) for i in range(k)) * bs
-            rate = gain / (args.fixed_overhead_ms + _theta(m))
-            if rate > best_rate:
-                best_k, best_rate = k, rate
-        trims = best_k < args.max_verify_len
-        any_trim = any_trim or trims
+    # Ask the REAL planner what it will do, rather than re-deriving its argmax.
+    #
+    # A hand-written approximation of the objective was wrong twice: it models
+    # the cost as fixed + theta(M), while budget_argmax_over_uniform_lens calls
+    # cost_table.step_time(total_verify_tokens(bs, length), num_gen_requests),
+    # which interpolates the table and adds the per-batch term. The
+    # approximation predicted "trim at every batch size" for a table under
+    # which the planner kept the full window through a 20-minute run. A preview
+    # that does not agree with the thing it previews is worse than none.
+    any_trim = _preview_with_real_planner(
+        path=args.out, batch_sizes=args.preview_bs,
+        accept=args.preview_accept, max_verify_len=args.max_verify_len)
+    if any_trim is None:      # planner not importable here
+        print("preview skipped: run this inside the TensorRT-LLM container to "
+              "have the real planner check the table before you spend a run "
+              "on it", file=sys.stderr)
+        any_trim = True
         print(f"  bs={bs:<5} -> K={best_k}"
               f"{'  TRIM' if trims else '   (full window)'}")
     if not any_trim:
