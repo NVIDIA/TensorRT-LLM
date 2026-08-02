@@ -366,6 +366,73 @@ def aligned_steps_from_stats(
     return aligned
 
 
+def explain_alignment(
+    rows: Sequence[dict],
+    *,
+    expected_ranks: int = 1,
+    timing_key: str = HOST_STEP_TIME_KEY,
+) -> str:
+    """Say why :func:`aligned_steps_from_stats` kept nothing.
+
+    A cell that reports ``aligned_steps=0`` is otherwise indistinguishable from
+    a cell that never ran, and the four rejection reasons want opposite fixes:
+    a rank count that is never right means ``--enable-attention-dp`` disagrees
+    with the deployment, context requests on every step mean the prompts are
+    still being ingested, disagreeing generation counts mean the batch is
+    draining, and a missing timing field means the requested ``--timing-field``
+    is not being published. Guessing between those costs a full sweep each
+    time.
+    """
+    by_iteration: Dict[int, List[dict]] = {}
+    for row in rows:
+        iteration = row.get("iter")
+        if iteration is None:
+            continue
+        by_iteration.setdefault(int(iteration), []).append(row)
+    if not by_iteration:
+        return (f"{len(rows)} stats rows carried no 'iter' field at all"
+                if rows else "no stats rows were received at all")
+
+    reasons: Dict[str, int] = {}
+    rank_counts: Dict[int, int] = {}
+    gen_seen: set = set()
+    for iteration, group in by_iteration.items():
+        ranks = {int(r.get("attentionDpRank", 0)) for r in group}
+        rank_counts[len(ranks)] = rank_counts.get(len(ranks), 0) + 1
+        if len(ranks) != int(expected_ranks):
+            reasons["rank count != expected"] = reasons.get("rank count != expected", 0) + 1
+            continue
+        batching = [row.get("inflightBatchingStats") or {} for row in group]
+        if any(int(stats.get("numContextRequests", 0) or 0) for stats in batching):
+            reasons["context requests in flight"] = reasons.get("context requests in flight", 0) + 1
+            continue
+        gen_counts = {int(stats.get("numGenRequests", 0) or 0) for stats in batching}
+        gen_seen.update(gen_counts)
+        if len(gen_counts) != 1:
+            reasons["ranks disagree on numGenRequests"] = reasons.get("ranks disagree on numGenRequests", 0) + 1
+            continue
+        if gen_counts and max(gen_counts) <= 0:
+            reasons["no generation requests"] = reasons.get("no generation requests", 0) + 1
+            continue
+        timing = group[0].get(timing_key)
+        if timing is None or float(timing) <= 0.0:
+            reasons[f"missing/zero {timing_key}"] = reasons.get(f"missing/zero {timing_key}", 0) + 1
+            continue
+        reasons["kept"] = reasons.get("kept", 0) + 1
+
+    parts = [f"{len(rows)} rows over {len(by_iteration)} iterations "
+             f"(iter {min(by_iteration)}..{max(by_iteration)})"]
+    parts.append("rejections: " + ", ".join(
+        f"{reason} x{count}" for reason, count in
+        sorted(reasons.items(), key=lambda kv: -kv[1])) or "none")
+    parts.append("ranks-per-iteration histogram: " + ", ".join(
+        f"{n}->{c}" for n, c in sorted(rank_counts.items())) +
+        f" (expected {expected_ranks})")
+    if gen_seen:
+        parts.append(f"numGenRequests observed: {sorted(gen_seen)[:12]}")
+    return "; ".join(parts)
+
+
 def summarize_cells(
     samples: Sequence[StepSample],
     *,
@@ -1128,6 +1195,19 @@ def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int) -> 
     aligned = aligned_steps_from_stats(
         rows, expected_ranks=config.dp_size, timing_key=config.timing_key
     )
+    kept = [s for s in aligned if s[1] == int(batch_size)]
+    if not kept:
+        # Printed per cell rather than once at the end: which cells failed and
+        # why is the whole diagnosis, and a sweep that ends in
+        # InsufficientSamplesError has already thrown that away.
+        print(
+            f"[dspark-sps]   bs={batch_size:>5} L={verify_len} kept nothing -- "
+            + explain_alignment(rows, expected_ranks=config.dp_size,
+                                timing_key=config.timing_key)
+            + (f"; aligned but numGenRequests never == {batch_size} "
+               f"(saw {sorted({a[1] for a in aligned})[:12]})" if aligned else ""),
+            file=sys.stderr,
+        )
     return [
         StepSample(
             batch_size=int(batch_size),
