@@ -50,9 +50,15 @@ AGENT_IMAGE = env.dockerImage ? env.dockerImage.replace("aarch64", "x86_64") : e
 TARGET_ARCH   = params.targetArch   ?: env.targetArch ?: AARCH64_TRIPLE
 BOLT_REF      = params.boltRef      ?: (env.artifactCommit ?: env.gitlabCommit ?: "unknown")
 BRANCH        = params.branch       ?: (env.gitlabTargetBranch ?: "main")
-// SBSA multi-node on oci-hsg: flexible node count (sbatch sets --nodes itself).
-// auto:gb200-flex -> gb200-flex-oci-hsg -> gb200-oci-trtllm (clusterName oci-hsg).
-SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "gb200-flex-aws-dfw" : "")
+// SBSA multi-node: flexible node count (sbatch sets --nodes itself).
+// gb300-flex-aws-cmh -> gb300-aws-trtllm-cmh (clusterName aws-cmh). We default to
+// aws-cmh (GB300): in cross-cluster comparison it had the best disagg completion
+// rate (7/8), vs GB200/aws-dfw and oci-aga (whose disagg all failed the
+// cache-transceiver network precheck -- a cluster infra issue, not ours). The
+// intermittent GEN IPC-spawn hang is hardware-independent (seen on both GB200 and
+// GB300), so this is about picking the healthiest cluster, not fixing the hang.
+// Override via params.slurmPlatform for a different cluster.
+SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "gb300-flex-aws-cmh" : "")
 BOLT_TARNAME  = params.boltTarName  ?: (TARGET_ARCH == AARCH64_TRIPLE ? "TensorRT-LLM-GH200.tar.gz" : "TensorRT-LLM.tar.gz")
 NUM_NODES     = params.numNodes     ?: "2"   // legacy single-workload wiring (unused by fan-out)
 // promote: publish the packaged bundle to the branch-keyed Artifactory path
