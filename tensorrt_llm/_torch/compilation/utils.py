@@ -69,6 +69,10 @@ def inplace_info():
             1: "input",
             2: "residual"
         },
+        torch.ops.trtllm.flashinfer_gemma_fused_add_rmsnorm.default: {
+            1: "input",
+            2: "residual"
+        },
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm_quant.default: {
             1: "out",
             2: "residual"
