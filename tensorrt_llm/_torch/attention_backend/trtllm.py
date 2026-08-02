@@ -563,6 +563,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # This is only a capacity input -- the op's own mMaxNumRequests is a
             # JIT-warmup hint, and the per-step request count comes from the
             # batch, not from here.
+            #
+            # It is not free: the attention workspace is sized from the same
+            # number, and on DEP8 (128 requests -> 896 rows) it was measured
+            # growing from 68 MiB to 604 MiB per rank. The op resizes itself, so
+            # this costs GPU memory that would otherwise hold KV cache rather
+            # than correctness. Shrinking it would mean sizing the generation
+            # workspace from the row count only where the row count is what the
+            # kernels actually use, which is a C++ change.
             self.max_num_requests = view.max_num_rows
             # Every runtime view has to agree on batch_size with
             # kv_lens_cuda_runtime, and the op reads request_types over all of
