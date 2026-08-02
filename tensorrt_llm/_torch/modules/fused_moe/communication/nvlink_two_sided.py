@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -99,6 +99,17 @@ class NVLinkTwoSided(Communication):
         """
         return True
 
+    def checkpoint_prepare(self) -> None:
+        """Detach TRT-native two-sided workspaces after global quiescence."""
+        if self._dispatch_state:
+            raise RuntimeError("Cannot checkpoint during an active MoE All-to-All phase")
+        MnnvlMoe.checkpoint_prepare()
+
+    def checkpoint_restore(self, comm) -> None:
+        """Restore TRT-native two-sided workspaces and protocol state."""
+        MnnvlMoe.checkpoint_restore(comm)
+        self._dispatch_state = {}
+
     def prepare_dispatch(
         self,
         token_selected_slots: torch.Tensor,
@@ -108,6 +119,7 @@ class NVLinkTwoSided(Communication):
         """
         NVLINK two-sided comm prepare dispatch: gather EPLB statistics and prepare alltoall_info.
         """
+        MnnvlMoe.require_mapped()
         all_rank_max_num_tokens = max(all_rank_num_tokens)
         top_k = token_selected_slots.shape[1]
 
@@ -144,6 +156,7 @@ class NVLinkTwoSided(Communication):
         """
         NVLINK two-sided comm dispatch (post-quant, uses alltoall_info from prepare_dispatch).
         """
+        MnnvlMoe.require_mapped()
         # Read alltoall_info from dispatch_state (set by prepare_dispatch)
         alltoall_info = self._dispatch_state.get("alltoall_info")
         if alltoall_info is None:
@@ -189,6 +202,7 @@ class NVLinkTwoSided(Communication):
         """
         NVLINK two-sided comm combine - reads from self._dispatch_state.
         """
+        MnnvlMoe.require_mapped()
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
 
@@ -204,4 +218,5 @@ class NVLinkTwoSided(Communication):
             do_reduce=self.alltoall_result_do_sum,
         )
 
+        self._dispatch_state = {}
         return final_hidden_states

@@ -18,7 +18,7 @@ import os
 import platform
 import sys
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import pynvml
 import torch
@@ -49,6 +49,19 @@ def _check_cu_result(cu_func_ret):
         if cu_func_ret != cuda.CUresult.CUDA_SUCCESS:
             raise RuntimeError(cu_func_ret)
         return None
+
+
+@dataclass
+class _MnnvlAllocationRecord:
+    comm: Any
+    comm_size: int
+    comm_rank: int
+    aligned_size: int
+    mem_handles: List[Any]
+    start_address: int
+    rank_stride: int
+    address_offset: int
+    mapped: bool = True
 
 
 class MnnvlMemory:
@@ -97,6 +110,11 @@ class MnnvlMemory:
         if not sys.is_finalizing():
             if hasattr(self, "ptr"):
                 type(self).close_mnnvl_memory(self.ptr)
+
+    @property
+    def mapped(self) -> bool:
+        """Whether physical handles are mapped into this VA reservation."""
+        return type(self).allocated_map[self.ptr].mapped
 
     def as_torch_strided_tensor(self, dtype):
         num_segments = type(self).comm.Get_size()
@@ -182,6 +200,105 @@ class MnnvlMemory:
         cls.current_mem_offset = 0
 
     @classmethod
+    def _create_and_map_handles(
+        cls,
+        comm,
+        aligned_size: int,
+        start_address: int,
+        rank_stride: int,
+        address_offset: int,
+    ) -> List[Any]:
+        dev_id = int(_check_cu_result(cuda.cuCtxGetDevice()))
+        assert dev_id == MnnvlMemory.dev_id, (
+            f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
+        )
+        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+        local_handle = _check_cu_result(cuda.cuMemCreate(aligned_size, allocation_prop, flags=0))
+        exported_handle = None
+        pidfds = []
+        remote_fds = []
+        mem_handles = [None] * comm.Get_size()
+        mapped_rank_ptrs = []
+        is_fabric = (
+            allocation_prop.requestedHandleTypes
+            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        )
+        try:
+            exported_handle = _check_cu_result(
+                cuda.cuMemExportToShareableHandle(
+                    local_handle, allocation_prop.requestedHandleTypes, 0
+                )
+            )
+            if is_fabric:
+                all_handles_data = comm.allgather(exported_handle.data)
+            else:
+                all_exported_fds = comm.allgather(int(exported_handle))
+                all_pids = comm.allgather(os.getpid())
+                syscall = ctypes.CDLL(None, use_errno=True).syscall
+                for pid in all_pids:
+                    pidfd = syscall(434, pid, 0)
+                    if pidfd < 0:
+                        err = ctypes.get_errno()
+                        raise RuntimeError(
+                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
+                        )
+                    pidfds.append(pidfd)
+                for pidfd, fd in zip(pidfds, all_exported_fds):
+                    remote_fd = syscall(438, pidfd, fd, 0)
+                    if remote_fd < 0:
+                        err = ctypes.get_errno()
+                        raise RuntimeError(
+                            f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno "
+                            f"{err}: {os.strerror(err)}"
+                        )
+                    remote_fds.append(remote_fd)
+                comm.barrier()
+                all_handles_data = remote_fds
+
+            access_desc = cuda.CUmemAccessDesc()
+            access_desc.location = allocation_prop.location
+            access_desc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+            for rank, handle_data in enumerate(all_handles_data):
+                rank_ptr = start_address + rank_stride * rank + address_offset
+                handle = (
+                    local_handle
+                    if rank == comm.Get_rank()
+                    else _check_cu_result(
+                        cuda.cuMemImportFromShareableHandle(
+                            handle_data, allocation_prop.requestedHandleTypes
+                        )
+                    )
+                )
+                mem_handles[rank] = handle
+                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, handle, 0))
+                mapped_rank_ptrs.append(rank_ptr)
+                _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [access_desc], 1))
+            return mem_handles
+        except Exception:
+            for rank_ptr in reversed(mapped_rank_ptrs):
+                try:
+                    _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
+                except RuntimeError as error:
+                    logger.warning("Failed to unmap incomplete MNNVL allocation: %s", error)
+
+            handles_to_release = [handle for handle in mem_handles if handle is not None]
+            if mem_handles[comm.Get_rank()] is None:
+                handles_to_release.append(local_handle)
+            for handle in handles_to_release:
+                try:
+                    _check_cu_result(cuda.cuMemRelease(handle))
+                except RuntimeError as error:
+                    logger.warning("Failed to release incomplete MNNVL allocation: %s", error)
+            raise
+        finally:
+            for pidfd in pidfds:
+                os.close(pidfd)
+            for remote_fd in remote_fds:
+                os.close(remote_fd)
+            if not is_fabric and exported_handle is not None:
+                os.close(int(exported_handle))
+
+    @classmethod
     def open_mnnvl_memory(cls, mapping: Mapping, size: int):
         # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
         MnnvlMemory.initialize()
@@ -207,121 +324,25 @@ class MnnvlMemory:
 
         assert cls.current_mem_offset + aligned_size <= cls.current_rank_stride
 
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
-        allocated_mem_handle = _check_cu_result(
-            cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
-        )
-        exported_fabric_handle = _check_cu_result(
-            cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
-            )
-        )
-        pidfds = []
-        remote_fds = []
-        try:
-            if (
-                allocation_prop.requestedHandleTypes
-                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-            ):
-                all_handles_data = comm.allgather(exported_fabric_handle.data)
-            else:
-                all_handles_data = comm.allgather(exported_fabric_handle)
-                all_pids = comm.allgather(os.getpid())
-                libc = ctypes.CDLL(None, use_errno=True)
-                syscall = libc.syscall
-                SYS_pidfd_open = 434
-                SYS_pidfd_getfd = 438
-                for i, pid in enumerate(all_pids):
-                    pidfd = syscall(SYS_pidfd_open, pid, 0)
-                    if pidfd < 0:
-                        err = ctypes.get_errno()
-                        raise RuntimeError(
-                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                        )
-                    pidfds.append(pidfd)
-
-                for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
-                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                    if remote_fd < 0:
-                        err = ctypes.get_errno()
-                        error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
-                        if err == 1:  # EPERM
-                            error_msg += (
-                                " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
-                                "to your docker run command."
-                            )
-                        else:
-                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
-                        raise RuntimeError(error_msg)
-                    remote_fds.append(remote_fd)
-
-                all_handles_data = remote_fds
-        except Exception:
-            # Release resources on failure path to avoid leaks; then re-raise.
-            if isinstance(exported_fabric_handle, int):
-                try:
-                    os.close(exported_fabric_handle)
-                except OSError as e:
-                    logger.warning(
-                        "Failed to close exported shareable handle on error: %s",
-                        e,
-                    )
-            try:
-                _check_cu_result(cuda.cuMemRelease(allocated_mem_handle))
-            except RuntimeError as e:
-                logger.warning(
-                    "cuMemRelease failed during error cleanup (original error will be raised): %s",
-                    e,
-                )
-            for _pidfd in pidfds:
-                try:
-                    os.close(_pidfd)
-                except OSError:
-                    pass
-            for _rfd in remote_fds:
-                try:
-                    os.close(_rfd)
-                except OSError:
-                    pass
-            raise
-        # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
-        # can use buf = memoryview(data) to import if using plain buffer for data.
-
-        madesc = cuda.CUmemAccessDesc()
-        madesc.location = allocation_prop.location
-        madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-
-        mem_handles = [None] * comm_size
-
-        for i, remote_handle_data in enumerate(all_handles_data):
-            rank_ptr = (
-                cls.current_start_address + cls.current_rank_stride * i + cls.current_mem_offset
-            )
-            if i == comm_rank:
-                # Local memory mapping
-                mem_handles[i] = allocated_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, allocated_mem_handle, 0))
-            else:
-                # Fabric memory mapping
-                imported_mem_handle = _check_cu_result(
-                    cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, allocation_prop.requestedHandleTypes
-                    )
-                )
-                mem_handles[i] = imported_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, imported_mem_handle, 0))
-
-            _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
-
-        ptr = cls.current_start_address + cls.current_mem_offset
-        stride = cls.current_rank_stride
-        cls.allocated_map[ptr] = (
-            mapping,
+        mem_handles = cls._create_and_map_handles(
+            comm,
             aligned_size,
-            mem_handles,
             cls.current_start_address,
             cls.current_rank_stride,
             cls.current_mem_offset,
+        )
+        # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
+        ptr = cls.current_start_address + cls.current_mem_offset
+        stride = cls.current_rank_stride
+        cls.allocated_map[ptr] = _MnnvlAllocationRecord(
+            comm=comm,
+            comm_size=comm_size,
+            comm_rank=comm_rank,
+            aligned_size=aligned_size,
+            mem_handles=mem_handles,
+            start_address=cls.current_start_address,
+            rank_stride=cls.current_rank_stride,
+            address_offset=cls.current_mem_offset,
         )
         cls.address_refcnt[cls.current_start_address] = (
             cls.address_refcnt.get(cls.current_start_address, 0) + 1
@@ -332,25 +353,68 @@ class MnnvlMemory:
 
     @classmethod
     def close_mnnvl_memory(cls, ptr: int):
-        mapping, aligned_size, mem_handles, start_address, rank_stride, address_offset = (
-            cls.allocated_map.pop(ptr)
-        )
-        comm = cls.get_comm(mapping)
-        comm_size = comm.Get_size()
-        for i in range(comm_size):
-            rank_ptr = start_address + i * rank_stride + address_offset
-            _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
-            _check_cu_result(cuda.cuMemRelease(mem_handles[i]))
-        cls.address_refcnt[start_address] -= 1
+        record = cls.allocated_map.pop(ptr)
+        if record.mapped:
+            cls._unmap_and_release_handles(record)
+        cls.address_refcnt[record.start_address] -= 1
 
-        if cls.address_refcnt[start_address] == 0:
-            cls.address_refcnt.pop(start_address)
-            device_ptr = cuda.CUdeviceptr(start_address)
-            _check_cu_result(cuda.cuMemAddressFree(device_ptr, comm_size * rank_stride))
-            if start_address == cls.current_start_address:
+        if cls.address_refcnt[record.start_address] == 0:
+            cls.address_refcnt.pop(record.start_address)
+            device_ptr = cuda.CUdeviceptr(record.start_address)
+            _check_cu_result(
+                cuda.cuMemAddressFree(device_ptr, record.comm_size * record.rank_stride)
+            )
+            if record.start_address == cls.current_start_address:
                 cls.current_start_address = 0
                 cls.current_rank_stride = 0
                 cls.current_mem_offset = 0
+
+    @classmethod
+    def _unmap_and_release_handles(cls, record: _MnnvlAllocationRecord) -> None:
+        for rank in range(record.comm_size):
+            rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
+            _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
+            _check_cu_result(cuda.cuMemRelease(record.mem_handles[rank]))
+
+    def checkpoint_prepare(self) -> None:
+        """Collectively detach backing handles while retaining graph-visible VA."""
+        cls = type(self)
+        record = cls.allocated_map[self.ptr]
+        if not record.mapped:
+            return
+        torch.cuda.synchronize()
+        record.comm.barrier()
+        cls._unmap_and_release_handles(record)
+        record.mem_handles = [None] * record.comm_size
+        record.mapped = False
+        record.comm.barrier()
+
+    def checkpoint_restore(self, comm) -> None:
+        """Collectively remap fresh handles at the original virtual addresses."""
+        cls = type(self)
+        record = cls.allocated_map[self.ptr]
+        if record.mapped:
+            return
+        comm_size = comm.Get_size()
+        comm_rank = comm.Get_rank()
+        if comm_size != record.comm_size or comm_rank != record.comm_rank:
+            raise RuntimeError(
+                "Cannot restore MNNVL memory with a communicator that differs from "
+                "the graph-visible allocation layout: "
+                f"rank/size {comm_rank}/{comm_size} != "
+                f"{record.comm_rank}/{record.comm_size}"
+            )
+        torch.cuda.synchronize()
+        record.mem_handles = cls._create_and_map_handles(
+            comm,
+            record.aligned_size,
+            record.start_address,
+            record.rank_stride,
+            record.address_offset,
+        )
+        record.comm = comm
+        cls.comm = comm
+        record.mapped = True
 
     @staticmethod
     @functools.cache
@@ -488,6 +552,37 @@ class MnnvlMoe:
             MnnvlMoe.moe_prepare_workspace.as_torch_strided_tensor(torch.uint64)
         )
         return MnnvlMoe.moe_prepare_workspace_tensor
+
+    @staticmethod
+    def checkpoint_prepare() -> None:
+        """Detach TRT-native two-sided MoE workspaces for checkpointing."""
+        for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace):
+            if workspace is not None:
+                workspace.checkpoint_prepare()
+
+    @staticmethod
+    def checkpoint_restore(comm) -> None:
+        """Restore TRT-native two-sided MoE workspaces at their original virtual addresses."""
+        workspaces = (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+        for workspace in workspaces:
+            if workspace is not None:
+                workspace.checkpoint_restore(comm)
+        if MnnvlMoe.moe_workspace_tensor is not None:
+            assert MnnvlMoe.moe_mapping is not None
+            torch.ops.trtllm.moe_initialize_workspace(
+                MnnvlMoe.moe_workspace_tensor,
+                MnnvlMoe.moe_mapping.moe_ep_rank,
+                MnnvlMoe.moe_mapping.moe_ep_size,
+            )
+        torch.cuda.synchronize()
+        comm.barrier()
+
+    @staticmethod
+    def require_mapped() -> None:
+        """Reject kernel access while either native MoE workspace is detached."""
+        for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace):
+            if workspace is not None and not workspace.mapped:
+                raise RuntimeError("Native MoE All-to-All workspace handles are unmapped")
 
     @staticmethod
     def compute_target_rank_id(
