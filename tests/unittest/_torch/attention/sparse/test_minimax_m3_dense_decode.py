@@ -15,35 +15,34 @@
 """trtllm-gen decode for MiniMax-M3's dense attention layers.
 
 Two things are under test and they fail differently. The pool geometry
-(``get_kv_subpage_pool``) is pure addressing against a real cache manager: if
-the flat sub-page view disagrees with ``get_buffers``, the kernel silently
-reads another layer's cache. The kernel call itself is checked against a
-PyTorch oracle through a stub manager, so the flashinfer argument conventions
-are exercised without standing up a model.
+(get_kv_subpage_pool) is pure addressing against a real cache manager: if the
+flat sub-page view disagrees with get_buffers, the kernel silently reads
+another layer's cache. The kernel call itself is checked against a PyTorch
+oracle through a stub manager, so the flashinfer argument conventions are
+exercised without standing up a model.
 """
 
 from __future__ import annotations
 
-import math
-from typing import List, Optional
+from typing import List
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
-    msa_ported_decode_active,
-)
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
-    _subpage_block_table,
-    dense_decode_sm_scale,
-    dense_decode_supported,
+    dense_decode_unsupported_reason,
     minimax_m3_trtllm_gen_dense_decode,
+    subpage_block_table,
+    uniform_subpages_per_slot,
+    write_subpage_block_table,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 PAGE_SIZE = 32
 HEAD_DIM = 128
+# The bmm1 scale, spelled as run_msa_paged_gqa spells it at q_scaling 1.
+SM_SCALE = HEAD_DIM**-0.5
 
 
 def _is_sm100f() -> bool:
@@ -144,7 +143,7 @@ def test_subpage_pool_stops_at_the_last_slots_v():
 
 def test_subpage_block_table_splits_k_and_v_rows():
     slots = torch.tensor([[0, 3, 7], [2, 5, 11]], device="cuda", dtype=torch.int32)
-    table = _subpage_block_table(slots, subpages_per_slot=9, reserve=False)
+    table = subpage_block_table(slots, subpages_per_slot=9)
 
     assert table.shape == (2, 2, 3)
     assert table.dtype == torch.int32
@@ -157,11 +156,45 @@ def test_subpage_block_table_reuses_one_buffer():
     a live earlier one within a step; they are written before every use."""
     slots_a = torch.zeros((2, 4), device="cuda", dtype=torch.int32)
     slots_b = torch.full((2, 4), 5, device="cuda", dtype=torch.int32)
-    first = _subpage_block_table(slots_a, 4, reserve=False)
-    second = _subpage_block_table(slots_b, 4, reserve=False)
+    first = subpage_block_table(slots_a, 4)
+    second = subpage_block_table(slots_b, 4)
 
     assert first.data_ptr() == second.data_ptr()
     assert second[:, 0].tolist() == [[20] * 4] * 2
+
+
+def test_write_subpage_block_table_fills_a_caller_owned_buffer():
+    """prepare() stages the expansion into its own graph-stable buffer, so the
+    in-place writer has to agree with the arena-backed helper."""
+    slots = torch.tensor([[0, 3, 7], [2, 5, 11]], device="cuda", dtype=torch.int32)
+    out = torch.empty((2, 2, 3), device="cuda", dtype=torch.int32)
+
+    write_subpage_block_table(slots, 9, out)
+
+    assert torch.equal(out, subpage_block_table(slots, 9))
+
+
+@pytest.mark.parametrize("sparse_layers", [[1, 3], []], ids=["mixed", "all-dense"])
+def test_uniform_subpages_per_slot_matches_every_layer(sparse_layers):
+    """prepare() expands the block table without naming a layer, so the factor
+    it uses has to be one every layer of the real pool agrees on."""
+    manager = _create_manager(2, sparse_layers)
+    try:
+        per_layer = {manager.get_kv_subpage_pool(i, "HND")[1] for i in range(4)}
+        factor = uniform_subpages_per_slot(manager)
+        assert factor == (per_layer.pop() if len(per_layer) == 1 else 0)
+    finally:
+        manager.shutdown()
+
+
+def test_uniform_subpages_per_slot_reports_zero_without_a_pool():
+    """A manager with no sub-page pool leaves each dense layer to expand its
+    own table, rather than being staged against a guessed factor."""
+
+    class _NoPool:
+        layer_offsets = {0: 0}
+
+    assert uniform_subpages_per_slot(_NoPool()) == 0
 
 
 # --------------------------------------------------------------------------
@@ -247,22 +280,22 @@ def _make_pool_inputs(
     return q, pool, block_table, torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
 
 
-def _run_dense(q, pool, subpages_per_slot, block_table, seq_lens, decode_query_len):
+def _run_dense(q, pool, subpages_per_slot, block_table, seq_lens, decode_query_len, **kwargs):
     out = torch.zeros_like(q, dtype=torch.bfloat16)
-    sm_scale = dense_decode_sm_scale(HEAD_DIM, 1.0)
     minimax_m3_trtllm_gen_dense_decode(
         q,
         _StubManager(pool, subpages_per_slot),
         0,
         block_table,
         seq_lens,
-        sm_scale=sm_scale,
+        sm_scale=SM_SCALE,
         output=out,
         decode_query_len=decode_query_len,
         max_seq_len=int(seq_lens.max()),
         max_num_requests=int(seq_lens.shape[0]),
+        **kwargs,
     )
-    return out, sm_scale
+    return out
 
 
 @pytest.mark.skipif(not _is_sm100f(), reason="trtllm-gen decode kernels are SM100/SM103 only")
@@ -276,16 +309,41 @@ def test_matches_reference(kv_dtype, num_heads, num_kv_heads, decode_query_len, 
     q, pool, block_table, seq_lens_t = _make_pool_inputs(
         seq_lens, num_heads, num_kv_heads, decode_query_len, subpages_per_slot, kv_dtype
     )
-    out, sm_scale = _run_dense(
-        q, pool, subpages_per_slot, block_table, seq_lens_t, decode_query_len
-    )
+    out = _run_dense(q, pool, subpages_per_slot, block_table, seq_lens_t, decode_query_len)
     # The kernel runs Q in the KV dtype, so the oracle gets the same rounding.
     q_ref = q.to(kv_dtype).to(torch.float32) if kv_dtype == torch.float8_e4m3fn else q
     ref = _reference_dense_decode(
-        q_ref, pool, subpages_per_slot, block_table, seq_lens_t, decode_query_len, sm_scale
+        q_ref, pool, subpages_per_slot, block_table, seq_lens_t, decode_query_len, SM_SCALE
     )
     tol = 6e-2 if kv_dtype == torch.float8_e4m3fn else 2e-2
     torch.testing.assert_close(out.float(), ref, rtol=tol, atol=tol)
+
+
+@pytest.mark.skipif(not _is_sm100f(), reason="trtllm-gen decode kernels are SM100/SM103 only")
+def test_staged_subpage_table_is_used_only_when_the_factor_matches():
+    """prepare() stages one expansion for every dense layer, so the kernel must
+    take it when the factor agrees and expand its own when it does not; either
+    way the answer is the same."""
+    subpages_per_slot = 9
+    seq_lens = [PAGE_SIZE * 3, PAGE_SIZE + 5]
+    q, pool, block_table, seq_lens_t = _make_pool_inputs(
+        seq_lens, 8, 1, 1, subpages_per_slot, torch.bfloat16, seed=11
+    )
+    staged = torch.empty(
+        (block_table.shape[0], 2, block_table.shape[1]), device="cuda", dtype=torch.int32
+    )
+    write_subpage_block_table(block_table, subpages_per_slot, staged)
+
+    args = (q, pool, subpages_per_slot, block_table, seq_lens_t, 1)
+    expanded_here = _run_dense(*args)
+    from_staged = _run_dense(*args, staged_subpage_table=staged, staged_subpages_per_slot=9)
+    # A stale factor must be ignored rather than trusted: this table addresses
+    # the wrong sub-pages entirely.
+    wrong = torch.zeros_like(staged)
+    ignored = _run_dense(*args, staged_subpage_table=wrong, staged_subpages_per_slot=2)
+
+    torch.testing.assert_close(from_staged.float(), expanded_here.float(), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(ignored.float(), expanded_here.float(), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.skipif(not _is_sm100f(), reason="trtllm-gen decode kernels are SM100/SM103 only")
@@ -296,7 +354,6 @@ def test_cuda_graph_replay_tracks_inputs():
     )
     stub = _StubManager(pool, 9)
     out = torch.zeros_like(q, dtype=torch.bfloat16)
-    sm_scale = dense_decode_sm_scale(HEAD_DIM, 1.0)
 
     def run():
         minimax_m3_trtllm_gen_dense_decode(
@@ -305,7 +362,7 @@ def test_cuda_graph_replay_tracks_inputs():
             0,
             block_table,
             seq_lens_t,
-            sm_scale=sm_scale,
+            sm_scale=SM_SCALE,
             output=out,
             decode_query_len=1,
             max_seq_len=PAGE_SIZE * 3,
@@ -338,39 +395,19 @@ def test_cuda_graph_replay_tracks_inputs():
 # --------------------------------------------------------------------------
 
 
-class _FakeMeta:
-    def __init__(self, decode_query_len: Optional[int]):
-        self.msa_decode_query_len = decode_query_len
-        self.msa_block_table = object() if decode_query_len is not None else None
-        self.msa_seq_lens_cuda = object() if decode_query_len is not None else None
-
-
-@pytest.mark.parametrize(
-    "decode_query_len,expected",
-    [
-        # A resolved span, single-token or speculative: the kernel owns it
-        # either way, and no switch can hand it back to fmha_sm100.
-        (1, True),
-        (2, True),
-        # No span, so this is a pure prefill and fmha_sm100 runs every row.
-        (None, False),
-    ],
-)
-def test_gating(decode_query_len, expected):
-    assert msa_ported_decode_active(_FakeMeta(decode_query_len)) is expected
-
-
 def test_declines_unsupported_geometry():
-    q = torch.zeros((1, 8, 64), device="cuda", dtype=torch.bfloat16)
-    assert "head_dim 64" in dense_decode_supported(_StubManager(q, 2), q)
+    """The reason is a string because it is logged; what matters here is that
+    each unsupported geometry is caught before the kernel is reached."""
+    pool = torch.zeros((1, 1, PAGE_SIZE, 64), device="cuda", dtype=torch.bfloat16)
+    assert "head_dim 64" in dense_decode_unsupported_reason(_StubManager(pool, 2), 64)
 
     class _NoPool:
         pass
 
-    q128 = torch.zeros((1, 8, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
-    assert "flat sub-page pool" in dense_decode_supported(_NoPool(), q128)
+    assert "flat sub-page pool" in dense_decode_unsupported_reason(_NoPool(), HEAD_DIM)
 
 
-def test_sm_scale_matches_flashinfer_convention():
-    assert dense_decode_sm_scale(HEAD_DIM, 1.0) == pytest.approx(1.0 / math.sqrt(HEAD_DIM))
-    assert dense_decode_sm_scale(HEAD_DIM, 2.0) == pytest.approx(1.0 / (2.0 * math.sqrt(HEAD_DIM)))
+def test_accepts_the_m3_geometry():
+    pytest.importorskip("flashinfer")
+    pool = torch.zeros((1, 1, PAGE_SIZE, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
+    assert dense_decode_unsupported_reason(_StubManager(pool, 2), HEAD_DIM) is None

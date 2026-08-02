@@ -3,34 +3,28 @@
 """trtllm-gen decode attention for MiniMax-M3's dense layers (0-2).
 
 Those layers attend the whole page table, so nothing about them needs MSA;
-they only run there because ``MsaSparseGqaFmha`` claims every M3 layer. MSA's
+they only run there because MsaSparseGqaFmha claims every M3 layer. MSA's
 kernel uses the context schedule, spending a 128-row Q tile on one decode
 token, while trtllm-gen has a generation tile scheduler for exactly this shape.
 
-``FlashInferTrtllmGenFmha`` cannot be reused as-is. It reaches the pool through
-``build_trtllm_gen_kv_cache_metadata``, which assumes each layer contributes
+FlashInferTrtllmGenFmha cannot be reused as-is. It reaches the pool through
+build_trtllm_gen_kv_cache_metadata, which assumes each layer contributes
 exactly K+V to a pool slot. M3 packs K+V for every layer of a group into one
 slot, and sparse layers add an index-K sub-page on top, so there is no uniform
-per-layer stride and ``_kv_pool_mapping_offset`` is only a ranking, not an
+per-layer stride and _kv_pool_mapping_offset is only a ranking, not an
 addressable offset. This module goes around that: it builds the same flat
-sub-page pool and ``[batch, 2, max_blocks]`` block table the kernel expects
+sub-page pool and [batch, 2, max_blocks] block table the kernel expects
 directly out of M3's own slot geometry, then calls the same flashinfer entry
 point the generic path calls.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
-
-# Zeroed on every call rather than only at allocation: a few KB of memset per
-# dense layer costs nothing, and it removes any dependence on the kernel
-# leaving the counters back at zero.
-_counter_buffers: dict[Tuple[int, int], torch.Tensor] = {}
 
 
 def _multi_processor_count(device: torch.device) -> int:
@@ -38,7 +32,16 @@ def _multi_processor_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(index).multi_processor_count
 
 
-def _counter_buffer(device: torch.device, num_heads: int, max_num_requests: int) -> torch.Tensor:
+def _counter_buffer(
+    device: torch.device, num_heads: int, max_num_requests: int, reserve: bool
+) -> torch.Tensor:
+    """Zeroed multi-CTA KV counters for one call.
+
+    Taken from the shared arena, like the workspace beside it, so the block
+    joins the graph memory pool and clear_memory_buffers(). The arena hands
+    back uninitialized memory, so the zeroing is per call rather than per
+    allocation; a few KB of memset costs nothing next to the kernel it feeds.
+    """
     from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
         _get_multi_ctas_kv_counter_size,
     )
@@ -46,25 +49,21 @@ def _counter_buffer(device: torch.device, num_heads: int, max_num_requests: int)
     size = _get_multi_ctas_kv_counter_size(
         num_heads, max_num_requests, _multi_processor_count(device)
     )
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, size)
-    buffer = _counter_buffers.get(key)
-    if buffer is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "The trtllm-gen multi-CTA KV counter buffer must be allocated "
-                "before CUDA graph capture."
-            )
-        buffer = torch.zeros(size, dtype=torch.uint8, device=device)
-        _counter_buffers[key] = buffer
-    return buffer
+    counters = get_memory_buffers().get_buffer(
+        [size],
+        torch.uint8,
+        buffer_name="m3_trtllm_gen_kv_counters",
+        reserve_buffer=reserve,
+    )
+    counters.zero_()
+    return counters
 
 
 def _workspace(q_dtype: torch.dtype, num_heads: int, head_dim: int, num_kv_heads: int) -> int:
     """Byte size of the trtllm-gen scratch slab.
 
-    It is a fixed slab (``kTrtllmGenWorkspaceSize``), independent of the batch,
-    but the size is read from the C++ layout rather than hardcoded.
+    It is a fixed slab (kTrtllmGenWorkspaceSize), independent of the batch, but
+    the size is read from the C++ layout rather than hardcoded.
     """
     from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
         _get_generation_workspace_layout,
@@ -74,15 +73,21 @@ def _workspace(q_dtype: torch.dtype, num_heads: int, head_dim: int, num_kv_heads
     return int(layout["trtllm_gen_workspace_size"])
 
 
-def _subpage_block_table(
-    block_table: torch.Tensor, subpages_per_slot: int, reserve: bool
+def subpage_block_table(
+    block_table: torch.Tensor, subpages_per_slot: int, reserve: bool = False
 ) -> torch.Tensor:
     """Expand a slot table into trtllm-gen's separate K and V page rows.
 
-    ``uses_shared_paged_kv_idx`` is False for TensorRT-LLM, so the kernel takes
-    ``[batch, 2, max_blocks]`` and indexes K and V independently. Rooting the
-    pool at this layer's K (see ``get_kv_subpage_pool``) puts slot ``s``'s K at
-    ``s * subpages_per_slot`` and its V one sub-page later.
+    uses_shared_paged_kv_idx is False for TensorRT-LLM, so the kernel takes
+    [batch, 2, max_blocks] and indexes K and V independently. Rooting the pool
+    at this layer's K (see get_kv_subpage_pool) puts slot s's K at
+    s * subpages_per_slot and its V one sub-page later.
+
+    The result is a function of the slot table and that factor alone, so every
+    dense layer of a step would compute the same one. prepare() therefore
+    stages it once into a graph-stable buffer, and this runs only where it
+    could not: a manager whose layers disagree on the factor, or a caller that
+    skipped prepare().
     """
     batch, max_blocks = block_table.shape
     out = get_memory_buffers().get_buffer(
@@ -91,9 +96,32 @@ def _subpage_block_table(
         buffer_name="m3_trtllm_gen_subpage_block_table",
         reserve_buffer=reserve,
     )
+    write_subpage_block_table(block_table, subpages_per_slot, out)
+    return out
+
+
+def write_subpage_block_table(
+    block_table: torch.Tensor, subpages_per_slot: int, out: torch.Tensor
+) -> None:
+    """Write the K and V sub-page rows of block_table into out."""
     torch.mul(block_table, subpages_per_slot, out=out[:, 0])
     torch.add(out[:, 0], 1, out=out[:, 1])
-    return out
+
+
+def uniform_subpages_per_slot(kv_cache_manager) -> int:
+    """Sub-pages per slot when every layer of the pool agrees, else 0.
+
+    The factor is a property of a layer group, so a single-group model has one
+    for the whole pool and prepare() can expand the block table without naming
+    a layer (see subpage_block_table). A manager with no sub-page pool, or one
+    whose groups disagree, reports 0 rather than a guess.
+    """
+    get_pool = getattr(kv_cache_manager, "get_kv_subpage_pool", None)
+    layer_offsets = getattr(kv_cache_manager, "layer_offsets", None)
+    if get_pool is None or not layer_offsets:
+        return 0
+    factors = {int(get_pool(layer_idx, "HND")[1]) for layer_idx in layer_offsets}
+    return factors.pop() if len(factors) == 1 else 0
 
 
 def minimax_m3_trtllm_gen_dense_decode(
@@ -108,9 +136,16 @@ def minimax_m3_trtllm_gen_dense_decode(
     decode_query_len: int,
     max_seq_len: int,
     max_num_requests: int,
+    staged_subpage_table: Optional[torch.Tensor] = None,
+    staged_subpages_per_slot: int = 0,
     enable_pdl: bool = True,
 ) -> None:
-    """Full-context decode attention through trtllm-gen, in place into ``output``."""
+    """Full-context decode attention through trtllm-gen, in place into output.
+
+    staged_subpage_table is the expansion of block_table prepare() already
+    staged, used when staged_subpages_per_slot matches this layer's factor and
+    expanded here otherwise; see subpage_block_table.
+    """
     from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
         _trtllm_gen_batch_decode_with_kv_cache,
     )
@@ -131,15 +166,17 @@ def minimax_m3_trtllm_gen_dense_decode(
         buffer_name="m3_trtllm_gen_workspace",
         reserve_buffer=reserve,
     )
-    counters = _counter_buffer(q.device, num_heads, max_num_requests)
-    counters.zero_()
+    if staged_subpage_table is None or staged_subpages_per_slot != subpages_per_slot:
+        staged_subpage_table = subpage_block_table(block_table, subpages_per_slot, reserve)
 
     _trtllm_gen_batch_decode_with_kv_cache(
         q,  # query
         kv_pool,  # kv_pool
         workspace,  # workspace_buffer
-        counters,  # multi_ctas_kv_counter_buffer
-        _subpage_block_table(block_table, subpages_per_slot, reserve),  # block_tables
+        _counter_buffer(
+            q.device, num_heads, max_num_requests, reserve
+        ),  # multi_ctas_kv_counter_buffer
+        staged_subpage_table,  # block_tables
         seq_lens,  # seq_lens
         max_seq_len,  # max_seq_len
         sm_scale,  # bmm1_scale
@@ -154,11 +191,6 @@ def minimax_m3_trtllm_gen_dense_decode(
         None,  # kv_scale_pool: M3 stores unscaled E4M3
         False,  # uses_shared_paged_kv_idx
     )
-
-
-def dense_decode_sm_scale(head_dim: int, q_scaling: float) -> float:
-    """bmm1 scale in trtllm-gen's convention, matching FlashInferTrtllmGenFmha."""
-    return 1.0 / (math.sqrt(head_dim) * q_scaling)
 
 
 def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional[str]:
@@ -178,14 +210,10 @@ def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional
     return None
 
 
-def dense_decode_supported(kv_cache_manager, q: torch.Tensor) -> Optional[str]:
-    """Return None when the geometry is supported, else why it is not."""
-    return dense_decode_unsupported_reason(kv_cache_manager, int(q.shape[-1]))
-
-
 __all__ = [
-    "dense_decode_sm_scale",
-    "dense_decode_supported",
     "dense_decode_unsupported_reason",
     "minimax_m3_trtllm_gen_dense_decode",
+    "subpage_block_table",
+    "uniform_subpages_per_slot",
+    "write_subpage_block_table",
 ]

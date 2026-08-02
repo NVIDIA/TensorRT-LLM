@@ -31,17 +31,17 @@ def msa_ported_decode_active(metadata) -> bool:
 
     They always do, when the step has generation rows at all: the Triton sparse
     kernel, the trtllm-gen dense kernel and the CuTe DSL indexer scorer own the
-    generation span together -- the whole of a pure-decode batch, or the row and
-    token suffix of a mixed one -- and fmha_sm100 is left with the context
-    prefix. There is no per-kernel switch and no fallback for a generation row:
-    a geometry the span's kernels cannot serve raises in prepare() instead of
+    generation span together (the whole of a pure-decode batch, or the row and
+    token suffix of a mixed one) and fmha_sm100 is left with the context prefix.
+    There is no per-kernel switch and no fallback for a generation row: a
+    geometry the span's kernels cannot serve raises in prepare() instead of
     being routed back to fmha_sm100 at several times the decode cost. See
     _resolve_decode_kernels.
 
-    So False means only that this step has no span: a pure-prefill step, or --
-    in the standalone kernel tests, whose metadata never ran prepare() -- one
+    So False means only that this step has no span: a pure-prefill step, or one
     that opted out by leaving the query length or the buffers the ported kernels
-    address unset.
+    address unset, which the standalone kernel tests do since their metadata
+    never runs prepare().
 
     One predicate serves every site that has to agree on the span: both
     attention branches and the indexer, which additionally orients its top-k
@@ -280,9 +280,8 @@ def select_blocks_from_maxscore(
     Applies init and local forced blocks and per-query valid-block masking
     on the amax-reduced scores [num_kv_heads, n_blocks, total_q]. Returns
     [total_q, num_kv_heads, topk] int32 ascending block ids with -1 tail
-    padding. When ``head_major_output`` is set, the logical result uses a
-    head-major backing so ``result.permute(1, 0, 2)`` is contiguous without a
-    copy.
+    padding. head_major_output backs that result head-major instead, so
+    result.permute(1, 0, 2) is contiguous without a copy.
     """
     nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
     return torch.ops.trtllm.minimax_m3_select_blocks(

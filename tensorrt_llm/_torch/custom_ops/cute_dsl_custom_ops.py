@@ -7754,8 +7754,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # view of the [heads, blocks, tokens] selector buffer, whose
             # innermost logical stride is the token count rather than 1.
             score_fake = cute.runtime.make_fake_tensor(
-                cutlass.Float32,
-                (num_heads, sym_total_tokens, cute.sym_int()),
+                cutlass.Float32, (num_heads, sym_total_tokens, cute.sym_int()),
                 stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()))
 
             sl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
@@ -7795,6 +7794,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             score: torch.Tensor,
             max_decode_query_len: int,
         ) -> None:
+            """Score one decode step, compiling the kernel on first use.
+
+            The compile allocates, so it must not land inside a CUDA graph
+            capture. It does not: CUDAGraphRunner.capture runs eager warmup
+            forwards first, and those cover every geometry the graphs it then
+            captures will replay.
+            """
             _, num_heads, head_dim = idx_q.shape
             key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim)
             if key not in cls.kernel_cache:
@@ -7803,10 +7809,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cls.kernel_cache[key](idx_q, index_k_cache, block_table, score,
                                   seq_lens)
 
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_minimax_m3_index_decode_score",
-        mutates_args=("score", ),
-        device_types="cuda")
+    @torch.library.custom_op("trtllm::cute_dsl_minimax_m3_index_decode_score",
+                             mutates_args=("score", ),
+                             device_types="cuda")
     def cute_dsl_minimax_m3_index_decode_score(
         idx_q: torch.Tensor,
         index_k_cache: torch.Tensor,
@@ -7869,21 +7874,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_decode_query_len: int,
     ) -> None:
         return None
-
-    def warmup_cute_dsl_minimax_m3_index_decode_score(
-        q_dtype: torch.dtype,
-        num_heads: int,
-        max_decode_query_len: int,
-        head_dim: int = 128,
-    ) -> None:
-        """Pre-compile the indexer scoring kernel for one decode geometry.
-
-        Must run before CUDA graph capture: the compile allocates and would
-        otherwise happen mid-capture on the first replayed step.
-        """
-        CuteDSLMiniMaxM3IndexDecodeScoreRunner._compile(q_dtype, num_heads,
-                                                        max_decode_query_len,
-                                                        head_dim)
 
     # ======================================================================
     # BF16 Dense Persistent BMM (CuTe DSL) for Blackwell

@@ -205,12 +205,11 @@ def run_msa_paged_gqa(
 
     elif kv_block_indexes is None and ported:
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
-            dense_decode_sm_scale,
-            dense_decode_supported,
+            dense_decode_unsupported_reason,
             minimax_m3_trtllm_gen_dense_decode,
         )
 
-        unsupported = dense_decode_supported(kv_cache_manager, q_view)
+        unsupported = dense_decode_unsupported_reason(kv_cache_manager, head_dim)
         if unsupported is not None:
             raise RuntimeError(
                 "MiniMax-M3 resolved a generation span for this step's dense "
@@ -218,19 +217,29 @@ def run_msa_paged_gqa(
                 "The two must agree, and there is no plan left to run the span; "
                 "see _resolve_decode_kernels."
             )
+        # The sub-page block table prepare() staged, if it could; the kernel
+        # expands its own when the factor does not match this layer's.
+        staged_subpage_rows = getattr(metadata, "msa_subpage_rows", None)
+        staged_table, staged_factor = (
+            staged_subpage_rows(gen_row0, gen_row1)
+            if staged_subpage_rows is not None
+            else (None, 0)
+        )
         minimax_m3_trtllm_gen_dense_decode(
             q_view[gen_tok0:],
             kv_cache_manager,
             layer_idx,
             metadata.msa_block_table[gen_row0:gen_row1],
             metadata.msa_seq_lens_cuda[gen_row0:gen_row1],
-            sm_scale=dense_decode_sm_scale(head_dim, float(attn.q_scaling)),
+            sm_scale=sm_scale,
             output=out_view[gen_tok0:],
             decode_query_len=decode_query_len,
             # Bounded by the span's own rows, so a long context request
             # cannot inflate the kernel's scheduling hint.
             max_seq_len=int(metadata.msa_max_kv_len),
             max_num_requests=int(metadata.max_num_requests),
+            staged_subpage_table=staged_table,
+            staged_subpages_per_slot=staged_factor,
         )
         fmha_tokens = gen_tok0
 

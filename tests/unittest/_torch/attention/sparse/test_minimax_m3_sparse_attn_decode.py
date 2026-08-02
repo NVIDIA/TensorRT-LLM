@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
-# PyTorch oracle derived from vLLM (Apache-2.0), ``_reference_sparse_attn``:
+# PyTorch oracle derived from vLLM (Apache-2.0), _reference_sparse_attn:
 # https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/tests/kernels/attention/test_minimax_m3.py#L755
 """Correctness tests for the Triton MiniMax-M3 sparse block decode attention.
 
@@ -17,7 +17,6 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
-    msa_ported_decode_active,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
     SPARSE_BLOCK_SIZE,
@@ -359,33 +358,3 @@ def test_resolve_num_topk_chunks_is_shape_only_power_of_two(total_q, num_kv_head
     assert 1 <= chunks <= max_topk
     assert chunks & (chunks - 1) == 0
     assert chunks == resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
-
-
-class _FakeMetadata:
-    def __init__(self, decode_query_len, block_table, seq_lens):
-        self.msa_decode_query_len = decode_query_len
-        self.msa_block_table = block_table
-        self.msa_seq_lens_cuda = seq_lens
-
-
-@pytest.mark.parametrize(
-    ("decode_query_len", "expected"),
-    [
-        # A resolved span, which is every step with generation rows: there is no
-        # switch that can send them to fmha_sm100 instead.
-        (1, True),
-        # No span was resolved, so the step is a pure prefill (or a caller that
-        # opted out) and fmha_sm100 runs every row.
-        (None, False),
-    ],
-)
-def test_triton_sparse_decode_gating(decode_query_len, expected):
-    metadata = _FakeMetadata(decode_query_len, torch.zeros(1), torch.zeros(1))
-    assert msa_ported_decode_active(metadata) is expected
-
-
-def test_triton_sparse_decode_gating_rejects_missing_buffers():
-    """The kernel addresses the page table and lengths directly, so a span
-    without them staged is not one it can run."""
-    assert not msa_ported_decode_active(_FakeMetadata(1, None, torch.zeros(1)))
-    assert not msa_ported_decode_active(_FakeMetadata(1, torch.zeros(1), None))

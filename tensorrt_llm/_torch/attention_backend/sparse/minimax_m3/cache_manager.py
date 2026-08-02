@@ -25,7 +25,7 @@ Provides:
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -315,7 +315,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     def has_index_value(self, layer_idx: int) -> bool:
         return layer_idx in self._index_v_buffers
 
-    def _kv_slot_geometry(self, layer_idx: int, kv_layout: str) -> tuple:
+    def _kv_slot_geometry(
+        self, layer_idx: int, kv_layout: str
+    ) -> Tuple[int, torch.dtype, int, int, List[int]]:
         """Resolve one layer's position in the coalesced K/V pool.
 
         Returns ``(addr_key, torch_dtype, num_slots, scale, page_shape)``,
@@ -404,7 +406,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
         return full_view[:, :2]
 
-    def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str = "HND") -> tuple:
+    def get_kv_subpage_pool(
+        self, layer_idx: int, kv_layout: str = "HND"
+    ) -> Tuple[torch.Tensor, int]:
         """Return ``(flat_pool, subpages_per_slot)`` for flat-block consumers.
 
         trtllm-gen addresses K and V pages independently, through a

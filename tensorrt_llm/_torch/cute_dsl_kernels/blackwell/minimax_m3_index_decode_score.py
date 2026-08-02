@@ -6,25 +6,25 @@
 """CuTe DSL MiniMax-M3 index decode block-scoring kernel (Blackwell SM100).
 
 Computes, for every (index head, decode query token, KV block), the maximum
-causally-valid ``Q . K`` dot product over the 128 index-K positions of that
-block. Those per-block maxima are what ``minimax_m3_select_blocks`` ranks to
-pick the top-k blocks the sparse attention then attends.
+causally-valid Q . K dot product over the 128 index-K positions of that block.
+Those per-block maxima are what minimax_m3_select_blocks ranks to pick the
+top-k blocks the sparse attention then attends.
 
-Uses TMA plus warp-level ``mma.sync`` rather than tcgen05: the score GEMM's N
+Uses TMA plus warp-level mma.sync rather than tcgen05: the score GEMM's N
 dimension is one decode token times a handful of index heads, so CTA occupancy
 matters far more than a deep single-CTA pipeline.
 
 Vendored from the vLLM source linked in the file header (v0.26.1rc0-77-g6f91edf96).
 Differences from upstream:
 
-* ``cpasync.make_tiled_tma_atom`` returns ``(atom, tensor)`` in the CuTe DSL
-  version pinned here rather than a ``TmaInfo``, so the shared-memory layouts
-  are rebuilt from the same compile-time constants instead of being read back
-  off the descriptor.
-* PDL follows ``TRTLLM_ENABLE_PDL`` and grid dependency control comes from
-  ``blackwell.utils`` rather than ``cute.arch``.
-* Compilation and caching live in the ``trtllm::cute_dsl_minimax_m3_index_
-  decode_score`` runner, matching the other CuTe DSL ops in this tree.
+* cpasync.make_tiled_tma_atom returns (atom, tensor) in the CuTe DSL version
+  pinned here rather than a TmaInfo, so the shared-memory layouts are rebuilt
+  from the same compile-time constants instead of being read back off the
+  descriptor.
+* PDL follows TRTLLM_ENABLE_PDL and grid dependency control comes from
+  blackwell.utils rather than cute.arch.
+* Compilation and caching live in the trtllm::cute_dsl_minimax_m3_index_decode_score
+  runner, matching the other CuTe DSL ops in this tree.
 """
 
 import cutlass
@@ -66,10 +66,10 @@ def _fp8_to_f16_mma_fragments(src: cute.Tensor):
 class IndexDecodeScoreKernel:
     """Per-block max index score for one decode step.
 
-    Grid is ``(batch, split_k)``: CTA ``(b, s)`` walks KV blocks
-    ``s, s + split_k, s + 2 * split_k, ...`` of request ``b`` and writes each
-    block's score directly, so no cross-CTA reduction is needed. CTAs whose
-    ``split_id`` exceeds the request's block count exit immediately.
+    Grid is (batch, split_k): CTA (b, s) walks KV blocks
+    s, s + split_k, s + 2 * split_k, ... of request b and writes each block's
+    score directly, so no cross-CTA reduction is needed. CTAs whose split_id
+    exceeds the request's block count exit immediately.
     """
 
     BLOCK_K = 128
@@ -233,6 +233,10 @@ class IndexDecodeScoreKernel:
             cute.arch.sync_threads()
 
             griddepcontrol_wait()
+            # TODO: releasing dependents here, rather than after the epilogue
+            # stores, is safe only while no PDL-launched successor reads score.
+            # Confirm that and either move the release past the stores or record
+            # the constraint here.
             griddepcontrol_launch_dependents()
 
             if warp_id == 4:

@@ -50,7 +50,11 @@ from .msa_utils import (
     per_token_valid_blocks,
     require_msa_module,
 )
-from .trtllm_gen_dense_decode import dense_decode_unsupported_reason
+from .trtllm_gen_dense_decode import (
+    dense_decode_unsupported_reason,
+    uniform_subpages_per_slot,
+    write_subpage_block_table,
+)
 
 
 def _cache_device(meta) -> torch.device:
@@ -298,6 +302,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # plan, so both forms are kept rather than one being derived at call time.
     msa_block_table: Optional[torch.Tensor] = None
     msa_seq_lens_cuda: Optional[torch.Tensor] = None
+    # msa_block_table with each slot expanded into the K and V sub-pages the
+    # trtllm-gen dense kernel indexes. _msa_subpages_per_slot is the expansion
+    # factor, or 0 where the pool has no single one; see msa_subpage_rows.
+    msa_subpage_block_table: Optional[torch.Tensor] = None
+    _msa_subpages_per_slot: int = 0
     # Per-request kv_lens as staged by prepare(), before the overlap scheduler
     # corrects them. on_update_kv_lens clamps against this; see there.
     msa_kv_lens_staged: Optional[torch.Tensor] = None
@@ -380,7 +389,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def msa_kv_lens_cpu(self) -> Optional[torch.Tensor]:
         """Per-request KV length, cached plus new tokens (host int32).
 
-        The base ``kv_lens`` includes ``num_extra_kv_tokens`` (speculative
+        The base kv_lens includes num_extra_kv_tokens (speculative
         draft-loop slots consumed by the C++ kernels); the MSA plans, ladder
         slots and page counts need the true attended length, so it is
         excluded here.
@@ -478,6 +487,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         step was prepared (a decode step or a structural test)."""
         return self._msa_eager_n_valid_blocks
 
+    def msa_subpage_rows(self, row_first: int, row_last: int) -> Tuple[Optional[torch.Tensor], int]:
+        """Staged sub-page block table for the given rows, with its factor.
+
+        (None, 0) when the pool has no single sub-pages-per-slot factor, which
+        leaves the caller to expand its own layer's table.
+        """
+        table = self.msa_subpage_block_table
+        if table is None:
+            return None, 0
+        return table[row_first:row_last], self._msa_subpages_per_slot
+
     def _msa_main_kv_is_fp8(self) -> bool:
         """Whether the main paged K/V cache is stored as FP8 E4M3.
 
@@ -547,6 +567,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # Resolved once here rather than per step: the factor is fixed by the
+        # pool's layout for the life of the manager.
+        self._msa_subpages_per_slot = uniform_subpages_per_slot(kv_cache_manager)
+        if self._msa_subpages_per_slot > 0:
+            self.msa_subpage_block_table = self.get_empty(
+                buffers,
+                (max_num_sequences, 2, max_blocks_per_seq),
+                cache_name="msa_subpage_block_table",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         # Staging for on_update_kv_lens: re-derives slots/bounds on device
         # from the corrected kv_lens_cuda, sync-free.
         tokens_per_block = int(kv_cache_manager.tokens_per_block)
@@ -613,7 +644,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def _msa_max_decode_tokens(self) -> int:
         """Worst-case decode-step query tokens (spec verify emits 1 + draft_len
         per row), bounded by max_num_tokens. getattr fallbacks cover metadata
-        built via ``__new__`` in structural tests.
+        built via __new__ in structural tests.
         """
         max_seqs = int(getattr(self, "max_num_sequences", 0) or 0)
         max_toks = int(getattr(self, "max_num_tokens", 0) or 0)
@@ -692,6 +723,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 f"Worst-case max_k_tiles ({max_k_tiles}) is less than the "
                 f"decode plan ({required_max_k_tiles})."
             )
+        self._msa_worst_case_max_k_tiles = int(max_k_tiles)
         self._alloc_msa_proxy_scratch(
             num_index_heads=num_index_heads,
             max_tokens=max_tokens,
@@ -739,8 +771,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         the Triton sparse kernel, the trtllm-gen dense kernel and the CuTe DSL
         indexer scorer. There is no second decode implementation to choose
         between and nothing to fall back to, so this either commits a span or
-        raises. Falling back would not be a small cost -- fmha_sm100 schedules
-        a generation row like a context row, and on a mixed step cannot even
+        raises. Falling back would not be a small cost: fmha_sm100 schedules a
+        generation row like a context row, and on a mixed step cannot even
         split the two apart (see _mixed_batch_split in fmha_sm100/api.py), so
         every decode row would ride the prefill schedule.
 
@@ -751,8 +783,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         requests precede it.
 
         prepare() and the per-layer call sites both read the span, so they
-        cannot disagree about which kernel runs -- and therefore cannot
-        disagree about which preparation was needed. Every input is a host-side
+        cannot disagree about which kernel runs, and therefore cannot disagree
+        about which preparation was needed. Every input is a host-side
         fact that is either fixed for the whole run (static kernel support,
         cache geometry) or fixed for the whole step (batch composition,
         query-length uniformity); nothing here may depend on a per-layer
@@ -782,7 +814,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # The ported kernels address the page table and lengths directly, so
         # they need those buffers allocated even though the plans are not. They
         # are, from __post_init__, for every manager that carries an index-K
-        # cache -- i.e. every real MiniMax-M3 run; see _create_msa_buffers.
+        # cache, which is every real MiniMax-M3 run; see _create_msa_buffers.
         if self.msa_block_table is None or self.msa_seq_lens_cuda is None:
             return
         # Host-side tensors, so these reads do not sync the device.
@@ -841,8 +873,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         kernels inside the graph are fixed at capture. A span that changed
         afterwards would stage inputs for one kernel while the graph ran
         another, so it has to be caught rather than tolerated. Every input to
-        the resolution is stable across a graph's replays -- the static support
-        checks and the bucket's own decode_query_len -- which is what makes this
+        the resolution is stable across a graph's replays (the static support
+        checks and the bucket's own decode_query_len), which is what makes this
         a check and not a re-capture.
 
         Whether a span exists decides whether any fmha_sm100 work runs at all,
@@ -890,14 +922,16 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         One answer for all three plans, because one span decides all three
         sites. The outcomes are
 
-        * no span -- the whole batch, as fmha_sm100 runs every row;
-        * a mixed span -- the context prefix only, since the span takes the
+        * no span: the whole batch, as fmha_sm100 runs every row;
+        * a mixed span: the context prefix only, since the span takes the
           generation suffix;
-        * a pure-decode span -- None, no rows left to plan.
+        * a pure-decode span: None, no rows left to plan.
 
-        Returning the row range rather than a bare "context only" flag keeps
-        on_update_kv_lens able to patch each plan's length mirrors against the
-        rows it was actually built from.
+        The range always starts at batch row 0, since fmha_sm100 keeps the batch
+        prefix and the ported kernels take the suffix. It is returned as a range
+        rather than a bare "context only" flag so that on_update_kv_lens can
+        rebase each plan's row indices onto the batch rows without assuming
+        that.
         """
         span = self._msa_decode_span
         if span is None:
@@ -935,7 +969,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def _msa_live_plans(self) -> tuple:
         """The fmha_sm100 plans in play this step, with the rows each covers.
 
-        Yields ``(plan, row_first, row_last)``. Decode steps populate the
+        Yields (plan, row_first, row_last). Decode steps populate the
         graph-safe owners, prefill and mixed steps the plain eager tuples;
         _build_step_plans clears whichever set does not apply, so only one set
         is ever live per site. The row range is narrower than the batch when the
@@ -1019,14 +1053,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # [0, split) and [split, batch). Which of the two holds the prefill
         # requests depends on the batch order, so those names are positional
         # only and nothing here may key off them; each sub-plan mirrors just its
-        # own range. Those row indices are relative to the plan, which need not
-        # start at batch row 0 -- a site whose ported kernel took the generation
-        # span was planned over the context prefix -- so plan_first rebases them
-        # onto the batch rows the corrected lengths are indexed by. Within a
-        # sub-plan holds either one row per request or one per query token,
-        # since the planner row-expands dense plans over query tokens, so the row
-        # count selects the source. qo_offset must stay non-negative: negative
-        # values hit the kernel's packed-length sentinel fallback.
+        # own range. Those row indices are relative to the plan, so plan_first
+        # rebases them onto the batch rows the corrected lengths are indexed by
+        # (see _msa_fmha_plan_rows). A sub-plan holds either one row per request
+        # or one per query token, since the planner row-expands dense plans over
+        # query tokens, so the row count selects the source. qo_offset must stay
+        # non-negative: negative values hit the kernel's packed-length sentinel
+        # fallback.
         per_request = {
             "kv_segment_lens": kv_true,
             "qo_offset": (kv_true - qo_dev).clamp_min(0),
@@ -1349,6 +1382,16 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             maybe_pin_memory(block_ids_cpu.to(torch.int32)), non_blocking=True
         )
         self.msa_seq_lens_cuda[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
+        # Sub-page expansion for the trtllm-gen dense layers, staged once here
+        # instead of once per layer. It runs outside capture and writes a
+        # graph-stable buffer, so a replay reads what this step staged, exactly
+        # as it does for the slot table above.
+        if self.msa_subpage_block_table is not None:
+            write_subpage_block_table(
+                self.msa_block_table[:batch_size],
+                self._msa_subpages_per_slot,
+                self.msa_subpage_block_table[:batch_size],
+            )
 
         # Staging for on_update_kv_lens.
         step_width = int(req_to_token.shape[1])
@@ -1462,6 +1505,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         decode plan at the worst-case max_k_tiles, so replays only shrink it.
         """
         store = self.msa_max_score
+        if plan_max_k_tiles <= 0:
+            raise ValueError(
+                "The proxy max-score view has no block extent (max_k_tiles="
+                f"{plan_max_k_tiles}). Both the fmha_sm100 proxy and the CuTe "
+                "DSL scorer address it by block id, so a zero extent would put "
+                "their writes past the end of the view."
+            )
         numel = num_index_heads * plan_max_k_tiles * num_tokens
         if numel > store.numel():
             raise ValueError(
@@ -1572,8 +1622,8 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         # Index-K may already be in the cache by two routes: the fused per-layer
         # write (msa_write_layer_caches, idx_k_prewritten=True) stored a live
         # bf16 idx_k, or the FP8 producer inserted FP8 index-K and passed
-        # idx_k=None. Write here only when neither owns it — i.e. a live idx_k
-        # that was not pre-written.
+        # idx_k=None. Write here only when neither owns it: a live idx_k that
+        # was not pre-written.
         if idx_k is not None and not idx_k_prewritten:
             idx_k_view = idx_k.reshape(num_tokens, 1, config.sparse_index_dim)
             metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
@@ -1711,10 +1761,10 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
     ) -> None:
         """Run MSA after the eager-prefill producer inserted main K/V.
 
-        ``TrtllmAttention.forward`` interprets ``k=None`` as a fused QKV
-        buffer, so it cannot represent compact Q with prewritten paged K/V.
-        Dispatch the same MSA paged-GQA helper directly; the #16755 prewritten
-        marker is consumed there exactly as on its general scatter path.
+        TrtllmAttention.forward reads k=None as a fused QKV buffer, so it
+        cannot express compact Q with prewritten paged K/V. Dispatch the same
+        MSA paged-GQA helper directly; it consumes the prewritten-layer marker
+        exactly as it does on its general scatter path.
         """
         output = forward_args.output
         if output is None:

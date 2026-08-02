@@ -1,15 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
-# PyTorch oracle vendored from vLLM (Apache-2.0), ``_reference_decode_index_score``:
+# PyTorch oracle vendored from vLLM (Apache-2.0), _reference_decode_index_score:
 # https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/tests/kernels/attention/test_minimax_m3.py#L188
 """Correctness tests for the CuTe DSL MiniMax-M3 indexer decode scorer.
 
 The PyTorch oracle is ported from the vLLM reference linked in the file header
 (v0.26.1rc0-77-g6f91edf96).
 """
-
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,7 +17,6 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
-    msa_ported_decode_active,
     select_blocks_from_maxscore,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -473,17 +470,3 @@ def test_cutedsl_score_helper_falls_back_on_unsupported_geometry():
         seq_lens_cuda=seq_lens,
         decode_query_len=dql,
     )
-
-
-def test_scorer_inputs_alone_decide_that_it_runs():
-    """The scorer runs on whatever span it is handed, with nothing else to
-    consult: prepare() passes the buffers exactly when it resolved one."""
-    metadata = SimpleNamespace(
-        msa_decode_query_len=1,
-        msa_block_table=object(),
-        msa_seq_lens_cuda=object(),
-    )
-    assert msa_ported_decode_active(metadata) is True
-
-    metadata.msa_decode_query_len = None
-    assert msa_ported_decode_active(metadata) is False

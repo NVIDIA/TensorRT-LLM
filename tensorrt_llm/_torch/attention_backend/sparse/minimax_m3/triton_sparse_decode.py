@@ -14,8 +14,8 @@ of a 128-row Q tile idle.
 Vendored from the vLLM source linked in the file header (v0.26.1rc0-77-g6f91edf96).
 Differences from upstream:
 
-* K and V are separate HND paged views (``[num_pages, num_kv_heads, page_size,
-  head_dim]``) with independent strides rather than one cache fused along the
+* K and V are separate HND paged views ([num_pages, num_kv_heads, page_size,
+  head_dim]) with independent strides rather than one cache fused along the
   last dim, because that is how the M3 KV pool is laid out here.
 * Only the scalar KV-scale mode is kept; M3 stores unscaled E4M3 K/V.
 * Partial-output and LSE scratch come from the persistent buffer arena so their
@@ -287,12 +287,12 @@ def minimax_m3_sparse_attn_decode(
     kv_scale: Optional[torch.Tensor] = None,
     num_topk_chunks: Optional[int] = None,
 ) -> None:
-    """Block-sparse GQA decode attention, written into ``output`` in place.
+    """Block-sparse GQA decode attention, written into output in place.
 
-    ``kv_scale`` is an optional scalar dequantization factor for an FP8 cache;
-    MiniMax-M3 stores unscaled E4M3, so it is normally None.
-    ``num_topk_chunks`` overrides the split-K factor and exists for tests: the
-    merged result must not depend on it.
+    kv_scale is an optional scalar dequantization factor for an FP8 cache;
+    MiniMax-M3 stores unscaled E4M3, so it is normally None. num_topk_chunks
+    overrides the split-K factor and exists for tests: the merged result must
+    not depend on it.
     """
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])

@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Latency of the MiniMax-M3 indexer decode scorer, CuTe DSL vs the MSA proxy.
 
-The CuTe DSL kernel replaces the fmha_sm100 ``output_maxscore`` pass that
-currently produces the per-block index scores. Run this on one SM100 GPU to see
-the per-call cost of each at a given batch size and context length; no model
-weights are needed.
+Both produce the per-block index scores the selector ranks: the CuTe DSL
+kernel on a resolved decode span, the fmha_sm100 output_maxscore pass on
+everything else. Run this on one SM100 GPU to see the per-call cost of each at
+a given batch size and context length; no model weights are needed.
 
     python tests/microbenchmarks/minimax_m3_index_decode_score.py \
         --batch 1 --seq-len 8192 --num-heads 1
@@ -45,9 +45,7 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=8192)
     parser.add_argument("--num-heads", type=int, default=1, help="Sharded index heads.")
     parser.add_argument("--decode-query-len", type=int, default=1)
-    parser.add_argument(
-        "--dtype", choices=("bfloat16", "fp8_e4m3"), default="fp8_e4m3"
-    )
+    parser.add_argument("--dtype", choices=("bfloat16", "fp8_e4m3"), default="fp8_e4m3")
     args = parser.parse_args()
 
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float8_e4m3fn
@@ -72,9 +70,7 @@ def main() -> None:
             idx_q, k_cache, block_table, seq_lens, score, dql
         )
 
-    print(
-        f"batch={batch} seq_len={seq_len} heads={num_heads} dql={dql} dtype={args.dtype}"
-    )
+    print(f"batch={batch} seq_len={seq_len} heads={num_heads} dql={dql} dtype={args.dtype}")
     print(f"  cutedsl : {_time_us(run_cutedsl):8.2f} us/call")
 
     if not msa_package_available():

@@ -152,55 +152,114 @@ def test_msa_metadata_rejects_undersized_max_score_buffer():
         )
 
 
+MAX_NUM_SEQUENCES = 8
+MAX_BLOCKS_PER_SEQ = 64
+
+
+class _RecordingBuffers:
+    """The graph buffer pool, recording what each buffer was reserved as."""
+
+    def __init__(self):
+        self.requested = {}
+
+    def get_buffer(self, tensor_shape, dtype, cache_name, capture_graph):
+        self.requested[cache_name] = (tuple(tensor_shape), dtype, capture_graph)
+        return torch.zeros(tensor_shape, device="cuda", dtype=dtype)
+
+
+def _buffer_metadata(**manager_fields):
+    """Metadata ready for _create_msa_buffers, under capture."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = SimpleNamespace(
+        max_blocks_per_seq=MAX_BLOCKS_PER_SEQ,
+        tokens_per_block=128,
+        get_index_k_buffer=lambda layer_idx, kv_layout=None: None,
+        **manager_fields,
+    )
+    metadata.is_cuda_graph = True
+    metadata.cuda_graph_buffers = _RecordingBuffers()
+    metadata.max_num_sequences = MAX_NUM_SEQUENCES
+    metadata.max_num_tokens = 512
+    # No sparse params, so the fmha_sm100 proxy scratch is skipped and this
+    # exercises only the layer-invariant buffers.
+    metadata._msa_params = None
+    return metadata
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_msa_buffers_include_graph_stable_block_table():
     """The 2-D page table and per-request length the ported decode kernels take
     must come from the graph buffer pool at the manager's worst-case geometry,
     so their addresses survive capture."""
-    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
-    metadata = metadata_cls.__new__(metadata_cls)
-    max_num_sequences, max_blocks_per_seq = 8, 64
-
-    metadata.kv_cache_manager = SimpleNamespace(
-        max_blocks_per_seq=max_blocks_per_seq,
-        tokens_per_block=128,
-        get_index_k_buffer=lambda layer_idx, kv_layout=None: None,
-    )
-
-    class RecordingBuffers:
-        def __init__(self):
-            self.requested = {}
-
-        def get_buffer(self, tensor_shape, dtype, cache_name, capture_graph):
-            self.requested[cache_name] = (tuple(tensor_shape), dtype, capture_graph)
-            return torch.zeros(tensor_shape, device="cuda", dtype=dtype)
-
-    buffers = RecordingBuffers()
-    metadata.is_cuda_graph = True
-    metadata.cuda_graph_buffers = buffers
-    metadata.max_num_sequences = max_num_sequences
-    metadata.max_num_tokens = 512
-    # No sparse params, so the fmha_sm100 proxy scratch is skipped and this
-    # exercises only the layer-invariant buffers.
-    metadata._msa_params = None
+    metadata = _buffer_metadata()
 
     metadata._create_msa_buffers()
 
     assert metadata._msa_buffers_ready
-    assert metadata.msa_block_table.shape == (max_num_sequences, max_blocks_per_seq)
-    assert metadata.msa_seq_lens_cuda.shape == (max_num_sequences,)
+    assert metadata.msa_block_table.shape == (MAX_NUM_SEQUENCES, MAX_BLOCKS_PER_SEQ)
+    assert metadata.msa_seq_lens_cuda.shape == (MAX_NUM_SEQUENCES,)
     # Reserved from the graph pool at the worst-case geometry, alongside the
     # flat page table the fmha_sm100 path uses.
-    assert buffers.requested["msa_block_table"] == (
-        (max_num_sequences, max_blocks_per_seq),
+    requested = metadata.cuda_graph_buffers.requested
+    assert requested["msa_block_table"] == (
+        (MAX_NUM_SEQUENCES, MAX_BLOCKS_PER_SEQ),
         torch.int32,
         True,
     )
-    assert buffers.requested["msa_seq_lens_cuda"] == (
-        (max_num_sequences,),
-        torch.int32,
-        True,
+    assert requested["msa_seq_lens_cuda"] == ((MAX_NUM_SEQUENCES,), torch.int32, True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    ("factors", "expected"),
+    [((9, 9, 9), 9), ((9, 4, 9), 0)],
+    ids=["uniform-pool", "groups-disagree"],
+)
+def test_msa_buffers_stage_the_subpage_table_only_for_a_uniform_pool(factors, expected):
+    """The sub-page expansion is hoisted out of the dense layers into prepare(),
+    which runs before any layer is named. That is sound only where every layer
+    of the pool packs the same number of sub-pages per slot; where they
+    disagree, no table is staged and each dense layer expands its own.
+    """
+    metadata = _buffer_metadata(
+        layer_offsets=dict.fromkeys(range(len(factors)), 0),
+        get_kv_subpage_pool=lambda layer_idx, kv_layout="HND": (None, factors[layer_idx]),
     )
+
+    metadata._create_msa_buffers()
+
+    assert metadata._msa_subpages_per_slot == expected
+    if expected == 0:
+        assert metadata.msa_subpage_block_table is None
+        assert "msa_subpage_block_table" not in metadata.cuda_graph_buffers.requested
+    else:
+        # One K row and one V row per slot, at the same worst-case geometry as
+        # the slot table it expands.
+        assert metadata.cuda_graph_buffers.requested["msa_subpage_block_table"] == (
+            (MAX_NUM_SEQUENCES, 2, MAX_BLOCKS_PER_SEQ),
+            torch.int32,
+            True,
+        )
+
+
+def test_msa_subpage_rows_slice_the_generation_span():
+    """A mixed step hands the dense kernel only the span's rows, and its block
+    table has to be sliced the same way the slot table is. The factor travels
+    with it so the kernel can tell a stale staging from its own geometry."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.msa_subpage_block_table = torch.arange(4 * 2 * 3, dtype=torch.int32).reshape(4, 2, 3)
+    metadata._msa_subpages_per_slot = 9
+
+    table, factor = metadata.msa_subpage_rows(2, 4)
+    assert factor == 9
+    assert torch.equal(table, metadata.msa_subpage_block_table[2:4])
+
+    # Nothing staged: the caller expands its own layer's table, and the 0
+    # factor is what tells it to.
+    metadata.msa_subpage_block_table = None
+    assert metadata.msa_subpage_rows(2, 4) == (None, 0)
 
 
 def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
@@ -225,6 +284,11 @@ def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
     # Oversized requests are rejected rather than silently corrupting memory.
     with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata.msa_proxy_max_score_view(num_index_heads, worst_k, max_batch + 1)
+
+    # So is an empty one. Both writers address the view by block id, so a zero
+    # extent is not a small view but writes past the end of one.
+    with pytest.raises(ValueError, match=r"no block extent"):
+        metadata.msa_proxy_max_score_view(num_index_heads, 0, max_batch)
 
 
 def test_msa_index_k_uses_hnd_cache_view_and_writer():
@@ -536,6 +600,42 @@ def test_msa_scratch_sizing_covers_spec_verify_tokens():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_lazily_allocated_scratch_publishes_the_bound_it_used(monkeypatch):
+    """The scratch is normally sized in _create_msa_buffers, but a metadata
+    built without sparse params allocates it here on first use. Either way the
+    worst-case bound has to be published: msa_proxy_max_score_view shapes the
+    view from it, including on a step that skips the proxy plan and so never
+    computes a bound of its own.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import msa_backend
+
+    # Both stand in for the fmha_sm100 submodule, which need not be built to
+    # test what is done with the number it returns.
+    monkeypatch.setattr(msa_backend, "require_msa_module", lambda: None)
+    monkeypatch.setattr(msa_backend, "_worst_case_proxy_max_k_tiles", lambda *a, **kw: 32)
+
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = SimpleNamespace()
+    metadata.cuda_graph_buffers = None
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 8
+    metadata.msa_max_score = None
+    metadata._msa_worst_case_max_k_tiles = 0
+
+    metadata._ensure_msa_decode_scratch_buffers(
+        num_index_heads=4,
+        max_batch=2,
+        capture_graph=False,
+        required_max_k_tiles=16,
+    )
+
+    assert metadata.msa_worst_case_max_k_tiles == 32
+    # The store was sized against that bound, so a view shaped by it fits.
+    assert metadata.msa_proxy_max_score_view(4, 32, 8).shape == (4, 32, 8)
+
+
 def _resolution_metadata(
     *, num_contexts=0, qo_lens=(1, 1), kv_lens=(9, 11), is_cuda_graph=False, page_size=128
 ):
@@ -640,6 +740,22 @@ def test_resolve_decode_kernels_resolves_no_span_for_a_pure_prefill(monkeypatch)
     assert metadata.msa_decode_query_len is None
     assert msa_ported_decode_active(metadata) is False
     assert metadata._msa_runs_no_fmha() is False
+
+
+def test_a_span_without_its_buffers_is_not_active():
+    """The ported kernels address the page table and per-request lengths
+    directly, so a metadata carrying a query length but neither (the standalone
+    kernel tests, which never run prepare()) has not resolved a span."""
+    metadata = SimpleNamespace(
+        msa_decode_query_len=1, msa_block_table=None, msa_seq_lens_cuda=torch.zeros(1)
+    )
+    assert msa_ported_decode_active(metadata) is False
+
+    metadata.msa_block_table = torch.zeros(1)
+    assert msa_ported_decode_active(metadata) is True
+
+    metadata.msa_seq_lens_cuda = None
+    assert msa_ported_decode_active(metadata) is False
 
 
 @pytest.mark.parametrize(
@@ -975,8 +1091,8 @@ def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("with_idx", [True, False])
 def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
-    """The fused per-layer cache scatter must match the legacy write_kv_slots
-    path exactly on production-shaped inputs: non-contiguous HND cache views
+    """The fused per-layer cache scatter must match the per-cache write_kv_slots
+    writes exactly on production-shaped inputs: non-contiguous HND cache views
     carved from a pooled allocation and strided source rows sliced from a fused
     projection, including the bf16 -> fp8 cache cast. Asserting on the whole
     pool also catches stray writes outside the targeted slots."""

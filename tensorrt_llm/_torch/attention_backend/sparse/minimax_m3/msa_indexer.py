@@ -262,8 +262,8 @@ class MsaIndexer:
         of the scorer's; they are selected separately and the tables joined.
 
         `require_cutedsl` says prepare() committed to the scorer and narrowed
-        the proxy plan to the context prefix, so declining is no longer an
-        option and raises.
+        the proxy plan to the context prefix, leaving the span nothing to
+        decline to, so a decline raises.
         """
         config = self.config
         total_q = int(idx_q.shape[0])
