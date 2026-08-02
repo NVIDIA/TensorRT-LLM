@@ -907,6 +907,22 @@ def main():
         if _kv:
             script_prefix_lines.append(f"export {_kv}")
 
+    # Also splice EXTRA_CONTAINER_EXPORTS *inline* into the per-role env prefixes
+    # built below. Aggregated ranks inherit these from the container env, but
+    # disaggregated ctx/gen/benchmark workers are launched with a curated inline
+    # env prefix (TLLM_PROFILE_START_STOP, FLASHINFER_JIT_DIR, HF_HOME, ...) and
+    # anything not on that prefix -- nor in the srun --container-env allowlist --
+    # is dropped at the worker boundary. Putting the same KEY=VALUE pairs inline
+    # guarantees opt-in passthroughs (e.g. cache-dir overrides, BOLT
+    # clear-counters env, BOLT_ITER_MULT) reach every disagg role. Values here are
+    # simple (no spaces); generic and a no-op when EXTRA_CONTAINER_EXPORTS unset.
+    _extra_inline_exports = " ".join(
+        _kv.strip()
+        for _kv in os.environ.get("EXTRA_CONTAINER_EXPORTS", "").split(";")
+        if _kv.strip()
+    )
+    _extra_inline_prefix = f"{_extra_inline_exports} " if _extra_inline_exports else ""
+
     nsys_prefix = ""
     tllm_profile_start_stop = ""
     ctx_tllm_profile_start_stop = ""
@@ -978,19 +994,21 @@ def main():
         ctx_worker_env_var = env_config.get("ctx_worker_env_var", "")
         gen_worker_env_var = env_config.get("gen_worker_env_var", "")
         ctx_worker_env_vars = (
+            f"{_extra_inline_prefix}"
             f"TLLM_PROFILE_START_STOP='{ctx_tllm_profile_start_stop}' "
             f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
             f"HF_HOME=/tmp/hf_home "
             f"{ctx_worker_env_var}"
         )
         gen_worker_env_vars = (
+            f"{_extra_inline_prefix}"
             f"TLLM_PROFILE_START_STOP='{gen_tllm_profile_start_stop}' "
             f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
             f"HF_HOME=/tmp/hf_home "
             f"{gen_worker_env_var}"
         )
-        server_env_vars = env_config.get("server_env_var", "")
-        benchmark_env_var = env_config.get("benchmark_env_var", "")
+        server_env_vars = f"{_extra_inline_prefix}{env_config.get('server_env_var', '')}"
+        benchmark_env_var = f"{_extra_inline_prefix}{env_config.get('benchmark_env_var', '')}"
         # Handle gen only mode
         if "gen_only_no_context" in bm_config.get("mode", ""):
             gen_worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {gen_worker_env_vars}"
