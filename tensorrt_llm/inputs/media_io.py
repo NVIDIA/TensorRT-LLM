@@ -586,6 +586,41 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
+def parse_data_uri(url: str) -> Tuple[str, str]:
+    """Parse an RFC 2397 data URI into its media type and base64 payload.
+
+    The payload is returned as the still-encoded base64 string rather than as
+    decoded bytes, so that it can be handed straight to
+    `BaseMediaIO.load_base64`, which decodes it per modality.
+
+    Args:
+        url: A complete `data:` URI, e.g. `data:image/png;base64,iVBORw0...`.
+
+    Returns:
+        A `(media_type, data)` pair. `media_type` is the empty string for URIs
+        that omit it, such as `data:;base64,...`, which RFC 2397 permits.
+
+    Raises:
+        ValueError: The URI has no `,` separating the header from the payload.
+        NotImplementedError: The payload is not base64-encoded.
+    """
+    path = urlparse(url).path
+    if "," not in path:
+        raise ValueError(
+            f"Malformed data URI {url[:64]!r}: expected "
+            "'data:[<media type>][;<parameter>]*,<data>', but found no ',' separating "
+            "the header from the payload."
+        )
+    data_spec, data = path.split(",", 1)
+    # Everything after the media type is a parameter, and `base64` need not be
+    # the first one -- `data:audio/wav;codecs=opus;base64,...` is well-formed.
+    media_type, *parameters = data_spec.split(";")
+    # Parameter names are case-insensitive per RFC 2045.
+    if not any(parameter.lower() == "base64" for parameter in parameters):
+        raise NotImplementedError("Only base64 data URLs are supported for now.")
+    return media_type, data
+
+
 _MediaT = TypeVar("_MediaT")
 
 
@@ -671,12 +706,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             data = await _safe_aiohttp_get(url, session=session)
             return await self._run_in_executor(self.load_bytes, data)
         elif parsed.scheme == "data":
-            data_spec, b64_data = parsed.path.split(",", 1)
-            parts = data_spec.split(";", 1)
-            media_type = parts[0]
-            encoding = parts[1] if len(parts) > 1 else ""
-            if encoding != "base64":
-                raise NotImplementedError("Only base64 data URLs are supported for now.")
+            media_type, b64_data = parse_data_uri(url)
             return await self._run_in_executor(self.load_base64, media_type, b64_data)
         elif parsed.scheme in ("", "file"):
             return await self._run_in_executor(self.load_file, url)

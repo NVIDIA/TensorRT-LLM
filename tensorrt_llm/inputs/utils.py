@@ -8,7 +8,7 @@ from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import numpy as np
 import soundfile
@@ -27,6 +27,7 @@ from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
                                           _safe_aiohttp_get, _safe_request_get)
 from tensorrt_llm.inputs.media_io import \
     convert_image_mode as convert_image_mode
+from tensorrt_llm.inputs.media_io import parse_data_uri
 from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
                                             default_hasher)
 from tensorrt_llm.inputs.multimodal_data import \
@@ -43,13 +44,7 @@ logger = logging.get_logger(__name__)
 
 
 def load_base64_image(parsed_url: str) -> Image.Image:
-    data_spec, data = parsed_url.path.split(",", 1)
-    media_type, data_type = data_spec.split(";", 1)
-
-    if data_type != "base64":
-        msg = "Only base64 data URLs are supported for now."
-        raise NotImplementedError(msg)
-
+    _, data = parse_data_uri(urlunparse(parsed_url))
     content = base64.b64decode(data)
     image = _load_and_convert_image(BytesIO(content))
     return image
@@ -122,14 +117,7 @@ async def async_load_image(
 
 
 def load_base64_video(video: str) -> BytesIO:
-    parsed_url = urlparse(video)
-    data_spec, data = parsed_url.path.split(",", 1)
-    media_type, data_type = data_spec.split(";", 1)
-
-    if data_type != "base64":
-        msg = "Only base64 data URLs are supported for now."
-        raise NotImplementedError(msg)
-
+    _, data = parse_data_uri(video)
     content = base64.b64decode(data)
     return content
 
