@@ -141,7 +141,7 @@ KvCacheManager::~KvCacheManager()
 void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
 {
     TLLM_CHECK_WITH_INFO(mLivingKvCaches.empty(),
-        "%s with %zu KvCache(s) still open; close them (or drain the engine) first", api, mLivingKvCaches.size());
+        "%s with %zu KV cache(s) still open; close them (or drain the engine) first", api, mLivingKvCaches.size());
 }
 
 void KvCacheManager::shutdown()
