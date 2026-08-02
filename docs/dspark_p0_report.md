@@ -290,6 +290,54 @@ acceptance 把 draft 重塑成 `[num_gens, runtime_draft_len]`，就成了 640 �
 **结论：hang 的真实根因是 H1（连带 K8）—— DSA 展开 stride 用静态 max 而非 runtime tier。**
 候选 2 是无害的共存现象；候选 3 未被证明有害。
 
+## 4.4 host-device sync 验证（overlap scheduler 不受影响）
+
+**静态审计**（逐行核实 `dspark_ragged.py` / `dspark_verify.py` / `dspark.py` / `heads.py`）：
+
+| 命中 | 判定 |
+|---|---|
+| `dspark_verify.py` 两处 `.numpy()` | ✅ survival 来自 `_host_buffer`（**pinned CPU**）；planner 全程在 host 快照上算 |
+| `dspark_ragged.py` 两处 `.tolist()` | ✅ `verify_lens` 是 CPU 张量 |
+| `dspark_ragged.py` `row_ids_from_lens` | ✅ `output_size` 是**必填参数**，docstring 说明这里 sync 是 "outright illegal" |
+| `dspark.py:634` `qo_indptr.to(device)` | ✅ 同 device，no-op |
+| `dspark.py:551` `chunk_positions[0].item()` | ⚠️ 真 sync，但在 **prefill** 路径且由 base DSpark `147404864d` (#15808) 引入，**不属本 PR** |
+
+加上本轮已修的两处（`repeat_interleave` 补 `output_size`、`apply_sts` 缓存 host 副本），
+**decode 路径上 confidence/ragged 没有新增 sync**。
+
+静态分析不是证明，所以加了 `TLLM_DSPARK_SYNC_DEBUG=<n>`：在 n 个 DSpark decode 迭代后
+arm `torch.cuda.set_sync_debug_mode("warn")`。**故意晚 arm** —— warmup 与 graph capture
+本就合法地同步，一开始就开会把信号埋掉。用 `warn` 不用 `error`，一次 run 能看到全部违规者。
+**实测结果待补。**
+
+## 4.5 kernel 改动兼容性
+
+K4 / K9 是 PR 自带的（`e1c28eeae2`），本轮验证其「纯加性」性质：
+
+| 判据 | 证据 |
+|---|---|
+| (a) 不传新参数时 uniform 路径不变 | `indexerTopK.cu:680-688` 的 `else` 分支是**原公式逐字保留**；`compressorKernels.cu:348` 在指针为空时 `nn == NEXT_N`，`sp = kv_len - NEXT_N` 即原式，且 `NEXT_N` 仍是模板常量（保住全展开） |
+| (a') bitwise 差分实测 | compressor：uniform 填充 == 传 `None`，**4/4 通过**；indexer top-k：`test_ragged_with_equal_lens_matches_uniform`，在 202 passed 内 |
+| (b) ragged 结果正确 | compressor 与**单请求 uniform** 逐个比对（避开「kernel 直接忽略参数也能过」的盲点），通过 |
+| (c) 互斥组合显式拒绝 | kernel `TLLM_CHECK`（`indexerTopK.cu:921`）+ 本轮新增的 Python config reject |
+| (d) G6 两开关关闭零回归 | **穷举证明**：新 stride 与原 `1 + max_draft_tokens` 对 MTP / DSpark / PARD / DFlash 在 K=1,3,5,8 上全部相等。唯一变化发生在 `runtime_draft_len < max`（动态 draft 长度），那是修 bug |
+
+## 4.6 新增的可观测性：trimming 到底有没有代价
+
+SGLang 博客（https://www.lmsys.org/blog/2026-07-06-dspark-sglang）的核心指标是
+`accept_length / block_accept_length`（报 0.88–0.97）。TRT-LLM 缺的是**分母** ——
+`ceiling_tokens` 数的是「不裁会**提交**多少 token」，回答「省了多少算力」，
+永远回答不了「毁了多少接受率」。后果：planner 过度裁剪只表现为端到端接受长度缓慢下降，
+与「workload 变难」不可区分。
+
+**没有照抄 SGLang 的估计器**，而是直接测那件事：被裁到窗口 `w` 的请求若**接受了整个 `w`**，
+说明剪的时候 draft 还活着，这一刀确实有代价；接受数 `< w` 的本来就会死，剪了不亏。
+`trim_regret_rate` = 被裁请求中前者的占比 —— **精确、无偏、不需要模型**。
+（从未被裁的请求外推是**构造性有偏**的：哪些不裁正是 planner 挑的。）
+
+记录点在 sampler，因为那是唯一一处「接受数」与「它对应的窗口」同时在 host 侧且属于同一步
+的地方 —— 活的 `py_verify_len` 那时已翻到下一步（正是 H6 快照存在的原因）。
+
 ## 5. 交付物 3：e2e 实测 —— **未完成**
 
 - 均匀 tier 路径 + overlap scheduler + DEP8 的 GSM8K：**运行中，未取得分数**。
