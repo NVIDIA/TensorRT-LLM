@@ -998,11 +998,6 @@ class LoraManager(object):
             return t_out
 
         def load_from_model_dir(uid, model_dir, hf_config):
-            if uid not in self._cpp_lora_weights:
-                self._cpp_lora_weights[uid] = []  # Will be converted to tensor later
-            if uid not in self._cpp_lora_config:
-                self._cpp_lora_config[uid] = []  # Will be converted to tensor later
-
             lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
@@ -1010,6 +1005,62 @@ class LoraManager(object):
             all_weights = get_all_hf_lora_weights(lora_model, hf_modules, component)
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))
+            model_dtype = str_dtype_to_torch(model_config.dtype)
+            supports_native_fp8 = torch.cuda.get_device_capability() == (9, 0)
+
+            def get_output_dtype(module_weights):
+                if _is_moe_module_weights(module_weights):
+                    output_dtypes = {
+                        weights["out"].dtype
+                        for weights in module_weights.values()
+                        if "out" in weights
+                    }
+                    return next(iter(output_dtypes)) if len(output_dtypes) == 1 else model_dtype
+                return module_weights["out"].dtype if "out" in module_weights else model_dtype
+
+            def uses_native_fp8(module_weights):
+                return (
+                    get_output_dtype(module_weights) == torch.float8_e4m3fn
+                    and not _is_moe_module_weights(module_weights)
+                    and supports_native_fp8
+                )
+
+            for layer_weights in all_weights.values():
+                placeholder_dtype = next(
+                    (
+                        weights["out"].dtype
+                        for weights in layer_weights.values()
+                        if not _is_moe_module_weights(weights) and "out" in weights
+                    ),
+                    model_dtype,
+                )
+                for lora_module in self.missing_qkv_modules:
+                    hf_module = model_config.trtllm_modules_to_hf_modules[lora_module]
+                    if isinstance(hf_module, list):
+                        hf_module = hf_module[0]
+                    layer_weights[hf_module] = {
+                        "in": torch.zeros(rank, model_config.hidden_size, dtype=placeholder_dtype),
+                        "out": torch.zeros(model_config.hidden_size, rank, dtype=placeholder_dtype),
+                    }
+
+            cache_dtypes = {
+                torch.float8_e4m3fn if uses_native_fp8(module_weights) else model_dtype
+                for layer_weights in all_weights.values()
+                for hf_module, module_weights in layer_weights.items()
+                if hf_modules_to_trtllm_modules[hf_module] in self.lora_target_modules
+            }
+            if len(cache_dtypes) > 1:
+                dtype_names = ", ".join(sorted(str(dtype) for dtype in cache_dtypes))
+                raise ValueError(
+                    "A LoRA adapter must use one PEFT cache dtype across all modules; "
+                    f"{model_dir} requires {dtype_names}. Mixing native FP8 dense modules "
+                    "with compute-dtype modules such as routed-expert MoE is not supported."
+                )
+
+            if uid not in self._cpp_lora_weights:
+                self._cpp_lora_weights[uid] = []  # Will be converted to tensor later
+            if uid not in self._cpp_lora_config:
+                self._cpp_lora_config[uid] = []  # Will be converted to tensor later
 
             self._lora_uid_to_low_ranks[uid] = {}
             self._lora_weights_pointers_list[uid] = {}
@@ -1017,15 +1068,6 @@ class LoraManager(object):
                 layer_weights = all_weights[layer_idx]
                 self._lora_uid_to_low_ranks[uid][layer_idx] = {}
                 self._lora_weights_pointers_list[uid][layer_idx] = {}
-
-                for lora_module in self.missing_qkv_modules:
-                    hf_module = model_config.trtllm_modules_to_hf_modules[lora_module]
-                    if isinstance(hf_module, list):
-                        hf_module = hf_module[0]
-                    layer_weights[hf_module] = {
-                        "in": torch.zeros(rank, model_config.hidden_size),
-                        "out": torch.zeros(model_config.hidden_size, rank),
-                    }
 
                 for hf_module, module_weights in layer_weights.items():
                     lora_module = hf_modules_to_trtllm_modules[hf_module]
@@ -1078,13 +1120,8 @@ class LoraManager(object):
                     t_out = prepare_fused_lora_modules_for_tp(lora_module, t_out, rank_dim)
 
                     effective_rank = t_in.shape[rank_dim]
-                    is_fp8 = t_out.dtype == torch.float8_e4m3fn
                     # TODO: Enable SM120/SM121 after validating the native FP8 LoRA kernel there.
-                    use_fp8_kernel = (
-                        is_fp8
-                        and not has_expert_indices
-                        and torch.cuda.get_device_capability() == (9, 0)
-                    )
+                    use_fp8_kernel = uses_native_fp8(module_weights)
                     if use_fp8_kernel:
                         if t_in.dtype != t_out.dtype:
                             raise ValueError(
@@ -1125,7 +1162,6 @@ class LoraManager(object):
                         )
                     else:
                         # Pre-Hopper kernels require the model compute dtype.
-                        model_dtype = str_dtype_to_torch(model_config.dtype)
                         t_in = t_in.to(model_dtype)
                         t_out = t_out.to(model_dtype)
                         t_out = t_out * scale
