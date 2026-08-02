@@ -866,7 +866,20 @@ class _KVCache:
                         indices.extend([BAD_PAGE_INDEX] * (new_num_blocks - old_num_blocks))
                     else:
                         if len(indices) < new_num_blocks:
-                            raise ValueError("User-provided base page indices is too short")
+                            # The buffer is a slice of host_kv_cache_block_offsets
+                            # and is therefore max_blocks_per_seq long, so this
+                            # means the sequence wants more blocks than
+                            # max_seq_len allows -- i.e. it is consuming KV
+                            # faster than it emits tokens. The bare message gave
+                            # no way to tell that from a genuinely oversized
+                            # request, which cost several 20-minute runs.
+                            raise ValueError(
+                                f"User-provided base page indices is too short: "
+                                f"buffer holds {len(indices)} blocks "
+                                f"(max_blocks_per_seq) but the sequence now "
+                                f"needs {new_num_blocks} (was {old_num_blocks}); "
+                                f"num_blocks={self.num_blocks}, "
+                                f"num_committed_tokens={self.num_committed_tokens}")
 
             stream_wait_events(
                 self.cuda_stream, (s.ready_event for s in chain.from_iterable(slots))

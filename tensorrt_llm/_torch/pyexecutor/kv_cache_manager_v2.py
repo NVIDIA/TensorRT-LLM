@@ -3535,14 +3535,33 @@ class KVCacheManagerV2(BaseResourceManager):
             if not kv_cache.is_active:
                 continue
             rewind_len = req.py_rewind_len
+            # Tokens this step actually claims: rejections inside the verify
+            # window plus the accepted ones.
+            runtime_draft_len = req.py_rewind_len + req.py_num_accepted_draft_tokens
             if self.is_draft:
-                runtime_draft_len = req.py_rewind_len + req.py_num_accepted_draft_tokens
                 # Dynamic-tree draft managers reserve K * max_draft_len slots,
                 # which can exceed the tree's runtime draft width. Reclaim that
                 # reserve slack together with rejected draft tokens; otherwise
                 # it accumulates in the draft KV cache after every generation
-                # step. Target managers do not allocate this reserve slack.
-                rewind_len += max(self._kv_reserve_draft_tokens - runtime_draft_len, 0)
+                # step.
+                reserved = self._kv_reserve_draft_tokens
+            else:
+                # The target manager reserves for the FULL drafted block --
+                # prepare_resources adds `max(draft_len, reserve)` tokens every
+                # generation step -- but ragged verification only ever writes
+                # `verified_len` of them, and py_rewind_len covers rejections
+                # *within that window* only. The positions the scheduler trimmed
+                # away were reserved and never reclaimed, leaking
+                # (draft_len - verified_len) tokens per step until the sequence
+                # demands more blocks than max_seq_len allows and the KV cache
+                # raises "User-provided base page indices is too short".
+                #
+                # Uniform speculation is unaffected: there verified_len ==
+                # draft_len, so this term is zero and the arithmetic is exactly
+                # what it was.
+                reserved = max(get_draft_token_length(req),
+                               self._kv_reserve_draft_tokens)
+            rewind_len += max(reserved - runtime_draft_len, 0)
             new_capacity = (
                 None
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
