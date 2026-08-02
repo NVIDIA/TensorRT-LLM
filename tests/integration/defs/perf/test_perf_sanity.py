@@ -1337,11 +1337,11 @@ class DisaggTestCmds(NamedTuple):
         which is what lets the gen srun exit — so this is not circular.
 
         Returns True once all sentinels exist, or False if the dedicated
-        sentinel timeout is reached first. On False the caller still parses
-        whatever is on disk: the sentinel is a correctness optimization
-        against reading a mid-flush log, not a reason to consume the whole-test
-        timeout and trigger Slurm's kill-on-bad-exit cascade (nvbugs 6487036 /
-        6487040 / 6487038).
+        sentinel timeout is reached first. On False the caller skips the
+        device-step metric because the GEN logs may still be incomplete. The
+        bounded wait prevents a stuck multi-node srun from consuming the
+        whole-test timeout and triggering Slurm's kill-on-bad-exit cascade
+        (nvbugs 6487036 / 6487040 / 6487038).
         """
         sentinels = [
             os.path.join(self.test_output_dir, f"gen_server_{i}.done")
@@ -1357,7 +1357,7 @@ class DisaggTestCmds(NamedTuple):
             if elapsed_time > timeout:
                 print_info(
                     f"Timeout ({timeout}s) waiting for gen worker log "
-                    f"sentinels {missing}; parsing current log contents."
+                    f"sentinels {missing}; skipping the device-step metric."
                 )
                 return False
             print_info(
@@ -1592,8 +1592,7 @@ class DisaggTestCmds(NamedTuple):
             # then parse each benchmark client's gen-worker device step time a
             # single time. Only gen_only runs populate this queue; other modes
             # skip both the sentinel wait and device-step-time parsing.
-            if pending_device_step_time:
-                self.wait_for_gen_log_sentinels()
+            if pending_device_step_time and self.wait_for_gen_log_sentinels():
                 for record in pending_device_step_time:
                     device_step_time_mean = parse_gen_worker_device_step_time(
                         self.test_output_dir,
