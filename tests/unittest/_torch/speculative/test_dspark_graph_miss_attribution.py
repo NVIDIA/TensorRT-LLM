@@ -78,3 +78,25 @@ def test_unattributed_misses_are_a_broken_probe_not_a_clean_run():
 
 def test_clean_run_passes():
     _stats().assert_ragged_active(require_trim=True)
+
+
+def test_ramp_up_steps_do_not_count_toward_the_gate_floor():
+    """A batch of one is uniform by construction, not a scheduler failure.
+
+    trtllm-bench ramps concurrency from zero, so a step-count floor of 64 can be
+    reached while only two requests are in flight. Every window is then
+    trivially identical, and gating on total steps failed a run whose scheduler
+    had done nothing wrong -- observed as "Broadcasting event-loop error to 2
+    pending request(s)". The floor counts steps whose batch could actually be
+    ragged.
+    """
+    stats = DSparkRaggedStats(mode=RaggedVerifyMode.COMPACT, max_draft_len=5)
+    for _ in range(64):
+        stats.record_step(num_gen_requests=1, verify_lens=[5])
+    assert stats.steps_total == 64
+    assert stats.steps_multi_request == 0, (
+        "single-request steps must not count toward the gate floor")
+
+    for _ in range(64):
+        stats.record_step(num_gen_requests=4, verify_lens=[1, 3, 5, 5])
+    assert stats.steps_multi_request == 64

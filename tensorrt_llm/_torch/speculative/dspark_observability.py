@@ -251,6 +251,10 @@ class DSparkRaggedStats:
         #: things: "peer_shape_mismatch" is one rank declining to go ragged and
         #: dragging the world eager, "key_not_captured" is the bucket grid being
         #: wrong, "peer_not_gen_only" is ordinary continuous batching.
+        #: Steps whose batch held at least two generation requests. The gate
+        #: counts these rather than all steps: trtllm-bench ramps concurrency,
+        #: so step 64 can still be a batch of two.
+        self.steps_multi_request = 0
         self.graph_miss_reasons: Dict[str, int] = {}
         #: the actual graph key, kept only for the reasons where it localizes
         #: the bug.
@@ -304,6 +308,12 @@ class DSparkRaggedStats:
             fallback: short reason the step did not go ragged.
         """
         self.steps_total += 1
+        # Steps where raggedness is even definable. A window can only differ
+        # *between* requests, so a batch of one is uniform by construction --
+        # counting it toward the gate's floor makes the gate fire during ramp-up
+        # and blame the scheduler for a batch that had not filled yet.
+        if int(num_gen_requests) >= 2:
+            self.steps_multi_request += 1
         # What a no-trim step would have submitted: every request sends its
         # bonus token plus the full block.
         self.ceiling_tokens += int(num_gen_requests) * (1 + self.max_draft_len)
@@ -428,6 +438,7 @@ class DSparkRaggedStats:
             "mode": self.mode.value,
             "steps_total": self.steps_total,
             "steps_ragged": self.steps_ragged,
+            "steps_multi_request": self.steps_multi_request,
             "steps_uniform_windows": self.steps_uniform_windows,
             "steps_no_windows": self.steps_no_windows,
             "ceiling_tokens": self.ceiling_tokens,

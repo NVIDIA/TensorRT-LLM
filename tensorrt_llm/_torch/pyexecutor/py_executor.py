@@ -2466,7 +2466,12 @@ class PyExecutor:
         if getattr(self, "_dspark_asserted", False):
             return
         min_steps = self._dspark_assert_min_steps
-        if min_steps is None or stats.steps_total < min_steps:
+        # Counted over steps with a real batch, not all steps. trtllm-bench
+        # ramps concurrency from zero, so step 64 can be a batch of two, where
+        # every window is trivially identical and the gate would fail a run
+        # whose scheduler had done nothing wrong -- observed as "Broadcasting
+        # event-loop error to 2 pending request(s)".
+        if min_steps is None or stats.steps_multi_request < min_steps:
             return
         self._dspark_asserted = True
         stats.assert_ragged_active(require_trim=True)
