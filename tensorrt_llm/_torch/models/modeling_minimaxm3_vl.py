@@ -1181,6 +1181,22 @@ class MiniMaxVLEncoderMLP(nn.Module):
         return self.fc2(x)
 
 
+class MiniMaxVLLayerNorm(nn.LayerNorm):
+    """``nn.LayerNorm`` whose parameter init is skipped under ``MetaInitMode``.
+
+    ``nn.LayerNorm.reset_parameters`` calls ``init.ones_``/``init.zeros_``,
+    which lower to ``aten.fill_.Scalar``. That op is not on ``MetaInitMode``'s
+    allowlist, so a plain ``nn.LayerNorm`` anywhere in the module tree raises
+    ``MetaInitException`` and forces the whole model onto the regular-init
+    path (a full host copy of the checkpoint). Every LN tensor here is
+    present in the checkpoint, so the loaded weights supply the values the
+    skipped init would have written.
+    """
+
+    def reset_parameters(self) -> None:
+        pass
+
+
 class MiniMaxVLEncoderLayer(nn.Module):
     """Vision encoder layer: pre-norm self-attention + pre-norm MLP.
 
@@ -1192,9 +1208,13 @@ class MiniMaxVLEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.self_attn = MiniMaxVLEncoderSelfAttention(config, dtype)
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.layer_norm1 = MiniMaxVLLayerNorm(
+            self.embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
         self.mlp = MiniMaxVLEncoderMLP(config, dtype)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.layer_norm2 = MiniMaxVLLayerNorm(
+            self.embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
 
     def forward(
         self,
@@ -1265,7 +1285,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
 
         self.embeddings = MiniMaxVLPatchEmbedding(config, dtype)
         # NOTE: the typo "layrnorm" matches the published checkpoint key.
-        self.pre_layrnorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.pre_layrnorm = MiniMaxVLLayerNorm(embed_dim, eps=config.layer_norm_eps, dtype=dtype)
         self.encoder = MiniMaxVLEncoder(config, dtype)
 
         if config.position_embedding_type != "rope" or config.rope_mode != "3d":
