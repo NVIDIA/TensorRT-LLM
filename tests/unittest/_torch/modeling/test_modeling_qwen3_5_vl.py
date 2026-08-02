@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_ssm_cache_dtype
 from tensorrt_llm.inputs import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 
 # Dense sibling of test_modeling_qwen3_5_vl_moe.py. The dense Qwen3.5-VL
 # (Qwen/Qwen3.5-27B, arch Qwen3_5ForConditionalGeneration, model_type qwen3_5)
@@ -209,6 +210,39 @@ def test_qwen35_dense_vl_placeholder_metadata_registered() -> None:
     assert metadata.placeholders_separator == ""
     assert metadata.content_format is ContentFormat.STRING
     assert metadata.interleave_placeholders
+
+
+def test_qwen35_dense_vl_serving_preserves_content_part_order() -> None:
+    class _Qwen35Config:
+        model_type = "qwen3_5"
+
+    image_placeholder = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder("qwen3_5", "image")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image_embeds", "image_embeds": {"data": "AAAA"}},
+                {"type": "text", "text": "middle"},
+                {"type": "image_embeds", "image_embeds": {"data": "BBBB"}},
+                {"type": "text", "text": "after"},
+            ],
+        }
+    ]
+
+    conversation, mm_coroutine, placeholder_counts, _ = parse_chat_messages_coroutines(
+        messages, _Qwen35Config(), None
+    )
+
+    try:
+        assert conversation[0]["content"] == (
+            f"before{image_placeholder}middle{image_placeholder}after"
+        )
+        assert placeholder_counts == [{image_placeholder: 2}]
+    finally:
+        mm_coroutine.close()
+        for media in conversation[0]["media"]:
+            media["data"].close()
 
 
 # --- Layered parity test scaffold -------------------------------------------
