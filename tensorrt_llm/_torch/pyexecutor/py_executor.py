@@ -3325,6 +3325,14 @@ class PyExecutor:
         # `static` and `compact` without editing the serving config, and every
         # counter below is keyed off the same decision.
         stats = getattr(worker, "ragged_stats", None)
+        # The sampler is built independently of the worker, so nothing connects
+        # them; do it here, where both are reachable. Acceptance has to be
+        # recorded in the sampler (that is where the accepted count and the
+        # window it was measured against are both host-side and belong to the
+        # same step), but the counters live on the worker.
+        if (stats is not None and self.sampler is not None
+                and getattr(self.sampler, "acceptance_stats", None) is None):
+            self.sampler.acceptance_stats = stats
         mode = getattr(worker, "ragged_verify_mode", None)
         compute_windows = (mode.computes_windows if mode is not None else
                            getattr(self.model_engine.spec_config,

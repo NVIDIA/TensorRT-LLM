@@ -181,6 +181,10 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
+    #: Optional observability sink, attached by the DSpark worker. Left None
+    #: everywhere else so this costs one attribute read per request.
+    acceptance_stats = None
+
     @staticmethod
     def _verified_len(request: LlmRequest, runtime_draft_len: int,
                       verify_lens_snapshot: Optional[dict] = None) -> int:
@@ -241,11 +245,19 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 ):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            req.py_rewind_len = (
-                self._verified_len(req, runtime_draft_len,
-                                   state.verify_lens_snapshot)
-                - req.py_num_accepted_draft_tokens
-            )
+            verified_len = self._verified_len(req, runtime_draft_len,
+                                              state.verify_lens_snapshot)
+            req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
+            # Acceptance against the window the request was actually given.
+            # Recorded here because this is the only place both numbers are
+            # host-side and belong to the same step -- the live py_verify_len
+            # has already moved on by now, which is why the snapshot exists.
+            # `acceptance_stats` is attached by the DSpark worker and is None
+            # for every other path.
+            if self.acceptance_stats is not None:
+                self.acceptance_stats.record_acceptance(
+                    accepted=req.py_num_accepted_draft_tokens,
+                    window=verified_len)
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(

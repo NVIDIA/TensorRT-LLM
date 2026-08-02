@@ -248,6 +248,25 @@ class DSparkRaggedStats:
         self.bucket_hist: Counter = Counter()
         self.padded_bs_hist: Counter = Counter()
 
+        #: Acceptance, split by whether the request's window was shortened.
+        #: This is the term the trim/ceiling ratio needs and the one TRT-LLM
+        #: did not have: `ceiling_tokens` above counts tokens *submitted* with
+        #: no trim, which answers "how much compute did we save" and never
+        #: "how much acceptance did we destroy".
+        self.accepted_tokens = 0
+        self.requests_scored = 0
+        #: Requests whose window was shorter than the full block.
+        self.requests_trimmed = 0
+        #: Trimmed requests that accepted their ENTIRE window. Those are the
+        #: ones where the draft was still alive at the cut, so trimming
+        #: certainly cost acceptance -- a trimmed request that accepted fewer
+        #: than its window would have died on its own and cost nothing. This is
+        #: an exact, unbiased count, which is why it is preferred here over
+        #: estimating the uncapped acceptance length: no model, no extrapolation
+        #: from the untrimmed subpopulation (which the planner selected, so it
+        #: is not a fair sample of the trimmed one).
+        self.trimmed_hit_ceiling = 0
+
         #: Graph replay is the whole point of landing on a bucket; an eager
         #: step costs far more than the tokens it saved.
         self.graph_replays = 0
@@ -338,6 +357,41 @@ class DSparkRaggedStats:
         """How many different window sizes were ever handed out."""
         return len(self.verify_len_hist)
 
+    def record_acceptance(self, *, accepted: int, window: int) -> None:
+        """Record one request's acceptance against the window it was given.
+
+        Args:
+            accepted: drafted positions accepted (excludes the bonus token).
+            window: drafted positions the request was allowed to verify.
+        """
+        self.requests_scored += 1
+        self.accepted_tokens += int(accepted)
+        if int(window) < self.max_draft_len:
+            self.requests_trimmed += 1
+            if int(accepted) >= int(window):
+                self.trimmed_hit_ceiling += 1
+
+    @property
+    def accept_len(self) -> float:
+        """Mean accepted drafted positions per request. 0.0 with no data."""
+        if not self.requests_scored:
+            return 0.0
+        return self.accepted_tokens / self.requests_scored
+
+    @property
+    def trim_regret_rate(self) -> float:
+        """Share of trimmed requests whose draft was still alive at the cut.
+
+        The operational reading: 0.0 means every trim was free -- those drafts
+        would have died anyway -- and the scheduler is taking compute back for
+        nothing. Climbing toward 1.0 means trimming is buying its throughput by
+        throwing away acceptance, which is the regression a delivered-only
+        acceptance metric cannot distinguish from a harder workload.
+        """
+        if not self.requests_trimmed:
+            return 0.0
+        return self.trimmed_hit_ceiling / self.requests_trimmed
+
     def summary(self) -> Dict[str, object]:
         """A JSON-safe snapshot, for logging or assertions."""
         return {
@@ -354,6 +408,10 @@ class DSparkRaggedStats:
             "verify_len_hist": dict(sorted(self.verify_len_hist.items())),
             "bucket_hist": dict(sorted(self.bucket_hist.items())),
             "padded_bs_hist": dict(sorted(self.padded_bs_hist.items())),
+            "accept_len": round(self.accept_len, 4),
+            "requests_scored": self.requests_scored,
+            "requests_trimmed": self.requests_trimmed,
+            "trim_regret_rate": round(self.trim_regret_rate, 4),
             "graph_replays": self.graph_replays,
             "graph_eager": self.graph_eager,
             "fallbacks": dict(self.fallbacks),

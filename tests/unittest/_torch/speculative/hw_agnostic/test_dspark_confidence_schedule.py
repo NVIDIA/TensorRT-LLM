@@ -829,3 +829,50 @@ def test_forced_verify_lens_off_by_default(monkeypatch):
     monkeypatch.setenv(FORCE_VERIFY_LENS_ENV, "0")
     assert forced_verify_lens(num_gen_requests=3, tiers=[1, 3, 5],
                               min_verify_len=1) is None
+
+
+def _stats(max_draft_len=5):
+    from tensorrt_llm._torch.speculative.dspark_observability import (
+        DSparkRaggedStats, RaggedVerifyMode)
+    return DSparkRaggedStats(mode=RaggedVerifyMode.COMPACT,
+                             max_draft_len=max_draft_len)
+
+
+def test_trim_regret_counts_only_drafts_alive_at_the_cut():
+    """A trimmed request that accepted its whole window lost something.
+
+    This is the quantity a delivered-only acceptance metric cannot recover: it
+    separates "trimming was free, those drafts would have died anyway" from
+    "trimming bought throughput by discarding acceptance".
+    """
+    stats = _stats()
+    # Given the full block and died early: not trimmed, no regret.
+    stats.record_acceptance(accepted=2, window=5)
+    # Trimmed to 3 and died at 1: the cut cost nothing.
+    stats.record_acceptance(accepted=1, window=3)
+    # Trimmed to 3 and accepted all 3: still alive at the cut -> regret.
+    stats.record_acceptance(accepted=3, window=3)
+
+    assert stats.requests_scored == 3
+    assert stats.requests_trimmed == 2
+    assert stats.trimmed_hit_ceiling == 1
+    assert stats.trim_regret_rate == 0.5
+    assert stats.accept_len == pytest.approx(2.0)
+
+
+def test_trim_regret_is_zero_when_nothing_was_trimmed():
+    stats = _stats()
+    for accepted in (0, 3, 5):
+        stats.record_acceptance(accepted=accepted, window=5)
+    assert stats.requests_trimmed == 0
+    assert stats.trim_regret_rate == 0.0
+    assert stats.summary()["accept_len"] == pytest.approx(8 / 3, abs=1e-4)
+
+
+def test_acceptance_metrics_appear_in_summary():
+    stats = _stats()
+    stats.record_acceptance(accepted=3, window=3)
+    summary = stats.summary()
+    for key in ("accept_len", "requests_scored", "requests_trimmed",
+                "trim_regret_rate"):
+        assert key in summary, f"{key} missing from the summary"
