@@ -150,3 +150,36 @@ def test_context_rows_precede_generation_rows():
     # host_context_lengths is the ops' shape oracle: one token per generation
     # row, real length for contexts.
     assert meta.attn_row_prompt_lens_cpu[nc:rows].tolist() == [1, 1, 1]
+
+
+def test_every_runtime_view_shares_the_row_count():
+    """All views the op reads must agree on batch_size, which is the row count.
+
+    ``TrtllmAttention.forward`` asserts this directly, and the C++ op indexes
+    ``request_types`` over its whole ``num_seqs`` -- so a view left at the
+    request count is an out-of-bounds read there rather than a shape error.
+    """
+    torch.cuda.init()
+    meta = _metadata(num_pools=1, max_blocks=8, max_seqs=6)
+    src = torch.zeros(1, 6, 2, 8, dtype=torch.int32, device="cuda")
+    nc = 1
+    rows = _expand(meta,
+                   num_contexts=nc,
+                   row_req_idx=[0, 0, 1],
+                   num_seqs=6,
+                   block_offsets=src)
+
+    view = meta.token_major_gen_view()
+    for name in ("sequence_length", "host_past_key_value_lengths",
+                 "host_context_lengths", "prompt_lens_cuda",
+                 "host_request_types"):
+        got = getattr(view, name).shape[0]
+        assert got == rows, (
+            f"{name} has {got} entries but the ops will read {rows} rows")
+    assert view.kv_cache_block_offsets.shape[1] == rows
+
+    # kCONTEXT is 0, kGENERATION is 1; the op checks every row at or past
+    # num_contexts is a generation row.
+    types = view.host_request_types.tolist()
+    assert types[:nc] == [0] * nc
+    assert types[nc:] == [1] * (rows - nc)

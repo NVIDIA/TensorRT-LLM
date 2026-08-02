@@ -595,6 +595,8 @@ class TokenMajorGenView:
     sequence_length: torch.Tensor
     host_past_key_value_lengths: torch.Tensor
     host_context_lengths: torch.Tensor
+    prompt_lens_cuda: torch.Tensor
+    host_request_types: torch.Tensor
     kv_cache_block_offsets: torch.Tensor
     #: Static row ceiling, NOT this step's row count. The attention op caches
     #: by (beam_width, max_num_requests, attention_window_size) and reserves its
@@ -1508,6 +1510,25 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.attn_row_req_idx_host = torch.zeros(
             (attn_rows_cap, ), dtype=torch.long, pin_memory=prefer_pinned())
         # host_context_lengths: the shape oracle both ops key off.
+        # The op indexes request_types over its whole num_seqs -- which under
+        # this presentation is the ROW count -- in
+        # `for (idx = num_contexts; idx < num_seqs; idx++)
+        #  TLLM_CHECK(request_types[idx] == kGENERATION)`
+        # (thop/attentionOp.cpp). Handing it the batch-major array would read
+        # past its end. Generation is 1, context 0; prefill the whole capacity
+        # as generation so a step only has to stamp its context prefix.
+        self.attn_row_request_types_host = torch.ones(
+            (attn_rows_cap, ), dtype=torch.int32,
+            pin_memory=prefer_pinned())
+        # Device twin of attn_row_prompt_lens_cpu: the forward path asserts
+        # every runtime view shares batch_size with kv_lens_cuda_runtime.
+        self.attn_row_prompt_lens_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (attn_rows_cap, ),
+            cache_name="attn_row_prompt_lens_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
         self.attn_row_prompt_lens_cpu = torch.zeros(
             (attn_rows_cap, ), dtype=torch.int32,
             pin_memory=prefer_pinned())
@@ -2032,6 +2053,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # (the ops read it for num_seqs and, for contexts, for the q length);
         # one token per row.
         self.attn_row_prompt_lens_cpu[nc:rows].fill_(1)
+        # Capacity is prefilled with kGENERATION, so only the context prefix
+        # needs stamping, and nc is small.
+        if nc:
+            self.attn_row_request_types_host[:nc].zero_()
+        self.attn_row_request_types_host[nc:rows].fill_(1)
 
         self.attn_row_kv_lens_cuda[:rows].copy_(
             self.attn_row_kv_lens_host[:rows], non_blocking=True)
@@ -2039,6 +2065,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.attn_row_kv_correction_host[:rows], non_blocking=True)
         self.attn_row_req_idx_cuda[:rows].copy_(
             self.attn_row_req_idx_host[:rows], non_blocking=True)
+        self.attn_row_prompt_lens_cuda[:rows].copy_(
+            self.attn_row_prompt_lens_cpu[:rows], non_blocking=True)
 
         self._attn_num_rows = rows
         # The block table is expanded on the DEVICE, from the copy that is
@@ -2112,6 +2140,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             sequence_length=self.attn_row_kv_lens_cuda[:rows],
             host_past_key_value_lengths=self.attn_row_kv_lens_host[:rows],
             host_context_lengths=self.attn_row_prompt_lens_cpu[:rows],
+            prompt_lens_cuda=self.attn_row_prompt_lens_cuda[:rows],
+            host_request_types=self.attn_row_request_types_host[:rows],
             kv_cache_block_offsets=self.attn_row_block_offsets[:, :rows],
             max_num_rows=self.attn_row_kv_lens_cuda.shape[0],
         )

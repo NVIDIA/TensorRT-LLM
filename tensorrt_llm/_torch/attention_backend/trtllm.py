@@ -547,7 +547,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             return
         saved = (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
                  self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
-                 self.max_num_requests)
+                 self.max_num_requests, self.prompt_lens_cuda_runtime,
+                 self.host_request_types_runtime)
         try:
             self.kv_lens_cuda_runtime = view.sequence_length
             self.kv_lens_runtime = view.host_past_key_value_lengths
@@ -563,11 +564,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # JIT-warmup hint, and the per-step request count comes from the
             # batch, not from here.
             self.max_num_requests = view.max_num_rows
+            # Every runtime view has to agree on batch_size with
+            # kv_lens_cuda_runtime, and the op reads request_types over all of
+            # num_seqs -- both are the row count here, not the request count.
+            self.prompt_lens_cuda_runtime = view.prompt_lens_cuda
+            self.host_request_types_runtime = view.host_request_types
             yield
         finally:
             (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
              self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
-             self.max_num_requests) = saved
+             self.max_num_requests, self.prompt_lens_cuda_runtime,
+             self.host_request_types_runtime) = saved
 
     def prepare(self) -> None:
         super().prepare()
