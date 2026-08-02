@@ -368,8 +368,19 @@ class CUDAGraphRunner:
         - The spec_metadata for the graph, if applicable.
         - The key for the graph, if applicable.
         """
+        # Why the last call declined, for the DSpark ragged counters. A miss is
+        # counted at the call site, which cannot see which of the several
+        # independent reasons applied -- and they mean opposite things: a peer
+        # shape mismatch is one rank declining to go ragged and dragging the
+        # whole world eager, while an uncaptured key is the token bucket grid
+        # being wrong. Attributing one to the other sends the fix to the wrong
+        # place.
+        self.last_miss_reason = None
+        self.last_miss_key = None
+
         # disable when doing statistic
         if ExpertStatistic.should_record():
+            self.last_miss_reason = "expert_statistic"
             return None, None, None
 
         can_run_cuda_graph = batch.can_run_cuda_graph
@@ -405,9 +416,18 @@ class CUDAGraphRunner:
                 for peer in all_can_graph_batch)
 
             if not is_all_gen_only or not all_shapes_equal:
+                # Deliberately distinguished: "some rank had contexts" is
+                # ordinary continuous batching, while "shapes differ" means a
+                # rank chose a different ragged bucket and is the one worth
+                # chasing.
+                self.last_miss_reason = ("peer_not_gen_only"
+                                         if not is_all_gen_only else
+                                         "peer_shape_mismatch")
                 return None, None, None
 
         if not self.enabled or not can_run_cuda_graph:
+            self.last_miss_reason = ("disabled" if not self.enabled else
+                                     "local_not_gen_only")
             return None, None, None
         if self.config.use_mrope and any(
                 self._needs_mrope_delta_cache_update(request)
@@ -416,6 +436,7 @@ class CUDAGraphRunner:
             # Qwen3.5 configs normalized to text-only decoding). Requests that
             # do carry a delta must first populate the model-side cache for their
             # current seq slot before graph replay.
+            self.last_miss_reason = "mrope_delta_cache"
             return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata)
@@ -427,9 +448,15 @@ class CUDAGraphRunner:
         # Graph doesn't exist yet.  If on-the-fly capture is not allowed,
         # fall back to eager so the caller doesn't need a separate check.
         if not self._capture_allowed:
+            # THE reason that means the bucket grid is wrong: the batch was
+            # graphable and every rank agreed, but this key was never captured.
+            self.last_miss_reason = "key_not_captured"
+            self.last_miss_key = key
             return None, None, None
 
         if batch_size not in self.supported_batch_sizes:
+            self.last_miss_reason = "bs_not_supported"
+            self.last_miss_key = key
             return None, None, None
 
         num_sequences_in_batch = batch_size * self.max_beam_width

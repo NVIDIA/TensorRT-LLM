@@ -247,8 +247,14 @@ class DSparkRaggedStats:
         self.verify_len_hist: Counter = Counter()
         self.bucket_hist: Counter = Counter()
         self.padded_bs_hist: Counter = Counter()
-        #: (rows, total_tokens) -> count, for steps that found no captured graph.
-        self.graph_miss_shapes: Dict[Tuple[int, int], int] = {}
+        #: why the graph runner declined -> count. The reasons mean opposite
+        #: things: "peer_shape_mismatch" is one rank declining to go ragged and
+        #: dragging the world eager, "key_not_captured" is the bucket grid being
+        #: wrong, "peer_not_gen_only" is ordinary continuous batching.
+        self.graph_miss_reasons: Dict[str, int] = {}
+        #: the actual graph key, kept only for the reasons where it localizes
+        #: the bug.
+        self.graph_miss_shapes: Dict[str, int] = {}
 
         #: Acceptance, split by whether the request's window was shortened.
         #: This is the term the trim/ceiling ratio needs and the one TRT-LLM
@@ -330,22 +336,34 @@ class DSparkRaggedStats:
         else:
             self.steps_uniform_windows += 1
 
-    def record_graph(self, *, replayed: bool, shape=None) -> None:
+    def record_graph(self, *, replayed: bool, shape) -> None:
         """Record whether this step replayed a CUDA graph or ran eager.
 
         ``shape`` is the ``(num_rows, total_verify_tokens)`` the step actually
-        submitted. It is kept only for misses, and only the distinct ones: a
-        miss means some shape was not captured, and knowing *which* is the
-        whole diagnosis. Counting misses without recording the shape leaves
-        only the options of guessing or re-running with a profiler.
+        submitted, or None on a replay. It is kept only for misses, and only
+        the distinct ones: a miss means some shape was not captured, and
+        knowing *which* is the whole diagnosis. Counting misses without
+        recording the shape leaves only guessing or re-running with a profiler.
+
+        Required rather than defaulted, deliberately. A run reported
+        ``graph_eager: 9`` alongside an empty ``graph_miss_shapes`` because the
+        caller was loaded from a build that predated this argument -- with a
+        default that reads as "no misses had shapes", which is indistinguishable
+        from "the probe works and found nothing". Without a default it is a
+        TypeError instead.
         """
         if replayed:
             self.graph_replays += 1
             return
         self.graph_eager += 1
         if shape is not None:
-            key = (int(shape[0]), int(shape[1]))
-            self.graph_miss_shapes[key] = self.graph_miss_shapes.get(key, 0) + 1
+            reason, key = shape
+            self.graph_miss_reasons[reason] = (
+                self.graph_miss_reasons.get(reason, 0) + 1)
+            if key is not None:
+                text = str(key)
+                self.graph_miss_shapes[text] = (
+                    self.graph_miss_shapes.get(text, 0) + 1)
 
     def merge_planner_stats(self, planner_stats: Dict[str, int]) -> None:
         """Fold in the planner's own fallback counters."""
@@ -420,10 +438,8 @@ class DSparkRaggedStats:
             "verify_len_hist": dict(sorted(self.verify_len_hist.items())),
             "bucket_hist": dict(sorted(self.bucket_hist.items())),
             "padded_bs_hist": dict(sorted(self.padded_bs_hist.items())),
-            "graph_miss_shapes": {
-                f"{rows}x{tok}": n
-                for (rows, tok), n in sorted(self.graph_miss_shapes.items())
-            },
+            "graph_miss_reasons": dict(sorted(self.graph_miss_reasons.items())),
+            "graph_miss_keys": dict(sorted(self.graph_miss_shapes.items())),
             "accept_len": round(self.accept_len, 4),
             "requests_scored": self.requests_scored,
             "requests_trimmed": self.requests_trimmed,
@@ -474,11 +490,33 @@ class DSparkRaggedStats:
             raise AssertionError(
                 f"DSpark ragged verify delivered as many tokens as a no-trim "
                 f"run, so nothing was saved: {summary}")
-        if self.graph_eager > 0:
+        # Only the misses ragged is responsible for. A batch some rank filled
+        # with context requests falls out of replay on the uniform path too --
+        # the uniform GSM8K run sat at ~1.7% eager for exactly that reason --
+        # so failing on it makes this check unsatisfiable on any workload with
+        # continuous batching, which is all of them. The three below are
+        # different: "key_not_captured" and "bs_not_supported" mean the batch
+        # was graphable, every rank agreed, and the shape was still missing --
+        # i.e. the token bucket grid is wrong. "peer_shape_mismatch" means one
+        # rank chose a different ragged bucket and dragged the whole world
+        # eager, which is the attention-DP divergence this feature has to avoid.
+        blamed = {"key_not_captured", "bs_not_supported", "peer_shape_mismatch"}
+        attributable = {
+            reason: n
+            for reason, n in self.graph_miss_reasons.items() if reason in blamed
+        }
+        if attributable:
+            raise AssertionError(
+                f"DSpark ragged verify dropped out of CUDA graph replay for "
+                f"reasons attributable to ragged scheduling "
+                f"({attributable}); a ragged step without a captured shape "
+                f"costs far more than the tokens it trims: {summary}")
+        if self.graph_eager > 0 and not self.graph_miss_reasons:
             raise AssertionError(
                 f"DSpark ragged verify dropped out of CUDA graph replay on "
-                f"{self.graph_eager} step(s); a ragged step without a captured "
-                f"shape costs far more than the tokens it trims: {summary}")
+                f"{self.graph_eager} step(s) but recorded no reason for any of "
+                f"them, so the misses cannot be attributed. That is a broken "
+                f"probe, not a clean run: {summary}")
 
 
 def format_verify_len_histogram(lens: List[int]) -> str:

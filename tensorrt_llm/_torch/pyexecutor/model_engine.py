@@ -6921,8 +6921,9 @@ class PyTorchModelEngine(ModelEngine):
                 self._record_dspark_graph_use(
                     replayed=can_run_graph,
                     shape=None if can_run_graph else
-                    (len(padded_requests.generation_requests),
-                     int(getattr(self, "_dspark_last_total_tokens", 0))))
+                    (getattr(self.cuda_graph_runner, "last_miss_reason", None)
+                     or "unknown",
+                     getattr(self.cuda_graph_runner, "last_miss_key", None)))
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata
