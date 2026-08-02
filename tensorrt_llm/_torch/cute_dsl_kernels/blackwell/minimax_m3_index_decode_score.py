@@ -217,6 +217,14 @@ class IndexDecodeScoreKernel:
         tma_full_mbar = smem.allocate_array(Int64, num_stages)
         tma_empty_mbar = smem.allocate_array(Int64, num_stages)
 
+        # TODO: this load precedes the griddepcontrol_wait() below, so under PDL
+        # it can observe seq_lens as the predecessor grid left it. num_blocks
+        # bounds both the block_table load and the score store, neither of which
+        # is otherwise masked, so a stale length here is an out-of-bounds write.
+        # Safe only while no PDL predecessor writes seq_lens (nothing between
+        # on_update_kv_lens and this kernel does today). Either move the load
+        # past the wait, as triton_sparse_decode.py orders its gdc_wait against
+        # the same tensor, or record the constraint here.
         seqlen = seq_lens[batch_id]
         num_blocks = cute.ceil_div(seqlen, BLOCK_K)
 

@@ -63,9 +63,9 @@ def test_minimax_m3_horizontal_producer_matches_separate_producers(num_tokens):
     slots = (torch.arange(num_tokens, dtype=torch.int32, device="cuda") * 37) % (
         (num_pages - 1) * 128
     )
-    # Keep the parity reference slots valid: the legacy separate main-K/V
-    # producer does not support negative slots. Negative-slot handling is
-    # exercised below using horizontal eager execution versus graph replay.
+    # Keep the parity reference slots valid: the separate main-K/V producer
+    # this is compared against does not support negative slots. Negative-slot
+    # handling is exercised below, eager execution versus graph replay.
     rope_cache = _rope_cache(max(256, num_tokens))
 
     main_width = (num_heads_q + 2 * num_kv_heads) * 128
