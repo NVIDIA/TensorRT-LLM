@@ -2444,6 +2444,44 @@ class PyExecutor:
             f"device->host synchronization from here on emits a warning with a "
             f"stack; on the overlap-scheduler path there should be none.")
 
+    def _maybe_assert_dspark_ragged_active(self, stats) -> None:
+        """Run the ragged gate mid-loop, once the step floor is reached.
+
+        The same check also runs at executor-loop cleanup, but only there it is
+        useless as a gate: cleanup happens after every request has completed and
+        the driver has already returned its results, so the AssertionError is
+        raised into a shutdown path that pytest never sees. A run whose ragged
+        path silently did nothing reported ``1 passed`` with eight ranks each
+        raising in their logs -- the worst possible outcome for a guard, since
+        the green result is what gets believed.
+
+        Raised from inside the loop instead, the exception propagates out
+        through the in-flight requests and fails the run. Only once: the
+        counters keep moving, and re-raising every step would bury the first
+        (and only informative) failure.
+        """
+        # Lazy rather than set in __init__: this class has several
+        # construction paths and a gate that silently no-ops because one of
+        # them missed an attribute is the exact failure being fixed here.
+        if getattr(self, "_dspark_asserted", False):
+            return
+        min_steps = self._dspark_assert_min_steps
+        if min_steps is None or stats.steps_total < min_steps:
+            return
+        self._dspark_asserted = True
+        stats.assert_ragged_active(require_trim=True)
+
+    @property
+    def _dspark_assert_min_steps(self) -> Optional[int]:
+        """Step floor from TLLM_DSPARK_ASSERT_ACTIVE, or None when disabled."""
+        raw = os.environ.get("TLLM_DSPARK_ASSERT_ACTIVE", "")
+        if not raw or raw in ("0", "false", "False"):
+            return None
+        try:
+            return 32 if raw in ("1", "true", "True") else int(raw)
+        except ValueError:
+            return None
+
     def _report_dspark_ragged_stats(self) -> None:
         """Final DSpark scheduling summary, and optionally a hard gate on it.
 
@@ -3445,6 +3483,7 @@ class PyExecutor:
             # recoverable from the log, which is the only shared channel.
             if stats.steps_total and stats.steps_total % 32 == 0:
                 stats.log_summary(prefix="DSpark ragged verify [periodic]")
+            self._maybe_assert_dspark_ragged_active(stats)
             fitted = None
             if bucket is not None:
                 fitted = [
