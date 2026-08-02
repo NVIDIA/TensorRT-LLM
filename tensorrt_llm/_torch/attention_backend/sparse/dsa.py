@@ -596,6 +596,11 @@ class TokenMajorGenView:
     host_past_key_value_lengths: torch.Tensor
     host_context_lengths: torch.Tensor
     kv_cache_block_offsets: torch.Tensor
+    #: Static row ceiling, NOT this step's row count. The attention op caches
+    #: by (beam_width, max_num_requests, attention_window_size) and reserves its
+    #: semaphore array from it, so a per-step value would thrash that cache and
+    #: re-reserve on every shape change.
+    max_num_rows: int
 
 
 @dataclass(init=False)
@@ -2101,6 +2106,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             host_past_key_value_lengths=self.attn_row_kv_lens_host[:rows],
             host_context_lengths=self.attn_row_prompt_lens_cpu[:rows],
             kv_cache_block_offsets=self.attn_row_block_offsets[:rows],
+            max_num_rows=self.attn_row_kv_lens_cuda.shape[0],
         )
 
     def ragged_row_kv_lens(self, num_tokens: int) -> Optional[torch.Tensor]:

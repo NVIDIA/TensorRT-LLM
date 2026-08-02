@@ -546,16 +546,28 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             yield
             return
         saved = (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
-                 self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets)
+                 self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
+                 self.max_num_requests)
         try:
             self.kv_lens_cuda_runtime = view.sequence_length
             self.kv_lens_runtime = view.host_past_key_value_lengths
             self.prompt_lens_cpu_runtime = view.host_context_lengths
             self.kv_cache_block_offsets = view.kv_cache_block_offsets
+            # The op reserves its multi-CTA-KV counter as
+            # `num_heads * max_num_requests` and sizes its generation workspace
+            # from the same number. Under this presentation the batch dimension
+            # the kernels see is the ROW count, which is larger. Passing the
+            # static ceiling grows the reservation to cover it while keeping the
+            # op's (beam_width, max_num_requests, window) cache key constant.
+            # This is only a capacity input -- the op's own mMaxNumRequests is a
+            # JIT-warmup hint, and the per-step request count comes from the
+            # batch, not from here.
+            self.max_num_requests = view.max_num_rows
             yield
         finally:
             (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
-             self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets) = saved
+             self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
+             self.max_num_requests) = saved
 
     def prepare(self) -> None:
         super().prepare()
