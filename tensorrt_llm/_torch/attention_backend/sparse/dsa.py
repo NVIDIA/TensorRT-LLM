@@ -1517,17 +1517,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # only consumer that walks this per row is the KV write inside the rope
         # kernel; the attention op overrides its page index pointer with the
         # sparse top-k indices, which are already per token.
+        # Same [num_pools, num_seqs, 2, max_blocks_per_seq] layout the attention
+        # op reads, expanded on the *sequence* axis only: this tensor is
+        # substituted for `kv_cache_block_offsets` wholesale while the ops are
+        # presented token-major, so its rank and axis order have to match what
+        # they already expect. The pool and K/V axes are carried through
+        # unchanged -- only the row axis is what token-major changes.
+        num_attention_op_pools = getattr(self.kv_cache_manager,
+                                         "num_attention_op_pools",
+                                         self.kv_cache_manager.num_pools)
         self.attn_row_block_offsets = self.get_empty(
             self.cuda_graph_buffers,
-            [attn_rows_cap, self.kv_cache_manager.max_blocks_per_seq],
+            [
+                num_attention_op_pools, attn_rows_cap, 2,
+                self.kv_cache_manager.max_blocks_per_seq
+            ],
             cache_name="attn_row_block_offsets",
             dtype=torch.int32,
             capture_graph=capture_graph,
-        )
-        self.attn_row_block_offsets_host = torch.zeros_like(
-            self.attn_row_block_offsets,
-            device='cpu',
-            pin_memory=prefer_pinned(),
         )
 
         self.block_table_expanded = self.get_empty(
@@ -2077,16 +2084,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         rows = self._attn_num_rows
         if rows <= 0 or self.kv_cache_block_offsets is None:
             return
-        width = min(self.attn_row_block_offsets.shape[1],
-                    self.kv_cache_block_offsets.shape[-1])
-        # kv_cache_block_offsets is [num_pools, num_seqs, 2, max_blocks] for the
-        # paged layout; the generation path reads pool 0, the K direction.
         src = self.kv_cache_block_offsets
-        while src.dim() > 2:
-            src = src[0] if src.shape[0] == 1 else src.select(0, 0)
-        torch.index_select(src[:, :width], 0,
-                           self.attn_row_req_idx_cuda[:rows],
-                           out=self.attn_row_block_offsets[:rows, :width])
+        # Gather along the sequence axis (1) and leave the pool and K/V axes
+        # alone. Collapsing leading axes instead would strip num_seqs itself and
+        # index a length-2 K/V axis with request ids, which the gather kernel
+        # catches as an out-of-bounds index rather than silently mis-reading.
+        pools = min(src.shape[0], self.attn_row_block_offsets.shape[0])
+        width = min(src.shape[-1], self.attn_row_block_offsets.shape[-1])
+        torch.index_select(
+            src[:pools, :, :, :width], 1, self.attn_row_req_idx_cuda[:rows],
+            out=self.attn_row_block_offsets[:pools, :rows, :, :width])
 
     def token_major_gen_view(self) -> Optional["TokenMajorGenView"]:
         """The token-major presentation for this step, or None.
@@ -2105,7 +2112,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             sequence_length=self.attn_row_kv_lens_cuda[:rows],
             host_past_key_value_lengths=self.attn_row_kv_lens_host[:rows],
             host_context_lengths=self.attn_row_prompt_lens_cpu[:rows],
-            kv_cache_block_offsets=self.attn_row_block_offsets[:rows],
+            kv_cache_block_offsets=self.attn_row_block_offsets[:, :rows],
             max_num_rows=self.attn_row_kv_lens_cuda.shape[0],
         )
 
