@@ -24,14 +24,19 @@ interactive HTML timeline as the ``time_breakdown`` tool.
 
 This module is intentionally torch-free and stdlib-only for the parse/merge/JSON
 path; ``plotly``/``numpy`` are pulled in lazily (via the sibling
-``time_breakdown`` package) only when ``--html`` is requested.
+``time_breakdown`` package) only when ``--html`` is requested. The
+``--agg-jsonl`` latency aggregation (mean/P50/P99 of the lifecycle intervals)
+is likewise pure stdlib -- it does NOT import ``time_breakdown``/``numpy``, so
+the offline aggregate runs anywhere, not just inside the torch container.
 """
 
 import argparse
 import csv
 import glob
 import json
+import math
 import os
+import statistics
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
@@ -275,6 +280,276 @@ def _derive_gaps(metrics: List[Dict[str, Any]]) -> List[Optional[float]]:
     return gaps
 
 
+# ===========================================================================
+# Latency aggregation (--agg-jsonl): mean / P50 / P99 of the lifecycle
+# intervals between time events. Pure stdlib -- no numpy / no time_breakdown.
+# ===========================================================================
+#
+# Clock domains (empirically confirmed on a GB200 disagg gpt-oss run):
+#   Domain A = {disagg router, gen worker}   ~46790 s steady-clock epoch
+#   Domain B = {ctx worker, benchmark client} ~217445 s steady-clock epoch
+# Cross-domain subtraction is invalid. Every metric below differences two
+# timestamps from the SAME timeline/worker (clock_safe=True), except the two
+# canonical disagg spans that straddle A<->B (clock_safe=False). TRT-LLM's
+# globalSteadyClockOffset is NOT applied to these JSONL timestamps, so no
+# cross-domain correction is assumed.
+#
+# The 12 canonical spans mirror time_breakdown.TimingMetricsConfig verbatim
+# (name, start_field, end_field). They are hardcoded rather than imported so
+# the aggregate path stays stdlib-only / importable outside the torch
+# container; test_perf_time_events.py has a drift guard that cross-checks this
+# list against TimingMetricsConfig whenever that module can be imported.
+_CANONICAL_METRICS = [
+    # (name, start_field, end_field, source, clock_safe)
+    (
+        "disagg_preprocessing",
+        "disagg_server_arrival_time",
+        "ctx_server_arrival_time",
+        "disagg",
+        False,
+    ),
+    ("ctx_preprocessing", "ctx_server_arrival_time", "ctx_arrival_time", "ctx_worker", True),
+    ("ctx_queue", "ctx_arrival_time", "ctx_first_scheduled_time", "ctx_worker", True),
+    ("ctx_processing", "ctx_first_scheduled_time", "ctx_first_token_time", "ctx_worker", True),
+    (
+        "ctx_postprocessing",
+        "ctx_first_token_time",
+        "ctx_server_first_token_time",
+        "ctx_worker",
+        True,
+    ),
+    ("disagg_relay", "ctx_server_first_token_time", "gen_server_arrival_time", "disagg", False),
+    ("gen_preprocessing", "gen_server_arrival_time", "gen_arrival_time", "gen_worker", True),
+    ("gen_queue_wait", "gen_arrival_time", "gen_kv_cache_transfer_start", "gen_worker", True),
+    (
+        "gen_kv_transfer",
+        "gen_kv_cache_transfer_start",
+        "gen_kv_cache_transfer_end",
+        "gen_worker",
+        True,
+    ),
+    (
+        "gen_post_transfer",
+        "gen_kv_cache_transfer_end",
+        "gen_first_scheduled_time",
+        "gen_worker",
+        True,
+    ),
+    (
+        "gen_postprocessing",
+        "gen_first_scheduled_time",
+        "gen_server_first_token_time",
+        "gen_worker",
+        True,
+    ),
+    (
+        "disagg_postprocessing",
+        "gen_server_first_token_time",
+        "disagg_server_first_token_time",
+        "disagg",
+        True,
+    ),
+]
+
+# Router dispatch chain -- all fields live on ONE disagg_router record
+# (Domain A), so every span is clock_safe.
+_ROUTER_METRICS = [
+    # (name, start_field, end_field)
+    ("router:arrival->ctx_dispatch", "arrival_time", "ctx_dispatch_time"),
+    ("router:arrival->gen_dispatch", "arrival_time", "gen_dispatch_time"),
+    ("router:ctx_dispatch->gen_dispatch", "ctx_dispatch_time", "gen_dispatch_time"),
+    ("router:gen_dispatch->first_token", "gen_dispatch_time", "first_token_time"),
+    ("router:first_token->resp_done", "first_token_time", "resp_done_time"),
+]
+
+
+def _percentile(values: List[float], p: float) -> float:
+    """p-th percentile with linear interpolation.
+
+    Mirrors tests/integration/defs/perf/perf_regression_utils.py. Empty -> 0.0.
+    """
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (p / 100.0) * (len(s) - 1)
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    frac = k - lo
+    return s[lo] + frac * (s[hi] - s[lo])
+
+
+def _duration(start: Optional[float], end: Optional[float]) -> float:
+    """Interval end-start with time_breakdown.TimingMetric's duration rules.
+
+    Returns 0.0 for missing / NaN / inverted (start>end), matching
+    time_breakdown.TimingMetric.calculate_duration. A wall-clock interval
+    between two distinct steady-clock reads is never genuinely 0, so callers
+    treat 0.0 as "not measured" and exclude it from the sample.
+    """
+    if start is None or end is None:
+        return 0.0
+    try:
+        if math.isnan(start) or math.isnan(end):
+            return 0.0
+    except TypeError:
+        return 0.0
+    if start > end:
+        return 0.0
+    return end - start
+
+
+def _nz(value: Optional[float]) -> Optional[float]:
+    """Treat a 0.0 timestamp as "not recorded" (None).
+
+    KV-transfer setters on the synchronous disagg receive path are deferred
+    (see ticket #15871), so gen kv_cache_transfer_start/end land as 0.0;
+    mapping them to None makes the span fall out as not_recorded instead of a
+    bogus end-0.0 interval.
+    """
+    return value if value else None
+
+
+def _infer_role(rec: Dict[str, Any]) -> str:
+    """Classify a worker record as 'ctx' or 'gen'.
+
+    Discriminators (verified against real GB200 capture):
+      * gen decode emits multi-step ``step_metrics`` -> gen.
+      * gen carries a nonzero ``kv_cache_size`` in request_timing_metrics
+        (ctx side reports 0) -> gen.
+      * ctx prefill emits ``ctx_chunk_metrics`` / ``ctx_gpu_forward_time`` -> ctx.
+    NOTE: ``kv_cache_transfer_start`` is NOT a usable signal -- the ctx side
+    stamps it (nonzero) while the gen side leaves it 0.0 on the sync path, so
+    it points the wrong way.
+    """
+    tbm = rec.get("time_breakdown_metrics") or {}
+    if tbm.get("step_metrics"):
+        return "gen"
+    rtm = rec.get("request_timing_metrics") or {}
+    if rtm.get("kv_cache_size"):
+        return "gen"
+    if tbm.get("ctx_chunk_metrics") or "ctx_gpu_forward_time" in tbm:
+        return "ctx"
+    return "unknown"
+
+
+def _dedup_records_by_role(records: List[Dict[str, Any]], role: str) -> List[Dict[str, Any]]:
+    """One record per logical request for the given role.
+
+    A tensor-parallel worker writes the SAME request once per rank (e.g. tp4
+    gen -> 4 near-identical copies), and request_timing_metrics / step_metrics
+    are lockstep-identical across ranks. Treating rank copies as independent
+    samples would inflate ``n`` up to (#ranks)x and fake precision. First-seen
+    wins; parse_event_dir sorts by filename so rank0's copy is canonical and
+    the result is deterministic.
+    """
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for rec in records:
+        if _infer_role(rec) != role:
+            continue
+        rid = rec.get("request_id")
+        key = rid if rid is not None else id(rec)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(rec)
+    return out
+
+
+def _reduce_step_itls(rec: Dict[str, Any]) -> List[float]:
+    """Inter-token latencies (seconds) from a gen record's per-step stream.
+
+    Sorted consecutive diffs of ``token_time``, keeping only positive gaps.
+    Empty when fewer than 2 tokens. This is the ENGINE-side inter-token time
+    (excludes network/detok), a server-side proxy for client ITL.
+    """
+    sm = (rec.get("time_breakdown_metrics") or {}).get("step_metrics") or []
+    tts = sorted(s.get("token_time") for s in sm if s.get("token_time") is not None)
+    gaps: List[float] = []
+    for i in range(1, len(tts)):
+        d = tts[i] - tts[i - 1]
+        if d > 0:
+            gaps.append(d)
+    return gaps
+
+
+def _extract_canonical_fields(rec: Dict[str, Any]) -> Dict[str, float]:
+    """Flatten the canonical lifecycle timestamps from a ``/perf_metrics`` record.
+
+    Mirrors time_breakdown.RequestDataParser.parse_request over the aggregated
+    ``--perf-json`` shape. Per-rank worker records lack the nested
+    ``ctx_perf_metrics``/``gen_perf_metrics`` containers, so every field
+    defaults to NaN and the 12 canonical rows read as not_recorded on a pure
+    ``--event-dir`` capture.
+    """
+    nan = float("nan")
+    ctx_perf = rec.get("ctx_perf_metrics")
+    gen_perf = rec.get("gen_perf_metrics")
+    disagg = ctx_perf is not None and gen_perf is not None
+    if disagg:
+        ctxm = ((ctx_perf or {}).get("perf_metrics") or {}).get("timing_metrics") or {}
+        genm = ((gen_perf or {}).get("perf_metrics") or {}).get("timing_metrics") or {}
+        d_arr = rec.get("disagg_server_arrival_time", nan)
+        d_ftt = rec.get("disagg_server_first_token_time", nan)
+    else:
+        ctxm = (rec.get("perf_metrics") or {}).get("timing_metrics") or {}
+        genm = {}
+        d_arr = nan
+        d_ftt = nan
+    return {
+        "disagg_server_arrival_time": d_arr,
+        "ctx_server_arrival_time": ctxm.get("server_arrival_time", nan),
+        "ctx_arrival_time": ctxm.get("arrival_time", nan),
+        "ctx_first_scheduled_time": ctxm.get("first_scheduled_time", nan),
+        "ctx_first_token_time": ctxm.get("first_token_time", nan),
+        "ctx_server_first_token_time": ctxm.get("server_first_token_time", nan),
+        "gen_server_arrival_time": genm.get("server_arrival_time", nan),
+        "gen_arrival_time": genm.get("arrival_time", nan),
+        "gen_first_scheduled_time": genm.get("first_scheduled_time", nan),
+        "gen_kv_cache_transfer_start": genm.get("kv_cache_transfer_start", nan),
+        "gen_kv_cache_transfer_end": genm.get("kv_cache_transfer_end", nan),
+        "gen_server_first_token_time": genm.get("server_first_token_time", nan),
+        "disagg_server_first_token_time": d_ftt,
+    }
+
+
+def _stats_row(
+    metric: str,
+    source: str,
+    clock_safe: bool,
+    samples_s: List[float],
+    unit: str = "ms",
+    scale: float = 1000.0,
+) -> Dict[str, Any]:
+    """Build one JSONL row from a list of second-valued samples.
+
+    ``samples_s`` are seconds; zeros are excluded (see _duration) and the rest
+    scaled to ms and rounded to 3 dp. An empty sample yields a
+    ``status: not_recorded`` row (never silently dropped).
+    """
+    vals = [v * scale for v in samples_s if v]
+    if not vals:
+        return {
+            "metric": metric,
+            "unit": unit,
+            "source": source,
+            "clock_safe": clock_safe,
+            "status": "not_recorded",
+        }
+    return {
+        "metric": metric,
+        "unit": unit,
+        "source": source,
+        "clock_safe": clock_safe,
+        "n": len(vals),
+        "mean": round(statistics.mean(vals), 3),
+        "p50": round(_percentile(vals, 50), 3),
+        "p99": round(_percentile(vals, 99), 3),
+        "min": round(min(vals), 3),
+        "max": round(max(vals), 3),
+    }
+
+
 class PerfTimeEventsMerger:
     """Merge per-rank time-event records with KV-transfer CSVs.
 
@@ -506,6 +781,135 @@ class PerfTimeEventsMerger:
         analyzer.create_timing_diagram(timing_data, html_path)
         print(f"Wrote HTML timeline to {html_path}")
 
+    def aggregate_metrics(self) -> List[Dict[str, Any]]:
+        """Summarize every lifecycle interval as mean / P50 / P99 across requests.
+
+        Also emits min / max / n. Returns one row dict per metric, in stable
+        order: the 12 canonical time_breakdown spans, the router dispatch
+        chain, the custom worker spans, then the vLLM-named views. Pure stdlib.
+
+        Rank duplication: a tensor-parallel worker writes each request once per
+        rank with lockstep-identical timings, so all worker-derived groups
+        dedup by (role, request_id) first -- otherwise ``n`` inflates by the
+        TP degree and fakes precision. Router/client rows are already unique
+        per request (router keyed by ctx id; client deduped by response_id).
+        """
+        rows: List[Dict[str, Any]] = []
+
+        # ---- Group 1: canonical 12 (from aggregated /perf_metrics records) ----
+        # Dedup records by request_id (role-agnostic: a /perf_metrics entry is
+        # one request); flatten each once.
+        seen_ids = set()
+        canon_recs = []
+        for rec in self.records:
+            rid = rec.get("request_id")
+            key = rid if rid is not None else id(rec)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            canon_recs.append(_extract_canonical_fields(rec))
+        for name, sf, ef, source, clock_safe in _CANONICAL_METRICS:
+            samples = [_duration(f.get(sf), f.get(ef)) for f in canon_recs]
+            rows.append(_stats_row(name, source, clock_safe, samples))
+
+        # ---- Group 2a: router dispatch chain ----
+        # Iterate the ctx-keyed events (naturally deduped) plus the _no_ctx
+        # gen-only bucket.
+        router_recs = [v for k, v in self.router_events.items() if k != "_no_ctx"]
+        router_recs.extend(self.router_events.get("_no_ctx", []))
+        for name, sf, ef in _ROUTER_METRICS:
+            samples = [_duration(r.get(sf), r.get(ef)) for r in router_recs]
+            rows.append(_stats_row(name, "router", True, samples))
+
+        # ---- Group 2b: custom worker spans ----
+        ctx_recs = _dedup_records_by_role(self.records, "ctx")
+        gen_recs = _dedup_records_by_role(self.records, "gen")
+
+        # ctx prefill compute: first chunk forward_start -> last chunk sample_end.
+        # rtm-gated to skip the warmup record (no request_timing_metrics).
+        ctx_fwd_samples = []
+        for rec in ctx_recs:
+            if not rec.get("request_timing_metrics"):
+                continue
+            ccm = (rec.get("time_breakdown_metrics") or {}).get("ctx_chunk_metrics") or []
+            if not ccm:
+                continue
+            ctx_fwd_samples.append(
+                _duration(ccm[0].get("forward_start_time"), ccm[-1].get("sample_end_time"))
+            )
+        rows.append(
+            _stats_row("ctx:forward_start->sampler_end", "ctx_worker", True, ctx_fwd_samples)
+        )
+
+        # gen KV-transfer span: 0.0 setters on the sync receive path -> _nz maps
+        # them to None so the row falls out as not_recorded (ticket #15871).
+        kv_samples = []
+        for rec in gen_recs:
+            rtm = rec.get("request_timing_metrics") or {}
+            kv_samples.append(
+                _duration(
+                    _nz(rtm.get("kv_cache_transfer_start")), _nz(rtm.get("kv_cache_transfer_end"))
+                )
+            )
+        rows.append(_stats_row("gen:kv_transfer_start->end", "gen_worker", True, kv_samples))
+
+        # arrival -> first_scheduled, per role (queue wait on each worker).
+        for role, recs in (("ctx", ctx_recs), ("gen", gen_recs)):
+            samples = []
+            for rec in recs:
+                rtm = rec.get("request_timing_metrics") or {}
+                samples.append(_duration(rtm.get("arrival_time"), rtm.get("first_scheduled_time")))
+            rows.append(
+                _stats_row(f"{role}:arrival->first_scheduled", f"{role}_worker", True, samples)
+            )
+
+        # ---- Group 3: vLLM-named views ----
+        # ttft / e2e: one value per successful client request, stats across
+        # requests. Dedup by response_id (client_index fallback).
+        seen_resp = set()
+        ttfts, e2es = [], []
+        for c in self.client_events:
+            if c.get("success") is False:
+                continue
+            rid = c.get("response_id", c.get("client_index"))
+            key = rid if rid is not None else id(c)
+            if key in seen_resp:
+                continue
+            seen_resp.add(key)
+            if c.get("ttft") is not None:
+                ttfts.append(c["ttft"])
+            if c.get("latency") is not None:
+                e2es.append(c["latency"])
+        # Client fields are ALREADY in seconds -> scale to ms like the rest.
+        rows.append(_stats_row("vllm:ttft", "client", True, ttfts))
+        rows.append(_stats_row("vllm:e2e", "client", True, e2es))
+
+        # tpot: per-request mean inter-token latency (engine-side proxy), stats
+        # across requests. itl: pooled across every inter-token gap.
+        tpot_samples, itl_pool = [], []
+        for rec in gen_recs:
+            gaps = _reduce_step_itls(rec)
+            if gaps:
+                tpot_samples.append(statistics.mean(gaps))
+                itl_pool.extend(gaps)
+        rows.append(_stats_row("vllm:tpot", "gen_worker", True, tpot_samples))
+        rows.append(_stats_row("vllm:itl", "gen_worker", True, itl_pool))
+
+        return rows
+
+    def write_agg_jsonl(self, path: str) -> None:
+        """Write the latency aggregate as JSONL.
+
+        One JSON object per line, one line per metric (see aggregate_metrics
+        for the row schema and order).
+        """
+        rows = self.aggregate_metrics()
+        with open(path, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        n_ok = sum(1 for r in rows if r.get("status") != "not_recorded")
+        print(f"Wrote latency aggregate ({n_ok}/{len(rows)} metrics populated) to {path}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -555,6 +959,17 @@ def main():
         nargs="?",
         help="Also emit an HTML timeline (optional path).",
     )
+    parser.add_argument(
+        "-a",
+        "--agg-jsonl",
+        default=os.getenv("TRTLLM_PERF_TIME_EVENTS_AGG_PATH") or None,
+        const="perf_time_events.latency_agg.jsonl",
+        nargs="?",
+        help="Also emit a latency-aggregate JSONL (mean / P50 / P99 + min / "
+        "max / n of every lifecycle interval; one JSON object per line). "
+        "Optional path (default: $TRTLLM_PERF_TIME_EVENTS_AGG_PATH, else "
+        "perf_time_events.latency_agg.jsonl). Pure stdlib -- no numpy.",
+    )
     args = parser.parse_args()
 
     if not any((args.event_dir, args.perf_json, args.router_dir, args.client_dir)):
@@ -575,6 +990,8 @@ def main():
     merger.write(args.output)
     if args.html:
         merger.write_html(args.html)
+    if args.agg_jsonl:
+        merger.write_agg_jsonl(args.agg_jsonl)
 
 
 if __name__ == "__main__":
