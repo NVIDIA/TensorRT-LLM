@@ -4090,9 +4090,17 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         """
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
-        spec_config = DSparkDecodingConfig(max_draft_len=5,
-                                           speculative_model=self.MODEL_PATH,
-                                           enable_confidence_scheduling=True)
+        # Same reasoning as the ragged case: without a cost table the planner
+        # cannot tell a cheap verified token from an expensive one and keeps the
+        # full block every step, so the tier ladder is captured but never
+        # selected from. The run is still a valid correctness check -- it just
+        # does not exercise the scheduling decision.
+        sps_table_path = os.environ.get("TLLM_DSPARK_SPS_TABLE") or None
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=5,
+            speculative_model=self.MODEL_PATH,
+            enable_confidence_scheduling=True,
+            confidence_sps_table_path=sps_table_path)
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  tensor_parallel_size=8,
