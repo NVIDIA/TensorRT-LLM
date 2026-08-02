@@ -250,7 +250,7 @@ class DiffusionRequest:
     (a :class:`~tensorrt_llm.visual_gen.params.VisualGenParams` instance).
     When ``params`` is ``None`` (the default), the executor creates a
     ``VisualGenParams()`` and fills it with pipeline-specific defaults
-    before calling ``pipeline.infer()``.
+    before calling ``pipeline.run_inference()``.
     """
 
     request_id: int
@@ -462,7 +462,7 @@ class DiffusionExecutor:
                     f"torch.compile recompilation or CUDA graph capture. "
                     f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
                 )
-            output = self.pipeline.infer(req)
+            output = self.pipeline.run_inference(req)
             if log_cuda_memory:
                 self._log_cuda_peak_memory(req.request_id)
             generation = time.perf_counter() - generation_start  # seconds

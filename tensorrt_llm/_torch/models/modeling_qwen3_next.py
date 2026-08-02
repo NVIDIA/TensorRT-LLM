@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/configs/qwen3_next.py
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -170,10 +173,15 @@ class Qwen3NextGate(nn.Module):
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert len(weights) == 1
-
-        self.weight.copy_(weights[0]["weight"][:])
+        weight = weights[0].get("weight")
+        if not allow_partial_loading:
+            assert weight is not None
+        if weight is not None:
+            self.weight.copy_(weight[:])
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
@@ -1072,7 +1080,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                      weight_mapper: BaseWeightMapper,
                      params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
-        new_weights = weight_mapper.preprocess_weights(weights)
+        new_weights = weight_mapper.preprocess_weights(
+            weights, allow_partial_loading=allow_partial_loading)
         # `new_weights` aliases the source tensors for every key
         # `preprocess_weights` did not rewrite -- the routed experts, i.e. most
         # of a MoE checkpoint. Holding `weights` too would pin them, so
