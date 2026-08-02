@@ -432,31 +432,72 @@ SGLang 博客（https://www.lmsys.org/blog/2026-07-06-dspark-sglang）的核心�
 记录点在 sampler，因为那是唯一一处「接受数」与「它对应的窗口」同时在 host 侧且属于同一步
 的地方 —— 活的 `py_verify_len` 那时已翻到下一步（正是 H6 快照存在的原因）。
 
-## 5. 交付物 3：e2e 实测 —— **未完成**
+## 5. 交付物 3：e2e 实测
 
-- 均匀 tier 路径 + overlap scheduler + DEP8 的 GSM8K：**运行中，未取得分数**。
-- ragged 路径：**未跑**。
-- planner.stats 的 fallback 计数：**未取得**。
+### 5.1 GSM8K = **96.2092** (± 0.526)
 
-已排除的环境障碍（供下一次复现参考）：
+配置：uniform tier ladder（`enable_confidence_scheduling=True`）、overlap scheduler 开启、
+DEP8、MEGAMOE_DEEPGEMM、B300 × 8。
 
-1. 容器里没有 `pytest` / `parameterized` / `mako` / `oyaml` 等；已装到
-   `/lustre/fsw/coreai_comparch_trtllm/laliao/pyextra`，通过 `PYTHONPATH` 引入。
-2. `srun --ntasks=8 pytest` 会让 LLM API 再去 `MPI_Comm_spawn`，报
-   `MPI_ERR_SPAWN`。**必须用 `trtllm-llmapi-launch` 包一层**（仓库里
-   `tmp/serve_*.slurm` 就是这么写的）。
-3. 便捷封装：`tmp/run_in_alloc.sh <jobid> <ntasks> "<cmd>"`。
-   注意它用 `$*` 展开，测试 id 里的 `[...]` 会被 shell 当 glob 吃掉 —— 用 `-k` 选择。
+| | |
+|---|---|
+| 实测 | **96.2092**（flexible-extract 与 strict-match 一致） |
+| 记录参考 | 96.475 |
+| 差 | 0.27，**在 1 个标准误（0.526）之内** —— 统计上不可区分 |
 
-已确认到达的阶段：权重加载完成 → DSpark worker 初始化 →
-`DSpark verify planner: tiers=[1, 3, 5], profiled_cost_table=False, ragged_verify_mode=static`。
+这印证了 goal doc §6.1 对该门的批评：`>= ref_accuracy` 对实测值只有 6.3 题余量，
+而 GSM8K 在 p=0.96 处的二项标准误约 0.54 分 —— **既太松又太紧，干净的 run 会假失败**。
 
-⚠️ **`profiled_cost_table=False`**：没有 profiled SPS 表时 `_decide_local` 无条件返回
-`max_tier`（`dspark_verify.py:268-270`）。所以即便这个 run 跑完，它证明的是
-**102 个 graph 的 capture 不再 hang**（那正是 07/30 失败的地方），
-**不是**「调度真的在 trim」。后者需要 §7 的 Q5。
+> pytest 报 fail，但**精度断言从未执行到**：失败在
+> `tensorrt_llm/evaluate/lm_eval.py:657` → `numpy.mean` 对字符串 dtype 求平均，
+> 是本轮拼装环境里 lm_eval 0.4.12 与容器 numpy 2.1.0 的版本不兼容，与模型和本轮改动无关。
+> lm_eval 已完整跑完 1319 题并输出了分数。
 
----
+### 5.2 这个分数是**基线**，不是调度生效后的分数
+
+随附计数器把这一点讲得毫不含糊：
+
+```
+mode: static, steps_total: 114, steps_no_windows: 114
+planner: {decisions: 114, fallback_flat_cost: 112}
+requests_trimmed: 0, trim_ratio: 0.0, trim_regret_rate: 0.0
+accept_len: 3.3009  (requests_scored: 3436)
+graph_replays: 520, graph_eager: 9
+```
+
+`fallback_flat_cost: 112/114` —— 该 build 尚未接上 SPS 表（开关是启动之后才补的），
+所以 planner 每步都拒绝裁剪。**这次 run 等价于 baseline DSpark，只是多捕获了 3× graph。**
+
+**这正是可观测性存在的理由**：一个「分数正确、日志正常、但 feature 什么都没干」的 run，
+靠计数器一眼看穿，不需要推测。
+
+其他可用数字：
+
+| 量 | 值 | 含义 |
+|---|---|---|
+| `accept_len` | **3.3009** | DSpark block drafter 在 GSM8K 上的真实接受长度（5 个 draft 位置接受 3.30，66%）—— τ 项的基准 |
+| `graph_replays / (replays+eager)` | **520/529 = 98.3%** | G4：稳态 decode 基本全部命中 graph replay |
+| `trim_regret_rate` | 0.0 | 与 `requests_trimmed: 0` 一致 |
+
+### 5.3 ragged 路径：**跑不起来**（见 §0.4）
+
+死于 K1（`mlaKernels.cu:1161`），31:51。
+
+### 5.4 复现环境的坑（供下一个人参考）
+
+1. 容器无 `pytest` / `lm_eval` / `mako` / `oyaml` / `parameterized` / `sacrebleu`。
+2. **不要用 `pip install --target` 装带依赖的包**：`PYTHONPATH` 永远排在 site-packages 前面，
+   一次 `pip install lm_eval` 就把 `numpy` / `transformers` / `datasets` / `pandas` / `pyarrow`
+   等 **50 个包**装进去并 shadow 掉容器版本，症状是
+   `No module named 'torch._C'` 或 `No module named 'transformers.utils.chat_template_utils'`。
+   做法：装完立刻把与容器重名的目录全部隔离。
+3. `srun --ntasks=8 pytest` 会让 LLM API 再去 `MPI_Comm_spawn`，报 `MPI_ERR_SPAWN`；
+   **必须套 `trtllm-llmapi-launch`**。
+4. 被 kill 的 srun step **不会回收 MPI worker**，它们继续占每卡 ~180 GiB，
+   下一次 run 会在 executor 创建时 OOM 并「怪自己」。启动前必须清理（`tmp/cleanup_node.sh`）。
+5. SPS profiler 需要 `TORCHINDUCTOR_COMPILE_THREADS=1`，否则 Inductor 每遇新 shape
+   就 fork 一个编译 worker（父进程常驻上百 GB × 8 rank）→ 宿主 OOM（exit 137）。
+6. **在花 25 分钟建 engine 之前，先廉价验证整条 import 链**。本轮为此损失了三次 25 分钟。
 
 ## 6. 交付物 5：对 goal doc §8 剩余待拍板问题的建议
 
