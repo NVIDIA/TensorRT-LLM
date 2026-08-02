@@ -50,6 +50,71 @@ goal doc §6.3 称它是「性价比最高的一个测试」。参数化之后�
 
 ---
 
+## 0.4 ⛔ 最重要的结论：ragged 在 DSv4 上被 K1 挡住，从未真正跑起来过
+
+端到端跑到真实 decode 之后，第一件撞上的事是：
+
+```
+RuntimeError: [TensorRT-LLM][ERROR] Assertion failed:
+  MLA can only support input sequences with the same sequence length.
+  (cpp/tensorrt_llm/kernels/mlaKernels.cu:1161)
+```
+
+调用栈毫无歧义：
+
+```
+modeling_deepseekv4.py:2509  forward
+ -> mla.py:1981   forward_impl_with_deepseek_v4
+ -> mla.py:2147   forward_generation_sparse_mla
+ -> mla.py:2549   forward_absorption_generation
+ -> self.mqa.mla_rope_generation(...)
+ -> trtllm.py:2038  torch.ops.trtllm.mla_rope_generation
+ -> mlaKernels.cu:1161
+```
+
+kernel 侧就是 goal doc §3.2 **K1** 逐字描述的那个检查：
+
+```cpp
+TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
+    "MLA can only support input sequences with the same sequence length.");
+auto seq_len = params.acc_q_len / params.batch_size;
+```
+
+### 为什么这条是决定性的
+
+commit `e1c28eeae2` 的标题是 **"Make DSpark ragged verification work on the DSv4 kernel path"**。
+但 `git show --stat` 显示它只动了两个 kernel：
+
+| 文件 | goal doc 编号 |
+|---|---|
+| `indexerTopK.cu` / `IndexerTopK.h` / `IndexerTopKOp.cpp` | **K4** 🔧 |
+| `compressorKernels.cu/.h` / `compressorOp.cpp` | **K9** 🔧 |
+
+**`mlaKernels.cu`（K1）和 `attentionOp.cpp`（K2）从未被触碰** —— 而 goal doc §3.2 把这两个都标为 ❌
+kernel 层阻断点，且 K1 排在前面。所以 ragged 路径在 DSv4 上**结构上就不可能端到端跑通**，
+这个 commit 的标题超出了它实际交付的范围。
+
+### 危险的那一半
+
+goal doc K1 还指出了比 abort 更坏的模式：窗口 `[6,2]` → 8 tokens / batch 2 → `seq_len=4`，
+**检查通过**，但每个请求的 K/V 写进错误的行 —— 持久性 KV 缓存污染，静默。
+本轮撞到的是响亮的那一半（整除性不成立）；另一半在别的窗口组合下可达。
+
+### 这对 D1/D2 意味着什么
+
+goal doc §5 说得很清楚：D1 和 D2 **都**靠把 generation 半边呈现成
+「`num_gen_tokens` 个长度为 1 的序列」来让 K1/K2 的整除检查平凡通过。
+**那个呈现变更从未实现。**
+
+而 §1 的 B2 实测说这个呈现**不慢**（0.93–1.00×）。所以路线是通的、代价是可接受的，
+只是**活还没干**。这正是 P0 之后该做的第一件事，而不是调参或找配置。
+
+### 对「吞吐有没有提升」这个问题的直接回答
+
+**今天无法测量。** 不是因为缺 SPS 表，而是因为 ragged 在 DSv4 的 MLA generation 路径上
+根本跑不起来。任何声称测到了 ragged 吞吐的数字，要么没真正走 ragged（planner 静默退化），
+要么就是撞了上面那个静默的 KV 污染分支。
+
 ## 1. 交付物 0：B2 实测数字（最先交）
 
 **问题**（goal doc §7.1 U1）：trtllm-gen sparse-MLA generation 在 `(batch=B, s_q=tier+1)` 与
