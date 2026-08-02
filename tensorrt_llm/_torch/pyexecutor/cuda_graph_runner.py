@@ -629,6 +629,31 @@ class CUDAGraphRunner:
 
         return output_ref
 
+    def will_pad_to(self, padded_bs: int, num_requests: int) -> bool:
+        """Whether a batch of ``num_requests`` can actually reach ``padded_bs``.
+
+        The ragged fit derives its token-bucket grid from an assumed padded row
+        count and hands the rounding slack to pad rows. If padding then
+        declines, those rows never appear and the fitted total lands in no
+        captured bucket -- seen as a graph key of batch_size 193 against a
+        ladder holding 192 and 256, costing every rank a replay.
+
+        Mirrors the size guards in :meth:`_get_padded_batch`. It deliberately
+        does not try to predict the resource-dependent bails (KV capacity for
+        the dummy request, encoder-decoder state): those are checked when the
+        dummy is created, and being wrong in the optimistic direction there
+        leaves the pre-existing behaviour rather than making it worse.
+        """
+        if padded_bs <= 0 or num_requests <= 0:
+            return False
+        if padded_bs not in self.supported_batch_sizes:
+            return False
+        if padded_bs == num_requests:
+            return True          # already at a captured size, nothing to add
+        # _get_padded_batch bails when padding_size + batch_size exceeds the
+        # configured batch size; that sum is just padded_bs.
+        return padded_bs <= self.config.batch_size
+
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:

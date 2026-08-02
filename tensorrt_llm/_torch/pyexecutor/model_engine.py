@@ -3756,6 +3756,31 @@ class PyTorchModelEngine(ModelEngine):
         padded_bs = runner._round_up_batch_size(widest_rows)
         if padded_bs == 0:
             return None
+        # The whole fit is built on the assumption that the batch will be padded
+        # up to `padded_bs`: the bucket grid is derived from it and fill_bucket
+        # hands the rounding slack to rows that do not exist yet. But padding is
+        # allowed to decline -- _get_padded_batch bails when the dummy request
+        # has no KV capacity, when padding would exceed the configured batch
+        # size, and on a few other resource checks. When it does, the rows never
+        # appear, the grid was derived for a row count that is not realised, and
+        # the filled total lands in no captured bucket: observed as
+        # graph_miss_keys {'(193, 5, False, False, True, 449)': 16} on a run
+        # where the ladder held 192 and 256 but not 193, costing every rank a
+        # replay on 16 of 318 steps.
+        #
+        # Only reachable with real trimming. Without it the total is always
+        # padded_bs * (max_verify_len + 1), which is a captured bucket by
+        # construction, so no amount of uniform testing surfaces this.
+        #
+        # Decline to go ragged rather than fit against rows that will not exist.
+        # Uniform always has a captured graph, so the fallback is cheap and the
+        # step still runs.
+        if not runner.will_pad_to(padded_bs, len(token_lens)):
+            logger.debug(
+                f"DSpark ragged: padding to {padded_bs} rows is not available "
+                f"for {len(token_lens)} requests, so the bucket grid derived "
+                f"from it would not be realised; falling back to uniform")
+            return None
         buckets = self.ragged_verify_token_buckets(padded_bs)
         if not buckets:
             return None

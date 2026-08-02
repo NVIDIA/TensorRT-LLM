@@ -100,3 +100,36 @@ def test_ramp_up_steps_do_not_count_toward_the_gate_floor():
     for _ in range(64):
         stats.record_step(num_gen_requests=4, verify_lens=[1, 3, 5, 5])
     assert stats.steps_multi_request == 64
+
+
+class _Runner:
+    """Just the fields will_pad_to reads."""
+
+    def __init__(self, supported, cfg_batch_size):
+        self.supported_batch_sizes = supported
+        self.config = type("C", (), {"batch_size": cfg_batch_size})()
+
+
+def test_will_pad_to_rejects_row_counts_the_ladder_cannot_reach():
+    """The ragged fit must not derive a grid from rows that never appear.
+
+    A run fitted its bucket grid to padded_bs=256 while the batch stayed at 193
+    -- the captured ladder held 192 and 256 but not 193 -- so the filled total
+    449 matched no captured bucket and every rank lost a graph replay on 16 of
+    318 steps. Only reachable with real trimming: without it the total is
+    padded_bs * (max_verify_len + 1), a captured bucket by construction.
+    """
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+        CUDAGraphRunner
+
+    runner = _Runner([1, 2, 4, 8, 128, 192, 256], cfg_batch_size=256)
+    will = CUDAGraphRunner.will_pad_to
+
+    assert will(runner, 256, 193), "193 -> 256 is reachable and should be taken"
+    assert not will(runner, 193, 193), "193 is not a captured size"
+    assert will(runner, 192, 192), "already at a captured size"
+    # Padding past the configured batch size is refused by _get_padded_batch,
+    # so the fit must not assume it.
+    assert not will(_Runner([256, 512], cfg_batch_size=256), 512, 300)
+    assert not will(runner, 0, 10)
+    assert not will(runner, 256, 0)
