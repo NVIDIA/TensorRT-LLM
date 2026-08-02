@@ -162,3 +162,24 @@ def test_ci_submit_rejects_split_group_disagreement(ci_submit_module, tmp_path):
             script_prefix_lines,
             split_group=2,
         )
+
+
+def test_ci_submit_rejects_missing_pytest_split_durations(ci_submit_module, tmp_path):
+    test_list_path = tmp_path / "test_list.txt"
+    test_list_path.write_text(
+        "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300-kimi]\n",
+        encoding="utf-8",
+    )
+    script_prefix_lines = [
+        'export pytestCommand="pytest --splitting-algorithm least_duration '
+        '--splits 1 --group 1 --durations-path /remote/.test_durations"'
+    ]
+
+    expected_path = tmp_path / "tests" / "integration" / "defs" / ".test_durations"
+    with pytest.raises(FileNotFoundError, match=f"durations file not found: {expected_path}"):
+        ci_submit_module.select_test_case_line(
+            test_list_path,
+            tmp_path,
+            script_prefix_lines,
+            split_group=1,
+        )

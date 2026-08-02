@@ -122,8 +122,10 @@ def _load_pytest_split_durations(tokens, llm_src):
     try:
         with open(durations_path, "r") as durations_file:
             durations = json.load(durations_file)
-    except FileNotFoundError:
-        durations = {}
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"pytest-split durations file not found: {durations_path}"
+        ) from error
     if isinstance(durations, list):
         durations = dict(durations)
     if not isinstance(durations, dict):
