@@ -582,6 +582,22 @@ class IndexerPrefillChunkMetadata:
     k_token_end: int  # K token end index in batch
 
 
+@dataclass(frozen=True)
+class TokenMajorGenView:
+    """One attention row per generation query token.
+
+    Handed only to the MLA rope and sparse-MLA generation ops, which derive
+    their sequence count from ``host_context_lengths.size(0)``. Everything else
+    keeps seeing the batch-major metadata, where ``num_seqs`` still means
+    "number of requests".
+    """
+    num_rows: int
+    sequence_length: torch.Tensor
+    host_past_key_value_lengths: torch.Tensor
+    host_context_lengths: torch.Tensor
+    kv_cache_block_offsets: torch.Tensor
+
+
 @dataclass(init=False)
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
@@ -931,6 +947,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # kv_lens_cuda may have just been corrected; the ragged per-row extent
         # is derived from it and has to follow.
         self.refresh_ragged_row_kv_lens()
+        self.refresh_token_major_gen_rows()
 
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
@@ -1420,6 +1437,94 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         # Rows covered by the current step's ragged layout; 0 on uniform steps.
         self._ragged_num_rows = 0
+
+        # ------------------------------------------------------------------
+        # Token-major presentation of the generation half, for the MLA rope and
+        # sparse-MLA generation ops (goal doc K1 / K2).
+        #
+        # Both of those ops learn their sequence count from a tensor *shape* --
+        # `num_seqs = host_context_lengths.size(0)` in dsv3RopeOp.cpp and
+        # thop/attentionOp.cpp -- and then require the query tokens to divide
+        # evenly across it. A ragged batch does not divide, so the assert
+        # "MLA can only support input sequences with the same sequence length"
+        # fires. Handing those two ops one row per generation *token* makes the
+        # division trivial (seq_len == 1) and satisfies the assert rather than
+        # weakening it; no kernel changes.
+        #
+        # These are a PARALLEL set of views, never the metadata's own fields.
+        # `num_seqs` is read as a request count in roughly twenty places --
+        # spec workers sizing acceptance rectangles, the KV-length correction in
+        # _preprocess_inputs, the indexer's own metadata -- so redefining it
+        # would be a global re-typing rather than a presentation change.
+        #
+        # Rows are laid out prefix-preserving: the context rows first, unchanged,
+        # then one row per generation token. That keeps `num_contexts`,
+        # `num_ctx_tokens` and the ops' `seq_offset = num_contexts` all correct
+        # without touching them.
+        #
+        # Capacity is the static ceiling and must never be recomputed from a
+        # runtime count: these live in the process-wide buffer pool keyed by
+        # `cache_name`, so a later reallocation would move addresses already
+        # baked into captured graphs. `2 + max_draft_tokens` per sequence covers
+        # one context row plus the widest generation window.
+        attn_rows_cap = self.max_num_sequences * (2 + self.max_draft_tokens)
+        self._attn_num_rows = 0
+        self.attn_row_kv_lens_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (attn_rows_cap, ),
+            cache_name="attn_row_kv_lens_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        # The per-row offset from its request's kv_len, kept separately so the
+        # extent can be rebuilt on device from a corrected kv_lens without going
+        # back to the host -- `_preprocess_inputs` rewrites kv_lens_cuda inside
+        # the capture body under the overlap scheduler.
+        self.attn_row_kv_correction_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (attn_rows_cap, ),
+            cache_name="attn_row_kv_correction_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.attn_row_req_idx_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (attn_rows_cap, ),
+            cache_name="attn_row_req_idx_cuda",
+            dtype=torch.long,
+            capture_graph=capture_graph,
+        )
+        self.attn_row_kv_lens_host = torch.zeros(
+            (attn_rows_cap, ), dtype=torch.int32,
+            pin_memory=prefer_pinned())
+        self.attn_row_kv_correction_host = torch.zeros(
+            (attn_rows_cap, ), dtype=torch.int32,
+            pin_memory=prefer_pinned())
+        self.attn_row_req_idx_host = torch.zeros(
+            (attn_rows_cap, ), dtype=torch.long, pin_memory=prefer_pinned())
+        # host_context_lengths: the shape oracle both ops key off.
+        self.attn_row_prompt_lens_cpu = torch.zeros(
+            (attn_rows_cap, ), dtype=torch.int32,
+            pin_memory=prefer_pinned())
+        # The main KV block table, one row per query token. Distinct from
+        # `block_table_expanded` below, which carries *indexer* pool indices at
+        # the indexer's own compression. On the DSv4 sparse generation path the
+        # only consumer that walks this per row is the KV write inside the rope
+        # kernel; the attention op overrides its page index pointer with the
+        # sparse top-k indices, which are already per token.
+        self.attn_row_block_offsets = self.get_empty(
+            self.cuda_graph_buffers,
+            [attn_rows_cap, self.kv_cache_manager.max_blocks_per_seq],
+            cache_name="attn_row_block_offsets",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.attn_row_block_offsets_host = torch.zeros_like(
+            self.attn_row_block_offsets,
+            device='cpu',
+            pin_memory=prefer_pinned(),
+        )
+
         self.block_table_expanded = self.get_empty(
             self.cuda_graph_buffers,
             [
@@ -1708,6 +1813,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
             if self.is_ragged_verify:
                 self._prepare_ragged_row_kv_lens(kv_lens)
+                self._prepare_token_major_gen_rows(kv_lens)
 
         self.expand_for_dsl = (use_dsl and self.kv_cache_manager is not None
                                and self.max_draft_tokens >= 1)
@@ -1856,6 +1962,146 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                            self.row_req_idx_cuda[:num_tokens],
                            out=row_kv_lens)
         row_kv_lens.add_(self.row_kv_correction_cuda[:num_tokens])
+
+    def _prepare_token_major_gen_rows(self, kv_lens: torch.Tensor) -> None:
+        """Build the one-row-per-generation-token view for the MLA gen ops.
+
+        See the buffer comments in :meth:`create_expanded_buffers` for why this
+        exists and why it is a parallel view rather than a redefinition of
+        ``num_seqs``.
+
+        Rows are ``[contexts unchanged] ++ [one per generation token]``. Row
+        ``o`` of a request verifying ``v`` positions attends to
+        ``kv_len - v + o + 1`` tokens, the same generalization the decode top-k
+        uses; substituting ``v = next_n`` recovers the uniform formula, which is
+        why the uniform path can keep its single row per request.
+
+        Assembled entirely on the host -- ``kv_lens`` is already a CPU tensor
+        here -- and crossed once through pinned memory. Reading it on the device
+        would be a D2H sync on a path the overlap scheduler depends on.
+        """
+        verify_lens = self.ragged_verify_lens
+        ngt = self._ragged_num_rows
+        if not verify_lens or ngt <= 0:
+            self._attn_num_rows = 0
+            return
+        nc = self.num_contexts
+        rows = nc + ngt
+        cap = self.attn_row_kv_lens_cuda.shape[0]
+        assert rows <= cap, (
+            f"token-major generation needs {rows} rows but the buffers hold "
+            f"{cap}; capacity is the static ceiling and must not be resized "
+            f"after any CUDA graph was captured")
+
+        # Context rows pass through untouched, so the ops' seq_offset still
+        # points at the first generation row.
+        if nc:
+            ctx_kv = kv_lens[:nc].to(torch.int32)
+            self.attn_row_kv_lens_host[:nc].copy_(ctx_kv)
+            self.attn_row_kv_correction_host[:nc].zero_()
+            self.attn_row_req_idx_host[:nc].copy_(
+                torch.arange(nc, dtype=torch.long))
+            self.attn_row_prompt_lens_cpu[:nc].copy_(
+                self.prompt_lens_cpu[:nc].to(torch.int32))
+
+        # Reuse what _prepare_ragged_row_kv_lens just built rather than walking
+        # the windows again: it produced exactly these per-row extents,
+        # corrections and request indices one call earlier. Rebuilding them
+        # would double the only O(num_gen_tokens) host work on the step.
+        self.attn_row_kv_lens_host[nc:rows].copy_(
+            self.row_kv_lens_host[:ngt])
+        self.attn_row_kv_correction_host[nc:rows].copy_(
+            self.row_kv_correction_host[:ngt])
+        # row_req_idx is batch-relative among generation requests; the attention
+        # rows are indexed over the whole batch, so shift past the contexts.
+        torch.add(self.row_req_idx_host[:ngt], nc,
+                  out=self.attn_row_req_idx_host[nc:rows])
+        # host_context_lengths is only a shape oracle for the generation half
+        # (the ops read it for num_seqs and, for contexts, for the q length);
+        # one token per row.
+        self.attn_row_prompt_lens_cpu[nc:rows].fill_(1)
+
+        self.attn_row_kv_lens_cuda[:rows].copy_(
+            self.attn_row_kv_lens_host[:rows], non_blocking=True)
+        self.attn_row_kv_correction_cuda[:rows].copy_(
+            self.attn_row_kv_correction_host[:rows], non_blocking=True)
+        self.attn_row_req_idx_cuda[:rows].copy_(
+            self.attn_row_req_idx_host[:rows], non_blocking=True)
+
+        self._attn_num_rows = rows
+        # The block table is expanded on the DEVICE, from the copy that is
+        # already there. Building it host-side and copying would add ~96 KiB of
+        # H2D per decode step (768 rows x max_blocks_per_seq int32) plus a host
+        # gather, both on the critical path the overlap scheduler exists to keep
+        # clear. One index_select costs neither.
+        self.refresh_token_major_block_table()
+
+    def refresh_token_major_gen_rows(self) -> None:
+        """Rebuild the per-row KV extent from the corrected ``kv_lens_cuda``.
+
+        Mirrors :meth:`refresh_ragged_row_kv_lens` and for the same reason: the
+        overlap scheduler corrects ``kv_lens_cuda`` on device after prepare(),
+        inside the CUDA-graph capture body, so a prepare-time extent would make
+        the rope kernel and the attention op disagree about the same quantity.
+
+        One gather plus one add. No allocation, no repeat_interleave, no D2H --
+        the row->request map and the correction were staged at prepare() time
+        and their addresses are pinned by the graph key.
+        """
+        rows = self._attn_num_rows
+        if not self.is_ragged_verify or rows <= 0:
+            return
+        torch.index_select(self.kv_lens_cuda[:self.num_seqs], 0,
+                           self.attn_row_req_idx_cuda[:rows],
+                           out=self.attn_row_kv_lens_cuda[:rows])
+        self.attn_row_kv_lens_cuda[:rows].add_(
+            self.attn_row_kv_correction_cuda[:rows])
+
+    def refresh_token_major_block_table(self) -> None:
+        """Expand the main KV block table to one row per query token, on device.
+
+        Every row of a request sees that request's blocks -- a verify window
+        never spans a request -- so this is a plain gather by the row->request
+        map. Done on the device because the source is already resident; doing it
+        host-side would mean a per-step H2D of the whole table.
+
+        Not refreshed from ``on_update_kv_lens``: block IDs do not move within a
+        step, the same reason ``block_table_expanded`` is built once per
+        prepare().
+        """
+        rows = self._attn_num_rows
+        if rows <= 0 or self.kv_cache_block_offsets is None:
+            return
+        width = min(self.attn_row_block_offsets.shape[1],
+                    self.kv_cache_block_offsets.shape[-1])
+        # kv_cache_block_offsets is [num_pools, num_seqs, 2, max_blocks] for the
+        # paged layout; the generation path reads pool 0, the K direction.
+        src = self.kv_cache_block_offsets
+        while src.dim() > 2:
+            src = src[0] if src.shape[0] == 1 else src.select(0, 0)
+        torch.index_select(src[:, :width], 0,
+                           self.attn_row_req_idx_cuda[:rows],
+                           out=self.attn_row_block_offsets[:rows, :width])
+
+    def token_major_gen_view(self) -> Optional["TokenMajorGenView"]:
+        """The token-major presentation for this step, or None.
+
+        None on every uniform batch, which is what keeps those paths
+        bit-identical: at ``s_q == 1`` trtllm-gen selects different kernels
+        (`mIsCausalSpecDecodingGen` is gated on ``mMaxSeqLenQ > 1``), so
+        presenting a uniform batch token-major would be functionally equivalent
+        but not bitwise so.
+        """
+        rows = self._attn_num_rows
+        if not self.is_ragged_verify or rows <= 0:
+            return None
+        return TokenMajorGenView(
+            num_rows=rows,
+            sequence_length=self.attn_row_kv_lens_cuda[:rows],
+            host_past_key_value_lengths=self.attn_row_kv_lens_host[:rows],
+            host_context_lengths=self.attn_row_prompt_lens_cpu[:rows],
+            kv_cache_block_offsets=self.attn_row_block_offsets[:rows],
+        )
 
     def ragged_row_kv_lens(self, num_tokens: int) -> Optional[torch.Tensor]:
         """The per-row extent slice for this step, or None on a uniform batch."""

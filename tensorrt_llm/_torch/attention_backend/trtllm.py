@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import functools
+import contextlib
 import math
 import os
 import weakref
@@ -516,6 +517,45 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cuda_runtime = prompt_lens_cuda
         self.prompt_lens_cpu_runtime = prompt_lens_cpu
         self.host_request_types_runtime = host_request_types
+
+    def token_major_gen_view(self):
+        """The token-major generation presentation, or None.
+
+        None on every backend but DSA, and on every uniform DSA batch. See
+        ``DSAtrtllmAttentionMetadata.token_major_gen_view``.
+        """
+        return None
+
+    @contextlib.contextmanager
+    def presented_token_major(self, view):
+        """Temporarily present the generation half as one row per query token.
+
+        The MLA rope and sparse-MLA generation ops learn their sequence count
+        from ``host_context_lengths.size(0)`` and then require the query tokens
+        to divide evenly across it. A ragged batch does not divide. Swapping in
+        per-token views for the duration of those two calls makes the division
+        trivial (seq_len == 1) and satisfies their asserts rather than weakening
+        them.
+
+        Scoped deliberately: ``num_seqs`` is read as a *request* count almost
+        everywhere else -- spec workers sizing acceptance rectangles, the
+        KV-length correction under the overlap scheduler, the indexer's own
+        metadata -- so the token-major rows must never outlive these two calls.
+        """
+        if view is None:
+            yield
+            return
+        saved = (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
+                 self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets)
+        try:
+            self.kv_lens_cuda_runtime = view.sequence_length
+            self.kv_lens_runtime = view.host_past_key_value_lengths
+            self.prompt_lens_cpu_runtime = view.host_context_lengths
+            self.kv_cache_block_offsets = view.kv_cache_block_offsets
+            yield
+        finally:
+            (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
+             self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets) = saved
 
     def prepare(self) -> None:
         super().prepare()
@@ -1770,13 +1810,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not self.fmha_libs:
             self.create_fmha_libs()
 
-        for fmha in self.fmha_libs:
-            if fmha.is_supported(q, k, v, metadata, forward_args):
-                fmha.forward(q, k, v, metadata, forward_args)
-                break
-        else:
-            raise RuntimeError(
-                "No TRT-LLM attention FMHA library supports this request.")
+        # goal doc K2. On a ragged generation step the attention op is handed
+        # one row per query token so its `num_tokens % num_seqs == 0` check
+        # passes with seq_len == 1. Wrapping the dispatch rather than the
+        # library keeps every fmha implementation, and its tests, untouched.
+        token_major_view = (metadata.token_major_gen_view() if
+                            forward_args.attention_input_type
+                            == AttentionInputType.generation_only else None)
+        with metadata.presented_token_major(token_major_view):
+            for fmha in self.fmha_libs:
+                if fmha.is_supported(q, k, v, metadata, forward_args):
+                    fmha.forward(q, k, v, metadata, forward_args)
+                    break
+            else:
+                raise RuntimeError(
+                    "No TRT-LLM attention FMHA library supports this request.")
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat
@@ -2035,6 +2083,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
 
+        # goal doc K1. Same presentation as the attention dispatch above: the
+        # rope kernel derives batch_idx = tok / seq_len and the KV write offset
+        # from a single scalar seq_len, which only describes a batch where every
+        # request contributes the same number of tokens.
+        with self.presented_token_major_for(metadata):
+            self._mla_rope_generation_impl(
+                metadata, fused_q, q_pe, latent_cache, cu_q_seqlens,
+                cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
+                mla_bmm2_scale, quant_q_buffer, out_scale, helix_tensor_params)
+
+    @contextlib.contextmanager
+    def presented_token_major_for(self, metadata):
+        with metadata.presented_token_major(metadata.token_major_gen_view()):
+            yield
+
+    def _mla_rope_generation_impl(self, metadata, fused_q, q_pe, latent_cache,
+                                  cu_q_seqlens, cu_kv_seqlens,
+                                  fmha_scheduler_counter, mla_bmm1_scale,
+                                  mla_bmm2_scale, quant_q_buffer, out_scale,
+                                  helix_tensor_params):
         torch.ops.trtllm.mla_rope_generation(
             fused_q,
             q_pe,

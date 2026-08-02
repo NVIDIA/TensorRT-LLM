@@ -3920,6 +3920,25 @@ class PyTorchModelEngine(ModelEngine):
                 f"{bucket}; the replayed graph was captured at a different "
                 f"width and nothing downstream would notice.")
 
+        # Row axis. Everything above is a token count, so all four agree even
+        # when the token-major presentation is malformed -- the presentation is
+        # about how many ROWS the MLA generation ops are shown, which is a
+        # different quantity and needs its own check.
+        view = attn_metadata.token_major_gen_view() if hasattr(
+            attn_metadata, "token_major_gen_view") else None
+        if view is not None:
+            expected_rows = attn_metadata.num_contexts + from_requests
+            assert view.num_rows == expected_rows, (
+                f"token-major presentation has {view.num_rows} rows but the "
+                f"batch has {attn_metadata.num_contexts} context rows plus "
+                f"{from_requests} generation tokens; the MLA generation ops "
+                f"would read a sequence count that does not describe this step.")
+            assert view.host_context_lengths.shape[0] == expected_rows, (
+                f"token-major host_context_lengths has "
+                f"{view.host_context_lengths.shape[0]} entries but the "
+                f"presentation is {expected_rows} rows -- that tensor's shape "
+                f"IS what the ops read as their sequence count.")
+
     def _attach_ragged_verify_layout(self, spec_metadata, attn_metadata,
                                      generation_requests) -> None:
         """Publish this step's per-request verify windows to both metadatas.
