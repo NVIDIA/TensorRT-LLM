@@ -117,10 +117,16 @@ find_tensorrt_llm_libs() {
         for f in libtensorrt_llm libnvinfer_plugin_tensorrt_llm libth_common; do
             for g in "$pkg"/libs/"$f".so*; do _emit "$g"; done
         done
-        # P1: Python bindings (name encodes interpreter + arch, so glob it).
-        for f in "$pkg"/bindings*.so; do _emit "$f"; done
-        # P1: Triton backend + executor worker, if present in this layout.
-        for f in "$pkg"/libs/libtriton_tensorrtllm.so* "$pkg"/bin/trtllmExecutorWorker; do _emit "$f"; done
+        # P1 (TEMPORARILY DISABLED): the Python bindings' BOLT static-init runs in
+        # the orchestrator + every spawned IPC worker, and is the prime suspect for
+        # the intermittent disagg GEN worker-init hang (stall at
+        # worker_init_status_queue, before model load). Same failure class as the
+        # already-excluded KV-transfer wrappers above. Keeping P0-only for now to
+        # isolate the hang; uncomment to re-enable P1 once the hang is understood.
+        # # P1: Python bindings (name encodes interpreter + arch, so glob it).
+        # for f in "$pkg"/bindings*.so; do _emit "$f"; done
+        # # P1: Triton backend + executor worker, if present in this layout.
+        # for f in "$pkg"/libs/libtriton_tensorrtllm.so* "$pkg"/bin/trtllmExecutorWorker; do _emit "$f"; done
     else
         log_warning "tensorrt_llm not importable (PYTHON=${PYTHON:-python3}); relying on BOLT_EXTRA_LIBS only"
     fi

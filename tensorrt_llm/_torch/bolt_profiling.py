@@ -70,14 +70,20 @@ CLEAR_SYMBOL = "__bolt_instr_clear_counters"
 #: prints the address at instrument time (scripts/bolt/bolt_lib.sh captures it).
 CLEAR_OFFSETS_ENV = "BOLT_CLEAR_OFFSETS_FILE"
 
-#: Basenames (substring match) of the objects we BOLT-instrument. Mirrors the
-#: target set in scripts/bolt/bolt_lib.sh (P0 native libs + P1 bindings/triton).
+#: Basenames (substring match) of the objects we BOLT-instrument. MUST mirror the
+#: target set actually instrumented in scripts/bolt/bolt_lib.sh, otherwise a lib
+#: listed here but NOT instrumented is still found loaded, fails clear-symbol
+#: resolution, and (with TLLM_BOLT_CLEAR_STRICT=1) fails the run. Currently P0-only
+#: -- the P1 entries (bindings, libtriton_tensorrtllm) are commented out to match
+#: bolt_lib.sh, which disabled P1 while isolating the disagg GEN worker-init hang.
+#: Re-enable these IN LOCKSTEP with the P1 lines in bolt_lib.sh.
 _TARGET_LIB_SUBSTRINGS = (
     "libtensorrt_llm.so",
     "libnvinfer_plugin_tensorrt_llm.so",
     "libth_common.so",
-    "libtriton_tensorrtllm.so",
-    "bindings",  # bindings.cpython-<ver>-<arch>.so
+    # --- P1 (disabled; re-enable together with bolt_lib.sh P1) ---
+    # "libtriton_tensorrtllm.so",
+    # "bindings",  # bindings.cpython-<ver>-<arch>.so
 )
 
 # One-shot latch: warmup can be re-entered in some paths; only clear once.
