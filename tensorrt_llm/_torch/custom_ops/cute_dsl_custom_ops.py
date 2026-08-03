@@ -9097,10 +9097,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sm_fake,
                 cutlass.Int32(1),
                 cutlass.Int32(1),
+                # stream sits before the emission tensors in __call__ -
+                # upstream's positional order, with the emission slots
+                # appended after it. Keep this list in that order: the
+                # runtime call below drops the stream (the TVM FFI env
+                # stream is used) and is otherwise the same sequence.
+                fake_stream,
                 block_max_fake,
                 hit_stats_fake,
                 hit_bitmap_fake,
-                fake_stream,
                 seed_thr=seed_thr_fake,
                 seed_counts=seed_counts_fake,
                 cand=cand_fake,
