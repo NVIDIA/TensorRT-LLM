@@ -82,11 +82,13 @@ SKIP_CS_MIN_N_RUNGS = 196608  # vb: cluster split from here up
 # (which carries a ~22us launch floor) and so charged 12us at batch 64 /
 # 512k, where the true cost is zero; that is what put the counts tier
 # behind a batch gate. The list cost is real per-emitted-entry work and
-# grows with batch and context alike; an unbucketed single-segment list
-# measures 1.5-5.8x cheaper, but rescoring the grid with it moves the
-# geomean by +0.5%, so the bucketed contract stays as is.
+# grows with batch and context alike. Parking the two tight lines above
+# the score range (see gvr_ext.LIST_PARK_LINE) drops it 2.7-5x - every
+# entry then lands in the one segment that claims through a per-warp
+# window instead of an exact ballot - at top-k parity, which is what
+# makes the list tier affordable past a single row.
 LIST_EMIT_MIN_N = 65536  # shorter rows: the emission outweighs the saving
-LIST_EMIT_MAX_B = 1  # past one row the list never repays its emission
+LIST_EMIT_MAX_B = 4  # past four rows the list stops repaying its emission
 COUNTS_MIN_TOKENS = 524288  # B * raw length; below this the counts
 # latency chain is exposed and the zero-emission rungs tier wins
 RUNGS_ONLY_MIN_N = 16384  # short-row band where rungs also beats counts
@@ -99,7 +101,7 @@ RUNGS_ONLY_MAX_N = 49152
 # the block-skip prefix - so the stock kernel wins outright and the
 # epilogue should emit nothing.
 ASSIST_WEAK_MIN_N = 49152
-ASSIST_WEAK_MAX_N_SMALL_K = 262144  # k <= ASSIST_WEAK_K
+ASSIST_WEAK_MAX_N_SMALL_K = 196608  # k <= ASSIST_WEAK_K
 ASSIST_WEAK_MAX_N_LARGE_K = 196608
 ASSIST_WEAK_K = 512
 ASSIST_WEAK_MAX_B = 8
@@ -143,11 +145,13 @@ def plan_emission(
         # and this holds for the zero-emission rungs tier too - it is
         # the same kernel, so the floor is the same
         return "none"
+    if have_epilogue and n_comp >= LIST_EMIT_MIN_N and batch <= LIST_EMIT_MAX_B:
+        # checked before the weak band below: that band is about the stock
+        # kernel out-scanning us, and a list hit never scans the row
+        return "list"
     weak_max = ASSIST_WEAK_MAX_N_SMALL_K if k <= ASSIST_WEAK_K else ASSIST_WEAK_MAX_N_LARGE_K
     if batch <= ASSIST_WEAK_MAX_B and ASSIST_WEAK_MIN_N <= n_comp < weak_max:
         return "none"  # stock's split grid wins this band outright
-    if have_epilogue and n_comp >= LIST_EMIT_MIN_N and batch <= LIST_EMIT_MAX_B:
-        return "list"
     if (
         have_epilogue
         and batch * n_comp * compress_ratio >= COUNTS_MIN_TOKENS

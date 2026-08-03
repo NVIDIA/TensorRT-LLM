@@ -2842,7 +2842,7 @@ class Indexer(nn.Module):
                             torch.cuda.get_device_properties(
                                 q_fp8.device).multi_processor_count,
                             compress_ratio=max(self.compress_ratio, 1))
-                        st.update_seed_rows(batch_size)
+                        st.update_seed_rows(batch_size, emit_tier)
                         gvr_emit_kwargs = st.indexer_emit_kwargs(
                             emit_tier, batch_size)
                         if self._gvr_route.attach_block_max or emit_tier in (
