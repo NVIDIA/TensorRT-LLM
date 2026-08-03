@@ -4754,6 +4754,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class CuteDSLFp8BlackwellBmmRunner(TunableRunner):
         kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
+        _FP8OUT_COMPILE_CONTRACTS = (
+            (1, True),
+            (2, True),
+            (1, False),
+        )
 
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
@@ -5169,32 +5174,46 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ).get_max_active_clusters(cluster_size)
                 stream = cute.runtime.make_fake_stream(
                     use_tvm_ffi_env_stream=True)
-                compiled_gemm = cute.compile(
-                    gemm.wrapper_fp8sf,
-                    m,
-                    n,
-                    k,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    batch_size,
-                    a_ptr,
-                    b_ptr,
-                    a_sf_ptr,
-                    b_sf_ptr,
-                    c_cute_tensor,
-                    max_active_clusters,
-                    stream,
-                    sf_out_ptr,
-                    aligned_m,
-                    sf_n,
-                    fp8_smem_row_iters,
-                    use_fp8_smem_epilogue,
-                    options="--opt-level 2 --enable-tvm-ffi",
-                )
-                self.__class__.kernel_cache[cache_key] = compiled_gemm
-            else:
-                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                # M and its scale stride are dynamic Int32 arguments. Only the
+                # two epilogue controls below are constexpr and produce distinct
+                # binaries. Compile every contract on the first warmup miss so
+                # eager decode cannot synchronously JIT an unseen small-M path.
+                cache_key_prefix = cache_key[:-2]
+                for (compile_row_iters,
+                     compile_smem_epilogue) in self._FP8OUT_COMPILE_CONTRACTS:
+                    compile_key = cache_key_prefix + (
+                        compile_row_iters,
+                        compile_smem_epilogue,
+                    )
+                    if compile_key in self.__class__.kernel_cache:
+                        continue
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper_fp8sf,
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        batch_size,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_cute_tensor,
+                        max_active_clusters,
+                        stream,
+                        sf_out_ptr,
+                        aligned_m,
+                        sf_n,
+                        compile_row_iters,
+                        compile_smem_epilogue,
+                        options="--opt-level 2 --enable-tvm-ffi",
+                    )
+                    self.__class__.kernel_cache[compile_key] = compiled_gemm
+
+            compiled_gemm = self.__class__.kernel_cache[cache_key]
 
             compiled_gemm(
                 m,

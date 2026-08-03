@@ -379,6 +379,60 @@ def test_dsv4_oa_fp8out_clears_packed_scale_padding(m: int) -> None:
     assert torch.count_nonzero(sf_padded[m:]).item() == 0
 
 
+@skip_pre_blackwell
+def test_dsv4_oa_fp8out_warmup_precompiles_every_m_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if get_sm_version() // 10 != 10:
+        pytest.skip("DSV4 O_a FP8 output requires the SM100 family")
+
+    batch_size, n, k = 4, 128, 128
+    runner = cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner
+    monkeypatch.setattr(runner, "kernel_cache", {})
+
+    def make_inputs(m: int) -> list[torch.Tensor]:
+        sf_m = (m + 3) // 4 * 4
+        return [
+            torch.zeros((batch_size, m, k), device="cuda", dtype=torch.float8_e4m3fn),
+            torch.zeros((batch_size, n, k), device="cuda", dtype=torch.float8_e4m3fn),
+            torch.ones((batch_size, 1, sf_m), device="cuda"),
+            torch.ones((batch_size, 1, 1), device="cuda"),
+            torch.empty((m, batch_size * n), device="cuda", dtype=torch.float8_e4m3fn),
+            torch.empty_strided((sf_m, 1), (1, sf_m), device="cuda", dtype=torch.int32),
+        ]
+
+    def run(m: int) -> list[torch.Tensor]:
+        inputs = make_inputs(m)
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(*inputs)
+        assert torch.count_nonzero(inputs[4]).item() == 0
+        return inputs
+
+    # A context-only warmup must materialize the two small-M epilogues too.
+    run(256)
+    fp8out_keys = {key for key in runner.kernel_cache if key[0] == "fp8out"}
+    assert len(fp8out_keys) == len(runner._FP8OUT_COMPILE_CONTRACTS)
+    assert {(key[-2], key[-1]) for key in fp8out_keys} == set(runner._FP8OUT_COMPILE_CONTRACTS)
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("CuTe JIT occurred after O_a warmup")
+
+    monkeypatch.setattr(cute_dsl_custom_ops.cute, "compile", fail_compile)
+    for m in (1, 17, 31, 33, 256):
+        run(m)
+    assert {key for key in runner.kernel_cache if key[0] == "fp8out"} == fp8out_keys
+
+    # Eager warmup must also make an irregular small-M graph safe to capture.
+    graph_inputs = make_inputs(23)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(*graph_inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(graph_inputs[4]).item() == 0
+    assert {key for key in runner.kernel_cache if key[0] == "fp8out"} == fp8out_keys
+
+
 def _make_dsv4_ob_packed_scale(n: int, k: int) -> torch.Tensor:
     packed_k = k // 512
     storage = torch.empty((packed_k, n), device="meta", dtype=torch.int32)
@@ -745,10 +799,12 @@ def _build_dsv4_o_proj_case(
     dtype_str: str,
     device: torch.device,
     use_cute_dsl_blockscaling_mm: bool | None = None,
+    dsv4_pro_contract: bool = False,
 ) -> tuple[MLA, torch.Tensor, torch.Tensor, SimpleNamespace]:
     """Build an MLA module, inputs, and reference-path tensors for the DeepSeek-V4
     o_proj tests. The blockscaling flag selects the O_b backend without changing
-    the generated tensors.
+    the generated tensors. ``dsv4_pro_contract`` selects the production O_b
+    dimensions required by the fused O_a/O_b path.
 
     Returns:
         (mla, attn_out_latent, position_ids, refs) where ``refs`` is a namespace
@@ -765,10 +821,10 @@ def _build_dsv4_o_proj_case(
     qk_rope_head_dim = 64
     v_head_dim = 512
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-    hidden_size = 4096
+    hidden_size = 7168 if dsv4_pro_contract else 4096
     max_position_embeddings = 65536
     o_lora_rank = 1024
-    num_groups = 8
+    num_groups = 16 if dsv4_pro_contract else 8
     n_local_groups = num_groups  # no TP in this test
 
     torch.manual_seed(42)
@@ -1007,7 +1063,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str) -> None:
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("num_tokens", [1, 16, 32, 128, 256])
+@pytest.mark.parametrize("num_tokens", [1, 32, 256])
 def test_deepseek_v4_o_proj_fused_fp8_equivalence(
     num_tokens: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1017,12 +1073,15 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(
 
     device = torch.device("cuda")
     mla, attn_out_latent, position_ids, refs = _build_dsv4_o_proj_case(
-        num_tokens, "fp8", device, use_cute_dsl_blockscaling_mm=False
+        num_tokens,
+        "fp8",
+        device,
+        use_cute_dsl_blockscaling_mm=False,
+        dsv4_pro_contract=True,
     )
     # The standalone MLA fixture has no decoder consumer to advertise split
     # output support, so opt in explicitly for this fused-path test.
     mla.allow_dsv4_split_output = True
-    monkeypatch.setattr(cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner, "kernel_cache", {})
     if num_tokens == 1:
         _check_dsv4_oa_fp8out_tensor_contract()
 
@@ -1044,6 +1103,7 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(
     monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "0")
     out_deep_gemm_fallback = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
     monkeypatch.delenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", raising=False)
+    assert mla._should_use_fused_oproj()
     out_cute = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
 
     # Analytic reference (same correctness bar as the unfused correctness test).
@@ -1088,14 +1148,3 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(
         and key[-1] == expected_smem_epilogue
     ]
     assert len(fp8out_keys) == 1
-
-    if num_tokens == 16:
-        compiled_gemm = cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache[
-            fp8out_keys[0]
-        ]
-        out_cached = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
-        assert (
-            cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache[fp8out_keys[0]]
-            is compiled_gemm
-        )
-        torch.testing.assert_close(out_cached, out_cute, rtol=0, atol=0)
