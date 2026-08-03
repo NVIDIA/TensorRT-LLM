@@ -1835,15 +1835,18 @@ class PyTorchModelEngine(ModelEngine):
             return graphs
 
         # Case 2b: DSpark confidence-scheduled verification.
-        # Unlike Case 2, the draft length here is NOT a function of the batch
-        # size -- at a fixed batch size the scheduler may still pick a different
-        # length as the batch's confidence changes. So the ladder is captured for
-        # every batch size, as a cross product.
+        # The drafted block is always full -- scheduling trims *verification*,
+        # not drafting -- so draft_len is pinned to the top tier in every mode.
+        # What varies is which axis the tiers land on: `compact` moves them to
+        # the token count (a cross product with the batch sizes), while
+        # `cap-accept` and the static fallback keep the ordinary one graph per
+        # batch size.
         #
-        # This is the expensive part of the feature and the reason the ladder is
-        # kept short: each captured graph costs ~10-23 MB of metadata outside the
-        # shared pool, and that memory is taken directly out of KV cache (the KV
-        # pool is sized from what is left after capture).
+        # Captured graphs are the expensive part of this feature: each costs
+        # ~10-23 MB of metadata outside the shared pool, taken directly out of
+        # KV cache (the KV pool is sized from what is left after capture). So a
+        # tier that no mode can select is not free, it is KV cache spent on a
+        # graph that will never be replayed.
         if (self.spec_config is not None and getattr(
                 self.spec_config, "enable_confidence_scheduling", False)):
             tiers = sorted({
@@ -1872,13 +1875,26 @@ class PyTorchModelEngine(ModelEngine):
                     f"token buckets from tiers {tiers}; draft_len pinned to "
                     f"{top_tier}).")
                 return graphs
-            graphs = [(bs, draft_len) for bs in cuda_graph_batch_sizes
-                      for draft_len in tiers]
+            # One draft length, not the ladder. The cross product above was
+            # right while the uniform tier path existed and picked a different
+            # draft_len per step; that path is gone, and nothing varies
+            # draft_len at runtime any more:
+            #
+            #   scheduling off  never reaches this branch (guarded above)
+            #   cap-accept      runtime_draft_len = planner.max_tier, always
+            #   compact         takes the ragged branch, pinned to top_tier
+            #
+            # So the lower tiers were captured and never selected -- with
+            # tiers {1,3,5}, two thirds of these graphs were dead, and captured
+            # graph memory comes straight out of KV cache.
+            top_tier = tiers[-1]
+            graphs = [(bs, top_tier) for bs in cuda_graph_batch_sizes]
             logger.info(
                 f"DSpark confidence scheduling: capturing {len(graphs)} graphs "
-                f"({len(cuda_graph_batch_sizes)} batch sizes x {len(tiers)} "
-                f"draft-length tiers {tiers}). Every extra tier costs captured "
-                f"graph memory that would otherwise be KV cache.")
+                f"({len(cuda_graph_batch_sizes)} batch sizes, draft_len pinned "
+                f"to {top_tier}). The drafted block is always full; only "
+                f"verification is trimmed, and cap-accept trims it at "
+                f"acceptance rather than in the layout.")
             return graphs
 
         # Case 3: Target model (two-model) or one-model without dynamic draft

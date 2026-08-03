@@ -517,12 +517,22 @@ def _capture_set(batch_sizes, tiers, max_draft_len=BLOCK):
     return PyTorchModelEngine._get_graphs_to_capture(engine, list(batch_sizes), None)
 
 
-def test_capture_is_the_batch_size_x_tier_cross_product():
-    """K is NOT a function of batch size here -- every bs needs every tier."""
+def test_capture_pins_the_draft_length_to_the_top_tier():
+    """One graph per batch size, not a cross product with the tier ladder.
+
+    The cross product was right while the uniform tier path existed and chose
+    a different draft_len per step. That path is gone and nothing varies
+    draft_len at runtime now: cap-accept pins it to planner.max_tier and
+    compact moves the ladder to the token axis. Capturing the lower tiers
+    anyway spent KV cache -- captured graphs come out of the same pool -- on
+    graphs that could never be selected. Measured on a real run: 57 graphs
+    where 19 were reachable.
+    """
     bss, tiers = [1, 8, 64], [1, 3, BLOCK]
     graphs = _capture_set(bss, tiers)
-    assert set(graphs) == {(bs, k) for bs in bss for k in tiers}
-    assert len(graphs) == len(bss) * len(tiers)
+    assert set(graphs) == {(bs, BLOCK) for bs in bss}
+    assert len(graphs) == len(bss), (
+        f"expected one graph per batch size, got {len(graphs)}: {graphs}")
 
 
 def _stats(max_draft_len=5):

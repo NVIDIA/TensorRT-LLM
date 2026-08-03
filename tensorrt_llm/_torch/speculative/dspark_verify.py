@@ -93,6 +93,7 @@ class DSparkVerifyPlanner:
             "fallback_flat_cost": 0,
             "fallback_no_confidence": 0,
             "fallback_short_snapshot": 0,
+            "fallback_no_gen_requests": 0,
         }
 
     @property
@@ -204,7 +205,19 @@ class DSparkVerifyPlanner:
         input layout is built per request (so it goes ragged) while the spec
         metadata sees a ``None`` and stays uniform.
         """
+        # Counted before any decline, so the four fallback counters below have a
+        # denominator. Without it they are absolute counts against an unknown
+        # total, which is how a run reported `planner_declined: 2` alongside an
+        # all-zero planner block: nothing said how many decisions there had
+        # been, so nothing said whether zero fallbacks meant "healthy" or
+        # "never asked".
+        self.stats["decisions"] += 1
+
         if num_gen_requests <= 0:
+            # Benign during ramp-up, but it has to be nameable: an unlabelled
+            # `return None` here is indistinguishable in the counters from a
+            # real decline, and this feature's failures are all silent.
+            self.stats["fallback_no_gen_requests"] += 1
             return None
 
         if self.cost_table is None or self.cost_table.is_flat:

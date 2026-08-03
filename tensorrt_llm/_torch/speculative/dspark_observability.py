@@ -513,6 +513,21 @@ class DSparkRaggedStats:
             raise AssertionError(
                 f"DSpark ragged verify handed out only one distinct window "
                 f"size, so the batch was uniform in all but name: {summary}")
+        # The two counter families have to move together. A run once reported
+        # per-step scheduling activity here beside an all-zero planner block,
+        # because `decisions` was never incremented -- which made the fallback
+        # counters unreadable, and those are the only thing that says WHY a
+        # step declined to trim. Zero decisions against non-zero windowed steps
+        # means the planner's stats are not wired to this object at all.
+        if self.planner_stats is not None:
+            decisions = int(self.planner_stats.get("decisions", 0))
+            windowed = self.steps_ragged + self.steps_uniform_windows
+            if windowed > 0 and decisions == 0:
+                raise AssertionError(
+                    f"DSpark scheduling produced windows on {windowed} steps "
+                    f"but the planner recorded 0 decisions, so its fallback "
+                    f"counters cannot be read -- and they are the only record "
+                    f"of why a step declined to trim: {summary}")
         # `cap-accept` submits the full block on purpose -- it measures the
         # commitment policy, not a compute saving -- so a zero trim ratio is
         # the expected outcome there, not a silent no-op. Requiring one would
