@@ -38,6 +38,34 @@ from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
 from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 
+# Temporary NCCL-EP v0.1.0 limitation. The LL combine kernel derives its
+# warp-group count and dynamic-SMEM requirement here:
+# https://github.com/NVIDIA/nccl/blob/nccl-ep-v0.1.0/contrib/nccl_ep/device/low_latency.cu#L1990-L2025
+# Its v0.1.0 group initialization limits LL execution to 14 warp groups:
+# https://github.com/NVIDIA/nccl/blob/nccl-ep-v0.1.0/contrib/nccl_ep/nccl_ep.cc#L1302-L1314
+# TODO: Remove this compatibility check after upgrading to NCCL-EP v0.2,
+# which removes the v0.1.0 LL-combine launch limitation.
+_NCCL_EP_V0_1_LL_MAX_WARP_GROUPS = 14
+
+
+def _get_nccl_ep_ll_combine_smem_requirement(
+    num_slots: int, hidden_size: int, num_device_sms: int
+) -> int | None:
+    """Return the NCCL-EP LL combine dynamic-SMEM requirement in bytes."""
+    num_warp_groups = (num_slots + num_device_sms - 1) // num_device_sms
+    if num_warp_groups > _NCCL_EP_V0_1_LL_MAX_WARP_GROUPS:
+        return None
+    num_warps_per_group = 32 // num_warp_groups
+
+    num_warps = num_warp_groups * num_warps_per_group
+    num_meta_bytes = hidden_size // 128 * 4
+    num_send_tma_bytes = 32 * 16 * 4 + 16
+    smem_send_size = num_warps * (3 * num_send_tma_bytes + num_meta_bytes)
+
+    num_recv_tma_bytes = 16 + hidden_size * 2
+    smem_recv_size = 2 * (3 * num_recv_tma_bytes + hidden_size * 2 + 3 * num_meta_bytes * 3)
+    return max(smem_send_size, smem_recv_size)
+
 
 class CommunicationFactory:
     """
@@ -413,4 +441,26 @@ class CommunicationFactory:
             )
         if top_k <= 0 or top_k > num_slots:
             return f"NcclEP requires 0 < top_k <= num_slots, got {top_k=}, {num_slots=}."
+        if torch.cuda.is_available():
+            device_properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+            required_smem = _get_nccl_ep_ll_combine_smem_requirement(
+                num_slots, hidden_size, device_properties.multi_processor_count
+            )
+            max_dynamic_smem = getattr(
+                device_properties,
+                "shared_memory_per_block_optin",
+                device_properties.shared_memory_per_block,
+            )
+            if required_smem is None:
+                return (
+                    "NcclEP low-latency combine requires at most "
+                    f"{_NCCL_EP_V0_1_LL_MAX_WARP_GROUPS} expert warp groups, got "
+                    f"{num_slots=} and {device_properties.multi_processor_count=}."
+                )
+            if required_smem > max_dynamic_smem:
+                return (
+                    "NcclEP low-latency combine requires "
+                    f"{required_smem} bytes of dynamic shared memory, but the current device "
+                    f"supports only {max_dynamic_smem} bytes."
+                )
         return None
