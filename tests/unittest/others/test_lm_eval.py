@@ -34,6 +34,7 @@ from tensorrt_llm.evaluate.lm_eval import (
     LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER,
     LmEvalWrapper,
     MultimodalLmEvalWrapper,
+    _resolve_post_process_fn,
 )
 from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     is_equiv,
@@ -42,7 +43,11 @@ from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     remove_boxed,
     strip_string,
 )
-from tensorrt_llm.evaluate.post_processing import extract_inkling_content
+from tensorrt_llm.evaluate.post_processing import (
+    extract_inkling_content,
+    strip_inkling_and_extract_mmmu_answer,
+    strip_thinking_and_extract_mmmu_answer,
+)
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -172,6 +177,7 @@ def test_process_results_answer_key_case_insensitive():
 def _make_lm_eval_wrapper(
     sampling_params: SamplingParams | None = None,
     sampling_override: bool = False,
+    preserve_caller_max_tokens: bool = False,
 ) -> LmEvalWrapper:
     """Build a wrapper with a fake llm.
 
@@ -184,6 +190,7 @@ def _make_lm_eval_wrapper(
         fake_llm,
         sampling_params=sampling_params,
         sampling_override=sampling_override,
+        preserve_caller_max_tokens=preserve_caller_max_tokens,
     )
 
 
@@ -275,6 +282,18 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
     assert out.stop == ["</s>"]
 
 
+def test_preserve_caller_max_tokens_keeps_larger_text_budget():
+    """Opt-in text evaluators keep a larger caller max_tokens budget."""
+    wrapper = _make_lm_eval_wrapper(
+        sampling_params=SamplingParams(max_tokens=1024),
+        preserve_caller_max_tokens=True,
+    )
+
+    out = wrapper._get_sampling_params({"max_gen_toks": 512})
+
+    assert out.max_tokens == 1024
+
+
 # ===========================================================================
 # Multimodal wrapper interleave — apply_chat_template content_parts
 # ===========================================================================
@@ -289,7 +308,11 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
 
 # Uses ``gemma3`` by default because it is always registered regardless of
 # transformers version; the wrapper's interleave logic itself is generic.
-def _make_multimodal_wrapper(model_type: str = "gemma3") -> MultimodalLmEvalWrapper:
+def _make_multimodal_wrapper(
+    model_type: str = "gemma3",
+    *,
+    keep_special_tokens: bool = False,
+) -> MultimodalLmEvalWrapper:
     fake_llm = MagicMock()
     fake_llm.tokenizer = MagicMock()
     fake_llm.input_processor = MagicMock()
@@ -300,7 +323,17 @@ def _make_multimodal_wrapper(model_type: str = "gemma3") -> MultimodalLmEvalWrap
             sampling_params=None,
             streaming=False,
             model_type=model_type,
+            keep_special_tokens=keep_special_tokens,
         )
+
+
+def test_multimodal_wrapper_can_preserve_special_tokens_for_post_processing():
+    """Inkling multimodal scoring needs raw <|content_*|> markers preserved."""
+    wrapper = _make_multimodal_wrapper(keep_special_tokens=True)
+
+    out = wrapper._get_sampling_params({"max_gen_toks": 8})
+
+    assert out.skip_special_tokens is False
 
 
 def _call_apply(wrapper, text: str, *, content_format: ContentFormat):
@@ -811,3 +844,31 @@ def test_inkling_content_then_thinking_keeps_only_content():
     """Out-of-order blocks: content kept, later reasoning dropped."""
     assert extract_inkling_content(
         f"{_CT}Answer: 5{_CTH}wait no") == "Answer: 5"
+
+
+def test_inkling_non_text_control_closes_content():
+    """Non-text content markers close the visible channel."""
+    assert extract_inkling_content(
+        f"{_CT}Answer<|content_image|>not visible{_EM}") == "Answer"
+
+
+def test_inkling_mmmu_answer_extraction_uses_visible_content_only():
+    """MMMU extraction must ignore numbers/options from Inkling reasoning."""
+    text = (f"{_CTH}wrong trail says answer is (D){_EM}"
+            f"{_MM}{_CT}The answer is (B).{_EM}{_CES}")
+
+    assert strip_inkling_and_extract_mmmu_answer(text) == "B"
+
+
+def test_lm_eval_post_process_resolver_special_token_modes():
+    fn, keep_special_tokens = _resolve_post_process_fn("inkling")
+    assert fn is extract_inkling_content
+    assert keep_special_tokens is True
+
+    fn, keep_special_tokens = _resolve_post_process_fn("inkling_mmmu")
+    assert fn is strip_inkling_and_extract_mmmu_answer
+    assert keep_special_tokens is True
+
+    fn, keep_special_tokens = _resolve_post_process_fn("strip_thinking_mmmu")
+    assert fn is strip_thinking_and_extract_mmmu_answer
+    assert keep_special_tokens is False

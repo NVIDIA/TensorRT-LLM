@@ -51,7 +51,10 @@ Env:
   * ``INKLING_CKPT``  -- checkpoint dir (default: the task.yaml checkpoint_path)
   * ``MMMU_ALIGN_CACHE`` -- cached real MMMU items (reused from Goal 1.1/1.2)
   * ``SGLANG_PY``     -- sglang ``python/`` root
-  * ``INKLING_VISION_ARTIFACT`` -- path for the replay record JSON
+  * ``INKLING_VISION_ARTIFACT`` -- output path for the replay-record JSON DUMP,
+    written for offline inspection only. Defaults to a gitignored transient file;
+    the pass/fail is the in-test live TRT-vs-SGLang assertion, NOT this dump, so
+    there is no checked-in reference artifact to keep in the tree.
 """
 
 from __future__ import annotations
@@ -92,9 +95,8 @@ SGLANG_PY = os.environ.get(
 )
 SGLANG_HMLP = os.path.join(SGLANG_PY, "sglang/srt/models/inkling_common/hmlp.py")
 SGLANG_NORM = os.path.join(SGLANG_PY, "sglang/srt/models/inkling_common/norm.py")
-ARTIFACT = os.environ.get(
-    "INKLING_VISION_ARTIFACT", os.path.join(HERE, "inkling_vision_tower_artifact.json")
-)
+DEFAULT_ARTIFACT = os.path.join(HERE, "inkling_vision_tower_generated_artifact.json")
+ARTIFACT = os.environ.get("INKLING_VISION_ARTIFACT", DEFAULT_ARTIFACT)
 
 PATCH_SIZE = 40
 TEMPORAL = 2

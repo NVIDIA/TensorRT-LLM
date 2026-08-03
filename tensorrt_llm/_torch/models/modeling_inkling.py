@@ -98,8 +98,6 @@ from .modeling_inkling_vision import (
     InklingAudioModel,
     InklingInputProcessor,
     InklingVisionModel,
-    emit_vision_scatter_probe,
-    vision_probe_enabled,
 )
 from .modeling_multimodal_utils import (
     filter_mm_token_from_input_ids,
@@ -120,388 +118,6 @@ from .modeling_multimodal_utils import (
 # stateless full-sequence causal conv. This is exactly the state the runtime
 # short-conv cache carries per request alongside the paged KV cache (crit8).
 InklingConvState = namedtuple("InklingConvState", ["k", "v", "attn", "mlp"])
-
-
-# ---------------------------------------------------------------------------
-# Batched-decode divergence localizer (env-gated, zero cost when unset)
-# ---------------------------------------------------------------------------
-# Set INKLING_DIVERGE_CHECK=1 to localize the served batched-decode corruption
-# (fair served GSM8K nc=4 = 0.60 vs nc=1 correct; the fixed-batch repro shows 4
-# IDENTICAL requests forking at decode step ~14+). On a batch of identical
-# requests every generation row MUST stay bit-identical, so this walks the decode
-# stack and reports the first (decode step, layer, sub-op) where identical-input
-# rows first produce a DIVERGENT output. It also reads the carried short-conv pool
-# state at the batch's generation slots, so a divergence can be attributed to a
-# genuine per-slot STATE bug (divergent carried conv state) vs benign fused-kernel
-# non-determinism (a tiny 1-2 ULP diff in a stateless op that reads identical
-# state). Prints only from tp_rank 0. Reset each new prefill so the step index is
-# per generation episode.
-_INK_DIVERGE = {"on": None, "step": 0, "reported": False}
-
-
-def _ink_diverge_on() -> bool:
-    d = _INK_DIVERGE
-    if d["on"] is None:
-        d["on"] = bool(os.environ.get("INKLING_DIVERGE_CHECK"))
-    return d["on"]
-
-
-def _ink_rowdiff(t: Optional[torch.Tensor], ctx=None) -> float:
-    """Max abs difference of any request from request 0 (0.0 => bit-identical).
-
-    Decode mode (``ctx is None``): ``t`` is ``[num_req, ...]`` (one row per
-    generation request); compare each row to row 0.
-
-    Prefill/context mode (``ctx=(num_req, seqlen)``): ``t`` is the packed
-    ``[num_req*seqlen, ...]`` context activation for ``num_req`` IDENTICAL
-    prompts of equal length ``seqlen``; reshape to ``[num_req, seqlen, ...]`` and
-    compare each request's whole span to request 0's. This is the invariant a
-    batch of identical prefills must hold, and the packed varlen layout means a
-    plain dim-0 rowdiff would wrongly compare token 0 to token 1 within a
-    sequence -- the reshape compares request-vs-request instead.
-    """
-    if t is None:
-        return 0.0
-    if ctx is not None:
-        num_req, seqlen = ctx
-        if num_req < 2 or t.shape[0] != num_req * seqlen:
-            return 0.0
-        r = t.detach().float().reshape(num_req, seqlen, *t.shape[1:])
-        return (r - r[0:1]).abs().max().item()
-    if t.shape[0] < 2:
-        return 0.0
-    r0 = t[0:1].detach().float()
-    return (t.detach().float() - r0).abs().max().item()
-
-
-# feedback #17 op-level B2 bisection: intra-layer op boundaries in forward order.
-# The op fingerprint (``InklingModel._ink_fp_ops``) is a
-# ``[num_layers, N_INK_FP_OPS, 4]`` capture-safe STATS buffer -- for every op it
-# stores ``[nonfinite_count, max_abs, 0, numel]`` computed element-wise on-device
-# and ``copy_``'d INTO the decode graph. Stats (not the raw vector) so the buffer
-# is shape-agnostic: it fingerprints the non-hidden-width attention internals
-# (q/k/v/rel_logits) alongside the hidden-width residual points, and
-# ``nonfinite_count`` names the FIRST tensor that is finite in eager but
-# NON-FINITE under CUDA graph regardless of shape. The chain walks the feedback
-# #17 order: attn_norm -> QK(q,k,v,rel) -> softmax/PV/KV-page(attn_kernel) ->
-# TP all-reduce(o_proj_out) -> attn_sconv -> h_attn. Order MUST match
-# inkling_fp_ops_analyze.py OP_NAMES.
-#
-# HEISENBUG GUARD (iter-79 -- fixes the iter-75/76/77/78 NO_NONFINITE + onset-
-# unprobed rejects). Job data proved the op probe is NOT a passive observer:
-# op-probing a global-attention layer PROTECTS it, moving the B2 nan onset to the
-# first UNPROBED global layer (no probe -> onset L5, job 5558469; probe globals
-# 5/11/17 -> onset L23, job 5560480; probe ALL globals -> fully SUPPRESSED, job
-# 5561260 -- onset pushed past layer 65). Cause: the earlier fingerprint
-# allocated ~3 numel-sized temporaries per op (a reshape-copy of the possibly
-# non-contiguous q/k/v slice, ``.to(fp32)``, the ``isfinite`` bool, the ``abs``
-# float) IN THE MIDDLE of the global-attention kernel path, shifting the
-# CUDA-graph memory pool exactly where B2's capture-baked stale-buffer read
-# lives. So chasing the onset with a layer cap (probe layer <= N) is futile --
-# the probe always moves the onset off the probed set. The iter-79 fix instead
-# makes the fingerprint ALLOCATION-FREE (see ``_ink_fp_stat``): a pre-allocated
-# fp32 scratch + in-place ``abs_`` + a scalar ``amax``, allocating NOTHING
-# numel-sized -- strictly lighter than the per-layer residual ``_ink_fp``
-# ``.to(fp32)`` copy that is already proven CUDA-graph-transparent (5558469
-# reproduces at natural onset L5 with it active). Transparent => no protection =>
-# B2 reproduces at its NATURAL onset layer, which is itself op-probed, so ALL 11
-# global-attention layers can be probed at once (any global onset is captured).
-# Retained from the lean iter-77 probe: GLOBAL-attention layers only (55
-# local/SWA skipped), the ``o_proj_local`` extra GEMM (op 6) left UNMEASURED
-# (matmul-vs-all-reduce discriminated via cross-rank attn_kernel/o_proj_out
-# finiteness in FP_OPS_XRANK), and mlp-side ops 10/11/12 UNMEASURED (B2 is
-# attention-born; the ``_ink_fp`` residual covers the post-mlp stream).
-_INK_FP_OP_NAMES = (
-    "attn_norm",  # 0 decoder: pre-attention RMSNorm output
-    "attn_q",  # 1 attention: q after qkv-proj + qk-norm
-    "attn_k",  # 2 attention: k after kv-sconv + qk-norm
-    "attn_v",  # 3 attention: v after kv-sconv
-    "attn_rel",  # 4 attention: relative-position bias rel_logits
-    "attn_kernel",  # 5 attention: paged decode-kernel output (softmax/PV/KV-page read)
-    "o_proj_local",  # 6 UNMEASURED (extra GEMM dropped -- Heisenbug); use XRANK
-    "o_proj_out",  # 7 attention: o_proj output POST all-reduce (= h_core)
-    "attn_sconv",  # 8 decoder: attention short-conv output (h_asc)
-    "h_attn",  # 9 decoder: post-attention residual (residual + h_asc)
-    "mlp_norm",  # 10 UNMEASURED (mlp-side; residual buffer covers downstream)
-    "moe_out",  # 11 UNMEASURED (mlp-side; residual buffer covers downstream)
-    "mlp_sconv",  # 12 UNMEASURED (mlp-side; residual buffer covers downstream)
-)
-N_INK_FP_OPS = len(_INK_FP_OP_NAMES)
-_INK_FP_STAT_W = 4  # [nonfinite_count, max_abs, l2, numel]
-
-
-def _ink_fp_stat(
-    slot: torch.Tensor, t: torch.Tensor, scratch: Optional[torch.Tensor] = None
-) -> None:
-    """Capture-safe finiteness fingerprint of ``t`` written into ``slot`` (a
-    length-4 fp32 view): ``[nonfinite_flag, max_abs, 0, numel]``.
-
-    ALLOCATION-FREE when ``scratch`` (a pre-allocated fp32 1-D buffer sized
-    ``>= t.numel()``) is supplied: the per-op work is ``copy_`` (cast+gather into
-    the scratch) -> in-place ``abs_`` -> a scalar ``amax`` reduction, so NOTHING
-    numel-sized is allocated inside the captured decode graph. Only tiny scalars
-    (the amax result + its ``isfinite``) are created -- strictly lighter than the
-    per-layer residual ``_ink_fp`` ``.to(fp32)`` copy that is already proven
-    CUDA-graph-transparent (job 5558469 reproduces B2 at its natural onset layer 5
-    with that residual probe active). See the HEISENBUG GUARD note above for why
-    allocation-freedom is load-bearing: the earlier ~3-numel-temp-per-op
-    fingerprint shifted the CUDA-graph memory pool and PROTECTED whichever global
-    layer it probed, moving the nan onset off the probed set.
-
-    ``nonfinite_flag`` (>0) is the FIRST-op nan detector for ANY tensor shape:
-    ``max_abs = amax(|t|)`` is nan if ``t`` has any nan and +inf if ``t`` has any
-    inf, so ``~isfinite(max_abs)`` flags any nonfinite element regardless of
-    shape. Everything is device-side (no ``.item()``/``.cpu()`` host sync) so it
-    is CUDA-graph-capture-safe. Pass the already-sliced last row (decode: the last
-    generation request)."""
-    tv = t.detach()
-    n = tv.numel()
-    if scratch is not None and n <= scratch.numel():
-        sv = scratch[:n].view(tv.shape)  # view of pre-alloc scratch (no alloc)
-        sv.copy_(tv)  # cast->fp32 + gather (no numel alloc)
-        sv.abs_()  # in-place abs (no alloc)
-        m = sv.amax()  # scalar reduction (no host sync)
-        slot[0].copy_((~torch.isfinite(m)).to(torch.float32))
-        slot[1].copy_(torch.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0))
-        slot[3].fill_(float(n))
-        return
-    # Fallback (no scratch supplied, or op larger than the scratch -- does not
-    # happen for the probed Inkling ops): the original small-alloc path.
-    tf = tv.reshape(-1).to(torch.float32)
-    slot.copy_(
-        torch.stack(
-            [
-                (~torch.isfinite(tf)).sum().to(torch.float32),
-                tf.abs().amax(),
-                tf.new_zeros(()),
-                tf.new_full((), float(tf.numel())),
-            ]
-        )
-    )
-
-
-# ===========================================================================
-# feedback #18 -- NO-PROBE capture-time buffer bisection for B2 (Stage 6).
-#
-# WHY (supersedes the feedback #17 op-probe as the FIRST tactic). The in-graph
-# op fingerprint above (``INKLING_FP_OPS``) is a Heisenbug: every element-wise
-# stat it records into the decode graph perturbs the CUDA-graph memory pool and
-# MOVES/SUPPRESSES the nan (no probe -> onset L5, job 5558469; probe 5/11/17 ->
-# L23, 5560480; probe all globals -> suppressed, 5561260). That layout
-# sensitivity is itself the tell: B2 is a CAPTURE-TIME fault from a
-# stale/UNINITIALIZED buffer or a captured pointer/offset in the global-attention
-# decode path (nan present from the FIRST replay at kv_pos=5, BEFORE any KV-page
-# boundary; the captured graph HOLDS it; eager is finite at identical metadata).
-#
-# So this route carries NO in-graph fingerprint. The pass/fail signal is the real
-# free-run output itself (B2 = collapse to a token-0 repeat; fixed = coherent
-# text -- driven by ``inkling_fp_localize_test.py`` with ``INKLING_FP`` UNSET).
-# ``INKLING_B2_FIX`` selects ONE candidate init/refresh toggle per run; each is a
-# distinct hypothesis about which captured buffer is stale, and each is a
-# candidate FIX if it flips collapse -> coherent while eager stays finite.
-#
-# CAPTURED-BUFFER ENUMERATION (global-attention decode, ``_run_generation`` +
-# ``inkling_decode_attention``). Every tensor the captured decode kernel reads:
-#   * ``q`` / ``rel_logits``          transient, RE-computed in-graph each replay
-#                                     (qkv_proj / einsum) -> not stale.
-#   * ``k_cache`` / ``v_cache``       persistent KVCacheManagerV2 pool views;
-#                                     stable pointer, contents read LIVE. If the
-#                                     pool is allocated uninitialized (poisoned),
-#                                     a decode read of an unwritten (page,slot)
-#                                     returns nan -> candidate ``zero_kvpool``.
-#   * ``meta.seq_lens``/``page_table``stable per-layer buffers (InklingDecodeMeta)
-#                                     refreshed EAGERLY each step; only ``[:num_gen]``
-#                                     is written, so a stale padding/prior-batch
-#                                     row could drive the in-graph KV scatter to a
-#                                     wrong page -> candidate ``full_meta`` (memset
-#                                     the whole cap each refresh). Their H2D copy
-#                                     is ``non_blocking`` -> a capture/replay read
-#                                     could race it -> candidate ``sync_meta``.
-#   * decode kernel out ``o``         ``torch.empty_like(q)`` -- a FRESH transient
-#                                     grabbed from the graph pool each forward, so
-#                                     its address moves with the pool layout (the
-#                                     exact Heisenbug knob). Candidate
-#                                     ``persist_out`` gives it a stable,
-#                                     eagerly-zeroed persistent buffer instead.
-# The four above were all RULED OUT (feedback #19). The leading unexplored
-# feedback #19 candidate class is the CUDA-graph PADDING metadata:
-#   * padding/dummy generation row     the ``max_batch_size=8`` decode graph pads
-#     KV scatter                       the single real request up to the bucket with
-#                                      dummy rows. The DIAG (job 5567187) MEASURED a
-#                                      padded replay batch as {row0: real, sl=511,
-#                                      16 pages} + {row1..7: dummy, sl=1, one page
-#                                      each, e.g. 99/110/121/.. and sometimes page 0}.
-#                                      Each dummy still runs the in-graph KV scatter
-#                                      ``k_cache[pages,:,offs,:] = k`` at slot 0 of
-#                                      its page, writing its pool-transient (garbage,
-#                                      possibly non-finite) k/v there. If a real
-#                                      request ever reads one of those pages a
-#                                      capture-time nan results -- at kv_pos<=5,
-#                                      before any page boundary, memory-layout-
-#                                      sensitive (the dummy's hidden state is
-#                                      pool-transient garbage), and INVISIBLE to
-#                                      compute-sanitizer initcheck (the slot was
-#                                      written, so the read is of initialised-but-
-#                                      corrupted memory, not an uninitialised read).
-#                                      Candidate ``pad_scatter`` redirects the dummy
-#                                      rows to a scratch page that no real row uses,
-#                                      EAGERLY in :meth:`refresh` (zero in-graph op,
-#                                      so a collapse->coherent flip is a real fix not
-#                                      a pool-perturbation artifact). CORRECTED
-#                                      detector: a dummy is a ``seq_len==1`` row in a
-#                                      PADDED CUDA-graph batch (``is_graph and
-#                                      num_gen>1``); iter-88 keyed on ``seq_len==1``
-#                                      alone and so also mis-redirected the sole real
-#                                      row of an eager ``num_gen==1`` warmup step
-#                                      (sl==1 there too), which made its NO_LEAD
-#                                      invalid (iter-90 confound analysis).
-# Toggles are env-gated and BYTE-UNCHANGED when ``INKLING_B2_FIX`` is unset.
-_B2_FIX_NAMES = ("zero_kvpool", "persist_out", "full_meta", "sync_meta", "pad_scatter")
-
-
-def _b2_fix_active(name: str) -> bool:
-    """True iff the feedback #18 no-probe B2 candidate ``name`` is selected via
-    ``INKLING_B2_FIX`` (comma-separated). Single ``dict`` lookup -> zero cost when
-    the env is unset (the production path is byte-unchanged)."""
-    v = os.environ.get("INKLING_B2_FIX")
-    if not v:
-        return False
-    return name in v.split(",")
-
-
-def _ink_report_divergence(
-    num_layers: int, dsink: dict, inputs_embeds: torch.Tensor, out: torch.Tensor
-) -> None:
-    """Print the first (step, layer, sub-op) where identical decode rows fork.
-
-    ``dsink[i]`` holds per-sub-op row divergences for layer ``i`` (see
-    :meth:`InklingDecoderLayer.forward`). Called only from tp_rank 0 on a
-    pure-generation forward of a batch of identical requests. Emits one greppable
-    TRACE line per step and one ONSET line the first time the final hidden state
-    diverges, attributing it to the first diverging sub-op and reporting whether
-    the carried short-conv pool state had already diverged coming in.
-    """
-    step = _INK_DIVERGE["step"]
-    d_embed = _ink_rowdiff(inputs_embeds)
-    final_d = _ink_rowdiff(out)
-    # First layer + sub-op whose output diverged (sub-ops in execution order,
-    # so the first nonzero pins the origin op within the stack).
-    first = None
-    for i in range(num_layers):
-        rec = dsink.get(i)
-        if rec is None:
-            continue
-        for op in ("attn_core", "attn_sconv", "mlp_core", "mlp_sconv"):
-            if rec[op] > 0.0:
-                first = (i, op, rec)
-                break
-        if first is not None:
-            break
-    # First layer whose carried pre-update conv-pool state already diverged.
-    state_first = None
-    for i in range(num_layers):
-        rec = dsink.get(i)
-        if rec is not None and any(v > 0.0 for v in rec["pre_state"]):
-            state_first = i
-            break
-    op_str = "L%d/%s=%.2e" % (first[0], first[1], first[2][first[1]]) if first else "none"
-    if step <= 80 or final_d > 0.0:
-        print(
-            "INKLING_DIVERGE_TRACE step=%d nrows=%d d_embed=%.3e final_d=%.3e "
-            "state_first=%s op_first=%s"
-            % (
-                step,
-                out.shape[0],
-                d_embed,
-                final_d,
-                ("L%d" % state_first) if state_first is not None else "none",
-                op_str,
-            ),
-            flush=True,
-        )
-    if final_d > 0.0 and not _INK_DIVERGE["reported"]:
-        _INK_DIVERGE["reported"] = True
-        if first is not None:
-            rec = first[2]
-            print(
-                "INKLING_DIVERGE_ONSET step=%d d_embed=%.3e final_d=%.3e "
-                "first_layer=%d first_subop=%s d_in=%.3e attn_core=%.3e "
-                "attn_sconv=%.3e mlp_core=%.3e mlp_sconv=%.3e pre_state=%s"
-                % (
-                    step,
-                    d_embed,
-                    final_d,
-                    first[0],
-                    first[1],
-                    rec["d_in"],
-                    rec["attn_core"],
-                    rec["attn_sconv"],
-                    rec["mlp_core"],
-                    rec["mlp_sconv"],
-                    ",".join("%.2e" % v for v in rec["pre_state"]),
-                ),
-                flush=True,
-            )
-        else:
-            print(
-                "INKLING_DIVERGE_ONSET step=%d d_embed=%.3e final_d=%.3e "
-                "first_layer=-1 (final diverged but no per-layer sub-op did; "
-                "final-norm / logits / gather path)" % (step, d_embed, final_d),
-                flush=True,
-            )
-
-
-def _ink_report_prefill(
-    num_layers: int, dsink: dict, inputs_embeds: torch.Tensor, out: torch.Tensor, ctx
-) -> None:
-    """Print the first (layer, sub-op) where identical PROMPTS diverge in prefill.
-
-    The decode localizer (:func:`_ink_report_divergence`) only fires on pure
-    generation forwards, so a residual divergence seeded during the context
-    forward (identical prompts prefilling to different logits) shows up there
-    only as a nonzero step-1 ``d_embed``. This reports it directly: ``ctx`` is
-    ``(num_req, seqlen)`` for the identical-prompt context batch, ``dsink`` holds
-    per-sub-op request-span divergences (already computed context-aware in
-    :meth:`InklingDecoderLayer.forward`). The first nonzero sub-op pins the
-    prefill origin -- dense-layer (0/1) ``attn_core`` => the prefill attention
-    kernel; layer>=2 ``mlp_core`` => the context-phase MoE.
-    """
-    num_req, seqlen = ctx
-    d_embed = _ink_rowdiff(inputs_embeds, ctx)
-    final_d = _ink_rowdiff(out, ctx)
-    first = None
-    for i in range(num_layers):
-        rec = dsink.get(i)
-        if rec is None:
-            continue
-        for op in ("attn_core", "attn_sconv", "mlp_core", "mlp_sconv"):
-            if rec[op] > 0.0:
-                first = (i, op, rec)
-                break
-        if first is not None:
-            break
-    op_str = "L%d/%s=%.2e" % (first[0], first[1], first[2][first[1]]) if first else "none"
-    print(
-        "INKLING_PREFILL_DIVERGE num_req=%d seqlen=%d d_embed=%.3e final_d=%.3e "
-        "op_first=%s" % (num_req, seqlen, d_embed, final_d, op_str),
-        flush=True,
-    )
-    if first is not None:
-        rec = first[2]
-        print(
-            "INKLING_PREFILL_ONSET first_layer=%d first_subop=%s d_in=%.3e "
-            "attn_core=%.3e attn_sconv=%.3e mlp_core=%.3e mlp_sconv=%.3e"
-            % (
-                first[0],
-                first[1],
-                rec["d_in"],
-                rec["attn_core"],
-                rec["attn_sconv"],
-                rec["mlp_core"],
-                rec["mlp_sconv"],
-            ),
-            flush=True,
-        )
 
 
 class InklingConvStateCache:
@@ -958,7 +574,7 @@ def _moe_config_with_trtllm_backend(model_config: ModelConfig) -> ModelConfig:
     (``_frozen``/``extra_attrs``/``pretrained_config``/``quant_config``), so the
     naive ``mc = copy.copy(model_config); mc.moe_backend = "TRTLLM"`` raises
     ``AttributeError: Cannot modify ModelConfig.'moe_backend' - instance is
-    frozen`` (the iter64 failure). Use the sanctioned escape hatch named in
+    frozen``. Use the sanctioned escape hatch named in
     ``ModelConfig.__setattr__``: unfreeze the *copy*, retarget only the scalar
     ``moe_backend``, then re-freeze. ``copy.copy`` is a shallow copy, so the
     ``_frozen`` bool on the copy is independent of the original -- the global
@@ -1029,8 +645,8 @@ class InklingMoeRoutingMethod(BaseMoeRoutingMethod):
     def routing_method_type(self):
         # TRTLLM backend (INKLING_MOE_BACKEND=TRTLLM): tag the routing with the
         # dedicated Inkling enum so the blockScaleMoe kernel dispatches its
-        # precomputed-routing branch (added in iter64: runner.h/runner.cu
-        # ``InklingSinkRenorm``) -- permute + fp4 GEMM + deterministic finalize on
+        # precomputed-routing branch (``InklingSinkRenorm`` in
+        # runner.h/runner.cu) -- permute + fp4 GEMM + deterministic finalize on
         # the topk_ids/topk_weights this method precomputes. Default (CUTLASS):
         # keep ``Unspecified`` so CUTLASS/VANILLA compute routing torch-side via
         # :meth:`apply` exactly as before (byte-unchanged).
@@ -1260,28 +876,6 @@ class InklingDecodeMeta:
         self.seq_lens: Optional[torch.Tensor] = None  # [cap] int32 GPU total-KV
         self.page_table: Optional[torch.Tensor] = None  # [cap, max_pages] int32
         self.ready = False
-        # feedback #18 no-probe B2 candidates. ``_owner`` is the InklingAttention
-        # (set right after construction) so :meth:`refresh` can size the persistent
-        # decode-output buffer eagerly. ``out_buf`` is the ``persist_out`` candidate
-        # -- a stable, eagerly-zeroed replacement for the decode kernel's fresh
-        # ``torch.empty_like`` output (whose pool-transient address is the Heisenbug
-        # knob). Both stay ``None`` unless the matching toggle is selected.
-        self._owner = None
-        self.out_buf: Optional[torch.Tensor] = None
-        # feedback #19 padding-metadata candidate ``pad_scatter``: total physical
-        # page count of this layer's KV pool, resolved LAZILY and ONLY when the
-        # toggle is selected (production path never calls this), so a CUDA-graph
-        # padding/dummy generation row can be scattered to a reserved scratch page
-        # instead of aliasing the real request's physical page 0.
-        self.num_pages: Optional[int] = None
-        # Guards for the INKLING_B2_DIAG batch-composition dump (eager, gated OFF
-        # by default -> production byte-unchanged). Two independent guards: one for
-        # the first eager/warmup refresh and one that fires up to 4x on the PADDED
-        # CUDA-graph replay (is_graph & num_gen>1). Job 5566938 proved a single
-        # one-shot guard logged only the num_gen=1 warmup and MISSED the padded
-        # batch=8 replay -- the batch composition B2 actually depends on.
-        self._diag_eager_logged = False
-        self._diag_graph_n = 0
 
     def _ensure(self, num_gen: int, mgr, device, is_graph: bool) -> None:
         if self.max_pages is None:
@@ -1298,37 +892,6 @@ class InklingDecodeMeta:
         self.cap = max(num_gen, self.cap)
         self.seq_lens = torch.ones(self.cap, dtype=torch.int32, device=device)
         self.page_table = torch.zeros((self.cap, self.max_pages), dtype=torch.int32, device=device)
-
-    def _b2_fix_eager(self, device) -> None:
-        """Apply the feedback #18 no-probe B2 candidates that must run EAGERLY (the
-        captured forward only READS these stable buffers):
-
-        * ``full_meta`` -- memset the WHOLE cap (not just ``[:num_gen]``) so a stale
-          padding / prior-batch page-table row cannot drive the in-graph KV scatter
-          to a wrong page.
-        * ``persist_out`` -- size the stable, zeroed decode-output buffer HERE
-          (never inside the captured forward), so the candidate adds no in-graph
-          allocation or zero of its own that would itself perturb the pool layout
-          and could "fix" B2 by perturbation (a false positive).
-
-        No-op unless the matching toggle is selected. Split out of :meth:`refresh`
-        so it is unit-testable without a full ``attn_metadata``."""
-        if _b2_fix_active("full_meta"):
-            self.seq_lens.fill_(1)
-            self.page_table.zero_()
-        if (
-            _b2_fix_active("persist_out")
-            and self._owner is not None
-            and (self.out_buf is None or self.out_buf.shape[0] < self.cap)
-        ):
-            o = self._owner
-            self.out_buf = torch.zeros(
-                self.cap,
-                o.local_num_heads,
-                o.head_dim,
-                dtype=o.qkv_proj.weight.dtype,
-                device=device,
-            )
 
     def refresh(self, attn_metadata, device) -> bool:
         """Publish this batch's generation decode metadata into the stable
@@ -1350,48 +913,6 @@ class InklingDecodeMeta:
         block_ids = mgr.get_batch_cache_indices(gen_ids, self.layer_idx)
         is_graph = bool(getattr(attn_metadata, "is_cuda_graph", False))
         self._ensure(num_gen, mgr, device, is_graph)
-        self._b2_fix_eager(device)
-        # ``sync_meta``: force the metadata H2D copies synchronous (production is
-        # ``non_blocking``) to test whether a captured/replayed decode read races
-        # the async copy of the eagerly-published seq_lens/page_table.
-        nb = not _b2_fix_active("sync_meta")
-        # ``pad_scatter`` (feedback #19 padding-metadata hypothesis; detector
-        # CORRECTED per iter-90's confound analysis): a CUDA-graph padded/dummy
-        # generation row (num_cached==0 -> seq_len==1) still runs the in-graph KV
-        # scatter, writing its pool-transient (garbage) k/v into whatever physical
-        # page its page-table row names; if a real request later reads that page a
-        # capture-time nan results. Redirect every dummy row to a scratch page that
-        # NO real row in this batch uses.
-        #
-        # RELIABLE dummy detector (fixes the iter-88 confound): dummy rows exist
-        # ONLY in a PADDED CUDA-graph batch (``is_graph and num_gen > 1``); the DIAG
-        # (job 5567187) proved such a batch is always {1 real row sl=511} + {N dummy
-        # rows sl=1}. In an eager or ``num_gen==1`` step the sole row is the real
-        # request even when its sl==1 at graph warmup -- so gating on
-        # ``is_graph and num_gen > 1`` never redirects a real row (the exact
-        # mis-redirect that made iter-88's NO_LEAD invalid). Lazy + toggle-gated ->
-        # the production path never calls ``get_buffers`` and stays byte-unchanged.
-        scratch_page = None
-        if _b2_fix_active("pad_scatter") and is_graph and num_gen > 1:
-            if self.num_pages is None:
-                try:
-                    kvb = mgr.get_buffers(self.layer_idx, kv_layout="HND")
-                    self.num_pages = int(kvb.shape[0])
-                except Exception:  # noqa: BLE001 - diagnostic; fall back to no-op
-                    self.num_pages = None
-            if self.num_pages and self.num_pages > 1:
-                # Pages the REAL rows (num_cached>0 -> sl>1) hold this step; a dummy
-                # must never be scattered onto one of them. Pick the highest FREE
-                # page as scratch (num_pages-1 itself can be a real page -- the DIAG
-                # real row used page 242).
-                real_pages = set()
-                for j in range(num_gen):
-                    if int(num_cached[j]) > 0:
-                        real_pages.update(int(b) for b in block_ids[j] if int(b) >= 0)
-                for p in range(self.num_pages - 1, -1, -1):
-                    if p not in real_pages:
-                        scratch_page = p
-                        break
         # Build host staging (pinned) then ONE async copy into each stable buffer.
         pin = prefer_pinned()
         sl_host = torch.empty(num_gen, dtype=torch.int32, pin_memory=pin)
@@ -1399,51 +920,12 @@ class InklingDecodeMeta:
             sl_host[i] = int(num_cached[i]) + 1
         pt_host = torch.zeros((num_gen, self.max_pages), dtype=torch.int32, pin_memory=pin)
         for i, blocks in enumerate(block_ids):
-            # ``pad_scatter``: ``scratch_page`` is non-None only in a padded
-            # CUDA-graph batch (is_graph and num_gen>1), so ``sl_host[i]==1`` here
-            # reliably means a dummy row (a real gen row has num_cached>=1 ->
-            # seq_len>=2). Point its whole page-table row at the real-row-free
-            # scratch page so the in-graph KV scatter cannot write the dummy's
-            # (pool-transient) k/v into any physical page a real request reads.
-            # Eager (no in-graph op) so a collapse->coherent flip is a real fix,
-            # not a pool-perturbation artifact.
-            if scratch_page is not None and int(sl_host[i]) == 1:
-                pt_host[i, :] = scratch_page
-                continue
             valid = [int(b) for b in blocks if int(b) >= 0]
             if valid:
                 w = min(len(valid), self.max_pages)
                 pt_host[i, :w] = torch.tensor(valid[:w], dtype=torch.int32)
-        # INKLING_B2_DIAG (eager, gated OFF by default -> production byte-unchanged):
-        # dump this batch's decode composition at the first global layer (5) so the
-        # CUDA-graph padding structure B2 depends on is MEASURED, not guessed.
-        # Per-row request id + seq_len + allocated pages reveal whether padding/dummy
-        # rows exist, their seq_len (validating the pad_scatter seq_len==1 detector),
-        # and whether they alias the real request's physical page 0 (row0). Log the
-        # first eager refresh AND up to 4 PADDED graph refreshes (is_graph & num_gen>1)
-        # -- the padded batch=8 replay is the composition that must be captured; a
-        # single one-shot guard fired only on the num_gen=1 warmup (job 5566938).
-        if os.environ.get("INKLING_B2_DIAG") == "1" and self.layer_idx == 5:
-            is_pad = is_graph and num_gen > 1
-            do_log = False
-            if is_pad and self._diag_graph_n < 4:
-                self._diag_graph_n += 1
-                do_log = True
-            elif not is_pad and not self._diag_eager_logged:
-                self._diag_eager_logged = True
-                do_log = True
-            if do_log:
-                parts = []
-                for i in range(num_gen):
-                    pgs = [int(b) for b in block_ids[i] if int(b) >= 0]
-                    parts.append(f"row{i}:id={gen_ids[i]!s} sl={int(sl_host[i])} pages={pgs}")
-                print(
-                    f"INKLING_B2_DIAG layer=5 num_gen={num_gen} is_graph={is_graph} "
-                    f"num_pages={self.num_pages} | " + " | ".join(parts),
-                    flush=True,
-                )
-        self.seq_lens[:num_gen].copy_(sl_host, non_blocking=nb)
-        self.page_table[:num_gen].copy_(pt_host, non_blocking=nb)
+        self.seq_lens[:num_gen].copy_(sl_host, non_blocking=True)
+        self.page_table[:num_gen].copy_(pt_host, non_blocking=True)
         self.ready = True
         return True
 
@@ -1586,13 +1068,6 @@ class InklingAttention(QKNormRoPEAttention):
         # refreshed eagerly (before capture/replay) by the model engine via
         # InklingForCausalLM.prepare_inkling_attn_decode -> _decode_meta.refresh.
         self._decode_meta = InklingDecodeMeta(layer_idx)
-        # feedback #18 no-probe B2 candidates: give the decode-meta a back-ref so
-        # ``refresh`` can size the ``persist_out`` buffer from this layer's head
-        # geometry; ``_b2_kvpool_zeroed`` gates the one-time ``zero_kvpool`` pool
-        # memset (see ``_attention``). Both are inert unless ``INKLING_B2_FIX`` is
-        # set, so the production path is byte-unchanged.
-        self._decode_meta._owner = self
-        self._b2_kvpool_zeroed = False
 
     def _project(self, hidden_states, conv_states, conv_pool_kv=None, conv_rt=None):
         """Fused qkv projection -> split -> k/v short-conv -> per-head qk RMSNorm.
@@ -1657,13 +1132,6 @@ class InklingAttention(QKNormRoPEAttention):
         rel = torch.einsum(
             "thd,de->the", r.float(), self.rel_logits_proj.float()
         )  # [T, H, rel_extent]
-        # DIAGNOSTIC ablation (env-gated, default OFF -> production byte-unchanged):
-        # INKLING_ABLATE_RELBIAS=1 zeros the learned relative-position bias so the
-        # attention runs on the core QK/PV path alone. Used by the iter90 MMLU
-        # B-token-bias localizer to test whether TRT's relative-bias implementation
-        # (vs SGLang's flashinfer score_mod) injects the systematic 'B' answer bias.
-        if os.environ.get("INKLING_ABLATE_RELBIAS", "0") == "1":
-            rel = torch.zeros_like(rel)
         if self.log_scaling_n_floor is not None and position_ids is not None:
             pos = position_ids.reshape(-1).float()
             tau = 1.0 + self.log_scaling_alpha * torch.log(
@@ -1715,18 +1183,6 @@ class InklingAttention(QKNormRoPEAttention):
         num_contexts = attn_metadata.num_contexts
         num_seqs = len(seq_lens)
         ctx_tokens = sum(seq_lens[:num_contexts])
-
-        # feedback #18 no-probe B2 candidate ``zero_kvpool``: zero this layer's
-        # paged KV pool ONCE, eagerly, on its first context (prefill) pass -- before
-        # any K/V is written -- so a later decode read of an unwritten (page, slot)
-        # sees a finite 0 instead of poisoned/uninitialized pool memory (a candidate
-        # capture-time B2 nan source). Fires at most once per layer lifetime (the
-        # first prefill / KV-estimation forward, never under decode-graph capture),
-        # so it cannot wipe a live request's cache. Diagnostic-only (the single-
-        # request B2 repro); default-off, production byte-unchanged.
-        if num_contexts > 0 and not self._b2_kvpool_zeroed and _b2_fix_active("zero_kvpool"):
-            kv.zero_()
-            self._b2_kvpool_zeroed = True
 
         # A mixed context+generation batch needs ``_project`` to apply the
         # prefill short-conv to the context tokens and the decode short-conv to
@@ -1868,17 +1324,6 @@ class InklingAttention(QKNormRoPEAttention):
             # request -> [num_req, num_kv_heads, head_dim], matching new k/v.
             k_cache[pages, :, offs, :] = k.to(k_cache.dtype)
             v_cache[pages, :, offs, :] = v.to(v_cache.dtype)
-            # feedback #18 no-probe B2 candidate ``persist_out``: write the decode
-            # kernel into the stable, eagerly-zeroed per-layer buffer (sized in
-            # ``_decode_meta.refresh``) instead of a fresh pool-transient
-            # ``torch.empty_like`` output whose address moves with the CUDA-graph
-            # pool layout -- the exact Heisenbug knob. ``None`` -> production path
-            # (fresh output), byte-unchanged when the toggle is off.
-            ob = (
-                meta.out_buf[:num_req]
-                if (meta.out_buf is not None and _b2_fix_active("persist_out"))
-                else None
-            )
             return inkling_decode_attention(
                 q,
                 k_cache,
@@ -1890,7 +1335,6 @@ class InklingAttention(QKNormRoPEAttention):
                 rel_logits,
                 self.rel_extent,
                 self.window_left,
-                out=ob,
             )
         # The write and the ragged->dense block-id work are host-side; under
         # CUDA-graph replay ``skip_kv_write`` is set and static ``decode_*``
@@ -1942,8 +1386,6 @@ class InklingAttention(QKNormRoPEAttention):
         decode_page_table=None,
         skip_kv_write: bool = False,
         return_conv_state: bool = False,
-        ops_fp: Optional[torch.Tensor] = None,
-        ops_scratch: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """Inkling attention through the Triton score_mod path.
@@ -1964,23 +1406,10 @@ class InklingAttention(QKNormRoPEAttention):
         # The pre-attention RMSNorm can emit fp32 (the residual-stream norm
         # path), but the attention/r projections are bf16 (``.attn`` is excluded
         # from NVFP4). Cast once so the decoder-layer forward is robust to the
-        # norm's output dtype -- the isolated crit4 replay fed a pre-cast bf16
-        # tensor, which hid this until the stacked forward / runtime.
+        # norm's output dtype.
         hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
         q, k, v, new_kv_state = self._project(hidden_states, conv_states, conv_pool_kv, conv_rt)
-        # feedback #17 op-level B2 bisection -- walk INTO the global-attention
-        # kernel. q/k/v (post qkv-proj + kv-sconv + qk-norm) and rel_logits are
-        # the paged-decode kernel's INPUTS; if they are finite but attn_kernel is
-        # non-finite, the nan is born in the softmax / PV / KV-page read, not
-        # upstream. Written capture-safely (element-wise stats, D2D into the graph)
-        # only under INKLING_FP_OPS. Fingerprint the last generation row.
-        if ops_fp is not None:
-            _ink_fp_stat(ops_fp[1], q[-1], ops_scratch)  # attn_q
-            _ink_fp_stat(ops_fp[2], k[-1], ops_scratch)  # attn_k
-            _ink_fp_stat(ops_fp[3], v[-1], ops_scratch)  # attn_v
         rel_logits = self._build_rel_logits(hidden_states, position_ids)
-        if ops_fp is not None:
-            _ink_fp_stat(ops_fp[4], rel_logits[-1], ops_scratch)  # attn_rel
         attn_out = self._attention(
             q,
             k,
@@ -1993,21 +1422,7 @@ class InklingAttention(QKNormRoPEAttention):
             allow_mixed=conv_rt is not None,
         )
         attn_out = attn_out.reshape(num_tokens, self.q_size)
-        if ops_fp is not None:
-            # attn_kernel = softmax/PV/KV-page-read output (pre out-proj).
-            _ink_fp_stat(ops_fp[5], attn_out[-1], ops_scratch)
-            # op index 6 (o_proj_local, the per-rank o_proj matmul PRE all-reduce)
-            # is INTENTIONALLY left UNMEASURED: the extra F.linear GEMM per global
-            # layer is the heaviest in-graph op and is what shifted the CUDA-graph
-            # pool and SUPPRESSED B2 in iter-75. The matmul-vs-all-reduce question
-            # is answered instead from the CROSS-RANK finiteness of attn_kernel
-            # (op 5, this rank's pre-o_proj input) vs o_proj_out (op 7, post
-            # all-reduce) in FP_OPS_XRANK: attn_kernel finite on every rank while
-            # o_proj_out is non-finite implicates the TP all-reduce collective (or
-            # a remote rank's nan it summed), not this rank's kernel.
         out = self.o_proj(attn_out)
-        if ops_fp is not None:
-            _ink_fp_stat(ops_fp[7], out[-1], ops_scratch)  # o_proj_out (post all-reduce)
         if return_conv_state:
             return out, new_kv_state
         return out
@@ -2165,13 +1580,11 @@ class InklingMoE(nn.Module):
         # experts stay replicated and are added AFTER this reduce (full + full),
         # so they are not double-counted.
         #
-        # NOTE (iter29): an fp32 routed partial + fp32 all-reduce (reduce_results=
-        # False + output_dtype=fp32) was TESTED and REVERTED -- it did NOT fix the
-        # TP=4 garbage. The TP-localizer showed the seed (layer3 isolated cos
-        # 0.9977) is unchanged by fp32 reduction, so it is NOT bf16 all-reduce
-        # cancellation; the sharded NVFP4 routed GEMM itself diverges ~0.3% from
-        # the full TP=1 GEMM (magnitude-dependent, in the FP4 weight/scale
-        # sharding, not the reduce). See progress.yaml iter29.
+        # An fp32 routed partial + fp32 all-reduce (reduce_results=False +
+        # output_dtype=fp32) does not change this: the sharded NVFP4 routed GEMM
+        # itself diverges ~0.3% from the full TP=1 GEMM (magnitude-dependent, in
+        # the FP4 weight/scale sharding, not the reduce), so bf16 all-reduce
+        # cancellation is not the cause.
         # Select the routed-expert MoE backend. Default: whatever
         # ``model_config.moe_backend`` resolves to (CUTLASS for this checkpoint).
         # When ``INKLING_MOE_BACKEND=TRTLLM`` route the NVFP4 routed experts
@@ -2193,18 +1606,11 @@ class InklingMoE(nn.Module):
             override_quant_config=experts_quant_config,
             layer_idx=layer_idx,
         )
-        # Proof marker: log the RESOLVED routed-expert backend so runs can confirm
-        # the trtllm-gen (blockScaleMoe) kernel is actually selected under
-        # INKLING_MOE_BACKEND=TRTLLM rather than silently falling back to CUTLASS.
-        # ``create_moe`` returns a ``ConfigurableMoE`` wrapper whose ``.backend`` is
-        # the resolved backend instance (``TRTLLMGenFusedMoE`` for the NVFP4 layers
-        # 3..65, ``CutlassFusedMoE`` for the bf16 layer-2), so the wrapper class
-        # name alone does NOT reveal the backend -- introspect ``.backend`` for the
-        # true ``backend_cls``. NOTE: the TRT-LLM ``logger`` appends the args
-        # instead of %-interpolating (a ``"...%s..."`` call prints the literal
-        # format string with the values dumped at the end -- unreadable AND
-        # ungreppable, which is why the iter65 TGMOE_BACKEND grep matched 0 lines),
-        # so pre-format with an f-string.
+        # Log the resolved routed-expert backend (introspect ``.backend`` -- the
+        # ConfigurableMoE wrapper class name does not reveal it) so a run can
+        # confirm the trtllm-gen kernel is selected under INKLING_MOE_BACKEND=TRTLLM
+        # rather than silently falling back to CUTLASS. Pre-format with an
+        # f-string: the TRT-LLM logger appends args instead of %-interpolating.
         backend_cls = type(getattr(self.experts, "backend", self.experts)).__name__
         logger.info(
             f"INKLING_MOE_SELECT layer={layer_idx} "
@@ -2289,21 +1695,10 @@ class InklingDecoderLayer(nn.Module):
         *,
         conv_state: Optional[InklingConvState] = None,
         conv_rt: Optional[InklingConvRuntime] = None,
-        dump_sink: Optional[dict] = None,
-        diverge_sink: Optional[dict] = None,
-        ops_fp: Optional[torch.Tensor] = None,
-        ops_scratch: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Pre-norm attention + MLP, each followed by a short-conv (internal
         residual), then the residual add.
-
-        ``dump_sink`` (env-gated localizer, runtime pool path only): when a dict
-        is passed, the layer stashes its two sub-block intermediates -- the
-        post-attention residual ``h_attn`` (isolates the attention TP transform)
-        and the pure MLP/MoE transform output ``moe_out`` (pre-sconv, pre-residual;
-        isolates the routed/shared expert TP transform when replayed on this SAME
-        ``h_attn``). Zero cost when ``None``.
 
         Three short-conv modes, by argument:
 
@@ -2320,158 +1715,23 @@ class InklingDecoderLayer(nn.Module):
         """
         if conv_rt is not None:
             # --- Runtime state-pool path (prefill-seed / decode / mixed). ---
-            # Divergence localizer: read the carried short-conv pool state at the
-            # generation slots BEFORE this step updates it. For a batch of
-            # identical requests these rows must be bit-identical; a nonzero diff
-            # here means the per-slot state carried from a prior step already
-            # diverged (a genuine state bug), vs a stateless op introducing the
-            # divergence THIS step (non-determinism / divergent KV read).
-            if diverge_sink is not None and conv_rt.gen_indices is not None:
-                gi = conv_rt.gen_indices
-                pre_state = (
-                    _ink_rowdiff(conv_state.k[gi]),
-                    _ink_rowdiff(conv_state.v[gi]),
-                    _ink_rowdiff(conv_state.attn[gi]),
-                    _ink_rowdiff(conv_state.mlp[gi]),
-                )
-            else:
-                pre_state = (0.0, 0.0, 0.0, 0.0)
-
             residual = hidden_states
             h = self.attn_norm(hidden_states)
-            # feedback #17 op-level B2 bisection (env INKLING_FP_OPS, zero cost
-            # off): capture-safe element-wise finiteness stats of this layer's
-            # intra-layer op boundaries recorded INTO the decode graph, so the
-            # analyzer names the FIRST op inside the first divergent layer that
-            # goes non-finite under CUDA graph. ``self.attn`` writes its OWN
-            # internals (indices 1..7: attn_q/k/v, attn_rel, attn_kernel,
-            # o_proj_local, o_proj_out) so the bisection walks INTO the
-            # global-attention kernel / paged-KV read / TP all-reduce; this layer
-            # writes the boundaries around it. Order MUST match _INK_FP_OP_NAMES /
-            # inkling_fp_ops_analyze.py.
-            if ops_fp is not None:
-                _ink_fp_stat(ops_fp[0], h[-1], ops_scratch)  # attn_norm
             h_core = self.attn(
                 position_ids,
                 h,
                 attn_metadata,
                 conv_pool_kv=(conv_state.k, conv_state.v),
                 conv_rt=conv_rt,
-                ops_fp=ops_fp,
-                ops_scratch=ops_scratch,
                 **kwargs,
             )
-            # (h_core == o_proj_out, written as ops_fp[7] inside self.attn.)
             h_asc = _apply_sconv(self.attn_sconv, h_core, conv_state.attn, conv_rt)
-            if ops_fp is not None:
-                _ink_fp_stat(ops_fp[8], h_asc[-1], ops_scratch)  # attn_sconv
             h = residual + h_asc
-            if ops_fp is not None:
-                _ink_fp_stat(ops_fp[9], h[-1], ops_scratch)  # h_attn
-
             residual = h
             hn = self.mlp_norm(h)
             hmlp = self.mlp(hn)
-            # ops 10/11/12 (mlp_norm/moe_out/mlp_sconv) are INTENTIONALLY not
-            # fingerprinted here: B2 is attention-born (first divergent layer is a
-            # global-ATTENTION layer) and the per-layer ``_ink_fp`` residual buffer
-            # already captures the post-mlp stream, so skipping the mlp-side probes
-            # trims in-graph reductions (the iter-75 Heisenbug lever) at no cost to
-            # the attention op-localization verdict.
-            if dump_sink is not None:
-                # Sub-block localizer split: the post-attention residual isolates
-                # the attention TP transform; the pure MLP/MoE transform output
-                # (pre-sconv, pre-residual) isolates the routed/shared expert TP
-                # transform when the reference replays it on this SAME h_attn.
-                # ``_answer_pos_only`` (feedback #4 all-66-layer module dump) slices
-                # the last (answer) token on-device before the host copy so the dump
-                # stays O(2*H)/layer instead of O(2*T*H); default path unchanged.
-                _ap = bool(dump_sink.get("_answer_pos_only"))
-
-                def _pick(_t):
-                    return (_t[-1] if _ap else _t).detach().float().cpu()
-
-                dump_sink["h_attn"] = _pick(h)
-                dump_sink["moe_out"] = _pick(hmlp)
-                # feedback #7 finer-grain L0-L4 split: capture the intra-layer
-                # module boundaries so an L3 divergence can be attributed to the
-                # router vs attention-core vs the short-convs. The DECISIVE point is
-                # the MoE gate -- router logits + top-k expert ids + post-renorm
-                # routing weights -- which separates "router top-k chaos" from an
-                # "expert GEMM/quant" bug. Recomputed from this layer's gate on the
-                # SAME ``hn`` (mlp_norm output) the fused MoE consumed: ``self.mlp.
-                # gate`` + ``inkling_joint_renorm`` ARE the exact routing math the
-                # CUTLASS path runs, and the trtllm-gen kernel consumes the SAME
-                # ``router_logits``, so this recompute is a faithful,
-                # backend-independent readout of the intended top-k. Zero cost when
-                # ``_finegrain`` is unset.
-                if dump_sink.get("_finegrain"):
-                    dump_sink["attn_core"] = _pick(h_core)
-                    dump_sink["attn_sconv"] = _pick(h_asc)
-                    dump_sink["mlp_norm"] = _pick(hn)
-                    if isinstance(self.mlp, InklingMoE):
-                        _rl = self.mlp.gate(hn)  # [T, num_routed+n_shared] fp32
-                        _rw, _ti, _ = inkling_joint_renorm(
-                            _rl,
-                            gate_bias=self.mlp.gate.bias,
-                            global_scale=self.mlp.gate.global_scale,
-                            route_scale=self.mlp.route_scale,
-                            top_k=self.mlp.top_k,
-                            num_routed=self.mlp.num_routed,
-                            n_shared=self.mlp.n_shared,
-                        )
-                        dump_sink["router_logits"] = _pick(_rl)
-                        dump_sink["topk_idx"] = (
-                            (_ti[-1] if _ap else _ti).detach().to(torch.int32).cpu()
-                        )
-                        dump_sink["routed_w"] = _pick(_rw)
             hm = _apply_sconv(self.mlp_sconv, hmlp, conv_state.mlp, conv_rt)
-            # op 12 (mlp_sconv) intentionally not fingerprinted (see the mlp-side
-            # note above -- attention-born B2, residual buffer covers downstream).
-            if dump_sink is not None and dump_sink.get("_finegrain"):
-                # point 6: mlp short-conv output (computed after the dump block).
-                dump_sink["mlp_sconv"] = (
-                    (hm[-1] if dump_sink.get("_answer_pos_only") else hm).detach().float().cpu()
-                )
             out = residual + hm
-            if diverge_sink is not None:
-                # Per-sub-op row divergence (identical requests -> must be 0.0).
-                # The sub-ops run in this order, so the first nonzero pins the
-                # origin: attn_core (paged/prefill attention + k/v sconv) ->
-                # attn_sconv -> mlp_core (dense/MoE) -> mlp_sconv. ``_ctx`` is set
-                # for a context/prefill forward of identical prompts (compare
-                # per-request spans); None for decode (compare per-row).
-                _ctx = diverge_sink.get("_ctx")
-                diverge_sink[self.layer_idx] = {
-                    "d_in": _ink_rowdiff(hidden_states, _ctx),
-                    "attn_core": _ink_rowdiff(h_core, _ctx),
-                    "attn_sconv": _ink_rowdiff(h_asc, _ctx),
-                    "mlp_core": _ink_rowdiff(hmlp, _ctx),
-                    "mlp_sconv": _ink_rowdiff(hm, _ctx),
-                    "d_out": _ink_rowdiff(out, _ctx),
-                    "pre_state": pre_state,
-                }
-            # Prefill-residual confirmer (env INKLING_PREFILL_RERUN): the 4
-            # identical prompts prefill as SEPARATE num_contexts=1 forwards, so
-            # the batched-span localizer can't see the residual -- it is run-to-run
-            # non-determinism in a single prefill. self.mlp is a pure function of
-            # its input, so rerun it on the SAME hn and compare: a nonzero diff
-            # pins the context-phase MoE (layers >=2) as the non-deterministic op,
-            # while the dense MLP (layers 0/1) must stay 0.0. Zero cost when unset.
-            import os as _os_rr
-
-            if (
-                _os_rr.environ.get("INKLING_PREFILL_RERUN")
-                and getattr(conv_rt, "num_ctx_tokens", 0) > 0
-                and conv_rt.gen_indices is None
-                and self.layer_idx in (0, 1, 2, 3, 4, 5)
-            ):
-                _hmlp2 = self.mlp(hn)
-                _d = (hmlp.detach().float() - _hmlp2.detach().float()).abs().max().item()
-                print(
-                    "INKLING_MOE_RERUN layer=%d ntok=%d d=%.3e" % (self.layer_idx, hn.shape[0], _d),
-                    flush=True,
-                )
             return out
 
         if conv_state is None:
@@ -2538,65 +1798,6 @@ class InklingModel(DecoderModel):
         self.norm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
-        # --- B2 CUDA-graph decode localizer (env INKLING_FP, zero cost off) ---
-        # Capture-SAFE per-layer decode fingerprint: a persistent, stable-pointer
-        # GPU buffer [num_layers+1, hidden_size] holding the last generation row's
-        # residual-stream hidden state after each decoder layer (and the final
-        # norm). The per-layer write is a pure device->device ``copy_`` recorded
-        # INTO the captured decode graph, so it re-runs every replay -- unlike the
-        # existing ``dump_sink``/``diverge_sink`` localizers, which ``.cpu()``
-        # (a D2H copy illegal under CUDA-graph capture) and therefore only ever
-        # saw the EAGER path. The buffer is allocated EAGERLY (pre-capture) by
-        # ``InklingForCausalLM.prepare_inkling_attn_decode`` and its contents are
-        # read out eagerly there too (see that method). ``None`` => feature off.
-        self._ink_fp: Optional[torch.Tensor] = None
-        self._ink_fp_ops: Optional[torch.Tensor] = None
-        # iter-79: pre-allocated fp32 scratch for the ALLOCATION-FREE op
-        # fingerprint (``_ink_fp_stat``), so the per-op probe never allocates a
-        # numel-sized temporary inside the captured decode graph.
-        self._ink_fp_ops_scratch: Optional[torch.Tensor] = None
-        self._ink_fp_step = 0
-        self._ink_fp_prev_decode = False
-        # Op-probe layer cap (Heisenbug safety knob): fingerprint global-attention
-        # layers with index <= this. Default unlimited (all 11 globals). Set
-        # INKLING_FP_OPS_MAXLAYER small (e.g. 17 => globals 5/11/17) to shrink the
-        # in-graph op count when confirming B2 still reproduces under the probe --
-        # the all-layer ``_ink_fp`` residual finds the true onset layer regardless.
-        self._ink_fp_ops_maxlayer = 10_000
-
-    def _ensure_fp_buffer(self, device) -> None:
-        """Allocate the capture-safe decode-fingerprint buffer once, EAGERLY,
-        before any CUDA-graph capture (a realloc under capture would strand the
-        graph's aliased pointer). ``[num_layers+1, hidden_size]`` fp32; the +1 row
-        holds the final-norm output. Called from ``prepare_inkling_attn_decode``
-        when ``INKLING_FP`` is set."""
-        if self._ink_fp is not None:
-            return
-        import os
-
-        h = self.norm.weight.shape[0]
-        self._ink_fp = torch.zeros(len(self.layers) + 1, h, dtype=torch.float32, device=device)
-        # feedback #17 op-level B2 bisection: per-layer intra-layer op boundaries
-        # (N_INK_FP_OPS=13, walking attn_norm -> QK(q,k,v,rel) ->
-        # softmax/PV/KV-page(attn_kernel) -> out-proj(o_proj_local) ->
-        # TP all-reduce(o_proj_out) -> sconv -> downstream) as capture-safe
-        # element-wise stats [nonfinite_count, max_abs, l2, numel], so the analyzer
-        # names the FIRST op inside the first divergent layer that goes non-finite
-        # under CUDA graph -- even for the non-hidden-width attention internals.
-        # Allocated EAGERLY (pre-capture) like _ink_fp. Zero cost unless
-        # INKLING_FP_OPS is set.
-        if os.environ.get("INKLING_FP_OPS"):
-            self._ink_fp_ops = torch.zeros(
-                len(self.layers), N_INK_FP_OPS, _INK_FP_STAT_W, dtype=torch.float32, device=device
-            )
-            self._ink_fp_ops_maxlayer = int(os.environ.get("INKLING_FP_OPS_MAXLAYER", "10000"))
-            # iter-79 ALLOCATION-FREE op fingerprint: a fp32 scratch sized well
-            # above the largest probed op numel (global rel_logits[-1] =
-            # local_heads*rel_extent <= 64*1024 at TP=1; hidden=6144; q<=8192).
-            # 1<<17 (512 KiB) gives >=8x margin at TP=4 and is allocated EAGERLY
-            # (pre-capture) like the buffers above, so ``_ink_fp_stat`` reuses it
-            # with copy_/abs_/amax and allocates nothing numel-sized in-graph.
-            self._ink_fp_ops_scratch = torch.zeros(1 << 17, dtype=torch.float32, device=device)
 
     def forward(
         self,
@@ -2622,222 +1823,23 @@ class InklingModel(DecoderModel):
         ``get_input_embeddings``) and scattered the RAW vision-tower rows in AFTER
         the norm, so the fused stream must NOT be re-normed here -- the vision rows
         carry the tower's own final norm and SGLang never pushes them through
-        ``embed_norm``. Re-norming the fused stream (the pre-fix behavior) sent the
-        image rows through an extra RMSNorm SGLang omits, corrupting them so the
-        decoder could not read the image (the "image not visible" hallucination
-        behind the MMMU Accounting gap). Text-only and focused-replay callers pass
-        raw ``inputs_embeds`` and keep the norm (default ``False``)."""
+        ``embed_norm``. Re-norming the fused stream would push the image rows
+        through an extra RMSNorm SGLang omits, corrupting them so the decoder
+        could not read the image. Text-only and focused-replay callers pass raw
+        ``inputs_embeds`` and keep the norm (default ``False``)."""
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds if inputs_embeds_prenormed else self.embed_norm(inputs_embeds)
-        # Debug-only: env-gated per-layer PREFILL activation dump, to localize the
-        # full-model TP=4 vs TP=1 divergence (the focused replays are all TP=1).
-        # Zero cost when INKLING_DUMP_PREFILL is unset. Dumps once, on the first
-        # context forward, one file per rank (all-reduced hidden is identical
-        # across ranks, so the comparison reads rank 0).
-        import os as _os
-
-        _dump_path = _os.environ.get("INKLING_DUMP_PREFILL")
-        # Only the real short prompt, not the ~max_num_tokens KV-cache estimation
-        # prefill: gate on a context-token count window and overwrite (the last
-        # matching prefill wins). Default window (1..64) preserves the original
-        # short-prompt TP-divergence localizer behavior. INKLING_DUMP_MINTOK /
-        # INKLING_DUMP_MAXTOK widen it for the per-layer TRT-vs-SGLang residual
-        # localizer (set both to the exact prompt token count to gate precisely and
-        # skip the warmup prefill); INKLING_DUMP_ALLLAYERS=1 records every decoder
-        # layer's residual stream instead of just the first eight.
-        _dump_min = int(_os.environ.get("INKLING_DUMP_MINTOK", "1"))
-        _dump_max = int(_os.environ.get("INKLING_DUMP_MAXTOK", "64"))
-        _dump_all = _os.environ.get("INKLING_DUMP_ALLLAYERS") == "1"
-        # feedback #4 Stage B: in all-layers mode ALSO capture the per-layer module
-        # split -- the post-attention residual ``h_attn`` (attention kernel) and the
-        # pure MLP/MoE transform ``moe_out`` (routed/shared-expert kernel) -- for
-        # EVERY one of the 66 layers, answer-position only. This is what cleanly
-        # separates an "attention kernel" divergence from a "MoE kernel" divergence
-        # against the SGLang-triton reference (the raw residual stream carries the
-        # pre/post-sconv convention offset that fakes a sharp drop). Zero cost unless
-        # both INKLING_DUMP_ALLLAYERS=1 and INKLING_DUMP_MODULES=1 are set.
-        _dump_modules = _os.environ.get("INKLING_DUMP_MODULES") == "1"
-        # feedback #7 finer-grain L0-L4 mode: on top of the feedback-#4 module dump,
-        # capture the intra-layer boundaries (attn_core, attn_sconv, mlp_norm,
-        # moe_out, mlp_sconv) plus the MoE gate (router_logits, top-k ids, routing
-        # weights) for layers 0..INKLING_DUMP_MAXLAYER only, to split the L3 MoE
-        # jump into router-chaos vs expert-GEMM. Zero cost unless _finegrain is set.
-        _dump_finegrain = _os.environ.get("INKLING_DUMP_FINEGRAIN") == "1"
-        _dump_maxlayer = int(_os.environ.get("INKLING_DUMP_MAXLAYER", "999"))
-        _ctx_tok = (
-            int(attn_metadata.seq_lens[: attn_metadata.num_contexts].sum())
-            if attn_metadata.num_contexts > 0
-            else 0
-        )
-        _do_dump = bool(_dump_path) and _dump_min <= _ctx_tok <= _dump_max
-        _rec = None
-        if _do_dump:
-            try:
-                _rank = int(self.model_config.mapping.tp_rank)
-            except Exception:
-                _rank = 0
-            _rec = {
-                "rank": _rank,
-                "input_ids": (input_ids.detach().cpu() if input_ids is not None else None),
-                "position_ids": (position_ids.detach().cpu() if position_ids is not None else None),
-                "num_contexts": int(attn_metadata.num_contexts),
-                "seq_lens": attn_metadata.seq_lens.detach().cpu(),
-                "inputs_embeds": inputs_embeds.detach().float().cpu(),
-                "embed_norm": hidden_states.detach().float().cpu(),
-                "layers": {},
-            }
-        # Batched-decode divergence localizer (env-gated). Reset the per-episode
-        # step counter on any context/prefill forward; probe pure-generation
-        # forwards of a batch (>1 row) on the runtime state-pool path (decode),
-        # AND context/prefill forwards of >=2 IDENTICAL prompts (residual).
-        _dv_on = _ink_diverge_on()
-        if _dv_on and attn_metadata.num_contexts > 0:
-            _INK_DIVERGE["step"] = 0
-            _INK_DIVERGE["reported"] = False
-        _dv = (
-            _dv_on
-            and attn_metadata.num_contexts == 0
-            and hidden_states.shape[0] > 1
-            and conv_rt is not None
-        )
-        # Prefill residual localizer: a PURE context forward of >=2 identical
-        # prompts of equal length. The decode localizer cannot see a divergence
-        # seeded here (it only fires on pure-gen forwards); this compares each
-        # request's whole prefill span to request 0's.
-        _pf = None
-        if _dv_on and attn_metadata.num_contexts >= 2 and conv_rt is not None:
-            _slens = attn_metadata.seq_lens.tolist()
-            _nc = attn_metadata.num_contexts
-            _clens = _slens[:_nc]
-            _L = _clens[0]
-            _ctok = sum(_clens)
-            if (
-                _L > 0
-                and all(x == _L for x in _clens)
-                and hidden_states.shape[0] == _ctok
-                and input_ids is not None
-                and input_ids.shape[0] >= _ctok
-            ):
-                _ii = input_ids[:_ctok].reshape(_nc, _L)
-                if bool((_ii == _ii[0:1]).all()):
-                    _pf = (_nc, _L)
-        _dsink = {} if _dv else None
-        _pfsink = {"_ctx": _pf} if _pf else None
-        _active_sink = _dsink if _dv else _pfsink
-        if _dv:
-            _INK_DIVERGE["step"] += 1
-        # B2 localizer: fingerprint pure-generation (decode) forwards only. The
-        # copy_ ops below are recorded into the captured decode graph and re-run
-        # on every replay (num_contexts is 0 both at capture and replay for the
-        # decode graph), so the buffer holds the LAST replay's per-layer decode
-        # output -- read out eagerly in prepare_inkling_attn_decode.
-        _fp_on = (
-            self._ink_fp is not None
-            and attn_metadata.num_contexts == 0
-            and hidden_states.shape[0] >= 1
-        )
         for i, layer in enumerate(self.layers):
             layer_state = conv_cache.layer_state(i) if conv_cache is not None else None
-            # Sublayer detail (h_attn/moe_out): full-position for the original
-            # short-prompt mode (i<8), OR answer-position-only for EVERY layer in the
-            # feedback #4 all-layers module-split mode. Plain all-layers mode keeps
-            # just the answer-position residual to bound the dump to ~66*H floats.
-            if _do_dump and _dump_all and _dump_modules:
-                if _dump_finegrain:
-                    # feedback #7: intra-layer boundaries + gate for L0..maxlayer
-                    # only; layers beyond maxlayer keep just the residual stream.
-                    _sink = (
-                        {"_answer_pos_only": True, "_finegrain": True}
-                        if i <= _dump_maxlayer
-                        else None
-                    )
-                else:
-                    _sink = {"_answer_pos_only": True}
-            elif _do_dump and not _dump_all and i < 8:
-                _sink = {}
-            else:
-                _sink = None
             hidden_states = layer(
                 position_ids,
                 hidden_states,
                 attn_metadata,
                 conv_state=layer_state,
                 conv_rt=conv_rt,
-                dump_sink=_sink,
-                diverge_sink=_active_sink,
-                ops_fp=(
-                    self._ink_fp_ops[i]
-                    if (
-                        _fp_on
-                        and self._ink_fp_ops is not None
-                        and not layer.attn.is_local
-                        and i <= self._ink_fp_ops_maxlayer
-                    )
-                    else None
-                ),
-                ops_scratch=self._ink_fp_ops_scratch,
             )
-            if _fp_on:
-                # Last generation row's residual after layer i (device->device,
-                # captured -> replays). fp32 cast is a transient graph-pool alloc.
-                self._ink_fp[i].copy_(hidden_states[-1].to(torch.float32))
-            if _do_dump and (_dump_all or i < 8):
-                # residual stream after layer i (non-fused: hidden_states IS the
-                # stream). All-layers mode stores the answer-position (last) token
-                # only, matching the SGLang forward-hook's rs[-1] capture.
-                # feedback #21.1c (Section D): INKLING_DUMP_FULLRESID=1 stores the FULL
-                # residual (all positions) per layer so the analyzer can slice the
-                # per-layer decoder STATE at the vision positions (Q1 first/Q2 mid/Q3
-                # last vision row + Q4 first text row). Default-off; use only on small
-                # items (full 66-layer per-position is large for big-patch images).
-                _save_full = (not _dump_all) or _os.environ.get("INKLING_DUMP_FULLRESID") == "1"
-                _rec["layers"][i] = (
-                    (hidden_states if _save_full else hidden_states[-1]).detach().float().cpu()
-                )
-                if _sink:
-                    _rec.setdefault("h_attn", {})[i] = _sink.get("h_attn")
-                    _rec.setdefault("moe_out", {})[i] = _sink.get("moe_out")
-                    if _sink.get("_finegrain"):
-                        # feedback #7 fine-grain points (present only for L0..
-                        # maxlayer; router_* only on MoE layers >= dense_mlp_idx).
-                        for _k in (
-                            "attn_core",
-                            "attn_sconv",
-                            "mlp_norm",
-                            "mlp_sconv",
-                            "router_logits",
-                            "topk_idx",
-                            "routed_w",
-                        ):
-                            _v = _sink.get(_k)
-                            if _v is not None:
-                                _rec.setdefault(_k, {})[i] = _v
-        out = self.norm(hidden_states)
-        if _fp_on:
-            self._ink_fp[len(self.layers)].copy_(out[-1].to(torch.float32))
-        if _dv or _pf:
-            try:
-                _dv_rank = int(self.model_config.mapping.tp_rank)
-            except Exception:
-                _dv_rank = 0
-            if _dv_rank == 0:
-                if _dv:
-                    _ink_report_divergence(len(self.layers), _dsink, inputs_embeds, out)
-                if _pf:
-                    _ink_report_prefill(len(self.layers), _pfsink, inputs_embeds, out, _pf)
-        if _do_dump:
-            _rec["final_norm"] = (out[-1] if _dump_all else out).detach().float().cpu()
-            import torch as _torch
-
-            # All-layers mode keys the file by context-token count so several
-            # teacher-forced prompts (distinct lengths) written under one fixed
-            # INKLING_DUMP_PREFILL base (set in the launcher env, seen by every TP
-            # worker) land in distinct files instead of overwriting each other.
-            _suffix = f".n{_ctx_tok}.rank{_rec['rank']}" if _dump_all else f".rank{_rec['rank']}"
-            _torch.save(_rec, f"{_dump_path}{_suffix}")
-            print(f"[inkling-dump] wrote prefill activations to {_dump_path}{_suffix}", flush=True)
-        return out
+        return self.norm(hidden_states)
 
 
 class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig]):
@@ -2861,7 +1863,7 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
         self._apply_allreduce_strategy()
 
     def _apply_allreduce_strategy(self) -> None:
-        """Keep Inkling's all-reduces off the NCCL_SYMMETRIC tactic (B2 defect).
+        """Keep Inkling's all-reduces off the NCCL_SYMMETRIC tactic.
 
         Under CUDA-graph capture a symmetric all-reduce corrupts the run when its
         send buffer is unregistered while its recv buffer is a registered NCCL
@@ -2919,74 +1921,6 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
         device = self.model.embed_tokens.weight.device
         for layer in self.model.layers:
             layer.attn._decode_meta.refresh(attn_metadata, device)
-        # feedback #18 no-probe B2 candidate ``sync_meta``: block until every
-        # layer's eager metadata H2D copy has landed before the captured/replayed
-        # decode forward reads it. Legal here (``prepare`` runs EAGERLY, outside any
-        # CUDA-graph capture); one device sync per decode step. Tests whether a
-        # captured/replayed read races the async seq_lens/page_table copy. No-op
-        # unless the toggle is selected.
-        if _b2_fix_active("sync_meta"):
-            torch.cuda.synchronize(device)
-        # --- B2 CUDA-graph decode localizer (env INKLING_FP, zero cost off) ---
-        # The captured decode forward runs no Python at replay, so we (1) allocate
-        # the capture-safe fingerprint buffer EAGERLY here (before capture) and
-        # (2) read out the PREVIOUS decode step's fingerprint HERE (eager) -- the
-        # buffer was filled by that step's graph replay's device->device copies.
-        # prepare(decode_k) dumps decode_{k-1}, one file per rank per step; the
-        # driver compares step 0 (first decode, whose INPUT token matches the
-        # cg=off run since prefill logits are identical) to pin the first layer
-        # where CUDA graph corrupts, plus cross-rank residual consistency.
-        import os
-
-        fp_path = os.environ.get("INKLING_FP")
-        if fp_path:
-            self.model._ensure_fp_buffer(device)
-            req_ids = getattr(attn_metadata, "request_ids", None)
-            num_ctx = int(getattr(attn_metadata, "num_contexts", 0) or 0)
-            num_gen = (len(req_ids) - num_ctx) if req_ids is not None else 0
-            if num_ctx > 0:
-                # A new episode's prefill (incl. the KV-estimation/warmup prefill):
-                # reset the per-episode step counter so the first REAL decode is
-                # step 0 and warmup dummy-decode fills before it are discarded.
-                self.model._ink_fp_step = 0
-                self.model._ink_fp_prev_decode = False
-            else:
-                if self.model._ink_fp_prev_decode:
-                    try:
-                        rank = int(self.model.model_config.mapping.tp_rank)
-                    except Exception:  # noqa: BLE001
-                        rank = 0
-                    step = self.model._ink_fp_step
-                    torch.save(
-                        self.model._ink_fp.detach().to("cpu"), f"{fp_path}.rank{rank}.step{step}"
-                    )
-                    # feedback #17 op-level stats dump. The [L,13,4] stats tensor
-                    # is tiny (~14 KB), so dump EVERY step (no MAXSTEP truncation):
-                    # the analyzer needs the full onset trace -- including steps
-                    # PAST a KV-page boundary -- to classify capture (nan from the
-                    # first replay, before any page boundary) vs replay-metadata
-                    # (nan onset AT a page-boundary-crossing step).
-                    if self.model._ink_fp_ops is not None:
-                        torch.save(
-                            self.model._ink_fp_ops.detach().to("cpu"),
-                            f"{fp_path}.ops.rank{rank}.step{step}",
-                        )
-                        # One-time page_size sidecar (rank 0, first dumped step):
-                        # the KV-cache page/token size, so the analyzer can place
-                        # each step's KV position relative to a page boundary for
-                        # the capture-vs-replay call. Best-effort; the verdict
-                        # degrades to pos-only if this is absent.
-                        if rank == 0 and step == 0:
-                            try:
-                                import json as _json
-
-                                _kv = attn_metadata.kv_cache_manager.get_buffers(0, kv_layout="HND")
-                                with open(f"{fp_path}.page_size.json", "w") as _pf:
-                                    _json.dump({"page_size": int(_kv.shape[3])}, _pf)
-                            except Exception:  # noqa: BLE001
-                                pass
-                    self.model._ink_fp_step += 1
-                self.model._ink_fp_prev_decode = num_gen > 0
 
     def forward(
         self,
@@ -3083,7 +2017,14 @@ def _encode_inkling_audio_embeds(
     InklingInputProcessor,
     model_type="inkling_mm_model",
     placeholder_metadata=MultimodalPlaceholderMetadata(
-        placeholder_map={"image": "<image>"},
+        # Image and audio are distinct registered modalities (``<image>`` -> one
+        # token per vision patch; ``<audio>`` -> one token per dMel frame, both
+        # expanded by InklingInputProcessor.assemble). Video has NO separate token
+        # or tower: a video is decoded to frames and each frame is served as an
+        # ordinary ``<image>`` (per-frame expansion via sample_video_frames), so
+        # it routes through the image modality, not a distinct ``<video>``
+        # placeholder. See the supported-models footnote.
+        placeholder_map={"image": "<image>", "audio": "<audio>"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.OPENAI,
     ),
@@ -3127,34 +2068,17 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         # ``kv_cache_hash_algo`` report, and the KV-cache-event hash algo -- no
         # longer report 'auto -> False' while the engine actually runs V2.
         #
-        # NOTE (iter59 tried, iter61 REVERTED, iter63 diagnosis corrected):
-        # a ``moe_config.disable_finalize_fusion=True`` default was added on the
-        # theory that the CUTLASS FUSED FC2+finalize kernel (non-deterministic for
-        # top-k > 2; Inkling routes top-6) drove the served nc>1 GSM8K `!!!!`/EMPTY
-        # collapse. Fused STAYS the default: disabling finalize fusion is a
-        # CORRECTNESS REGRESSION -- a single greedy chat ("What is 3+4?") collapses
-        # to a `!!!!` loop at num_concurrent=1 with unfused finalize (job 5489709
-        # ARM B, resolved_dff=True, bang_run=6), while FUSED answers `7` cleanly
-        # (ARM A). The unfused-finalize path has its OWN separate bug.
-        #
-        # BUT the nc>1 corruption IS the fused MoE combine's cross-row
-        # non-determinism -- NOT a phantom per-slot short-conv/KV state bug (this
-        # CORRECTS the iter61 note). Decisive evidence: job 5489709 ran the
-        # divergence localizer on a batch of 8 IDENTICAL decode rows with
-        # ``d_embed=0`` (identical inputs) and ``pre_state=0`` (identical carried
-        # conv state), and the fused path STILL forks first at ``L2/mlp_core`` --
-        # the first (bf16) MoE layer -- by ~3.1e-2 (~1 ULP at that activation
-        # scale), which the 64-layer residual stack amplifies ~200x to
-        # ``final_d=6.4`` in ONE step, flipping the greedy argmax. Layers 0/1
-        # (dense) and attention stay bit-identical, so the origin is the MoE
-        # combine, not short-conv/KV. The earlier nrows=4 ``d_embed~2.05`` is the
-        # amplified DOWNSTREAM state many steps later, not a prefill divergence. At
-        # nc=1 there is one row so no cross-row fork (correct); at nc>1 identical
-        # rows diverge and a large fraction go off-track -> served 0.60. SGLang
-        # runs flashinfer_trtllm_routed (deterministic combine) and holds 0.955 at
-        # nc=4, so the FIX DIRECTION is a deterministic MoE combine that KEEPS nc=1
-        # correct -- exactly the human "confirm CUTLASS-vs-flashinfer kernel"
-        # guidance; pursue a Python/config-level deterministic combine first.
+        # Keep the CUTLASS FUSED FC2+finalize kernel as the default: disabling
+        # finalize fusion is a correctness regression (a single greedy prompt
+        # collapses to a repeated-token loop at num_concurrent=1 with unfused
+        # finalize, while the fused path answers cleanly). The served nc>1
+        # corruption is the fused combine's cross-row non-determinism, not a
+        # per-slot short-conv/KV-state bug: identical decode rows fork first at
+        # the first (bf16) MoE layer by ~1 ULP, which the deep residual stack
+        # amplifies enough to flip the greedy argmax, while the dense layers and
+        # attention stay bit-identical. The deterministic-combine fix is the
+        # trtllm-gen backend (``INKLING_MOE_BACKEND=TRTLLM``), mirroring SGLang's
+        # flashinfer_trtllm_routed.
         return {
             "kv_cache_config": {"use_kv_cache_manager_v2": True},
         }
@@ -3289,13 +2213,6 @@ class InklingForConditionalGeneration(InklingForCausalLM):
                             mm_token_indices=mi,
                         )
                         inputs_embeds_prenormed = True
-                        # Priority-0 image-use probe (S3-C6 / feedback #3 P0-B/V4):
-                        # env-gated, default-off scatter accounting proving every
-                        # image placeholder position was filled by a tower row.
-                        if vision_probe_enabled():
-                            n_rows = int(sum(int(e.shape[0]) for e in mm_embeds))
-                            n_idx = int(mi.numel()) if mi is not None else 0
-                            emit_vision_scatter_probe(n_idx, n_rows)
                 elif aud_raw and not vis_raw:
                     # Audio-only fusion: identical structure to vision, swapping the
                     # tower rows and the audio placeholder positions. The audio rows
@@ -3385,10 +2302,9 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         return input_ids, out
 
     def load_weights(self, weights: dict, weight_mapper=None):
-        # Load the bf16 vision + audio towers first (Goals 1.4 / 6.1 fusion): the
-        # ``model.visual.*`` / ``model.audio.*`` keys the text loader intentionally
-        # drops (INKLING_DEFERRED_PREFIXES). Done before the text load so any
-        # post-load completeness check sees them populated.
+        # Load the bf16 vision + audio towers first: the ``model.visual.*`` /
+        # ``model.audio.*`` keys the text loader intentionally drops. Done before
+        # the text load so any post-load completeness check sees them populated.
         if self.visual is not None:
             visual_weights = {k: v for k, v in weights.items() if k.startswith("model.visual.")}
             self.visual.load_weights(visual_weights)

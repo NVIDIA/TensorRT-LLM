@@ -808,27 +808,29 @@ INK_EM = "<|end_message|>"
 INK_END = "<|content_model_end_sampling|>"
 
 
-@pytest.mark.parametrize(("text", "content", "reasoning"), [
-    # Canonical thinking-then-answer turn: only the content_text is visible.
-    (f"{INK_CH}3+4=7{INK_EM}{INK_MM}{INK_CT}The answer is 7{INK_EM}{INK_END}",
-     "The answer is 7", "3+4=7"),
-    # Answer-only (no thinking block).
-    (f"{INK_CT}42{INK_EM}", "42", ""),
-    # Thinking-only turn (looped / no answer emitted): visible content is EMPTY,
-    # NOT the reasoning text -- a truncated chain-of-thought must not be scored
-    # as the answer (matches SGLang InklingDetector routing everything to
-    # reasoning_text with empty normal_text).
-    (f"{INK_CH}reasoning only, no answer{INK_EM}{INK_END}",
-     "", "reasoning only, no answer"),
-    # Truncated mid-thinking (generation hit the token cap): still empty content.
-    (f"{INK_CH}looping 12 13 14", "", "looping 12 13 14"),
-    # No Inkling markers at all -> passthrough as visible content (non-Inkling /
-    # already-stripped output is untouched).
-    ("plain text no markers", "plain text no markers", ""),
-    # Multiple content_text blocks concatenate.
-    (f"{INK_CT}Step 1{INK_EM}{INK_MM}{INK_CT} Step 2{INK_EM}",
-     "Step 1 Step 2", ""),
-])
+@pytest.mark.parametrize(
+    ("text", "content", "reasoning"),
+    [
+        # Canonical thinking-then-answer turn: only the content_text is visible.
+        (f"{INK_CH}3+4=7{INK_EM}{INK_MM}{INK_CT}The answer is 7{INK_EM}{INK_END}",
+         "The answer is 7", "3+4=7"),
+        # Answer-only (no thinking block).
+        (f"{INK_CT}42{INK_EM}", "42", ""),
+        # Thinking-only turn (looped / no answer emitted): visible content is EMPTY,
+        # NOT the reasoning text -- a truncated chain-of-thought must not be scored
+        # as the answer (matches SGLang InklingDetector routing everything to
+        # reasoning_text with empty normal_text).
+        (f"{INK_CH}reasoning only, no answer{INK_EM}{INK_END}", "",
+         "reasoning only, no answer"),
+        # Truncated mid-thinking (generation hit the token cap): still empty content.
+        (f"{INK_CH}looping 12 13 14", "", "looping 12 13 14"),
+        # No Inkling markers at all -> passthrough as visible content (non-Inkling /
+        # already-stripped output is untouched).
+        ("plain text no markers", "plain text no markers", ""),
+        # Multiple content_text blocks concatenate.
+        (f"{INK_CT}Step 1{INK_EM}{INK_MM}{INK_CT} Step 2{INK_EM}",
+         "Step 1 Step 2", ""),
+    ])
 def test_inkling_reasoning_parser(text: str, content: str, reasoning: str):
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
     result = parser.parse(text)
@@ -850,7 +852,9 @@ def test_inkling_reasoning_parser_stream_across_deltas():
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
     # Split the <|content_text|> marker across two deltas to exercise the
     # partial-control holdback.
-    deltas = [f"{INK_CH}think a{INK_EM}{INK_MM}<|content_te", "xt|>ANS 5", INK_END]
+    deltas = [
+        f"{INK_CH}think a{INK_EM}{INK_MM}<|content_te", "xt|>ANS 5", INK_END
+    ]
     content = "".join(parser.parse_delta(d).content for d in deltas)
     content += parser.finish().content
     assert content == "ANS 5"
@@ -871,7 +875,8 @@ _INK_STREAM_CASES = [
     # tool-invocation block (routes to content, matching SGLang)
     f'{INK_CH}need a tool{INK_EM}{INK_MM}<|content_invoke_tool_json|>{{"name":"f"}}{INK_EM}{INK_END}',
     # separator-interleaved repetition (the pre-fix EOS-bug runtime shape)
-    f"{INK_CH}reason{INK_EM}" + f"{INK_MM}{INK_CT}Answer: A{INK_EM}{INK_END}" * 6,
+    f"{INK_CH}reason{INK_EM}" +
+    f"{INK_MM}{INK_CT}Answer: A{INK_EM}{INK_END}" * 6,
     # non-Inkling / already-stripped passthrough
     "plain answer without any markers",
 ]
@@ -909,8 +914,14 @@ def test_inkling_reasoning_parser_tool_and_repetition_segmentation():
     visible answers, with NO control tokens leaking into either channel."""
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
     r = parser.parse(
-        f'{INK_CH}need tool{INK_EM}{INK_MM}<|content_invoke_tool_json|>{{"n":1}}{INK_EM}{INK_END}')
+        f'{INK_CH}need tool{INK_EM}{INK_MM}<|content_invoke_tool_json|>{{"n":1}}{INK_EM}{INK_END}'
+    )
     assert r.content == '{"n":1}'
+    assert r.reasoning_content == "need tool"
+    r = parser.parse(
+        f'{INK_CH}need tool{INK_EM}{INK_MM}<|content_invoke_tool_text|>lookup{INK_EM}{INK_END}'
+    )
+    assert r.content == "lookup"
     assert r.reasoning_content == "need tool"
     rep = f"{INK_CH}reason{INK_EM}" + f"{INK_MM}{INK_CT}Answer: A{INK_EM}{INK_END}" * 6
     r = parser.parse(rep)
@@ -923,8 +934,21 @@ def test_inkling_reasoning_parser_end_tokens_split_across_deltas():
     """<|end_message|> and <|content_model_end_sampling|> split across delta
     boundaries must still close their block (partial-control holdback)."""
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
-    deltas = [f"{INK_CH}think{INK_EM}{INK_MM}{INK_CT}ANS<|end_mes",
-              "sage|><|content_model_end_", "sampling|>"]
+    deltas = [
+        f"{INK_CH}think{INK_EM}{INK_MM}{INK_CT}ANS<|end_mes",
+        "sage|><|content_model_end_", "sampling|>"
+    ]
     content = "".join(parser.parse_delta(d).content for d in deltas)
     content += parser.finish().content
     assert content == "ANS"
+
+
+def test_inkling_reasoning_parser_non_text_controls_close_content():
+    """Non-text control tokens close the visible channel instead of inheriting it."""
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+
+    r = parser.parse(
+        f"{INK_CT}Answer<|content_image|>not text{INK_EM}{INK_END}tail")
+
+    assert r.content == "Answer"
+    assert r.reasoning_content == ""

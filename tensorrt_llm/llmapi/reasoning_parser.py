@@ -653,14 +653,17 @@ _INKLING_MESSAGE_MODEL = "<|message_model|>"
 _INKLING_CONTENT_TEXT = "<|content_text|>"
 _INKLING_CONTENT_THINKING = "<|content_thinking|>"
 _INKLING_INVOKE_TOOL_JSON = "<|content_invoke_tool_json|>"
-_INKLING_END_TOKENS = frozenset({
-    "<|content_model_end_sampling|>",
-    "<|end_message|>",
-})
+_INKLING_INVOKE_TOOL_TEXT = "<|content_invoke_tool_text|>"
+_INKLING_INVOKE_TOOL = "<|content_invoke_tool|>"
 _INKLING_CONTENT_KINDS = {
     _INKLING_CONTENT_THINKING: "reasoning",
     _INKLING_CONTENT_TEXT: "content",
 }
+_INKLING_TOOL_CONTENT_TOKENS = frozenset({
+    _INKLING_INVOKE_TOOL_JSON,
+    _INKLING_INVOKE_TOOL_TEXT,
+    _INKLING_INVOKE_TOOL,
+})
 _INKLING_CONTROL_TOKENS = frozenset({
     "<|endoftext|>",
     "<|message_user|>",
@@ -677,12 +680,13 @@ _INKLING_CONTROL_TOKENS = frozenset({
     "<|end_message|>",
     "<|audio_end|>",
     _INKLING_INVOKE_TOOL_JSON,
-    "<|content_invoke_tool_text|>",
-    "<|content_invoke_tool|>",
+    _INKLING_INVOKE_TOOL_TEXT,
+    _INKLING_INVOKE_TOOL,
     "<|model_trigger_generation|>",
 })
 _INKLING_CONTROL_RE = re.compile("|".join(
-    re.escape(t) for t in sorted(_INKLING_CONTROL_TOKENS, key=len, reverse=True)))
+    re.escape(t)
+    for t in sorted(_INKLING_CONTROL_TOKENS, key=len, reverse=True)))
 _INKLING_MAX_CONTROL_LEN = max(len(t) for t in _INKLING_CONTROL_TOKENS)
 
 
@@ -730,13 +734,15 @@ class InklingReasoningParser(BaseReasoningParser):
             pos = m.end()
             if token == _INKLING_MESSAGE_MODEL:
                 self._kind = "header"
-            elif token == _INKLING_INVOKE_TOOL_JSON:
+            elif token in _INKLING_TOOL_CONTENT_TOKENS:
                 self._kind = "tool"
             elif token in _INKLING_CONTENT_KINDS:
                 self._kind = _INKLING_CONTENT_KINDS[token]
-            elif token in _INKLING_END_TOKENS:
-                self._kind = None
-            # Any other control token leaves the current kind unchanged.
+            else:
+                # End tokens, message headers, and non-text content markers are
+                # framing. They close the previous block and drop any text until a
+                # visible content or tool-content marker opens a new block.
+                self._kind = "header"
         self._emit(text[pos:], content, reasoning)
 
     def parse(self, text: str) -> ReasoningParserResult:

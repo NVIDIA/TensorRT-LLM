@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import io
 import math
-import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -441,8 +440,8 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
     ``get_dummy_mm_data_for_tokens()`` (``_torch/pyexecutor/_util.py``); those
     live on the dummy-inputs builder, not the base processor, so a processor
     that inherits only the base crashes ``trtllm-serve`` at startup with
-    ``AttributeError: ... has no attribute 'get_preferred_media_io_kwargs'``
-    (jobs 5597129/5597134). The builder's defaults are exactly right for
+    ``AttributeError: ... has no attribute 'get_preferred_media_io_kwargs'``.
+    The builder's defaults are exactly right for
     image-only Inkling: ``get_preferred_media_io_kwargs`` -> ``{}`` (no
     special media-IO decode format like Qwen's video ``np`` frames) and
     ``get_mm_max_tokens_per_item`` -> ``{}`` (empty demand -> the profiler's
@@ -506,7 +505,7 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
     @property
     def processor(self):
         # Inkling ships no HF AutoProcessor; expose the local image
-        # preprocessor so base helpers that probe ``self.processor`` work.
+        # preprocessor so base helpers that read ``self.processor`` work.
         return self._preprocessor
 
     @property
@@ -539,6 +538,37 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         6.1). Returned as int32 so the engine's
         ``torch.isin(input_ids, mm_token_ids)`` lookup matches both."""
         return torch.tensor([self.image_token_id, self.audio_token_id], dtype=torch.int32)
+
+    # ---- multimodal-hash prefix caching: explicitly unsupported -----------
+    # Inkling expands each <image> placeholder to one token per vision patch and
+    # each <audio> placeholder to one token per dMel frame -- a per-item count
+    # that comes from the preprocessor geometry, not a static HF
+    # ``_get_num_multimodal_tokens`` formula. The multimodal-hash prefix cache
+    # (``inputs.multimodal.find_mm_token_lengths``) needs that count up front and
+    # is not wired to the Inkling preprocessors, so refuse it LOUDLY and the SAME
+    # way for every modality instead of inheriting the base's opaque
+    # ``NotImplementedError`` (image/video, via ``get_num_multimodal_tokens``) /
+    # ``AttributeError`` (audio, method absent). ``process_prompt_maybe_hash``
+    # catches the raise, records ``multimodal_hashing_supported=False`` once, and
+    # serves every multimodal request through the uncached path -- so this
+    # disables only cross-request MM prefix reuse, never a request itself.
+    # Recorded as unsupported in docs/source/models/supported-models.md.
+    def _reject_mm_hash_cache(self, modality: str) -> None:
+        raise NotImplementedError(
+            f"InklingInputProcessor does not support multimodal-hash prefix "
+            f"caching ({modality}): the per-item token count is derived from the "
+            f"vision/audio preprocessor geometry and is not wired to "
+            f"get_num_multimodal_tokens. Multimodal requests still run, uncached."
+        )
+
+    def get_num_tokens_per_image(self, *, image=None, **kwargs) -> int:
+        self._reject_mm_hash_cache("image")
+
+    def get_num_tokens_per_audio(self, *, audio=None, **kwargs) -> int:
+        self._reject_mm_hash_cache("audio")
+
+    def get_num_tokens_per_video(self, *, video=None, **kwargs) -> int:
+        self._reject_mm_hash_cache("video")
 
     # ---- core (pure, testable) expansion + validation ---------------------
     def assemble(
@@ -857,128 +887,6 @@ class InklingVisionRMSNorm(nn.Module):
         return F.rms_norm(x, (self.hidden_size,), self.weight, self.variance_epsilon)
 
 
-# ===========================================================================
-# Priority-0 image-use probe (Stage-3 S3-C6 / human feedback #3 P0-B).
-#
-# ``INKLING_VISION_PROBE=1`` turns on env-gated, default-OFF stdout markers that
-# PROVE -- from INSIDE the module, not by inspecting the request dict -- that the
-# vision tower forward actually executed for a request and that its per-patch
-# rows were scattered into every image placeholder position. Human feedback #3
-# is explicit that "an assertion that merely inspects the input dict is NOT
-# acceptable, it must prove the tower ran". The accepted text/production path
-# never sets the env, so this is a zero-cost no-op there (the guard short-circuits
-# before any device sync). The MMMU deterministic bs=1 runner sets it so the
-# per-forward marker sequence lines up one-to-one with the scored items, and
-# ``p0_verify.py`` parses the tee'd ARM log to gate the P0-B image-use criterion.
-_VISION_FWD_CALLS = [0]  # monotonic tower-forward counter (per worker process)
-_VISION_SCATTER_CALLS = [0]  # monotonic fusion-scatter counter (per worker process)
-
-
-def vision_probe_enabled() -> bool:
-    return os.environ.get("INKLING_VISION_PROBE", "0") == "1"
-
-
-def _probe_rank() -> int:
-    for k in ("SLURM_PROCID", "RANK", "LOCAL_RANK"):
-        v = os.environ.get(k)
-        if v is not None and str(v).lstrip("-").isdigit():
-            return int(v)
-    return 0
-
-
-def emit_vision_tower_probe(in_patches: int, out: "torch.Tensor") -> None:
-    """Marker emitted from INSIDE ``InklingVisionModel.forward`` proving the tower
-    ran, with the input patch count, output row/dim shape, dtype/device, and a
-    finiteness check. ``out_rows`` must equal the item's ``num_patches`` (one
-    hMLP row per patch) -- the count evidence P0-B requires."""
-    n = _VISION_FWD_CALLS[0] = _VISION_FWD_CALLS[0] + 1
-    try:
-        finite = bool(torch.isfinite(out).all().item())
-        rows, dim = int(out.shape[0]), int(out.shape[-1])
-    except Exception as e:  # noqa: BLE001
-        print(
-            f"INKLING_VISION_FWD_TOWER rank={_probe_rank()} call={n} "
-            f"in_patches={int(in_patches)} ERROR={e!r}",
-            flush=True,
-        )
-        return
-    print(
-        f"INKLING_VISION_FWD_TOWER rank={_probe_rank()} call={n} "
-        f"in_patches={int(in_patches)} out_rows={rows} out_dim={dim} "
-        f"dtype={out.dtype} dev={out.device} finite={finite}",
-        flush=True,
-    )
-
-
-def emit_vision_scatter_probe(n_mm_idx: int, n_vision_rows: int) -> None:
-    """Marker emitted from INSIDE the multimodal fusion after
-    ``fuse_input_embeds`` proving every image placeholder position was filled by a
-    vision row: ``n_mm_idx`` (placeholder positions) must equal ``n_vision_rows``
-    (tower output rows). A mismatch is exactly the off-by-one / dropped-row scatter
-    bug feedback #3 V4 asks us to rule out."""
-    n = _VISION_SCATTER_CALLS[0] = _VISION_SCATTER_CALLS[0] + 1
-    match = int(n_mm_idx) == int(n_vision_rows)
-    print(
-        f"INKLING_VISION_FWD_SCATTER rank={_probe_rank()} call={n} "
-        f"n_mm_idx={int(n_mm_idx)} n_vision_rows={int(n_vision_rows)} "
-        f"match={match}",
-        flush=True,
-    )
-
-
-# ===========================================================================
-# Human feedback #21.1a -- LIVE production vision-tower INTERNALS dump (B1-B4).
-#
-# ``INKLING_VISION_DUMP=<base>`` turns on an env-gated, default-OFF tensor dump of
-# the tower interior (fold / linear_i / norm_i / final_norm / visual_out) from
-# INSIDE ``InklingVisionModel.forward`` during a LIVE TP=4 production run, so the
-# fb21 analyzer can compare the tower INTERNALS -- not just the tower output row
-# (C4) -- against the SGLang ``visual.vision_encoder.*`` forward-hook capture.
-# Sections A/B of the fb15 walk proved the two ports byte-identical only as
-# CPU_SOURCE_REPLAY (feedback #16); this makes the internals a LIVE_RUNTIME
-# comparison. The capture keys mirror the SGLang ``make_visual_hook`` capture
-# points EXACTLY (linear_0..3 = layers.linear_i out, norm_0..2 = layers.norm_i out,
-# final_norm = final_norm out, visual_out = tower output rows) so the analyzer
-# compares like with like. Each TP worker writes its own rank file; the tower is
-# replicated across ranks, so rank 0 carries the full interior. Default-off: the
-# accepted text/production path never sets the env, so this is a zero-cost no-op
-# there (the guard short-circuits before any clone/host-copy).
-_VISION_DUMP_CALLS = [0]  # monotonic tower-forward dump counter (per worker process)
-
-
-def vision_dump_base() -> "Optional[str]":
-    """Base path for the env-gated tower-internal tensor dump, or ``None`` when off."""
-    return os.environ.get("INKLING_VISION_DUMP") or None
-
-
-def emit_vision_tower_dump(base: str, caps: Dict[str, "torch.Tensor"], num_patches: int) -> None:
-    """Save the captured tower internals to ``<base>.call<n>.rank<r>.pt`` (feedback #21.1a).
-    Wrapped so a dump failure prints a marker but never breaks the production forward."""
-    try:
-        n = _VISION_DUMP_CALLS[0] = _VISION_DUMP_CALLS[0] + 1
-        r = _probe_rank()
-        path = f"{base}.call{n}.rank{r}.pt"
-        meta = {
-            k: {
-                "shape": list(v.shape),
-                "dtype": str(v.dtype),
-                "max_abs": float(v.abs().max()) if v.numel() else 0.0,
-            }
-            for k, v in caps.items()
-        }
-        torch.save(
-            {"num_patches": int(num_patches), "call": n, "rank": r, "internals": caps, "meta": meta},
-            path,
-        )
-        print(
-            f"INKLING_VISION_DUMP_SAVED rank={r} call={n} num_patches={int(num_patches)} "
-            f"keys={sorted(caps)} -> {path}",
-            flush=True,
-        )
-    except Exception as e:  # noqa: BLE001
-        print(f"INKLING_VISION_DUMP_ERROR rank={_probe_rank()} {e!r}", flush=True)
-
-
 class InklingVisionModel(nn.Module):
     """Inkling hMLP vision tower: ``vision_patches_bthwc`` -> one text-hidden row
     per patch (Goal 1.3). Reimplements HF ``InklingVisionModel`` / SGLang
@@ -1020,39 +928,18 @@ class InklingVisionModel(nn.Module):
         """``(num_patches, T, H, W, C)`` -> ``(num_patches, decoder_dmodel)``."""
         num_patches = vision_patches_bthwc.shape[0]
         x = vision_patches_bthwc
-        # feedback #21.1a: env-gated, default-OFF LIVE tower-internals capture. ``caps`` stays None
-        # (zero cost) unless INKLING_VISION_DUMP is set; the capture keys mirror the SGLang
-        # ``make_visual_hook`` points exactly so fb21 compares like with like.
-        _dump = vision_dump_base()
-        caps: Optional[Dict[str, torch.Tensor]] = {} if _dump else None
         for i, (start, end) in enumerate(zip(self.scales[:-1], self.scales[1:])):
             t_fold = end[0] // start[0]
             hw_fold = end[1] // start[1]
             if hw_fold > 1 or t_fold > 1:
                 x = fold_timespace_to_depth(x, t_fold, hw_fold)
-                if caps is not None:
-                    caps[f"fold_{i}"] = x.detach().float().cpu().clone()
             x = self.layers[f"linear_{i}"](x)
-            if caps is not None:
-                caps[f"linear_{i}"] = x.detach().float().cpu().clone()
             if i < self.n_layers - 1:
                 x = self.layers[f"norm_{i}"](x)
-                if caps is not None:
-                    caps[f"norm_{i}"] = x.detach().float().cpu().clone()
                 x = F.gelu(x)
-                if caps is not None:
-                    caps[f"gelu_{i}"] = x.detach().float().cpu().clone()
         if self.final_norm is not None:
             x = self.final_norm(x)
-            if caps is not None:
-                caps["final_norm"] = x.detach().float().cpu().clone()
-        out = x.reshape(num_patches, -1)
-        if caps is not None:
-            caps["visual_out"] = out.detach().float().cpu().clone()
-            emit_vision_tower_dump(_dump, caps, num_patches)
-        if vision_probe_enabled():
-            emit_vision_tower_probe(num_patches, out)
-        return out
+        return x.reshape(num_patches, -1)
 
     @torch.no_grad()
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:

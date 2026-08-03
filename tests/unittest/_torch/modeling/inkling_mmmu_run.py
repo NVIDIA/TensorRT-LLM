@@ -43,7 +43,7 @@ unreachable in-scope. Both markers always print so nothing is masked.
 
 Run: trtllm-llmapi-launch python tests/unittest/_torch/modeling/inkling_mmmu_run.py
 Env: INKLING_CHECKPOINT, INKLING_MMMU_REF (sglang_mmmu_ref.json), INKLING_MMMU_OUT,
-     INKLING_MMMU_N (default 6), INKLING_MMMU_MAXTOK (default 2560),
+     INKLING_MMMU_N (default 50), INKLING_MMMU_MAXTOK (default 2560),
      INKLING_MMMU_BS (default 1), INKLING_CUDA_GRAPH/INKLING_OVERLAP.
 """
 
@@ -70,7 +70,7 @@ OUT = os.environ.get(
     "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/kleinc/"
     "codes/agent-flow/workspace/inkling-advanced-bringup/results/trt_mmmu_run.json",
 )
-N_ITEMS = int(os.environ.get("INKLING_MMMU_N", "6"))
+N_ITEMS = int(os.environ.get("INKLING_MMMU_N", "50"))
 MAXTOK = int(os.environ.get("INKLING_MMMU_MAXTOK", "2560"))
 BS = int(os.environ.get("INKLING_MMMU_BS", "1"))
 CUDA_GRAPH = os.environ.get("INKLING_CUDA_GRAPH", "0") == "1"
@@ -204,14 +204,17 @@ def main() -> int:
     # requires a PER-ITEM image-use assertion -- every scored item must produce
     # nonzero image embeddings scattered into placeholder positions, and an item
     # that silently degrades to text-only must FAIL the run, not be scored.
-    recs = P.build_prompts(N_ITEMS, with_num_patches=True)
-    items_by_id = {it["id"]: it for it in R.load_fixed_items()}
+    # Draw from the 50-item vision-parity pool (Module 2 needs n_paired == 50);
+    # every id pairs against the cached SGLang pool. build_prompts and the
+    # scoring lookup MUST use the SAME resolved item list so ids line up.
+    parity_items = R.load_parity_items(N_ITEMS)
+    recs = P.build_prompts(N_ITEMS, with_num_patches=True, items=parity_items)
+    items_by_id = {it["id"]: it for it in parity_items}
     tok = AutoTokenizer.from_pretrained(CKPT, trust_remote_code=True)
     print(
         f"[mmmu] tp={TP} cuda_graph={CUDA_GRAPH} overlap={OVERLAP} bs={BS} "
         f"n_items={len(recs)} maxtok={MAXTOK} deterministic={DETERMINISTIC} "
         f"enable_autotuner={ENABLE_AUTOTUNER} "
-        f"vision_probe={os.environ.get('INKLING_VISION_PROBE', '0')} "
         f"dump_genids={int(DUMP_GENIDS)} "
         f"allreduce_autotune_disabled="
         f"{os.environ.get('TLLM_DISABLE_ALLREDUCE_AUTOTUNE', '0')}",

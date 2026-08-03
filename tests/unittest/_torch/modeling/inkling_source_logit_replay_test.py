@@ -53,11 +53,12 @@ CKPT = os.environ.get(
     "users/kleinc/hf_data/Inkling-NVFP4-full")
 REF = os.environ.get(
     "INKLING_SGLANG_REF",
-    "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_trtllm/users/kleinc/"
-    "codes/agent-flow/workspace/inkling-bringup/results/sglang_ref_logit_replay.json")
+    "/lustre/fsw/coreai_comparch_trtllm/kleinc/codes/agent-flow/workspace/"
+    "inkling-bringup/results/sglang_ref_logit_replay.json")
 
 CUDA_GRAPH = os.environ.get("INKLING_CUDA_GRAPH", "0") == "1"
 OVERLAP = os.environ.get("INKLING_OVERLAP", "1" if CUDA_GRAPH else "0") == "1"
+TP = int(os.environ.get("INKLING_TP", "4"))
 CONT = int(os.environ.get("INKLING_SLR_CONT", "8"))  # short continuation tokens
 UNPADDED_VOCAB = int(os.environ.get("INKLING_UNPADDED_VOCAB", "200058"))
 # Catastrophic-divergence guard on the raw-logit cosine. SGLang (flashinfer fp4 +
@@ -100,20 +101,25 @@ def main() -> int:
     ref = [r for r in ref if r.get("input_ids") and r.get("pos_top")]
     assert ref, f"no usable SGLang references in {REF}"
     tok = AutoTokenizer.from_pretrained(CKPT, trust_remote_code=True)
-    print(f"[slr] cuda_graph={CUDA_GRAPH} overlap={OVERLAP} ckpt={CKPT} "
+    print(f"[slr] tp={TP} cuda_graph={CUDA_GRAPH} overlap={OVERLAP} ckpt={CKPT} "
           f"n_prompts={len(ref)} cont={CONT} ref={REF}", flush=True)
 
     moe_backend = os.environ.get("INKLING_MOE_BACKEND", "CUTLASS")
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+    # KV-cache free-memory fraction is env-tunable so the gate fits nodes with
+    # less headroom (the NVFP4 weights already fill most of each device); the
+    # small short-sequence run needs little KV cache, so lowering it does not
+    # change the per-position logits the gate checks.
+    kv_frac = float(os.environ.get("INKLING_KV_FRAC", "0.75"))
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=kv_frac,
                                     dtype="auto", enable_block_reuse=False)
     llm = LLM(
         CKPT,
-        tensor_parallel_size=4,
+        tensor_parallel_size=TP,
         trust_remote_code=True,
         attn_backend="TRTLLM",
         moe_config=MoeConfig(backend=moe_backend),
         kv_cache_config=kv_cache_config,
-        gather_generation_logits=True,  # TP=4: gather full-vocab logits to rank 0
+        gather_generation_logits=True,  # TP: gather full-vocab logits to rank 0
         cuda_graph_config=CudaGraphConfig() if CUDA_GRAPH else None,
         disable_overlap_scheduler=not OVERLAP,
         max_seq_len=2048,
@@ -262,6 +268,61 @@ def main() -> int:
               f"idx {inc}; mean_cos_raw={mean_cos_raw:.6f} (gate={COS_GATE}) "
               f"min_cos_raw={min_cos_raw:.6f} (floor={MIN_COS_FLOOR})", flush=True)
     return 0 if ok else 1
+
+
+def _launch_world_size():
+    """Number of ranks this process was launched with (1 for a plain single-task
+    pytest / srun --ntasks=1)."""
+    for k in ("SLURM_NTASKS", "OMPI_COMM_WORLD_SIZE", "WORLD_SIZE", "PMI_SIZE"):
+        v = os.environ.get(k)
+        if v and v.isdigit():
+            return int(v)
+    return 1
+
+
+def _slr_skip_reason():
+    """Why this GPU parity gate cannot run in the current environment (``None`` ->
+    runnable). Keeps the file collectable everywhere and executable only where the
+    checkpoint, the SGLang reference, and enough GPUs are present."""
+    try:
+        import torch
+    except Exception as e:  # noqa: BLE001
+        return f"torch unavailable: {e}"
+    if not torch.cuda.is_available():
+        return "no CUDA device"
+    if torch.cuda.device_count() < TP:
+        return (f"need >= {TP} GPUs for INKLING_TP={TP}, have "
+                f"{torch.cuda.device_count()} (set INKLING_TP=1 for a single-GPU run)")
+    # A TP>1 LLM must be launched with >= TP ranks (trtllm-llmapi-launch /
+    # srun --ntasks=TP); a single-task pytest cannot spawn the workers, so skip
+    # rather than error. Route the TP=4 corner through a dedicated Slurm script
+    # gate, or set INKLING_TP=1 for a single-GPU pytest decode-parity check.
+    launch_world_size = _launch_world_size()
+    if TP > 1 and launch_world_size < TP:
+        return (f"TP={TP} needs a >= {TP}-rank launch; this process has world size "
+                f"{launch_world_size}. Run as a dedicated multi-GPU Slurm gate "
+                f"(trtllm-llmapi-launch) or set INKLING_TP=1.")
+    if not os.path.isdir(CKPT):
+        return f"Inkling checkpoint not found: {CKPT} (set INKLING_CHECKPOINT)"
+    if not os.path.isfile(REF):
+        return f"SGLang reference not found: {REF} (set INKLING_SGLANG_REF)"
+    return None
+
+
+def test_source_logit_replay():
+    """crit6 final-logit parity gate, runnable under pytest.
+
+    Runs the full decode stack (TP=INKLING_TP, INKLING_CUDA_GRAPH/INKLING_OVERLAP
+    corner) and asserts per-prompt greedy-argmax equality against the SGLang
+    reference at generated position 0 -- the same check the ``__main__`` script
+    performs. Skips cleanly when the checkpoint / reference / GPUs are absent so
+    collection never breaks; the QA parity gate provides them. The verdict prints
+    as ``INKLING_SLR_OK/FAIL``."""
+    import pytest
+    reason = _slr_skip_reason()
+    if reason:
+        pytest.skip(reason)
+    assert main() == 0, "source_logit_replay failed -- see the INKLING_SLR_* verdict lines"
 
 
 if __name__ == "__main__":

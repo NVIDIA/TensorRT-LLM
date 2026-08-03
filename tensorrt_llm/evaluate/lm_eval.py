@@ -51,6 +51,35 @@ from .interface import (Evaluator, dump_inference_results,
 LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER = "<image>"
 
 
+def _resolve_post_process_fn(
+    post_process_fn: Optional[Callable[[str], str] | str]
+) -> tuple[Optional[Callable[[str], str]], bool]:
+    """Resolve a CLI post-processor key and whether it needs raw special tokens."""
+    keep_special_tokens = False
+    if not isinstance(post_process_fn, str):
+        return post_process_fn, keep_special_tokens
+
+    if post_process_fn == "strip_thinking_mmmu":
+        from .post_processing import strip_thinking_and_extract_mmmu_answer
+        post_process_fn = strip_thinking_and_extract_mmmu_answer
+    elif post_process_fn == "inkling":
+        # Inkling emits typed content blocks delimited by special tokens. Route
+        # <|content_thinking|> out and score only the visible <|content_text|>
+        # channel -- the offline analog of SGLang's --reasoning-parser inkling.
+        from .post_processing import extract_inkling_content
+        post_process_fn = extract_inkling_content
+        keep_special_tokens = True
+    elif post_process_fn == "inkling_mmmu":
+        from .post_processing import strip_inkling_and_extract_mmmu_answer
+        post_process_fn = strip_inkling_and_extract_mmmu_answer
+        keep_special_tokens = True
+    else:
+        raise click.BadParameter(
+            f"Unknown --post_process_fn={post_process_fn!r}; "
+            "expected 'strip_thinking_mmmu', 'inkling', or 'inkling_mmmu'.")
+    return post_process_fn, keep_special_tokens
+
+
 class LmEvalWrapper(TemplateLM):
 
     def __init__(self,
@@ -232,7 +261,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  output_dir: Optional[str] = None,
                  sampling_override: bool = False,
                  preserve_caller_max_tokens: bool = False,
-                 post_process_fn: Optional[Callable[[str], str]] = None):
+                 post_process_fn: Optional[Callable[[str], str]] = None,
+                 keep_special_tokens: bool = False):
         """
         Initialize the multimodal wrapper.
 
@@ -251,6 +281,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                 to model outputs before scoring. Used by Kimi K2.5 to strip
                 ``<think>...</think>`` and extract the final answer (see
                 ``tensorrt_llm.evaluate.post_processing``).
+            keep_special_tokens: If True, preserve special tokens in generated
+                text so channel-based post-processors can parse them.
         """
         super().__init__(
             llm,
@@ -262,6 +294,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             output_dir=output_dir,
             sampling_override=sampling_override,
             preserve_caller_max_tokens=preserve_caller_max_tokens,
+            keep_special_tokens=keep_special_tokens,
         )
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
@@ -648,15 +681,12 @@ class LmEvalEvaluator(Evaluator):
             output_dir=self.output_dir,
             sampling_override=sampling_override,
             post_process_fn=self.post_process_fn,
+            preserve_caller_max_tokens=self.preserve_caller_max_tokens,
         )
-        if self.MULTIMODAL:
-            # preserve_caller_max_tokens is a multimodal-wrapper parameter.
-            lm_kwargs[
-                "preserve_caller_max_tokens"] = self.preserve_caller_max_tokens
-        else:
-            # keep_special_tokens is a text-path (LmEvalWrapper) parameter used
-            # by channel-based post-processors like Inkling content extraction.
-            lm_kwargs["keep_special_tokens"] = self.keep_special_tokens
+        # Channel-based post-processors such as Inkling content extraction need
+        # raw special tokens regardless of whether the task is text-only or
+        # multimodal.
+        lm_kwargs["keep_special_tokens"] = self.keep_special_tokens
 
         results = lm_eval.evaluate(
             lm=lm_cls(llm, **lm_kwargs),
@@ -696,28 +726,8 @@ class LmEvalEvaluator(Evaluator):
     def command_harness(cls, ctx, **kwargs):
         llm: PyTorchLLM = ctx.obj
 
-        # Resolve the post-processor: accept a callable (already-bound) or the
-        # string key "strip_thinking_mmmu" coming from CLI flags.
-        post_process_fn = kwargs.pop("post_process_fn", None)
-        keep_special_tokens = False
-        if isinstance(post_process_fn, str):
-            if post_process_fn == "strip_thinking_mmmu":
-                from .post_processing import \
-                    strip_thinking_and_extract_mmmu_answer
-                post_process_fn = strip_thinking_and_extract_mmmu_answer
-            elif post_process_fn == "inkling":
-                # Inkling emits typed content blocks delimited by special tokens.
-                # Route <|content_thinking|> out and score only the visible
-                # <|content_text|> channel — the offline analog of SGLang's
-                # --reasoning-parser inkling. Requires special tokens preserved
-                # in the detokenized output (keep_special_tokens=True).
-                from .post_processing import extract_inkling_content
-                post_process_fn = extract_inkling_content
-                keep_special_tokens = True
-            else:
-                raise click.BadParameter(
-                    f"Unknown --post_process_fn={post_process_fn!r}; "
-                    "expected 'strip_thinking_mmmu' or 'inkling'.")
+        post_process_fn, keep_special_tokens = _resolve_post_process_fn(
+            kwargs.pop("post_process_fn", None))
 
         evaluator = cls(
             dataset_path=kwargs.pop("dataset_path", None),
@@ -1325,12 +1335,11 @@ class MMMU(LmEvalEvaluator):
         "produce chain-of-thought before the answer).")
     @click.option(
         "--post_process_fn",
-        type=click.Choice(["strip_thinking_mmmu"]),
+        type=click.Choice(["strip_thinking_mmmu", "inkling_mmmu"]),
         default=None,
         help="Per-sample post-processor. 'strip_thinking_mmmu' strips "
-        "<think>...</think> and then runs the MMMU answer extractor — needed "
-        "for thinking models (Kimi K2.5, Step3p7) whose CoT output the "
-        "default lm-eval regex cannot parse.")
+        "<think>...</think> and 'inkling_mmmu' extracts Inkling's visible "
+        "<|content_text|>; both then run the MMMU answer extractor.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:

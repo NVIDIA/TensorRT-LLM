@@ -15,7 +15,10 @@
 import pytest
 
 from tensorrt_llm import LLM
-from tensorrt_llm.evaluate.post_processing import strip_thinking_and_extract_mmmu_answer
+from tensorrt_llm.evaluate.post_processing import (
+    strip_inkling_and_extract_mmmu_answer,
+    strip_thinking_and_extract_mmmu_answer,
+)
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
     KvCacheConfig,
@@ -667,6 +670,52 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             enable_attention_dp=attention_dp,
             trust_remote_code=True,
             enable_chunked_prefill=True,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
+class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "thinkingmachines/Inkling-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/Inkling-NVFP4"
+    MAX_NUM_TOKENS = 16384
+
+    # Inkling is a long-CoT reasoning model: keep a large max_tokens so the
+    # chain-of-thought is not truncated, and truncate long MMMU prompts to the
+    # task's input budget.
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    # Reasoning output: keep Inkling's typed-content markers, route out
+    # <|content_thinking|>, and extract the final MMMU choice before scoring.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        post_process_fn=strip_inkling_and_extract_mmmu_answer,
+        keep_special_tokens=True,
+        preserve_caller_max_tokens=True,
+    )
+
+    @skip_pre_blackwell
+    def test_nvfp4(self):
+        """NVFP4 accuracy on the MMMU vision benchmark (Blackwell).
+
+        The vision path exercises image attach + placeholder expansion + fusion.
+        Reference is the SGLang baseline-off measurement the bring-up paired
+        against (see references/mmmu.yaml); Inkling is validated to match it
+        item-for-item.
+        """
+        with LLM(
+            self.MODEL_PATH,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)

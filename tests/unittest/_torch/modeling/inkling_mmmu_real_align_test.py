@@ -117,6 +117,65 @@ FIXED_ITEMS: List[Tuple[str, int]] = [
     ("Computer_Science", 0),
 ]
 
+# Larger fixed pool for the MMMU vision-parity gate (Module 2 needs 50 paired
+# samples). Every id below -- ``validation_<Config>_<offset+1>`` -- is present in
+# the advanced bring-up's cached SGLang 858-item pool, so a 50-item TRT run pairs
+# by id with no capture job. The first six entries ARE ``FIXED_ITEMS`` (the
+# alignment canary); the remaining 44 spread one item per remaining MMMU
+# discipline, then a second item per discipline, for a cross-domain sample.
+PARITY_ITEMS: List[Tuple[str, int]] = [
+    ("Math", 0),
+    ("Math", 1),
+    ("Physics", 0),
+    ("Chemistry", 0),
+    ("Accounting", 0),
+    ("Computer_Science", 0),
+    ("Agriculture", 0),
+    ("Architecture_and_Engineering", 0),
+    ("Art", 0),
+    ("Art_Theory", 1),
+    ("Basic_Medical_Science", 0),
+    ("Biology", 0),
+    ("Clinical_Medicine", 0),
+    ("Design", 0),
+    ("Diagnostics_and_Laboratory_Medicine", 0),
+    ("Economics", 0),
+    ("Electronics", 0),
+    ("Energy_and_Power", 0),
+    ("Finance", 0),
+    ("Geography", 0),
+    ("History", 0),
+    ("Literature", 0),
+    ("Manage", 0),
+    ("Marketing", 0),
+    ("Materials", 0),
+    ("Mechanical_Engineering", 0),
+    ("Music", 1),
+    ("Pharmacy", 0),
+    ("Psychology", 1),
+    ("Public_Health", 0),
+    ("Sociology", 0),
+    ("Accounting", 1),
+    ("Agriculture", 1),
+    ("Architecture_and_Engineering", 1),
+    ("Art", 1),
+    ("Art_Theory", 2),
+    ("Basic_Medical_Science", 1),
+    ("Biology", 1),
+    ("Chemistry", 1),
+    ("Clinical_Medicine", 1),
+    ("Computer_Science", 1),
+    ("Design", 1),
+    ("Diagnostics_and_Laboratory_Medicine", 1),
+    ("Economics", 1),
+    ("Electronics", 1),
+    ("Energy_and_Power", 1),
+    ("Finance", 1),
+    ("Geography", 1),
+    ("History", 1),
+    ("Literature", 1),
+]
+
 DATASETS_SERVER = "https://datasets-server.huggingface.co/rows"
 
 
@@ -224,11 +283,12 @@ def _selected_items() -> List[Tuple[str, int]]:
     return out
 
 
-def load_fixed_items() -> List[dict]:
-    """Resolve the fixed real items, preferring the on-disk cache; fetch+cache on miss."""
+def _fetch_and_cache_items(specs: List[Tuple[str, int]]) -> List[dict]:
+    """Resolve ``(config, offset)`` MMMU items, preferring the on-disk cache;
+    fetch+cache on miss."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     items: List[dict] = []
-    for config, offset in _selected_items():
+    for config, offset in specs:
         stem = os.path.join(CACHE_DIR, f"{config}_{offset}")
         meta_p, img_p = stem + ".json", stem + ".png"
         if os.path.exists(meta_p) and os.path.exists(img_p):
@@ -245,6 +305,23 @@ def load_fixed_items() -> List[dict]:
             json.dump({k: v for k, v in item.items() if k != "image_bytes"}, f, indent=2)
         items.append(item)
     return items
+
+
+def load_fixed_items() -> List[dict]:
+    """Resolve the fixed real items (the alignment canary), preferring the on-disk
+    cache; fetch+cache on miss."""
+    return _fetch_and_cache_items(_selected_items())
+
+
+def load_parity_items(n: Optional[int] = None) -> List[dict]:
+    """Resolve the first ``n`` MMMU vision-parity items (default all
+    ``PARITY_ITEMS``), fetching+caching each exactly like :func:`load_fixed_items`.
+
+    ``inkling_mmmu_run.py`` uses this to reach the Module-2 ``n_paired == 50``
+    bar: every id pairs by construction against the cached SGLang pool. ``n`` is
+    clamped to the pool size."""
+    specs = PARITY_ITEMS if n is None else PARITY_ITEMS[: max(0, int(n))]
+    return _fetch_and_cache_items(specs)
 
 
 # ===========================================================================

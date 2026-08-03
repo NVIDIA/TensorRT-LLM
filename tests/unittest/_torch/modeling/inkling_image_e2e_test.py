@@ -39,9 +39,9 @@ What this asserts (per config):
 
 This is a coarse runtime-wiring smoke for Goal 1.4. The AUTHORITATIVE correctness
 proof is the SGLang-reference ``source_logit_replay`` / ``generation_parity``
-COMPARISON in the sibling files ``inkling_image_logit_replay_test.py`` /
-``inkling_image_generation_parity_test.py`` (they consume the served SGLang
-capture and are immune to free-run divergence via single-step / teacher forcing).
+comparison (``inkling_source_logit_replay_test.py`` /
+``inkling_generation_parity_test.py``): they consume the served SGLang capture and
+are immune to free-run divergence via single-step / teacher forcing.
 
 Run: trtllm-llmapi-launch python tests/unittest/_torch/modeling/inkling_image_e2e_test.py
 Env: INKLING_CHECKPOINT/INKLING_CKPT, INKLING_CUDA_GRAPH, INKLING_OVERLAP,
@@ -104,8 +104,11 @@ def main() -> int:
         )
 
     moe_backend = os.environ.get("INKLING_MOE_BACKEND", "CUTLASS")
+    # Env-tunable so the smoke fits nodes with less headroom (the NVFP4 weights
+    # already fill most of each device); a small smoke needs little KV cache.
+    kv_frac = float(os.environ.get("INKLING_KV_FRAC", "0.7"))
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.7, dtype="auto", enable_block_reuse=False
+        free_gpu_memory_fraction=kv_frac, dtype="auto", enable_block_reuse=False
     )
     llm = LLM(
         ckpt,

@@ -184,19 +184,27 @@ _INK_CONTENT_MODEL_END_SAMPLING = "<|content_model_end_sampling|>"
 # Any special token that opens a new (non content-text) block or closes one; a
 # content-text run ends at the first of these.
 _INK_CONTROL_TOKENS = (
+    "<|endoftext|>",
+    "<|message_user|>",
+    "<|message_system|>",
     _INK_CONTENT_THINKING,
     _INK_CONTENT_TEXT,
     _INK_END_MESSAGE,
     _INK_CONTENT_MODEL_END_SAMPLING,
     "<|message_model|>",
-    "<|message_system|>",
-    "<|message_user|>",
     "<|message_tool|>",
+    "<|content_image|>",
+    "<|content_audio_input|>",
+    "<|content_tool_error|>",
     "<|content_invoke_tool_json|>",
     "<|content_invoke_tool_text|>",
+    "<|content_invoke_tool|>",
     "<|content_xml|>",
+    "<|audio_end|>",
+    "<|model_trigger_generation|>",
 )
-_INK_CONTROL_RE = re.compile("|".join(re.escape(t) for t in _INK_CONTROL_TOKENS))
+_INK_CONTROL_RE = re.compile("|".join(
+    re.escape(t) for t in sorted(_INK_CONTROL_TOKENS, key=len, reverse=True)))
 
 
 def extract_inkling_content(text: str) -> str:
@@ -247,3 +255,13 @@ def extract_inkling_content(text: str) -> str:
     # number would be harvested by GSM8K/MMLU flexible-extract) — exactly the
     # failure the reasoning channel is meant to exclude.
     return "".join(content_parts).strip()
+
+
+def strip_inkling_and_extract_mmmu_answer(text: str) -> str:
+    """Extract the final MMMU answer from Inkling typed-content output.
+
+    Inkling uses ``<|content_thinking|>`` / ``<|content_text|>`` markers instead
+    of ``<think>...</think>`` tags, so it needs content-channel extraction before
+    the common MMMU answer extractor.
+    """
+    return extract_mmmu_answer(extract_inkling_content(text))

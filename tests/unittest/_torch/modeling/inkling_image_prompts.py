@@ -171,8 +171,17 @@ def _num_patches_for(image_bytes: bytes) -> int:
     return int(pre.preprocess([image_bytes])["num_patches"][0])
 
 
-def build_prompts(n: Optional[int] = None, with_num_patches: bool = True) -> List[Dict[str, Any]]:
+def build_prompts(
+    n: Optional[int] = None,
+    with_num_patches: bool = True,
+    items: Optional[List[dict]] = None,
+) -> List[Dict[str, Any]]:
     """Return up to ``n`` canonical image-prompt records.
+
+    ``items`` (a pre-resolved item list from
+    :func:`inkling_mmmu_real_align_test.load_fixed_items` /
+    :func:`load_parity_items`) overrides the default 6-item canary source; the
+    MMMU parity runner passes the 50-item pool through it.
 
     Each record::
 
@@ -193,7 +202,8 @@ def build_prompts(n: Optional[int] = None, with_num_patches: bool = True) -> Lis
     if n is None:
         n = N_PROMPTS
     tok = _build_tokenizer()
-    items = R.load_fixed_items()
+    if items is None:
+        items = R.load_fixed_items()
     out: List[Dict[str, Any]] = []
     for it in items[:n]:
         prompt_text, _qtype = H.render_mmmu_prompt(it["question"], it["options"])
