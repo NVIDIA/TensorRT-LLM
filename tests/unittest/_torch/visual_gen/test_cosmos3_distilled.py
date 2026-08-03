@@ -24,6 +24,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     load_scheduler,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+from tensorrt_llm._torch.visual_gen.profiler import VisualGenProfiler
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
@@ -527,10 +528,8 @@ def _denoise_ready_pipeline() -> Cosmos3OmniMoTPipeline:
     return _bare_pipeline(
         pipeline_config=SimpleNamespace(visual_gen_mapping=None),
         cache_accelerator=None,
-        _predenoise_pending=False,
-        _postdenoise_pending=False,
         _is_warmup=False,
-        _profile_range=None,
+        _profiler=VisualGenProfiler(),
     )
 
 
