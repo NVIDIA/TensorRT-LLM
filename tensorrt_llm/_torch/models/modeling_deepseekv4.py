@@ -2652,52 +2652,6 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             **kwargs,
         )
 
-    def warmup_dsv4_deep_gemm_ob(self, max_num_tokens: int) -> None:
-        """Seed the JIT cache used by the opt-out DeepGEMM O_b backend.
-
-        The default CuTe backend is compiled by the regular AutoTuner forward.
-        DeepGEMM inference deliberately calls ``fp8_gemm_nt`` directly to avoid
-        custom-op and AutoTuner overhead, so startup reuses ``fp8_swap_ab_gemm``
-        to compile the same signature without changing that hot path.
-        """
-        if max_num_tokens <= 0:
-            return
-
-        warmed_signatures = set()
-        for layer in self.model.layers:
-            attention = getattr(layer, "self_attn", None)
-            should_warmup = getattr(attention, "_should_warmup_dsv4_deep_gemm_ob", None)
-            if should_warmup is None or not should_warmup():
-                continue
-
-            weight = attention.o_b_proj.weight
-            weight_scale = attention.o_b_proj.weight_scale
-            signature = (
-                tuple(weight.shape),
-                tuple(weight.stride()),
-                weight.dtype,
-                tuple(weight_scale.shape),
-                tuple(weight_scale.stride()),
-                weight_scale.dtype,
-                attention.dtype,
-                weight.device,
-            )
-            if signature in warmed_signatures:
-                continue
-            warmed_signatures.add(signature)
-            dummy_input = torch.empty(
-                (max_num_tokens, weight.shape[1]),
-                dtype=attention.dtype,
-                device=weight.device,
-            )
-            torch.ops.trtllm.fp8_swap_ab_gemm(
-                dummy_input,
-                weight,
-                weight_scale,
-                output_dtype=attention.dtype,
-                disable_ue8m0_cast=False,
-            )
-
     def load_weights(self, weights: Dict):
         weight_loader = DeepseekV4WeightLoader(self)
         weight_loader.load_weights(weights)

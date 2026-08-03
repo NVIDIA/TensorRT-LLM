@@ -1251,21 +1251,17 @@ class MLA(nn.Module):
         return (
             self.allow_dsv4_split_output
             and not _is_env_truthy("TRTLLM_DSV4_DISABLE_FUSED_OPROJ")
+            and _is_env_truthy("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", default=True)
             and is_sm_100f()
             and IS_CUTLASS_DSL_AVAILABLE
             and self.n_local_groups == self.num_groups
+            and self.hidden_size == _DSV4_PRO_OB_N
+            and self.n_local_groups * self.o_lora_rank == _DSV4_PRO_OB_K
             and getattr(self.o_b_proj, "tp_size", 1) == 1
             and self.o_a_proj.dtype == torch.float8_e4m3fn
             and self.o_b_proj.has_fp8_block_scales
             and self.dtype == torch.bfloat16
             and not getattr(self.o_b_proj, "use_cute_dsl_blockscaling_mm", False)
-        )
-
-    def _should_warmup_dsv4_deep_gemm_ob(self) -> bool:
-        # CuTe is the default and participates in the regular AutoTuner warmup.
-        # The opt-out DeepGEMM path needs its separate startup-only JIT warmup.
-        return self._should_use_fused_oproj() and not _is_env_truthy(
-            "TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", default=True
         )
 
     def _fused_oa_ob_proj(
@@ -1299,25 +1295,16 @@ class MLA(nn.Module):
             sf_out_padded,
         )
         sf_out = sf_out_padded[:num_tokens]
-        return self._fused_ob_gemm(o_lora_fp8, sf_out, num_tokens)
+        return self._fused_ob_gemm(o_lora_fp8, sf_out)
 
-    def _fused_ob_gemm(
-        self, o_lora_fp8: torch.Tensor, sf_out: torch.Tensor, num_tokens: int
-    ) -> torch.Tensor:
-        """Run DSV4-Pro O_b with DeepGEMM or the opt-in CuTe DSL kernel."""
-        m, n = num_tokens, self.hidden_size
+    def _fused_ob_gemm(self, o_lora_fp8: torch.Tensor, sf_out: torch.Tensor) -> torch.Tensor:
+        """Run the fused DSV4-Pro O_b CuTe DSL kernel."""
+        n = self.hidden_size
         k_ob = o_lora_fp8.shape[1]
         weight, weight_scale = self.o_b_proj.weight, self.o_b_proj.weight_scale
-        # Default to CuTe; setting the env to 0 retains the DeepGEMM rollback.
-        use_cute_ob_proj = (
-            _is_env_truthy("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", default=True)
-            and m > 0
-            and n == _DSV4_PRO_OB_N
-            and k_ob == _DSV4_PRO_OB_K
-        )
 
         cute_weight_scale = weight_scale
-        if use_cute_ob_proj and cute_weight_scale.dtype != torch.int32:
+        if cute_weight_scale.dtype != torch.int32:
             cute_weight_scale = getattr(self.o_b_proj, "_ob_wsf_int", None)
             if cute_weight_scale is None:
                 # Convert the static weight scale once.
@@ -1330,19 +1317,6 @@ class MLA(nn.Module):
                 )
                 self.o_b_proj._ob_wsf_int = cute_weight_scale
 
-        if not use_cute_ob_proj:
-            from tensorrt_llm import deep_gemm
-
-            hidden = torch.empty([m, n], device=o_lora_fp8.device, dtype=self.dtype)
-            deep_gemm.fp8_gemm_nt(
-                (o_lora_fp8, sf_out),
-                (weight, weight_scale),
-                hidden,
-                c=None,
-                disable_ue8m0_cast=False,
-            )
-            return hidden
-
         return torch.ops.trtllm.dsv4_fp8_splitk_gemm(o_lora_fp8, sf_out, weight, cute_weight_scale)
 
     def _deepseek_v4_o_proj(
@@ -1353,7 +1327,7 @@ class MLA(nn.Module):
         if isinstance(attn_out_latent, tuple):
             attn_fp8, attn_scale = attn_out_latent
             num_tokens = attn_fp8.shape[1]
-            if self._should_use_fused_oproj():
+            if num_tokens > 0 and self._should_use_fused_oproj():
                 return self._fused_oa_ob_proj(attn_fp8, attn_scale, num_tokens)
 
             o_lora = torch.empty(
@@ -1396,7 +1370,7 @@ class MLA(nn.Module):
                 128,
                 self.inverse_rotary_emb.is_neox,
             )
-            if self._should_use_fused_oproj():
+            if num_tokens > 0 and self._should_use_fused_oproj():
                 return self._fused_oa_ob_proj(attn_fp8, attn_scale, num_tokens)
 
             o_lora = torch.empty(
