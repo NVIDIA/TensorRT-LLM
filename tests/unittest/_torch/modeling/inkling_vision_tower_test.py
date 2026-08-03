@@ -73,7 +73,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import inkling_mmmu_real_align_test as R  # noqa: E402  (cached items + importlib loader)
+import inkling_mmmu_fixtures as R  # noqa: E402  (cached items + importlib loader)
 
 from tensorrt_llm._torch.configs.inkling import InklingConfig  # noqa: E402
 from tensorrt_llm._torch.models.modeling_inkling_vision import (  # noqa: E402

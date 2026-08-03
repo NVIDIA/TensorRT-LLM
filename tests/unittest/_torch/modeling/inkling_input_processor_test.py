@@ -25,7 +25,7 @@ Proves the Stage-1 / Goal-1.2 contract for the production TRT-LLM
      assemble expansion count equals SGLang's ``num_patches``.
 
 The SGLang reference is loaded from on-disk source via the helpers already
-proven in ``inkling_mmmu_real_align_test`` (which handle the numba
+proven in ``inkling_mmmu_fixtures`` (which handle the numba
 ``<dynamic>`` disk-cache hazard); the production preprocessing path itself uses
 NO numba and NO ``sglang`` import. This test is deliberately non-skipping for
 the pure-unit checks; the real-source parity check FAILS (does not skip) if the
@@ -377,8 +377,8 @@ def _tensor_stats(a: np.ndarray, b: np.ndarray):
 
 def run_preprocess_parity() -> dict:
     """Compare production preprocessing to SGLang's real numba kernel on real
-    MMMU images. Reuses the proven loaders in ``inkling_mmmu_real_align_test``."""
-    import inkling_mmmu_real_align_test as R  # noqa: E402
+    MMMU images. Reuses the proven loaders in ``inkling_mmmu_fixtures``."""
+    import inkling_mmmu_fixtures as R  # noqa: E402
 
     ip, _ev = R.load_sglang_refs()  # SGLang image_processing (numba-safe load)
     items = R.load_fixed_items()
