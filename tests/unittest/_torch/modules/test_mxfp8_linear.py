@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -96,14 +95,20 @@ def _mock_mxfp8_ops(monkeypatch):
     )
 
 
+def _mock_flashinfer_mxfp8_op(monkeypatch, output):
+    """Stand in for the trtllm::flashinfer_mm_mxfp8 wrapper op."""
+    op = Mock(return_value=output)
+    monkeypatch.setattr(linear_module, "_flashinfer_mxfp8_op", lambda: op)
+    return op
+
+
 def test_mxfp8_flashinfer_call_contract(monkeypatch):
-    """The forced backend reuses TRT tensors and a zero-copy weight transpose."""
+    """The forced backend hands the wrapper op the TRT-LLM quantized tensors."""
     monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "flashinfer")
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
 
     expected = torch.empty((2, 3), dtype=torch.bfloat16)
-    mm_mxfp8 = Mock(return_value=expected)
-    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
+    flashinfer_gemm = _mock_flashinfer_mxfp8_op(monkeypatch, expected)
     quantized, activation_scale, quantize, _, _, _, _ = _mock_mxfp8_ops(monkeypatch)
 
     weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
@@ -116,18 +121,34 @@ def test_mxfp8_flashinfer_call_contract(monkeypatch):
 
     assert output is expected
     quantize.assert_called_once_with(activation, True)
-    args = mm_mxfp8.call_args.args
-    kwargs = mm_mxfp8.call_args.kwargs
-    assert args[0] is quantized
-    assert args[1].shape == (4, 3)
-    assert args[1].data_ptr() == weight.data_ptr()
-    assert args[2] is activation_scale
-    assert args[3] is weight_scale
-    assert kwargs == {
-        "out_dtype": torch.bfloat16,
-        "use_8x4_sf_layout": False,
-        "backend": "cutlass",
-    }
+    # The [K, N] transpose and the mm_mxfp8 kwargs live inside the wrapper op,
+    # so the weight is passed through in its stored [N, K] layout.
+    flashinfer_gemm.assert_called_once_with(
+        quantized, activation_scale, weight, weight_scale, torch.bfloat16
+    )
+
+
+def test_mxfp8_explicit_flashinfer_survives_torch_compile(monkeypatch):
+    """A pinned backend is a compile-time constant dispatched through an op."""
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "flashinfer")
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: True)
+
+    expected = torch.empty((2, 3), dtype=torch.bfloat16)
+    flashinfer_gemm = _mock_flashinfer_mxfp8_op(monkeypatch, expected)
+    _, _, _, native_gemm, _, _, _ = _mock_mxfp8_ops(monkeypatch)
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+    method = MXFP8LinearMethod()
+
+    assert method.apply(module, activation, bias=None) is expected
+    flashinfer_gemm.assert_called_once()
+    native_gemm.assert_not_called()
 
 
 def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
@@ -135,8 +156,7 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
 
     flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
-    mm_mxfp8 = Mock(return_value=flashinfer_output)
-    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
+    flashinfer_gemm = _mock_flashinfer_mxfp8_op(monkeypatch, flashinfer_output)
     _, _, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
 
     module = SimpleNamespace(
@@ -150,16 +170,43 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
 
     assert method.apply(module, activation, bias=None) is native_output
     native_gemm.assert_called_once()
-    mm_mxfp8.assert_not_called()
+    flashinfer_gemm.assert_not_called()
 
     method.mark_flashinfer_autotuned()
     with flashinfer_mxfp8_decode_graph_capture():
         assert method.apply(module, activation, bias=None) is flashinfer_output
-    mm_mxfp8.assert_called_once()
+    flashinfer_gemm.assert_called_once()
 
     # Leaving the decode-capture scope restores the eager/native path.
     assert method.apply(module, activation, bias=None) is native_output
     assert native_gemm.call_count == 2
+
+
+def test_mxfp8_auto_stays_native_under_torch_compile(monkeypatch):
+    """Dynamo cannot trace the context lookups that gate FlashInfer dispatch."""
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: True)
+
+    flashinfer_gemm = _mock_flashinfer_mxfp8_op(
+        monkeypatch, torch.empty((2, 3), dtype=torch.bfloat16)
+    )
+    _, _, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+    method = MXFP8LinearMethod()
+    assert method.enable_flashinfer_auto()
+    method.mark_flashinfer_autotuned()
+
+    with flashinfer_mxfp8_decode_graph_capture():
+        assert method.apply(module, activation, bias=None) is native_output
+    native_gemm.assert_called_once()
+    flashinfer_gemm.assert_not_called()
 
 
 @pytest.mark.parametrize(

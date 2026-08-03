@@ -33,7 +33,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_enabled,
+                     is_nvfp4_marlin_enabled, is_torch_compiling,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
 
@@ -3035,6 +3035,15 @@ def _mxfp8_cutlass_op_available() -> bool:
                    ) and torch.cuda.get_device_capability()[0] >= 10
 
 
+def _flashinfer_mxfp8_op():
+    """The wrapped FlashInfer MXFP8 GEMM op, or None when unavailable.
+
+    Registered by custom_ops.flashinfer_custom_ops only when flashinfer
+    exposes mm_mxfp8. Going through the op keeps the call opaque to Dynamo.
+    """
+    return getattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", None)
+
+
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
@@ -3074,12 +3083,15 @@ class MXFP8LinearMethod(LinearMethodBase):
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
       - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
-        with ``mm_mxfp8``. MiniMax-M3 enables this path automatically only
-        while tuning or capturing decode CUDA graphs; eager execution remains
-        on the native TensorRT-LLM op.
+        via trtllm::flashinfer_mm_mxfp8, which wraps mm_mxfp8 so a compiled
+        graph gets one opaque node. MiniMax-M3 enables this path automatically
+        only while tuning or capturing decode CUDA graphs, and that automatic
+        selection is skipped under torch.compile. A pinned flashinfer backend
+        applies everywhere.
 
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
-    ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
+    ``flashinfer``, or ``auto``; ``auto`` settles on ``trtllm`` when the model
+    is compiled. The reference layout is 2D [O,K/32]; both
     compiled backends consume the same 1D padded swizzled scale layout.
     When the TensorRT-LLM autotuner is enabled, the native backend profiles
     its compiled tactics during startup. Learned tactics are registered in
@@ -3128,19 +3140,18 @@ class MXFP8LinearMethod(LinearMethodBase):
                     "FlashInfer MXFP8 GEMM requires the TensorRT-LLM MXFP8 "
                     "quantization ops on Blackwell")
             return False
-        try:
-            from flashinfer import mm_mxfp8
-        except ImportError as error:
+        op = _flashinfer_mxfp8_op()
+        if op is None:
             if required:
                 raise RuntimeError(
                     "TRTLLM_MXFP8_GEMM_BACKEND=flashinfer requires the "
-                    "pinned flashinfer-python package") from error
+                    "pinned flashinfer-python package")
             logger.warning_once(
                 "FlashInfer MXFP8 is unavailable; using the native "
                 "TensorRT-LLM GEMM backend.",
                 key="flashinfer_mxfp8_unavailable")
             return False
-        self._flashinfer_mxfp8 = mm_mxfp8
+        self._flashinfer_mxfp8 = op
         return True
 
     def enable_flashinfer_auto(self) -> bool:
@@ -3211,8 +3222,12 @@ class MXFP8LinearMethod(LinearMethodBase):
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
             act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
                 input.contiguous(), True)
+            # The automatic path switches per call on context state, which
+            # Dynamo cannot trace and a compiled graph could not honor. A
+            # pinned backend resolves before tracing, so only the automatic
+            # path falls back to the native op under torch.compile.
             use_flashinfer = self.backend == "flashinfer" or (
-                self.backend == "auto" and
+                self.backend == "auto" and not is_torch_compiling() and
                 (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
                  (self._flashinfer_autotuned
                   and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
@@ -3221,12 +3236,10 @@ class MXFP8LinearMethod(LinearMethodBase):
                 assert flashinfer_mxfp8 is not None
                 output = flashinfer_mxfp8(
                     act_e4m3,
-                    module.weight.t(),
                     act_sf,
+                    module.weight,
                     module.weight_scale,
-                    out_dtype=module.dtype,
-                    use_8x4_sf_layout=False,
-                    backend="cutlass",
+                    module.dtype,
                 )
             else:
                 # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.

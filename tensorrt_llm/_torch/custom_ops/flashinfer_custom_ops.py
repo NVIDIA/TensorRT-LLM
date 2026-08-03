@@ -126,3 +126,37 @@ if IS_FLASHINFER_AVAILABLE:
         is_neox: bool = True,
     ):
         return
+
+    # mm_mxfp8 is newer than the entry points above, so probe it separately
+    # rather than breaking this module's import on an older flashinfer build.
+    try:
+        from flashinfer import mm_mxfp8
+    except ImportError:
+        mm_mxfp8 = None
+
+    if mm_mxfp8 is not None:
+
+        # Wrap this into a custom op so torch.compile traces one opaque node
+        # instead of inlining flashinfer's Python-level tactic lookup.
+        @torch.library.custom_op("trtllm::flashinfer_mm_mxfp8", mutates_args=())
+        def flashinfer_mm_mxfp8(act: torch.Tensor, act_scale: torch.Tensor,
+                                weight: torch.Tensor,
+                                weight_scale: torch.Tensor,
+                                output_dtype: torch.dtype) -> torch.Tensor:
+            # Argument order mirrors trtllm::mxfp8_mxfp8_gemm: weight arrives as
+            # [N, K] and mm_mxfp8 wants [K, N]. Both scale buffers are the 1D
+            # padded swizzled CUTLASS layout, hence use_8x4_sf_layout=False.
+            return mm_mxfp8(act,
+                            weight.t(),
+                            act_scale,
+                            weight_scale,
+                            out_dtype=output_dtype,
+                            use_8x4_sf_layout=False,
+                            backend="cutlass")
+
+        @flashinfer_mm_mxfp8.register_fake
+        def _(act: torch.Tensor, act_scale: torch.Tensor, weight: torch.Tensor,
+              weight_scale: torch.Tensor,
+              output_dtype: torch.dtype) -> torch.Tensor:
+            return act.new_empty((act.size(0), weight.size(0)),
+                                 dtype=output_dtype)

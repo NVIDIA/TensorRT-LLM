@@ -300,6 +300,43 @@ def _register_fake():
         return qk.new_empty((qk.shape[0], num_heads_q, head_dim),
                             dtype=torch.float8_e4m3fn)
 
+    @torch.library.register_fake("trtllm::fused_qk_norm_rope_to_fp8")
+    def _(qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, rotary_dim, eps,
+          q_weight, k_weight, base, is_neox, position_ids, factor, low, high,
+          attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
+          mrope_section2):
+        del rotary_dim, eps, q_weight, k_weight, base, is_neox, position_ids
+        del factor, low, high, attention_factor, is_qk_norm, use_gemma
+        del use_mrope, mrope_section1, mrope_section2
+        total_heads = num_heads_q + num_heads_k + num_heads_v
+        return qkv.new_empty((qkv.shape[0], total_heads * head_dim),
+                             dtype=torch.float8_e4m3fn)
+
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_fp8_qk_norm_rope_kv_insert")
+    def _(qkv, kv_cache, out_cache_loc, num_heads_q, num_heads_k, num_heads_v,
+          head_dim, rotary_dim, eps, q_weight, k_weight, base, is_neox,
+          position_ids):
+        del kv_cache, out_cache_loc, num_heads_k, num_heads_v, rotary_dim, eps
+        del q_weight, k_weight, base, is_neox, position_ids
+        return qkv.new_empty((qkv.shape[0], num_heads_q, head_dim),
+                             dtype=torch.float8_e4m3fn)
+
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert")
+    def _(packed, kv_cache, index_k_cache, out_cache_loc, num_heads_q,
+          num_heads_kv, num_heads_index, head_dim, rotary_dim, eps, q_weight,
+          k_weight, index_q_weight, index_k_weight, rotary_cos_sin,
+          position_ids):
+        del kv_cache, index_k_cache, out_cache_loc, num_heads_kv, rotary_dim
+        del eps, q_weight, k_weight, index_q_weight, index_k_weight
+        del rotary_cos_sin, position_ids
+        num_tokens = packed.shape[0]
+        return (packed.new_empty((num_tokens, num_heads_q, head_dim),
+                                 dtype=torch.float8_e4m3fn),
+                packed.new_empty((num_tokens, num_heads_index, head_dim),
+                                 dtype=torch.float8_e4m3fn))
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)
