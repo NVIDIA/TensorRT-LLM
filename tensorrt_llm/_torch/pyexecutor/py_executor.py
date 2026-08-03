@@ -3442,6 +3442,9 @@ class PyExecutor:
                             for v in ragged_lens) if ragged_lens else 0)
         local_max_window = max(ragged_lens) if ragged_lens else 0
         peer_stats = None
+        # Single-rank runs have no peer that could be holding a context
+        # request, so the local batch's own answer is the group's.
+        all_can_graph = bool(scheduled_batch.can_run_cuda_graph)
         if is_distributed:
             payloads = self.dist.tp_allgather([
                 1 if ragged_lens is not None else 0,
@@ -3491,6 +3494,7 @@ class PyExecutor:
         # addition rather than a second set of conditions inside code that took
         # three bugs to get right for `compact`.
         bucket = None
+        ragged_active = False
         cap_accept = (mode is not None and mode.computes_windows
                       and not mode.trims_submitted_tokens)
         if cap_accept:
@@ -3505,11 +3509,33 @@ class PyExecutor:
             if cap_accept:
                 for request, window in zip(gen_requests, ragged_lens):
                     request.py_verify_cap = int(window)
-            else:
+                ragged_active = True
+            elif all_can_graph:
                 bucket = self.model_engine.fit_ragged_verify_lens(
                     gen_requests, ragged_lens, peer_stats=peer_stats)
+                ragged_active = bucket is not None
                 if bucket is None:
                     fallback_reason = "no_captured_shape"
+            else:
+                # No rank can replay a graph this step -- some batch holds a
+                # context request, which has always meant eager, long before
+                # this feature existed. Fitting a captured bucket is therefore
+                # pointless: there is no key to match, and the round-up would
+                # only add tokens nobody asked for. Worse, the fit sizes its
+                # padding from generation rows while `_get_padded_batch` pads
+                # the TOTAL batch, so on exactly these steps it budgeted for a
+                # row that never appeared -- 18 tokens against a key of 24,
+                # which threw and deadlocked the other ranks.
+                #
+                # So run ragged WITHOUT a bucket: the windows go out as the
+                # planner chose them and the token total is whatever it is.
+                # Trimming still saves real compute here; only the alignment is
+                # unnecessary. `agreed_ragged_bucket` stays cleared so the graph
+                # key keeps its uniform shape.
+                self.model_engine.cuda_graph_runner.agreed_ragged_bucket = None
+                for request, window in zip(gen_requests, ragged_lens):
+                    request.py_verify_len = int(window)
+                ragged_active = True
 
         # Record what the step actually decided, reading the windows back off
         # the requests rather than off `ragged_lens`: fit_ragged_verify_lens
@@ -3532,7 +3558,11 @@ class PyExecutor:
                 # the windows would be booked as if they had been submitted.
                 fitted = [int(v) for v in ragged_lens] if ragged_lens else None
                 delivered = num_gen_requests * (1 + max_draft_len)
-            elif bucket is not None:
+            elif ragged_active:
+                # Read back off the requests, not off `ragged_lens`: when a
+                # bucket was fitted its rounding slack was spent on real
+                # verification, so the fitted windows are what the target sees.
+                # Without a bucket the two are the same thing.
                 fitted = [
                     int(request.py_verify_len) for request in gen_requests
                     if getattr(request, "py_verify_len", None) is not None
@@ -3546,7 +3576,7 @@ class PyExecutor:
                               fallback=fallback_reason,
                               delivered=delivered)
 
-        if bucket is not None:
+        if ragged_active and not cap_accept:
             # The block is always drafted in full -- only verification is
             # trimmed -- so the batch-wide draft length stays at the top tier.
             # That keeps the drafted-token buffer and the padded acceptance
