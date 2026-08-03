@@ -40,6 +40,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _cleanup_cuda,
     _disable_inductor_compile_worker_quiesce,
     _golden_media_path,
+    _lpips_deterministic_algorithms,
     _lpips_model_path,
     _run_lpips_eval,
     _run_wan_lpips_pipeline,
@@ -291,46 +292,51 @@ def _run_wan22_multinode_slurm_rank(tmp_path):
 
     visual_gen = None
     try:
-        try:
-            visual_gen = VisualGen(model=model_path, args=visual_gen_args)
-        except SystemExit as exc:
-            assert rank != 0, "Only non-zero SLURM ranks should exit through worker mode"
-            assert exc.code in (0, None)
-            return
+        with _lpips_deterministic_algorithms(fully_eager=True):
+            try:
+                visual_gen = VisualGen(model=model_path, args=visual_gen_args)
+            except SystemExit as exc:
+                assert rank != 0, "Only non-zero SLURM ranks should exit through worker mode"
+                assert exc.code in (0, None)
+                return
 
-        assert rank == 0
-        params = VisualGenParams(
-            height=WAN22_LPIPS_HEIGHT,
-            width=WAN22_LPIPS_WIDTH,
-            num_frames=WAN22_LPIPS_NUM_FRAMES,
-            num_inference_steps=WAN22_LPIPS_NUM_INFERENCE_STEPS,
-            guidance_scale=WAN22_LPIPS_GUIDANCE_SCALE,
-            seed=WAN22_LPIPS_SEED,
-            frame_rate=WAN22_LPIPS_FRAME_RATE,
-            negative_prompt=WAN22_LPIPS_NEGATIVE_PROMPT,
-        )
-        output = visual_gen.generate(inputs=WAN22_LPIPS_PROMPT, params=params)
-        assert output.error is None, f"unexpected error on Wan 2.2 multi-node run: {output.error}"
-        assert output.video is not None
+            assert rank == 0
+            params = VisualGenParams(
+                height=WAN22_LPIPS_HEIGHT,
+                width=WAN22_LPIPS_WIDTH,
+                num_frames=WAN22_LPIPS_NUM_FRAMES,
+                num_inference_steps=WAN22_LPIPS_NUM_INFERENCE_STEPS,
+                guidance_scale=WAN22_LPIPS_GUIDANCE_SCALE,
+                seed=WAN22_LPIPS_SEED,
+                frame_rate=WAN22_LPIPS_FRAME_RATE,
+                negative_prompt=WAN22_LPIPS_NEGATIVE_PROMPT,
+            )
+            output = visual_gen.generate(inputs=WAN22_LPIPS_PROMPT, params=params)
+            assert output.error is None, (
+                f"unexpected error on Wan 2.2 multi-node run: {output.error}"
+            )
+            assert output.video is not None
 
-        generated_path = tmp_path / "wan22_t2v_generated_multinode_slurm.mp4"
-        output.save(generated_path, frame_rate=WAN22_LPIPS_FRAME_RATE)
-        assert generated_path.is_file(), (
-            f"VisualGen multi-node run did not produce {generated_path}"
-        )
+            generated_path = tmp_path / "wan22_t2v_generated_multinode_slurm.mp4"
+            output.save(generated_path, frame_rate=WAN22_LPIPS_FRAME_RATE)
+            assert generated_path.is_file(), (
+                f"VisualGen multi-node run did not produce {generated_path}"
+            )
 
-        golden_path = _golden_media_path(
-            tmp_path, "wan22_t2v_lpips_golden_video.mp4", "Wan 2.2 LPIPS golden video"
-        )
-        score = _run_lpips_eval(
-            tmp_path,
-            "wan22_t2v_multinode_slurm",
-            "video",
-            WAN22_LPIPS_PROMPT,
-            golden_path,
-            generated_path,
-        )
-        _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
+            golden_path = _golden_media_path(
+                tmp_path,
+                WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO,
+                "Wan 2.2 FA4 fully-eager LPIPS golden video",
+            )
+            score = _run_lpips_eval(
+                tmp_path,
+                "wan22_t2v_multinode_slurm",
+                "video",
+                WAN22_LPIPS_PROMPT,
+                golden_path,
+                generated_path,
+            )
+            _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
     finally:
         if visual_gen is not None:
             visual_gen.shutdown()
@@ -383,7 +389,7 @@ def _run_wan22_multinode_slurm_parent():
         env.pop(var, None)
 
     test_file = str(Path(__file__).resolve())
-    nodeid = f"{test_file}::test_wan22_t2v_lpips_against_golden_multinode_slurm"
+    nodeid = f"{test_file}::test_wan22_t2v_multinode_slurm_lpips_against_golden"
     cmd = [
         "srun",
         "-l",
@@ -527,7 +533,7 @@ def test_wan22_t2v_lpips_against_golden_tp(_visual_gen_deps, tmp_path, variant_n
     _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
 
 
-def test_wan22_t2v_lpips_against_golden_multinode_slurm(request, tmp_path):
+def test_wan22_t2v_multinode_slurm_lpips_against_golden(request, tmp_path):
     if _slurm_rank_env() is not None:
         _run_wan22_multinode_slurm_rank(tmp_path)
         return
