@@ -18,20 +18,27 @@ Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
 
 Action generation
 -----------------
-``COSMOS3_DOMAIN_PRESETS`` lists training-aligned defaults per embodiment. When
-``domain_name`` (or a uniquely mapped ``domain_id``) is set, the pipeline fills
-omitted ``raw_action_dim``, ``action_chunk_size``, ``num_frames``,
+``COSMOS3_DOMAIN_PRESETS`` lists training-aligned sampling defaults per
+embodiment. When ``domain_name`` (or a uniquely mapped ``domain_id``) is set,
+the pipeline fills omitted ``action_chunk_size``, ``num_frames``,
 ``action_resolution``, and ``frame_rate`` from the preset and logs a warning if
 explicit values differ. See Cosmos3 omni ``action_*.json`` inputs for reference
 configs (bridge, av, droid, libero, etc.).
+
+``raw_action_dim`` is deliberately *not* a preset field: it is fixed by the
+embodiment, while several embodiments share one preset via
+``COSMOS3_DOMAIN_PRESET_ALIASES``. It resolves from
+``action.EMBODIMENT_TO_RAW_ACTION_DIM`` instead.
 """
 
 from typing import Any, TypedDict
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     COSMOS3_ACTION_RESOLUTIONS,
+    DEFAULT_ACTION_VIEW_POINT,
     EMBODIMENT_TO_DOMAIN_ID,
     normalize_action_resolution,
+    resolve_raw_action_dim,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 
@@ -85,9 +92,12 @@ COSMOS3_ACTION_PARAMS = {
 
 
 class Cosmos3DomainPreset(TypedDict, total=False):
-    """Recommended action-generation settings for a trained embodiment."""
+    """Recommended action sampling settings for a trained embodiment.
 
-    raw_action_dim: int
+    Sampling settings only — the embodiment's action width lives in
+    ``action.EMBODIMENT_TO_RAW_ACTION_DIM``, keyed by the unaliased domain name.
+    """
+
     action_chunk_size: int
     num_frames: int
     action_resolution: int
@@ -96,9 +106,8 @@ class Cosmos3DomainPreset(TypedDict, total=False):
 
 # Training-aligned defaults. Values mirror Cosmos3 omni action JSON examples where available.
 COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
-    # WidowX bridge; 7-DOF arm + gripper in 10-D state.
+    # WidowX bridge.
     "bridge_orig_lerobot": {
-        "raw_action_dim": 10,
         "action_chunk_size": 16,
         "num_frames": 17,
         "action_resolution": 480,
@@ -106,7 +115,6 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     },
     # Autonomous-vehicle steering/throttle; longer action horizon.
     "av": {
-        "raw_action_dim": 9,
         "action_chunk_size": 60,
         "num_frames": 61,
         "action_resolution": 480,
@@ -114,7 +122,6 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     },
     # 6-DoF camera pose + shutter; matches AV-style horizon.
     "camera_pose": {
-        "raw_action_dim": 9,
         "action_chunk_size": 60,
         "num_frames": 61,
         "action_resolution": 480,
@@ -122,7 +129,6 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     },
     # Franka single-arm tabletop; same domain_id as robomind-franka.
     "droid_lerobot": {
-        "raw_action_dim": 10,
         "action_chunk_size": 16,
         "num_frames": 17,
         "action_resolution": 480,
@@ -130,15 +136,13 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     },
     # LIBERO sim single-arm; lower action resolution bucket.
     "libero": {
-        "raw_action_dim": 10,
         "action_chunk_size": 16,
         "num_frames": 17,
         "action_resolution": 256,
         "frame_rate": 10.0,
     },
-    # MANO hand pose; high-DOF hand articulation.
+    # MANO hand pose.
     "hand_pose": {
-        "raw_action_dim": 57,
         "action_chunk_size": 16,
         "num_frames": 17,
         "action_resolution": 480,
@@ -146,7 +150,6 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     },
     # AgiBot humanoid; shared domain_id with agibot_gear_gripper*.
     "agibotworld": {
-        "raw_action_dim": 29,
         "action_chunk_size": 16,
         "num_frames": 17,
         "action_resolution": 480,
@@ -154,7 +157,6 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     },
     # Google Robot (RT-1 / fractal) single-arm.
     "fractal": {
-        "raw_action_dim": 10,
         "action_chunk_size": 16,
         "num_frames": 17,
         "action_resolution": 480,
@@ -162,7 +164,6 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     },
     # 2-D planar push task.
     "pusht": {
-        "raw_action_dim": 2,
         "action_chunk_size": 16,
         "num_frames": 17,
         "action_resolution": 256,
@@ -170,7 +171,6 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     },
     # UMI handheld gripper setup.
     "umi": {
-        "raw_action_dim": 10,
         "action_chunk_size": 16,
         "num_frames": 17,
         "action_resolution": 480,
@@ -178,7 +178,9 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     },
 }
 
-# Map alias domain_name keys to a canonical preset entry.
+# Map alias domain_name keys to a canonical preset entry. These share *sampling*
+# settings only; each alias keeps its own action width (e.g. robomind-franka-dual
+# is 20-D and galbot is 30-D, unlike the presets they borrow here).
 COSMOS3_DOMAIN_PRESET_ALIASES: dict[str, str] = {
     "robomind-franka": "droid_lerobot",
     "robomind-franka-dual": "droid_lerobot",
@@ -274,7 +276,24 @@ def resolve_domain_action_config(
             return recommended
         return fallback
 
-    resolved_raw_action_dim = _resolve_field("raw_action_dim", raw_action_dim)
+    # The action width is canonical per embodiment, so it comes from the
+    # embodiment table rather than the (alias-shared) sampling preset.
+    canonical_raw_action_dim = resolve_raw_action_dim(domain_name=domain_name, domain_id=domain_id)
+    if raw_action_dim is not None:
+        if canonical_raw_action_dim is not None and int(raw_action_dim) != canonical_raw_action_dim:
+            warnings.append(
+                f"Cosmos3 raw_action_dim={raw_action_dim} differs from the canonical width "
+                f"{canonical_raw_action_dim} for domain_name={domain_name!r}."
+            )
+        resolved_raw_action_dim = raw_action_dim
+    else:
+        resolved_raw_action_dim = canonical_raw_action_dim
+        if domain_requested and canonical_raw_action_dim is None:
+            warnings.append(
+                "Cosmos3 has no canonical action width for "
+                f"domain_name={domain_name!r}, domain_id={domain_id!r}; "
+                "pass raw_action_dim explicitly for policy/inverse_dynamics."
+            )
     resolved_chunk = _resolve_field(
         "action_chunk_size",
         action_chunk_size,
@@ -376,7 +395,8 @@ COSMOS3_EXTRA_SPECS: dict[str, ExtraParamSchema] = {
         default=None,
         description=(
             "Raw action DOF for policy/inverse_dynamics (e.g. 10 bridge, 9 av, 29 agibot). "
-            "Inferred from domain_name preset when omitted."
+            "Resolved from the embodiment when omitted; required for domains with no "
+            "canonical width (libero)."
         ),
     ),
     "action_chunk_size": ExtraParamSchema(
@@ -400,6 +420,14 @@ COSMOS3_EXTRA_SPECS: dict[str, ExtraParamSchema] = {
             f"{list(COSMOS3_ACTION_RESOLUTIONS)}. Inferred from domain_name preset when omitted."
         ),
         range=(min(COSMOS3_ACTION_RESOLUTIONS), max(COSMOS3_ACTION_RESOLUTIONS)),
+    ),
+    "view_point": ExtraParamSchema(
+        type="Literal['ego_view', 'third_person_view', 'wrist_view', 'concat_view']",
+        default=DEFAULT_ACTION_VIEW_POINT,
+        description=(
+            "Camera perspective for action generation. Fills the trained action caption's "
+            "cinematography.framing field."
+        ),
     ),
     "action_fps": ExtraParamSchema(
         type="float",

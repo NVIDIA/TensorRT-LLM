@@ -451,7 +451,8 @@ def _forward_with_action(
     with torch.inference_mode():
         out = model(
             hidden_states=hs,
-            timestep=ts,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
             text_ids=text_ids,
             text_mask=text_mask,
             video_shape=video_shape,

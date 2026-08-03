@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,8 @@ import numpy as np
 import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
+
+from tensorrt_llm.logger import logger
 
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
@@ -41,6 +45,132 @@ EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
     "agibot_gear_gripper_ext": 15,
     "fractal": 20,
 }
+
+# Canonical unpadded action width per embodiment.  Widths compose the Cosmos3
+# unified action representation from shared geometric blocks: a 9-D pose (3-D
+# translation + 6-D rotation), a 1-D grasp state, and a 15-D fingertip state.
+# One arm is 9 + 1 = 10; a dual-arm setup is 20; the AgiBot humanoid is
+# 9 + 2 x (9 + 1) = 29; two-hand egocentric motion is 9 + 2 x (9 + 15) = 57.
+#
+# This is a property of the embodiment, not a tunable, so it is keyed by the
+# real domain name rather than by the sampling presets in ``defaults.py`` (where
+# several of these names share one preset).  ``libero`` is absent on purpose:
+# its width depends on the dataset's rotation space (7/10/13), so callers must
+# pass ``raw_action_dim`` explicitly.
+EMBODIMENT_TO_RAW_ACTION_DIM: dict[str, int] = {
+    "av": 9,
+    "camera_pose": 9,
+    "hand_pose": 57,
+    "pusht": 2,
+    "umi": 10,
+    "bridge_orig_lerobot": 10,
+    "droid_lerobot": 10,
+    "robomind-franka": 10,
+    "robomind-franka-dual": 20,
+    "robomind-ur": 10,
+    "galbot": 30,
+    "agibotworld": 29,
+    "agibot_gear_gripper": 29,
+    "agibot_gear_gripper_ext": 29,
+    "fractal": 10,
+}
+
+
+def resolve_raw_action_dim(
+    domain_name: Any = None,
+    domain_id: Any = None,
+) -> int | None:
+    """Look up the canonical action width, or None when it cannot be determined.
+
+    Resolves by name first.  A bare ``domain_id`` is only usable when every
+    embodiment sharing that id agrees on a width (true for all current ids).
+    """
+    if domain_name is not None and str(domain_name).strip():
+        return EMBODIMENT_TO_RAW_ACTION_DIM.get(str(domain_name).strip().lower())
+
+    if domain_id is None:
+        return None
+
+    widths = {
+        EMBODIMENT_TO_RAW_ACTION_DIM[name]
+        for name, mapped_id in EMBODIMENT_TO_DOMAIN_ID.items()
+        if mapped_id == int(domain_id) and name in EMBODIMENT_TO_RAW_ACTION_DIM
+    }
+    return widths.pop() if len(widths) == 1 else None
+
+
+# Camera perspective -> framing sentence. The action model was trained on these
+# exact sentences, so they are reproduced verbatim rather than paraphrased.
+ACTION_VIEWPOINT_TEMPLATES: dict[str, str] = {
+    "ego_view": "This video is captured from a first-person perspective looking at the scene.",
+    "third_person_view": (
+        "This video is captured from a third-person perspective looking towards the agent "
+        "from the front."
+    ),
+    "wrist_view": "This video is captured from a wrist-mounted camera.",
+    "concat_view": "This video contains concatenated views from multiple camera perspectives.",
+}
+
+DEFAULT_ACTION_VIEW_POINT = "ego_view"
+
+# Canonical ``W,H`` labels; every action canvas is one of these bucket shapes.
+ACTION_ASPECT_RATIO_LABELS = ("1,1", "4,3", "3,4", "16,9", "9,16")
+
+
+def action_aspect_ratio_label(height: int, width: int) -> str:
+    """Closest canonical aspect label, e.g. 832x480 -> ``"16,9"``.
+
+    Bucket sizes are only approximately their label (832/480 is 1.733, not
+    1.778), so the label is matched by nearest ratio instead of reducing H/W.
+    """
+    ratio = width / height if height > 0 else 1.0
+    return min(
+        ACTION_ASPECT_RATIO_LABELS,
+        key=lambda label: abs(int(label.split(",")[0]) / int(label.split(",")[1]) - ratio),
+    )
+
+
+def build_action_json_prompt(
+    description: str,
+    *,
+    view_point: str | None,
+    num_frames: int,
+    frame_rate: float,
+    height: int,
+    width: int,
+) -> str:
+    """Build the structured action caption the action model was trained on.
+
+    Replaces the flat duration/resolution templates used by the video paths: the
+    JSON already carries duration, fps, resolution and aspect ratio. Key order is
+    part of the trained format and is preserved.
+    """
+    duration_seconds = num_frames / frame_rate if frame_rate > 0 else 0.0
+    if not math.isfinite(duration_seconds) or duration_seconds < 0:
+        duration_seconds = 0.0
+    minutes, seconds = divmod(round(duration_seconds), 60)
+
+    text = description.strip()
+    if text and not text.endswith((".", "!", "?")):
+        text = f"{text}."
+
+    framing = ACTION_VIEWPOINT_TEMPLATES.get(view_point) if view_point is not None else None
+    if view_point is not None and framing is None:
+        logger.warning(
+            f"Unrecognized Cosmos3 action view_point={view_point!r}; expected one of "
+            f"{sorted(ACTION_VIEWPOINT_TEMPLATES)}. Dropping the cinematography.framing field."
+        )
+
+    prompt: dict[str, Any] = {}
+    if framing:
+        prompt["cinematography"] = {"framing": framing}
+    prompt["actions"] = [{"time": f"0:00-{minutes}:{seconds:02d}", "description": text}]
+    prompt["duration"] = f"{int(duration_seconds)}s"
+    prompt["fps"] = float(frame_rate)
+    prompt["resolution"] = {"H": int(height), "W": int(width)}
+    prompt["aspect_ratio"] = action_aspect_ratio_label(height, width)
+    return json.dumps(prompt)
+
 
 VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
     "256": {

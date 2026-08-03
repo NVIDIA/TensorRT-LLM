@@ -36,8 +36,10 @@ from tensorrt_llm.logger import logger
 
 from .action import (
     ACTION_MODE_INVERSE_DYNAMICS,
+    DEFAULT_ACTION_VIEW_POINT,
     action_reference_image,
     action_start_frame_offset,
+    build_action_json_prompt,
     build_vision_condition_mask,
     normalize_action_mode,
     normalize_action_video_input,
@@ -304,6 +306,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             action_resolution=extra_params.get("action_resolution")
             or extra_params.get("image_size"),
             action_fps=extra_params.get("action_fps"),
+            view_point=extra_params.get("view_point", DEFAULT_ACTION_VIEW_POINT),
             video=extra_params.get("video"),
         )
 
@@ -757,6 +760,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         action: Any = None,
         action_resolution: Optional[int] = None,
         action_fps: Optional[float] = None,
+        view_point: Optional[str] = DEFAULT_ACTION_VIEW_POINT,
         video: Any = None,
     ):
         pipeline_start = time.time()
@@ -923,43 +927,61 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if negative_prompt is None:
             negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT
 
-        # Positive prompt: forward duration/resolution templates.  T2I has no
-        # duration concept (single image) and uses the image-flavored
-        # resolution template.
-        use_duration_template = use_duration_template and not is_t2i
-        dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
-        if use_resolution_template:
-            res_tmpl = (
-                COSMOS3_IMAGE_RESOLUTION_TEMPLATE if is_t2i else COSMOS3_DEFAULT_RESOLUTION_TEMPLATE
-            )
+        if do_action:
+            # Action checkpoints were trained on a structured JSON caption that
+            # already carries duration/fps/resolution/aspect_ratio, so the flat
+            # templates are skipped here and the negative prompt stays verbatim.
+            prompt = [
+                build_action_json_prompt(
+                    p,
+                    view_point=view_point,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    height=height,
+                    width=width,
+                )
+                for p in prompt
+            ]
         else:
-            res_tmpl = None
+            # Positive prompt: forward duration/resolution templates.  T2I has no
+            # duration concept (single image) and uses the image-flavored
+            # resolution template.
+            use_duration_template = use_duration_template and not is_t2i
+            dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
+            if use_resolution_template:
+                res_tmpl = (
+                    COSMOS3_IMAGE_RESOLUTION_TEMPLATE
+                    if is_t2i
+                    else COSMOS3_DEFAULT_RESOLUTION_TEMPLATE
+                )
+            else:
+                res_tmpl = None
 
-        # Negative prompt: mirror positive metadata (cosmos-framework CLI default
-        # when ``negative_prompt_keep_metadata`` promotes mode to ``same``).
-        negative_prompt = self._format_prompt_with_metadata(
-            negative_prompt,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            duration_template=dur_tmpl,
-            resolution_template=res_tmpl,
-            force_duration_template=False,
-        )
-
-        prompt = [
-            self._format_prompt_with_metadata(
-                p,
+            # Negative prompt: mirror positive metadata (cosmos-framework CLI default
+            # when ``negative_prompt_keep_metadata`` promotes mode to ``same``).
+            negative_prompt = self._format_prompt_with_metadata(
+                negative_prompt,
                 height=height,
                 width=width,
                 num_frames=num_frames,
                 frame_rate=frame_rate,
                 duration_template=dur_tmpl,
                 resolution_template=res_tmpl,
+                force_duration_template=False,
             )
-            for p in prompt
-        ]
+
+            prompt = [
+                self._format_prompt_with_metadata(
+                    p,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    duration_template=dur_tmpl,
+                    resolution_template=res_tmpl,
+                )
+                for p in prompt
+            ]
         logger.info(f"Prompt with metadata: '{prompt}'")
 
         prompt = prompt[0]

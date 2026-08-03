@@ -103,6 +103,7 @@ def compute_mrope_position_ids_vision(
     temporal_compression_factor: int = 4,
     enable_fps_modulation: bool = False,
     start_frame_offset: int = 0,
+    base_temporal_compression_factor: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
@@ -114,12 +115,20 @@ def compute_mrope_position_ids_vision(
     to reflect real time so that videos at different frame rates get comparable
     temporal embeddings.
 
+    ``base_temporal_compression_factor`` sets the temporal grid the scaled
+    positions land on, and defaults to ``temporal_compression_factor``.  Action
+    tokens run at frame rate (``temporal_compression_factor=1``) but must share
+    the vision latent-frame grid, so they pass the vision VAE factor here.
+
     Returns:
         (position_ids [3, grid_t * grid_h * grid_w], next_temporal_offset)
     """
+    if base_temporal_compression_factor is None:
+        base_temporal_compression_factor = temporal_compression_factor
+
     if enable_fps_modulation and fps is not None:
         tps = fps / temporal_compression_factor
-        base_tps = base_fps / temporal_compression_factor
+        base_tps = base_fps / base_temporal_compression_factor
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
         t_index = (
             ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
@@ -161,7 +170,13 @@ def compute_mrope_position_ids_action(
     enable_fps_modulation: bool = True,
     start_frame_offset: int = 1,
 ) -> tuple[torch.Tensor, int | float]:
-    """Generate mRoPE IDs for action tokens as a frame-rate (T, 1, 1) grid."""
+    """Generate mRoPE IDs for action tokens as a frame-rate (T, 1, 1) grid.
+
+    Action tokens are uncompressed in time, so they advance one source frame per
+    token while vision latent frames advance ``base_temporal_compression_factor``
+    source frames.  Scaling against the vision base rate keeps both streams on
+    one shared timeline.
+    """
     return compute_mrope_position_ids_vision(
         grid_t=grid_t,
         grid_h=1,
@@ -172,6 +187,7 @@ def compute_mrope_position_ids_action(
         temporal_compression_factor=1,
         enable_fps_modulation=enable_fps_modulation,
         start_frame_offset=start_frame_offset,
+        base_temporal_compression_factor=base_temporal_compression_factor,
     )
 
 

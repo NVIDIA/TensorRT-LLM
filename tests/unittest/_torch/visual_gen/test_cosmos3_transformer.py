@@ -463,7 +463,8 @@ class TestCosmos3Action:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -484,10 +485,14 @@ class TestCosmos3Action:
         )
         action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
         domain_ids = torch.tensor([self.NUM_DOMAINS], dtype=torch.long, device=DEVICE)
-        with torch.inference_mode(), pytest.raises(ValueError, match="domain_id"):
+        with (
+            torch.inference_mode(),
+            pytest.raises(ValueError, match=r"domain_id must be in \[0, \d+\)"),
+        ):
             model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -506,7 +511,8 @@ class TestCosmos3Action:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -528,7 +534,8 @@ class TestCosmos3Action:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
@@ -552,7 +559,8 @@ class TestCosmos3Action:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
-                timestep=ts,
+                timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                raw_timestep=ts,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 video_shape=video_shape,
