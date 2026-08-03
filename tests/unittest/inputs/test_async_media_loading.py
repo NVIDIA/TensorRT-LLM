@@ -29,6 +29,7 @@ import tensorrt_llm.inputs.utils as utils_module
 from tensorrt_llm.inputs.media_io import (
     AudioMediaIO,
     ImageMediaIO,
+    NotADataURIError,
     UnsupportedDataURIEncodingError,
     _get_aiohttp_session,
     parse_data_uri,
@@ -159,6 +160,26 @@ class TestParseDataUri:
         assert isinstance(unsupported.value, UnsupportedDataURIEncodingError)
 
     @pytest.mark.parametrize(
+        "path",
+        [
+            "/tmp/holiday,2026.mp4",  # absolute path, comma in the filename
+            "./clips/a,b.mp4",  # relative path
+            "holiday,2026.mp4",  # bare filename
+            "/tmp/plain.mp4",  # no comma at all
+        ],
+    )
+    def test_non_data_scheme_is_rejected_as_such(self, path):
+        """A filesystem path must not be diagnosed as bad base64.
+
+        Without a scheme check, a path containing a "," is split like a data
+        URI and reported as an encoding problem, which is misleading.
+        """
+        with pytest.raises(NotADataURIError, match="Expected a 'data:' URI") as excinfo:
+            parse_data_uri(path)
+        assert not isinstance(excinfo.value, UnsupportedDataURIEncodingError)
+        assert path in str(excinfo.value)
+
+    @pytest.mark.parametrize(
         "url",
         [
             "data:image/jpeg;charset=utf-8;base64,QUJD",
@@ -166,6 +187,7 @@ class TestParseDataUri:
             "data:audio/wav;codecs=opus;base64,QUJD",
             "data:image/png,hello",
             "data:image/png;base64",
+            "/tmp/holiday,2026.mp4",
         ],
     )
     def test_accepts_str_and_parseresult_identically(self, url):

@@ -586,6 +586,14 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
+class NotADataURIError(ValueError):
+    """A URL handed to the data: URI parser that is not a data: URI.
+
+    A plain ValueError rather than also a NotImplementedError: the payload is
+    not an unsupported encoding, the input is simply the wrong kind of URL.
+    """
+
+
 class UnsupportedDataURIEncodingError(NotImplementedError, ValueError):
     """A data: URI whose payload is not base64-encoded.
 
@@ -613,15 +621,23 @@ def parse_data_uri(url: Union[str, ParseResult]) -> Tuple[str, str]:
         that omit it, such as `data:;base64,...`, which RFC 2397 permits.
 
     Raises:
+        NotADataURIError: The URL is not a `data:` URI at all.
         ValueError: The URI has no `,` separating the header from the payload.
         UnsupportedDataURIEncodingError: The payload is not base64-encoded. This is
             both a NotImplementedError and a ValueError.
     """
     parsed = url if isinstance(url, ParseResult) else urlparse(url)
+    displayed = parsed.geturl()[:64]
+    # Check the scheme first: without it a filesystem path containing a "," is
+    # split like a data URI and misreported as an encoding problem.
+    if parsed.scheme != "data":
+        raise NotADataURIError(
+            f"Expected a 'data:' URI but got scheme {parsed.scheme!r}: {displayed!r}."
+        )
     path = parsed.path
     if "," not in path:
         raise ValueError(
-            f"Malformed data URI {parsed.geturl()[:64]!r}: expected "
+            f"Malformed data URI {displayed!r}: expected "
             "'data:[<media type>][;<parameter>]*,<data>', but found no ',' separating "
             "the header from the payload."
         )
