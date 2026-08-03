@@ -227,7 +227,7 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
             launch_stages,
         )
 
-    def test_product_reporting_is_excluded_from_dry_run(self):
+    def test_product_reporting_is_excluded_but_test_results_are_collected(self):
         setup = _function_body(
             PARENT_GROOVY,
             "setupPipelineEnvironment",
@@ -237,10 +237,16 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
             setup.index("if (testFilter[INFRA_DRY_RUN])"),
             setup.index("getCbtsResult("),
         )
+        always_start = PARENT_GROOVY.index("        always {")
+        always_block = PARENT_GROOVY[
+            always_start : PARENT_GROOVY.index("    stages {", always_start)
+        ]
         self.assertIn(
-            "!testFilter[INFRA_DRY_RUN]) {\n                    collectTestResults(",
-            PARENT_GROOVY,
+            "if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {",
+            always_block,
         )
+        self.assertIn("collectTestResults(this, testFilter, globalVars)", always_block)
+        self.assertNotIn("testFilter[INFRA_DRY_RUN]", always_block)
         self.assertNotIn("L0_Stability", PARENT_GROOVY)
 
     def test_dry_run_skips_changed_file_analysis(self):
