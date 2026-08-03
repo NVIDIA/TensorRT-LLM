@@ -428,10 +428,8 @@ class ModelConfig(Generic[TConfig]):
                 )
             json_quant_configs.update(json_extended_quant_configs)
             # kv_cache_quant_algo is global regardless of MIXED_PRECISION
-            kv_cache_quant_algo = (QuantAlgo(
-                json_quant_configs['kv_cache_quant_algo']) if
-                                   json_quant_configs.get('kv_cache_quant_algo')
-                                   is not None else None)
+            kv_cache_quant_algo = _algo_or_none(
+                json_quant_configs.get('kv_cache_quant_algo'))
             mixed_quant_configs = json_quant_configs.get(
                 'quantized_layers', None)
             if (kv_quant_lhs := json_extended_quant_configs.get(

@@ -120,7 +120,9 @@ class InklingTextConfig(PretrainedConfig):
 
         self.dense_mlp_idx = dense_mlp_idx
         self.intermediate_size = intermediate_size
-        self.moe_intermediate_size = intermediate_size
+        # A config.json may spell this out; PretrainedConfig.__init__ has already
+        # stored it from **kwargs, so read it back before defaulting.
+        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", intermediate_size)
         self.dense_intermediate_size = dense_intermediate_size
         self.n_routed_experts = n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok

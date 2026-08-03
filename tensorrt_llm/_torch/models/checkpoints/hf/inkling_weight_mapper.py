@@ -257,13 +257,27 @@ class InklingHfWeightMapper(HfWeightMapper):
     ``weight_scale_2`` and ``input_scale``) that the fused-MoE loader consumes.
     """
 
+    @property
+    def _text_config(self):
+        """The text sub-config the mapped weights actually describe.
+
+        ``ModelLoader.load`` initializes the mapper with the TOP-LEVEL
+        ``InklingConfig``, which carries the decoder geometry under
+        ``text_config`` and has no ``vocab_size`` / ``n_routed_experts`` of its
+        own. Resolving here covers both entry points: the loader-supplied mapper
+        and the one ``InklingForConditionalGeneration.load_weights`` builds.
+        """
+        cfg = self.config.pretrained_config
+        return getattr(cfg, "text_config", cfg)
+
     def preprocess_weights(self, weights: Dict) -> Dict:
         new_weights: Dict[str, torch.Tensor] = {}
+        text_config = self._text_config
         unpadded_vocab = int(
             getattr(
-                self.config.pretrained_config,
+                text_config,
                 "unpadded_vocab_size",
-                self.config.pretrained_config.vocab_size,
+                text_config.vocab_size,
             )
         )
         for name, tensor in weights.items():
@@ -348,7 +362,7 @@ class InklingHfWeightMapper(HfWeightMapper):
             # already correct, so ONLY the activation input scale needs this.
             tensor = tensor.to(torch.float32) / (_NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX)
 
-        n_experts = int(getattr(self.config.pretrained_config, "n_routed_experts", tensor.shape[0]))
+        n_experts = int(getattr(self._text_config, "n_routed_experts", tensor.shape[0]))
         projs = ("w1", "w3") if which == "w13_weight" else ("w2",)
 
         def _assign(e, vals):
