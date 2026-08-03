@@ -65,6 +65,18 @@ AGREEMENT_AB_CONFIGS = (
         "eplb0_mtp1_ccb-NIXL-sync-terminal.yaml"
     ),
 )
+EMPTY_GEN_STATUS_AB_CONFIGS = (
+    DISAGG_CONFIG_DIR
+    / (
+        "gb300_deepseek-r1-fp4_128k8k_con256_ctx1_pp4_gen1_dep8_"
+        "eplb0_mtp1_ccb-NIXL-empty-gen-status-control.yaml"
+    ),
+    DISAGG_CONFIG_DIR
+    / (
+        "gb300_deepseek-r1-fp4_128k8k_con256_ctx1_pp4_gen1_dep8_"
+        "eplb0_mtp1_ccb-NIXL-empty-gen-status-treatment.yaml"
+    ),
+)
 AGREEMENT_AB_TEST_LIST = (
     REPO_ROOT
     / "tests"
@@ -308,6 +320,53 @@ def test_python_consensus_ab_config_changes_only_terminal_mode():
             == 11_400_000
         )
 
+
+def test_python_empty_gen_status_ab_changes_only_diagnostic_mode():
+    configs = []
+    effective_envs = []
+    arms = []
+    for config_path in EMPTY_GEN_STATUS_AB_CONFIGS:
+        with open(config_path) as config_file:
+            config = yaml.safe_load(config_file)
+        configs.append(config)
+        arm = config["benchmark"]["agreement_ab_arms"][0]
+        arms.append(arm)
+        base_env = {
+            item.split("=", 1)[0]: item.split("=", 1)[1]
+            for item in config["environment"]["ctx_worker_env_var"].split()
+            if "=" in item
+        }
+        effective_env = dict(base_env)
+        effective_env.update(
+            item.split("=", 1) for item in arm["ctx_worker_env_var"].split() if "=" in item
+        )
+        effective_envs.append(effective_env)
+
+    assert [arm["name"] for arm in arms] == [
+        "empty-gen-status-control",
+        "empty-gen-status-treatment",
+    ]
+    assert [env["TRTLLM_NVBUG_6448152_SKIP_EMPTY_PYTHON_GEN_STATUS"] for env in effective_envs] == [
+        "0",
+        "1",
+    ]
+    assert [
+        env["TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS"] for env in effective_envs
+    ] == ["1", "1"]
+    assert [
+        env["TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_PEER_READY_CONSENSUS"] for env in effective_envs
+    ] == ["1", "1"]
+
+    normalized_configs = copy.deepcopy(configs)
+    for config in normalized_configs:
+        arm = config["benchmark"]["agreement_ab_arms"][0]
+        arm["name"] = "<arm>"
+        arm["ctx_worker_env_var"] = (
+            "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS=1 "
+            "TRTLLM_NVBUG_6448152_SKIP_EMPTY_PYTHON_GEN_STATUS=<mode>"
+        )
+    assert normalized_configs[0] == normalized_configs[1]
+
     test_list = yaml.safe_load(AGREEMENT_AB_TEST_LIST.read_text())
     post_merge_tests = next(
         entry["tests"]
@@ -318,12 +377,12 @@ def test_python_consensus_ab_config_changes_only_terminal_mode():
         (
             "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-"
             "gb300_deepseek-r1-fp4_128k8k_con256_ctx1_pp4_gen1_dep8_"
-            "eplb0_mtp1_ccb-NIXL-async-terminal] TIMEOUT (210)"
+            "eplb0_mtp1_ccb-NIXL-empty-gen-status-control] TIMEOUT (210)"
         ),
         (
             "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-"
             "gb300_deepseek-r1-fp4_128k8k_con256_ctx1_pp4_gen1_dep8_"
-            "eplb0_mtp1_ccb-NIXL-sync-terminal] TIMEOUT (210)"
+            "eplb0_mtp1_ccb-NIXL-empty-gen-status-treatment] TIMEOUT (210)"
         ),
     ]
 

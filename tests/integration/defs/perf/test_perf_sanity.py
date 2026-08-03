@@ -31,7 +31,6 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
-from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 from test_common.perf_sanity_agreement import (
     BENCHMARK_STATUS_FAILED,
     BENCHMARK_STATUS_SUCCESS,
@@ -50,6 +49,7 @@ from test_common.perf_sanity_agreement import (
     validate_context_agreement_mode,
     write_atomic_coordination_text,
 )
+from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 
 from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port

@@ -72,6 +72,7 @@ from tensorrt_llm.mapping import Mapping
 _ASYNC_TERMINAL_ENV = "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS"
 _ASYNC_PEER_READY_ENV = "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_PEER_READY_CONSENSUS"
 _CONTEXT_ACTIVATION_DIGEST_ENV = "TRTLLM_PYTHON_TRANSCEIVER_CONTEXT_ACTIVATION_DIGEST"
+_EMPTY_GEN_STATUS_BYPASS_ENV = "TRTLLM_NVBUG_6448152_SKIP_EMPTY_PYTHON_GEN_STATUS"
 _ASYNC_STARTUP_TAG = "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CONSENSUS"
 _ASYNC_READY_CANCELLED_EPOCH_ATTR = "_trtllm_async_ready_cancelled_epoch"
 _MAX_RETIRED_CONSENSUS_REQUESTS = 65536
@@ -162,6 +163,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         try:
             self._context_info_endpoint = self._broadcast_context_endpoint()
             self._exchange_rank_info()
+            self._complete_empty_gen_status_diagnostic_startup()
         except Exception:
             self._rollback_failed_startup()
             raise
@@ -266,6 +268,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _init_async_consensus(self, cache_transceiver_config: CacheTransceiverConfig) -> None:
         self._init_context_activation_digest()
+        diagnostic_value = os.getenv(_EMPTY_GEN_STATUS_BYPASS_ENV)
+        self._empty_gen_status_diagnostic_configured = diagnostic_value is not None
+        self._empty_gen_status_flag_value = (
+            diagnostic_value if diagnostic_value is not None else "<unset>"
+        )
+        # Parse only after the existing startup exchange. A malformed or
+        # rank-mismatched TEST ONLY value must fail collectively rather than
+        # letting one PP rank reject before its peers enter startup.
+        self._empty_gen_status_bypass_enabled = False
+        self._empty_gen_status_diagnostic_started = False
+        self._empty_gen_status_exercised_logged = False
+        self._empty_gen_status_summary_logged = False
+        self._empty_gen_status_counters: Dict[str, int] = defaultdict(int)
         terminal_value = os.getenv(_ASYNC_TERMINAL_ENV, "0")
         peer_ready_value = os.getenv(_ASYNC_PEER_READY_ENV, "0")
         self._async_terminal_flag_value = terminal_value
@@ -314,6 +329,64 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # A malformed or mismatched same-version opt-in must reach that
         # universally-entered allgather before every new worker rejects it.
 
+    def _complete_empty_gen_status_diagnostic_startup(self) -> None:
+        if not self._empty_gen_status_diagnostic_configured:
+            return
+
+        self._empty_gen_status_bypass_enabled = self._parse_binary_env(
+            _EMPTY_GEN_STATUS_BYPASS_ENV,
+            self._empty_gen_status_flag_value,
+        )
+
+        mapping = self._mapping
+        config = self._async_consensus_config
+        qualified = (
+            self._async_consensus is not None
+            and self._async_terminal_consensus_enabled
+            and self._async_peer_ready_consensus_enabled
+            and config.backend == "NIXL"
+            and config.transceiver_runtime == "PYTHON"
+            and mapping.world_size == 4
+            and mapping.tp_size == 1
+            and mapping.pp_size == 4
+            and mapping.cp_size == 1
+            and not mapping.enable_attention_dp
+        )
+        if not qualified:
+            raise RuntimeError(
+                f"{_EMPTY_GEN_STATUS_BYPASS_ENV} is TEST ONLY and requires "
+                "the exact Python/NIXL CTX PP4 async-terminal/peer-ready topology"
+            )
+
+        self._empty_gen_status_diagnostic_started = True
+        mode = "treatment" if self._empty_gen_status_bypass_enabled else "control"
+        logger.info(
+            "PYTHON_EMPTY_GEN_STATUS_DIAGNOSTIC "
+            f"event=startup rank={self._dist.rank} mode={mode} "
+            "world=4 tp=1 pp=4 cp=1 attention_dp=0 "
+            "terminal=1 peer_ready=1"
+        )
+
+    def _log_empty_gen_status_diagnostic_summary(self) -> None:
+        if not getattr(self, "_empty_gen_status_diagnostic_started", False) or getattr(
+            self, "_empty_gen_status_summary_logged", False
+        ):
+            return
+        mode = "treatment" if self._empty_gen_status_bypass_enabled else "control"
+        counters = self._empty_gen_status_counters
+        logger.info(
+            "PYTHON_EMPTY_GEN_STATUS_DIAGNOSTIC "
+            f"event=shutdown_summary rank={self._dist.rank} mode={mode} "
+            f"checks={counters['checks']} "
+            f"async_progress_calls={counters['async_progress_calls']} "
+            f"async_progress_nonempty_calls={counters['async_progress_nonempty_calls']} "
+            f"skipped_empty_status_calls={counters['skipped_empty_status_calls']} "
+            f"legacy_status_calls={counters['legacy_status_calls']} "
+            f"recv_session_observed_calls={counters['recv_session_observed_calls']} "
+            f"unexpected_recv_session_calls={counters['unexpected_recv_session_calls']}"
+        )
+        self._empty_gen_status_summary_logged = True
+
     def _async_startup_descriptor(self) -> tuple:
         config = self._async_consensus_config
         topology = (
@@ -336,6 +409,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             topology,
             self._async_terminal_flag_value,
             self._async_peer_ready_flag_value,
+            self._empty_gen_status_flag_value,
         )
 
     def _complete_async_consensus_startup(self, gathered: list) -> list[str]:
@@ -541,6 +615,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
     def shutdown(self):
+        self._log_empty_gen_status_diagnostic_summary()
         if getattr(self, "_shutdown_complete", False):
             self._log_context_activation_digest()
             return
@@ -1738,8 +1813,45 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, reclaimable_failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
-        if getattr(self, "_async_consensus", None) is not None:
-            self._progress_async_consensus()
+        coordinator_active = getattr(self, "_async_consensus", None) is not None
+        diagnostic_active = getattr(self, "_empty_gen_status_diagnostic_started", False)
+        if coordinator_active:
+            if diagnostic_active:
+                self._empty_gen_status_counters["async_progress_calls"] += 1
+            progressed = self._progress_async_consensus()
+            if diagnostic_active and progressed:
+                self._empty_gen_status_counters["async_progress_nonempty_calls"] += 1
+        if diagnostic_active:
+            counters = self._empty_gen_status_counters
+            counters["checks"] += 1
+            if self._ever_had_recv_session:
+                counters["recv_session_observed_calls"] += 1
+            if (
+                self._empty_gen_status_bypass_enabled
+                and coordinator_active
+                and at_least_request_num == 0
+            ):
+                if self._ever_had_recv_session:
+                    counters["unexpected_recv_session_calls"] += 1
+                    logger.error(
+                        "PYTHON_EMPTY_GEN_STATUS_DIAGNOSTIC "
+                        f"event=invariant_violation rank={self._dist.rank} "
+                        "mode=treatment unexpected_recv_session=1"
+                    )
+                    raise RuntimeError(
+                        "TEST ONLY empty CTX GEN-status bypass observed a receive session"
+                    )
+                counters["skipped_empty_status_calls"] += 1
+                if not self._empty_gen_status_exercised_logged:
+                    logger.info(
+                        "PYTHON_EMPTY_GEN_STATUS_DIAGNOSTIC "
+                        f"event=exercised rank={self._dist.rank} mode=treatment "
+                        "at_least_request_num=0 ever_had_recv_session=0 "
+                        "async_progress_called_before_skip=1"
+                    )
+                    self._empty_gen_status_exercised_logged = True
+                return [], [], []
+            counters["legacy_status_calls"] += 1
         if not self._ever_had_recv_session and not self._gen_need_sync:
             return [], [], []
         block_all = at_least_request_num is None

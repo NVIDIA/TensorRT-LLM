@@ -42,6 +42,7 @@ def _clear_async_consensus_env(monkeypatch) -> None:
     monkeypatch.delenv(transceiver_module._ASYNC_TERMINAL_ENV, raising=False)
     monkeypatch.delenv(transceiver_module._ASYNC_PEER_READY_ENV, raising=False)
     monkeypatch.delenv(transceiver_module._CONTEXT_ACTIVATION_DIGEST_ENV, raising=False)
+    monkeypatch.delenv(transceiver_module._EMPTY_GEN_STATUS_BYPASS_ENV, raising=False)
 
 
 @dataclass
@@ -295,6 +296,133 @@ def _enable_fake_async_consensus(
     return coordinator
 
 
+def _enable_empty_gen_status_diagnostic(
+    transceiver: KvCacheTransceiverV2,
+    *,
+    treatment: bool,
+) -> tuple[_FakeAsyncCoordinator, Mock, Mock]:
+    coordinator = _enable_fake_async_consensus(
+        transceiver,
+        terminal=True,
+        peer_ready=True,
+    )
+    transceiver._empty_gen_status_diagnostic_configured = True
+    transceiver._empty_gen_status_bypass_enabled = treatment
+    transceiver._empty_gen_status_diagnostic_started = True
+    transceiver._empty_gen_status_exercised_logged = False
+    transceiver._empty_gen_status_summary_logged = False
+    transceiver._empty_gen_status_counters = defaultdict(int)
+    transceiver._ever_had_recv_session = False
+    transceiver._gen_need_sync = True
+    gen_consensus = Mock(return_value=[])
+    gen_consensus_outcome = Mock(return_value=([], [], [], [], []))
+    transceiver._gen_consensus = gen_consensus
+    transceiver._gen_consensus_outcome = gen_consensus_outcome
+    return coordinator, gen_consensus, gen_consensus_outcome
+
+
+def test_empty_gen_status_treatment_progresses_async_protocol_before_skip() -> None:
+    transceiver = _make_transceiver({})
+    coordinator, gen_consensus, gen_consensus_outcome = _enable_empty_gen_status_diagnostic(
+        transceiver,
+        treatment=True,
+    )
+    transceiver._poll_gen_sessions_for_poll_interval = Mock()
+
+    assert transceiver.check_gen_transfer_status(0) == ([], [], [])
+
+    assert coordinator.poll_count == 1
+    gen_consensus.assert_not_called()
+    gen_consensus_outcome.assert_not_called()
+    assert transceiver._empty_gen_status_counters == {
+        "async_progress_calls": 1,
+        "checks": 1,
+        "skipped_empty_status_calls": 1,
+    }
+
+
+def test_empty_gen_status_control_preserves_legacy_consensus() -> None:
+    transceiver = _make_transceiver({})
+    coordinator, gen_consensus, gen_consensus_outcome = _enable_empty_gen_status_diagnostic(
+        transceiver,
+        treatment=False,
+    )
+
+    assert transceiver.check_gen_transfer_status(0) == ([], [], [])
+
+    assert coordinator.poll_count == 1
+    gen_consensus.assert_called_once_with([])
+    gen_consensus_outcome.assert_called_once()
+    assert transceiver._empty_gen_status_counters == {
+        "async_progress_calls": 1,
+        "checks": 1,
+        "legacy_status_calls": 1,
+    }
+
+
+@pytest.mark.parametrize("at_least_request_num", [None, 1])
+def test_empty_gen_status_treatment_never_skips_blocking_or_progress_calls(
+    at_least_request_num: Optional[int],
+) -> None:
+    transceiver = _make_transceiver({})
+    coordinator, gen_consensus, gen_consensus_outcome = _enable_empty_gen_status_diagnostic(
+        transceiver,
+        treatment=True,
+    )
+    transceiver._poll_gen_sessions_for_poll_interval = Mock()
+
+    assert transceiver.check_gen_transfer_status(at_least_request_num) == ([], [], [])
+
+    assert coordinator.poll_count == 1
+    gen_consensus.assert_called_once_with([])
+    gen_consensus_outcome.assert_called_once()
+    assert transceiver._empty_gen_status_counters["skipped_empty_status_calls"] == 0
+    assert transceiver._empty_gen_status_counters["legacy_status_calls"] == 1
+
+
+def test_empty_gen_status_treatment_fails_closed_after_receive_role_observed() -> None:
+    transceiver = _make_transceiver({})
+    coordinator, gen_consensus, gen_consensus_outcome = _enable_empty_gen_status_diagnostic(
+        transceiver,
+        treatment=True,
+    )
+    transceiver._ever_had_recv_session = True
+
+    with pytest.raises(RuntimeError, match="observed a receive session"):
+        transceiver.check_gen_transfer_status(0)
+
+    assert coordinator.poll_count == 1
+    gen_consensus.assert_not_called()
+    gen_consensus_outcome.assert_not_called()
+    assert transceiver._empty_gen_status_counters["recv_session_observed_calls"] == 1
+    assert transceiver._empty_gen_status_counters["unexpected_recv_session_calls"] == 1
+    assert transceiver._empty_gen_status_counters["legacy_status_calls"] == 0
+
+
+def test_empty_gen_status_startup_rejects_non_exact_topology() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._empty_gen_status_diagnostic_configured = True
+    transceiver._empty_gen_status_flag_value = "1"
+    transceiver._empty_gen_status_bypass_enabled = True
+    transceiver._async_consensus = _FakeAsyncCoordinator()
+    transceiver._async_terminal_consensus_enabled = True
+    transceiver._async_peer_ready_consensus_enabled = True
+    transceiver._async_consensus_config = SimpleNamespace(
+        backend="NIXL",
+        transceiver_runtime="PYTHON",
+    )
+    transceiver._mapping = SimpleNamespace(
+        world_size=2,
+        tp_size=1,
+        pp_size=2,
+        cp_size=1,
+        enable_attention_dp=False,
+    )
+
+    with pytest.raises(RuntimeError, match="exact Python/NIXL CTX PP4"):
+        transceiver._complete_empty_gen_status_diagnostic_startup()
+
+
 class _FakeStartupMpiDist:
     def __init__(self, gather_result=None) -> None:
         self.rank = 0
@@ -355,12 +483,35 @@ def test_async_startup_rejects_same_version_flag_mismatch(monkeypatch) -> None:
     def mismatch_flag(contribution):
         tag, endpoint, descriptor = contribution
         peer_descriptor = list(descriptor)
-        peer_descriptor[-2] = "0"
+        peer_descriptor[-3] = "0"
         return [contribution, (tag, endpoint, tuple(peer_descriptor))]
 
     monkeypatch.setattr(transceiver_module, "MPIDist", _FakeStartupMpiDist)
     monkeypatch.setenv(transceiver_module._ASYNC_TERMINAL_ENV, "1")
     dist = _FakeStartupMpiDist(mismatch_flag)
+    transceiver = _make_startup_transceiver(dist)
+    config = SimpleNamespace(backend="NIXL", transceiver_runtime="PYTHON")
+    transceiver._init_async_consensus(config)
+
+    with pytest.raises(RuntimeError, match="startup descriptor mismatch"):
+        transceiver._exchange_rank_info()
+
+    assert len(dist.descriptors) == 1
+    assert dist.pp_values == [0]
+
+
+def test_async_startup_rejects_empty_gen_status_mode_mismatch(monkeypatch) -> None:
+    def mismatch_diagnostic_mode(contribution):
+        tag, endpoint, descriptor = contribution
+        peer_descriptor = list(descriptor)
+        peer_descriptor[-1] = "0"
+        return [contribution, (tag, endpoint, tuple(peer_descriptor))]
+
+    monkeypatch.setattr(transceiver_module, "MPIDist", _FakeStartupMpiDist)
+    monkeypatch.setenv(transceiver_module._ASYNC_TERMINAL_ENV, "1")
+    monkeypatch.setenv(transceiver_module._ASYNC_PEER_READY_ENV, "1")
+    monkeypatch.setenv(transceiver_module._EMPTY_GEN_STATUS_BYPASS_ENV, "1")
+    dist = _FakeStartupMpiDist(mismatch_diagnostic_mode)
     transceiver = _make_startup_transceiver(dist)
     config = SimpleNamespace(backend="NIXL", transceiver_runtime="PYTHON")
     transceiver._init_async_consensus(config)
