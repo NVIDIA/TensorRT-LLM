@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 2096,
-    "total_files": 224
+    "total_violations": 2027,
+    "total_files": 219
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -167,17 +167,11 @@
   "tensorrt_llm/_torch/attention_backend/sparse/rocket.py": {
     "E712": 2
   },
-  "tensorrt_llm/_torch/attention_backend/trtllm.py": {
-    "E712": 1
-  },
   "tensorrt_llm/_torch/compilation/patterns/residual_add_norm.py": {
     "E402": 1
   },
   "tensorrt_llm/_torch/compilation/piecewise_optimizer.py": {
     "E711": 2
-  },
-  "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
-    "E741": 3
   },
   "tensorrt_llm/_torch/distributed/ops.py": {
     "E712": 1,
@@ -203,9 +197,6 @@
   },
   "tensorrt_llm/_torch/models/modeling_llama_min_latency.py": {
     "E731": 2
-  },
-  "tensorrt_llm/_torch/models/modeling_mistral.py": {
-    "F811": 1
   },
   "tensorrt_llm/_torch/models/modeling_mllama.py": {
     "E712": 1
@@ -558,9 +549,6 @@
     "D210": 1,
     "F811": 1
   },
-  "tensorrt_llm/serve/openai_server.py": {
-    "F821": 3
-  },
   "tensorrt_llm/serve/responses_utils.py": {
     "D200": 2,
     "D212": 7
@@ -578,7 +566,7 @@
   "tensorrt_llm/serve/scripts/benchmark_serving.py": {
     "D202": 1,
     "D205": 1,
-    "D212": 2
+    "D212": 1
   },
   "tensorrt_llm/serve/scripts/benchmark_utils.py": {
     "D202": 1,
@@ -606,9 +594,7 @@
   },
   "tensorrt_llm/serve/tool_parser/qwen3_tool_parser.py": {
     "D200": 1,
-    "D205": 1,
-    "D212": 4,
-    "D301": 1
+    "D212": 4
   },
   "tensorrt_llm/serve/tool_parser/utils.py": {
     "D212": 1
@@ -646,21 +632,21 @@
     "D205": 3,
     "D210": 2,
     "D212": 5,
-    "D300": 6,
-    "D403": 5,
-    "D415": 11
+    "D300": 4,
+    "D403": 4,
+    "D415": 9
   },
   "tests/integration/defs/conftest.py": {
     "D200": 3,
-    "D202": 9,
+    "D202": 7,
     "D205": 3,
     "D209": 1,
     "D212": 5,
     "D214": 1,
-    "D300": 91,
+    "D300": 74,
     "D403": 51,
-    "D415": 91,
-    "E722": 2,
+    "D415": 74,
+    "E722": 1,
     "E741": 1
   },
   "tests/integration/defs/cpp/conftest.py": {
@@ -678,9 +664,6 @@
   "tests/integration/defs/disaggregated/test_disaggregated_etcd.py": {
     "D415": 1
   },
-  "tests/integration/defs/disaggregated/test_disaggregated_single_gpu.py": {
-    "D205": 1
-  },
   "tests/integration/defs/examples/serve/test_serve.py": {
     "D205": 1,
     "D212": 2
@@ -692,15 +675,12 @@
     "E722": 1
   },
   "tests/integration/defs/examples/test_gpt.py": {
-    "D202": 3,
-    "D300": 5,
-    "D403": 1,
-    "D415": 4
+    "D202": 1
   },
   "tests/integration/defs/examples/test_phi.py": {
     "D202": 1,
-    "D300": 2,
-    "D415": 2
+    "D300": 1,
+    "D415": 1
   },
   "tests/integration/defs/llmapi/test_llm_api_qa.py": {
     "D200": 1,
@@ -805,7 +785,7 @@
   },
   "tests/integration/defs/test_e2e.py": {
     "D200": 5,
-    "D415": 6,
+    "D415": 5,
     "F811": 1
   },
   "tests/integration/defs/test_list_parser.py": {
