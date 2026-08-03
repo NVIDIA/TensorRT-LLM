@@ -172,3 +172,51 @@ def test_graph_key_uses_the_agreed_bucket_not_a_fresh_sum():
     r.agreed_ragged_bucket = 512
     r.spec_config = type("S", (), {"enable_ragged_verify": False})()
     assert get(r, object()) is None
+
+
+def test_capture_publishes_the_bucket_it_shaped_the_batch_to():
+    """The other half of the test above, and the regression it let through.
+
+    Once the key reads a fitted value instead of re-summing the batch, whoever
+    shapes a batch has to publish the shape. Real steps do both in
+    fit_ragged_verify_lens. CUDA-graph capture shapes its warmup batch in
+    _set_warmup_ragged_windows and never called the fit, so the bucket stayed
+    None while the batch really held `verify_bucket` tokens.
+
+    Both consequences are silent in different ways. The capture-time forward
+    ran with metadata describing a uniform batch over ragged tensors and died
+    hundreds of frames later in the MoE on `unmatched tensor shape`. Had it
+    survived, all three of a batch size's buckets would have been stored under
+    one key with no token axis -- colliding with each other, and matching no
+    runtime step, so every ragged step would have fallen back to eager without
+    an error anywhere.
+    """
+    import types
+
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    runner = types.SimpleNamespace(agreed_ragged_bucket=None)
+    requests = [types.SimpleNamespace(py_verify_len=None) for _ in range(4)]
+    batch = types.SimpleNamespace(generation_requests=requests)
+    engine = types.SimpleNamespace(cuda_graph_runner=runner)
+
+    # bs=4, draft_len=5 -> the t=5 bucket is 4 * 6 = 24 tokens.
+    PyTorchModelEngine._set_warmup_ragged_windows(engine, batch, 24, 5)
+
+    assert sum(1 + r.py_verify_len for r in requests) == 24, (
+        "the warmup batch must hit the bucket exactly")
+    assert runner.agreed_ragged_bucket == 24, (
+        "capture shaped the batch to 24 tokens but did not publish it, so the "
+        "graph would be keyed as if the batch were uniform")
+
+    # A narrower bucket at the same batch size, to prove it is per-entry and
+    # not set once: capture walks every tier for every batch size.
+    PyTorchModelEngine._set_warmup_ragged_windows(engine, batch, 8, 5)
+    assert sum(1 + r.py_verify_len for r in requests) == 8
+    assert runner.agreed_ragged_bucket == 8
+
+    # An empty batch publishes nothing rather than a stale or zero bucket.
+    runner.agreed_ragged_bucket = None
+    PyTorchModelEngine._set_warmup_ragged_windows(
+        engine, types.SimpleNamespace(generation_requests=[]), 24, 5)
+    assert runner.agreed_ragged_bucket is None

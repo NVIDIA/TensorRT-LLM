@@ -2109,6 +2109,12 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
+                # The warmup batches published a bucket per captured shape; the
+                # first real step must not inherit the last one. `fit_ragged_
+                # verify_lens` clears it on entry, but a step that never reaches
+                # the fit -- the planner declining, or a non-ragged mode -- would
+                # otherwise key on a bucket from capture.
+                self.cuda_graph_runner.agreed_ragged_bucket = None
                 # Absolute private-pool size, not a delta. Deltas are useless
                 # here: an engine build runs several capture passes over a
                 # shared allocator, so the per-pass increments came out as
@@ -3694,6 +3700,16 @@ class PyTorchModelEngine(ModelEngine):
         filled = layout.fill_bucket(max_verify_len=1 + int(draft_len))
         for request, tokens in zip(requests, filled.verify_lens.tolist()):
             request.py_verify_len = int(tokens) - 1
+        # Publish it to the runner as well, or the graph is captured under a key
+        # that does not describe the batch just shaped. `_ragged_verify_bucket`
+        # reads `agreed_ragged_bucket` rather than re-summing the batch (so that
+        # every attention-DP rank keys on a value they agreed on, instead of one
+        # each derived independently) -- and nothing sets that during capture,
+        # because the runtime fit never runs here. The key's token axis was
+        # therefore None while the batch really held `verify_bucket` tokens, and
+        # the mismatch surfaced far away, in the MoE's shared-vs-routed row
+        # count, as `unmatched tensor shape` two graphs into the capture pass.
+        self.cuda_graph_runner.agreed_ragged_bucket = int(verify_bucket)
 
     def ragged_verify_token_buckets(self, padded_bs: int) -> List[int]:
         """Captured token totals for a ragged batch of ``padded_bs`` rows.
