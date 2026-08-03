@@ -681,6 +681,19 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.request_ids,
             self.num_contexts,
         )
+        # MTP uses a separate draft KV cache manager; prepare its DeepSeek-V4
+        # sliding-window tables before the base path copies draft block offsets.
+        draft_kv_cache_manager = getattr(self, "draft_kv_cache_manager", None)
+        draft_compute_sliding_block_tables = getattr(
+            draft_kv_cache_manager,
+            "compute_sliding_block_tables",
+            None,
+        )
+        if draft_compute_sliding_block_tables is not None:
+            draft_compute_sliding_block_tables(
+                self.request_ids,
+                self.num_contexts,
+            )
 
         TrtllmAttentionMetadata.prepare(self)
 
