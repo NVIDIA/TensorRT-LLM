@@ -160,6 +160,7 @@ def make_kv_cache_manager(
     resize_context_fn=None,
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
+    max_resident_sequences=None,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
@@ -170,6 +171,9 @@ def make_kv_cache_manager(
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
+    # Must be pinned: a bare Mock() is not None, so the scheduler's residency
+    # gate would compare an int against a child Mock and raise TypeError.
+    mgr.max_resident_sequences.return_value = max_resident_sequences
     return mgr
 
 
@@ -2215,6 +2219,53 @@ class TestEdgeCases:
         assert ids(out.fitting_disagg_gen_init_requests) == [1]
         assert ids(out.generation_requests) == [2]
         assert ids(out.context_requests) == [4]
+
+
+# ===========================================================================
+# Residency Cap (non-droppable state pools)
+# ===========================================================================
+
+
+class TestResidencyCap:
+    """A manager reporting max_resident_sequences bounds newly started
+    sequences, so a pool whose state cannot be evicted never over-subscribes.
+    """
+
+    def test_none_leaves_admission_unbounded(self):
+        """Plain attention models report None and keep MAX_UTILIZATION behavior."""
+        mgr = make_kv_cache_manager(max_resident_sequences=None)
+        sched = make_scheduler(mgr)
+        reqs = [make_ctx_request(i, context_remaining_length=10) for i in range(20)]
+        out = sched.schedule_request(reqs, set())
+        assert len(out.context_requests) == 20
+
+    def test_caps_newly_started_sequences(self):
+        mgr = make_kv_cache_manager(max_resident_sequences=3)
+        sched = make_scheduler(mgr)
+        reqs = [make_ctx_request(i, context_remaining_length=10) for i in range(20)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1, 2]
+
+    def test_already_started_sequences_consume_the_cap(self):
+        """In-progress generation holds its slot, so no new context is admitted."""
+        mgr = make_kv_cache_manager(max_resident_sequences=2)
+        sched = make_scheduler(mgr)
+        reqs = [
+            make_gen_request(0),
+            make_gen_request(1),
+            make_ctx_request(2, context_remaining_length=10),
+        ]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.context_requests) == []
+
+    def test_continuing_chunk_is_not_charged_again(self):
+        """Only a first chunk starts a sequence; later chunks keep their slot."""
+        mgr = make_kv_cache_manager(max_resident_sequences=1)
+        sched = make_scheduler(mgr)
+        req = make_ctx_request(0, context_remaining_length=10, is_first_context_chunk=False)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
 
 
 # ===========================================================================

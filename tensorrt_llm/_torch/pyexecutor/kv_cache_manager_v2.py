@@ -2151,6 +2151,43 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
 
+    def max_resident_sequences(self) -> Optional[int]:
+        """Upper bound on sequences that can co-reside at ``max_seq_len``.
+
+        MAX_UTILIZATION admits new sequences up to ``max_batch_size`` and
+        relies on suspend/resume to survive over-subscription. That recovery
+        only works while some resident sequence can still be evicted to free
+        the pages a suspended one needs to resume. A sequence whose state is
+        non-droppable (a hybrid Mamba recurrent state is fixed-size per
+        sequence and cannot be recomputed from tokens) contributes no
+        evictable pages, so once every sequence is suspended the pool can no
+        longer drain and the scheduler makes no further progress.
+
+        Returns None when no such non-droppable pool exists, keeping the
+        unbounded MAX_UTILIZATION behavior for plain attention models.
+        """
+        state_pool_groups = {
+            pool_group_id
+            for pool_group_id, _, kind in self._stats_life_cycle_metadata().values()
+            if kind != "attention"
+        }
+        if not state_pool_groups:
+            return None
+
+        # Charging every attention pool the full max_seq_len is deliberately
+        # worst-case: a genuinely sliding-window pool needs fewer pages per
+        # sequence, so the bound errs low rather than over-admitting.
+        pages_per_seq = math.ceil(self.max_seq_len / self.tokens_per_block)
+        # A state pool holds one fixed slot per sequence; an attention pool
+        # must hold every page of each resident sequence.
+        return max(
+            1,
+            min(
+                stat.total // (1 if pool_group_id in state_pool_groups else pages_per_seq)
+                for pool_group_id, stat in enumerate(self._get_storage_statistics(GPU_LEVEL))
+            ),
+        )
+
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.
 

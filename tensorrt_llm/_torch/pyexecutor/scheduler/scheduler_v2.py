@@ -183,6 +183,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.chunk_unit_size = 0
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
+        # Cap on concurrently-started sequences, None when unbounded. See
+        # KVCacheManagerV2.max_resident_sequences() for why it is needed.
+        self.max_resident_sequences = kv_cache_manager.max_resident_sequences()
         draft_mgr_name = (
             type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None"
         )
@@ -192,6 +195,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         logger.info(
             f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
             f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
+            f"max_resident_sequences={self.max_resident_sequences}, "
             f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}, "
             f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}"
         )
@@ -400,8 +404,24 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
+        #
+        # Starting a new sequence is what grows the resident set, so the
+        # residency cap is enforced here. Requests already started keep
+        # their slot; the rest wait in the queue until one drains.
+        residency_cap = self.max_resident_sequences
+        num_started = (
+            sum(1 for r in requests_list if self._is_started_request(r))
+            if residency_cap is not None
+            else 0
+        )
+
         for req in pending_ctx:
             if budget.requests_full:
+                break
+            # Read before scheduling: _try_schedule_context advances the
+            # request past its first chunk.
+            is_new_sequence = residency_cap is not None and req.is_first_context_chunk
+            if is_new_sequence and num_started >= residency_cap:
                 break
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
@@ -418,6 +438,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     break
                 if action is ScheduleAction.SKIP:
                     continue
+                if is_new_sequence:
+                    num_started += 1
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
