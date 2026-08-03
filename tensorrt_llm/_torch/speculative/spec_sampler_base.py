@@ -61,6 +61,13 @@ class SampleStateSpec(SampleState):
     #: reading ``request.py_verify_len`` live rewinds by the wrong amount under
     #: the overlap scheduler. None on every uniform path.
     verify_lens_snapshot: Optional[dict] = None
+    #: Same idea, for ``cap-accept``: the window the scheduler chose, which
+    #: bounds *commitment* only -- the target still scored the full block, so
+    #: the KV rewind must use the full block and not this. Kept in a separate
+    #: field from ``verify_lens_snapshot`` for exactly that reason: the two
+    #: never coexist, and conflating them would rewind by the window after
+    #: verifying the block, silently leaking KV.
+    verify_caps_snapshot: Optional[dict] = None
 
 
 class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -212,6 +219,35 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             per_request = getattr(request, "py_verify_len", None)
         return runtime_draft_len if per_request is None else int(per_request)
 
+    @staticmethod
+    def _apply_verify_cap(num_new_tokens: int,
+                          cap: Optional[int]) -> tuple[int, int]:
+        """Trim a commit to the scheduler's window. ``cap-accept`` only.
+
+        The target scored the whole drafted block, so ``num_new_tokens`` is the
+        UNCAPPED chain: ``accepted + 1``, the accepted drafts plus the bonus at
+        the first unaccepted position. A window of ``cap`` drafted positions
+        therefore admits ``cap + 1`` tokens.
+
+        Truncating there keeps every committed token one the target already
+        verified. When the cap bites, the last token kept is ``draft[cap]``,
+        which was accepted, rather than the target's own sample at that
+        position -- a different provenance from SGLang's ``cap_correct_len``,
+        identical under greedy, and lossless either way, since a token is only
+        committed if verification accepted it. The committed COUNT matches.
+
+        Returns:
+            (tokens to commit, positions the cap discarded). The second value
+            is the exact acceptance the schedule cost, which is the number
+            ``compact`` cannot produce because it never scores those positions.
+        """
+        if cap is None:
+            return num_new_tokens, 0
+        admitted = int(cap) + 1
+        if num_new_tokens <= admitted:
+            return num_new_tokens, 0
+        return admitted, num_new_tokens - admitted
+
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -234,10 +270,16 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
+        caps = state.verify_caps_snapshot
         for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
+            # cap-accept only: the target scored the whole block, so this is the
+            # uncapped chain and the scheduler's window has to be applied here.
+            cap = None if caps is None else caps.get(req.py_request_id)
+            num_new_tokens, cap_trim = self._apply_verify_cap(
+                num_new_tokens, cap)
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
                 if TorchSampler._handle_stop_criteria(
@@ -254,10 +296,17 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # has already moved on by now, which is why the snapshot exists.
             # `acceptance_stats` is attached by the DSpark worker and is None
             # for every other path.
+            #
+            # Under cap-accept the window is the cap, NOT `verified_len`: the
+            # target verified the whole block (which is what makes the rewind
+            # above correct), but the scheduler only granted `cap`. Reporting
+            # the block here would count every request as untrimmed and hide
+            # the mode's entire measurement.
             if self.acceptance_stats is not None:
                 self.acceptance_stats.record_acceptance(
                     accepted=req.py_num_accepted_draft_tokens,
-                    window=verified_len)
+                    window=verified_len if cap is None else int(cap),
+                    cap_trim=cap_trim)
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(
@@ -350,12 +399,18 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
         # Cheap (a few ints) and only populated when the ragged path is live.
         verify_lens_snapshot = None
+        verify_caps_snapshot = None
         for request in sampling_requests:
             window = getattr(request, "py_verify_len", None)
             if window is not None:
                 if verify_lens_snapshot is None:
                     verify_lens_snapshot = {}
                 verify_lens_snapshot[request.py_request_id] = int(window)
+            cap = getattr(request, "py_verify_cap", None)
+            if cap is not None:
+                if verify_caps_snapshot is None:
+                    verify_caps_snapshot = {}
+                verify_caps_snapshot[request.py_request_id] = int(cap)
 
         return SampleStateSpec(
             requests=sampling_requests,
@@ -364,4 +419,5 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
             verify_lens_snapshot=verify_lens_snapshot,
+            verify_caps_snapshot=verify_caps_snapshot,
         )

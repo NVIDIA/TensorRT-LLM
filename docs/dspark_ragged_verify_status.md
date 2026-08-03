@@ -150,7 +150,7 @@ P0-3/5/6 属于「跑出来的数字看着正常但其实是错的」：replay �
 
 | 开关 | 作用 |
 |---|---|
-| `TLLM_DSPARK_RAGGED_VERIFY_MODE=static\|compact` | 选路径。`cap-accept` **未实现，显式抛 `NotImplementedError`** |
+| `TLLM_DSPARK_RAGGED_VERIFY_MODE=static\|cap-accept\|compact` | 选路径。三种模式**均已实现** |
 | ~~`TLLM_DSPARK_FORCE_VERIFY_LENS=1`~~ | **已删除**。改用 `tests/microbenchmarks/dspark_make_steep_sps_table.py` 造陡峭 cost table,让**真实 planner** 自己产出不等窗口 |
 | `DSparkRaggedStats.assert_ragged_active()` | 断言 ragged 真的生效 |
 
@@ -163,8 +163,26 @@ P0-3/5/6 属于「跑出来的数字看着正常但其实是错的」：replay �
 `bs_not_supported`、`peer_shape_mismatch` 三类失败——它们分别表示 bucket 网格错了、
 批次档位没捕获、以及跨 rank 形状发散。
 
-**`cap-accept` 为什么不能 alias 成 `compact`**：它唯一的价值是「输出必须与 `static`
-逐 token 一致」，别名化会让这个对照失去意义。
+**`cap-accept`（已实现）**:算出每请求窗口并**按窗口提交**,但**不缩小交给 target 的
+token 轴**——整块照算,超出窗口的接受位置被丢弃。它绝不能 alias 成 `compact`:唯一
+价值就是那个对照。
+
+实现方式是把窗口写在**独立属性 `py_verify_cap`** 上,不碰 `py_verify_len`。于是布局侧
+(`model_engine` / `cuda_graph_runner` / `dsa.py`)完全看不见窗口,自动走整块;
+`_verified_len` 因为 `py_verify_len is None` 自动返回整块,**KV rewind 随之正确**
+(`rewind = 整块 - capped`)。这样新模式是纯增量,而不是在「为 compact 调了三个 bug
+才对」的记账代码里再加一组条件分支。
+
+截断在 `SpecSamplerBase._apply_verify_cap`:`num_new_tokens` 是未截断链
+(`accepted + 1`),窗口 `w` 允许 `w + 1` 个 token。截断后末位是 `draft[w]`——它**已通过
+验证**,提交合法。与 SGLang 取「cut 处 target 自己的采样」来源不同,贪婪下相同,两者
+提交 token 数一致且都无损。
+
+它产出 `compact` 结构上拿不到的数:`cap_trim_tokens`,即**被丢弃的、本可接受的位置数**
+——裁剪的真实接受代价。`compact` 下那些位置根本没算,只能用 `trim_regret_rate` 卡下界。
+
+代价是**不省任何算力**,所以它是诊断模式,永远不是服务配置。`assert_ragged_active()`
+的 `require_trim` 因此对该模式豁免,否则那条门在它唯一该跑的模式里恒不可满足。
 
 **「循环依赖」这个理由已被证伪**:产出 cost table **不需要** ragged 能跑。
 `dspark_sps_profiler` 会把 `RAGGED_VERIFY_MODE` 钉成 `static`,并通过逐个 verify_len
@@ -190,7 +208,7 @@ confidence 排序的 top-k 分配。三个只在真裁剪时可达的 bug 正是
 | P1 | **SPS cost table profiler** | 没有它 planner 必然不 trim，**任何性能结论都是空的**。参考 SGLang `python/sglang/benchmark/dspark_sps_profiler.py`：服务端 `RAGGED_VERIFY_MODE=static` + record flag，扫 batch size 记 step time |
 | P1 | GSM8K + ADP | 冒烟通过后才有意义 |
 | P1 | graph 按 token 数分桶 + ADP tier 协商 | SGLang `compute_target_verify_graph_key` 对 ragged 返回 `(graph_num_tokens, graph_num_tokens)`——两个轴都变 token 数；DP 下各 rank 共用同一 tier 并一起降档 |
-| P2 | 实现 `cap-accept` | 隔离「kernel 算错」与「planner 没触发」的最强工具 |
+| ~~P2~~ | ~~实现 `cap-accept`~~ | **已完成**。隔离「kernel 算错」与「planner 没触发」 |
 | P2 | 对照剩余 53 个 sparse 失败 | 目前只对照了 mqa 那 6 个 |
 
 ---

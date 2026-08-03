@@ -74,7 +74,7 @@ PR 的 host 侧管线质量是高的，不要推翻重做：
 | `compressor_paged_kv_compress` 新增 `Tensor? new_tokens_per_seq=None` | **已实现** | `compressorOp.cpp:153`（schema）、`compressorKernels.cu:340-348`（`nn` 取代 `NEXT_N`，`NEXT_N` 降级为编译期上界）、`:425`（Phase 2）；Phase 1 由 `token_idx < kv_len` 守卫（`:369`）、Phase 3 由 `num_compressions` 守卫（`:440-442`），二者对 `nn < NEXT_N` 均正确 |
 | `num_gen_tokens_per_seq` ragged 时取 **max** 而非 mean | **已实现** | `deepseek_v4.py:748-769` |
 | `gen_new_tokens_per_seq` 每请求向量 + graph-stable buffer | **已实现** | `deepseek_v4.py:337-352` |
-| ragged verify mode 开关（static / cap-accept / compact）+ 统计 | **部分实现**，`cap-accept` 显式 `NotImplementedError` | `dspark.py:457-496`、`dspark_observability.py` |
+| ragged verify mode 开关（static / cap-accept / compact）+ 统计 | **已全部实现**（`cap-accept` 见 `spec_sampler_base._apply_verify_cap` + `py_verify_cap`） | `dspark.py:457-496`、`dspark_observability.py` |
 | C++ ragged top-k 单测 | **已新增** | `tests/unittest/_torch/thop/parallel/test_indexer_topk_ragged.py` |
 
 **重要副作用**：`num_gen_tokens_per_seq` 改成取 max 之后，compressor 输出 buffer 的 sizing 公式 `num_generations * ceil(w/cr)`（`deepseek_v4.py:753-757`、`:766-768`）重新成为**合法上界**（因为 `w_r ≤ w_max` ⇒ `Σ_r ceil(w_r/cr) ≤ n·ceil(w_max/cr)`）。这消除了「越界写 `kv_comp`」这一类内存破坏风险。取 mean 时该公式**不是**上界，是真实的 OOB 写。
@@ -318,7 +318,7 @@ cd /code/tensorrt_llm && python -m pytest \
 | 测试 | 内容 | 为什么锐利 |
 |---|---|---|
 | **A1 逐 token 等价** | 同一 engine 配置、同一批 prompt，`static`（verify 全量）与开启调度后，temperature=0 下断言每个 prompt 的 `token_ids` **完全相等** | 贪婪投机解码定义上是 lossless，任何分歧都是 bug。把 6 题的容忍度变成 1 token 的容忍度。**注意**：跨不同 graph 形状的严格 bitwise 相等 TRT-LLM 并不保证（MoE/attention 规约顺序会变），所以诚实的形式是允许极少数 prompt 分歧并设硬上限，或用 `cap-accept` 模式（下条）。 |
-| **A2 `cap-accept` 差分** | 实现 SGLang 的三模式（`static` / `cap-accept` / `compact`）。`cap-accept` 跑**均匀 kernel 路径**（`next_n=6`）但只提交每请求窗口内的 token，输出应与 `compact` **逐 token 相同** | `cap-accept` vs `compact` 的差异 ⇒ **必然是 ragged kernel bug**；`static` vs `cap-accept` 的差异 ⇒ **必然是调度/接受逻辑 bug**。把 pass/fail 变成可定位。工作区的 `dspark_observability.py` 已有 mode 枚举，`cap-accept` 目前显式 `NotImplementedError`（`dspark.py:471-478`）—— **这是需要补的**。 |
+| **A2 `cap-accept` 差分** | 实现 SGLang 的三模式（`static` / `cap-accept` / `compact`）。`cap-accept` 跑**均匀 kernel 路径**（`next_n=6`）但只提交每请求窗口内的 token，输出应与 `compact` **逐 token 相同** | `cap-accept` vs `compact` 的差异 ⇒ **必然是 ragged kernel bug**；`static` vs `cap-accept` 的差异 ⇒ **必然是调度/接受逻辑 bug**。把 pass/fail 变成可定位。**已实现**：窗口写在独立属性 `py_verify_cap` 上（不碰 `py_verify_len`），布局侧因此看不见窗口、自动走整块；截断在 `SpecSamplerBase._apply_verify_cap`。 |
 | **A3 布局一致性断言** | host 侧断言：`sum(1 + py_verify_len over padded generation_requests) == attn_metadata.num_tokens - num_ctx_tokens == spec_metadata.total_verify_tokens == key[bucket]` | 这一条就能同时抓住 H0、H5、H8 |
 | **A4 时序断言** | 断言 `attn_metadata.ragged_verify_lens` 在 `prepare()` 执行的那一刻是**本步**的（而非上一步） | 抓 H2、H4 |
 | **A5 接受长度分布** | 记录并断言每请求接受长度直方图，以及 `sum(accepted)` 与接受 kernel 报告一致 | 抓「token 落到了错误请求的槽位但整批仍生成合法文本」这一类 |
@@ -386,7 +386,7 @@ TRT-LLM 的 `dsa.py` **从不传 `indices`**，而是用既有的 "expanded buff
 
 3. **工作区那 11 个未提交的改动如何处置？** K4/K9 的实现质量是好的（可选参数、非 ragged bit-identical、TORCH_CHECK 替换而非放宽），但 H3/H4 是新引入的 P0 bug。建议：先修 H3/H4 再提交，**不要**在带着必抛异常的代码的状态下推进其他工作。
 
-4. **`cap-accept` 模式要不要实现？** 它是把 GSM8K 从「pass/fail 硬币」变成「可定位诊断」的关键（§6.2 A2），成本不高（复用 PR 已有的 `torch.minimum(..., verify_lens)` clamp，`interface.py:1473-1480`、`:1889-1896`）。当前是显式 `NotImplementedError`。
+4. ~~**`cap-accept` 模式要不要实现？**~~ **已实现**（§6.2 A2）。它把 GSM8K 从「pass/fail 硬币」变成可定位诊断，并产出 `compact` 结构上拿不到的 `cap_trim_tokens`（裁剪的真实接受代价）。
 
 5. **STS 表和 SPS 表由谁、按什么流程产出？** 这是 U4/U5，也是 G8。在它们存在之前，任何**性能**结论都是空的，而且 feature 在构造上无法 trim。需要一个 profiling 脚本 + 产物的存放约定（checkpoint 内？repo 内 `examples/configs/`？）。
 

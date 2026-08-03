@@ -3463,12 +3463,35 @@ class PyExecutor:
         # on different ranks (the pad-row fit is sized from the local request
         # count), which is why the attention-DP graph gate compares the token
         # bucket and not just the batch size.
+        #
+        # `cap-accept` stops short of this: it wants the schedule's commitment
+        # policy without the layout that pays for it, so it submits the full
+        # block and needs no bucket at all. The windows go onto `py_verify_cap`
+        # rather than `py_verify_len` precisely so the whole token-layout path
+        # below and downstream (input layout, DSA row expansion, graph key, KV
+        # rewind) keeps seeing an untrimmed batch -- the mode is then a pure
+        # addition rather than a second set of conditions inside code that took
+        # three bugs to get right for `compact`.
         bucket = None
+        cap_accept = (mode is not None and mode.computes_windows
+                      and not mode.trims_submitted_tokens)
+        if cap_accept:
+            # Stale caps are the same hazard as stale windows, minus the one
+            # thing that makes stale windows survivable: a mismatched layout
+            # eventually trips an assert, whereas a stale cap just commits
+            # against last step's schedule with nothing to contradict it.
+            # Clear every request first, set second.
+            for request in gen_requests:
+                request.py_verify_cap = None
         if ragged_lens is not None:
-            bucket = self.model_engine.fit_ragged_verify_lens(
-                gen_requests, ragged_lens, peer_stats=peer_stats)
-            if bucket is None:
-                fallback_reason = "no_captured_shape"
+            if cap_accept:
+                for request, window in zip(gen_requests, ragged_lens):
+                    request.py_verify_cap = int(window)
+            else:
+                bucket = self.model_engine.fit_ragged_verify_lens(
+                    gen_requests, ragged_lens, peer_stats=peer_stats)
+                if bucket is None:
+                    fallback_reason = "no_captured_shape"
 
         # Record what the step actually decided, reading the windows back off
         # the requests rather than off `ragged_lens`: fit_ragged_verify_lens
@@ -3483,7 +3506,15 @@ class PyExecutor:
                 stats.log_summary(prefix="DSpark ragged verify [periodic]")
             self._maybe_assert_dspark_ragged_active(stats)
             fitted = None
-            if bucket is not None:
+            delivered = None
+            if cap_accept:
+                # Nothing was fitted, so there is nothing to read back: the
+                # scheduled windows ARE the decision. The block is submitted
+                # whole, which `delivered` has to say explicitly -- otherwise
+                # the windows would be booked as if they had been submitted.
+                fitted = [int(v) for v in ragged_lens] if ragged_lens else None
+                delivered = num_gen_requests * (1 + max_draft_len)
+            elif bucket is not None:
                 fitted = [
                     int(request.py_verify_len) for request in gen_requests
                     if getattr(request, "py_verify_len", None) is not None
@@ -3494,7 +3525,8 @@ class PyExecutor:
                               verify_lens=fitted,
                               bucket=bucket,
                               padded_bs=None,
-                              fallback=fallback_reason)
+                              fallback=fallback_reason,
+                              delivered=delivered)
 
         if bucket is not None:
             # The block is always drafted in full -- only verification is

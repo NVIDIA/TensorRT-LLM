@@ -465,16 +465,6 @@ class DSparkWorker(SpecWorkerBase):
             self.spec_config, "enable_ragged_verify", False) else
                       RaggedVerifyMode.STATIC)
         self.ragged_verify_mode = read_ragged_verify_mode(default=configured)
-        if self.ragged_verify_mode is RaggedVerifyMode.CAP_ACCEPT:
-            # Deliberately not aliased onto `compact`. The whole value of
-            # cap-accept is that its output must be bit-identical to `static`
-            # while the windows still drive commitment; silently running it as
-            # `compact` would make that comparison meaningless.
-            raise NotImplementedError(
-                "TLLM_DSPARK_RAGGED_VERIFY_MODE='cap-accept' is not implemented "
-                "yet: it requires submitting the full block to the target while "
-                "committing only each request's window. Use 'static' or "
-                "'compact'.")
         self.ragged_stats = DSparkRaggedStats(mode=self.ragged_verify_mode,
                                               max_draft_len=block_size)
         # goal doc A6: the ragged counters say what happened, the planner's say

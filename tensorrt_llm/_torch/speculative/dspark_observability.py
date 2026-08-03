@@ -193,6 +193,12 @@ class DSparkRaggedStats:
         #: from the untrimmed subpopulation (which the planner selected, so it
         #: is not a fair sample of the trimmed one).
         self.trimmed_hit_ceiling = 0
+        #: Positions the target accepted and the window then discarded --
+        #: the exact acceptance the schedule cost. Only ``cap-accept`` can
+        #: populate this, because only there are those positions scored at all;
+        #: it stays 0 under ``compact``, where the honest answer is that the
+        #: number is unknowable without re-running.
+        self.cap_trim_tokens = 0
 
         #: Graph replay is the whole point of landing on a bucket; an eager
         #: step costs far more than the tokens it saved.
@@ -210,6 +216,7 @@ class DSparkRaggedStats:
         bucket: Optional[int] = None,
         padded_bs: Optional[int] = None,
         fallback: Optional[str] = None,
+        delivered: Optional[int] = None,
     ) -> None:
         """Record one decode step's scheduling decision.
 
@@ -221,6 +228,13 @@ class DSparkRaggedStats:
             bucket: the captured token bucket the batch was fitted to, if any.
             padded_bs: the row count the batch was padded to, if any.
             fallback: short reason the step did not go ragged.
+            delivered: tokens actually handed to the target, when that is not
+                derivable from ``verify_lens`` and ``bucket``. Required by
+                ``cap-accept``, which schedules windows but submits the full
+                block: deriving it there would report the windows as if they
+                had been submitted, i.e. credit the mode with a compute saving
+                it deliberately does not take, and ``trim_ratio`` would then
+                describe a run that never happened.
         """
         self.steps_total += 1
         # Steps where raggedness is even definable. A window can only differ
@@ -248,9 +262,14 @@ class DSparkRaggedStats:
         self.verify_len_hist.update(lens)
         self.window_tokens += sum(1 + v for v in lens)
         # A bucket is what the graph actually ran; without one the step ran on
-        # exactly the windows it asked for.
-        self.delivered_tokens += int(bucket) if bucket else sum(1 + v
-                                                                for v in lens)
+        # exactly the windows it asked for -- unless the caller says otherwise,
+        # which is how cap-accept reports submitting the full block.
+        if delivered is not None:
+            self.delivered_tokens += int(delivered)
+        else:
+            self.delivered_tokens += int(bucket) if bucket else sum(1 + v
+                                                                    for v in
+                                                                    lens)
         if bucket:
             self.bucket_hist[int(bucket)] += 1
         if padded_bs:
@@ -312,15 +331,26 @@ class DSparkRaggedStats:
         """How many different window sizes were ever handed out."""
         return len(self.verify_len_hist)
 
-    def record_acceptance(self, *, accepted: int, window: int) -> None:
+    def record_acceptance(self,
+                          *,
+                          accepted: int,
+                          window: int,
+                          cap_trim: int = 0) -> None:
         """Record one request's acceptance against the window it was given.
 
         Args:
             accepted: drafted positions accepted (excludes the bonus token).
             window: drafted positions the request was allowed to verify.
+            cap_trim: positions the target accepted but the window discarded.
+                Non-zero only in ``cap-accept``, the one mode where those
+                positions are actually scored, so this is a measurement rather
+                than an estimate. Zero elsewhere -- under ``compact`` they were
+                never computed and cannot be counted, only bounded from below
+                by ``trimmed_hit_ceiling``.
         """
         self.requests_scored += 1
         self.accepted_tokens += int(accepted)
+        self.cap_trim_tokens += int(cap_trim)
         if int(window) < self.max_draft_len:
             self.requests_trimmed += 1
             if int(accepted) >= int(window):
@@ -332,6 +362,20 @@ class DSparkRaggedStats:
         if not self.requests_scored:
             return 0.0
         return self.accepted_tokens / self.requests_scored
+
+    @property
+    def accept_loss_per_request(self) -> float:
+        """Mean accepted positions the schedule discarded, per request.
+
+        The exact counterpart to :attr:`accept_len`: add the two and you get
+        the acceptance a no-trim run would have achieved on the same drafts.
+        Meaningful only under ``cap-accept``; 0.0 elsewhere, where it means
+        "not measured", not "no loss" -- ``trim_regret_rate`` is the bound
+        available under ``compact``.
+        """
+        if not self.requests_scored:
+            return 0.0
+        return self.cap_trim_tokens / self.requests_scored
 
     @property
     def trim_regret_rate(self) -> float:
@@ -370,6 +414,8 @@ class DSparkRaggedStats:
             "requests_scored": self.requests_scored,
             "requests_trimmed": self.requests_trimmed,
             "trim_regret_rate": round(self.trim_regret_rate, 4),
+            "cap_trim_tokens": self.cap_trim_tokens,
+            "accept_loss_per_request": round(self.accept_loss_per_request, 4),
             "graph_replays": self.graph_replays,
             "graph_eager": self.graph_eager,
             "fallbacks": dict(self.fallbacks),
@@ -412,7 +458,13 @@ class DSparkRaggedStats:
             raise AssertionError(
                 f"DSpark ragged verify handed out only one distinct window "
                 f"size, so the batch was uniform in all but name: {summary}")
-        if require_trim and self.trim_ratio <= 0.0:
+        # `cap-accept` submits the full block on purpose -- it measures the
+        # commitment policy, not a compute saving -- so a zero trim ratio is
+        # the expected outcome there, not a silent no-op. Requiring one would
+        # make the gate unsatisfiable in the one mode whose entire job is to be
+        # the trusted reference the other modes are compared against.
+        if (require_trim and self.mode.trims_submitted_tokens
+                and self.trim_ratio <= 0.0):
             raise AssertionError(
                 f"DSpark ragged verify delivered as many tokens as a no-trim "
                 f"run, so nothing was saved: {summary}")

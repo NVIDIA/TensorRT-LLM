@@ -874,3 +874,42 @@ verify-all 的退化情形出现。
 >
 > §10.8 的 sync 对照写的是「confidence head 关」= `scheduling=False`,配置依然合法,
 > 不需要重新设计。
+
+### 10.10 实现 `cap-accept`(A2 / Q4 收口)
+
+三模式现已全部可用,`dspark.py` 里的 `NotImplementedError` 已移除。
+
+`cap-accept` 算出每请求窗口并**按窗口提交**,但**不缩小交给 target 的 token 轴**。
+它把 `compact` 混在一起的两件事拆开:
+
+    cap-accept 输出 ≠ static 输出   ⇒ 调度策略有问题
+    compact 输出  ≠ cap-accept 输出 ⇒ 布局压缩有问题
+
+**实现是纯增量的**:窗口写在独立属性 `py_verify_cap` 上,**不碰 `py_verify_len`**。
+于是布局侧(`model_engine` / `cuda_graph_runner` / `dsa.py`)完全看不见窗口、自动
+走整块;`_verified_len` 因为 `py_verify_len is None` 自动返回整块,**KV rewind 随之
+正确**(`rewind = 整块 − capped`)。这样就不必在「为 compact 调了三个 bug 才对」的
+记账代码里再加一组条件分支——§10.6 那个 KV leak 正是这类记账错误。
+
+截断在 `SpecSamplerBase._apply_verify_cap`:`num_new_tokens` 是未截断链
+(`accepted + 1`),窗口 `w` 允许 `w + 1` 个 token。截断后末位是 `draft[w]`,它已通过
+验证,提交合法。与 SGLang 取「cut 处 target 自己的采样」来源不同,**贪婪下相同**,
+两者提交 token 数一致且都无损。
+
+**它产出 `compact` 结构上拿不到的数**:`cap_trim_tokens` = 被丢弃的、本可接受的位置
+数,即裁剪的真实接受代价。`compact` 下那些位置根本没算,SGLang 为此专门养了一个
+~600 行的统计估计器;我们此前只有 `trim_regret_rate` 这个下界。
+
+两个埋在计数器里的坑,都已处理并有测试:
+
+1. **不能给它记上算力节省**。`record_step` 会按 `sum(1+v)` 推算 delivered,那会让
+   cap-accept 显示出一个它刻意不去拿的 trim_ratio——而那正是判断功能是否生效的
+   头号指标。新增显式 `delivered` 参数,由调用方传整块。
+2. **`assert_ragged_active(require_trim=True)` 会误杀它**。它的 `trim_ratio` 恒为 0
+   是设计如此。该判据现在对不裁 token 轴的模式豁免,否则这道门在它唯一该跑的模式
+   里恒不可满足。
+
+代价是**不省任何算力**,所以它是诊断模式,永远不是服务配置。
+
+覆盖:`tests/unittest/_torch/speculative/hw_agnostic/test_dspark_cap_accept.py`
+(51 项,含截断算术的全枚举不变式、两个计数器坑的回归)。**尚未 e2e 跑过。**
