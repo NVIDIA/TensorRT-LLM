@@ -191,6 +191,9 @@ Q2 原本问的是：本轮交付「均匀 tier 阶梯」还是「ragged」。�
 | 收益 | 拿满 SPS(B) 项，**损失 τ 项** | 完整 Θ = τ·SPS(B) |
 | 风险 | 中。无 K2 假设 | **高**。押在 K2（trtllm-gen sparse-MLA generation）这个读码无法证明的行为上 |
 
+> **后续（见 §10.9）**：均匀 tier 阶梯不只是「没选它」，而是**已从代码里整个删除**。
+> 它在实测中退化成「验证整块」，却仍占着一条独立代码路径。下表保留作决策记录。
+
 **已定：做 ragged。** 因此：
 
 1. goal doc §5.1 里划给 **P2 的 H6 / H7 / H9 / H10 全部上提到 P0**（见 §3 表二）。
@@ -830,3 +833,44 @@ planner 在对着虚构的成本曲线优化,所以那轮的吞吐数字无意�
 * **`peer_not_gen_only` 类 graph miss**:32/318 步,属正常连续批处理(uniform
   路径同样存在),非缺陷,但可作为后续调度优化的方向。
 * **吞吐收益需要更低接受率的模型或负载**。这是 checkpoint 的属性,非本 PR 可解。
+
+### 10.9 删除均匀 tier 阶梯:三状态收敛成两状态
+
+调度原本有三种状态,中间那种不值得保留:
+
+| 配置 | 语义 | 结局 |
+|---|---|---|
+| `scheduling=False` | 验证整个 drafted block | **保留**,唯一兜底 |
+| `scheduling=True, ragged=False` | 整批取同一个 verify 长度(tier `{1,3,5}` 里选) | **已删除** |
+| `scheduling=True, ragged=True` | 每请求各自的窗口 | **保留** |
+
+删除理由有两条,都是实测出来的:
+
+1. **它做不到调度的本意**。整批一个长度,就无法把长窗口给高置信请求、短窗口给
+   坍塌的请求——而那正是 confidence head 存在的理由。
+2. **它在本 checkpoint 上恒等于「验证整块」**。阶梯只有 `{1,3,5}` 三档,接受率
+   ~90% 时 argmax 永远落在 5,即整块。也就是说:一条独立代码路径(进 graph key、
+   进跨 rank allgather、进 planner 的 fallback 计数),运行效果和 `scheduling=False`
+   完全一样。
+
+SGLang 也没有对应物:它的 scheduler 一律经 top-k 产出每请求窗口,"均匀"只作为
+verify-all 的退化情形出现。
+
+删掉的东西:`decide_draft_len` 及其 `_decide_local`、`snap_to_tier`(唯一调用者
+就是 uniform 分支)、`py_executor` 里的 uniform 分支、跨 rank allgather 里的 tier
+字段(5→4 个 int)、以及覆盖该路径的 12 个测试和一个 rank 模拟 helper。共
+−350 行。兜底现在直接是 `runtime_draft_len = planner.max_tier`,不需要跨 rank
+协商,所以这一步也少了一次归约。
+
+`llm_args` 现在**直接拒绝** `scheduling=True + ragged=False`,而不是把它悄悄当成
+别的东西。关掉特性用 `enable_confidence_scheduling=False`。
+
+> **历史数据是否受影响**:§10.2 的 uniform 基线 96.2092 仍然有效,但理由不是
+> 「它没用中间态」——我没有回去核对那一轮的 flag(§2 表一把中间里程碑定义成
+> `scheduling=True + ragged=False`,所以有可能就是它)。理由是 §10.3 已实测
+> planner 在三种工况下**一次都没裁剪**:中间态在本 checkpoint 上必然选到 tier 5,
+> 即整块。因此无论那一轮用的是哪套 flag,96.2092 描述的都是「验证整块」,而那条
+> 路径原封不动地留着。
+>
+> §10.8 的 sync 对照写的是「confidence head 关」= `scheduling=False`,配置依然合法,
+> 不需要重新设计。
