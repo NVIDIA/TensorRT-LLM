@@ -798,7 +798,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
     ):
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
@@ -829,7 +828,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             swiglu_limit=swiglu_limit,
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
-            without_comm=without_comm,
         )
 
     def get_workspace(self, m_max: int, group_size: int):

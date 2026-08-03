@@ -76,6 +76,7 @@ add_library(
   deepseekV4BlockTableOp.cpp
   inverseRopeFp8QuantOp.cpp
   fusedQKNormRopeOp.cpp
+  fusedAdaptiveLayerNormOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp

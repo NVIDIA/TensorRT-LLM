@@ -1020,7 +1020,12 @@ class _KVCache:
                         ),
                         move_ssm=is_end,
                     )
-                if has_partial_snapshot:
+                    # _commit_block transitions out of ALLOWED (to USER_STOP) when a
+                    # block cannot be committed (VIRTUAL_STOP). Stop here so we don't
+                    # re-enter _commit_block on an already-stopped cache.
+                    if self._commit_state != self.CommitState.ALLOWED:
+                        break
+                if has_partial_snapshot and self._commit_state == self.CommitState.ALLOWED:
                     partial_ordinal = BlockOrdinal(new_num_full_blocks)
                     if is_end:
                         self._commit_block(
@@ -1061,49 +1066,36 @@ class _KVCache:
         if self._commit_state != self.CommitState.USER_STOP:
             raise LogicError("plan_committed_block_drop() requires stop_committing()")
 
-        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
-        matched_blocks: list[Block] = []
-        if self.num_committed_tokens > 0:
-            # Locate pages through the radix tree rather than
-            # SeqBlock.tree_block: the latter is not guaranteed to identify a
-            # partial snapshot after reuse. Requiring an exact match keeps the
-            # preceding conversation plan intact if this turn no longer has a
-            # complete reusable endpoint. All PP ranks use the same lookup so
-            # attention-only ranks include the final partial SWA block too.
-            match = self.manager._match_reuse(self.reuse_scope, self._committed_tokens)
-            if match.num_tokens != self.num_committed_tokens or not match.blocks:
-                return None
-            matched_blocks = match.blocks
-        elif ssm_lc_id is not None:
+        if self.num_committed_tokens == 0:
             return None
 
-        def get_committed_page(block: Block, life_cycle_id: LifeCycleId) -> CommittedPage | None:
-            page_ref = block.storage[life_cycle_id]
-            return page_ref() if page_ref is not None else None
+        # Locate pages through the radix tree rather than
+        # SeqBlock.tree_block: the latter is not guaranteed to identify a
+        # partial snapshot after reuse. Requiring an exact match keeps the
+        # preceding conversation plan intact if this turn no longer has a
+        # complete reusable endpoint. All PP ranks use the same lookup so
+        # attention-only ranks include the final partial SWA block too.
+        match = self.manager._match_reuse(self.reuse_scope, self._committed_tokens)
+        if match.num_tokens != self.num_committed_tokens or not match.blocks:
+            return None
 
-        end = BlockOrdinal(len(matched_blocks))
+        end = BlockOrdinal(len(match.blocks))
         pages_to_drop: list[CommittedPage] = []
         for lc_idx, lc in self.manager._life_cycles.items():
-            if isinstance(lc, SsmLifeCycle):
-                continue
-            if lc.window_size is None:
-                continue
-            stale_range = _KVCache._get_stale_range(
-                self.tokens_per_block, self.num_committed_tokens, lc
-            )
-            window_start = min(stale_range.end, end)
+            if isinstance(lc, AttnLifeCycle):
+                if lc.window_size is None:
+                    continue
+                stale_range = _KVCache._get_stale_range(
+                    self.tokens_per_block, self.num_committed_tokens, lc
+                )
+                window_start = min(stale_range.end, end)
+            else:
+                window_start = BlockOrdinal(end - 1)
             for ordinal in typed_range(window_start, end):
-                tree_block = matched_blocks[ordinal]
-                page = get_committed_page(tree_block, lc_idx)
+                page = match.blocks[ordinal].get_page(lc_idx)
                 if page is None:
                     return None
                 pages_to_drop.append(page)
-
-        if ssm_lc_id is not None:
-            page = get_committed_page(matched_blocks[-1], ssm_lc_id)
-            if not isinstance(page, SsmCommittedPage):
-                return None
-            pages_to_drop.append(page)
         return PlannedDropHandle(pages_to_drop)
 
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens

@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
     CUTE_AVAILABLE,
@@ -313,14 +312,7 @@ class PipelineLoader:
             pipeline._setup_cache_acceleration()
 
         if not skip_warmup:
-            if config.torch_compile.enable_autotune:
-                with autotune(
-                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
-                    skip_dynamic_tuning_buckets=True,
-                ):
-                    pipeline.warmup()
-            else:
-                pipeline.warmup()
+            pipeline.warmup()
             logger.info(f"Warmup completed in {time.time() - t0:.2f}s")
         else:
             logger.info("Warmup skipped (skip_warmup=True)")

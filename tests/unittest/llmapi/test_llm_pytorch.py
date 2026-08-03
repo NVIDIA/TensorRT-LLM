@@ -1187,7 +1187,7 @@ def test_min_tokens(use_speculative: bool):
 def test_min_tokens_long_prompt():
     """Check min_tokens is respected when prompt is longer than min_tokens.
 
-    Regression test for NVBug 5823135: _apply_min_length_penalty compared
+    Regression test for NVBug 5823135: the min-length EOS suppression compared
     total token count (prompt + generated) against the raw min_tokens value
     instead of comparing generated token count only.  When prompt_len >=
     min_tokens the EOS suppression was never activated, allowing early

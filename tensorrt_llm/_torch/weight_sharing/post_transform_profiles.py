@@ -34,6 +34,39 @@ if TYPE_CHECKING:
     from torch import nn
 
 
+# Stable identifier for the tensor names, layouts, aliases, and receiver-side
+# finalization contract produced by the currently qualified Llama target path.
+# Never change the meaning of an existing ABI ID. Introduce a new ID whenever
+# a transform changes transferred tensor semantics or the receiver must
+# interpret/finalize the transferred state differently.
+LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-llama-target-layout-v1"
+
+
+@dataclass(frozen=True)
+class PostTransformConfigIdentity:
+    """Canonical model identity captured before constructor normalization."""
+
+    architecture: str | None
+    model_type: str | None
+
+    @classmethod
+    def from_model_config(cls, model_config: object) -> "PostTransformConfigIdentity":
+        """Capture registry dimensions from a resolved pre-construction config."""
+
+        pretrained_config = getattr(model_config, "pretrained_config", None)
+        architectures = getattr(pretrained_config, "architectures", None)
+        architecture = (
+            architectures[0]
+            if isinstance(architectures, (list, tuple))
+            and architectures
+            and isinstance(architectures[0], str)
+            else None
+        )
+        configured_model_type = getattr(pretrained_config, "model_type", None)
+        model_type = configured_model_type if isinstance(configured_model_type, str) else None
+        return cls(architecture=architecture, model_type=model_type)
+
+
 class PostTransformTransferScope(str, Enum):
     """The model component represented by a post-transform transfer."""
 
@@ -72,6 +105,7 @@ class PostTransformProfile:
     speculative_mode: str | None
     protocol_version: int
     transfer_scope: PostTransformTransferScope
+    transform_abi_id: str
     supported_features: frozenset[PostTransformFeature] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
@@ -85,6 +119,8 @@ class PostTransformProfile:
             raise ValueError("Post-transform speculative_mode must not be empty")
         if self.protocol_version < 1:
             raise ValueError("Post-transform protocol_version must be positive")
+        if not isinstance(self.transform_abi_id, str) or not self.transform_abi_id:
+            raise ValueError("Post-transform transform_abi_id must be a non-empty string")
         object.__setattr__(self, "supported_features", frozenset(self.supported_features))
 
 
@@ -114,6 +150,14 @@ class PostTransformQualificationDecision:
 
         return (
             self.reason is PostTransformQualificationReason.QUALIFIED and self.profile is not None
+        )
+
+    @property
+    def transform_abi_id(self) -> str | None:
+        """The qualified layout ABI, or `None` for a rejected profile."""
+
+        return (
+            self.profile.transform_abi_id if self.qualified and self.profile is not None else None
         )
 
 
