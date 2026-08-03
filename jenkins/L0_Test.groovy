@@ -67,6 +67,9 @@ LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
 
+MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:0.4.1"
+MODEL_EXPRESS_REDIS_IMAGE = "urm.nvidia.com/docker/redis:7-alpine"
+
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
@@ -2910,7 +2913,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
     }
 }
 
-def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMode = false)
+def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMode = false, modelExpress = false)
 {
     def targetCloud = "kubernetes-cpu"
     def selectors = """
@@ -2921,6 +2924,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def nodeLabelPrefix = ""
     def tolerations = ""
     def extraDeviceEnv = ""
+    def serviceInitContainerConfig = ""
+    def serviceContainerConfig = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
@@ -3119,6 +3124,80 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         - SYS_ADMIN"""
         break
     }
+    if (modelExpress) {
+        if (arch != "amd64") {
+            throw new Exception("ModelExpress CI sidecars currently support amd64 test pods only.")
+        }
+        extraDeviceEnv += """
+                    - name: MODEL_EXPRESS_URL
+                      value: "http://127.0.0.1:8001"
+                    - name: TRTLLM_MX_E2E_REQUIRED
+                      value: "1"
+        """
+        serviceInitContainerConfig = """
+                initContainers:
+                  - name: redis
+                    image: ${MODEL_EXPRESS_REDIS_IMAGE}
+                    args: ["--save", "", "--appendonly", "no"]
+                    restartPolicy: Always
+                    ports:
+                    - containerPort: 6379
+                    startupProbe:
+                      tcpSocket:
+                        port: 6379
+                      initialDelaySeconds: 1
+                      periodSeconds: 1
+                      failureThreshold: 30
+                    livenessProbe:
+                      tcpSocket:
+                        port: 6379
+                      periodSeconds: 10
+                    resources:
+                      requests:
+                        cpu: 500m
+                        memory: 1Gi
+                        ephemeral-storage: 2Gi
+                      limits:
+                        cpu: 500m
+                        memory: 1Gi
+                        ephemeral-storage: 2Gi
+                    imagePullPolicy: Always
+        """
+        serviceContainerConfig = """
+                  - name: model-express-server
+                    image: ${MODEL_EXPRESS_SERVER_IMAGE}
+                    command: ["/app/modelexpress-server"]
+                    args: ["--port", "8001"]
+                    env:
+                    - name: MX_METADATA_BACKEND
+                      value: "redis"
+                    - name: REDIS_URL
+                      value: "redis://127.0.0.1:6379"
+                    ports:
+                    - containerPort: 8001
+                    readinessProbe:
+                      tcpSocket:
+                        port: 8001
+                      initialDelaySeconds: 2
+                      periodSeconds: 2
+                      failureThreshold: 30
+                    livenessProbe:
+                      tcpSocket:
+                        port: 8001
+                      initialDelaySeconds: 10
+                      periodSeconds: 10
+                    resources:
+                      requests:
+                        cpu: '1'
+                        memory: 4Gi
+                        ephemeral-storage: 4Gi
+                      limits:
+                        cpu: '1'
+                        memory: 4Gi
+                        ephemeral-storage: 4Gi
+                    imagePullPolicy: Always
+        """
+    }
     // Temporarily avoid an arm64 CPU builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
     def blockedNodeAffinity = targetCloud == "kubernetes-cpu" && arch == "arm64" ? '''
                               - key: "kubernetes.io/hostname"
@@ -3182,6 +3261,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 - "qa_only"
 ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
+${serviceInitContainerConfig}
                 containers:
                   ${containerConfig}
                     env:
@@ -3190,6 +3270,7 @@ ${blockedNodeAffinity}
                         fieldRef:
                           fieldPath: spec.nodeName
                     ${extraDeviceEnv}
+                  ${serviceContainerConfig}
                   - name: jnlp
                     image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
@@ -5146,6 +5227,9 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-AutoDeploy-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
+        // platform, test DB, split, splits, GPU count, ModelExpress sidecars
+        "DGX_H100-2_GPUs-PyTorch-ModelExpress-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
+        "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 4, true],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-PyTorch-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-PyTorch-2": ["rtx-5080", "l0_gb203", 2, 2],
@@ -5181,7 +5265,7 @@ def launchTestJobs(pipeline, testFilter)
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt, retryContext = null ->
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-"), values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -5839,17 +5923,19 @@ def launchTestJobs(pipeline, testFilter)
         }, {}, true)
     }]}
 
-    multiGpuJobs = parallelJobs.findAll{(it.key =~ /\d+_GPUs/) && !it.key.contains("Post-Merge")}
+    // OnDemand stages are available through --stage-list/--extra-stage only.
+    multiGpuJobs = parallelJobs.findAll{(it.key =~ /\d+_GPUs/) && !it.key.contains("Post-Merge") && !it.key.contains("-OnDemand-")}
     println multiGpuJobs.keySet()
     multiGpuJobsPostMerge = parallelJobs.findAll{(it.key =~ /\d+_GPUs/) && it.key.contains("Post-Merge")}
 
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
 
+    onDemandJobs = parallelJobs.findAll {it.key.contains("-OnDemand-")}
     postMergeJobs = parallelJobs.findAll {it.key.contains("Post-Merge")}
 
     // Start as a normal pre-merge job
-    parallelJobsFiltered = parallelJobs - multiGpuJobs - postMergeJobs
+    parallelJobsFiltered = parallelJobs - multiGpuJobs - postMergeJobs - onDemandJobs
 
     // Check if the multi GPU related file has changed or not. If changed, add multi GPU test stages.
     if (testFilter[(MULTI_GPU_FILE_CHANGED)]) {
@@ -5860,7 +5946,7 @@ def launchTestJobs(pipeline, testFilter)
         echo "AUTO_TRIGGER_TAG_LIST mode is true. Auto trigger tags: ${testFilter[(AUTO_TRIGGER_TAG_LIST)].join(', ')}."
         def autoTriggerTagStages = [:]
         for (tag in testFilter[(AUTO_TRIGGER_TAG_LIST)]) {
-            autoTriggerTagStages += parallelJobs.findAll { it.key.contains(tag) }
+            autoTriggerTagStages += (parallelJobs - onDemandJobs).findAll { it.key.contains(tag) }
         }
         parallelJobsFiltered += autoTriggerTagStages
         if (autoTriggerTagStages.size() > 0) {
@@ -5953,6 +6039,9 @@ def launchTestJobs(pipeline, testFilter)
         }
     }
 
+    // Keep manually triggered stages out of every automatic selection path.
+    parallelJobsFiltered -= onDemandJobs
+
     // Check --stage-list, only run the stages in stage-list. Supports wildcard '*'.
     if (testFilter[TEST_STAGE_LIST] != null) {
         echo "Use TEST_STAGE_LIST for filtering. Stages: ${testFilter[(TEST_STAGE_LIST)]}."
@@ -5989,6 +6078,9 @@ def launchTestJobs(pipeline, testFilter)
         def needsSanity = cbts.sanity_required
         def needsPerfSanity = cbts.perfsanity_required
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
+            if (key.contains("-OnDemand-")) {
+                return false
+            }
             if (key =~ /Post-Merge/) return affectedSet.contains(key)
             return affectedSet.contains(key) ||
                    (needsSanity && key =~ /PackageSanityCheck/) ||
