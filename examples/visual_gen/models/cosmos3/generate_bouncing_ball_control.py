@@ -29,7 +29,7 @@ Generate the control, then run transfer with it:
         --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
         --prompt "A photorealistic beach ball with colorful panels bouncing \
                   between the walls of an enclosed room, studio lighting." \
-        --extra_params '{"edge": {"control_path": "./ball_control/control.mp4"}}' \
+        --extra_params '{"edge": "./ball_control/control.mp4"}' \
         --output_path cosmos3_bouncing_ball.mp4
 
 Tip: keep synthetic controls edge-style. The ``blur`` hint expects the low

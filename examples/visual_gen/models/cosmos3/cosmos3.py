@@ -28,6 +28,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
+    TRANSFER_HINT_KEYS,
+    find_closest_target_size,
+)
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -40,6 +44,59 @@ def _resolve_path(path: str) -> str:
     if relative_to_script.is_file():
         return str(relative_to_script.resolve())
     return path
+
+
+def _load_transfer_controls(extra_params: Dict[str, Any]) -> Optional[str]:
+    """Read precomputed transfer controls into ``control`` bytes, client-side.
+
+    A hint may name a control file (``{"edge": "ctrl.mp4"}`` or
+    ``{"edge": {"control_path": "ctrl.mp4"}}``); the worker only accepts encoded
+    bytes, so the media is read here. Returns the first control path seen, for
+    output sizing.
+    """
+    first_path = None
+    for key in TRANSFER_HINT_KEYS:
+        hint = extra_params.get(key)
+        if isinstance(hint, str):
+            hint = {"control_path": hint}
+        if not isinstance(hint, dict):
+            continue
+        control_path = hint.pop("control_path", None)
+        if control_path is None:
+            continue
+        control_path = _resolve_path(control_path)
+        hint["control"] = Path(control_path).read_bytes()
+        extra_params[key] = hint
+        first_path = first_path or control_path
+    return first_path
+
+
+def _fit_output_to_source(params, source_path: Optional[str]) -> None:
+    """Size the output to the bucket whose aspect ratio matches ``source_path``.
+
+    Transfer output resolution comes from the request (as it does for V2V), so
+    the aspect fit happens here, where the file is still at hand. Needs OpenCV
+    to read the frame size; without it the model defaults stand.
+    """
+    if source_path is None:
+        return
+    try:
+        import cv2
+    except ImportError:
+        print("OpenCV not installed: leaving the output resolution at the model default.")
+        return
+    capture = cv2.VideoCapture(str(source_path))
+    try:
+        if not capture.isOpened():
+            return
+        source_w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        source_h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+    if source_w <= 0 or source_h <= 0:
+        return
+    params.width, params.height = find_closest_target_size(source_h, source_w, 720)
+    print(f"Fitting output to the source aspect: {params.width}x{params.height} (WxH)")
 
 
 def load_prompt_file(path: str) -> Dict[str, Any]:
@@ -171,7 +228,8 @@ def main():
             "flag-derived values). Keys are validated against the pipeline's "
             "extra_param_specs. Transfer example: "
             '\'{"edge": true, "blur": true, "control_guidance": 1.5}\' with --video_path, '
-            'or \'{"edge": {"control_path": "/path/control.mp4"}}\' for a precomputed control.'
+            'or \'{"edge": "/path/control.mp4"}\' for a precomputed control (read here and '
+            "sent as encoded bytes)."
         ),
     )
 
@@ -224,6 +282,9 @@ def main():
     if args.extra_params:
         # Merged last: explicit JSON wins over flag-derived values.
         params.extra_params.update(args.extra_params)
+    control_source = _load_transfer_controls(params.extra_params)
+    if any(params.extra_params.get(key) is not None for key in TRANSFER_HINT_KEYS):
+        _fit_output_to_source(params, args.video_path or control_source)
 
     if negative_prompt is None:
         params.negative_prompt = None

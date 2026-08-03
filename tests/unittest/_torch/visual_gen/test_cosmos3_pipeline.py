@@ -814,7 +814,19 @@ class TestCosmos3TransferRouting:
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.action_gen = False
         pipeline.audio_gen = False
-        pipeline._set_flow_shift = lambda *args, **kwargs: None
+        pipeline._apply_flow_shift = lambda *args, **kwargs: None
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+        pipeline.sampling = FakeSampling()
         captured = {}
 
         def fake_forward_transfer(**kwargs):
@@ -830,7 +842,7 @@ class TestCosmos3TransferRouting:
             captured.clear()
             pipeline.forward(
                 prompt="bounce",
-                video=_make_test_video(5, width=16, height=16),
+                video=_V2V_FIXTURE_MP4.read_bytes(),
                 transfer_config=cfg,
                 height=16,
                 width=16,

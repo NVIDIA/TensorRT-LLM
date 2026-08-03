@@ -232,21 +232,42 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     ),
     # Transfer
     "edge": ExtraParamSchema(
-        type="bool_or_str_or_dict", default=None, description="Edge transfer control"
+        type="bool_or_bytes_or_dict",
+        default=None,
+        description=(
+            "Canny-edge control. true auto-computes it from the `video` extra param; "
+            "or pass the encoded MP4/AVI bytes of a precomputed control clip, or an "
+            'object {"control": <bytes>, "preset_edge_threshold": "medium"}.'
+        ),
     ),
     "blur": ExtraParamSchema(
-        type="bool_or_str_or_dict", default=None, description="Blur transfer control."
+        type="bool_or_bytes_or_dict",
+        default=None,
+        description=(
+            "Low-frequency (color/lighting) control. true auto-computes it from the "
+            "`video` extra param; or pass encoded control bytes, or an object "
+            '{"control": <bytes>, "preset_blur_strength": "medium"}.'
+        ),
     ),
     "depth": ExtraParamSchema(
-        type="bool_or_str_or_dict", default=None, description="Depth transfer control."
+        type="bool_or_bytes_or_dict",
+        default=None,
+        description=(
+            "Depth control. Requires precomputed encoded MP4/AVI bytes (no auto-computation)."
+        ),
     ),
     "seg": ExtraParamSchema(
-        type="bool_or_str_or_dict", default=None, description="Segmentation transfer control."
+        type="bool_or_bytes_or_dict",
+        default=None,
+        description="Semantic-segmentation control. Requires precomputed encoded MP4/AVI bytes.",
     ),
     "wsm": ExtraParamSchema(
-        type="bool_or_str_or_dict",
+        type="bool_or_bytes_or_dict",
         default=None,
-        description="World scenario model transfer control.",
+        description=(
+            "World-scenario-model control. Requires precomputed encoded MP4/AVI bytes; "
+            "runs 101-frame chunks at 10 fps."
+        ),
     ),
     "control_guidance": ExtraParamSchema(
         type="float",
@@ -257,9 +278,6 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         type="list",
         default=None,
         description="[lo, hi] timestep window where control guidance is active.",
-    ),
-    "resolution": ExtraParamSchema(
-        type="str", default=None, description="Transfer resolution bucket (e.g. '720')."
     ),
     "num_video_frames_per_chunk": ExtraParamSchema(
         type="int",

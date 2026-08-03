@@ -18,7 +18,6 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
 import numpy as np
-import PIL.Image
 import pytest
 import torch
 import torch.nn as nn
@@ -27,22 +26,16 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pi
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
-    _path_media_to_uint8_cthw,
-    _pil_to_uint8_rgb,
+    decode_media_to_uint8_cthw,
     find_closest_target_size,
     load_or_compute_control_frames,
     make_blur_control,
     make_edge_control,
-    media_height_width,
-    media_to_uint8_cthw,
-    normalized_video_to_uint8_cthw,
     pad_temporal_frames,
-    resize_center_crop_uint8_cthw,
     resolve_transfer_config,
     uint8_cthw_to_normalized_5d,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import TransformerOutput
-from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import read_video_tensor
 
 pytestmark = pytest.mark.cosmos3
 
@@ -53,6 +46,15 @@ def _ids(value: int) -> torch.Tensor:
 
 def _mask() -> torch.Tensor:
     return torch.ones(1, 1, dtype=torch.long)
+
+
+def _fake_decode_window(num_frames: int):
+    """Stand in for the NVDEC window decode, returning ``[T, H, W, 3]`` uint8."""
+
+    def _decode(data, *, first_frame, last_frame, target_h, target_w, device):
+        return torch.zeros(num_frames, target_h, target_w, 3, dtype=torch.uint8)
+
+    return _decode
 
 
 def _req(**overrides):
@@ -165,13 +167,20 @@ class TestTransferConfig:
         assert resolve_transfer_config({"wsm": True}, _req()).fps == 10
         assert resolve_transfer_config({"wsm": True, "fps": 24.0}, _req()).fps == 24.0
 
-    def test_precomputed_control_tensor_passthrough(self):
-        precomputed = torch.zeros(3, 2, 8, 8, dtype=torch.uint8)
-        cfg = resolve_transfer_config({"edge": {"control": precomputed}}, _req())
-        loaded = load_or_compute_control_frames(
-            cfg.hints["edge"], height=8, width=8, max_frames=2, input_frames=None
+    def test_precomputed_control_bytes_reach_the_decoder(self, monkeypatch):
+        monkeypatch.setattr(
+            transfer_module, "decode_video_reference_window", _fake_decode_window(2)
         )
-        assert tuple(loaded.shape) == (3, 2, 8, 8)
+        cfg = resolve_transfer_config({"edge": {"control": b"\x00control"}}, _req())
+        loaded = load_or_compute_control_frames(
+            cfg.hints["edge"],
+            height=8,
+            width=8,
+            max_frames=2,
+            input_frames=None,
+            device=torch.device("cpu"),
+        )
+        assert tuple(loaded.shape) == (3, 2, 8, 8) and loaded.dtype == torch.uint8
 
 
 # =============================================================================
@@ -202,6 +211,7 @@ class TestTransferMediaHelpers:
                 width=8,
                 max_frames=1,
                 input_frames=torch.zeros(3, 1, 8, 8, dtype=torch.uint8),
+                device=torch.device("cpu"),
             )
 
     def test_edge_uses_rgb_canny(self, monkeypatch):
@@ -255,42 +265,9 @@ class TestTransferMediaHelpers:
         assert tuple(blurred.shape) == (3, 1, 72, 72)
         assert fake_cv2.bilateral_calls == [((72, 72, 3), 3, 15.0, 10.0)]
 
-    @staticmethod
-    def _write_mp4(path, num_frames=5, size=16):
-        cv2 = pytest.importorskip("cv2")
-        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (size, size))
-        try:
-            for _ in range(num_frames):
-                writer.write(np.zeros((size, size, 3), dtype=np.uint8))
-        finally:
-            writer.release()
-
-    def test_video_decode_paths(self, tmp_path):
-        clip = tmp_path / "clip.mp4"
-        self._write_mp4(clip)
-
-        frames = read_video_tensor(clip)
-        assert tuple(frames.shape) == (5, 16, 16, 3) and frames.dtype == torch.uint8
-        assert read_video_tensor(clip, max_frames=3).shape[0] == 3
-
-        cthw = _path_media_to_uint8_cthw(clip, max_frames=None)
-        assert tuple(cthw.shape) == (3, 5, 16, 16)
-        assert media_height_width(str(clip)) == (16, 16)
-
-        image_path = tmp_path / "frame.png"
-        PIL.Image.new("RGB", (8, 4), "red").save(image_path)
-        image_cthw = _path_media_to_uint8_cthw(image_path, max_frames=None)
-        assert tuple(image_cthw.shape) == (3, 1, 4, 8)
-
-        with pytest.raises(FileNotFoundError):
-            _path_media_to_uint8_cthw(tmp_path / "missing.mp4", max_frames=None)
-
 
 class TestTransferFrameConversions:
-    """Dedicated unit tests for the transfer control-frame conversion helpers.
-
-    CPU-only; the video-path decode is covered by ``test_video_decode_paths``.
-    """
+    """Unit tests for the transfer control-frame conversion helpers (CPU-only)."""
 
     def test_uint8_cthw_to_normalized_5d_maps_0_255_to_pm1(self):
         black = torch.zeros(3, 2, 4, 5, dtype=torch.uint8)
@@ -309,53 +286,56 @@ class TestTransferFrameConversions:
                 torch.zeros(2, 4, 4, dtype=torch.uint8), dtype=torch.float32
             )
 
-    def test_normalized_video_roundtrips_with_model_input(self):
-        frames = (torch.arange(3 * 2 * 4 * 4) % 256).reshape(3, 2, 4, 4).to(torch.uint8)
-        model_input = uint8_cthw_to_normalized_5d(frames, dtype=torch.float32)
-        back = normalized_video_to_uint8_cthw(model_input)
-        assert back.shape == (3, 2, 4, 4) and back.dtype == torch.uint8
-        assert (back.int() - frames.int()).abs().max() <= 1  # rounding tolerance
 
-    def test_normalized_video_accepts_channels_last(self):
-        thwc = torch.rand(2, 4, 5, 3)  # [T, H, W, C] in [0, 1]
-        out = normalized_video_to_uint8_cthw(thwc)
-        assert out.shape == (3, 2, 4, 5) and out.dtype == torch.uint8
+class TestTransferControlPayloads:
+    """Controls cross the extra-param boundary as encoded bytes, like ``video``."""
 
-    def test_normalized_video_rejects_batch_gt_1(self):
-        with pytest.raises(ValueError, match="batch size 1"):
-            normalized_video_to_uint8_cthw(torch.zeros(2, 3, 1, 4, 4))
+    def test_hint_accepts_bytes_bare_and_in_an_object(self):
+        assert resolve_transfer_config({"edge": b"MP4"}, _req()).hints["edge"].control == b"MP4"
+        cfg = resolve_transfer_config({"depth": {"control": b"MP4"}}, _req())
+        assert cfg.hints["depth"].control == b"MP4"
 
-    def test_resize_center_crop_uint8_cthw_shape(self):
-        frames = (torch.arange(3 * 2 * 8 * 4) % 256).reshape(3, 2, 8, 4).to(torch.uint8)
-        out = resize_center_crop_uint8_cthw(frames, height=4, width=4)
-        assert out.shape == (3, 2, 4, 4) and out.dtype == torch.uint8
+    def test_hint_rejects_a_bare_path(self):
+        with pytest.raises(ValueError, match="not a path"):
+            resolve_transfer_config({"edge": "/tmp/control.mp4"}, _req())
 
-    def test_resize_center_crop_uint8_cthw_rejects_bad_shape(self):
-        with pytest.raises(ValueError, match="3, T, H, W"):
-            resize_center_crop_uint8_cthw(torch.zeros(1, 2, 4, 4, dtype=torch.uint8), 4, 4)
+    def test_hint_rejects_control_path(self):
+        with pytest.raises(ValueError, match="control_path"):
+            resolve_transfer_config({"edge": {"control_path": "/tmp/control.mp4"}}, _req())
 
-    def test_pil_to_uint8_rgb_from_pil_and_float_tensor(self):
-        img = PIL.Image.new("RGB", (5, 4), (10, 20, 30))  # (W=5, H=4)
-        arr = _pil_to_uint8_rgb(img)
-        assert arr.shape == (4, 5, 3) and arr.dtype == np.uint8
-        assert arr[0, 0].tolist() == [10, 20, 30]
-        chw = torch.full((3, 4, 5), -1.0)  # [-1, 1] CHW float, -1 -> 0
-        out = _pil_to_uint8_rgb(chw)
-        assert out.shape == (4, 5, 3) and out.dtype == np.uint8 and int(out.max()) == 0
+    def test_hint_rejects_non_bytes_control(self):
+        with pytest.raises(TypeError, match="encoded MP4/AVI bytes"):
+            resolve_transfer_config({"edge": {"control": torch.zeros(3, 1, 4, 4)}}, _req())
 
-    def test_media_to_uint8_cthw_from_list(self):
-        frames = [PIL.Image.new("RGB", (8, 6), (v, v, v)) for v in (0, 128, 255)]
-        out = media_to_uint8_cthw(frames, height=4, width=4)
-        assert out.shape == (3, 3, 4, 4) and out.dtype == torch.uint8
+    def test_decode_asks_for_the_leading_window_and_returns_cthw(self, monkeypatch):
+        seen = {}
 
-    def test_media_to_uint8_cthw_from_tensor(self):
-        video = torch.rand(1, 3, 2, 8, 6)  # [1, 3, T, H, W] in [0, 1]
-        out = media_to_uint8_cthw(video, height=4, width=4)
-        assert out.shape == (3, 2, 4, 4) and out.dtype == torch.uint8
+        def fake_decode(data, *, first_frame, last_frame, target_h, target_w, device):
+            seen.update(data=data, first=first_frame, last=last_frame, h=target_h, w=target_w)
+            return torch.zeros(3, target_h, target_w, 3, dtype=torch.uint8)
 
-    def test_media_to_uint8_cthw_rejects_unknown_type(self):
-        with pytest.raises(TypeError, match="control payload type"):
-            media_to_uint8_cthw(42, height=4, width=4)
+        monkeypatch.setattr(transfer_module, "decode_video_reference_window", fake_decode)
+        out = decode_media_to_uint8_cthw(
+            b"clip", height=8, width=6, max_frames=4, device=torch.device("cpu")
+        )
+        assert tuple(out.shape) == (3, 3, 8, 6) and out.dtype == torch.uint8
+        assert seen == {"data": b"clip", "first": 0, "last": 3, "h": 8, "w": 6}
+
+    def test_decode_rejects_unencoded_payloads(self):
+        with pytest.raises(TypeError, match="encoded MP4/AVI bytes"):
+            decode_media_to_uint8_cthw(
+                torch.zeros(3, 1, 4, 4),
+                height=4,
+                width=4,
+                max_frames=1,
+                device=torch.device("cpu"),
+            )
+
+    def test_decode_rejects_a_nonpositive_window(self):
+        with pytest.raises(ValueError, match="max_frames must be positive, got 0"):
+            decode_media_to_uint8_cthw(
+                b"clip", height=4, width=4, max_frames=0, device=torch.device("cpu")
+            )
 
 
 # =============================================================================
@@ -460,14 +440,52 @@ class TestForwardTransferChunks:
         with pytest.raises(ValueError, match="num_conditional_frames"):
             chunks(189, 93, 93)
 
+    def test_decode_window_is_bounded_by_the_output_length(self, monkeypatch):
+        """The decoder reserves its retention ring from the requested window, so
+        asking for ``max_frames`` (5000 by default) would reserve ~14 GB at 720p
+        before a frame lands. Only what gets generated is decoded."""
+        pipeline = _make_pipeline()
+        windows = []
+
+        class StopAfterDecode(Exception):
+            pass
+
+        def recording_decode(data, *, first_frame, last_frame, target_h, target_w, device):
+            windows.append((first_frame, last_frame))
+            raise StopAfterDecode
+
+        monkeypatch.setattr(transfer_module, "decode_video_reference_window", recording_decode)
+        cfg = resolve_transfer_config({"edge": {"control": b"clip"}}, _req())
+        assert cfg.max_frames == 5000  # the default ceiling stays in place
+
+        with pytest.raises(StopAfterDecode):
+            pipeline._forward_transfer(
+                prompt="transfer",
+                negative_prompt="",
+                height=16,
+                width=16,
+                max_frames=cfg.max_frames,
+                num_inference_steps=1,
+                max_sequence_length=8,
+                use_system_prompt=False,
+                use_duration_template=False,
+                use_resolution_template=False,
+                seed=1,
+                frame_rate=24.0,
+                num_frames=189,
+                transfer_config=cfg,
+                video=b"input-clip",
+            )
+
+        assert windows == [(0, 188)]
+
     def test_multichunk_overlap_path(self, monkeypatch):
         pipeline = _make_pipeline()
         captured = {"targets": [], "conditional_frames": [], "decode_calls": [], "flow_shifts": []}
 
-        pipeline._transfer_bucket_size = lambda cfg, source_hw: (16, 16)
         tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
         pipeline._tokenize_prompt = lambda *args, **kwargs: next(tokenized)
-        pipeline._set_flow_shift = lambda target, **kwargs: captured["flow_shifts"].append(target)
+        pipeline._apply_flow_shift = lambda target, **kwargs: captured["flow_shifts"].append(target)
 
         original_prepare = pipeline._prepare_transfer_latents
 
@@ -492,14 +510,19 @@ class TestForwardTransferChunks:
         # Identity postprocess so assertions run on the raw float assembly.
         monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
 
-        # Input video: frame0 black (-1 normalized), frame1+ white (+1).
-        video = [PIL.Image.new("RGB", (16, 16), "black")] + [
-            PIL.Image.new("RGB", (16, 16), "white") for _ in range(7)
-        ]
-        control = torch.zeros(3, 8, 16, 16, dtype=torch.uint8)
+        # Input video: frame0 black (-1 normalized), frame1+ white (+1); the
+        # control is an all-black clip. Both arrive as encoded bytes and are
+        # decoded on the worker, so the decode is what the stub stands in for.
+        def fake_media_decode(data, *, first_frame, last_frame, target_h, target_w, device):
+            frames = torch.zeros(8, target_h, target_w, 3, dtype=torch.uint8)
+            if data == b"input-clip":
+                frames[1:] = 255
+            return frames
+
+        monkeypatch.setattr(transfer_module, "decode_video_reference_window", fake_media_decode)
         cfg = resolve_transfer_config(
             {
-                "edge": {"control": control},
+                "edge": {"control": b"control-clip"},
                 "guidance_scale": 1.0,
                 "control_guidance": 1.0,
                 "max_frames": 8,
@@ -522,8 +545,10 @@ class TestForwardTransferChunks:
             use_duration_template=False,
             use_resolution_template=False,
             seed=123,
+            frame_rate=24.0,
+            num_frames=8,
             transfer_config=cfg,
-            video=video,
+            video=b"input-clip",
         )
 
         assert captured["conditional_frames"] == [2, 1]

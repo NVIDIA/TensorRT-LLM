@@ -17,7 +17,6 @@ import json
 import math
 import os
 import time
-from collections.abc import Mapping
 from typing import Any, Iterable, List, Optional, Union
 
 import PIL.Image
@@ -62,10 +61,8 @@ from .sampling import Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
     Cosmos3TransferConfig,
-    find_closest_target_size,
+    decode_media_to_uint8_cthw,
     load_or_compute_control_frames,
-    media_height_width,
-    media_to_uint8_cthw,
     pad_temporal_frames,
     resolve_transfer_config,
     uint8_cthw_to_normalized_5d,
@@ -289,57 +286,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # resolve it by mode. The checkpoint value is exposed separately as
         # ``default_use_system_prompt``.
         return dict(COSMOS3_EXTRA_SPECS)
-
-    def _transfer_bucket_size(
-        self,
-        transfer_config: Cosmos3TransferConfig,
-        source_hw: tuple[int, int] | None,
-    ) -> tuple[int, int]:
-        resolution = transfer_config.resolution if transfer_config.resolution is not None else 720
-        source_h, source_w = source_hw or (
-            COSMOS3_720P_PARAMS["height"],
-            COSMOS3_720P_PARAMS["width"],
-        )
-        target_w, target_h = find_closest_target_size(int(source_h), int(source_w), resolution)
-        return int(target_h), int(target_w)
-
-    @staticmethod
-    def _video_payload_value(video: Any, key: str) -> Any:
-        if isinstance(video, Mapping):
-            return video.get(key)
-        return getattr(video, key, None)
-
-    @classmethod
-    def _video_payload_fps(cls, video: Any) -> Optional[float]:
-        for key in ("fps", "frame_rate", "source_fps", "input_fps", "avg_fps", "average_fps"):
-            fps = cls.positive_float(cls._video_payload_value(video, key))
-            if fps is not None:
-                return fps
-        for key in ("metadata", "info"):
-            metadata = cls._video_payload_value(video, key)
-            if metadata is None or metadata is video:
-                continue
-            fps = cls._video_payload_fps(metadata)
-            if fps is not None:
-                return fps
-        if isinstance(video, Mapping):
-            for key in ("frames", "data", "video"):
-                nested = video.get(key)
-                if nested is None or nested is video:
-                    continue
-                fps = cls._video_payload_fps(nested)
-                if fps is not None:
-                    return fps
-        if isinstance(video, (str, os.PathLike)):
-            try:
-                import imageio.v3 as iio
-
-                metadata = iio.immeta(os.fspath(video))
-            except Exception:
-                return None
-            if metadata is not video:
-                return cls._video_payload_fps(metadata)
-        return None
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
@@ -1017,7 +963,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             num_inference_steps = num_inference_steps or COSMOS3_720P_PARAMS["num_inference_steps"]
             if guidance_scale is None:
                 guidance_scale = COSMOS3_720P_PARAMS["guidance_scale"]
-            if is_v2v:
+            if transfer_config is not None:
+                # _forward_transfer applies the hint's own shift; rebuilding the
+                # schedulers here would only be undone a few lines later.
+                pass
+            elif is_v2v:
                 # V2V wants a stronger shift and the uniform sigma schedule.
                 self._apply_flow_shift(
                     flow_shift if flow_shift is not None else COSMOS3_V2V_DEFAULT_FLOW_SHIFT,
@@ -1102,6 +1052,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 use_duration_template=False,
                 use_resolution_template=False,
                 seed=seed,
+                frame_rate=frame_rate,
+                num_frames=num_frames,
                 transfer_config=transfer_config,
                 video=video,
             )
@@ -1426,21 +1378,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
 
     @staticmethod
-    def _first_transfer_control_hw(
-        transfer_config: Cosmos3TransferConfig,
-    ) -> tuple[int, int] | None:
-        for hint in transfer_config.ordered_hints:
-            if hint.control is not None:
-                detected = media_height_width(hint.control)
-                if detected is not None:
-                    return detected
-            if hint.control_path is not None:
-                detected = media_height_width(hint.control_path)
-                if detected is not None:
-                    return detected
-        return None
-
-    @staticmethod
     def _get_transfer_num_chunks(
         total_frames: int,
         frames_per_chunk: int,
@@ -1630,46 +1567,56 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         use_duration_template: str,
         use_resolution_template: str,
         seed,
+        frame_rate: float,
+        num_frames: int,
         transfer_config: Cosmos3TransferConfig,
         video: Any,
     ) -> PipelineOutput:
-        input_frames = None
-        transfer_input_fps = self._video_payload_fps(video) if video is not None else None
-        source_hw = (
-            media_height_width(video)
-            if video is not None
-            else self._first_transfer_control_hw(transfer_config)
-        )
-        height, width = self._transfer_bucket_size(transfer_config, source_hw)
         if self.rank == 0:
-            logger.info(
-                "Cosmos3 transfer bucket: "
-                f"source_hw={source_hw}, resolution={transfer_config.resolution or 720}, "
-                f"target={width}x{height} (WxH), transfer_input_fps={transfer_input_fps}"
-            )
-        if video is not None:
-            input_frames = media_to_uint8_cthw(
-                video,
-                height=height,
-                width=width,
-                max_frames=max_frames,
-            )
-            input_frames = input_frames[:, : transfer_config.max_frames]
+            logger.info(f"Cosmos3 transfer target={width}x{height} (WxH)")
 
+        # Decode the input video and every precomputed control on this rank's
+        # NVDEC. A decode can fail non-uniformly across ranks (decoder init,
+        # corrupt stream, allocation), so converge all ranks on one outcome
+        # before any model collective rather than hanging the healthy ones.
+        # The decoder sizes its retention ring from the requested window, so
+        # asking for `max_frames` (5000 by default) would reserve ~14 GB at 720p
+        # before a single frame lands. Bound it by what is actually generated:
+        # the output is `num_frames` long, and `max_frames` stays the ceiling.
+        decode_frames = min(int(max_frames), int(transfer_config.num_frames or num_frames))
+        if self.rank == 0:
+            logger.info(f"Cosmos3 transfer decoding up to {decode_frames} frames per reference")
+
+        input_frames = None
         per_hint_frames: dict[str, torch.Tensor] = {}
-        for hint in transfer_config.ordered_hints:
-            frames = load_or_compute_control_frames(
-                hint,
-                height=height,
-                width=width,
-                max_frames=transfer_config.max_frames,
-                input_frames=input_frames,
-            )
-            if frames.shape[1] < 1:
-                raise ValueError(f"Cosmos3 transfer hint '{hint.key}' produced no frames.")
-            per_hint_frames[hint.key] = frames
-        if not per_hint_frames:
-            raise ValueError("Cosmos3 transfer requires at least one control hint.")
+        prepare_error: Optional[Exception] = None
+        try:
+            if video is not None:
+                input_frames = decode_media_to_uint8_cthw(
+                    video,
+                    height=height,
+                    width=width,
+                    max_frames=decode_frames,
+                    device=self.device,
+                )
+
+            for hint in transfer_config.ordered_hints:
+                frames = load_or_compute_control_frames(
+                    hint,
+                    height=height,
+                    width=width,
+                    max_frames=decode_frames,
+                    input_frames=input_frames,
+                    device=self.device,
+                )
+                if frames.shape[1] < 1:
+                    raise ValueError(f"Cosmos3 transfer hint '{hint.key}' produced no frames.")
+                per_hint_frames[hint.key] = frames
+            if not per_hint_frames:
+                raise ValueError("Cosmos3 transfer requires at least one control hint.")
+        except Exception as exc:
+            prepare_error = exc
+        synchronize_media_prepare_status(prepare_error)
 
         total_frames = next(iter(per_hint_frames.values())).shape[1]
         if transfer_config.num_frames is not None:
@@ -1700,14 +1647,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if input_frames is not None:
             input_frames = pad_temporal_frames(input_frames, padded_frames)
 
-        configured_frame_rate = self.positive_float(transfer_config.fps)
-        input_frame_rate = self.positive_float(transfer_input_fps)
-        sampling_frame_rate = self.positive_float(transfer_config.fps)
-        is_wsm_only = len(transfer_config.hints) == 1 and "wsm" in transfer_config.hints
-        if is_wsm_only:
-            frame_rate = configured_frame_rate or input_frame_rate or sampling_frame_rate or 24.0
-        else:
-            frame_rate = input_frame_rate or configured_frame_rate or sampling_frame_rate or 24.0
+        # The encoded reference carries no frame rate across the extra-param
+        # boundary, so the hint's configured fps (wsm's 10) wins over the
+        # request's, which falls back to the mode default.
+        frame_rate = (
+            self.positive_float(transfer_config.fps) or self.positive_float(frame_rate) or 24.0
+        )
         num_inference_steps = num_inference_steps or COSMOS3_720P_PARAMS["num_inference_steps"]
         guidance_scale = (
             float(transfer_config.guidance_scale)
