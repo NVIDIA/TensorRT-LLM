@@ -76,7 +76,13 @@ def test_apply_msa_patch_applies_every_msa_patch(tmp_path):
     patched_plan = project_dir / "3rdparty" / "MSA" / MSA_PLAN
 
     apply_msa_patch(project_dir)
-    assert "Fast path 1 (uniform cost)" in patched_plan.read_text()
+    plan_source = patched_plan.read_text()
+    assert "Fast path 1 (uniform cost)" in plan_source
+    assert "int direct_kv_iters[MAX_UNSPLIT]" in plan_source
+    assert "uint pack_cost_idx" in plan_source
+    assert "uint64_t pack_cost_idx" not in plan_source
+    assert "_max_bucket_cost_bound <= 0x7ffffe" in plan_source
+    assert "const int64_t _num_direct_rows" in plan_source
 
     apply_msa_patch(project_dir)
     assert "Fast path 1 (uniform cost)" in patched_plan.read_text()
