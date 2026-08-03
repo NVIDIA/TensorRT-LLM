@@ -197,9 +197,14 @@ def test_dsv4_ob_cute_tactics_are_runtime_tuned() -> None:
         assert len(tactics) > 1
         assert runner._get_fallback_tactic(num_splits) in tactics
 
-    split1_tiles = {tactic[0] for tactic in runner_cls._SPLIT_K1_TACTICS}
-    assert (256, 128) in split1_tiles
-    assert (256, 144) in split1_tiles
+    split1_tactics = set(runner_cls._SPLIT_K1_TACTICS)
+    assert all(len(tactic) == 6 for tactic in split1_tactics)
+    assert {
+        ((256, 96), (2, 1), False, None, False, False),
+        ((256, 112), (2, 1), False, None, False, False),
+        ((256, 112), (2, 1), False, None, False, True),
+    } <= split1_tactics
+    assert {(256, 128), (256, 144)} <= {tactic[0] for tactic in split1_tactics}
 
 
 @pytest.mark.parametrize(
@@ -243,9 +248,11 @@ def test_dsv4_ob_cute_compile_key_excludes_runtime_shapes() -> None:
     runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
     tactic = runner._SPLIT_K1_TACTICS[0]
     key = runner._get_compile_key(16384, 1, *tactic, 74, True)
+    tma_tactic = next(tactic for tactic in runner._SPLIT_K1_TACTICS if tactic[-1])
 
     assert key == runner._get_compile_key(16384, 1, *tactic, 74, True)
     assert key != runner._get_compile_key(16384, 1, *tactic, 80, True)
+    assert key != runner._get_compile_key(16384, 1, *tma_tactic, 74, True)
 
 
 def test_dsv4_ob_tuning_input_hook_restores_packed_scale_layout() -> None:
@@ -652,6 +659,29 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
     assert runtime_tactics[-1][2] != -1
 
 
+def _pack_dsv4_ob_scales(exponents: torch.Tensor) -> torch.Tensor:
+    rows, num_blocks = exponents.shape
+    aligned_rows = (rows + 3) // 4 * 4
+    grouped = exponents.reshape(rows, num_blocks // 4, 4).to(torch.int32)
+    packed = (
+        grouped[..., 0] | (grouped[..., 1] << 8) | (grouped[..., 2] << 16) | (grouped[..., 3] << 24)
+    )
+    storage = torch.zeros(
+        (num_blocks // 4, aligned_rows),
+        device=exponents.device,
+        dtype=torch.int32,
+    )
+    storage[:, :rows] = packed.transpose(0, 1)
+    return torch.as_strided(storage, packed.shape, (1, aligned_rows))
+
+
+def _dequant_dsv4_ob_operand(operand: torch.Tensor, exponents: torch.Tensor) -> torch.Tensor:
+    rows, k = operand.shape
+    return (
+        operand.float().reshape(rows, -1, 128) * torch.exp2(exponents.float() - 127.0)[..., None]
+    ).reshape(rows, k)
+
+
 @skip_pre_blackwell
 def test_dsv4_pro_fp8_splitk_gemm_packed_scales(monkeypatch: pytest.MonkeyPatch) -> None:
     if get_sm_version() // 10 != 10:
@@ -667,29 +697,14 @@ def test_dsv4_pro_fp8_splitk_gemm_packed_scales(monkeypatch: pytest.MonkeyPatch)
         128, dim=0
     )
 
-    def pack_scales(exponents: torch.Tensor, aligned_rows: int) -> torch.Tensor:
-        rows, num_blocks = exponents.shape
-        grouped = exponents.reshape(rows, num_blocks // 4, 4).to(torch.int32)
-        packed = (
-            grouped[..., 0]
-            | (grouped[..., 1] << 8)
-            | (grouped[..., 2] << 16)
-            | (grouped[..., 3] << 24)
-        )
-        storage = torch.zeros((num_blocks // 4, aligned_rows), device="cuda", dtype=torch.int32)
-        storage[:, :rows] = packed.transpose(0, 1)
-        return torch.as_strided(storage, packed.shape, (1, aligned_rows))
-
-    sfa = pack_scales(exp_a, m)
-    sfb = pack_scales(exp_b, n)
+    sfa = _pack_dsv4_ob_scales(exp_a)
+    sfb = _pack_dsv4_ob_scales(exp_b)
     monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", str(num_splits))
     output = torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb)
     partials = output.view(num_splits, m, n)
 
-    scale_a = torch.exp2(exp_a.float() - 127.0)
-    scale_b = torch.exp2(exp_b.float() - 127.0)
-    a_dequant = (a.float().reshape(m, k_blocks, 128) * scale_a[..., None]).reshape(m, k)
-    b_dequant = (b.float().reshape(n, k_blocks, 128) * scale_b[..., None]).reshape(n, k)
+    a_dequant = _dequant_dsv4_ob_operand(a, exp_a)
+    b_dequant = _dequant_dsv4_ob_operand(b, exp_b)
     split_k = k // num_splits
     expected = torch.stack(
         [
@@ -699,6 +714,30 @@ def test_dsv4_pro_fp8_splitk_gemm_packed_scales(monkeypatch: pytest.MonkeyPatch)
         ]
     )
     torch.testing.assert_close(partials.float(), expected, rtol=0.02, atol=0.05)
+
+
+@skip_pre_blackwell
+def test_dsv4_pro_fp8_splitk_gemm_tma_scale_pipeline() -> None:
+    if get_sm_version() // 10 != 10:
+        pytest.skip("dsv4_fp8_splitk_gemm requires the SM100 family")
+
+    m, n, k = 256, 112, 2048
+    k_blocks = k // 128
+    torch.manual_seed(1234)
+    a = (torch.randn((m, k), device="cuda") * 0.125).to(torch.float8_e4m3fn)
+    b = (torch.randn((n, k), device="cuda") * 0.125).to(torch.float8_e4m3fn)
+    exp_a = torch.randint(124, 131, (m, k_blocks), device="cuda")
+    exp_b = torch.randint(124, 131, (n, k_blocks), device="cuda")
+    sfa = _pack_dsv4_ob_scales(exp_a)
+    sfb = _pack_dsv4_ob_scales(exp_b)
+    output = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner(use_tvm_ffi=True)
+    tma_tactic = ((256, 112), (2, 1), False, None, False, True)
+
+    for _ in range(3):
+        runner.forward([a, sfa, b, sfb, output], tactic=tma_tactic, num_splits=1)
+    expected = _dequant_dsv4_ob_operand(a, exp_a) @ _dequant_dsv4_ob_operand(b, exp_b).T
+    torch.testing.assert_close(output.float(), expected, rtol=0.02, atol=0.05)
 
 
 def _per_token_fp8_quant_dequant(x: torch.Tensor) -> torch.Tensor:

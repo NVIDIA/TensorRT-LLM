@@ -4346,37 +4346,40 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # kernels. Runtime AutoTuner profiling, rather than an M-based table,
         # selects the winner for every token bucket and GPU SKU.
         _SPLIT_K4_TACTICS = (
-            ((128, 32), (1, 1), True, None, False),
-            ((128, 32), (1, 1), True, None, True),
-            ((256, 32), (2, 1), True, None, False),
-            ((256, 32), (2, 1), True, None, True),
+            ((128, 32), (1, 1), True, None, False, False),
+            ((128, 32), (1, 1), True, None, True, False),
+            ((256, 32), (2, 1), True, None, False, False),
+            ((256, 32), (2, 1), True, None, True, False),
         )
         _SPLIT_K2_TACTICS = (
-            ((128, 32), (1, 1), True, None, False),
-            ((128, 32), (1, 1), True, None, True),
-            ((256, 64), (2, 1), True, 8, False),
-            ((256, 64), (2, 1), True, 8, True),
-            ((256, 128), (2, 1), True, None, False),
-            ((256, 128), (2, 1), True, None, True),
+            ((128, 32), (1, 1), True, None, False, False),
+            ((128, 32), (1, 1), True, None, True, False),
+            ((256, 64), (2, 1), True, 8, False, False),
+            ((256, 64), (2, 1), True, 8, True, False),
+            ((256, 128), (2, 1), True, None, False, False),
+            ((256, 128), (2, 1), True, None, True, False),
         )
         _SPLIT_K1_TACTICS = (
-            ((128, 128), (1, 1), True, None, False),
-            ((128, 128), (1, 1), True, None, True),
-            ((256, 112), (2, 1), False, None, True),
-            ((256, 128), (2, 1), True, None, False),
-            ((256, 128), (2, 1), True, None, True),
-            ((256, 144), (2, 1), True, None, False),
-            ((256, 144), (2, 1), True, None, True),
-            ((256, 160), (2, 1), False, None, True),
-            ((256, 160), (2, 1), True, None, True),
-            ((256, 192), (2, 1), True, None, True),
-            ((256, 208), (2, 1), False, None, True),
-            ((256, 208), (2, 1), True, None, True),
-            ((256, 224), (2, 1), False, None, True),
-            ((256, 224), (2, 1), True, None, True),
-            ((256, 240), (2, 1), False, None, True),
-            ((256, 240), (2, 1), True, None, True),
-            ((256, 256), (2, 1), True, None, True),
+            ((128, 128), (1, 1), True, None, False, False),
+            ((128, 128), (1, 1), True, None, True, False),
+            ((256, 96), (2, 1), False, None, False, False),
+            ((256, 112), (2, 1), False, None, False, False),
+            ((256, 112), (2, 1), False, None, False, True),
+            ((256, 112), (2, 1), False, None, True, False),
+            ((256, 128), (2, 1), True, None, False, False),
+            ((256, 128), (2, 1), True, None, True, False),
+            ((256, 144), (2, 1), True, None, False, False),
+            ((256, 144), (2, 1), True, None, True, False),
+            ((256, 160), (2, 1), False, None, True, False),
+            ((256, 160), (2, 1), True, None, True, False),
+            ((256, 192), (2, 1), True, None, True, False),
+            ((256, 208), (2, 1), False, None, True, False),
+            ((256, 208), (2, 1), True, None, True, False),
+            ((256, 224), (2, 1), False, None, True, False),
+            ((256, 224), (2, 1), True, None, True, False),
+            ((256, 240), (2, 1), False, None, True, False),
+            ((256, 240), (2, 1), True, None, True, False),
+            ((256, 256), (2, 1), True, None, True, False),
         )
 
         _TUNING_CONFIGS = {
@@ -4410,7 +4413,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.use_tvm_ffi = use_tvm_ffi
 
         def unique_id(self):
-            return (self.use_tvm_ffi, )
+            return (self.use_tvm_ffi, "tma-scale-v1")
 
         @classmethod
         def get_tuning_config(cls, num_splits: int) -> TuningConfig:
@@ -4448,13 +4451,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def _get_compile_key(k: int, num_splits: int, mma_tiler_mn: tuple,
                              cluster_shape_mn: tuple, swap_ab: bool,
                              max_ab_stages: Optional[int], l2_swizzle: bool,
-                             max_active_clusters: int,
+                             tma_packed_scales: bool, max_active_clusters: int,
                              use_tvm_ffi: bool) -> tuple:
             # Exact problem dimensions and scale strides are runtime arguments.
             # Do not add them here: doing so causes multi-second synchronous JIT
             # compilation on previously unseen request token counts.
             return (k, num_splits, mma_tiler_mn, cluster_shape_mn, swap_ab,
-                    max_ab_stages, l2_swizzle, max_active_clusters, use_tvm_ffi)
+                    max_ab_stages, l2_swizzle, tma_packed_scales,
+                    max_active_clusters, use_tvm_ffi)
 
         def forward(
             self,
@@ -4470,8 +4474,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             device_key = a_tensor.device
             if tactic == -1:
                 tactic = self._get_fallback_tactic(num_splits)
-            (mma_tiler_mn, cluster_shape_mn, swap_ab, max_ab_stages,
-             l2_swizzle) = tactic
+            (mma_tiler_mn, cluster_shape_mn, swap_ab, max_ab_stages, l2_swizzle,
+             tma_packed_scales) = tactic
             # The persistent grid is capped at max_active_clusters *clusters
             # of this tactic's size*; querying it for the wrong cluster size
             # halves the grid for (1, 1)-cluster tactics.
@@ -4503,6 +4507,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 swap_ab,
                 max_ab_stages,
                 l2_swizzle,
+                tma_packed_scales,
                 max_active_clusters,
                 self.use_tvm_ffi,
             )
@@ -4551,7 +4556,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn,
                     False,
                     packed_k128_scales=True,
-                    tma_packed_scales=False,
+                    tma_packed_scales=tma_packed_scales,
                     dynamic_mma_n=True,
                     apply_alpha=False,
                     max_ab_stages=max_ab_stages,
