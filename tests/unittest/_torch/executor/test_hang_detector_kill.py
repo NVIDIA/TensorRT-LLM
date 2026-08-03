@@ -17,6 +17,7 @@
 import asyncio
 import contextlib
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -778,3 +779,199 @@ def test_second_loop_run_still_kills_after_a_clean_first_run(monkeypatch):
         ex._event_loop_wrapper()
 
     assert events == [("watchdog", 4), "cleanup", "cancel", ("kill", 4, 1234.5)]
+
+
+# ---------------------------------------------------------------------------
+# The delivery gate (review: symmetric crashes must not become exit 137).
+# ---------------------------------------------------------------------------
+
+
+def test_kill_is_skipped_once_the_error_reached_the_client(monkeypatch):
+    """A reportable crash must not be converted into a bare exit 137.
+
+    `crashed` means "the loop raised before its break", which is broader than
+    "peers are stranded". In a symmetric crash every rank raises, nobody is
+    stranded, and every rank arms this kill. If the stashed error already
+    surfaced to the client the failure is diagnosable, so killing the world
+    only destroys N tracebacks.
+    """
+    calls = []
+    monkeypatch.setattr(
+        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+    )
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+
+    delivered = threading.Event()
+    delivered.set()
+    fired = hard_kill_on_rank_crash(4, error_delivered=delivered)
+
+    assert fired is False, "kill fired despite the error having been delivered"
+    assert calls == [], "propagate_hard_kill must not run once the error is reportable"
+
+
+def test_kill_still_fires_when_nothing_consumed_the_error(monkeypatch):
+    """The stranded-peer case is unchanged: nothing consumes it, so kill."""
+    calls = []
+    monkeypatch.setattr(
+        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+    )
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+
+    fired = hard_kill_on_rank_crash(4, error_delivered=threading.Event())
+
+    assert fired is True
+    assert calls == [1]
+
+
+def test_kill_fires_when_no_delivery_event_is_supplied(monkeypatch):
+    """Back-compat: callers that pass nothing get the old behaviour."""
+    calls = []
+    monkeypatch.setattr(
+        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+    )
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+
+    assert hard_kill_on_rank_crash(4) is True
+    assert calls == [1]
+
+
+def test_delivery_is_checked_after_the_grace_not_before(monkeypatch):
+    """The check must come after the wait, else it defeats its own purpose.
+
+    The grace exists so the error can reach the client. Sampling the flag
+    before waiting would read it while it is still False and kill anyway.
+    """
+    calls = []
+    monkeypatch.setattr(
+        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+    )
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0.5")
+
+    delivered = threading.Event()
+
+    def deliver_during_grace():
+        time.sleep(0.15)
+        delivered.set()
+
+    t = threading.Thread(target=deliver_during_grace, daemon=True)
+    t.start()
+    fired = hard_kill_on_rank_crash(4, error_delivered=delivered)
+    t.join(timeout=5)
+
+    assert fired is False, "the flag was set during the grace window; the kill must observe it"
+    assert calls == []
+
+
+def test_watchdog_threads_the_delivery_event_through(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
+    )
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+
+    delivered = threading.Event()
+    delivered.set()
+    wd = start_rank_crash_kill_watchdog(4, error_delivered=delivered)
+    assert wd is not None
+    wd.join(timeout=5)
+
+    assert calls == [], "watchdog killed despite a delivered error"
+
+
+# ---------------------------------------------------------------------------
+# Real 2-rank MPI: the kill and the gate, with propagate_hard_kill NOT mocked.
+#
+# Every other kill-path test in this file monkeypatches propagate_hard_kill,
+# so none of them exercises a real MPI_Abort (raised in review by @BowenFu).
+# These two do: they launch a real 2-rank MPI job and assert on the exit
+# status of the whole job.
+#
+# Scope, stated honestly: this proves the KILL MECHANISM and the delivery
+# gate over a real communicator. It is not a full 2-rank LLM crash -- there
+# is no engine here -- so it does not by itself prove the end-to-end claim
+# that a client sees the original exception. It does close the "nothing
+# exercises a real MPI_Abort" gap.
+# ---------------------------------------------------------------------------
+
+_MPI_2RANK_SCRIPT = """
+import os, sys, time
+from mpi4py import MPI
+from tensorrt_llm._torch.pyexecutor.hang_detector import hard_kill_on_rank_crash
+
+comm = MPI.COMM_WORLD
+comm.Barrier()                      # both ranks up, imports done
+# Printed only once imports and MPI init have succeeded. The assertions
+# require it, so a setup failure (bad import, no MPI) cannot masquerade as
+# a successful abort just by exiting non-zero.
+if comm.Get_rank() == 0:
+    print("RANK0_READY", flush=True)
+
+if comm.Get_rank() == 0:
+    import threading
+    delivered = threading.Event()
+    if os.environ["DELIVERED"] == "1":
+        delivered.set()
+    hard_kill_on_rank_crash(comm.Get_size(), error_delivered=delivered)
+    # Only reached when the kill is skipped.
+    print("RANK0_SURVIVED", flush=True)
+else:
+    # A peer that would otherwise sit in a collective forever.
+    time.sleep(20)
+    print("RANK1_SURVIVED", flush=True)
+
+comm.Barrier()
+sys.exit(0)
+"""
+
+
+def _run_two_rank(delivered: str):
+    env = {
+        **os.environ,
+        "DELIVERED": delivered,
+        hang_detector_module.RANK_CRASH_KILL_GRACE_ENV: "0",
+    }
+    return subprocess.run(
+        ["mpirun", "--allow-run-as-root", "-n", "2", sys.executable, "-c", _MPI_2RANK_SCRIPT],
+        env=env,
+        timeout=600,
+        capture_output=True,
+    )
+
+
+@pytest.mark.skipif(shutil.which("mpirun") is None, reason="mpirun not available")
+def test_real_mpi_abort_takes_down_both_ranks():
+    """Undelivered crash: the abort must reach the peer, not just rank 0.
+
+    Cross-rank propagation is the load-bearing part of the whole feature. If
+    MPI_Abort only killed rank 0, the peer would still burn to its own
+    HangDetector -- exactly the failure this exists to prevent.
+    """
+    proc = _run_two_rank(delivered="0")
+    out = (proc.stdout + proc.stderr).decode(errors="replace")
+
+    assert "RANK0_READY" in out, (
+        f"the job never reached the kill call -- this is a setup failure, not "
+        f"an abort, and must not be read as a pass; out={out[-1500:]}"
+    )
+    assert proc.returncode != 0, f"job survived an undelivered crash kill; out={out[-800:]}"
+    assert "RANK1_SURVIVED" not in out, (
+        f"peer rank outlived the abort -- propagation failed; out={out[-800:]}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("mpirun") is None, reason="mpirun not available")
+def test_real_mpi_job_survives_when_the_error_was_delivered():
+    """Delivered crash: no abort, so both ranks run to completion.
+
+    This is the review point -- a symmetric crash whose error already reached
+    the client must not have its tracebacks replaced by exit 137.
+    """
+    proc = _run_two_rank(delivered="1")
+    out = (proc.stdout + proc.stderr).decode(errors="replace")
+
+    assert "RANK0_READY" in out, (
+        f"the job never reached the kill call -- setup failure; out={out[-1500:]}"
+    )
+    assert proc.returncode == 0, f"job died despite a delivered error; out={out[-800:]}"
+    assert "RANK0_SURVIVED" in out, f"rank 0 was killed anyway; out={out[-800:]}"
+    assert "RANK1_SURVIVED" in out, f"peer was killed anyway; out={out[-800:]}"

@@ -153,6 +153,7 @@ def hard_kill_on_rank_crash(
     world_size: int,
     deadline: Optional[float] = None,
     cancelled: Optional[threading.Event] = None,
+    error_delivered: Optional[threading.Event] = None,
 ) -> bool:
     """Hard-kill the whole world after this rank's executor loop crashed.
 
@@ -203,6 +204,28 @@ def hard_kill_on_rank_crash(
                 "longer needed); this timer will not fire."
             )
             return False
+        # The grace has elapsed. Before killing, check whether the crash
+        # already reached the client.
+        #
+        # `crashed` upstream means "the loop raised before its break", which
+        # is broader than "peers are stranded". In a SYMMETRIC crash -- a
+        # deterministic Python error, a bad config, an OOM at the same batch --
+        # every rank raises, nobody is stranded, and every rank arms this kill.
+        # Firing then would replace N clean tracebacks with a bare exit 137.
+        #
+        # The kill exists to stop peers blocking in a collective forever. If
+        # the stashed error has already been surfaced to the client, the
+        # failure is diagnosable and the kill buys nothing, so skip it and let
+        # the process exit normally with its original exception.
+        if error_delivered is not None and error_delivered.is_set():
+            _best_effort_log_error(
+                "Rank-crash hard kill NOT fired: the executor-loop error "
+                "already reached the client, so the failure is reportable "
+                "without killing the world. Peers that are genuinely stranded "
+                "are still covered -- in that case nothing consumes the error "
+                "and this kill fires as before."
+            )
+            return False
         propagate_hard_kill()
         return True
     except Exception as e:  # noqa: BLE001 - must not mask the loop's original error
@@ -226,11 +249,14 @@ class RankCrashKillWatchdog(threading.Thread):
       over still fires at crash + grace rather than restarting the clock.
     """
 
-    def __init__(self, world_size: int, grace: float):
+    def __init__(
+        self, world_size: int, grace: float, error_delivered: Optional[threading.Event] = None
+    ):
         super().__init__(name="rank_crash_kill_watchdog", daemon=True)
         self._world_size = world_size
         self.deadline = time.monotonic() + max(0.0, grace)
         self._cancelled = threading.Event()
+        self._error_delivered = error_delivered
 
     def cancel(self) -> None:
         """Disarm the kill. Never raises; safe to call more than once."""
@@ -241,10 +267,18 @@ class RankCrashKillWatchdog(threading.Thread):
         return self._cancelled.is_set()
 
     def run(self) -> None:
-        hard_kill_on_rank_crash(self._world_size, deadline=self.deadline, cancelled=self._cancelled)
+        hard_kill_on_rank_crash(
+            self._world_size,
+            deadline=self.deadline,
+            cancelled=self._cancelled,
+            error_delivered=self._error_delivered,
+        )
 
 
-def start_rank_crash_kill_watchdog(world_size: int) -> Optional[RankCrashKillWatchdog]:
+def start_rank_crash_kill_watchdog(
+    world_size: int,
+    error_delivered: Optional[threading.Event] = None,
+) -> Optional[RankCrashKillWatchdog]:
     """Arm a daemon thread that hard-kills the world once the grace elapses.
 
     Must be armed BEFORE executor-loop cleanup: cleanup can block without
@@ -270,7 +304,7 @@ def start_rank_crash_kill_watchdog(world_size: int) -> Optional[RankCrashKillWat
         grace = _rank_crash_kill_grace()
         if grace is None:
             return None
-        watchdog = RankCrashKillWatchdog(world_size, grace)
+        watchdog = RankCrashKillWatchdog(world_size, grace, error_delivered)
         watchdog.start()
         return watchdog
     except Exception as e:  # noqa: BLE001 - must not mask the loop's original error

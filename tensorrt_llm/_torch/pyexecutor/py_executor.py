@@ -638,6 +638,11 @@ class PyExecutor:
         #     broadcast an ErrorResponse to every pending request, waking
         #     callers parked in queue.get() / aqueue.get().
         self._event_loop_error: Optional[BaseException] = None
+        # Set once the stashed error has been surfaced to a client. Gates the
+        # rank-crash hard kill: if the failure is already reportable, killing
+        # the world only replaces a traceback with exit 137. threading.Event
+        # because the kill runs on a daemon thread.
+        self._event_loop_error_delivered = threading.Event()
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -1236,12 +1241,24 @@ class PyExecutor:
             # _executor_loop_cleanup is enough to wake local waiters.
             self._event_loop_error = e
             raise e
+        except BaseException:
+            # SystemExit / KeyboardInterrupt are NOT Exception, so they reach
+            # here rather than the handler above. Peers are just as stranded,
+            # but these are deliberate teardown signals -- the launcher is
+            # already tearing the job down -- and arming an MPI_Abort on top
+            # would turn a clean Ctrl-C into exit 137. Left unarmed on
+            # purpose; `crashed` stays False. Stated explicitly because the
+            # comment above describes the invariant the *Exception* path
+            # enforces, not this one.
+            raise
         finally:
             # Armed BEFORE cleanup: cleanup can block without bound on a
             # send handle wedged by the crash, and a kill placed only after
             # it would never fire.
             watchdog = start_rank_crash_kill_watchdog(
-                self.dist.world_size) if crashed else None
+                self.dist.world_size,
+                error_delivered=self._event_loop_error_delivered,
+            ) if crashed else None
             try:
                 self._executor_loop_cleanup()
             finally:
@@ -1265,8 +1282,10 @@ class PyExecutor:
                     if watchdog is not None:
                         watchdog.cancel()
                         deadline = watchdog.deadline
-                    hard_kill_on_rank_crash(self.dist.world_size,
-                                            deadline=deadline)
+                    hard_kill_on_rank_crash(
+                        self.dist.world_size,
+                        deadline=deadline,
+                        error_delivered=self._event_loop_error_delivered)
 
     @property
     def is_warmup(self) -> bool:
@@ -7145,6 +7164,9 @@ class PyExecutor:
                 # instead of hanging here or hitting a KeyError below.
                 error = self._event_loop_error
                 if error is not None:
+                    # The caller is about to see the original exception, so
+                    # the crash is reportable without killing the world.
+                    self._event_loop_error_delivered.set()
                     raise RuntimeError(
                         f"Event loop terminated with error: {error}") from error
                 raise RuntimeError(
