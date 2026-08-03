@@ -70,6 +70,16 @@ from .test_llm import llama_model_path
 
 
 @pytest.mark.cpu_only
+def test_generation_config_mode_defaults_and_validation():
+    assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
+    assert (TorchLlmArgs(model=llama_model_path,
+                         generation_config="auto").generation_config == "auto")
+
+    with pytest.raises(ValidationError, match="generation_config"):
+        TorchLlmArgs(model=llama_model_path, generation_config="invalid")
+
+
+@pytest.mark.cpu_only
 def test_LookaheadDecodingConfig():
     # from constructor
     config = LookaheadDecodingConfig(max_window_size=4,
@@ -2522,6 +2532,32 @@ class TestServeDefaults:
             explicit_cli_keys={"tensor_parallel_size"},
         )
         assert merged["tensor_parallel_size"] == 1
+
+    def test_serve_generation_config_cli_over_yaml_precedence(self):
+        """YAML wins when CLI omits the mode; an explicit CLI mode wins otherwise."""
+        default_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            generation_config="trtllm",
+        )
+        assert "generation_config" not in default_args
+
+        yaml_merged = update_llm_args_with_extra_dict(
+            default_args, {"generation_config": "auto"})
+        assert yaml_merged["generation_config"] == "auto"
+
+        explicit_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            generation_config="trtllm",
+            explicit_cli_keys={"generation_config"},
+        )
+        cli_merged = update_llm_args_with_extra_dict(
+            explicit_args,
+            {"generation_config": "auto"},
+            explicit_cli_keys={"generation_config"},
+        )
+        assert cli_merged["generation_config"] == "trtllm"
 
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
