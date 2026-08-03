@@ -73,13 +73,9 @@ docs/source/**/*.rst
 
 # Testing
 .coverage.*
-.bootstrap_build.lock
 results_trt/
 llm-test-workspace/
 ad-test-workspace/
-tests/unittest/_torch/modeling/_mmmu_cache/
-tests/unittest/_torch/modeling/mmmu_align_artifact.json
-tests/unittest/_torch/modeling/inkling_vision_tower_generated_artifact.json
 
 # FetchContent reference cache
 3rdparty/.cache_3rdparty/
