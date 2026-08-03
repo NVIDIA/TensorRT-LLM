@@ -704,37 +704,106 @@ attention workspace 9×、ragged 让显存悬崖来得更早」,其中只有张�
 捕获共用分配器的情况下得出 `+13.9 / +5.5 / −0.8 / +0.7 GiB` 这种自相矛盾的
 数——增量法本身不成立;换成私有池绝对值后三次独立测量复现到小数点后三位。
 
-### 10.5 修掉的真 bug
+### 10.5 每请求不同的 verify len:已验证
 
-1. **KV 泄漏(ragged 独有)**。`kv_cache_manager_v2.py` 的 target manager 把回退
-   补偿 gate 在 `if self.is_draft` 后面。预留侧每步加 `1 + max(draft_len, reserve)`，
-   回退侧只退 `py_rewind_len = verified_len − accepted`，于是每步漏
-   `draft_len − verified_len`，直到序列需要的 block 超过 `max_seq_len`，报
-   `User-provided base page indices is too short`。uniform 下 `verified_len ==
-   draft_len` 故该项为 0，所以 GSM8K 从未暴露。
-2. **token-major block table 布局**。展开表用了 `[rows, max_blocks]`，而 op 读
-   `[num_pools, num_seqs, 2, max_blocks]`，且 gather 折掉了 `num_seqs` 轴 → 8 卡
-   device-side OOB。
+这是 P0 的核心能力,也是 K1/K2 那个原始 blocker 要解决的东西。**已由 planner
+自主产出,无任何外部强制**(`TLLM_DSPARK_FORCE_VERIFY_LENS` 已从代码中删除):
+
+```
+steps_ragged: 211/318          同一步内窗口不相同的步数
+distinct_verify_lens: 4        {1: 27375, 2: 5831, 3: 12, 5: 66}
+trim_ratio: 0.6064             裁掉 60.6% 的 token 上限
+KV 溢出: 0    OOM: 0
+```
+
+分配链路是真实的:confidence head → 每请求 survival 概率 → 成本表算出预算 →
+top-k 按 survival 高低分配窗口。置信度高的拿长窗口,容易早被拒的拿短窗口。
+
+**这证明了机制,不证明策略有收益。** 该轮用的是刻意造陡的合成成本表
+(`tests/microbenchmarks/dspark_make_steep_sps_table.py`,输出带 `SYNTHETIC: true`),
+planner 在对着虚构的成本曲线优化,所以那轮的吞吐数字无意义。真实表下 planner 在
+所有批次档位都选满窗口(见 10.3)。
+
+**为什么必须造这张表**:此 checkpoint 接受率约 90%,planner 永远不会自己走到
+裁剪路径。而下面三个 bug **只在真裁剪时可达**——没有这张表,它们会带着绿色的
+测试合入。
+
+### 10.6 修掉的真 bug
+
+1. **KV 泄漏(ragged 独有)**。预留侧每步加 `1 + max(draft_len, reserve)`,
+   回退侧只退 `py_rewind_len = verified_len − accepted`;`kv_cache_manager_v2`
+   把补偿项 gate 在 `if self.is_draft` 后面,于是 target manager 每步漏
+   `draft_len − verified_len`,直到序列需要的 block 超过 `max_seq_len`,报
+   `User-provided base page indices is too short`。uniform 下该项恒为 0。
+   **定位方式**:窗口=5 vs 窗口轮转、其余全同的一次对照,而非读代码。
+
+2. **token-major block table 布局**。展开表用了 `[rows, max_blocks]`,而 op 读
+   `[num_pools, num_seqs, 2, max_blocks]`,且 gather 折掉了 `num_seqs` 轴 →
+   8 卡 device-side OOB。
+
 3. **`host_request_types` / `prompt_lens_cuda` 未行化**。op 按 `num_seqs`(=896)
-   索引 128 长的数组。
-4. **lm-eval 分数选取**。把 `samples`(1319×100) 混进平均，报出 44030.98 且
-   **通过**了 96.0 的门槛。按 `metric,filter` 键结构修正。
+   索引 128 长的数组。**主动审计 12 个 per-sequence 参数找出来的,不是等它崩。**
 
-### 10.6 方法论教训（值得写进流程）
+4. **bucket fit 假设 padding 必然发生**。fit 按 padded_bs 推导 bucket 网格并把
+   余量分给尚不存在的 pad 行,但 `_get_padded_batch` 可以拒绝 padding。拒绝时
+   网格对应的行数不存在,填出的总数落在网格外:`graph_miss_keys
+   {'(193, 5, False, False, True, 449)': 16}`,捕获档位有 192 和 256 却没有 193。
+   修法:fit 前先问 `runner.will_pad_to`,不能 pad 就退回 uniform。
 
-- **探针失效比功能失效更常见**。整晚四次"失败"里三次是探针问题：模块版本偏斜导致
-  埋点静默为空、sync 探针未 arm 就读、gate 在 ramp-up 期误触发。**沉默不等于通过**——
-  任何"没有告警"的结论必须先证明探针确实生效了。
-- **对照实验优于读代码**。KV 泄漏是靠"窗口=5 vs rotating,其余全同"一次定位的；
-  在此之前我读了三轮代码都没找到。
-- **噪声底必须先测**。G2 token 等价性判定为**无法测量**：两次完全相同的 static run
-  之间就有 15/16 发散，顺序提交也没改善——目标模型在 TP8+EP8+ADP 下跨进程不能复现
-  自己的贪心输出。差一点把不存在的 ragged 正确性问题报出去。
+5. **跨 rank bucket 不一致**。bucket 被独立推导两次:fit 从 allgather 的
+   `peer_stats` 算,graph key 又遍历 `generation_requests`(padding 追加**之后**)
+   重新求和。两条独立推导却要求跨 rank 精确相等,一致性是碰巧的。实测
+   `peer_shape_mismatch` 不裁剪时 2/265 步、裁剪时 16/318 步,每次让 8 个 rank
+   一起掉出 replay。修法:fit 发布商定值,key 直接读——按构造必然一致。
 
-### 10.7 未完成
+6. **lm-eval 分数选取**(与 DSpark 无关的既有 bug)。把 `samples`(1319×100)
+   混进平均,报出 **44030.98 并通过了 96.0 的门槛**。按 `metric,filter` 键结构修正。
 
-- 动态 sync 证明:探针已确认能 arm 且 arm 后零同步警告,但缺一次跑满的运行
-- `peer_shape_mismatch: 2`：并发 512 下首次出现的、真正可归因于 ragged 的
-  graph miss——跨 rank bucket 协商未收敛，2/265 步让 8 个 rank 一起掉出 replay
-- `forced_verify_lens` / rotating 是否应从生产代码移除（它按 batch 位置分窗口，
-  与 confidence 正交，测不了策略；但目前是唯一能执行裁剪路径的手段）
+### 10.7 踩过的坑(值得写进流程)
+
+**探针失效比功能失效更常见。** 本次至少七次「失败」中,探针本身有问题的占多数:
+
+| 现象 | 真因 |
+|---|---|
+| `graph_miss_shapes` 为空 | 模块版本偏斜,默认参数把「没记录」伪装成「没发生」 |
+| sync 探针零警告 | 探针根本没 arm,我差点报通过 |
+| gate 在 ramp 期误杀三轮实验 | floor 数的是总步数,而并发从 0 爬升 |
+| 显存增量 `+13.9/+5.5/−0.8/+0.7` | 多轮捕获共用分配器,增量法不成立 |
+| 造表后 ragged 仍不亮(两次) | 固定开销压倒可裁剪项;网格覆盖不到工作区间 |
+| 预览说会裁、实跑不裁 | 我重推了 planner 的 argmax,与真实实现不符 |
+
+由此得到三条:
+
+* **沉默不等于通过。** 任何「没有告警」的结论,必须先证明探针确实生效。
+* **能调用就别重推。** 造表预览改成直接 `import` 真实的
+  `budget_argmax_over_uniform_lens` 后一次就对,并能回测历史结果;测试里也用真的
+  `DSparkScheduleConfig` 而非 mock。
+* **夹具必须能自检。** 造表工具现在会预测 planner 的选择,并在「任何档位都不裁」
+  时直接 WARNING——失败在生成的那一秒暴露,而不是 20 分钟后。
+
+**没有对照的归因一律不成立。** 本次有四条结论因补对照而推翻或修正:
+
+| 断言 | 结局 |
+|---|---|
+| ragged graph 显存 3× | 实测 ≈0(8.746 vs 8.740 GiB) |
+| ragged 让 bs=512 OOM | 不开 ragged 同样配置也曾跑通;且 ragged 在更低的 25.10 GiB 就挂,与「更费显存」矛盾 |
+| `peer_shape_mismatch` 是 bug | 是那道门在正常拦截(但推导重复确实该修) |
+| G2 token 等价性失败 | 两次**相同** static run 之间也 15/16 发散——噪声底 = 信号,该测试在此部署上问不出东西 |
+
+**局部证据不能支撑全局断言。** 我曾报「ragged 未引入新的 host-device sync」,
+依据是审计了自己新增的 token-major 代码(那部分确实干净),但动态探针在
+`dspark.py:117/516/551` 和 `deepseek_v4.py:891` 抓到 32 次真同步。静态审计只能
+覆盖「我写的代码」,动态探针才覆盖「这条路径实际执行的一切」。
+
+**在功能没满负荷运行时做的验证,适用范围比看起来窄。** 上面 4 和 5 两个 bug 都
+只在真裁剪时可达;我此前核对过「两条 padded_bs 规则一致」,但那是在不裁剪的前提
+下做的,总数恒定完全掩盖了行数这一维。
+
+### 10.8 未完成
+
+* **动态 sync 证明**(唯一未定论项)。ragged 侧已测得 arm 后 32 次真同步,位置见
+  上;**对照(confidence head 关、其余逐字相同)尚未跑完**,因此「这些是 ragged
+  引入的还是 DSpark 既有的」暂无结论。在此之前不应引用任何 sync 相关结论。
+* **`peer_not_gen_only` 类 graph miss**:32/318 步,属正常连续批处理(uniform
+  路径同样存在),非缺陷,但可作为后续调度优化的方向。
+* **吞吐收益需要更低接受率的模型或负载**。这是 checkpoint 的属性,非本 PR 可解。
