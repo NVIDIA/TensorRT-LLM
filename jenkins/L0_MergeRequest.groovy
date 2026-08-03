@@ -2366,7 +2366,7 @@ pipeline {
                         echo "Upload Build Info failed: ${e.toString()}"
                     }
                 }
-                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
+                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
                     collectTestResults(this, testFilter, globalVars)
                 }
             }
