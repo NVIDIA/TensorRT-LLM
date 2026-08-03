@@ -221,6 +221,17 @@ def use_py_mamba_cache_manager() -> bool:
     return os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
 
 
+def mamba_manager_preference() -> Optional[str]:
+    """Normalized value of the TLLM_MAMBA_MANAGER_PREFERENCE override.
+
+    Upper-cased so callers compare against 'CPP' / 'MIXED' consistently;
+    None when unset. Unrecognized values are returned as-is so the consumer
+    can warn about them.
+    """
+    preference = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
+    return preference.upper() if preference is not None else None
+
+
 def mamba_manager_override_forces_v1(llm_args: 'TorchLlmArgs') -> bool:
     """Whether an env override pins the V1 Mamba route for aggregated serving.
 
@@ -229,16 +240,14 @@ def mamba_manager_override_forces_v1(llm_args: 'TorchLlmArgs') -> bool:
     default while one is active — an unset setting would resolve to V2 and
     collide with the route the override already selected.
 
-    ``llm_args`` is read defensively: :meth:`get_model_defaults` is also called
-    with ``None`` (perf-sanity transceiver precheck) and with a plain dict
-    (``tests/unittest/llmapi/test_config_database.py``).
+    Both overrides are agg-mode-only, so this returns False once a disagg
+    transceiver backend is configured. ``llm_args`` is read via ``getattr``
+    because :meth:`get_model_defaults` is also called with ``None`` and with a
+    plain dict in-tree.
     """
-    preference = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', '').upper()
-    if not (use_py_mamba_cache_manager() or preference in ('CPP', 'MIXED')):
+    if not (use_py_mamba_cache_manager()
+            or mamba_manager_preference() in ('CPP', 'MIXED')):
         return False
-
-    # Both overrides are agg-mode-only; in disagg the manager follows the
-    # transceiver configuration instead.
     transceiver_config = getattr(llm_args, 'cache_transceiver_config', None)
     return getattr(transceiver_config, 'backend', None) is None
 

@@ -60,6 +60,7 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
                                   MambaHybridCacheManagerV2,
                                   MixedMambaHybridCacheManager,
+                                  mamba_manager_preference,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -122,7 +123,9 @@ def get_kv_cache_manager_cls(
     the Python transceiver with the NIXL backend. Unsupported V2 routes fail
     rather than falling back to a different manager.
 
-    Env-var overrides:
+    Env-var overrides. Both select a compatibility manager, so both are
+    consulted only in aggregated serving; in disaggregated serving the manager
+    follows the transceiver configuration instead.
       * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager in aggregated serving.
       * ``TLLM_MAMBA_MANAGER_PREFERENCE`` — explicit manager preference.
     """
@@ -166,6 +169,8 @@ def get_kv_cache_manager_cls(
                         "KV cache manager V2 for hybrid Mamba disaggregated "
                         "serving requires transceiver_runtime='PYTHON' with "
                         "backend='NIXL'.")
+                # Falls through to the shared V2 route below, which still owns
+                # the remaining V2 compatibility checks.
             else:
                 if (kv_cache_config.enable_block_reuse and runtime == "PYTHON"):
                     raise ValueError(
@@ -194,9 +199,8 @@ def get_kv_cache_manager_cls(
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid mamba model")
             return MixedMambaHybridCacheManager
-        env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
-        if env_override is not None:
-            env_override = env_override.upper()
+        env_override = mamba_manager_preference()
+        if env_override is not None and not is_disagg:
             if env_override == 'MIXED':
                 if use_v2:
                     raise ValueError(
