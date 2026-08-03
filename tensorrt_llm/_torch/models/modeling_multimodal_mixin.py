@@ -39,11 +39,11 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.logger import logger
 
 from .modeling_multimodal_utils import (
-    _cache_multimodal_embeddings,
+    _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
@@ -225,6 +225,26 @@ _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 _MM_ENCODER_CACHE_LOG_NAME = "mm_encoder_cache"
 
 
+def _build_request_multimodal_input(
+    request: "LlmRequest", cache_enabled: bool
+) -> Optional[MultimodalInput]:
+    """Build the encoder-cache key metadata carried by one request."""
+    # Skip construction (and `from_components` validation) when no persistent cache consumes it.
+    if not cache_enabled or request.multimodal_hashes is None:
+        return None
+    # `MultimodalModelMixin._encoder_cache_keys` uses UUID-aware multimodal hashes internally.
+    # Although the UUIDs are not exposed as an attribute, they remain in the backing C++ request
+    # for KV-cache block keys and cache events.
+    return MultimodalInput.from_components(
+        request.multimodal_hashes,
+        request.multimodal_positions,
+        request.multimodal_lengths,
+        mm_item_run_cu_offsets=request.multimodal_item_run_cu_offsets,
+        mm_run_positions=request.multimodal_run_positions,
+        mm_run_lengths=request.multimodal_run_lengths,
+    )
+
+
 def _get_mm_aux_stream(max_prefetch_ahead: int = 0) -> Optional[torch.cuda.Stream]:
     """Return the side CUDA stream used for multimodal encoder prefetch.
 
@@ -377,7 +397,7 @@ class MultimodalModelMixin:
         by multimodal embeddings. Return `None` to use the out-of-vocabulary
         sentinel behavior in `fuse_input_embeds`.
         """
-        raise NotImplementedError
+        return None
 
     @property
     def text_embedding_layer(self):
@@ -394,6 +414,25 @@ class MultimodalModelMixin:
         """Return the dtype of each cached multimodal embedding row."""
         raise NotImplementedError
 
+    @property
+    def encoder_cache_active(self) -> bool:
+        """Whether the persistent encoder cache is active for this model.
+
+        Single source of truth shared by:
+
+        * the in-iter consume path
+        * the side-stream prefetch dispatch
+        * the engine's cache-related gate
+        * the KV-cache memory reservation.
+
+        The cache is only active when the model opts in via `supports_encoder_cache` and configures
+        a positive capacity.
+        """
+        if not self.supports_encoder_cache:
+            return False
+        multimodal_config = self.model_config.multimodal_config
+        return multimodal_config is not None and multimodal_config.encoder_cache_max_bytes > 0
+
     def select_multimodal_params(
         self,
         multimodal_params: Sequence[MultimodalParams],
@@ -401,15 +440,125 @@ class MultimodalModelMixin:
     ) -> Sequence[MultimodalParams]:
         """Select the params that participate in multimodal encoder work.
 
-        Returns the context-slice params with multimodal content. Helpers below
+        Returns the context-slice params with active multimodal content. Helpers below
         this method (`get_multimodal_embeddings`, `find_input_mm_embeds`,
         `fuse_input_embeds`) operate on the returned list and therefore see
         only `has_content()` params. Models overriding this hook must
         preserve that invariant.
         """
         return [
-            param for param in list(multimodal_params)[:num_context_requests] if param.has_content()
+            param
+            for param in list(multimodal_params)[:num_context_requests]
+            if param.has_content()
+            and (
+                param.multimodal_runtime is None
+                or param.multimodal_runtime.num_mm_tokens_in_chunk != 0
+            )
         ]
+
+    @property
+    def language_model(self) -> torch.nn.Module:
+        """Return the inner language model that receives prepared inputs."""
+        raise NotImplementedError
+
+    @property
+    def vocab_size_padded(self) -> int:
+        """Return the inner language model's padded vocabulary size."""
+        return self.language_model.vocab_size_padded
+
+    def infer_max_seq_len(self) -> int:
+        """Return the inner language model's maximum sequence length."""
+        return self.language_model.infer_max_seq_len()
+
+    def get_language_model_extra_forward_kwargs(
+        self,
+        *,
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        **forward_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Return model-specific arguments for the inner language-model forward."""
+        return {}
+
+    def get_language_model_forward_kwargs(
+        self,
+        *,
+        attn_metadata: Any,
+        input_ids: Optional[torch.Tensor],
+        raw_input_ids: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        inputs_embeds: Optional[torch.Tensor],
+        mm_inputs: PreparedLlmInputs,
+        return_context_logits: bool,
+        **forward_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build common and model-specific inner language-model forward arguments."""
+        llm_kwargs = {
+            "attn_metadata": attn_metadata,
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "inputs_embeds": inputs_embeds,
+            "return_context_logits": return_context_logits,
+        }
+        llm_kwargs.update(
+            self.get_language_model_extra_forward_kwargs(
+                raw_input_ids=raw_input_ids,
+                position_ids=position_ids,
+                mm_inputs=mm_inputs,
+                **forward_kwargs,
+            )
+        )
+        return llm_kwargs
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        attn_metadata: Any,
+        input_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Prepare multimodal inputs and dispatch them to the language model."""
+        multimodal_params = kwargs.pop("multimodal_params", [])
+        mm_inputs = self.prepare_multimodal_inputs(
+            input_ids=input_ids,
+            positions=position_ids,
+            multimodal_params=multimodal_params,
+            num_context_requests=attn_metadata.num_contexts,
+            attn_metadata=attn_metadata,
+            **kwargs,
+        )
+        if inputs_embeds is not None:
+            if mm_inputs.inputs_embeds is not None:
+                raise ValueError(
+                    "MultimodalModelMixin.forward received both caller-supplied inputs_embeds "
+                    "and multimodal-derived inputs_embeds. These paths are mutually exclusive; "
+                    "pass at most one."
+                )
+            mm_inputs = PreparedLlmInputs(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                extra_embeds=mm_inputs.extra_embeds,
+            )
+
+        llm_kwargs = self.get_language_model_forward_kwargs(
+            attn_metadata=attn_metadata,
+            input_ids=mm_inputs.input_ids,
+            raw_input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=mm_inputs.inputs_embeds,
+            mm_inputs=mm_inputs,
+            return_context_logits=return_context_logits,
+            multimodal_params=multimodal_params,
+            num_generation_requests=attn_metadata.num_generations,
+            spec_metadata=spec_metadata,
+            **kwargs,
+        )
+        return self.language_model.forward(**llm_kwargs)
 
     def after_full_multimodal_embeddings(
         self,
@@ -655,6 +804,11 @@ class MultimodalModelMixin:
 
         Delegates cache lookup and gather behavior to `get_multimodal_embeddings`, then validates
         the single tensor contract for both encoded and cached-only paths.
+
+        During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
+        the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
+        records each entry's producer event on the issuing (aux) stream; the next iteration's
+        main-stream consumer waits on the request-level `encoder_event` for ordering.
         """
         encoder_cache = self._get_multimodal_encoder_cache()
         cache_misses: list[MultimodalParams] = []
@@ -662,8 +816,11 @@ class MultimodalModelMixin:
         if encoder_cache is not None:
             for param in multimodal_params:
                 if param.multimodal_data.get("multimodal_embedding") is not None:
-                    # The forward that attached this request-local embedding already populated the
-                    # persistent cache.
+                    # A present embedding means either an earlier forward already wrote the
+                    # persistent cache, or a prefetch hit attached a cache-owned tensor. Either
+                    # way, skip re-lookup and re-write. `get_multimodal_embeddings` waits on the
+                    # request event and records the attached tensor on the consuming stream before
+                    # gathering it.
                     continue
                 partition = self.partition_encoder_cache(param, encoder_cache)
                 if partition is None or partition.is_full_miss:
@@ -700,19 +857,16 @@ class MultimodalModelMixin:
         The cache stores per-item embeddings for params that can be represented by one modality.
         See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
         """
-        multimodal_config = self.model_config.multimodal_config
-        if multimodal_config is None:
-            return None
-
-        max_bytes = multimodal_config.encoder_cache_max_bytes
-        if max_bytes <= 0:
+        if not self.encoder_cache_active:
             logger.debug_once(
-                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because "
-                "multimodal_config.encoder_cache_max_bytes=0.",
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because the model does not opt in via "
+                "supports_encoder_cache or multimodal_config.encoder_cache_max_bytes=0.",
                 key="mm_encoder_cache_disabled",
             )
             return None
 
+        multimodal_config = self.model_config.multimodal_config
+        max_bytes = multimodal_config.encoder_cache_max_bytes
         if self._multimodal_encoder_cache is None:
             # Per-item embeddings are views produced by splitting a request-level encoder output.
             # Clone them so a cached item neither aliases mutable caller output nor retains the
@@ -722,6 +876,7 @@ class MultimodalModelMixin:
             self._multimodal_encoder_cache = TensorLRUCache(
                 max_bytes,
                 name=_MM_ENCODER_CACHE_LOG_NAME,
+                cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
             )
             try:
                 embedding_dim = self.embedding_dim
@@ -1186,16 +1341,19 @@ def _dispatch_cross_iter_prefetch(
     The event covers all work queued in the aux-stream block, so the same
     event object is shared across all candidates.
     """
+    encoder_cache_enabled = model.encoder_cache_active
     params_list = [
         MultimodalParams(
+            multimodal_input=_build_request_multimodal_input(req, encoder_cache_enabled),
             multimodal_data=mm_data,
             multimodal_runtime=MultimodalRuntimeData(
                 past_seen_token_num=0,
                 chunk_end_pos=cumsum.numel(),
                 embed_mask_cumsum=cumsum,
             ),
+            mm_item_order=req.py_mm_item_order,
         )
-        for _, mm_data, cumsum in candidates
+        for req, mm_data, cumsum in candidates
     ]
 
     # Prefetch targets requests outside the current iteration, so their
@@ -1203,14 +1361,33 @@ def _dispatch_cross_iter_prefetch(
     # this after the iteration's LLM kernels so aux-stream H2D copies and
     # encoder work can overlap them.
     #
-    # Ordering is handled by `encoder_event`, and tensor lifetime is anchored
-    # by `req.py_multimodal_data` until the request is consumed or terminated.
-    # Keeping `record_stream` out also keeps this path modality-neutral.
+    # Request-local ordering is handled by `encoder_event`; the consume path also `record_stream`s
+    # attached embeddings before gathering them so post-prefill request cleanup cannot release
+    # storage while main-stream work is pending. Persistent-cache clones use their own producer
+    # events and consumer `record_stream` calls inside `TensorLRUCache`.
     encoder_event = None
     try:
         with _run_on_aux_stream(aux_stream) as encoder_event:
-            for p in params_list:
-                p.to_device(
+            encoder_cache = model._get_multimodal_encoder_cache() if encoder_cache_enabled else None
+            cache_misses: list[MultimodalParams] = []
+            partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
+            if encoder_cache is None:
+                cache_misses = params_list
+            else:
+                for param in params_list:
+                    partition = model.partition_encoder_cache(param, encoder_cache)
+                    if partition is None or partition.is_full_miss:
+                        cache_misses.append(param)
+                    elif partition.is_full_hit:
+                        param.multimodal_data["multimodal_embedding"] = (
+                            model.assemble_full_embedding(partition.hits, len(partition.keys))
+                        )
+                    else:
+                        partial_hits.append((param, partition))
+
+            params_to_transfer = cache_misses + [param for param, _ in partial_hits]
+            for param in params_to_transfer:
+                param.to_device(
                     "multimodal_data",
                     "cuda",
                     pin_memory=prefer_pinned(),
@@ -1223,8 +1400,23 @@ def _dispatch_cross_iter_prefetch(
             # model_engine._prepare_inputs.
             for (req, _, _), p in zip(candidates, params_list):
                 req.py_multimodal_data = p.multimodal_data
-            encoder_output = model.encode_multimodal_inputs(params_list)
-            _cache_multimodal_embeddings(params_list, [encoder_output])
+
+            if partial_hits and encoder_cache is not None:
+                model._encode_with_partial_cache(partial_hits, encoder_cache)
+            if cache_misses:
+                encoder_output = model.encode_multimodal_inputs(cache_misses)
+                _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
+                if encoder_cache is not None:
+                    for param in cache_misses:
+                        model._write_encoder_cache_entries(param, encoder_cache)
+
+            # Prefetch only needs to attach each request's embedding. Validate each request
+            # independently instead of gathering the unused batch output with `torch.cat`.
+            for param in params_list:
+                embedding = param.multimodal_data.get("multimodal_embedding")
+                if not isinstance(embedding, torch.Tensor):
+                    raise ValueError("Multimodal encoder prefetch did not produce an embedding.")
+                model._validate_embeddings([embedding], [param])
     finally:
         # Stash the event on every candidate's durable LlmRequest (not the
         # per-iter `MultimodalParams`), since `_prepare_inputs` rebuilds the

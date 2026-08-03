@@ -130,22 +130,31 @@ Note:
 ## Multimodal Encoder Optimizations
 
 The following optimizations are available to models that implement
-`MultimodalModelMixin`. Currently, only `Mistral3ForConditionalGeneration` supports them.
+`MultimodalModelMixin`.
 
 | Model Architecture | Multimodal Encoder Side Stream | Multimodal Embeddings Cache |
 | ------------------ | ------------------------------ | --------------------------- |
+| `Gemma4ForConditionalGeneration` | Yes | Yes |
+| `Gemma4UnifiedForConditionalGeneration` | Yes | Yes |
 | `Mistral3ForConditionalGeneration` | Yes | Yes |
+| `Qwen3VLForConditionalGeneration` | Yes | Yes |
+| `Qwen3VLMoeForConditionalGeneration` | Yes | Yes |
+| `Qwen3_5ForConditionalGeneration` | Yes | Yes |
+| `Qwen3_5MoeForConditionalGeneration` | Yes | Yes |
 
 - **Multimodal encoder side stream** prefetches encoder work for pending requests on a separate
   CUDA stream, allowing it to overlap with work on the main stream. Set
   `multimodal_config.encoder_side_stream_max_ahead` to a positive value to enable it; the value
   limits the number of prefetched requests that can be ahead of admission. This option is mutually
-  exclusive with `multimodal_config.encoder_cuda_graph` and can increase peak GPU memory use.
+  exclusive with `multimodal_config.encoder_cuda_graph` and can increase peak GPU memory use. It
+  can be combined with the multimodal embeddings cache so side-stream cache hits skip encoder work
+  and misses populate the cache.
 - **Multimodal embeddings cache** is a per-model, cross-request LRU cache of encoder embeddings.
   Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for example, `"512MiB"`), or
   `0` to disable it. Entries are cached per multimodal item, but a request reuses cached embeddings
   only when all of its items hit the cache. At present, only single-modality requests are cacheable;
-  mixed-modality requests bypass the cache.
+  mixed-modality requests bypass the cache. When combined with side-stream prefetch, peak memory is
+  the cache capacity plus any in-flight prefetched encoder inputs and outputs.
 
 # Visual Generation Models
 
@@ -173,6 +182,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
 
 ### Feature Matrix
 
@@ -183,7 +193,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image** [^2] | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
+| **Qwen-Image** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image-Layered** [^3] | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |

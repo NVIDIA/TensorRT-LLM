@@ -50,6 +50,8 @@ l0_h100:
   - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_rejection_buffers_guard.py
+  - unittest/_torch/speculative/test_capture_override_leak.py
+  - unittest/_torch/speculative/test_sa_hybrid_state_promotion.py
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/thop/parallel
   - unittest/_torch/thop/parallel_hw_agnostic
@@ -221,6 +223,16 @@ l0_h100:
   - test_e2e.py::test_openai_chat_harmony_perf_metrics
   - test_e2e.py::test_openai_responses
   - test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph[v1]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph[v2]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_changed_final_token_reuse_cuda_graph[v1]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_changed_final_token_reuse_cuda_graph[v2]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_context_logits_after_final_token_reuse[v1]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_context_logits_after_final_token_reuse[v2]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_guided_decoding_after_final_token_reuse[v1]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_guided_decoding_after_final_token_reuse[v2]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_zero_runtime_draft_speculation_after_final_token_reuse[v1]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_zero_runtime_draft_speculation_after_final_token_reuse[v2]
   # ------------- Prefix-aware scheduling E2E tests ---------------
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[guaranteed-chunked]

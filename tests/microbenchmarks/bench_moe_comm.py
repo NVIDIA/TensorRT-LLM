@@ -1276,7 +1276,6 @@ def _run_benchmark_worker_under_current_mpi(
                 reduce_results=False,
                 model_config=model_config,
                 init_load_balancer=False,
-                without_comm=True,
             )
             # Ensure quantization params (e.g., NVFP4 global scale) live on CUDA.
             moe = moe.to(device)
