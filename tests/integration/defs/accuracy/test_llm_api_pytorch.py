@@ -43,6 +43,7 @@ from ..conftest import (check_device_contain, get_device_count, llm_models_root,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
                         skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper, skip_ray)
+from tensorrt_llm.evaluate.post_processing import extract_inkling_content
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2)
@@ -7809,3 +7810,52 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
+    """Text-only accuracy for the Inkling NVFP4 checkpoint.
+
+    The multimodal counterpart (MMMU, vision path) lives in
+    test_llm_api_pytorch_multimodal.py; this covers the shared text decoder,
+    which is what GSM8K and MMLU exercise.
+    """
+
+    MODEL_NAME = "thinkingmachines/Inkling-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/Inkling-NVFP4"
+    MAX_NUM_TOKENS = 16384
+
+    # Inkling is a long-CoT reasoning model: leave room for the chain of
+    # thought so the visible answer is not truncated away.
+    sampling_params = SamplingParams(max_tokens=MAX_NUM_TOKENS)
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    # Inkling emits typed-content channels. Keep the markers through
+    # detokenization and drop the <|content_thinking|> channel, so only the
+    # visible answer is scored.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        post_process_fn=extract_inkling_content,
+        keep_special_tokens=True,
+        preserve_caller_max_tokens=True,
+    )
+
+    @skip_pre_blackwell
+    def test_nvfp4(self):
+        """NVFP4 text accuracy on GSM8K and MMLU (Blackwell).
+
+        Both references are the cached SGLang NVFP4 measurements the bring-up
+        paired against; see references/gsm8k.yaml and references/mmlu.yaml for
+        the provenance and the TRT-side measurements.
+        """
+        with LLM(
+                self.MODEL_PATH,
+                max_num_tokens=self.MAX_NUM_TOKENS,
+                kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            for task in (GSM8K(self.MODEL_NAME), MMLU(self.MODEL_NAME)):
+                task.evaluate(
+                    llm,
+                    sampling_params=self.sampling_params,
+                    extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+                )
