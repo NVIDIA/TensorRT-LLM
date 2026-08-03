@@ -4067,8 +4067,20 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("moe_backend", ["MEGAMOE_DEEPGEMM", "TRTLLM"])
-    def test_gsm8k_dep8_confidence_scheduling_overlap(self, moe_backend):
-        """Confidence scheduling with the overlap scheduler ON.
+    def test_gsm8k_dep8_static_verify_overlap(self, moe_backend):
+        """DSpark verifying the full block, with the overlap scheduler ON.
+
+        This was a confidence-scheduling test until the uniform tier ladder was
+        removed. That path chose one verify length for the whole batch and, on
+        this checkpoint, always chose the full block -- so it never differed
+        from what this test does now, and the combination it configured
+        (scheduling on, ragged off) is rejected outright by llm_args today.
+
+        Kept, rather than deleted, because it is the STATIC reference the other
+        two modes are differenced against: same prompts, same seed, verify
+        everything. cap-accept must match it token for token (the schedule only
+        changes how many tokens are committed per step, never which), and
+        compact must then match cap-accept.
 
         The sibling test above pins ``disable_overlap_scheduler=True``, which
         makes it a weaker test than it looks: with overlap off,
@@ -4090,17 +4102,14 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         """
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
-        # Same reasoning as the ragged case: without a cost table the planner
-        # cannot tell a cheap verified token from an expensive one and keeps the
-        # full block every step, so the tier ladder is captured but never
-        # selected from. The run is still a valid correctness check -- it just
-        # does not exercise the scheduling decision.
-        sps_table_path = os.environ.get("TLLM_DSPARK_SPS_TABLE") or None
+        # No scheduling at all: every request verifies its whole drafted block.
+        # There is nothing for a cost table to inform here, which is the point
+        # -- this run has to be reproducible without one so it can serve as the
+        # reference for the two scheduled modes.
         spec_config = DSparkDecodingConfig(
             max_draft_len=5,
             speculative_model=self.MODEL_PATH,
-            enable_confidence_scheduling=True,
-            confidence_sps_table_path=sps_table_path)
+            enable_confidence_scheduling=False)
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
                  tensor_parallel_size=8,

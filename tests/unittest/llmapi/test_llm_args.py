@@ -3825,6 +3825,21 @@ class TestDSparkConfidenceScheduling:
         kw.setdefault("max_draft_len", 5)
         return DSparkDecodingConfig(**kw)
 
+    def _scheduled(self, **kw):
+        """Scheduling on, with the companions it now implies.
+
+        Turning scheduling on means ragged -- the uniform tier ladder that
+        used to sit between "schedule per request" and "verify everything" is
+        gone -- and ragged means a profiled cost table, without which the
+        planner's budget degenerates to verify-all. Both are enforced in
+        llm_args, so a ladder test that sets only the master switch is
+        testing a configuration that can no longer exist.
+        """
+        kw["enable_confidence_scheduling"] = True
+        kw.setdefault("enable_ragged_verify", True)
+        kw.setdefault("confidence_sps_table_path", "/tmp/sps.json")
+        return self._cfg(**kw)
+
     def test_defaults_are_off(self):
         c = self._cfg()
         assert c.enable_confidence_scheduling is False
@@ -3845,21 +3860,18 @@ class TestDSparkConfidenceScheduling:
                 self._cfg(**kw)
 
     def test_default_ladder_is_derived_and_includes_the_full_block(self):
-        c = self._cfg(enable_confidence_scheduling=True)
+        c = self._scheduled()
         assert c.verify_len_tiers == [1, 3, 5]
 
     def test_full_block_is_always_reachable(self):
         """The full block is the fallback when confidence is stale; keep it."""
-        c = self._cfg(enable_confidence_scheduling=True,
-                      confidence_verify_len_tiers=[1, 2])
+        c = self._scheduled(confidence_verify_len_tiers=[1, 2])
         assert c.verify_len_tiers[-1] == 5
 
     def test_ladder_cannot_exceed_max_draft_len(self):
         with pytest.raises(ValueError, match="exceeds max_draft_len"):
-            self._cfg(enable_confidence_scheduling=True,
-                      confidence_verify_len_tiers=[1, 9])
+            self._scheduled(confidence_verify_len_tiers=[1, 9])
 
     def test_ladder_is_deduped_and_sorted(self):
-        c = self._cfg(enable_confidence_scheduling=True,
-                      confidence_verify_len_tiers=[5, 1, 3, 3])
+        c = self._scheduled(confidence_verify_len_tiers=[5, 1, 3, 3])
         assert c.verify_len_tiers == [1, 3, 5]
