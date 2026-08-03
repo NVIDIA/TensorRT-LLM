@@ -825,8 +825,9 @@ def _launch_fused_k1234(
     NC = T // _BT
     has_bias = dt_bias is not None
 
-    # Dynamic shapes: cache only on mode flags, not B/NC/H
-    cache_key = (dev, has_bias, safe_gate)
+    # B only changes the outer extent and launch grid. T, H, and K change
+    # compiled tensor layouts, so they must select distinct artifacts.
+    cache_key = (dev, has_bias, safe_gate, T, H, K)
 
     # Buffers
     BH = B * H
