@@ -31,9 +31,8 @@ The public ``trtllm::kda_prefill`` operator returns only the KDA output and
 final recurrent state. Intermediate matrices remain private runner workspace.
 """
 
-from typing import Optional, Tuple
-
 import weakref
+from typing import Optional, Tuple
 
 import torch
 
@@ -282,8 +281,11 @@ _BUF_CACHE_MAX_ENTRIES = 8
 # Padded-input scratch cache for the eqlen partial-chunk path. Keyed by
 # (B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta, device, real_T).
 # real_T is part of the key so the g sentinel tail [real_T:T_padded] = -1e3
-# is set once and reused across calls with the same shape.
+# is set once and reused across calls with the same shape. LRU-bounded like
+# _buf_cache: real_T varies per prefill batch, so an unbounded dict would pin
+# scratch for every distinct token count forever.
 _padded_input_cache = {}
+_PAD_CACHE_MAX_ENTRIES = 8
 
 # Sentinel-padded g scratch for varlen single-seq Phase 2.1 path. Keyed by
 # (B, T_padded, H, K, dtype, device, real_T). The tail [real_T:T_padded] is
@@ -299,7 +301,12 @@ def _get_g_sentinel_buffer(B, T_padded, H, K, dtype_g, device, real_T):
         e = torch.zeros(B, T_padded, H, K, dtype=dtype_g, device=device)
         if real_T < T_padded:
             e[:, real_T:] = -1000.0
+        while len(_g_sentinel_cache) >= _PAD_CACHE_MAX_ENTRIES:
+            _g_sentinel_cache.pop(next(iter(_g_sentinel_cache)))
         _g_sentinel_cache[key] = e
+    else:
+        # LRU refresh so hot shapes survive eviction.
+        _g_sentinel_cache[key] = _g_sentinel_cache.pop(key)
     return e
 
 
@@ -327,12 +334,16 @@ def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta,
         if real_T < T_padded:
             g_pad[:, real_T:] = -1000.0
         e = (q_pad, k_pad, v_pad, g_pad, beta_pad)
+        while len(_padded_input_cache) >= _PAD_CACHE_MAX_ENTRIES:
+            _padded_input_cache.pop(next(iter(_padded_input_cache)))
         _padded_input_cache[key] = e
+    else:
+        # LRU refresh so hot shapes survive eviction.
+        _padded_input_cache[key] = _padded_input_cache.pop(key)
     return e
 
 
-def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT,
-                 varlen=False):
+def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=False):
     """All beta fusion lives in akk_inv kernel epilogue (post-inv column-scale)."""
     key = (dev.index or 0, B, T, H, K_dim, V_dim, NT, N_seqs, varlen)
     if key not in _buf_cache:
@@ -486,6 +497,12 @@ def _launch_k4_persistent(
     use_fast_sync=False,
 ):
     """Launch persistent K4 with cached CuTe wrappers.
+
+    Precondition: all sequence lengths in cu_seqlens must be > 0 (a
+    zero-length sequence deadlocks the kernel's chunk-loop barriers; see the
+    k4_persistent module docstring). Not validated here: cu_seqlens is on the
+    GPU and a host-side check would sync the hot path, and the prefill
+    runtime never emits zero-length sequences.
 
     No fast-launch (args-tuple) cache here: such a cache pins the per-call
     v/initial-state tensors via their cute wrappers (the wrapper holds the
@@ -792,10 +809,8 @@ def _launch_fused_k123_inv(
             stream,
         )
     akk_fn = _akk_inv_cache[akk_cache_key]
-    akk_args = (akk_in_view, akk_out_view, beta_ct, B, NT, akk_cu_ct,
-                akk_ci_ct, T_val, stream)
+    akk_args = (akk_in_view, akk_out_view, beta_ct, B, NT, akk_cu_ct, akk_ci_ct, T_val, stream)
     akk_fn(*akk_args)
-
 
 
 # ========== Fused K1234 compilation cache ==========
@@ -923,10 +938,8 @@ def _chunk_kda_fwd(
             # pool the initial state may alias.
             final_state = initial_state.to(torch.float32).clone()
         else:
-            final_state = torch.zeros(
-                n_seqs, H, K, V_dim, dtype=torch.float32, device=q.device)
-        return (o, final_state, None, None, None, None, None, None, None,
-                None, None, initial_state)
+            final_state = torch.zeros(n_seqs, H, K, V_dim, dtype=torch.float32, device=q.device)
+        return (o, final_state, None, None, None, None, None, None, None, None, None, initial_state)
 
     # ===== Fused K1234 path (eqlen only, single kernel launch) =====
     if use_fused_k1234 and not is_varlen:
@@ -1028,7 +1041,8 @@ def _chunk_kda_fwd(
         assert cur_T % BT == 0 and cur_T >= real_T, (
             f"varlen single-seq path expects caller-padded input "
             f"(T={cur_T}, seqlen={real_T}); see "
-            "KDAKernelDispatch.prefill_chunk_kda")
+            "KDAKernelDispatch.prefill_chunk_kda"
+        )
         g_pad = _get_g_sentinel_buffer(B, cur_T, H, K, g.dtype, g.device, real_T)
         g_pad[:, :real_T].copy_(g[:, :real_T])
         g = g_pad
@@ -1060,7 +1074,8 @@ def _chunk_kda_fwd(
             # KDAKernelDispatch.prefill_chunk_kda.
             raise ValueError(
                 f"kda_prefill requires >= 4 total varlen chunks (got {NT}); "
-                "route small varlen batches to the FLA fallback")
+                "route small varlen batches to the FLA fallback"
+            )
         N_seqs = len(cu_seqlens) - 1
     else:
         NT = T // BT
@@ -1079,8 +1094,7 @@ def _chunk_kda_fwd(
         cu_eqlen,
         co_eqlen,
         cute_wrappers,
-    ) = _get_buffers(device, k.dtype, B, T, H, K, V_dim, NT, N_seqs, BT,
-                     varlen=is_varlen)
+    ) = _get_buffers(device, k.dtype, B, T, H, K, V_dim, NT, N_seqs, BT, varlen=is_varlen)
 
     # ===== State copy on side stream, parallel with K123 =====
     # K4 needs S_out populated with initial_state. By doing this copy on a
@@ -1213,6 +1227,8 @@ class KdaPrefillRunner:
             raise RuntimeError("Kimi K3 KDA prefill requires NVIDIA CUTLASS DSL")
         if chunk_size != 64:
             raise ValueError(f"Kimi K3 KDA prefill requires chunk_size=64, got {chunk_size}")
+        if A_log is None:
+            raise ValueError("Kimi K3 KDA prefill requires A_log")
 
         result = _chunk_kda_fwd(
             q=q,
