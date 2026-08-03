@@ -30,9 +30,9 @@
 // Attention_residual kernel at e7f934124acc915575f9f7561f9d1e373ab43089.
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/kimiK3AttnRes/attnResFwd.h"
 
-#include <algorithm>
 #include <cfloat>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -70,6 +70,14 @@ __inline__ __device__ float block_reduce_sum(float val, float* ws)
     if (wid == 0)
         val = warp_reduce_sum(val);
     return val;
+}
+
+__device__ __forceinline__ bf16_t apply_output_rms_norm(bf16_t value, float rsigma, bf16_t weight)
+{
+    // Preserve KimiK3RMSNorm semantics: normalize in FP32, round to the
+    // activation dtype, then apply the BF16 weight.
+    bf16_t const normalized = __float2bfloat16_rn(__bfloat162float(value) * rsigma);
+    return __float2bfloat16_rn(__bfloat162float(normalized) * __bfloat162float(weight));
 }
 
 __device__ __forceinline__ bf16_t const* v_addr(
@@ -719,10 +727,6 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                     plan.logits_all[ng] = local_logit;
                 }
             }
-            // Publish the final chunk's plan.logits_all stores before the
-            // cross-lane reads in consumer warp 0 below (earlier chunks are
-            // covered by the NamedBarrier inside the loop).
-            __syncwarp();
 
             float inv_s = 1.f / s_running;
             bf16_t* out_ptr = output + (long long) tb * H;
@@ -1012,22 +1016,29 @@ static void launch_fwd(bf16_t const* block_residual, bf16_t const* layer_residua
 
 // Small-N counterpart to the Triton one-program topology.  One CTA owns the
 // complete token, with exactly 28 hidden elements per thread at H=7168.  For
-// N=2/4, packed BF16 V remains in registers across the statistics/softmax
-// boundary; N=1 can write V directly because its softmax is identically one.
-template <int N>
-__global__ void __launch_bounds__(256, 1)
-    attn_res_fwd_s1_single_cta_kernel(bf16_t const* __restrict__ block_res, bf16_t const* __restrict__ layer_res,
-        bf16_t const* __restrict__ res_w, bf16_t const* __restrict__ rms_w, bf16_t* __restrict__ output,
-        float* __restrict__ rsigma_out, float* __restrict__ probs_out, float* __restrict__ logits_out, float rms_eps)
+// N=2/3/4, packed BF16 V remains in registers across the statistics/softmax
+// boundary. The fused output is retained in registers for the trailing
+// RMSNorm, preserving the BF16 boundary without a shared-memory round trip.
+template <int N, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false, bool ENABLE_PDL = false>
+__global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16_t const* __restrict__ block_res,
+    bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add, bf16_t const* __restrict__ res_w,
+    bf16_t const* __restrict__ rms_w, bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res,
+    bf16_t* __restrict__ output, float* __restrict__ rsigma_out, float* __restrict__ probs_out,
+    float* __restrict__ logits_out, float rms_eps, float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    if constexpr (ENABLE_PDL)
+    {
+        cudaGridDependencySynchronize();
+    }
+
     constexpr int H = 7168;
     constexpr int THREADS = 256;
     constexpr int WARPS = THREADS / 32;
     constexpr int ITEMS = H / THREADS;
     constexpr float LOG2_E = 1.4426950408889634f;
     static_assert(H % THREADS == 0);
-    static_assert(N == 1 || N == 2 || N == 4);
+    static_assert(N >= 1 && N <= 4);
 
     __shared__ float2 warp_stats[WARPS * N];
     __shared__ float weights[N];
@@ -1036,7 +1047,9 @@ __global__ void __launch_bounds__(256, 1)
     int const warp = tid >> 5;
 
     float2 stats[N] = {};
+    float output_sq_local = 0.f;
     uint32_t v_cache_bf16[ITEMS][(N + 1) / 2];
+    bf16_t mixed_cache[ITEMS];
 #pragma unroll
     for (int item = 0; item < ITEMS; item++)
     {
@@ -1048,10 +1061,26 @@ __global__ void __launch_bounds__(256, 1)
         {
             bf16_t const* row = n < N - 1 ? block_res + (size_t) n * H : layer_res;
             bf16_t packed_v = row[h];
+            if constexpr (FUSE_LAYER_ADD)
+            {
+                if (n == N - 1)
+                {
+                    packed_v = __float2bfloat16_rn(__bfloat162float(packed_v) + __bfloat162float(layer_res_add[h]));
+                    updated_layer_res[h] = packed_v;
+                }
+            }
             float v = __bfloat162float(packed_v);
             if constexpr (N == 1)
             {
-                output[h] = packed_v;
+                if constexpr (FUSE_OUTPUT_RMS_NORM)
+                {
+                    mixed_cache[item] = packed_v;
+                    output_sq_local = fmaf(v, v, output_sq_local);
+                }
+                else
+                {
+                    output[h] = packed_v;
+                }
             }
             else
             {
@@ -1072,6 +1101,17 @@ __global__ void __launch_bounds__(256, 1)
 
                 packed.bf16x2 = __halves2bfloat162(item_v[2 * pair], item_v[2 * pair + 1]);
                 v_cache_bf16[item][pair] = packed.bits;
+            }
+            if constexpr (N % 2 == 1)
+            {
+                union
+                {
+                    __nv_bfloat162 bf16x2;
+                    uint32_t bits;
+                } packed;
+
+                packed.bf16x2 = __halves2bfloat162(item_v[N - 1], __float2bfloat16_rn(0.f));
+                v_cache_bf16[item][N / 2] = packed.bits;
             }
         }
     }
@@ -1135,9 +1175,12 @@ __global__ void __launch_bounds__(256, 1)
         for (int n = 0; n < N; n++)
         {
             weights[n] *= inv_denominator;
-            rsigma_out[n] = local_rsigma[n];
-            logits_out[n] = local_logits[n];
-            probs_out[n] = weights[n];
+            if (rsigma_out)
+                rsigma_out[n] = local_rsigma[n];
+            if (logits_out)
+                logits_out[n] = local_logits[n];
+            if (probs_out)
+                probs_out[n] = weights[n];
         }
     }
     __syncthreads();
@@ -1162,9 +1205,65 @@ __global__ void __launch_bounds__(256, 1)
                 value = fmaf(weights[2 * pair], v.x, value);
                 value = fmaf(weights[2 * pair + 1], v.y, value);
             }
+            if constexpr (N % 2 == 1)
+            {
+                union
+                {
+                    __nv_bfloat162 bf16x2;
+                    uint32_t bits;
+                } packed;
+
+                packed.bits = v_cache_bf16[item][N / 2];
+                float2 v = __bfloat1622float2(packed.bf16x2);
+                value = fmaf(weights[N - 1], v.x, value);
+            }
             int h = tid + item * THREADS;
-            output[h] = __float2bfloat16_rn(value);
+            bf16_t const mixed = __float2bfloat16_rn(value);
+            if constexpr (FUSE_OUTPUT_RMS_NORM)
+            {
+                mixed_cache[item] = mixed;
+                float const mixed_float = __bfloat162float(mixed);
+                output_sq_local = fmaf(mixed_float, mixed_float, output_sq_local);
+            }
+            else
+            {
+                output[h] = mixed;
+            }
         }
+    }
+
+    if constexpr (FUSE_OUTPUT_RMS_NORM)
+    {
+        output_sq_local = warp_reduce_sum(output_sq_local);
+        if (lane == 0)
+        {
+            warp_stats[warp].x = output_sq_local;
+        }
+        __syncthreads();
+        if (tid == 0)
+        {
+            float output_sq = 0.f;
+#pragma unroll
+            for (int w = 0; w < WARPS; w++)
+            {
+                output_sq += warp_stats[w].x;
+            }
+            weights[0] = rsqrtf(output_sq / H + output_rms_eps);
+        }
+        __syncthreads();
+
+        float const output_rsigma = weights[0];
+#pragma unroll
+        for (int item = 0; item < ITEMS; item++)
+        {
+            int h = tid + item * THREADS;
+            output[h] = apply_output_rms_norm(mixed_cache[item], output_rsigma, output_rms_w[h]);
+        }
+    }
+
+    if constexpr (ENABLE_PDL)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
     }
 #else
     if (cute::thread0())
@@ -1174,30 +1273,67 @@ __global__ void __launch_bounds__(256, 1)
 #endif
 }
 
+template <int N, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false>
+static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* layer_residual,
+    bf16_t const* layer_residual_add, bf16_t const* res_weight, bf16_t const* rms_weight,
+    bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output, float* rsigma, float* probs,
+    float* logits, float rms_eps, float output_rms_eps, cudaStream_t stream)
+{
+    if (tensorrt_llm::common::getEnvEnablePDL())
+    {
+        auto kernel = &attn_res_fwd_s1_single_cta_kernel<N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>;
+        cudaLaunchConfig_t config{};
+        config.gridDim = dim3(1);
+        config.blockDim = dim3(256);
+        config.stream = stream;
+        cudaLaunchAttribute attribute{};
+        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute.val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = &attribute;
+        config.numAttrs = 1;
+        cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, layer_residual_add, res_weight, rms_weight,
+            output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps);
+    }
+    else
+    {
+        attn_res_fwd_s1_single_cta_kernel<N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>
+            <<<1, 256, 0, stream>>>(block_residual, layer_residual, layer_residual_add, res_weight, rms_weight,
+                output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps);
+    }
+}
+
 template <int N>
 static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* layer_residual, bf16_t const* res_weight,
     bf16_t const* rms_weight, bf16_t* output, float* rsigma, float* probs, float* logits, float rms_eps,
     cudaStream_t stream)
 {
-    attn_res_fwd_s1_single_cta_kernel<N><<<1, 256, 0, stream>>>(
-        block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, rms_eps);
+    launch_s1_single_cta<N, false, false>(block_residual, layer_residual, nullptr, res_weight, rms_weight, nullptr,
+        nullptr, output, rsigma, probs, logits, rms_eps, 0.f, stream);
 }
 
 // Single-token split-K specialization.  The complete grid is one CTA cluster:
 // rank g owns a disjoint H/GROUPS slice, keeps that slice of FP32 V in its
 // rank-local shared memory, and exchanges only (square, dot) partials via DSM.
-template <int N, int GROUPS = 8>
-__global__ void __launch_bounds__(256, 1)
-    attn_res_fwd_s1_splitk_kernel(bf16_t const* __restrict__ block_res, bf16_t const* __restrict__ layer_res,
-        bf16_t const* __restrict__ res_w, bf16_t const* __restrict__ rms_w, bf16_t* __restrict__ output,
-        float* __restrict__ rsigma_out, float* __restrict__ probs_out, float* __restrict__ logits_out, float rms_eps)
+template <int N, int GROUPS = 8, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false,
+    bool ENABLE_PDL = false>
+__global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t const* __restrict__ block_res,
+    bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add, bf16_t const* __restrict__ res_w,
+    bf16_t const* __restrict__ rms_w, bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res,
+    bf16_t* __restrict__ output, float* __restrict__ rsigma_out, float* __restrict__ probs_out,
+    float* __restrict__ logits_out, float rms_eps, float output_rms_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    if constexpr (ENABLE_PDL)
+    {
+        cudaGridDependencySynchronize();
+    }
+
     namespace cg = cooperative_groups;
     constexpr int H = 7168;
     constexpr int K_PER_CTA = H / GROUPS;
     constexpr int THREADS = 256;
     constexpr int WARPS = THREADS / 32;
+    constexpr int ITEMS = (K_PER_CTA + THREADS - 1) / THREADS;
     constexpr float LOG2_E = 1.4426950408889634f;
     static_assert(H % GROUPS == 0);
 
@@ -1224,7 +1360,16 @@ __global__ void __launch_bounds__(256, 1)
         for (int n = 0; n < N; n++)
         {
             bf16_t const* row = n < N - 1 ? block_res + (size_t) n * H : layer_res;
-            float v = __bfloat162float(row[h]);
+            bf16_t packed_v = row[h];
+            if constexpr (FUSE_LAYER_ADD)
+            {
+                if (n == N - 1)
+                {
+                    packed_v = __float2bfloat16_rn(__bfloat162float(packed_v) + __bfloat162float(layer_res_add[h]));
+                    updated_layer_res[h] = packed_v;
+                }
+            }
+            float v = __bfloat162float(packed_v);
             v_cache[(size_t) n * K_PER_CTA + ki] = v;
             sq[n] = fmaf(v, v, sq[n]);
             dot[n] = fmaf(v, q, dot[n]);
@@ -1267,16 +1412,26 @@ __global__ void __launch_bounds__(256, 1)
 
     // One thread per candidate reduces across CTA ranks.  Parallelizing this
     // avoids making a single leader issue all GROUPS*N remote DSM reads.
+    float2 cluster_total = {};
     if (tid < N)
     {
-        float2 total = {};
 #pragma unroll
         for (int g = 0; g < GROUPS; g++)
         {
             float2 const* remote_stats = cluster.map_shared_rank(warp_stats, g);
-            total = float2_add(total, remote_stats[tid]);
+            cluster_total = float2_add(cluster_total, remote_stats[tid]);
         }
-        warp_stats[tid] = total;
+    }
+
+    // No rank may overwrite its published DSM partial until every other rank
+    // has finished reading it.  This second cluster barrier is required even
+    // though every rank traverses the same remote-rank loop: CTAs can make
+    // progress independently, especially at the higher-register N=9/12
+    // specializations.
+    cluster.sync();
+    if (tid < N)
+    {
+        warp_stats[tid] = cluster_total;
     }
     __syncthreads();
 
@@ -1307,17 +1462,22 @@ __global__ void __launch_bounds__(256, 1)
             weights[n] *= inv_sum;
             if (group == 0)
             {
-                rsigma_out[n] = local_rsigma[n];
-                logits_out[n] = local_logits[n];
-                probs_out[n] = weights[n];
+                if (rsigma_out)
+                    rsigma_out[n] = local_rsigma[n];
+                if (logits_out)
+                    logits_out[n] = local_logits[n];
+                if (probs_out)
+                    probs_out[n] = weights[n];
             }
         }
     }
 
     cluster.sync();
 
+    float output_sq_local = 0.f;
+    bf16_t mixed_cache[ITEMS];
 #pragma unroll
-    for (int ki = tid; ki < K_PER_CTA; ki += THREADS)
+    for (int ki = tid, item = 0; ki < K_PER_CTA; ki += THREADS, item++)
     {
         float value = 0.0f;
 #pragma unroll
@@ -1325,7 +1485,70 @@ __global__ void __launch_bounds__(256, 1)
         {
             value = fmaf(weights[n], v_cache[(size_t) n * K_PER_CTA + ki], value);
         }
-        output[h_begin + ki] = __float2bfloat16_rn(value);
+        bf16_t const mixed = __float2bfloat16_rn(value);
+        if constexpr (FUSE_OUTPUT_RMS_NORM)
+        {
+            float const mixed_float = __bfloat162float(mixed);
+            mixed_cache[item] = mixed;
+            output_sq_local = fmaf(mixed_float, mixed_float, output_sq_local);
+        }
+        else
+        {
+            output[h_begin + ki] = mixed;
+        }
+    }
+
+    if constexpr (FUSE_OUTPUT_RMS_NORM)
+    {
+        output_sq_local = warp_reduce_sum(output_sq_local);
+        if (lane == 0)
+        {
+            warp_stats[warp].x = output_sq_local;
+        }
+        __syncthreads();
+        if (tid == 0)
+        {
+            float output_sq = 0.f;
+#pragma unroll
+            for (int w = 0; w < WARPS; w++)
+            {
+                output_sq += warp_stats[w].x;
+            }
+            warp_stats[0].x = output_sq;
+        }
+
+        cluster.sync();
+
+        if (tid == 0)
+        {
+            float output_sq = 0.f;
+#pragma unroll
+            for (int g = 0; g < GROUPS; g++)
+            {
+                float2 const* remote_stats = cluster.map_shared_rank(warp_stats, g);
+                output_sq += remote_stats[0].x;
+            }
+            weights[0] = rsqrtf(output_sq / H + output_rms_eps);
+        }
+
+        // Keep every source CTA alive until all remote DSM reads above have
+        // completed.  A block-local barrier is insufficient: a faster CTA
+        // could otherwise leave the cluster while a peer still reads its
+        // rank-local output-square partial.
+        cluster.sync();
+
+        float const output_rsigma = weights[0];
+#pragma unroll
+        for (int ki = tid, item = 0; ki < K_PER_CTA; ki += THREADS, item++)
+        {
+            int const h = h_begin + ki;
+            output[h] = apply_output_rms_norm(mixed_cache[item], output_rsigma, output_rms_w[h]);
+        }
+    }
+
+    if constexpr (ENABLE_PDL)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
     }
 #else
     if (cute::thread0())
@@ -1335,24 +1558,32 @@ __global__ void __launch_bounds__(256, 1)
 #endif
 }
 
-template <int N, int GROUPS = 8>
-static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_residual, bf16_t const* res_weight,
-    bf16_t const* rms_weight, bf16_t* output, float* rsigma, float* probs, float* logits, float rms_eps,
-    cudaStream_t stream)
+template <int N, int GROUPS = 8, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false>
+static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_residual,
+    bf16_t const* layer_residual_add, bf16_t const* res_weight, bf16_t const* rms_weight,
+    bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output, float* rsigma, float* probs,
+    float* logits, float rms_eps, float output_rms_eps, cudaStream_t stream)
 {
     constexpr int K_PER_CTA = 7168 / GROUPS;
     constexpr int WARPS = 8;
     constexpr size_t smem_size
         = (size_t) N * K_PER_CTA * sizeof(float) + (size_t) WARPS * N * sizeof(float2) + (size_t) N * sizeof(float);
-    auto kernel = &attn_res_fwd_s1_splitk_kernel<N, GROUPS>;
+    bool const enable_pdl = tensorrt_llm::common::getEnvEnablePDL();
+    auto kernel_pdl = &attn_res_fwd_s1_splitk_kernel<N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>;
+    auto kernel_nopdl = &attn_res_fwd_s1_splitk_kernel<N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>;
+    auto kernel = enable_pdl ? kernel_pdl : kernel_nopdl;
     {
         // cudaFuncSetAttribute applies to the current device only; set it
-        // once per device (per kernel instantiation).
+        // once per device (per kernel instantiation). Both PDL variants are
+        // registered so a later flip of getEnvEnablePDL() is still valid.
         static std::once_flag attrs_set[64];
         int dev = 0;
         TLLM_CUDA_CHECK(cudaGetDevice(&dev));
         auto const set_attr = [&]
-        { TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)); };
+        {
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel_pdl, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel_nopdl, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        };
         if (dev >= 0 && dev < 64)
         {
             std::call_once(attrs_set[dev], set_attr);
@@ -1363,21 +1594,36 @@ static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_r
         }
     }
     void* args[] = {const_cast<bf16_t**>(&block_residual), const_cast<bf16_t**>(&layer_residual),
-        const_cast<bf16_t**>(&res_weight), const_cast<bf16_t**>(&rms_weight), &output, &rsigma, &probs, &logits,
-        &rms_eps};
+        const_cast<bf16_t**>(&layer_residual_add), const_cast<bf16_t**>(&res_weight), const_cast<bf16_t**>(&rms_weight),
+        const_cast<bf16_t**>(&output_rms_weight), &updated_layer_residual, &output, &rsigma, &probs, &logits, &rms_eps,
+        &output_rms_eps};
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(GROUPS);
     config.blockDim = dim3(256);
     config.dynamicSmemBytes = smem_size;
     config.stream = stream;
-    cudaLaunchAttribute attribute{};
-    attribute.id = cudaLaunchAttributeClusterDimension;
-    attribute.val.clusterDim.x = GROUPS;
-    attribute.val.clusterDim.y = 1;
-    attribute.val.clusterDim.z = 1;
-    config.attrs = &attribute;
-    config.numAttrs = 1;
+    cudaLaunchAttribute attributes[2]{};
+    attributes[0].id = cudaLaunchAttributeClusterDimension;
+    attributes[0].val.clusterDim.x = GROUPS;
+    attributes[0].val.clusterDim.y = 1;
+    attributes[0].val.clusterDim.z = 1;
+    if (enable_pdl)
+    {
+        attributes[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attributes[1].val.programmaticStreamSerializationAllowed = 1;
+    }
+    config.attrs = attributes;
+    config.numAttrs = enable_pdl ? 2 : 1;
     cudaLaunchKernelExC(&config, reinterpret_cast<void const*>(kernel), args);
+}
+
+template <int N, int GROUPS = 8>
+static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_residual, bf16_t const* res_weight,
+    bf16_t const* rms_weight, bf16_t* output, float* rsigma, float* probs, float* logits, float rms_eps,
+    cudaStream_t stream)
+{
+    launch_s1_splitk<N, GROUPS, false, false>(block_residual, layer_residual, nullptr, res_weight, rms_weight, nullptr,
+        nullptr, output, rsigma, probs, logits, rms_eps, 0.f, stream);
 }
 
 template <int H, int TB_TILE>
@@ -1457,10 +1703,12 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     float const rms_eps = params.rmsEps;
 
     int dev = 0;
-    TLLM_CUDA_CHECK(cudaGetDevice(&dev));
+    cudaGetDevice(&dev);
     int num_sm = attn_res_fwd_grid_size(dev);
-    TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res_fwd: failed to query the SM count of device %d", dev);
-    TLLM_CHECK_WITH_INFO(N <= N_MAX, "attn_res_fwd: unsupported N=%d (max %d)", N, N_MAX);
+    if (num_sm <= 0 || N > N_MAX)
+    {
+        return;
+    }
 
     if (H == 8192)
     {
@@ -1510,7 +1758,7 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
         else if (N == 12 && T == 1024)
         {
             launch_fwd<7168, 4, false, true>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma,
-                probs, logits, N, T, B, rms_eps, std::max(1, num_sm - 1), stream);
+                probs, logits, N, T, B, rms_eps, num_sm - 1, stream);
         }
         else
         {
@@ -1546,10 +1794,57 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
                 logits, N, T, B, rms_eps, num_sm, stream);
         }
     }
+}
+
+template <int N, bool FUSE_LAYER_ADD>
+static void launchAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStream_t stream)
+{
+    using namespace sm100::fwd_prod_v2;
+
+    auto const* layer_residual_add = FUSE_LAYER_ADD ? params.layerResidualAdd : nullptr;
+    auto* updated_layer_residual = FUSE_LAYER_ADD ? params.updatedLayerResidual : nullptr;
+
+    if constexpr (N <= 4)
+    {
+        launch_s1_single_cta<N, true, FUSE_LAYER_ADD>(params.blockResidual, params.layerResidual, layer_residual_add,
+            params.resWeight, params.rmsWeight, params.outputRmsWeight, updated_layer_residual, params.output, nullptr,
+            nullptr, nullptr, params.rmsEps, params.outputRmsEps, stream);
+    }
     else
     {
-        TLLM_CHECK_WITH_INFO(false, "attn_res_fwd: unsupported hidden size H=%d", H);
+        launch_s1_splitk<N, 8, true, FUSE_LAYER_ADD>(params.blockResidual, params.layerResidual, layer_residual_add,
+            params.resWeight, params.rmsWeight, params.outputRmsWeight, updated_layer_residual, params.output, nullptr,
+            nullptr, nullptr, params.rmsEps, params.outputRmsEps, stream);
     }
+}
+
+template <bool FUSE_LAYER_ADD>
+static void invokeAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStream_t stream)
+{
+    switch (params.numCandidates)
+    {
+    case 1: launchAttnResDecodeRmsNorm<1, FUSE_LAYER_ADD>(params, stream); break;
+    case 2: launchAttnResDecodeRmsNorm<2, FUSE_LAYER_ADD>(params, stream); break;
+    case 3: launchAttnResDecodeRmsNorm<3, FUSE_LAYER_ADD>(params, stream); break;
+    case 4: launchAttnResDecodeRmsNorm<4, FUSE_LAYER_ADD>(params, stream); break;
+    case 5: launchAttnResDecodeRmsNorm<5, FUSE_LAYER_ADD>(params, stream); break;
+    case 6: launchAttnResDecodeRmsNorm<6, FUSE_LAYER_ADD>(params, stream); break;
+    case 7: launchAttnResDecodeRmsNorm<7, FUSE_LAYER_ADD>(params, stream); break;
+    case 8: launchAttnResDecodeRmsNorm<8, FUSE_LAYER_ADD>(params, stream); break;
+    case 9: launchAttnResDecodeRmsNorm<9, FUSE_LAYER_ADD>(params, stream); break;
+    case 12: launchAttnResDecodeRmsNorm<12, FUSE_LAYER_ADD>(params, stream); break;
+    default: break;
+    }
+}
+
+void invokeAttnResRmsNormFwd(AttnResFwdParams const& params, cudaStream_t stream)
+{
+    invokeAttnResDecodeRmsNorm<false>(params, stream);
+}
+
+void invokeAttnResAddRmsNormFwd(AttnResFwdParams const& params, cudaStream_t stream)
+{
+    invokeAttnResDecodeRmsNorm<true>(params, stream);
 }
 
 } // namespace kernels::kimiK3AttnRes
