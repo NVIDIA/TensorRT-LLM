@@ -68,7 +68,11 @@ DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
 # --------------------------------------------------------------------------- #
 def _read_test_list_lines(test_list_path):
     with open(test_list_path, "r") as f:
-        lines = [line.strip() for line in f if line.strip()]
+        lines = []
+        for line in f:
+            stripped_line = line.strip()
+            if stripped_line and not stripped_line.startswith("#"):
+                lines.append(stripped_line)
     if not lines:
         raise ValueError(f"Test list is empty: {test_list_path}")
     return lines

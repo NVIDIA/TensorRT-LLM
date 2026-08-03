@@ -31,7 +31,7 @@ EXAMPLE_SUBMIT_PATH = REPO_ROOT / "examples" / "disaggregated" / "slurm" / "benc
 
 
 class _FakePytestItem:
-    def __init__(self, nodeid: str):
+    def __init__(self, nodeid: str) -> None:
         self.nodeid = nodeid
 
     def __str__(self) -> str:
@@ -119,7 +119,10 @@ def test_example_worker_environment_exports_positive_concurrency(example_submit_
     assert worker_environment["TLLM_BENCHMARK_REQ_QUEUES_SIZE"] == "4301"
 
 
-def test_ci_submit_selects_same_least_duration_shard_as_pytest_split(ci_submit_module, tmp_path):
+def test_ci_submit_selects_same_least_duration_shard_as_pytest_split(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
     test_lines = [
         "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-r1] TIMEOUT (90)",
         "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_kimi-k25] TIMEOUT (90)",
@@ -154,7 +157,9 @@ def test_ci_submit_selects_same_least_duration_shard_as_pytest_split(ci_submit_m
     assert selected == test_lines[1]
 
 
-def test_ci_submit_selector_matches_installed_pytest_split(ci_submit_module):
+def test_ci_submit_selector_matches_installed_pytest_split(
+    ci_submit_module: ModuleType,
+) -> None:
     lines = [
         f"perf/test_perf_sanity.py::test_e2e[case-{case_name}] TIMEOUT (90)"
         for case_name in ("zeta", "alpha", "gamma", "beta", "epsilon", "delta")
@@ -183,7 +188,48 @@ def test_ci_submit_selector_matches_installed_pytest_split(ci_submit_module):
                 ]
 
 
-def test_ci_submit_rejects_split_group_disagreement(ci_submit_module, tmp_path):
+@pytest.mark.parametrize(
+    ("splits", "group", "match"),
+    (
+        (0, 1, "--splits"),
+        (2, 0, "--group"),
+        (2, 3, "--group"),
+    ),
+)
+def test_ci_submit_rejects_invalid_least_duration_groups(
+    ci_submit_module: ModuleType,
+    splits: int,
+    group: int,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        ci_submit_module._select_least_duration_group(
+            ["perf/test_perf_sanity.py::test_e2e[case]"],
+            {},
+            splits,
+            group,
+        )
+
+
+def test_ci_submit_ignores_test_list_comments(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    test_list_path = tmp_path / "test_list.txt"
+    test_list_path.write_text(
+        "# section comment\n\nperf/test_perf_sanity.py::test_e2e[case]\n",
+        encoding="utf-8",
+    )
+
+    assert ci_submit_module._read_test_list_lines(test_list_path) == [
+        "perf/test_perf_sanity.py::test_e2e[case]"
+    ]
+
+
+def test_ci_submit_rejects_split_group_disagreement(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
     test_list_path = tmp_path / "test_list.txt"
     test_list_path.write_text(
         "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300-kimi]\n",
@@ -202,7 +248,10 @@ def test_ci_submit_rejects_split_group_disagreement(ci_submit_module, tmp_path):
         )
 
 
-def test_ci_submit_rejects_missing_pytest_split_durations(ci_submit_module, tmp_path):
+def test_ci_submit_rejects_missing_pytest_split_durations(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
     test_list_path = tmp_path / "test_list.txt"
     test_list_path.write_text(
         "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300-kimi]\n",
