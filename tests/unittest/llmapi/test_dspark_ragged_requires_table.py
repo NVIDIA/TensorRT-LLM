@@ -44,15 +44,32 @@ def test_ragged_with_an_sps_table_is_accepted():
 
 
 @patch.dict(os.environ, {}, clear=False)
-def test_uniform_confidence_scheduling_still_needs_no_table():
-    """Only the ragged path is gated.
+def test_confidence_scheduling_without_ragged_is_rejected():
+    """There is no uniform tier ladder to fall back to.
 
-    Uniform tier selection degrades gracefully without a table -- it picks the
-    max tier, which is the pre-existing behaviour -- so requiring one there
-    would break working configurations.
+    Scheduling used to have a middle state: pick one verify length for the
+    whole batch from the captured tiers. It could not act on per-request
+    confidence -- which is the entire point of a confidence head -- and it
+    degenerated to the full block whenever acceptance was high, i.e. on every
+    workload measured on this checkpoint. It is gone, so this combination now
+    names a path that does not exist and must not silently mean something else.
+
+    The two remaining states are: schedule per request (ragged), or verify the
+    whole drafted block (confidence scheduling off).
     """
+    with pytest.raises(ValueError, match="enable_ragged_verify"):
+        DSparkDecodingConfig(max_draft_len=5,
+                             speculative_model="/nonexistent/model",
+                             enable_confidence_scheduling=True,
+                             enable_ragged_verify=False)
+
+
+@patch.dict(os.environ, {}, clear=False)
+def test_scheduling_off_needs_no_table_and_verifies_everything():
+    """The fallback is static verification, which has nothing to profile."""
     cfg = DSparkDecodingConfig(max_draft_len=5,
                                speculative_model="/nonexistent/model",
-                               enable_confidence_scheduling=True,
+                               enable_confidence_scheduling=False,
                                enable_ragged_verify=False)
+    assert not cfg.enable_confidence_scheduling
     assert not cfg.enable_ragged_verify

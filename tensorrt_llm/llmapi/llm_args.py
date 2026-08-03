@@ -2867,6 +2867,28 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "enable_ragged_verify requires enable_confidence_scheduling=True: "
                 "per-request verify lengths are chosen from confidence-head "
                 "survival, which is only computed when scheduling is on")
+        if self.enable_confidence_scheduling and not self.enable_ragged_verify:
+            # The two flags describe one feature. Scheduling without ragged used
+            # to mean a uniform tier ladder -- one window chosen for the whole
+            # batch -- which is a middle ground that does not earn its keep:
+            # it cannot give a confident request a longer window than a
+            # collapsing one, which is the entire point of scheduling against
+            # per-request confidence, and it degenerates to the full block
+            # whenever acceptance is high (every workload measured on
+            # DeepSeek-V4-Pro-DSpark). SGLang has no equivalent either: its
+            # scheduler always produces per-request windows via top-k, and
+            # uniform appears only as the verify-all degenerate case.
+            #
+            # So there are two states, not three: schedule per request, or
+            # verify the full block. Declining the feature is
+            # enable_confidence_scheduling=False.
+            raise ValueError(
+                "enable_confidence_scheduling requires enable_ragged_verify=True. "
+                "Scheduling a single window for the whole batch cannot act on "
+                "per-request confidence, and collapses to verifying the full "
+                "block whenever acceptance is high. To turn the feature off, "
+                "set enable_confidence_scheduling=False -- that verifies the "
+                "full drafted block, which is the only fallback.")
         if (self.enable_ragged_verify and not self.confidence_sps_table_path
                 and not self.confidence_sts_path):
             # Without a profiled cost table the planner's budget degenerates to

@@ -3400,7 +3400,6 @@ class PyExecutor:
         # single collective, and nothing after it may issue another one.
         ragged_lens = None
         fallback_reason = None
-        local_tier = planner.max_tier
         if compute_windows:
             ragged_lens = planner.decide_verify_lens(
                 num_gen_requests=num_gen_requests,
@@ -3410,22 +3409,20 @@ class PyExecutor:
                 fallback_reason = "planner_declined"
         else:
             fallback_reason = "mode_static"
-            # Only computed on the uniform path so the planner's fallback
-            # counters keep meaning "this step declined to trim" exactly once.
-            # On the ragged path the placeholder above is the largest tier --
-            # i.e. verify everything -- which is the documented safe answer for
-            # the case this value is actually used: some *other* rank declined
-            # and dragged the whole group back to a uniform step.
-            local_tier = planner.decide_draft_len(
-                num_gen_requests=num_gen_requests,
-                rows=confidence_rows,
-                reduce_across_ranks=False)
+            # Nothing to compute: the fallback verifies the full drafted
+            # block. This used to call decide_draft_len, which picked one tier
+            # for the whole batch -- a middle ground between "schedule per
+            # request" and "verify everything". It is gone: it could not act on
+            # per-request confidence, which is the point of scheduling, and it
+            # degenerated to the full block whenever acceptance was high, which
+            # was every workload measured here. The config that reached it is
+            # rejected in llm_args now, so there are two states, not three.
 
         # --- Phase 2: one collective, same shape on every rank, every step ----
         #
         # Carries everything the rest of the step needs, so the `peer_stats`
         # gather that used to follow is folded in here rather than added to it:
-        #   [wants_ragged, num_rows, total_verify_tokens, max_window, tier]
+        #   [wants_ragged, num_rows, total_verify_tokens, max_window]
         # `_can_queue` already runs `tp_allgather(batch_size)` just before this
         # hook and could absorb this too, but that would mean computing the
         # local draft length inside a hot path shared by every speculation mode.
@@ -3440,7 +3437,6 @@ class PyExecutor:
                 local_rows,
                 local_tokens,
                 local_max_window,
-                int(local_tier),
             ])
             if not all(int(payload[0]) for payload in payloads):
                 # Any rank that cannot go ragged takes the whole group with it:
@@ -3456,9 +3452,6 @@ class PyExecutor:
                 ragged_lens = [min(int(v), agreed_max) for v in ragged_lens]
                 peer_stats = [[int(payload[1]),
                                int(payload[2])] for payload in payloads]
-            agreed_tier = max(int(payload[4]) for payload in payloads)
-        else:
-            agreed_tier = int(local_tier)
 
         # --- Phase 3: no more collectives -------------------------------------
         #
@@ -3522,8 +3515,11 @@ class PyExecutor:
             # layout with uniform acceptance -- silent token misattribution.
             for request in gen_requests:
                 request.py_verify_len = None
-            # Already agreed in phase 2 -- deliberately not another collective.
-            runtime_draft_len = planner.snap_to_tier(agreed_tier)
+            # Verify the full drafted block. This is the only fallback: the
+            # uniform tier ladder that used to sit between "schedule per
+            # request" and "verify everything" is gone, so there is nothing to
+            # agree on across ranks here and no collective is needed.
+            runtime_draft_len = planner.max_tier
 
         # Stage this step's confidence for the *next* decision. Non-blocking; if
         # it has not landed by then the planner just verifies the full block.

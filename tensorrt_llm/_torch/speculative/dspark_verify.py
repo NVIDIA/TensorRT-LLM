@@ -20,15 +20,18 @@ Three constraints shape this component, and all three point the same way:
    from ``(batch_size, draft_len, ...)`` -- every input to that choice is a host
    value. A device-resident budget would have to be copied back before the batch
    could be shaped, which is the synchronization we are trying to avoid.
-2. **The decision must land on a captured draft length.** A length with no
-   captured graph does not raise; ``maybe_get_cuda_graph`` returns ``None`` and
-   the step silently runs eager, which costs far more than the tokens saved.
-   Hence :meth:`decide_draft_len` only ever returns a value from ``tiers``.
-3. **Every rank must decide identically.** ``draft_len`` is part of the graph key
-   but is *not* part of the attention-DP consistency allgather, so two ranks that
-   pick different lengths select different graphs -- one replays, one falls back
-   to eager -- and their collectives diverge. :meth:`decide_draft_len` therefore
-   reduces across ranks before returning.
+2. **The step must land on a captured graph.** A shape with no captured graph
+   does not raise; ``maybe_get_cuda_graph`` returns ``None`` and the step
+   silently runs eager, which costs far more than the tokens saved. The drafted
+   block is always ``max_tier`` long, so what varies is the *verified* token
+   total, and the layout rounds that up to a captured verify bucket before the
+   batch is shaped.
+3. **Every rank must decide identically.** The graph key is not part of the
+   attention-DP consistency allgather, so two ranks that shape the batch
+   differently select different graphs -- one replays, one falls back to eager
+   -- and their collectives diverge. The caller therefore reduces the ragged
+   decision across ranks (a single allgather in ``py_executor``) before any rank
+   acts on it; :meth:`decide_verify_lens` itself is rank-local by default.
 
 Confidence for step ``t`` only becomes readable on the host at ``t+1`` (or ``t+2``
 with the overlap scheduler), so the decision always runs on a lagged snapshot.
@@ -55,9 +58,9 @@ class DSparkVerifyPlanner:
     Args:
         cfg: verify-length bounds.
         cost_table: measured step cost. A flat table means "not profiled"; the
-            planner then refuses to trim (see :meth:`decide_draft_len`).
-        tiers: draft lengths that have a captured CUDA graph. The returned length
-            is always one of these.
+            planner then refuses to trim (see :meth:`decide_verify_lens`).
+        tiers: draft lengths that have a captured CUDA graph. The drafted block
+            is always ``max_tier``; these also bound the budget search.
         apply_calibration: maps raw confidence logits to probabilities. Normally
             ``confidence_head.apply_sts``; defaults to a plain sigmoid.
         all_rank_max: cross-rank reduction, returning the max of ``value`` over
@@ -107,8 +110,8 @@ class DSparkVerifyPlanner:
         keying exists to avoid.
 
         Never synchronizes: the copy is issued on the current stream and an event
-        is recorded. :meth:`decide_draft_len` polls that event and simply does not
-        use the snapshot if it has not landed.
+        is recorded. :meth:`decide_verify_lens` polls that event and simply does
+        not use the snapshot if it has not landed.
         """
         if confidence_logits is None or confidence_logits.shape[0] == 0:
             return
@@ -169,59 +172,6 @@ class DSparkVerifyPlanner:
             self.stats["fallback_no_confidence"] += 1
             return None
         return selected
-
-    def snap_to_tier(self, value: int) -> int:
-        """Round ``value`` up to a captured tier.
-
-        Callers that reduce across ranks themselves need this: the reduced value
-        is a maximum over per-rank choices and so is already a tier, but a caller
-        combining it with anything else has to land back on the ladder before it
-        can be used as a graph key.
-        """
-        value = int(value)
-        if value in self.tiers:
-            return value
-        return min((t for t in self.tiers if t >= value), default=self.max_tier)
-
-    def decide_draft_len(
-        self,
-        *,
-        num_gen_requests: int,
-        rows: Optional[Sequence[int]] = None,
-        all_rank_max: Optional[Callable[[int], int]] = None,
-        reduce_across_ranks: bool = True,
-    ) -> int:
-        """Choose this iteration's draft length, agreed across all ranks.
-
-        Degrades to the largest captured tier (i.e. verify everything, today's
-        behavior) whenever the inputs are not trustworthy: no confidence
-        snapshot yet, or an unprofiled (flat) cost model under which every extra
-        verified token looks free.
-
-        ``rows`` maps each generation request to its buffer row; see
-        :meth:`_gather_rows`. ``all_rank_max`` overrides the constructor's
-        reduction; the caller that owns the distributed handle usually supplies
-        it here.
-
-        ``reduce_across_ranks=False`` returns the *local* choice and issues no
-        collective, leaving the agreement to a caller that batches it with its
-        other cross-rank traffic. Since the reduction is a max over tiers, and
-        every local choice is already a tier, the caller only has to reduce and
-        pass the result through :meth:`snap_to_tier`.
-        """
-        self.stats["decisions"] += 1
-        chosen = self._decide_local(num_gen_requests=num_gen_requests, rows=rows)
-        if not reduce_across_ranks:
-            return int(chosen)
-        all_rank_max = all_rank_max or self.all_rank_max
-        if all_rank_max is not None:
-            # Max, not min: a rank that wanted to trim more simply verifies a few
-            # extra tokens. Disagreeing on the graph key is the unrecoverable
-            # outcome, so agreement matters more than the saving.
-            chosen = int(all_rank_max(int(chosen)))
-            if chosen not in self.tiers:
-                chosen = min((t for t in self.tiers if t >= chosen), default=self.max_tier)
-        return int(chosen)
 
     def decide_verify_lens(
         self,
@@ -294,22 +244,3 @@ class DSparkVerifyPlanner:
             f"internal: produced {len(lens)} verify lengths for {num_gen_requests} requests"
         )
         return [int(v) for v in lens]
-
-    def _decide_local(self, *, num_gen_requests: int, rows: Optional[Sequence[int]] = None) -> int:
-        if num_gen_requests <= 0:
-            return self.max_tier
-        if self.cost_table is None or self.cost_table.is_flat:
-            self.stats["fallback_flat_cost"] += 1
-            return self.max_tier
-        selected = self._gather_rows(num_gen_requests=num_gen_requests, rows=rows)
-        if selected is None:
-            return self.max_tier
-        probs = self.apply_calibration(selected)
-        survival = compute_survival(probs).numpy().astype(np.float64)
-        return budget_argmax_over_uniform_lens(
-            survival=survival,
-            num_gen_requests=int(num_gen_requests),
-            cost_table=self.cost_table,
-            allowed_lens=self.tiers,
-            min_verify_len=self.cfg.min_verify_len,
-        )
