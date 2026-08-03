@@ -23,8 +23,7 @@ No fused/CUDA-graph-safe TensorRT-LLM backend exposes a ``score_mod`` hook:
 ``attentionOp.cpp`` disables context FMHA for ``kRELATIVE`` position embedding,
 and the trtllm-gen decode kernel rejects a relative bias. So the production
 attention path for Inkling is a pair of Triton kernels that apply the bias as an
-aux-tensor ``score_mod``, exactly mirroring the SGLang reference
-(``sglang/kernels/ops/attention/{score_mod,extend_attention,decode_attention}.py``).
+aux-tensor ``score_mod``.
 
 The bias is precomputed on the torch side as a contiguous ``rel_logits`` aux
 tensor ``[num_query_tokens, num_heads, rel_extent]`` (``einsum('thd,de->the', r,

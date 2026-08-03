@@ -12,24 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Config classes for the Inkling multimodal checkpoint (text bring-up).
+"""Config classes for the Inkling multimodal checkpoint.
 
-The in-scope checkpoint (``Inkling-NVFP4-full``) publishes ``config.json`` with
-``model_type == "inkling_mm_model"`` and ``architectures ==
-["InklingForConditionalGeneration"]``. The installed transformers pin does not
-ship Inkling, so these classes reconstruct the config from the checkpoint's
-nested dicts without any transformers shim (reference-test policy: no installed
-``transformers`` Inkling remote-code as pass evidence).
+The checkpoint publishes ``config.json`` with ``model_type ==
+"inkling_mm_model"`` and ``architectures ==
+["InklingForConditionalGeneration"]``. Transformers does not ship Inkling, so
+these classes reconstruct the config from the checkpoint's nested dicts without
+any transformers shim.
 
-Only the text tower drives the GSM8K/MMLU accuracy gates, so the audio, vision,
-and MTP sub-configs are kept verbatim (as ``PretrainedConfig`` blobs) but are
-not otherwise interpreted here.
+The audio, vision, and MTP sub-configs are kept verbatim (as
+``PretrainedConfig`` blobs); the vision and audio towers read their geometry
+directly off them (see ``models/modeling_inkling_multimodal.py``).
 
-Field names mirror the checkpoint ``text_config`` and the SGLang / HF reference
-(``codes/sglang/.../models/inkling*`` and
-``codes/transformers/.../models/inkling/``). All numeric defaults are the real
-checkpoint values, but a checkpoint ``config.json`` that spells a field out
-overrides the default via ``from_dict``.
+Field names mirror the checkpoint ``text_config``. All numeric defaults are the
+real checkpoint values, but a ``config.json`` that spells a field out overrides
+the default via ``from_dict``.
 """
 
 from transformers.configuration_utils import PretrainedConfig
@@ -187,10 +184,9 @@ class InklingTextConfig(PretrainedConfig):
 class InklingConfig(PretrainedConfig):
     """Top-level Inkling multimodal config (``inkling_mm_model``).
 
-    Reconstructs ``text_config`` with :class:`InklingTextConfig`; ``audio_config``,
-    ``vision_config`` and ``mtp_config`` are retained as plain
-    ``PretrainedConfig`` blobs so the multimodal checkpoint round-trips, but only
-    the text tower is built for the GSM8K/MMLU bring-up.
+    Reconstructs ``text_config`` with :class:`InklingTextConfig`;
+    ``audio_config``, ``vision_config`` and ``mtp_config`` are retained as plain
+    ``PretrainedConfig`` blobs so the multimodal checkpoint round-trips.
     """
 
     model_type = "inkling_mm_model"
@@ -213,13 +209,8 @@ class InklingConfig(PretrainedConfig):
         # (``<|content_image|><|unused_200054|>...`` and
         # ``<|content_audio_input|><|unused_200053|><|audio_end|>...``).
         # They MUST be in-vocab: TensorRT-LLM's executor validates request token
-        # ids and rejects an out-of-range id, so the SGLang-internal -101/-102
-        # sentinels (parser/inkling_tokenizer.py) raise ``RequestError: Token ID
-        # out of range`` at ``llm.generate``. The sentinel and the in-vocab id
-        # are interchangeable for parity (both are replaced by the same tower
-        # embeddings); the SGLang reference is POSTed with -101/-102, TRT runs
-        # 200054/200053. The in-scope checkpoint's config.json omits these, so the
-        # defaults are authoritative unless a config spells them out.
+        # ids and rejects an out-of-range id. The checkpoint's config.json omits
+        # these, so the defaults apply unless a config spells them out.
         image_token_id: int = 200054,
         audio_token_id: int = 200053,
         tie_word_embeddings: bool = False,

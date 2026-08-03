@@ -20,13 +20,12 @@ Two responsibilities:
    and :func:`inkling_account_checkpoint` derive the exact set of ``model.llm.*``
    checkpoint keys the text loader consumes, and classify every checkpoint key as
    consumed-text / intentionally-deferred (audio, vision, MTP) / unaccounted.
-   This is a direct port of the primary-source-verified Stage-1 spec and is
-   pinned by ``tests/unit/_torch/modeling/test_modeling_inkling.py`` against the
-   real checkpoint index (no GPU). It guarantees no missing q/k-norm, rel-bias,
-   short-conv, route/global-scale or unpadded-logit tensor can hide.
+   Pinned by ``tests/unittest/_torch/modeling/test_modeling_inkling.py`` against
+   the real checkpoint index (no GPU). It guarantees no missing q/k-norm,
+   rel-bias, short-conv, route/global-scale or unpadded-logit tensor can hide.
 
 2. **Name/layout remapping (the load path).** :class:`InklingHfWeightMapper`
-   renames the checkpoint's SGLang-style keys (``wq_du``, ``w13_weight`` …) to
+   renames the checkpoint's keys (``wq_du``, ``w13_weight`` …) to
    the TRT-LLM module tree, fuses q/k/v into the attention ``qkv_proj``, and
    unfuses the NVFP4 routed experts (``w13_weight`` -> per-expert ``w1``/``w3``
    with their block scales) into the layout the fused-MoE loader expects.
@@ -51,7 +50,8 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 _NVFP4_E2M1_MAX = 6.0
 _NVFP4_E4M3_MAX = 448.0
 
-# Prefixes intentionally unused for the text-only GSM8K/MMLU bring-up.
+# Prefixes the text loader does not consume: the vision / audio towers load
+# themselves (see modeling_inkling_multimodal.py) and MTP is not implemented.
 INKLING_DEFERRED_PREFIXES: Tuple[str, ...] = (
     "model.audio.",
     "model.visual.",
@@ -224,17 +224,13 @@ def _split_interleaved_gate_up(t: torch.Tensor,
     """Split an Inkling gate/up-INTERLEAVED fused tensor into ``(gate, up)`` STRIDED
     VIEWS (no copy) along ``dim``: gate = even indices, up = odd indices.
 
-    The Inkling checkpoint (SGLang ``inference_moe_w13_interleaved=True``, the
-    default and the layout this NVFP4 checkpoint ships) stores every fused
-    gate+up weight with the two projections INTERLEAVED along the output
-    (``2*inter``) dim: ``[g0, u0, g1, u1, ...]``. SGLang's default SwiGLU reads it
-    as ``silu(z[..., ::2]) * z[..., 1::2]``. TRT-LLM's fused gate_up / fused-MoE
-    loaders instead want separate gate/up, and the old mapper split the fused
-    tensor with a plain contiguous ``chunk(2)`` (``[first half | second half]``),
-    which pairs the WRONG gate/up channels in every dense-MLP, routed-expert and
-    shared-expert SwiGLU -> incoherent assembled text (invisible to isolated
-    single-layer tests that made the same contiguous mis-read; reference-loop
-    drift). Matches ``sglang .../inkling_common/util.py::deinterleave_gate_up``.
+    The Inkling checkpoint stores every fused gate+up weight with the two
+    projections INTERLEAVED along the output (``2*inter``) dim:
+    ``[g0, u0, g1, u1, ...]``, i.e. the reference SwiGLU reads it as
+    ``silu(z[..., ::2]) * z[..., 1::2]``. TRT-LLM's fused gate_up / fused-MoE
+    loaders instead want separate gate/up; a plain contiguous ``chunk(2)``
+    (``[first half | second half]``) would pair the WRONG gate/up channels in
+    every dense-MLP, routed-expert and shared-expert SwiGLU.
 
     Returns STRIDED VIEWS rather than a contiguous copy on purpose: the fused-MoE
     / gate_up loaders shard each rank's slice then call ``.contiguous()`` on that
@@ -349,14 +345,10 @@ class InklingHfWeightMapper(HfWeightMapper):
             # activation ``input_scale = amax / (E2M1_MAX * E4M3_MAX)``, so the
             # activation global scale ``1 / max_e(input_scale)`` lands the e4m3
             # activation block scales in range. Without this conversion the global
-            # scale is (E2M1_MAX*E4M3_MAX)=2688x too small, the activation fp4 block
-            # scales underflow e4m3, and every routed expert loses ~0.62 rel_rms vs
-            # the bf16 ground truth (7.6x SGLang) -- the baseline GSM8K gap.
-            # Mirrors sglang inkling.py:1222 / inkling_common/dense_mlp.py:497
-            # (``input_scale = input_amax / (6.0 * 448.0)``). Weight/block-scale/
-            # scale2 layout is already correct (positional bisection: 24/24 L3
-            # experts element-wise identical), so ONLY the activation input scale
-            # needs this fix.
+            # scale is (E2M1_MAX*E4M3_MAX)=2688x too small, the activation fp4
+            # block scales underflow e4m3, and every routed expert diverges from
+            # the bf16 ground truth. Weight / block-scale / scale2 layout is
+            # already correct, so ONLY the activation input scale needs this.
             tensor = tensor.to(torch.float32) / (_NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX)
 
         n_experts = int(getattr(self.config.pretrained_config,
