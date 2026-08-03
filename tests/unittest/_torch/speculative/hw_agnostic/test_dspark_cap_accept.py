@@ -256,6 +256,32 @@ def test_the_summary_carries_the_measurement():
     assert summary["accept_loss_per_request"] == pytest.approx(3.0)
 
 
+def test_the_cuda_graph_padding_dummy_carries_a_cap():
+    """The regression that made the whole mode a silent no-op.
+
+    `pad_batch` appends a shared dummy request to reach a captured batch size,
+    and `_attach_accept_caps` drops the batch's caps if ANY request lacks one.
+    The dummy has no cap of its own, so before this it disabled cap-accept --
+    on padded steps only, so the mode measured nothing on some steps and
+    worked on others, with nothing in the output to say which.
+
+    Mirrors the treatment `py_verify_len` already got for the ragged path.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.pyexecutor import cuda_graph_runner
+
+    src = inspect.getsource(cuda_graph_runner.CUDAGraphRunner._get_padded_batch)
+    assert "py_verify_cap" in src, (
+        "the padded-batch builder no longer stamps the dummy with a verify "
+        "cap; cap-accept will silently degrade to static on every padded step")
+    # And it must be cleared, not left stale: the dummy object is cached
+    # across steps and shared between them.
+    assert "if cap_accept else None" in src, (
+        "the dummy's cap is not cleared for non-cap-accept batches, so a "
+        "stale cap would trim a static step")
+
+
 def test_accept_caps_is_not_the_ragged_flag():
     """The distinction the whole fix rests on.
 

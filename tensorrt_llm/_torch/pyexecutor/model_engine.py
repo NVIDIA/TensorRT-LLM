@@ -4048,7 +4048,20 @@ class PyTorchModelEngine(ModelEngine):
         if not caps or any(cap is None for cap in caps):
             # Partial caps are worse than none: the uncapped requests would
             # commit their full block while the rest honoured a window, which
-            # is neither mode and reproducible by neither.
+            # is neither mode and reproducible by neither. So drop them all --
+            # but say so, because the result is a run that looks like a
+            # successful cap-accept and measured nothing. The CUDA-graph
+            # padding dummy used to land here on every padded step (it carries
+            # no cap of its own); it is given one in `pad_batch` now.
+            if caps and any(cap is not None for cap in caps):
+                if not getattr(self, "_warned_partial_accept_caps", False):
+                    self._warned_partial_accept_caps = True
+                    logger.warning(
+                        "DSpark cap-accept: %d of %d generation requests carry "
+                        "no verify cap, so caps were dropped for the whole "
+                        "batch and this step ran as 'static'. The mode is "
+                        "measuring nothing on steps like this one.",
+                        sum(1 for cap in caps if cap is None), len(caps))
             spec_metadata.accept_caps = None
             spec_metadata.accept_cap_trim = None
             return

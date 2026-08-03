@@ -767,6 +767,19 @@ class CUDAGraphRunner:
                 for request in batch.generation_requests)
             padding_dummy_request.py_verify_len = (self.ragged_pad_verify_len
                                                    if ragged else None)
+            # cap-accept needs the same treatment for the same reason, and
+            # fails differently without it: `_attach_accept_caps` drops the
+            # whole batch's caps if any request lacks one, so a single
+            # capless dummy would degrade the mode to `static` -- silently,
+            # and only on the steps that happen to need padding. The dummy's
+            # own acceptance is discarded, so give it the full block, i.e. no
+            # cap at all. Cleared otherwise: the object is cached across steps
+            # and would carry a stale cap into a static batch.
+            cap_accept = any(
+                getattr(request, "py_verify_cap", None) is not None
+                for request in batch.generation_requests)
+            padding_dummy_request.py_verify_cap = (
+                self.spec_config.max_draft_len if cap_accept else None)
         batch.generation_requests.extend([padding_dummy_request] * padding_size)
         return padding_size
 
