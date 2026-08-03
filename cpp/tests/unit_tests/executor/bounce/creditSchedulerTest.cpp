@@ -20,8 +20,10 @@
 #include <gtest/gtest.h>
 
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -54,6 +56,111 @@ std::vector<std::uint32_t> want(std::uint32_t n)
 std::size_t freeRegions(b::CreditScheduler& s)
 {
     return s.freeBytes() / kRegion;
+}
+
+// Model the Python transceiver's bounded worker queues: each sender has at most `threadsPerSender`
+// synchronous submit+wait requests active, and a worker submits its next one-chunk request as soon as
+// the previous request completes. The resulting small-request load is sustained without ever
+// exceeding TRTLLM_KV_TRANSFER_NUM_THREADS active requests per sender.
+void expectLargeChunkProgressWithBoundedSenderConcurrency(std::uint32_t numSenders, std::uint32_t threadsPerSender)
+{
+    struct WorkerSlot
+    {
+        std::uint32_t sender{};
+        std::uint64_t nextRid{};
+        std::string flow;
+        std::optional<std::uint64_t> heldOffset;
+    };
+
+    std::uint32_t const numSmallFlows = numSenders * threadsPerSender;
+    ASSERT_GT(numSmallFlows, 1U);
+    // Both test instantiations use a power-of-two flow count, matching the buddy arena's full usable
+    // capacity. One one-region request per worker slot fills it exactly.
+    b::CreditScheduler s(kBase, static_cast<std::size_t>(numSmallFlows) * kRegion, kRegion,
+        /*maxInflightChunksPerRequest=*/1);
+
+    auto makeFlow = [](std::uint32_t sender, std::uint64_t rid)
+    { return std::string("smallPeer") + std::to_string(sender) + '\x1f' + std::to_string(rid); };
+
+    std::vector<WorkerSlot> slots;
+    slots.reserve(numSmallFlows);
+    std::unordered_map<std::string, std::size_t> flowToSlot;
+    for (std::uint32_t sender = 0; sender < numSenders; ++sender)
+    {
+        for (std::uint32_t thread = 0; thread < threadsPerSender; ++thread)
+        {
+            WorkerSlot slot;
+            slot.sender = sender;
+            slot.nextRid = thread;
+            slot.flow = makeFlow(sender, slot.nextRid);
+            slot.nextRid += threadsPerSender;
+            auto grants = s.onWant(slot.flow, want(1));
+            ASSERT_EQ(grants.size(), 1U);
+            slot.heldOffset = grants.front().offset;
+            flowToSlot.emplace(slot.flow, slots.size());
+            slots.push_back(std::move(slot));
+        }
+    }
+    EXPECT_EQ(s.freeBytes(), 0U);
+
+    std::string const largeFlow = std::string("largePeer\x1f") + "0";
+    std::uint32_t const largeBytes = (numSmallFlows / 2) * kRegion;
+    EXPECT_TRUE(s.onWant(largeFlow, {largeBytes}).empty());
+
+    bool largeGranted = false;
+    std::size_t nextSlot = 0;
+    std::size_t smallCompletions = 0;
+    std::size_t const kMaxCompletions = static_cast<std::size_t>(numSmallFlows) * 32;
+    auto recordGrants = [&](std::vector<b::Grant> const& grants)
+    {
+        for (auto const& grant : grants)
+        {
+            if (grant.flow == largeFlow)
+            {
+                EXPECT_EQ(grant.len, largeBytes);
+                largeGranted = true;
+                continue;
+            }
+            auto const it = flowToSlot.find(grant.flow);
+            ASSERT_NE(it, flowToSlot.end());
+            slots[it->second].heldOffset = grant.offset;
+        }
+    };
+
+    while (!largeGranted && smallCompletions < kMaxCompletions)
+    {
+        std::size_t checked = 0;
+        while (checked < slots.size() && !slots[nextSlot].heldOffset)
+        {
+            nextSlot = (nextSlot + 1) % slots.size();
+            ++checked;
+        }
+        ASSERT_LT(checked, slots.size()) << "drain stopped every in-flight small request before the large grant";
+
+        auto& slot = slots[nextSlot];
+        std::string const completedFlow = slot.flow;
+        std::uint64_t const completedOffset = *slot.heldOffset;
+        slot.heldOffset.reset();
+        flowToSlot.erase(completedFlow);
+        recordGrants(s.onScatterDone(completedFlow, completedOffset));
+        ++smallCompletions;
+        if (largeGranted)
+        {
+            break;
+        }
+
+        // The synchronous Python worker can submit exactly one replacement after its old request
+        // completes. If receiver drain is active this new flow remains pending instead of refilling
+        // the just-freed region, allowing a large buddy block to coalesce.
+        slot.flow = makeFlow(slot.sender, slot.nextRid);
+        slot.nextRid += threadsPerSender;
+        flowToSlot.emplace(slot.flow, nextSlot);
+        recordGrants(s.onWant(slot.flow, want(1)));
+        nextSlot = (nextSlot + 1) % slots.size();
+    }
+
+    EXPECT_TRUE(largeGranted) << "sustained bounded-concurrency small requests starved the large chunk after "
+                              << smallCompletions << " completions";
 }
 
 // Conservation: every region is either free, held by some flow, or locally held. With N equal
@@ -558,4 +665,14 @@ TEST(CreditScheduler, VariableSizeRegionsPackAndBackpressure)
     auto g2 = s.onWant("B", std::vector<std::uint32_t>{4 * kRegion});
     ASSERT_EQ(g2.size(), 1u);
     EXPECT_EQ(g2[0].len, 4 * kRegion);
+}
+
+TEST(CreditScheduler, ManySingleThreadSendersCannotStarveLargeChunk)
+{
+    expectLargeChunkProgressWithBoundedSenderConcurrency(/*numSenders=*/8, /*threadsPerSender=*/1);
+}
+
+TEST(CreditScheduler, FourThreadsPerSenderCannotStarveLargeChunk)
+{
+    expectLargeChunkProgressWithBoundedSenderConcurrency(/*numSenders=*/4, /*threadsPerSender=*/4);
 }
