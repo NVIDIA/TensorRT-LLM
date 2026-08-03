@@ -97,9 +97,9 @@ When adding an ABI ID:
 
 ## Installation
 
-The official TensorRT LLM release container includes the MX Python client. No
-additional Python package installation is required in that container. MX
-remains opt-in at runtime: TensorRT LLM uses the client only when the MX
+TensorRT LLM release containers include an MX Python client. P2P transfer
+requires a client build containing the TensorRT LLM adapter described below.
+MX remains opt-in at runtime: TensorRT LLM uses the client only when the MX
 checkpoint-loading path and a server URL are configured. Installing the client
 does not expand the model support scope described above.
 
@@ -110,13 +110,13 @@ Python client through the optional `mx` extra:
 pip install "tensorrt-llm[mx]"
 ```
 
-The extra pins the ModelExpress client to version `0.4.1`, matching the client
-API qualified by this integration. Deploy a compatible MX server version.
-The extra can be added to an existing TensorRT LLM installation. If the MX
-loading path is configured but the client cannot be imported, TensorRT LLM
-fails with an actionable installation message instead of silently loading from
-the Hugging Face checkpoint. Source discovery and transfer failures continue to
-use the Hugging Face fallback described above.
+The extra currently pins the ModelExpress client to version `0.4.1`. That
+release does not contain the TensorRT LLM adapter, so P2P transfer additionally
+requires a newer ModelExpress build that provides
+`modelexpress.engines.trtllm`. Until a compatible client release is published,
+validation images must install ModelExpress from its source repository without
+replacing TensorRT LLM's dependency stack. If the adapter is unavailable,
+TensorRT LLM logs a warning and uses the Hugging Face fallback described above.
 
 ## Deploy the MX Service
 
@@ -177,12 +177,12 @@ path.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `mx_config.server_url` | `null` | URL of the separately managed MX server. |
-| `mx_config.server_query_timeout_s` | `null` | Timeout for MX source discovery. When unset, TensorRT LLM uses a short fallback cap when no source exists and otherwise lets MX wait for long donor loads. |
+| `mx_config.server_query_timeout_s` | `null` | Deprecated and ignored. MX checks once for a compatible source, then falls back to native checkpoint loading. |
 
 ## Notes and Limitations
 
-- Post-transform MX reception is currently limited to the Llama model family.
-  Other model families safely fall back to Hugging Face loading until they are
+- Post-transform MX reception is attempted only for qualified Llama profiles.
+  Other models safely fall back to Hugging Face loading until they are
   explicitly qualified and added as exact capability profiles.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.

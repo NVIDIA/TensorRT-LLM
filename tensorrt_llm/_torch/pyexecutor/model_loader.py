@@ -292,7 +292,6 @@ def _construct_checkpoint_loader(
     checkpoint_format: Optional[str],
     *,
     mx_config: Optional[ModelExpressConfig] = None,
-    mx_model_name: Optional[str] = None,
 ) -> Optional[BaseCheckpointLoader]:
     if backend == "_autodeploy":
         return None
@@ -312,8 +311,6 @@ def _construct_checkpoint_loader(
         if checkpoint_format == "MX":
             if mx_config is not None:
                 extra_kwargs["mx_server_url"] = mx_config.server_url
-            if mx_model_name is not None:
-                extra_kwargs["model_name"] = mx_model_name
 
         checkpoint_loader = BaseCheckpointLoader.get(
             checkpoint_format=checkpoint_format,
@@ -526,9 +523,9 @@ class ModelLoader:
         Returns:
             The loaded and initialized PyTorch model.
         """
+        self._checkpoint_loader = checkpoint_loader
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
-        self._checkpoint_loader = checkpoint_loader
         # Some model constructors normalize or rewrite config fields. Capture
         # the registry identity from the resolved input before construction so
         # publication and reception qualify the architecture the user asked
@@ -1354,12 +1351,20 @@ class ModelLoader:
         failures.
         """
         if self._gms_backend is not None:
-            self._gms_backend.cleanup()
+            gms_backend = self._gms_backend
             self._gms_backend = None
+            try:
+                gms_backend.cleanup()
+            except Exception:  # noqa: BLE001 - shutdown must remain best effort
+                logger.warning(
+                    "Failed to clean up GMS backend %r",
+                    gms_backend,
+                    exc_info=True,
+                )
         if self._checkpoint_loader is not None:
             try:
                 self._checkpoint_loader.cleanup()
-            except Exception:
+            except Exception:  # noqa: BLE001 - shutdown must remain best effort
                 logger.warning(
                     "Failed to clean up checkpoint loader %r",
                     self._checkpoint_loader,
