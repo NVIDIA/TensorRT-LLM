@@ -320,8 +320,8 @@ def _lookup_model_cls(model_dir):
 def resolve_model_prefs(model_dir, side, cache_cfg):
     """Mirror serving's model-preference resolution (PR #15823 semantics).
 
-    - use_kv_cache_manager_v2 == "auto" (yaml absent): adopt the model
-      class's get_preferred_kv_cache_manager_version() value, falling back to V1
+    - use_kv_cache_manager_v2 == "auto" (yaml absent): require the model
+      class and adopt its get_preferred_kv_cache_manager_version() value
       (llm_utils._resolve_kv_cache_manager_v2_auto).
     - cache_cfg.transceiver_runtime == "auto": adopt
       model_cls.get_preferred_transceiver_runtime(), NIXL-gated, via the
@@ -333,6 +333,12 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
 
     api = load_internal_apis()
     model_cls, hf_view = _lookup_model_cls(model_dir)
+    setting = side["use_kv_cache_manager_v2"]
+    if setting == "auto" and model_cls is None:
+        raise RuntimeError(
+            "use_kv_cache_manager_v2 is 'auto', but the precheck could not resolve "
+            f"a registered model class from model_dir={model_dir!r}; refusing to assume V1"
+        )
 
     # Runtime BEFORE V2, like serving: the V2 resolver's disagg gating reads
     # cache_cfg.transceiver_runtime and treats an unresolved "auto" as non-PYTHON.
@@ -347,7 +353,6 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
                 flush=True,
             )
 
-    setting = side["use_kv_cache_manager_v2"]
     if setting == "auto":
         try:
             # The REAL serving resolver, via the same shim pattern as the
@@ -360,11 +365,8 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
                 speculative_config=None,
             )
             use_v2 = bool(api.resolve_kv_cache_manager_v2_auto(shim, model_cls, hf_view))
-        except Exception as e:  # noqa: BLE001 - fall back like a missing model
-            print(
-                f"[precheck] WARNING: V2 'auto' resolution failed ({e!r}); assuming V1", flush=True
-            )
-            use_v2 = False
+        except Exception as e:  # noqa: BLE001 - resolver spans model extension hooks
+            raise RuntimeError("V2 'auto' resolution failed; refusing to assume V1") from e
     else:
         use_v2 = bool(setting)
     return use_v2
@@ -500,7 +502,8 @@ def free_sequence(kvm, req, use_v2):
 def _wait_gen_complete(xcvr, req, runtime, llm_request_state):
     """Block until this gen request's receive finishes (or errors).
 
-    PYTHON transceiver: check_gen_transfer_status(None) blocks for all. C++:
+    The Python transceiver is handled once per wave in gen_run_wave(), where
+    its returned request IDs can be checked before releasing KV pages. For C++,
     the int API can return before THIS request completes on a cold link, so
     poll for a terminal state (bounded by signal.alarm + hang detector).
     Logs periodic progress so a stalled transfer shows WHICH request is stuck
@@ -508,8 +511,7 @@ def _wait_gen_complete(xcvr, req, runtime, llm_request_state):
     "RDMA write never completed").
     """
     if runtime == "PYTHON":
-        xcvr.check_gen_transfer_status(None)
-        return
+        raise ValueError("Python generation waves must be checked as a batch")
     terminal = (
         llm_request_state.DISAGG_GENERATION_TRANS_COMPLETE,
         llm_request_state.DISAGG_TRANS_ERROR,
@@ -916,12 +918,15 @@ class PrecheckRunner:
                 rid = self._pair_rid(peer_idx, li, rep, pair)
                 req = make_request(True, rid, req_len, self.runtime)
                 add_sequence(self.kvm, req, req_len, self.use_v2)
+                # Track ownership as soon as allocation succeeds. A later
+                # setup failure must retain the pages rather than free storage
+                # that an asynchronously dispatched sender may still read.
+                reqs[pair] = req
                 fill_request(self.kvm, rid)
                 tensorrt_llm.logger.info(
                     f"[ctx{self.server_idx} r{self.rank}] rid={rid} len={req_len}: send START"
                 )
                 self.xcvr.respond_and_send_async(req)
-                reqs[pair] = req
         except Exception as e:  # noqa: BLE001 - relayed to gen, then raised
             local_err = e
         reason = self._consensus_error(local_err)
@@ -955,7 +960,9 @@ class PrecheckRunner:
         reason = self.comm.bcast(reason, root=0)
 
         if reason is not None:
-            self._free_all(reqs)
+            # Send setup can fail asymmetrically after another rank dispatched
+            # work. A block-all collective is not safe from that state, and
+            # reusing the pages is worse than retaining them until teardown.
             raise _TransferError(f"ctx send setup failed: {reason}")
         return params_by_pair, reqs
 
@@ -966,16 +973,33 @@ class PrecheckRunner:
         t0 = time.monotonic()
         local_err = None
         try:
-            self.xcvr.check_context_transfer_status(None)  # block-all
+            completed, failed = self.xcvr.check_context_transfer_status(None)  # block-all
+            completed_rids = set(completed)
+            failed_rids = set(failed)
+            missing = [
+                p
+                for p, req in reqs.items()
+                if req.py_request_id not in completed_rids | failed_rids
+            ]
+            if missing:
+                raise _TransferError(
+                    f"block-all returned before terminal status for pairs {missing}"
+                )
+            failed_pairs = [p for p, req in reqs.items() if req.py_request_id in failed_rids]
+            if failed_pairs:
+                raise _TransferError(f"ctx transfer failed for pairs {failed_pairs}")
             bad = [
                 p for p, r in reqs.items() if r.state == self.llm_request_state.DISAGG_TRANS_ERROR
             ]
             if bad:
-                local_err = _TransferError(f"ctx DISAGG_TRANS_ERROR on pairs {bad}")
+                raise _TransferError(f"ctx DISAGG_TRANS_ERROR on pairs {bad}")
+            # Only successful IDs prove that every sender finished reading its
+            # source pages. Failed/cancelled/missing waves retain ownership
+            # until process teardown because their task events need not prove
+            # physical NIXL quiescence.
+            self._free_all(reqs)
         except Exception as e:  # noqa: BLE001
             local_err = e
-        finally:
-            self._free_all(reqs)
         states = {p: str(r.state) for p, r in reqs.items()}
         tensorrt_llm.logger.info(
             f"[ctx{self.server_idx} r{self.rank}] wave sends finished in "
@@ -1004,23 +1028,40 @@ class PrecheckRunner:
                     False, rid, req_len, self.runtime, ctx_params=params_by_pair[pair]
                 )
                 add_sequence(self.kvm, req, req_len, self.use_v2)
+                # Track every allocated sequence before receive dispatch. On
+                # setup failure, retain all pages until process teardown.
+                reqs[pair] = req
                 tensorrt_llm.logger.info(
                     f"[gen{self.server_idx} r{self.rank}] rid={rid} len={req_len}: recv START"
                 )
                 self.xcvr.request_and_receive_async(req)
-                reqs[pair] = req
         except Exception as e:  # noqa: BLE001
             local_err = e
         reason = self._consensus_error(local_err)
         if reason is not None:
-            self._free_all(reqs)
             raise _TransferError(f"gen receive setup failed: {reason}")
 
         mismatch = ""
         t0 = time.monotonic()
+        safe_to_free = False
         try:
-            for pair, req in reqs.items():
-                _wait_gen_complete(self.xcvr, req, self.runtime, self.llm_request_state)
+            if self.runtime == "PYTHON":
+                completed, failed, cancelled = self.xcvr.check_gen_transfer_status(None)
+                completed_rids = set(completed)
+                failed_rids = set(failed)
+                cancelled_rids = {req.py_request_id for req in cancelled}
+                expected_rids = {req.py_request_id for req in reqs.values()}
+                missing_rids = expected_rids - completed_rids - failed_rids - cancelled_rids
+                if failed_rids or cancelled_rids or missing_rids:
+                    raise _TransferError(
+                        "Python gen block-all did not complete every request: "
+                        f"failed={sorted(failed_rids)} "
+                        f"cancelled={sorted(cancelled_rids)} "
+                        f"missing={sorted(missing_rids)}"
+                    )
+            else:
+                for req in reqs.values():
+                    _wait_gen_complete(self.xcvr, req, self.runtime, self.llm_request_state)
             if reqs:
                 tensorrt_llm.logger.info(
                     f"[gen{self.server_idx} r{self.rank}] wave recvs finished in "
@@ -1031,8 +1072,18 @@ class PrecheckRunner:
                 p for p, r in reqs.items() if r.state == self.llm_request_state.DISAGG_TRANS_ERROR
             ]
             if bad:
-                local_err = _TransferError(f"gen DISAGG_TRANS_ERROR on pairs {bad}")
-            elif self.plan["verify_data"] and rep >= self.plan["warmup_requests"]:
+                raise _TransferError(f"gen DISAGG_TRANS_ERROR on pairs {bad}")
+            incomplete = [
+                p
+                for p, r in reqs.items()
+                if r.state != self.llm_request_state.DISAGG_GENERATION_TRANS_COMPLETE
+            ]
+            if incomplete:
+                raise _TransferError(f"gen requests not complete for pairs {incomplete}")
+            # Remote writes and local CUDA work are now complete. Later byte
+            # verification failures do not invalidate the ownership proof.
+            safe_to_free = True
+            if self.plan["verify_data"] and rep >= self.plan["warmup_requests"]:
                 for pair, req in reqs.items():
                     ok, detail = verify_request(self.kvm, req.py_request_id)
                     if not ok:
@@ -1040,7 +1091,7 @@ class PrecheckRunner:
                         break
         except Exception as e:  # noqa: BLE001
             local_err = e
-        finally:
+        if safe_to_free:
             self._free_all(reqs)
         reason = self._consensus_error(local_err)
         if reason is not None:

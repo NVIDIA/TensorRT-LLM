@@ -967,6 +967,7 @@ def main():
                     hardware_config.get("gpus_per_ctx_server", 0) or 0,
                     hardware_config.get("gpus_per_gen_server", 0) or 0,
                 ),
+                llm_models_root=args.llm_models_root,
             )
         )
 
@@ -974,6 +975,7 @@ def main():
         srun_args_lines.extend(
             [
                 "--container-env=DISAGG_SERVING_TYPE",
+                "--container-env=LLM_MODELS_ROOT",
                 "--container-env=pytestCommand",
             ]
         )
