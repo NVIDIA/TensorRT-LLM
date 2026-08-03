@@ -107,7 +107,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         HV: cutlass.Constexpr[int],
         K: cutlass.Constexpr[int],
         V: cutlass.Constexpr[int],
-        N: cutlass.Constexpr[int],
+        N: cutlass.Int32,
         NUM_SPEC: cutlass.Constexpr[int],
         TILE_V: cutlass.Constexpr[int],
         KERNEL_WIDTH: cutlass.Constexpr[int],
@@ -291,11 +291,6 @@ def _require_stride_layout(
         raise ValueError("Expected num_accepted_tokens length to match N.")
 
 
-def _layout_key(tensor: torch.Tensor):
-    return (tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()),
-            _fits_32bit_stride(tensor))
-
-
 def _fits_32bit_stride(tensor: torch.Tensor) -> bool:
     int32_max = 2**31 - 1
     max_offset = int(tensor.storage_offset())
@@ -322,7 +317,18 @@ def _dlpack_arg(tensor: torch.Tensor):
     for dim, stride in enumerate(tensor.stride()):
         if stride == 1:
             return _from_dlpack_arg(tensor).mark_layout_dynamic(dim)
-    return _from_dlpack_arg(tensor)
+    return _from_dlpack_arg(tensor).mark_layout_dynamic()
+
+
+def _layout_key(tensor: torch.Tensor, dynamic_layout: bool = False):
+    arg = _dlpack_arg(tensor) if dynamic_layout else _from_dlpack_arg(tensor)
+    shape_mask = arg.dynamic_shapes_mask
+    stride_mask = arg.dynamic_strides_mask
+    shape = tuple(None if dynamic else size
+                  for size, dynamic in zip(tensor.shape, shape_mask))
+    stride = tuple(None if dynamic else value
+                   for value, dynamic in zip(tensor.stride(), stride_mask))
+    return (tensor.dtype, shape, stride, _fits_32bit_stride(tensor))
 
 
 # (device_index, enabled) -> persistent int32 [1] control tensor. Keys are
@@ -370,9 +376,9 @@ def _is_benchmark_static_shape(N: int, H: int, HV: int, K: int, V: int,
             and N in (32, 128) and H in (2, 12, 32))
 
 
-# Layout-and-constexpr-keyed compile cache. Compilation is per (N, T_total,
-# pool size, layouts, flags) — a new generation batch size triggers a
-# multi-second cute.compile, after which the artifact is reused.
+# Layout-and-constexpr-keyed compile cache. Request count and packed-token
+# length are dynamic; batches sharing the same kernel variant reuse one
+# artifact even when their launch grid and token-buffer extents differ.
 _compiled_cache = {}
 
 
@@ -521,15 +527,13 @@ def kda_mtp_decode_impl(
         V_dim,
         num_spec,
         W,
-        N,
-        T_total,
         pool_size,
         lower_bound,
         use_flat_layout,
         _layout_key(h0_arg),
-        _layout_key(x_q_arg),
-        _layout_key(x_k_arg),
-        _layout_key(x_v_arg),
+        _layout_key(x_q_arg, dynamic_layout=True),
+        _layout_key(x_k_arg, dynamic_layout=True),
+        _layout_key(x_v_arg, dynamic_layout=True),
         _layout_key(w_q),
         _layout_key(w_k),
         _layout_key(w_v),
@@ -537,16 +541,16 @@ def kda_mtp_decode_impl(
         _layout_key(cs_k),
         _layout_key(cs_v),
         _layout_key(A_log),
-        _layout_key(g),
+        _layout_key(g, dynamic_layout=True),
         _layout_key(dt_bias),
-        _layout_key(beta),
-        _layout_key(out),
+        _layout_key(beta, dynamic_layout=True),
+        _layout_key(out, dynamic_layout=True),
         _layout_key(qkg_cache),
         _layout_key(v_cache),
         _layout_key(beta_cache),
-        _layout_key(ssm_state_indices),
-        _layout_key(cu_seqlens),
-        _layout_key(num_accepted_tokens),
+        _layout_key(ssm_state_indices, dynamic_layout=True),
+        _layout_key(cu_seqlens, dynamic_layout=True),
+        _layout_key(num_accepted_tokens, dynamic_layout=True),
         use_setmaxreg,
         use_regular_metadata,
         use_reg_q_weights,
@@ -562,9 +566,9 @@ def kda_mtp_decode_impl(
         _compiled_cache[key] = cute.compile(
             _run_kda_decode_mtp,
             _from_dlpack_arg(h0_arg),
-            _from_dlpack_arg(x_q_arg),
-            _from_dlpack_arg(x_k_arg),
-            _from_dlpack_arg(x_v_arg),
+            _dlpack_arg(x_q_arg),
+            _dlpack_arg(x_k_arg),
+            _dlpack_arg(x_v_arg),
             _from_dlpack_arg(w_q),
             _from_dlpack_arg(w_k),
             _from_dlpack_arg(w_v),
@@ -572,18 +576,18 @@ def kda_mtp_decode_impl(
             _from_dlpack_arg(cs_k),
             _from_dlpack_arg(cs_v),
             _from_dlpack_arg(A_log),
-            _from_dlpack_arg(g),
+            _dlpack_arg(g),
             _from_dlpack_arg(dt_bias),
-            _from_dlpack_arg(beta),
-            _from_dlpack_arg(out),
+            _dlpack_arg(beta),
+            _dlpack_arg(out),
             _from_dlpack_arg(h0_arg),
             _from_dlpack_arg(qkg_cache),
             _from_dlpack_arg(v_cache),
             _from_dlpack_arg(beta_cache),
-            _from_dlpack_arg(stage_timing_arg),
-            _from_dlpack_arg(ssm_state_indices),
-            _from_dlpack_arg(cu_seqlens),
-            _from_dlpack_arg(num_accepted_tokens),
+            _dlpack_arg(stage_timing_arg),
+            _dlpack_arg(ssm_state_indices),
+            _dlpack_arg(cu_seqlens),
+            _dlpack_arg(num_accepted_tokens),
             _from_dlpack_arg(precompute_control),
             scale=scale,
             HV=HV,
@@ -630,6 +634,7 @@ def kda_mtp_decode_impl(
         _dlpack_arg(cu_seqlens),
         _dlpack_arg(num_accepted_tokens),
         _dlpack_arg(precompute_control),
+        N,
         stream,
     )
 
