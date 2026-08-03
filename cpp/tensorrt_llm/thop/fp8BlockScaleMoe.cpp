@@ -242,7 +242,10 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         {args.num_tokens, total_experts_per_token}, expert_weights_scalar_type, routing_device, std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, total_experts_per_token}, at::ScalarType::Int, routing_device, std::nullopt);
-    int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+    // Size for both histogram halves [counts | offsets] over the fused expert set
+    // (num_experts + num_fused_shared_experts); the large-#tokens offsets kernel indexes
+    // up to 2 * num_total_experts. num_tokens_per_expert stays at num_experts (unused by routing).
+    int64_t const size_of_expert_count_histogram = std::max(num_total_experts * 2, int64_t(256 * 2));
     at::Tensor expert_count_histogram
         = at::detail::empty_cuda({size_of_expert_count_histogram}, at::ScalarType::Int, routing_device, std::nullopt);
 

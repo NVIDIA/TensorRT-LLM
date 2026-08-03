@@ -195,7 +195,9 @@ __global__ void routingMainKernel(KernelParams params)
     {
         int32_t globalThreadIdx = blockIdx.x * blockDim.x + threadIdx.x;
         int32_t globalThreadStride = gridDim.x * blockDim.x;
-        int32_t expertCountsNum = 2 * params.mNumExperts;
+        // This kernel runs before run() inflates mNumExperts by mNumFusedSharedExperts, so zero the
+        // full [counts | offsets] range the post-inflation histogram/offsets path consumes (2*(E+n)).
+        int32_t expertCountsNum = 2 * (params.mNumExperts + params.mNumFusedSharedExperts);
         initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
     }
 
