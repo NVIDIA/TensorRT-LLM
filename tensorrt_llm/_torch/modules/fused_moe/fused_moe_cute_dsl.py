@@ -434,7 +434,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
@@ -451,7 +450,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
-            without_comm=without_comm,
             activation_type=activation_type,
         )
         self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
