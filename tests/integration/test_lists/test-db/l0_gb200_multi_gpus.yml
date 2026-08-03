@@ -59,6 +59,7 @@ l0_gb200_multi_gpus:
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
   - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
+  - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_nccl_ep_cuda_graph_replay_uses_updated_routing
   - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_fabric_memory[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_bounce[TinyLlama-1.1B-Chat-v1.0]

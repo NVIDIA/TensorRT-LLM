@@ -72,24 +72,6 @@ def require_msa_module():
     return fmha_sm100
 
 
-def cache_view_to_msa_paged(cache_view: torch.Tensor) -> torch.Tensor:
-    """Convert a KV cache view to the fmha_sm100 HND paged layout.
-
-    A 4-D paged view [num_pages, page_size, num_heads, head_dim] permutes to
-    [num_pages, num_heads, page_size, head_dim]. A 3-D flat-slot cache
-    [num_slots, num_heads, head_dim] is treated as one virtual page, giving
-    [1, num_heads, num_slots, head_dim].
-    """
-    if cache_view.dim() == 4:
-        return cache_view.permute(0, 2, 1, 3).contiguous()
-    if cache_view.dim() == 3:
-        return cache_view.permute(1, 0, 2).unsqueeze(0).contiguous()
-    raise ValueError(
-        f"Unsupported cache view rank {cache_view.dim()} for MSA paged conversion; "
-        "expected 3 (flat-slot) or 4 (paged)."
-    )
-
-
 def msa_paged_kv(kv_cache_manager, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return per-layer paged K and V in fmha_sm100 HND layout, zero-copy.
 
@@ -247,7 +229,6 @@ __all__ = [
     "MSA_REQUIRED_HEAD_DIM",
     "MSA_REQUIRED_TOPK",
     "build_kv_page_indices",
-    "cache_view_to_msa_paged",
     "msa_package_available",
     "msa_paged_kv",
     "per_token_valid_blocks",

@@ -412,6 +412,9 @@ class _KVCache:
         self.manager.commit_stats(
             self._pending_stats.global_stats, self._pending_stats.iteration_stats_by_life_cycle
         )
+        self.manager._commit_ssm_snapshot_iteration_stats(
+            self._pending_stats.ssm_snapshot_iteration_stats_by_life_cycle
+        )
         request_stats = self._pending_stats.request_stats.copy()
         self._pending_stats.clear()
         self.manager.clear_stats_dirty(self.id)
@@ -1017,7 +1020,12 @@ class _KVCache:
                         ),
                         move_ssm=is_end,
                     )
-                if has_partial_snapshot:
+                    # _commit_block transitions out of ALLOWED (to USER_STOP) when a
+                    # block cannot be committed (VIRTUAL_STOP). Stop here so we don't
+                    # re-enter _commit_block on an already-stopped cache.
+                    if self._commit_state != self.CommitState.ALLOWED:
+                        break
+                if has_partial_snapshot and self._commit_state == self.CommitState.ALLOWED:
                     partial_ordinal = BlockOrdinal(new_num_full_blocks)
                     if is_end:
                         self._commit_block(
@@ -1047,37 +1055,44 @@ class _KVCache:
         return self._reuse_scope
 
     def plan_committed_block_drop(self) -> PlannedDropHandle | None:
-        """Plan dropping SWA blocks needed only by the next conversation turn.
+        """Plan dropping pages needed only by the next conversation turn.
 
         The plan covers committed pages in each SWA life cycle's current
-        attention window. Full-attention and attention-sink blocks are excluded
-        because later turns may still need them. SSM state is not yet supported.
-        This must be called after stop_committing(). Returns None without
-        creating a plan if any required SWA page is unavailable.
+        attention window and the exact SSM snapshot for the committed prefix.
+        Full-attention and attention-sink blocks are excluded because later
+        turns may still need them. This must be called after stop_committing().
+        Returns None without creating a plan if any required page is unavailable.
         """
         if self._commit_state != self.CommitState.USER_STOP:
             raise LogicError("plan_committed_block_drop() requires stop_committing()")
 
-        end = self._num_committed_blocks
+        if self.num_committed_tokens == 0:
+            return None
+
+        # Locate pages through the radix tree rather than
+        # SeqBlock.tree_block: the latter is not guaranteed to identify a
+        # partial snapshot after reuse. Requiring an exact match keeps the
+        # preceding conversation plan intact if this turn no longer has a
+        # complete reusable endpoint. All PP ranks use the same lookup so
+        # attention-only ranks include the final partial SWA block too.
+        match = self.manager._match_reuse(self.reuse_scope, self._committed_tokens)
+        if match.num_tokens != self.num_committed_tokens or not match.blocks:
+            return None
+
+        end = BlockOrdinal(len(match.blocks))
         pages_to_drop: list[CommittedPage] = []
         for lc_idx, lc in self.manager._life_cycles.items():
-            if isinstance(lc, SsmLifeCycle):
-                # TODO: Support recording reusable SSM state pages.
-                continue
-            if lc.window_size is None:
-                continue
-            stale_range = _KVCache._get_stale_range(
-                self.tokens_per_block, self.num_committed_tokens, lc
-            )
-            window_start = min(stale_range.end, end)
+            if isinstance(lc, AttnLifeCycle):
+                if lc.window_size is None:
+                    continue
+                stale_range = _KVCache._get_stale_range(
+                    self.tokens_per_block, self.num_committed_tokens, lc
+                )
+                window_start = min(stale_range.end, end)
+            else:
+                window_start = BlockOrdinal(end - 1)
             for ordinal in typed_range(window_start, end):
-                tree_block = self._blocks[ordinal].tree_block
-                if tree_block is None:
-                    return None
-                page_ref = tree_block.storage[lc_idx]
-                if page_ref is None:
-                    return None
-                page = page_ref()
+                page = match.blocks[ordinal].get_page(lc_idx)
                 if page is None:
                     return None
                 pages_to_drop.append(page)
@@ -2059,6 +2074,15 @@ class _KVCache:
             )
             snapshot_holder = unwrap_rawref(snapshot_ref).hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
+        if should_record_stats and ssm_lc_id is not None:
+            changed = self._pending_stats.record_ssm_snapshot_lookup(
+                ssm_lc_id,
+                lookup_tokens=match.num_lookup_tokens,
+                reused_tokens=num_tokens,
+                tokens_per_block=tokens_per_block,
+            )
+            if changed:
+                self.manager.mark_stats_dirty(self.id)
         self._num_committed_blocks = BlockOrdinal(len(self._committed_tokens) // tokens_per_block)
         for beam_indices in self._base_page_indices:
             for indices in beam_indices:

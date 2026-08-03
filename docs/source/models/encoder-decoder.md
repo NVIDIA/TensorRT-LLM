@@ -11,17 +11,15 @@ TensorRT engine. The LLM API treats the supplied prompt as the encoder input and
 automatically starts the decoder with the checkpoint's
 `decoder_start_token_id` or `bos_token_id`.
 
-This guide covers text-to-text generation with the following Hugging Face
-architectures:
+This guide covers text-to-text generation and speech-to-text transcription with
+the following Hugging Face architectures:
 
 | Hugging Face architecture | Model families and examples |
 | --- | --- |
 | `T5ForConditionalGeneration` | T5, Flan-T5, and ByT5, for example `google/flan-t5-small` |
 | `BartForConditionalGeneration` | BART checkpoints |
 | `MBartForConditionalGeneration` | mBART checkpoints |
-
-Whisper is not currently supported by the PyTorch encoder-decoder path. Support
-is in progress.
+| `WhisperForConditionalGeneration` | Whisper automatic speech recognition (ASR), for example `openai/whisper-large-v3` |
 
 mBART architecture loading is available. When a BART or mBART checkpoint
 defines `forced_bos_token_id`, the PyTorch backend seeds that token in the
@@ -29,6 +27,11 @@ decoder prefix. Source- and target-language selection remains
 checkpoint-specific, so validate the configured language tokens before
 deployment. Refer to [Understand BART and mBART decoder tokens](#understand-bart-and-mbart-decoder-tokens)
 for BOS, EOS, and output-limit behavior.
+
+Whisper consumes audio rather than a text prompt. The sections up to
+[Transcribe audio with Whisper](#transcribe-audio-with-whisper) describe the
+text-to-text models; the runtime configuration, KV cache manager, beam search,
+CUDA graph, and parallelism guidance in this guide applies to all architectures.
 
 ## Feature support
 
@@ -41,7 +44,7 @@ The following table describes the supported and recommended configurations.
 | Greedy decoding | Yes | Set `temperature=0.0`. |
 | Beam search | Yes with V1 | Configure `max_beam_width` when constructing `LLM`, then set `use_beam_search=True` in `SamplingParams`. |
 | Attention backend | `TRTLLM` | Use this backend for encoder-decoder models. It is required when `tensor_parallel_size > 1`. |
-| Decoder CUDA graphs | Yes | `CudaGraphConfig` captures decoder work. V1 supports greedy and beam search; V2 supports its single-beam path. |
+| Decoder CUDA graphs | Yes, except in FP32 | `CudaGraphConfig` captures decoder work. V1 supports greedy and beam search; V2 supports its single-beam path. FP32 encoder-decoder models decline capture at engine init and log a warning instead of failing. |
 | Encoder CUDA graphs | No | `EncodeCudaGraphConfig` is disabled for encoder-decoder models. The encoder runs eagerly. |
 | Overlap scheduler | Yes | Enabled by default. V1 supports greedy decoding and beam search; V2 remains limited to `max_beam_width=1`. |
 | Tensor parallelism | Yes | Use `tensor_parallel_size > 1` with `attn_backend="TRTLLM"`. Attention head counts must be divisible by the TP size. |
@@ -200,6 +203,81 @@ past EOS.
 The runtime does not inject `forced_eos_token_id` when a sequence reaches
 `max_tokens`. It preserves the model-selected final token and reports
 `finish_reason="length"`.
+
+## Transcribe audio with Whisper
+
+Whisper is an audio encoder-decoder model for speech transcription and
+translation. It differs from the text-to-text models in this guide in two ways:
+the encoder consumes audio instead of a text prompt, and the text prompt, when
+supplied, sets the decoder task prefix rather than the encoder input.
+
+Pass one audio clip per request through `multi_modal_data["audio"]`:
+
+```python
+import soundfile
+
+from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams, SchedulerConfig
+
+
+model = "openai/whisper-large-v3"
+wave, sample_rate = soundfile.read("utterance.wav")
+
+with LLM(
+    model=model,
+    backend="pytorch",
+    attn_backend="TRTLLM",
+    max_batch_size=4,
+    # Cross-KV pool capacity. The default (1024) is smaller than the 1500
+    # encoder positions that every Whisper request produces.
+    max_input_len=1500,
+    max_num_tokens=3000,
+    enable_chunked_prefill=False,
+    kv_cache_config=KvCacheConfig(
+        enable_block_reuse=False,
+        free_gpu_memory_fraction=0.8,
+        cross_kv_cache_fraction=0.5,
+    ),
+    scheduler_config=SchedulerConfig(use_python_scheduler=True),
+) as llm:
+    result = llm.generate(
+        {"prompt": "", "multi_modal_data": {"audio": [(wave, sample_rate)]}},
+        sampling_params=SamplingParams(max_tokens=96, temperature=0.0),
+        use_tqdm=False,
+    )
+    print(result.outputs[0].text)
+```
+
+Set `max_input_len` to at least 1500. Every Whisper request produces 1500 encoder
+positions regardless of clip length, and the cross-KV pool is sized from `max_input_len`.
+
+The audio item accepts a file path or URL, an `(array, sample_rate)` tuple, or a
+`{"array": ..., "sampling_rate": ...}` mapping. Supply exactly one clip per
+request, at the checkpoint's sampling rate, which is 16 kHz for the published
+Whisper checkpoints. Clips shorter than the 30-second window are zero-padded;
+longer clips and other sampling rates are rejected rather than silently
+truncated or resampled. Long-form chunked transcription is not part of this
+path.
+
+### Select the language and task
+
+An empty text prompt selects the checkpoint default, which is English
+transcription (`<|startoftranscript|>[<|en|>][<|transcribe|>]<|notimestamps|>`).
+A non-empty text prompt replaces that decoder prefix verbatim and is how you
+override the language or switch to translation. It must begin with
+`<|startoftranscript|>`:
+
+```python
+prompt = "<|startoftranscript|><|de|><|transcribe|><|notimestamps|>"
+result = llm.generate(
+    {"prompt": prompt, "multi_modal_data": {"audio": [(wave, sample_rate)]}},
+    sampling_params=SamplingParams(max_tokens=96, temperature=0.0),
+)
+```
+
+The prefix counts against the decoder position table, so `SamplingParams.max_tokens`
+is capped to the space remaining in it. A request asking for more logs a warning
+and proceeds with the capped budget. Pre-tokenized `prompt_token_ids` are not
+consumed on this path.
 
 ## Run a batch
 

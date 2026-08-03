@@ -31,11 +31,11 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (
     AttentionDpConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
     DFlashDecodingConfig, DSparkDecodingConfig, DraftTargetDecodingConfig,
-    Eagle3DecodingConfig, KvCacheConfig, MiniMaxM3SparseAttentionConfig,
-    MoeConfig, MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
-    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
-    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
-    TorchCompileConfig)
+    Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
+    MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
+    NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
+    SADecodingConfig, SamplingParams, SchedulerConfig,
+    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -4689,6 +4689,12 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(
             max_batch_size=32, enable_padding=True),
                               torch_compile_config=torch_compile_config)
+        # Piecewise CUDA-graph capture (torch_compile=True) needs extra
+        # workspace beyond what the default KV-cache fraction reserves on
+        # 44 GiB L40S; lower the fraction in that case to avoid executor OOM.
+        if torch_compile:
+            pytorch_config["kv_cache_config"] = KvCacheConfig(
+                free_gpu_memory_fraction=0.6)
 
         with LLM(f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf",
                  tensor_parallel_size=tp_size,
@@ -5925,7 +5931,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=enable_block_reuse)
         if enable_block_reuse:
-            kv_cache_config.mamba_state_cache_interval = 256
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         pytorch_config = dict(disable_overlap_scheduler=False,
                               cuda_graph_config=CudaGraphConfig(
                                   max_batch_size=512, enable_padding=True))
@@ -6225,10 +6231,10 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         if moe_backend == "TRTLLM" and get_sm_version() not in (100, 103):
             pytest.skip(f"{moe_backend} backend supports SM 100 and 103 only")
 
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
-                                            max_batch_size=256)
+                                            max_batch_size=128)
         moe_config = MoeConfig(backend=moe_backend)
 
         # H20 path produces a small but fluctuating gap relative to H100/H200 BF16 MoE config.
@@ -6242,7 +6248,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
-                 max_batch_size=256,
+                 max_batch_size=128,
                  enable_chunked_prefill=True,
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
@@ -6291,6 +6297,9 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=enable_block_reuse)
+        if enable_block_reuse:
+            kv_cache_config.avg_seq_len = 2048
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         # DeepGEMM MoE kernels only support datacenter Blackwell (SM100/SM103).
         # Fall back to the CUTLASS MoE backend (which supports FP8 block scales)
         # on other architectures such as Hopper (SM90) and consumer Blackwell
@@ -6444,6 +6453,9 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
                                         enable_block_reuse=enable_block_reuse)
+        if enable_block_reuse:
+            kv_cache_config.avg_seq_len = 2048
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         cuda_graph_config = CudaGraphConfig(max_batch_size=256,
                                             enable_padding=True)
 
@@ -7109,6 +7121,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
                     free_gpu_memory_fraction=0.5,
+                    use_kv_cache_manager_v2=False,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=4,
@@ -7128,7 +7141,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
+        "tp_size, ep_size, periodic_snapshot_interval, attention_dp, use_mtp",
         [
             (1, 1, 256, False, False),
             (4, 1, 256, False, True),
@@ -7139,7 +7152,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         ids=["TP1", "TP4_MTP", "TEP4", "DEP4_MTP_OFF", "DEP4_MTP_ON"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
-                                     mamba_state_cache_interval, attention_dp,
+                                     periodic_snapshot_interval, attention_dp,
                                      use_mtp):
         gpu_needed = max(tp_size, ep_size)
         if get_device_count() < gpu_needed:
@@ -7154,9 +7167,11 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
+                    avg_seq_len=2048,
                     mamba_ssm_cache_dtype="float16",
-                    mamba_state_cache_interval=mamba_state_cache_interval,
-                    free_gpu_memory_fraction=0.8,
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=periodic_snapshot_interval),
+                    free_gpu_memory_fraction=0.7,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=tp_size,
@@ -7228,7 +7243,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 model_path,
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
+                    avg_seq_len=2048,
                     mamba_ssm_cache_dtype="float16",
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=256),
                     free_gpu_memory_fraction=0.5,
                 ),
                 max_batch_size=32,
@@ -7561,7 +7579,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.parametrize(
-        "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
+        "tp_size, ep_size, periodic_snapshot_interval, attention_dp, use_mtp",
         [
             (4, 1, 256, False, True),
             (4, 4, 256, False, False),
@@ -7571,7 +7589,7 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
         ids=["TP4_MTP", "TEP4", "ADP4", "ADP4_MTP"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
-                                     mamba_state_cache_interval, attention_dp,
+                                     periodic_snapshot_interval, attention_dp,
                                      use_mtp):
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
@@ -7582,8 +7600,10 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
                 kv_cache_config=KvCacheConfig(
                     enable_block_reuse=True,
+                    avg_seq_len=2048,
                     mamba_ssm_cache_dtype="float16",
-                    mamba_state_cache_interval=mamba_state_cache_interval,
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=periodic_snapshot_interval),
                     free_gpu_memory_fraction=0.5,
                 ),
                 max_batch_size=max_batch_size,
@@ -7911,6 +7931,110 @@ class TestGLM52(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(model_name)
             task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_nvfp4_mtp_index_share(self, tp_size, ep_size):
+        # Like test_nvfp4 but max_draft_len=3, exercising DSA indexer Top-K reuse
+        # across MTP draft steps (index_share_for_mtp_iteration=true from the checkpoint).
+        model_name = "zai-org/GLM-5.2"
+        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=3),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_nvfp4_mtp_index_share_mtp_ar(self, tp_size, ep_size):
+        # Acceptance-rate guard for max_draft_len=3 + index-share; counts accepted
+        # drafts from streaming (get_stats needs enable_iter_perf_stats).
+        model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        max_draft_len = 3
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            speculative_config=MTPDecodingConfig(max_draft_len=max_draft_len),
+            enable_chunked_prefill=True,
+        )
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_seq_len=8192,
+                 **pytorch_config) as llm:
+            raw_prompts = [
+                "The capital of France is",
+                "The president of the United States is",
+                "The future of AI is",
+            ]
+            prompts = [
+                llm.tokenizer.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": p
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ) for p in raw_prompts
+            ]
+            tok_ids = [llm.tokenizer.encode(p) for p in prompts]
+            sampling_params = SamplingParams(max_tokens=128, temperature=0)
+
+            total_drafted = 0
+            total_accepted = 0
+            for i, prompt_ids in enumerate(tok_ids):
+                num_tokens = 0
+                num_drafted = 0
+                num_accepted = 0
+                for output in llm.generate_async(prompt_ids,
+                                                 sampling_params,
+                                                 streaming=True):
+                    new_tokens = output.outputs[0].token_ids
+                    num_drafted += max_draft_len
+                    num_accepted += len(new_tokens) - num_tokens - 1
+                    num_tokens = len(new_tokens)
+
+                accept_rate = num_accepted / num_drafted
+                total_drafted += num_drafted
+                total_accepted += num_accepted
+                print(
+                    f"GLM-5.2 MTP index-share prompt {i} acceptance rate: "
+                    f"{accept_rate:.2%} ({num_accepted}/{num_drafted} tokens)")
+
+            aggregate_accept_rate = (total_accepted / total_drafted
+                                     if total_drafted > 0 else 0.0)
+            print("GLM-5.2 MTP index-share aggregate acceptance rate: "
+                  f"{aggregate_accept_rate:.2%} ({total_accepted}/"
+                  f"{total_drafted} tokens across {len(tok_ids)} prompts)")
+            assert aggregate_accept_rate > 0.2, (
+                f"Aggregate acceptance rate {aggregate_accept_rate:.2%} "
+                f"below threshold 20%")
 
 
 @skip_pre_blackwell
