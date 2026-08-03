@@ -150,6 +150,20 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``sparse_index_dim`` — width of the index-K/V vectors.
     """
 
+    # The AttentionOp-facing tensors this manager builds are synthetic
+    # placeholders over INDEX_KEY-coalesced pools, so one-model speculative
+    # draft layers must live in a separate manager even under attention DP
+    # (read by ``_should_create_separate_draft_kv_cache``).
+    supports_shared_draft_layers = False
+
+    # Workaround: the Eagle3 drafter's trtllm-gen generation kernels hit an
+    # illegal memory access at tokens_per_block=128 (base regression), while
+    # the MSA target requires 128. The dense draft layers have no page-size
+    # constraint, so the separate draft manager runs at 32 (read by
+    # ``_create_one_model_draft_kv_cache_manager``). Remove once the kernel
+    # bug is fixed.
+    draft_manager_tokens_per_block = 32
+
     def __init__(
         self,
         *args,

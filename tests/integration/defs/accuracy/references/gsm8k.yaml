@@ -495,6 +495,9 @@ nvidia/MiniMax-M3-NVFP4:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 86
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: Eagle3
+    accuracy: 88
 nvidia/NVIDIA-Nemotron-Nano-9B-v2:
   - accuracy: 85.027
   - quant_algo: FP8
