@@ -1525,20 +1525,20 @@ def fused_kernel123(
                     beta_row1 = _z
                     if IS_VARLEN and not VARLEN_PURE:
                         if chunk_start + q_row_base + row0 < mma_eos:
-                            beta_row0 = mBeta[
-                                i_b, chunk_start + q_row_base + row0, i_h
-                            ].to(cutlass.Float32)
+                            beta_row0 = mBeta[i_b, chunk_start + q_row_base + row0, i_h].to(
+                                cutlass.Float32
+                            )
                         if chunk_start + q_row_base + row1 < mma_eos:
-                            beta_row1 = mBeta[
-                                i_b, chunk_start + q_row_base + row1, i_h
-                            ].to(cutlass.Float32)
+                            beta_row1 = mBeta[i_b, chunk_start + q_row_base + row1, i_h].to(
+                                cutlass.Float32
+                            )
                     else:
-                        beta_row0 = mBeta[
-                            i_b, chunk_start + q_row_base + row0, i_h
-                        ].to(cutlass.Float32)
-                        beta_row1 = mBeta[
-                            i_b, chunk_start + q_row_base + row1, i_h
-                        ].to(cutlass.Float32)
+                        beta_row0 = mBeta[i_b, chunk_start + q_row_base + row0, i_h].to(
+                            cutlass.Float32
+                        )
+                        beta_row1 = mBeta[i_b, chunk_start + q_row_base + row1, i_h].to(
+                            cutlass.Float32
+                        )
 
                     acc_aqk_n0_0, acc_aqk_n0_1, acc_aqk_n0_2, acc_aqk_n0_3 = _z, _z, _z, _z
                     acc_aqk_n1_0, acc_aqk_n1_1, acc_aqk_n1_2, acc_aqk_n1_3 = _z, _z, _z, _z

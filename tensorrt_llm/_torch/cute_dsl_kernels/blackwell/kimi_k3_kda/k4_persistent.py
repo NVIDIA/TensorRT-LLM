@@ -1453,7 +1453,6 @@ def make_host_fn(num_sm=148):
             o_out,
             tm_workspace,
             scheduler_params,
-        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True,
-                 stream=stream)
+        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True, stream=stream)
 
     return host_fn

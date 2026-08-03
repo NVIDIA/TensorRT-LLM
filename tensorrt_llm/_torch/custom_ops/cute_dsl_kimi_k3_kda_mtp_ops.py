@@ -68,7 +68,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from cutlass.cute.runtime import from_dlpack
 
     from ..cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
-        NUM_THREADS, TILE_K, kda_decode_mtp_kernel)
+        NUM_THREADS,
+        TILE_K,
+        kda_decode_mtp_kernel,
+    )
 else:
     raise ImportError("Kimi K3 KDA MTP decode requires NVIDIA CUTLASS DSL")
 
@@ -230,16 +233,12 @@ def _require_stride_layout(
     }
     for name, tensor in last_dim_tensors.items():
         if tensor.stride(-1) != 1:
-            raise ValueError(
-                f"Expected {name} to be contiguous in its last dimension.")
+            raise ValueError(f"Expected {name} to be contiguous in its last dimension.")
 
-    if w_q.shape != (H * K, W) or w_k.shape != (H * K, W) or w_v.shape != (
-            HV * V, W):
-        raise ValueError(f"Expected w_q/w_k shape [{H * K}, {W}] and w_v "
-                         f"shape [{HV * V}, {W}].")
+    if w_q.shape != (H * K, W) or w_k.shape != (H * K, W) or w_v.shape != (HV * V, W):
+        raise ValueError(f"Expected w_q/w_k shape [{H * K}, {W}] and w_v shape [{HV * V}, {W}].")
     if w_q.stride(1) != 1 or w_k.stride(1) != 1 or w_v.stride(1) != 1:
-        raise ValueError(
-            "Expected w_q/w_k/w_v to be contiguous in the kernel-width axis.")
+        raise ValueError("Expected w_q/w_k/w_v to be contiguous in the kernel-width axis.")
 
     if A_log.ndim != 1 or A_log.shape[0] != H:
         raise ValueError(f"Expected A_log shape [{H}].")
@@ -248,43 +247,41 @@ def _require_stride_layout(
 
     state_s = W - 1 + num_spec
     if cs_q.ndim != 3 or cs_k.ndim != 3 or cs_v.ndim != 3:
-        raise ValueError("Expected cs_q/cs_k/cs_v to have shape "
-                         "[pool, dim, S].")
+        raise ValueError("Expected cs_q/cs_k/cs_v to have shape [pool, dim, S].")
     if cs_q.shape[1] != H * K or cs_k.shape[1] != H * K:
         raise ValueError(f"Expected cs_q/cs_k shape [pool, {H * K}, S].")
     if cs_v.shape[1] != HV * V:
         raise ValueError(f"Expected cs_v shape [pool, {HV * V}, S].")
-    if cs_q.shape[2] < state_s or cs_k.shape[2] < state_s or \
-            cs_v.shape[2] < state_s:
-        raise ValueError(
-            f"Expected conv-state S dimension to be at least {state_s}.")
+    if cs_q.shape[2] < state_s or cs_k.shape[2] < state_s or cs_v.shape[2] < state_s:
+        raise ValueError(f"Expected conv-state S dimension to be at least {state_s}.")
     if cs_q.stride(1) != 1 or cs_k.stride(1) != 1 or cs_v.stride(1) != 1:
         raise ValueError(
             "Expected cs_q/cs_k/cs_v to use dim-contiguous layout "
-            "(allocate as [pool, S, dim] and transpose(1, 2)).")
+            "(allocate as [pool, S, dim] and transpose(1, 2))."
+        )
 
     pool_size = recurrent_state.shape[0]
     if recurrent_state.ndim != 4 or recurrent_state.shape[1:] != (HV, V, K):
-        raise ValueError(f"Expected recurrent_state shape "
-                         f"[pool, {HV}, {V}, {K}] (V-first pool layout).")
+        raise ValueError(
+            f"Expected recurrent_state shape [pool, {HV}, {V}, {K}] (V-first pool layout)."
+        )
     if qkg_cache.ndim != 4 or qkg_cache.shape[1:] != (num_spec, 3, H * K):
-        raise ValueError(
-            f"Expected qkg_cache shape [pool, {num_spec}, 3, {H * K}].")
+        raise ValueError(f"Expected qkg_cache shape [pool, {num_spec}, 3, {H * K}].")
     if v_cache.ndim != 3 or v_cache.shape[1:] != (num_spec, HV * V):
-        raise ValueError(
-            f"Expected v_cache shape [pool, {num_spec}, {HV * V}].")
+        raise ValueError(f"Expected v_cache shape [pool, {num_spec}, {HV * V}].")
     if beta_cache.ndim != 3 or beta_cache.shape[1:] != (num_spec, HV):
-        raise ValueError(
-            f"Expected beta_cache shape [pool, {num_spec}, {HV}].")
-    if qkg_cache.shape[0] < pool_size or v_cache.shape[0] < pool_size or \
-            beta_cache.shape[0] < pool_size:
-        raise ValueError(
-            "Expected cache pool dimensions to cover recurrent_state rows.")
+        raise ValueError(f"Expected beta_cache shape [pool, {num_spec}, {HV}].")
+    if (
+        qkg_cache.shape[0] < pool_size
+        or v_cache.shape[0] < pool_size
+        or beta_cache.shape[0] < pool_size
+    ):
+        raise ValueError("Expected cache pool dimensions to cover recurrent_state rows.")
 
-    if ssm_state_indices.ndim != 1 or cu_seqlens.ndim != 1 or \
-            num_accepted_tokens.ndim != 1:
-        raise ValueError("Expected ssm_state_indices, cu_seqlens, and "
-                         "num_accepted_tokens to be 1D.")
+    if ssm_state_indices.ndim != 1 or cu_seqlens.ndim != 1 or num_accepted_tokens.ndim != 1:
+        raise ValueError(
+            "Expected ssm_state_indices, cu_seqlens, and num_accepted_tokens to be 1D."
+        )
     if cu_seqlens.shape[0] != ssm_state_indices.shape[0] + 1:
         raise ValueError("Expected cu_seqlens length to be N + 1.")
     if num_accepted_tokens.shape[0] != ssm_state_indices.shape[0]:
@@ -324,10 +321,10 @@ def _layout_key(tensor: torch.Tensor, dynamic_layout: bool = False):
     arg = _dlpack_arg(tensor) if dynamic_layout else _from_dlpack_arg(tensor)
     shape_mask = arg.dynamic_shapes_mask
     stride_mask = arg.dynamic_strides_mask
-    shape = tuple(None if dynamic else size
-                  for size, dynamic in zip(tensor.shape, shape_mask))
-    stride = tuple(None if dynamic else value
-                   for value, dynamic in zip(tensor.stride(), stride_mask))
+    shape = tuple(None if dynamic else size for size, dynamic in zip(tensor.shape, shape_mask))
+    stride = tuple(
+        None if dynamic else value for value, dynamic in zip(tensor.stride(), stride_mask)
+    )
     return (tensor.dtype, shape, stride, _fits_32bit_stride(tensor))
 
 
@@ -336,15 +333,13 @@ def _layout_key(tensor: torch.Tensor, dynamic_layout: bool = False):
 _precompute_control_cache = {}
 
 
-def _precompute_control_tensor(device: torch.device,
-                               enabled: bool) -> torch.Tensor:
+def _precompute_control_tensor(device: torch.device, enabled: bool) -> torch.Tensor:
     dev = torch.device(device)
-    key = (dev.index
-           if dev.index is not None else torch.cuda.current_device(),
-           bool(enabled))
+    key = (dev.index if dev.index is not None else torch.cuda.current_device(), bool(enabled))
     if key not in _precompute_control_cache:
         _precompute_control_cache[key] = torch.tensor(
-            [1 if enabled else 0], dtype=torch.int32, device=dev)
+            [1 if enabled else 0], dtype=torch.int32, device=dev
+        )
     return _precompute_control_cache[key]
 
 
@@ -370,10 +365,18 @@ def _try_flatten_args(
     return True, h0, x_q_flat, x_k_flat, x_v_flat
 
 
-def _is_benchmark_static_shape(N: int, H: int, HV: int, K: int, V: int,
-                               W: int, num_spec: int) -> bool:
-    return (K == 128 and V == 128 and W == 4 and num_spec == 2 and H == HV
-            and N in (32, 128) and H in (2, 12, 32))
+def _is_benchmark_static_shape(
+    N: int, H: int, HV: int, K: int, V: int, W: int, num_spec: int
+) -> bool:
+    return (
+        K == 128
+        and V == 128
+        and W == 4
+        and num_spec == 2
+        and H == HV
+        and N in (32, 128)
+        and H in (2, 12, 32)
+    )
 
 
 # Layout-and-constexpr-keyed compile cache. Request count and packed-token
@@ -454,12 +457,7 @@ def kda_mtp_decode_impl(
 
     N = cu_seqlens.shape[0] - 1
     if out is None:
-        out = torch.zeros(1,
-                          T_total,
-                          HV,
-                          V_dim,
-                          dtype=x_q.dtype,
-                          device=x_q.device)
+        out = torch.zeros(1, T_total, HV, V_dim, dtype=x_q.dtype, device=x_q.device)
     if num_accepted_tokens.dtype != torch.int32:
         num_accepted_tokens = num_accepted_tokens.to(torch.int32)
 
@@ -509,8 +507,7 @@ def kda_mtp_decode_impl(
         V=V_dim,
     )
     pool_size = h0_arg.shape[0]
-    is_benchmark_static_shape = _is_benchmark_static_shape(
-        N, H, HV, K, V_dim, W, num_spec)
+    is_benchmark_static_shape = _is_benchmark_static_shape(N, H, HV, K, V_dim, W, num_spec)
     use_setmaxreg = is_benchmark_static_shape
     use_reg_q_weights = is_benchmark_static_shape
     use_regular_metadata = bool(regular_metadata_hint)
@@ -562,7 +559,8 @@ def kda_mtp_decode_impl(
             f"kda_mtp_decode: compiling variant N={N} H={HV} T={T_total} "
             f"num_spec={num_spec} zero_accepted={use_zero_accepted} "
             f"regular_metadata={use_regular_metadata} "
-            f"static_shape={is_benchmark_static_shape}")
+            f"static_shape={is_benchmark_static_shape}"
+        )
         _compiled_cache[key] = cute.compile(
             _run_kda_decode_mtp,
             _from_dlpack_arg(h0_arg),

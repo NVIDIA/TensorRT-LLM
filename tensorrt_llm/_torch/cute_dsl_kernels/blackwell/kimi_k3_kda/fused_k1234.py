@@ -2269,7 +2269,9 @@ def make_host_fn(has_bias=False, use_safe_gate=False, profile_clocks=False):
             num_heads,
             batch_size,
         ).launch(
-            grid=(BH, 1, 1), block=(THREADS, 1, 1), smem=225 * 1024,
+            grid=(BH, 1, 1),
+            block=(THREADS, 1, 1),
+            smem=225 * 1024,
             stream=stream,
         )  # Force high SMEM to prevent >1 block per SM (TMEM conflict)
 
