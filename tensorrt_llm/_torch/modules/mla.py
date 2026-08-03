@@ -17,7 +17,7 @@ import functools
 import math
 import os
 import weakref
-from typing import List, Optional, cast
+from typing import Dict, List, Optional, cast
 
 import torch
 from torch import nn
@@ -49,6 +49,7 @@ from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..utils import (
+    AuxStreamType,
     Fp4QuantizedTensor,
     compute_swizzled_sf_shape,
     is_torch_compiling,
@@ -422,7 +423,7 @@ class MLA(nn.Module):
         predicted_tokens_per_seq: int,
         max_position_embeddings: int,
         bias: bool,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
@@ -448,8 +449,9 @@ class MLA(nn.Module):
             predicted_tokens_per_seq (int): The number of predicted tokens per sequence.
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
-            aux_stream (Optional[torch.cuda.Stream]): The auxiliary CUDA stream
-                for running operations in two parallel streams.
+            aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary
+                CUDA streams by role. The DSv4 lanes are read only when the layer has
+                a DSv4 indexer.
             pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
             layer_idx (int): The layer index.
             dtype (torch.dtype): The data type.
@@ -761,16 +763,12 @@ class MLA(nn.Module):
             and sparse_params is not None
             and sparse_params.compress_ratios[layer_idx] == 4
         )
-        self.indexer_stream = None
-        self.indexer_aux_stream = None
-        self.compressor_stream = None
-        if self.has_dsv4_indexer and aux_stream is not None:
-            self.indexer_stream = torch.cuda.Stream(device=aux_stream.device)
-            self.indexer_aux_stream = torch.cuda.Stream(device=aux_stream.device)
-            self.compressor_stream = torch.cuda.Stream(device=aux_stream.device)
-        mqa_aux_stream = (
-            self.indexer_aux_stream if self.indexer_aux_stream is not None else aux_stream
-        )
+        aux_stream_dict = aux_stream_dict or {}
+        self.aux_stream = aux_stream_dict.get(AuxStreamType.Attention, None)
+        self.indexer_stream = aux_stream_dict.get(AuxStreamType.MlaIndexer, None)
+        self.indexer_aux_stream = aux_stream_dict.get(AuxStreamType.MlaIndexerAux, None)
+        self.compressor_stream = aux_stream_dict.get(AuxStreamType.MlaCompressor, None)
+        mqa_aux_stream = self.indexer_aux_stream if self.has_dsv4_indexer else self.aux_stream
 
         self.mqa = create_attention(
             config.attn_backend,
@@ -800,7 +798,6 @@ class MLA(nn.Module):
 
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
 
-        self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.dsv4_overlap_start_event = torch.cuda.Event()
         self.dsv4_compressor_start_event = torch.cuda.Event()
