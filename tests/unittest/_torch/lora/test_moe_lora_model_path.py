@@ -11,8 +11,7 @@ These CPU-only tests (no GPU or built C++ op required) assert, at each hop,
 that a non-empty lora_params is forwarded:
 
   1. QwenMoE.forward to the routed self.experts call (legacy wrapper).
-  2. ConfigurableMoE.forward_impl to scheduler.forward (the default
-     ENABLE_CONFIGURABLE_MOE=1 path).
+  2. ConfigurableMoE.forward_impl to scheduler.forward.
   3. ExternalCommMoEScheduler._get_backend_kwargs to the CutlassFusedMoE
      run_moe kwargs, and not to backends that cannot carry LoRA.
 """
@@ -74,8 +73,7 @@ def test_qwen_moe_forward_passes_lora_params_to_routed_experts():
 
 def test_configurable_moe_forward_impl_forwards_lora_params_to_scheduler():
     """ConfigurableMoE.forward_impl must forward lora_params to the scheduler
-    so routed-expert MoE LoRA is not dropped on the default
-    ENABLE_CONFIGURABLE_MOE=1 path."""
+    so routed-expert MoE LoRA is not dropped."""
     x = torch.randn(4, 8)
     router_logits = torch.randn(4, 2)
 

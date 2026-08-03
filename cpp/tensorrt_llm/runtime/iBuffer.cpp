@@ -20,6 +20,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferView.h"
 
 #include <cuda_runtime_api.h>
@@ -48,7 +49,7 @@ IBuffer::UniquePtr IBuffer::slice(IBuffer::SharedPtr buffer, std::size_t offset,
     return std::make_unique<BufferView>(std::move(buffer), offset, size);
 }
 
-IBuffer::UniquePtr IBuffer::wrap(void* data, nvinfer1::DataType type, std::size_t size, std::size_t capacity)
+IBuffer::UniquePtr IBuffer::wrap(void* data, tensorrt_llm::DataType type, std::size_t size, std::size_t capacity)
 {
     TLLM_CHECK_WITH_INFO(size <= capacity, "Requested size is larger than capacity");
     auto memoryType = IBuffer::memoryType(data);
@@ -91,17 +92,17 @@ char const* IBuffer::getDataTypeName(DataType dataType)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kINT64: return DataTypeTraits<nvinfer1::DataType::kINT64>::name;
-    case nvinfer1::DataType::kINT32: return DataTypeTraits<nvinfer1::DataType::kINT32>::name;
-    case nvinfer1::DataType::kFLOAT: return DataTypeTraits<nvinfer1::DataType::kFLOAT>::name;
-    case nvinfer1::DataType::kBF16: return DataTypeTraits<nvinfer1::DataType::kBF16>::name;
-    case nvinfer1::DataType::kHALF: return DataTypeTraits<nvinfer1::DataType::kHALF>::name;
-    case nvinfer1::DataType::kBOOL: return DataTypeTraits<nvinfer1::DataType::kBOOL>::name;
-    case nvinfer1::DataType::kUINT8: return DataTypeTraits<nvinfer1::DataType::kUINT8>::name;
-    case nvinfer1::DataType::kINT8: return DataTypeTraits<nvinfer1::DataType::kINT8>::name;
-    case nvinfer1::DataType::kFP8: return DataTypeTraits<nvinfer1::DataType::kFP8>::name;
-    case nvinfer1::DataType::kINT4: [[fallthrough]] /* do nothing */;
-    case nvinfer1::DataType::kFP4: [[fallthrough]] /* do nothing */;
+    case tensorrt_llm::DataType::kINT64: return DataTypeTraits<tensorrt_llm::DataType::kINT64>::name;
+    case tensorrt_llm::DataType::kINT32: return DataTypeTraits<tensorrt_llm::DataType::kINT32>::name;
+    case tensorrt_llm::DataType::kFLOAT: return DataTypeTraits<tensorrt_llm::DataType::kFLOAT>::name;
+    case tensorrt_llm::DataType::kBF16: return DataTypeTraits<tensorrt_llm::DataType::kBF16>::name;
+    case tensorrt_llm::DataType::kHALF: return DataTypeTraits<tensorrt_llm::DataType::kHALF>::name;
+    case tensorrt_llm::DataType::kBOOL: return DataTypeTraits<tensorrt_llm::DataType::kBOOL>::name;
+    case tensorrt_llm::DataType::kUINT8: return DataTypeTraits<tensorrt_llm::DataType::kUINT8>::name;
+    case tensorrt_llm::DataType::kINT8: return DataTypeTraits<tensorrt_llm::DataType::kINT8>::name;
+    case tensorrt_llm::DataType::kFP8: return DataTypeTraits<tensorrt_llm::DataType::kFP8>::name;
+    case tensorrt_llm::DataType::kINT4: [[fallthrough]] /* do nothing */;
+    case tensorrt_llm::DataType::kFP4: [[fallthrough]] /* do nothing */;
     default: TLLM_THROW("Unknown data type");
     }
 }

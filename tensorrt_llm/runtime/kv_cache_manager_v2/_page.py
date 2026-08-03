@@ -241,6 +241,7 @@ class CommittedPage(Page):
     """
 
     block: rawref.ref["Block"]
+    planned_drop_count: int
     __rawref__: rawref.ref["CommittedPage"]
 
     def is_committed(self) -> bool:
@@ -256,6 +257,7 @@ class CommittedPage(Page):
         priority: Priority,
     ):
         self.block = rawref.ref(block)
+        self.planned_drop_count = 0
         self.__rawref__ = rawref.NULL
         Page.__init__(
             self,

@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "userbuffers.h"
 #include "utils.h"
@@ -1774,11 +1775,11 @@ int allgather2_userbuff_residual(int const handler, size_t const offset, size_t 
 }
 
 void allreduce2_userbuff_inplace_impl(int const handler, size_t const offset, size_t const elements,
-    nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+    tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1791,7 +1792,7 @@ void allreduce2_userbuff_inplace_impl(int const handler, size_t const offset, si
         break;
     }
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1809,17 +1810,17 @@ void allreduce2_userbuff_inplace_impl(int const handler, size_t const offset, si
 }
 
 int allgather2_userbuff_residual_impl(int const handler, size_t const offset, size_t const elements,
-    int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream,
+    int const hidden_size, void* residual, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream,
     bool force_enable)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
         return allgather2_userbuff_residual<half>(
             handler, offset, elements, hidden_size, residual, comm, stream, force_enable);
         break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
         return allgather2_userbuff_residual<__nv_bfloat16>(
             handler, offset, elements, hidden_size, residual, comm, stream, force_enable);
         break;
@@ -1830,11 +1831,11 @@ int allgather2_userbuff_residual_impl(int const handler, size_t const offset, si
 
 int allreduce2_userbuff_rmsnorm_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
-    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+    void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1849,7 +1850,7 @@ int allreduce2_userbuff_rmsnorm_impl(int const handler, size_t const offset, int
         break;
     }
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1870,12 +1871,12 @@ int allreduce2_userbuff_rmsnorm_impl(int const handler, size_t const offset, int
 
 int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
-    float* scalefactor, void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm,
+    float* scalefactor, void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm,
     cudaStream_t stream)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1890,7 +1891,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t con
         break;
     }
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1914,11 +1915,11 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t con
 int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, int const scale_handler, size_t const scale_offset, size_t const elements,
     int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor, void* residual_in,
-    void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+    void* residual_out, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1935,7 +1936,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
         break;
     }
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {

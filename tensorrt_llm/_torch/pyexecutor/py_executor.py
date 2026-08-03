@@ -42,7 +42,7 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
@@ -108,6 +108,9 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
+
+# Environment variable to control the benchmark disagg fill target.
+BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME = "TLLM_BENCHMARK_REQ_QUEUES_SIZE"
 
 # Environment variable to control which ranks print step logging.
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
@@ -732,8 +735,7 @@ class PyExecutor:
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
-        self.benchmark_req_queues_size = int(
-            os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
+        self._configure_benchmark_req_queues_size()
 
         # list of requests in each PP micro batch
         self.num_micro_batches = max(self.dist.pp_size,
@@ -765,10 +767,10 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         # Encoder-decoder models execute the encoder and decoder in separate
-        # iterations. The encoder branch lives in ``_executor_loop`` only;
-        # ``_executor_loop_overlap`` has not been threaded yet. Reject
-        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
-        # is intentionally out of scope for this port).
+        # iterations in both executor loops. PP usage is very rare for these
+        # models, so encoder PP send/recv support is not implemented in the
+        # PyTorch path for now. Reject pp_size > 1.
+        # TODO: Add support for pp + encoder models
         is_encoder_decoder = bool(
             getattr(getattr(self.model_engine.model, "model_config", None),
                     "is_encoder_decoder", False))
@@ -778,11 +780,6 @@ class PyExecutor:
                     "pp_size > 1 is not supported for encoder-decoder models "
                     "in the PyTorch flow; encoder send/recv hooks are out of "
                     "scope. Set pp_size=1 to run T5/BART/mBART.")
-            if not self.disable_overlap_scheduler:
-                raise NotImplementedError(
-                    "Overlap scheduler is not yet wired for encoder-decoder "
-                    "models. Set disable_overlap_scheduler=True for "
-                    "encoder-decoder runs.")
             if getattr(self.model_engine, "_torch_compile_piecewise_cuda_graph",
                        False):
                 raise NotImplementedError(
@@ -919,9 +916,13 @@ class PyExecutor:
         # under steady state — see ping-pong comment in _profiler).
         self._latest_host_step_time_ms: Optional[float] = None
         self._latest_prev_device_step_time_ms: Optional[float] = None
+        self._emit_initial_stats()
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
+        if kv_cache_transceiver is not None:
+            self.hang_detector.register_status_provider(
+                kv_cache_transceiver.get_status_dump)
         cache_transceiver_config = getattr(self.llm_args,
                                            "cache_transceiver_config", None)
         max_tokens_in_buffer = getattr(cache_transceiver_config,
@@ -1279,6 +1280,21 @@ class PyExecutor:
 
     def _set_global_steady_clock_offset(self):
         assert self.global_rank >= 0, "rank should be >= 0"
+
+        # First calibration wins (mirrors the C++ guard in CacheTransceiver).
+        # PyExecutor is constructed twice per process (memory-profiling dry run,
+        # then the real executor), so this method runs twice. Recalibration is
+        # idempotent as long as the measurement below reads the raw
+        # steady_clock, but skipping it avoids a redundant barrier+allgather
+        # and protects the offset if the measurement path ever becomes
+        # offset-aware (which would make a second pass observe ~zero skew and
+        # wipe the correct value).
+        if LlmRequest.global_steady_clock_offset is not None:
+            logger.info(
+                f"global_steady_clock_offset already set "
+                f"({LlmRequest.global_steady_clock_offset}); skipping recalibration "
+                f"for rank {self.global_rank}")
+            return
 
         # Sync all ranks
         self.dist.barrier()
@@ -2017,6 +2033,9 @@ class PyExecutor:
 
             # Aggregate stats from all generation requests
             for req in scheduled_batch.generation_requests:
+                # exclude attention dp dummy / CUDA Graph padding requests from AL calculation
+                if getattr(req, 'is_dummy', False):
+                    continue
                 draft_len = getattr(req, 'num_draft_tokens', 0)
                 py_draft_tokens = getattr(req, 'py_draft_tokens', None)
                 py_num_accepted = getattr(req, 'py_num_accepted_draft_tokens',
@@ -2550,6 +2569,10 @@ class PyExecutor:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
+                    if hasattr(self.kv_cache_manager,
+                               "prepare_expect_snapshot_points"):
+                        self.kv_cache_manager.prepare_expect_snapshot_points(
+                            self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
                         self.active_requests, self.inflight_req_ids)
                     if self.kv_cache_transceiver:
@@ -2583,6 +2606,9 @@ class PyExecutor:
                     f'{scheduled_batch.num_context_requests} context requests and '
                     f'{scheduled_batch.num_generation_requests} generation requests'
                 )
+
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
@@ -3207,8 +3233,17 @@ class PyExecutor:
                 scheduled_batch.batch_size, self.model_engine.max_draft_len)
             # 2. Pad or truncate draft tokens to the resolved length
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
+            rejection_on = getattr(self.model_engine.spec_config,
+                                   "use_rejection_sampling", False)
             for request in scheduled_batch.generation_requests:
                 current_num_draft_tokens = len(request.py_draft_tokens)
+                # One-model rejection: a gen request entering with 0 real draft
+                # tokens produced no draft-prob scatter for its slot last iter,
+                # so next iter's rejection kernel would read a stale draft_probs
+                # row. Mark it (pre-pad signal) so _prepare_tp_inputs writes a
+                # one-hot placeholder row after spec_metadata.prepare().
+                request.py_needs_onehot_draft_probs = (
+                    rejection_on and current_num_draft_tokens == 0)
                 if spec_dec_mode.is_pard():
                     # special case: PARD carries 2K-1 draft tokens per request
                     runtime_draft_token_buffer_width = (
@@ -3247,6 +3282,7 @@ class PyExecutor:
                 if spec_config is not None and spec_config.is_linear_tree else
                 self.model_engine.max_total_draft_tokens)
 
+    @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -3683,7 +3719,7 @@ class PyExecutor:
                     f"one or more requests are waiting for KV cache allocation "
                     f"on a model-parallel rank whose scheduler could not fit "
                     f"any of them. Increase free_gpu_memory_fraction or reduce "
-                    f"TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
+                    f"{BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} (currently "
                     f"{self.benchmark_req_queues_size}).")
                 logger.error(error_msg)
                 # Fail all active and waiting requests on every rank so every
@@ -3851,6 +3887,7 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    @nvtx_range("_handle_disagg_cache_errors_synced")
     def _handle_disagg_cache_errors_synced(self):
         """Rank-safe disagg cache error and poison handler.
 
@@ -3929,6 +3966,25 @@ class PyExecutor:
             requests=local_voted_error_requests,
             charge_budget=False,
         )
+
+    def _emit_initial_stats(self) -> None:
+        """Emit a startup stats snapshot so that cache_config_info is
+        immediately available to external metric scrapers (e.g. the
+        Kubernetes Inference Gateway EPP) before any inference request."""
+        if not self.enable_iter_perf_stats:
+            return
+        stats = self._get_init_iter_stats(0, 0)
+        kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_cache_manager is not None:
+            kv_stats = kv_cache_manager.get_kv_cache_stats()
+            kv_stats_to_save = KvCacheStats()
+            kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
+            kv_stats_to_save.tokens_per_block = kv_stats.tokens_per_block
+            kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
+            kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
+            stats.kv_cache_stats = kv_stats_to_save
+        self._append_iter_stats(stats)
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -4447,6 +4503,9 @@ class PyExecutor:
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
+
                 gpu_forward_events_from_perf_pool = False
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -4907,6 +4966,30 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
+    def _get_request_admission_capacity(self) -> int:
+        """Return the maximum number of distinct requests admitted at once."""
+        if self.enable_attention_dp:
+            return self.dist.tp_size * self.max_num_active_requests
+        return self.max_num_active_requests
+
+    def _configure_benchmark_req_queues_size(self) -> None:
+        """Clamp the benchmark fill target to the request admission ceiling."""
+        requested_fill_target = int(
+            os.environ.get(BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME, 0))
+        admission_capacity = self._get_request_admission_capacity()
+        self.benchmark_req_queues_size = min(requested_fill_target,
+                                             admission_capacity)
+
+        if (requested_fill_target > self.benchmark_req_queues_size
+                and self.dist.rank == 0):
+            logger.warning(
+                f"[PyExecutor] {BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} "
+                f"requested fill target {requested_fill_target} exceeds the "
+                f"executor request admission capacity {admission_capacity}; "
+                f"using effective fill target "
+                f"{self.benchmark_req_queues_size} to prevent an unreachable "
+                f"benchmark disagg fill gate.")
+
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
@@ -4914,12 +4997,9 @@ class PyExecutor:
         all_ranks_num_active_requests: Optional[List[int]] = None
     ) -> List[RequestQueueItem]:
         """Pop requests from waiting_queue based on available capacity."""
-        if self.enable_attention_dp:
-            total_max = self.dist.tp_size * self.max_num_active_requests
-        else:
-            total_max = self.max_num_active_requests
+        admission_capacity = self._get_request_admission_capacity()
 
-        max_new_requests = total_max - total_num_active_requests
+        max_new_requests = admission_capacity - total_num_active_requests
 
         # Benchmark disagg fill-phase admission throttle (slow-start ramp).
         if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
@@ -4927,7 +5007,8 @@ class PyExecutor:
             if self._fill_admit_cap == 0:
                 self._fill_admit_cap = self.dist.tp_size
             else:
-                self._fill_admit_cap = min(self._fill_admit_cap * 2, total_max)
+                self._fill_admit_cap = min(self._fill_admit_cap * 2,
+                                           admission_capacity)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
         return get_from_waiting_queue(
@@ -5214,8 +5295,69 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    def _get_ctx_mla_kv_len_cap(self):
+        """Cap on the summed context attended-KV length (total_kv_len) per forward step, cached.
+
+        The KV-cache estimator is the single decision point: it reserves the fp8 context-MLA workspace only
+        when KV-cache reuse can grow it past the profiled floor, and carries the exact token cap that reserve
+        covers onto the KV manager as `fp8_ctx_mla_kv_len_cap` (`min(L_cap, budget/(k+w))`). The scheduler
+        reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
+        (`blocks_in_primary_pool` forwards `get_page_index_upper_bound`, not the available-page count).
+        A carried value of None -- non-fp8-MLA model, no reservation needed (reuse off / chunked prefill),
+        or estimation skipped -- means no admission cap is applied.
+        """
+        cap = getattr(self, "_ctx_mla_kv_len_cap", "unset")
+        if cap != "unset":
+            return cap
+        if getattr(self, "is_warmup", False):
+            # Estimation/warmup runs fresh-prefill dummies against a throwaway manager that reserved
+            # nothing; don't cap them (and don't cache -- real serving recomputes from the real manager).
+            return None
+        carried = getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None)
+        self._ctx_mla_kv_len_cap = int(carried) if carried else None
+        return self._ctx_mla_kv_len_cap
+
+    @staticmethod
+    def _context_attended_kv_len(ctx_req) -> int:
+        """Attended KV length this context request contributes to total_kv_len this step.
+
+        Cached prefix (post-reuse begin position) plus this chunk's new tokens, clamped to the prompt length.
+        V1 leaves `context_current_position` at 0 with the reuse credit in `estimated_reusable_tokens` (first
+        chunk only); V2 has already advanced `context_current_position`.
+        """
+        begin = ctx_req.context_current_position
+        if ctx_req.is_first_context_chunk:
+            begin = max(begin, ctx_req.estimated_reusable_tokens)
+        attended = begin + ctx_req.context_chunk_size
+        return min(attended, ctx_req.orig_prompt_len)
+
+    def _cap_context_by_total_kv_len(self, context_requests):
+        """Trim scheduled context requests so their summed attended KV length stays within the fp8
+        context-MLA workspace reservation (KV-cache reuse can push total_kv_len far past `max_num_tokens`).
+        The first request is always kept: it attends at most `max_seq_len` and at most its pool, both covered
+        by the cap, so one request always fits and forward progress is guaranteed. Deferred requests stay
+        active and retry next iteration, mirroring `_waiting_requests`.
+        """
+        cap = self._get_ctx_mla_kv_len_cap()
+        if cap is None or len(context_requests) <= 1:
+            return context_requests
+        cumulative = 0
+        for i, ctx_req in enumerate(context_requests):
+            cumulative += self._context_attended_kv_len(ctx_req)
+            if i > 0 and cumulative > cap:
+                logger.debug(
+                    f"Deferring {len(context_requests) - i} context request(s): summed attended "
+                    f"KV length {cumulative} would exceed the fp8 context-MLA workspace cap {cap}."
+                )
+                return context_requests[:i]
+        return context_requests
+
     @nvtx_range("_schedule")
     def _schedule(self):
+        if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
+            self.kv_cache_manager.prepare_expect_snapshot_points(
+                self.active_requests)
+
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
@@ -5245,6 +5387,11 @@ class PyExecutor:
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
+
+        # Cap summed context attended-KV length so the fp8 context-MLA attention workspace stays within the
+        # headroom the estimator reserved for it (no-op for non-fp8-MLA models).
+        scheduled_context_requests = self._cap_context_by_total_kv_len(
+            scheduled_context_requests)
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = scheduler_output.encoder_requests
@@ -5717,7 +5864,30 @@ class PyExecutor:
         token_nums = None
         if (not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None
                 and self.max_num_tokens is not None):
-            token_nums = [self.max_num_tokens]
+            # max_num_tokens is the aggregate per-iteration budget and can
+            # exceed the legal capacity of one sequence.
+            token_num = min(
+                self.max_num_tokens,
+                self.model_engine.max_num_tokens,
+                self.model_engine.max_seq_len,
+                self.kv_cache_manager.max_seq_len,
+            )
+            # One-engine speculative decoding appends extra KV tokens after
+            # add_sequence_batch(). Keep them in the same block count that
+            # the capacity scheduler reserves from the prompt length.
+            extra_kv_tokens = self.kv_cache_manager.num_extra_kv_tokens
+            tokens_per_block = self.kv_cache_manager.tokens_per_block
+            block_capacity = ((token_num + tokens_per_block - 1) //
+                              tokens_per_block) * tokens_per_block
+            token_num = max(1, min(token_num, block_capacity - extra_kv_tokens))
+            token_nums = [token_num]
+
+        if not self._has_adp_dummy_kv_capacity(token_nums):
+            logger.warning_once(
+                "Unable to fit the complete attention-DP dummy KV allocation; "
+                "skipping this forward iteration and retrying",
+                key="attention_dp_dummy_insufficient_kv_capacity")
+            return
 
         if (not self._enable_dsv4_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
@@ -5740,8 +5910,7 @@ class PyExecutor:
         has_live_adp_dummy = any(
             request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
             for request in self.active_requests)
-        if has_live_adp_dummy or not self._has_adp_dummy_kv_capacity(
-                token_nums):
+        if has_live_adp_dummy:
             return
 
         try:
@@ -6196,10 +6365,10 @@ class PyExecutor:
             )
         except Exception:
             # Speculative prefetch is best-effort and must never crash the
-            # executor loop. On failure, `py_mm_encoder_event` is not stamped,
-            # so the next iteration's `_prepare_inputs` falls back to the
-            # standard in-iter encode path (which re-runs `to_device` and the
-            # encoder unconditionally when no cached embedding is present).
+            # executor loop. The dispatch helper stamps an event when it queued
+            # any auxiliary-stream work, even on a partial failure, so the next
+            # iteration can safely inspect the request-local data and fall back
+            # to the standard in-iter encode path for any missing embedding.
             logger.warning(
                 f"Cross-iter MM encoder prefetch failed; falling back to "
                 f"in-iter encode.\n{traceback.format_exc()}")

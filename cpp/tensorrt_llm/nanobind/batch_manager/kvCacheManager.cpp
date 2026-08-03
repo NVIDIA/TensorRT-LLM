@@ -18,6 +18,7 @@
 #include "kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/torch.h"
@@ -348,8 +349,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 
     nb::class_<tbk::PoolConfiguration>(m, "PoolConfiguration")
         .def(nb::init<>())
-        .def(nb::init<SizeType32, SizeType32, nvinfer1::DataType>(), nb::arg("window_size"), nb::arg("size_per_head"),
-            nb::arg("dtype"))
+        .def(nb::init<SizeType32, SizeType32, tensorrt_llm::DataType>(), nb::arg("window_size"),
+            nb::arg("size_per_head"), nb::arg("dtype"))
         .def_rw("window_size", &tbk::PoolConfiguration::windowSize)
         .def_rw("size_per_head", &tbk::PoolConfiguration::sizePerHead)
         .def_rw("dtype", &tbk::PoolConfiguration::dtype);
@@ -661,8 +662,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
     nb::class_<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
         .def(nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
                  std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
-                 std::vector<SizeType32> const&, nvinfer1::DataType, SizeType32, int64_t, SizeType32, SizeType32, bool,
-                 tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
+                 std::vector<SizeType32> const&, tensorrt_llm::DataType, SizeType32, int64_t, SizeType32, SizeType32,
+                 bool, tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
                  std::shared_ptr<tbk::KVCacheEventManager>, bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>,
                  bool, SizeType32, SizeType32, bool, std::optional<tbk::LinearAttentionMetadata>,
                  std::vector<tbk::PoolConfiguration> const&>(),

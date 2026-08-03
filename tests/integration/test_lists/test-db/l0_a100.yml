@@ -52,7 +52,7 @@ l0_a100:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: tensorrt
+      backend: pytorch
   tests:
   - unittest/llmapi/test_llm.py -m "part0"
   - unittest/llmapi/test_llm.py -m "not part0" TIMEOUT (90)

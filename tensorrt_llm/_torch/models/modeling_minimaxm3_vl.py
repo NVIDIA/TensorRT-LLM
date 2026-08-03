@@ -2071,9 +2071,14 @@ def get_minimax_m3_vl_input_processor_cls():
     path. Re-type by dynamic subclassing here so the registered class
     inherits from the base.
     """
-    from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+    from tensorrt_llm.inputs.registry import (
+        BaseMultimodalDummyInputsBuilder,
+        BaseMultimodalInputProcessor,
+    )
 
-    class _Registered(MiniMaxM3VLInputProcessor, BaseMultimodalInputProcessor):
+    class _Registered(
+        MiniMaxM3VLInputProcessor, BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder
+    ):
         pass
 
     _Registered.__name__ = "MiniMaxM3VLInputProcessor"

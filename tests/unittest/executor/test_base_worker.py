@@ -35,6 +35,9 @@ def test_enqueue_request_wraps_lora_load_error():
         raise RuntimeError("bad adapter")
 
     worker = object.__new__(BaseWorker)
+    # GC-time __del__ -> shutdown() reads this; __init__ is bypassed here, so
+    # seed it to keep teardown a clean no-op.
+    worker.doing_shutdown = False
     worker._lora_manager = LoraManager()
     worker._load_lora_adapter = raise_load_error
     request = type(
@@ -176,7 +179,9 @@ class TestRpcWorkerBaseTP2:
         self.session = self.create_worker_session()
 
     def create_worker_session(self):
-        session = MpiPoolSession(n_workers=2)
+        # wait_shutdown: block shutdown until the workers exited, so a test
+        # handed a live pool right after this one cannot race the GPU release.
+        session = MpiPoolSession(n_workers=2, wait_shutdown=True)
         return session
 
     @pytest.mark.gpu2

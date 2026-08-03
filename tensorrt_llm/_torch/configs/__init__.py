@@ -9,6 +9,7 @@ from tensorrt_llm._torch.configs.gemma4_unified import (
 )
 from tensorrt_llm._torch.configs.inkling import InklingConfig, InklingTextConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
+from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
 
 
 def _register_custom_configs_with_transformers() -> None:
@@ -38,6 +39,10 @@ def _register_custom_configs_with_transformers() -> None:
         "kimi_k2": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
         "laguna": LagunaConfig,
+        # minicpmv4_6 is only registered in transformers>=5.7.0; register our
+        # own composite config so AutoTokenizer.from_pretrained works on older
+        # releases (the model itself is built via load_pretrained_config).
+        "minicpmv4_6": MiniCPMV4_6Config,
         "gemma4_unified": Gemma4UnifiedConfig,
         "gemma4_unified_text": Gemma4UnifiedTextConfig,
         "gemma4_unified_vision": Gemma4UnifiedVisionConfig,
@@ -69,4 +74,6 @@ __all__ = [
     "InklingConfig",
     "InklingTextConfig",
     "LagunaConfig",
+    "MiniCPMV4_6Config",
+    "MiniCPMV4_6VisionConfig",
 ]

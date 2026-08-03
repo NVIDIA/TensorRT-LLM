@@ -330,6 +330,173 @@ def _logic_ltx2_av_ulysses_vs_single_gpu(rank, world_size, backend, audio_seq_le
     )
 
 
+def _make_model_config_cfg(
+    cfg_size: int,
+    ulysses_size: int,
+    backend: str = "VANILLA",
+) -> "DiffusionModelConfig":
+    """DiffusionModelConfig with CFG x Ulysses parallelism (dist must be up)."""
+    ws = dist.get_world_size()
+    rk = dist.get_rank()
+    vgm = VisualGenMapping(world_size=ws, rank=rk, cfg_size=cfg_size, ulysses_size=ulysses_size)
+    config = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(),
+        quant_config=QuantConfig(),
+        torch_compile=TorchCompileConfig(enable=False),
+        attention=AttentionConfig(backend=backend),
+        visual_gen_mapping=vgm,
+        cache=None,
+        attention_metadata_state=(
+            create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
+        ),
+        parallel=ParallelConfig(cfg_size=cfg_size, ulysses_size=ulysses_size),
+        skip_create_weights_in_init=False,
+    )
+    config.mapping = vgm.to_llm_mapping()
+    return config
+
+
+def _build_stage2_groups_for_test(vgm):
+    """Mirror of LTX2TwoStagesPipeline._build_stage2_dit_groups."""
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import Stage2Groups
+
+    rank = dist.get_rank()
+    fold = vgm.flatten_cfg_ranks()
+    uly_group = None
+    for ranks in fold:
+        g = dist.new_group(ranks, use_local_synchronization=False)
+        if rank in ranks:
+            uly_group = g
+    flat = [r for ranks in fold for r in ranks]
+    if len(fold) == 1:
+        seq_group, gather_index = uly_group, None
+    else:
+        seq_group = dist.new_group(sorted(flat), use_local_synchronization=False)
+        gather_index = flat
+    return Stage2Groups(
+        ulysses_group=uly_group,
+        seq_group=seq_group,
+        seq_rank=flat.index(rank),
+        seq_size=len(flat),
+        gather_index=gather_index,
+    )
+
+
+def _logic_ltx2_dual_topology(rank, world_size, backend, audio_seq_len):
+    """{default, stage2} switch: stack alternation, shard/gather round-trip,
+    and full-forward numerical equivalence vs the single-GPU reference.
+
+    cfg2 x u(world/2): the default topology shards each cfg branch's sequence
+    over its own fiber; stage2 folds cfg into one world-spanning ulysses group.
+    Stage 2 has no CFG, so a forward on identical inputs must match the
+    reference in BOTH topologies, across repeated back-and-forth switches.
+    """
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel, LTXModelType
+
+    device = torch.device(f"cuda:{rank}")
+    dtype = torch.bfloat16
+    batch = 1
+    v_dims = (1, 4, 4)
+    v_patches = v_dims[0] * v_dims[1] * v_dims[2]  # 16: divisible by u2 and u4
+
+    torch.manual_seed(123)
+    ref_cfg = _make_model_config(ulysses_size=1, backend=backend)
+    ref_model = (
+        LTXModel(model_type=LTXModelType.AudioVideo, model_config=ref_cfg, **_AV_CONFIG)
+        .to(device, dtype=dtype)
+        .eval()
+    )
+    _init_all_weights(ref_model)
+    ref_model.configure_audio_ulysses(audio_seq_len)
+    ref_state = ref_model.state_dict()
+
+    torch.manual_seed(123)
+    d_cfg = _make_model_config_cfg(cfg_size=2, ulysses_size=world_size // 2, backend=backend)
+    s2 = _build_stage2_groups_for_test(d_cfg.visual_gen_mapping)
+    d_model = (
+        LTXModel(
+            model_type=LTXModelType.AudioVideo,
+            model_config=d_cfg,
+            stage2_groups=s2,
+            **_AV_CONFIG,
+        )
+        .to(device, dtype=dtype)
+        .eval()
+    )
+    d_model.load_state_dict(ref_state)
+    d_model.configure_audio_ulysses(audio_seq_len)
+
+    assert d_model._has_stage2
+    assert d_model._sharder.size == world_size // 2
+    assert d_model._sharder_s2.size == world_size
+
+    video, audio, v_ctx, a_ctx, v_pos, a_pos = _build_inputs(
+        batch, v_patches, v_dims, audio_seq_len, dtype, device
+    )
+    ref_cache = ref_model.prepare_text_cache(
+        video_context=v_ctx,
+        video_positions=v_pos,
+        audio_context=a_ctx,
+        audio_positions=a_pos,
+        dtype=dtype,
+    )
+    with torch.no_grad():
+        ref_v, ref_a = ref_model(video=video, audio=audio, text_cache=ref_cache)
+
+    x = torch.randn(1, 32, 8, device=device, dtype=dtype)
+    for is_stage2 in (False, True, False, True):
+        d_model.set_ulysses_topology(is_stage2=is_stage2)
+
+        blk = d_model.transformer_blocks[0]
+        expect = blk.attn1._attn_stage2 if is_stage2 else blk.attn1._attn_default
+        assert blk.attn1.attn is expect, f"Rank {rank}: attn stack not switched"
+        # is_ulysses must track the ACTIVE stack (the pair can differ in type).
+        from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
+
+        for name in ("attn1", "video_to_audio_attn", "audio_attn1"):
+            mod = getattr(blk, name, None)
+            if mod is not None:
+                assert mod.is_ulysses == isinstance(mod.attn, UlyssesAttention), (
+                    f"Rank {rank}: {name}.is_ulysses stale (is_stage2={is_stage2})"
+                )
+        # CONDITIONAL audio mode keeps audio self-attn plain even at ulysses>1.
+        assert not isinstance(blk.audio_attn1.attn, UlyssesAttention), (
+            f"Rank {rank}: audio_attn1 wrapped despite CONDITIONAL mode (is_stage2={is_stage2})"
+        )
+        sh = d_model._active_sharder
+        assert sh.size == (world_size if is_stage2 else world_size // 2)
+        assert torch.equal(sh.gather(sh.shard(x, dim=1), dim=1), x), (
+            f"Rank {rank}: shard/gather round-trip broken (is_stage2={is_stage2})"
+        )
+
+        # prepare_text_cache is topology-dependent — always AFTER the switch.
+        d_cache = d_model.prepare_text_cache(
+            video_context=v_ctx,
+            video_positions=v_pos,
+            audio_context=a_ctx,
+            audio_positions=a_pos,
+            dtype=dtype,
+        )
+        video_i, audio_i, *_ = _build_inputs(batch, v_patches, v_dims, audio_seq_len, dtype, device)
+        with torch.no_grad():
+            d_v, d_a = d_model(video=video_i, audio=audio_i, text_cache=d_cache)
+
+        torch.testing.assert_close(
+            d_v,
+            ref_v,
+            rtol=5e-2,
+            atol=5e-2,
+            msg=f"Rank {rank}: video mismatch (is_stage2={is_stage2})",
+        )
+        torch.testing.assert_close(
+            d_a,
+            ref_a,
+            rtol=5e-2,
+            atol=5e-2,
+            msg=f"Rank {rank}: audio mismatch (is_stage2={is_stage2})",
+        )
+
+
 # =============================================================================
 # Test classes
 # =============================================================================
@@ -357,3 +524,122 @@ class TestLTX2AVUlysses:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _logic_ltx2_full_audio_construction(rank, world_size, backend, audio_seq_len):
+    """Legacy FULL mode at ulysses>1: audio_attn1 is CONSTRUCTED as ulysses (env
+    constant is the only selector) and, given stage-2 groups under cfg2, gets
+    its own distinct {default, stage2} stack pair like attn1/v2a."""
+    import tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 as tl
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel, LTXModelType
+
+    device = torch.device(f"cuda:{rank}")
+    dtype = torch.bfloat16
+
+    orig = tl._LTX2_AUDIO_CONDITIONAL_SHARD
+    tl._LTX2_AUDIO_CONDITIONAL_SHARD = False
+    try:
+        torch.manual_seed(123)
+        d_cfg = _make_model_config_cfg(cfg_size=2, ulysses_size=world_size // 2, backend=backend)
+        s2 = _build_stage2_groups_for_test(d_cfg.visual_gen_mapping)
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo,
+                model_config=d_cfg,
+                stage2_groups=s2,
+                **_AV_CONFIG,
+            )
+            .to(device, dtype=dtype)
+            .eval()
+        )
+        _init_all_weights(model)
+        model.configure_audio_ulysses(audio_seq_len)
+        blk = model.transformer_blocks[0]
+        assert blk.audio_attn1.is_ulysses, "FULL mode must construct ulysses audio_attn1"
+        assert blk.audio_attn1._attn_stage2 is not blk.audio_attn1._attn_default, (
+            "FULL audio_attn1 must get a distinct stage-2 stack under cfg2"
+        )
+        # Both topologies forward without error (audio sharded across the active group).
+        video, audio, v_ctx, a_ctx, v_pos, a_pos = _build_inputs(
+            1, 16, (1, 4, 4), audio_seq_len, dtype, device
+        )
+        for is_stage2 in (False, True, False):
+            model.set_ulysses_topology(is_stage2=is_stage2)
+            cache = model.prepare_text_cache(
+                video_context=v_ctx,
+                video_positions=v_pos,
+                audio_context=a_ctx,
+                audio_positions=a_pos,
+                dtype=dtype,
+            )
+            video_i, audio_i, *_ = _build_inputs(1, 16, (1, 4, 4), audio_seq_len, dtype, device)
+            with torch.no_grad():
+                v, a = model(video=video_i, audio=audio_i, text_cache=cache)
+            assert v.shape[1] == 16 and a.shape[1] == audio_seq_len
+    finally:
+        tl._LTX2_AUDIO_CONDITIONAL_SHARD = orig
+
+
+def _logic_ltx2_stage2_head_divisibility_raises(rank, world_size, backend, _unused):
+    """Construction fails fast when the head count divides the stage-1 ulysses
+    size (u = ws/2) but not the stage-2 group size (cfg*u = ws)."""
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel, LTXModelType
+
+    d_cfg = _make_model_config_cfg(cfg_size=2, ulysses_size=world_size // 2, backend=backend)
+    s2 = _build_stage2_groups_for_test(d_cfg.visual_gen_mapping)
+    bad = dict(
+        _AV_CONFIG,
+        num_attention_heads=6,
+        cross_attention_dim=6 * _AV_CONFIG["attention_head_dim"],
+    )
+    assert 6 % (world_size // 2) == 0 and 6 % world_size != 0
+    try:
+        LTXModel(
+            model_type=LTXModelType.AudioVideo,
+            model_config=d_cfg,
+            stage2_groups=s2,
+            **bad,
+        )
+        raise AssertionError(f"Rank {rank}: indivisible stage-2 head count was not rejected")
+    except ValueError as e:
+        assert "stage-2 ulysses requires" in str(e), f"Rank {rank}: {e}"
+
+
+def _logic_ltx2_trtllm_audio_downgrade_with_stage2(rank, world_size, backend, _unused):
+    """cfg2 x u1 stage-2 fold under a TRTLLM backend: audio may be padded to the
+    stage-2 multiple, whose key_padding_mask TRTLLM drops — audio_attn1 must
+    downgrade to VANILLA at construction even though ulysses_size == 1."""
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel, LTXModelType
+
+    d_cfg = _make_model_config_cfg(cfg_size=2, ulysses_size=1, backend="TRTLLM")
+    s2 = _build_stage2_groups_for_test(d_cfg.visual_gen_mapping)
+    model = LTXModel(
+        model_type=LTXModelType.AudioVideo,
+        model_config=d_cfg,
+        stage2_groups=s2,
+        **_AV_CONFIG,
+    )
+    blk = model.transformer_blocks[0]
+    assert blk.audio_attn1.attn_backend == "VANILLA", (
+        f"Rank {rank}: audio_attn1 backend {blk.audio_attn1.attn_backend}, expected VANILLA"
+    )
+    assert blk.attn1.attn_backend == "TRTLLM", f"Rank {rank}: video attn1 must keep TRTLLM"
+
+
+class TestLTX2TopologySwitch:
+    """{default, stage2} dual-topology switch on 4 GPUs (cfg2 x u2 -> u4):
+    pointer alternation, shard/gather round-trip, and whole-dataflow numerical
+    equivalence vs the single-GPU reference in both topologies."""
+
+    @pytest.mark.parametrize("audio_seq_len", [64, 62], ids=["no_pad", "pad2"])
+    def test_dual_topology_alternation_matches_reference(self, audio_seq_len):
+        run_test_in_distributed(4, _logic_ltx2_dual_topology, "VANILLA", audio_seq_len)
+
+    def test_full_audio_mode_construction_and_switch(self):
+        run_test_in_distributed(4, _logic_ltx2_full_audio_construction, "VANILLA", 64)
+
+    def test_stage2_head_divisibility_raises(self):
+        run_test_in_distributed(4, _logic_ltx2_stage2_head_divisibility_raises, "VANILLA", 0)
+
+    def test_trtllm_audio_downgrade_with_stage2_fold(self):
+        run_test_in_distributed(2, _logic_ltx2_trtllm_audio_downgrade_with_stage2, "TRTLLM", 0)

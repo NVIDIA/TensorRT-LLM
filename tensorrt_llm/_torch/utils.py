@@ -26,6 +26,9 @@ aux_stream_name_list = [
     'MoeOutputMemset',
     'MoeFc2Alpha',
     'EngramPrecompute',
+    'MlaIndexer',
+    'MlaIndexerAux',
+    'MlaCompressor',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -36,6 +39,11 @@ EventType = Enum(
     ['Main', *aux_stream_name_list],
     start=0,
 )
+
+
+def is_gdn_replay_enabled() -> bool:
+    """Return whether GDN replay was explicitly enabled."""
+    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "0") == "1"
 
 
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in

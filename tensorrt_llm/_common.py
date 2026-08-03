@@ -13,12 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ctypes
 import os
 import platform
 import threading
 import time
-from functools import wraps
 from pathlib import Path
 
 import torch
@@ -45,16 +43,6 @@ def _init(log_level: object = None) -> None:
     logger.info("Starting TensorRT LLM init.")
 
     project_dir = str(Path(__file__).parent.absolute())
-
-    # Promote libtensorrt_llm.so symbols to the process's global scope. The KV
-    # cache transfer agent wrappers (libtensorrt_llm_nixl_wrapper.so,
-    # libtensorrt_llm_ucx_wrapper.so) are dlopen'ed at runtime without linking
-    # against libtensorrt_llm.so and resolve its symbols from the global symbol
-    # table, while Python extension modules and their dependencies load with
-    # RTLD_LOCAL. This promotion was previously a side effect of loading the
-    # TensorRT plugin library with RTLD_GLOBAL.
-    if platform.system() != "Windows":
-        ctypes.CDLL(project_dir + "/libs/libtensorrt_llm.so", mode=ctypes.RTLD_GLOBAL)
 
     # Load FT decoder layer and torch custom ops.
     if platform.system() == "Windows":
@@ -89,27 +77,3 @@ def _init(log_level: object = None) -> None:
         print_stacks_thread.start()
 
     logger.info("TensorRT LLM inited.")
-
-
-# TODO: dead on the Python side (no remaining @_is_building users); the IS_BUILDING
-# env var is only read by the C++ isBuilding() in the TensorRT plugins. Remove this
-# together with that C++ half in the C++ decouple step.
-class _BuildingFlag:
-    def __enter__(self):
-        os.environ["IS_BUILDING"] = "1"
-
-    def __exit__(self, type, value, tb):
-        del os.environ["IS_BUILDING"]
-
-
-def _is_building(f):
-    """Use this to decorate functions which are called during engine building/refitting process,
-    otherwise, the plugin registration will fail.
-    """
-
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        with _BuildingFlag():
-            return f(*args, **kwargs)
-
-    return decorated

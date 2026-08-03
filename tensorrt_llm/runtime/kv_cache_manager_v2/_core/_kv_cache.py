@@ -16,7 +16,7 @@
 import array
 import enum
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -37,6 +37,7 @@ from .._common import (
     CudaStream,
     PageIndex,
     PageIndexMode,
+    PageStatus,
     Priority,
     TokenIdExt,
 )
@@ -127,6 +128,58 @@ class SeqBlock:
     def __del__(self) -> None:
         self.tree_block = None
         self.pages.clear()
+
+
+class PlannedDropHandle:
+    """Track committed pages planned for dropping without owning them.
+
+    The handle stores weak references and does not keep pages alive. Dropping it
+    decrements each live page's planned-drop count and removes an already-droppable
+    page from eviction tracking when no plans remain.
+    """
+
+    __slots__ = ("_page_refs",)
+
+    _page_refs: tuple[rawref.ref[CommittedPage], ...] | None
+
+    def __init__(self, pages: Iterable[CommittedPage]) -> None:
+        planned_pages = tuple({id(page): page for page in pages}.values())
+        self._page_refs = tuple(rawref.ref(page) for page in planned_pages)
+        for page in planned_pages:
+            page.planned_drop_count += 1
+
+    def drop(self) -> None:
+        """Apply this drop plan and invalidate the handle.
+
+        A live page is removed from eviction tracking only when this is its final
+        plan and it is already droppable and queued for eviction. Calling this
+        method twice is invalid.
+        """
+        page_refs = self._page_refs
+        if page_refs is None:
+            raise ValueError("Planned drop handle has already been dropped")
+
+        pages = list[CommittedPage]()
+        for page_ref in page_refs:
+            page = page_ref()
+            if page is not None:
+                if page.planned_drop_count <= 0:
+                    raise ValueError("Committed page has no planned drop")
+                pages.append(page)
+
+        self._page_refs = None
+        for page in pages:
+            page.planned_drop_count -= 1
+            if (
+                page.planned_drop_count == 0
+                and page.status == PageStatus.DROPPABLE
+                and page.scheduled_for_eviction
+            ):
+                page.manager.exclude_from_eviction(page)
+
+    def __del__(self) -> None:
+        if self._page_refs is not None:
+            self.drop()
 
 
 class _Status(enum.Enum):
@@ -358,6 +411,9 @@ class _KVCache:
             return KVCacheStatsDelta()
         self.manager.commit_stats(
             self._pending_stats.global_stats, self._pending_stats.iteration_stats_by_life_cycle
+        )
+        self.manager._commit_ssm_snapshot_iteration_stats(
+            self._pending_stats.ssm_snapshot_iteration_stats_by_life_cycle
         )
         request_stats = self._pending_stats.request_stats.copy()
         self._pending_stats.clear()
@@ -964,7 +1020,12 @@ class _KVCache:
                         ),
                         move_ssm=is_end,
                     )
-                if has_partial_snapshot:
+                    # _commit_block transitions out of ALLOWED (to USER_STOP) when a
+                    # block cannot be committed (VIRTUAL_STOP). Stop here so we don't
+                    # re-enter _commit_block on an already-stopped cache.
+                    if self._commit_state != self.CommitState.ALLOWED:
+                        break
+                if has_partial_snapshot and self._commit_state == self.CommitState.ALLOWED:
                     partial_ordinal = BlockOrdinal(new_num_full_blocks)
                     if is_end:
                         self._commit_block(
@@ -992,6 +1053,50 @@ class _KVCache:
     @property
     def reuse_scope(self) -> ReuseScope:
         return self._reuse_scope
+
+    def plan_committed_block_drop(self) -> PlannedDropHandle | None:
+        """Plan dropping pages needed only by the next conversation turn.
+
+        The plan covers committed pages in each SWA life cycle's current
+        attention window and the exact SSM snapshot for the committed prefix.
+        Full-attention and attention-sink blocks are excluded because later
+        turns may still need them. This must be called after stop_committing().
+        Returns None without creating a plan if any required page is unavailable.
+        """
+        if self._commit_state != self.CommitState.USER_STOP:
+            raise LogicError("plan_committed_block_drop() requires stop_committing()")
+
+        if self.num_committed_tokens == 0:
+            return None
+
+        # Locate pages through the radix tree rather than
+        # SeqBlock.tree_block: the latter is not guaranteed to identify a
+        # partial snapshot after reuse. Requiring an exact match keeps the
+        # preceding conversation plan intact if this turn no longer has a
+        # complete reusable endpoint. All PP ranks use the same lookup so
+        # attention-only ranks include the final partial SWA block too.
+        match = self.manager._match_reuse(self.reuse_scope, self._committed_tokens)
+        if match.num_tokens != self.num_committed_tokens or not match.blocks:
+            return None
+
+        end = BlockOrdinal(len(match.blocks))
+        pages_to_drop: list[CommittedPage] = []
+        for lc_idx, lc in self.manager._life_cycles.items():
+            if isinstance(lc, AttnLifeCycle):
+                if lc.window_size is None:
+                    continue
+                stale_range = _KVCache._get_stale_range(
+                    self.tokens_per_block, self.num_committed_tokens, lc
+                )
+                window_start = min(stale_range.end, end)
+            else:
+                window_start = BlockOrdinal(end - 1)
+            for ordinal in typed_range(window_start, end):
+                page = match.blocks[ordinal].get_page(lc_idx)
+                if page is None:
+                    return None
+                pages_to_drop.append(page)
+        return PlannedDropHandle(pages_to_drop)
 
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
@@ -1969,6 +2074,15 @@ class _KVCache:
             )
             snapshot_holder = unwrap_rawref(snapshot_ref).hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
+        if should_record_stats and ssm_lc_id is not None:
+            changed = self._pending_stats.record_ssm_snapshot_lookup(
+                ssm_lc_id,
+                lookup_tokens=match.num_lookup_tokens,
+                reused_tokens=num_tokens,
+                tokens_per_block=tokens_per_block,
+            )
+            if changed:
+                self.manager.mark_stats_dirty(self.id)
         self._num_committed_blocks = BlockOrdinal(len(self._committed_tokens) // tokens_per_block)
         for beam_indices in self._base_page_indices:
             for indices in beam_indices:
