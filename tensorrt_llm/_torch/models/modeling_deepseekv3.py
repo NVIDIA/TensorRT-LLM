@@ -752,7 +752,8 @@ class DeepseekV3Attention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
@@ -777,7 +778,7 @@ class DeepseekV3Attention(MLA):
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
-                         aux_stream=aux_stream,
+                         aux_stream_dict=aux_stream_dict,
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
@@ -801,7 +802,8 @@ class DeepseekV32Attention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
@@ -827,7 +829,7 @@ class DeepseekV32Attention(MLA):
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
-                         aux_stream=aux_stream,
+                         aux_stream_dict=aux_stream_dict,
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
 
@@ -1275,14 +1277,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.self_attn = DeepseekV32Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
-                aux_stream=aux_stream_dict[AuxStreamType.Attention],
+                aux_stream_dict=aux_stream_dict,
                 mapping_with_cp=mapping_with_cp,
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
         else:
             self.self_attn = DeepseekV3Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
-                aux_stream=aux_stream_dict[AuxStreamType.Attention],
+                aux_stream_dict=aux_stream_dict,
                 mapping_with_cp=mapping_with_cp,
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
 
@@ -1898,25 +1900,14 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     def get_preferred_transceiver_runtime(cls,
                                           pretrained_config: Any = None
                                           ) -> Optional[Literal["PYTHON"]]:
-        """GLM-5 family checkpoints default to the Python (v2) KV-cache transceiver.
+        """``DeepseekV3ForCausalLM``, ``DeepseekV32ForCausalLM``, and ``GlmMoeDsaForCausalLM`` all prefer the Python (v2) KV-cache transceiver.
 
-        This implementation class is shared by DeepSeek-V3/V3.2 and the GLM-5 family — both
-        GLM-5 and GLM-5.2 declare ``GlmMoeDsaForCausalLM`` / ``glm_moe_dsa`` — so the preference
-        is differentiated per checkpoint: only GLM checkpoints opt into the Python transceiver.
-        The MLA backbone transfers a large latent KV, which the Python transceiver handles better
-        in disaggregated serving. This is only adopted when the user leaves
-        ``cache_transceiver_config.transceiver_runtime`` at 'auto' and the effective backend is
-        NIXL; otherwise the C++ transceiver is used.
+        All three use MLA attention (``DeepseekV3Attention`` and ``DeepseekV32Attention`` both
+        extend ``MLA``), which transfers a large latent KV that the Python transceiver handles
+        better in disaggregated serving. Applied only when ``transceiver_runtime`` is 'auto'
+        and the backend is NIXL.
         """
-        if pretrained_config is None:
-            return None
-        architectures = getattr(pretrained_config, 'architectures', None) or []
-        # model_type is checked as a fallback: it is 'glm_moe_dsa' on GLM
-        # checkpoints until __init__ rewrites it to 'deepseek_v32'.
-        if ("GlmMoeDsaForCausalLM" in architectures or getattr(
-                pretrained_config, 'model_type', None) == 'glm_moe_dsa'):
-            return "PYTHON"
-        return None
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
