@@ -31,9 +31,8 @@ The public ``trtllm::kda_prefill`` operator returns only the KDA output and
 final recurrent state. Intermediate matrices remain private runner workspace.
 """
 
-from typing import Optional, Tuple
-
 import weakref
+from typing import Optional, Tuple
 
 import torch
 
@@ -70,6 +69,51 @@ def _ct(t, etype):
     r = from_dlpack(t, assumed_align=16)
     r.element_type = etype
     return r
+
+
+def _fits_32bit_stride(tensor: torch.Tensor) -> bool:
+    int32_max = 2**31 - 1
+    max_offset = int(tensor.storage_offset())
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        stride = abs(int(stride))
+        if stride > int32_max:
+            return False
+        if size:
+            max_offset += (int(size) - 1) * stride
+            if max_offset > int32_max:
+                return False
+    return True
+
+
+def _dynamic_dlpack_arg(tensor: torch.Tensor):
+    wrapper = from_dlpack(
+        tensor,
+        assumed_align=16,
+        use_32bit_stride=_fits_32bit_stride(tensor),
+    )
+    for dim, stride in enumerate(tensor.stride()):
+        if stride == 1:
+            return wrapper.mark_layout_dynamic(dim)
+    return wrapper
+
+
+def _layout_key(tensor: torch.Tensor):
+    return (
+        tensor.dtype,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        _fits_32bit_stride(tensor),
+    )
+
+
+def _dynamic_vector_layout_key(tensor: torch.Tensor):
+    """Key a 1D CuTe argument whose sole extent is runtime dynamic."""
+    assert tensor.ndim == 1
+    return (
+        tensor.dtype,
+        tuple(tensor.stride()),
+        _fits_32bit_stride(tensor),
+    )
 
 
 def _current_cu_stream(device):
@@ -331,8 +375,7 @@ def _get_padded_input_buffers(B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta,
     return e
 
 
-def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT,
-                 varlen=False):
+def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=False):
     """All beta fusion lives in akk_inv kernel epilogue (post-inv column-scale)."""
     key = (dev.index or 0, B, T, H, K_dim, V_dim, NT, N_seqs, varlen)
     if key not in _buf_cache:
@@ -475,7 +518,6 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT,
 def _launch_k4_persistent(
     cute_wrappers,
     v_beta,
-    S_in,
     S_out,
     cu_seqlens,
     chunk_offsets,
@@ -484,6 +526,9 @@ def _launch_k4_persistent(
     H=None,
     V_dim=None,
     use_fast_sync=False,
+    state_pool=None,
+    state_indices=None,
+    has_initial_states=None,
 ):
     """Launch persistent K4 with cached CuTe wrappers.
 
@@ -498,7 +543,13 @@ def _launch_k4_persistent(
     dev = v_beta.device
     dev_idx = dev.index or 0
 
-    s_ct = cute_wrappers["s_ct"]
+    use_indexed_state = state_pool is not None
+    if use_indexed_state:
+        if state_indices is None or has_initial_states is None:
+            raise ValueError("Indexed KDA prefill requires state_indices and has_initial_states.")
+        s_ct = _dynamic_dlpack_arg(state_pool)
+    else:
+        s_ct = cute_wrappers["s_ct"]
     a_ct = cute_wrappers["a_ct"]
     b_ct = cute_wrappers["ks_ct"]  # raw k_scaled (beta absorbed in akk_inv)
     q_ct = cute_wrappers["qs_ct"]
@@ -519,6 +570,14 @@ def _launch_k4_persistent(
     else:
         cu_ct, co_ct = _get_k4_varlen_cu_co(cu_seqlens, chunk_offsets)
 
+    if use_indexed_state:
+        state_indices_ct = _dynamic_dlpack_arg(state_indices)
+        has_initial_states_ct = _dynamic_dlpack_arg(has_initial_states)
+    else:
+        # These arguments are compile-time dead on the legacy path.
+        state_indices_ct = cu_ct
+        has_initial_states_ct = cu_ct
+
     # Allocate for the maximum persistent grid once. The scheduler applies
     # min(N_seqs * H, num_sm) at runtime, so pre-minimizing here would turn
     # every distinct request count into another compiled host function.
@@ -538,7 +597,7 @@ def _launch_k4_persistent(
     # Launch on torch's CURRENT stream — see _current_cu_stream.
     stream = _current_cu_stream(dev)
 
-    k4_fn = cute_wrappers.get("_k4_fn")
+    k4_fn = None if use_indexed_state else cute_wrappers.get("_k4_fn")
     if k4_fn is None:
         # H and the state K/V dims MUST be in the key: s_ct bakes the inner
         # [H, K, V] shape and all strides at compile time
@@ -550,10 +609,26 @@ def _launch_k4_persistent(
         # regression whenever another head count compiled first in the same
         # process (isolated processes were clean). N_seqs and the token/chunk
         # counts stay runtime — only layout-baked dims belong here.
-        cache_key = (dev_idx, num_sm, H, S_out.shape[-2], V_dim)
+        if use_indexed_state:
+            cache_key = (
+                dev_idx,
+                num_sm,
+                H,
+                state_pool.shape[-1],
+                V_dim,
+                True,
+                _layout_key(state_pool),
+                # The sole dimension of these vectors is marked dynamic by
+                # _dynamic_dlpack_arg. Excluding its runtime extent lets the
+                # warmup compile serve full and underfilled context batches.
+                _dynamic_vector_layout_key(state_indices),
+                _dynamic_vector_layout_key(has_initial_states),
+            )
+        else:
+            cache_key = (dev_idx, num_sm, H, S_out.shape[-2], V_dim, False)
         k4_fn = _k4p_cache.get(cache_key)
         if k4_fn is None:
-            host_fn = _k4p_make_host(num_sm=num_sm)
+            host_fn = _k4p_make_host(num_sm=num_sm, use_indexed_state=use_indexed_state)
             k4_fn = cute.compile(
                 host_fn,
                 a_ct,
@@ -565,6 +640,8 @@ def _launch_k4_persistent(
                 o_ct,
                 gk_ct,
                 s_ct,
+                state_indices_ct,
+                has_initial_states_ct,
                 cu_ct,
                 co_ct,
                 tm_ct,
@@ -572,7 +649,8 @@ def _launch_k4_persistent(
                 stream,
             )
             _k4p_cache[cache_key] = k4_fn
-        cute_wrappers["_k4_fn"] = k4_fn
+        if not use_indexed_state:
+            cute_wrappers["_k4_fn"] = k4_fn
 
     args = (
         a_ct,
@@ -584,6 +662,8 @@ def _launch_k4_persistent(
         o_ct,
         gk_ct,
         s_ct,
+        state_indices_ct,
+        has_initial_states_ct,
         cu_ct,
         co_ct,
         tm_ct,
@@ -792,10 +872,8 @@ def _launch_fused_k123_inv(
             stream,
         )
     akk_fn = _akk_inv_cache[akk_cache_key]
-    akk_args = (akk_in_view, akk_out_view, beta_ct, B, NT, akk_cu_ct,
-                akk_ci_ct, T_val, stream)
+    akk_args = (akk_in_view, akk_out_view, beta_ct, B, NT, akk_cu_ct, akk_ci_ct, T_val, stream)
     akk_fn(*akk_args)
-
 
 
 # ========== Fused K1234 compilation cache ==========
@@ -898,14 +976,31 @@ def _chunk_kda_fwd(
     return_intermediate_states: bool = False,
     cp_context=None,
     use_fused_k1234: bool = False,
+    state_pool: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_states: torch.Tensor | None = None,
 ):
     """KDA forward — optimized, FLA-compatible interface."""
     if safe_gate and lower_bound is None:
         lower_bound = -5.0
 
+    use_indexed_state = state_pool is not None
+    if use_indexed_state:
+        if initial_state is not None or output_final_state:
+            raise ValueError(
+                "Indexed KDA prefill mutates state_pool in place and does not "
+                "accept initial_state or output_final_state=True."
+            )
+        if state_indices is None or has_initial_states is None:
+            raise ValueError("Indexed KDA prefill requires state_indices and has_initial_states.")
+        if use_fused_k1234:
+            raise ValueError("Indexed KDA prefill is not supported by fused K1234.")
+
     is_varlen = cu_seqlens is not None
 
     if q.shape[1] == 0:
+        if use_indexed_state:
+            raise ValueError("Indexed KDA prefill does not support an empty token batch.")
         # Zero-token call: the runtime can emit a context batch whose token
         # payload is empty (observed under the overlap scheduler + logprobs
         # flows; the FLA fallback tolerates it). No tokens means no output
@@ -923,10 +1018,8 @@ def _chunk_kda_fwd(
             # pool the initial state may alias.
             final_state = initial_state.to(torch.float32).clone()
         else:
-            final_state = torch.zeros(
-                n_seqs, H, K, V_dim, dtype=torch.float32, device=q.device)
-        return (o, final_state, None, None, None, None, None, None, None,
-                None, None, initial_state)
+            final_state = torch.zeros(n_seqs, H, K, V_dim, dtype=torch.float32, device=q.device)
+        return (o, final_state, None, None, None, None, None, None, None, None, None, initial_state)
 
     # ===== Fused K1234 path (eqlen only, single kernel launch) =====
     if use_fused_k1234 and not is_varlen:
@@ -1028,7 +1121,8 @@ def _chunk_kda_fwd(
         assert cur_T % BT == 0 and cur_T >= real_T, (
             f"varlen single-seq path expects caller-padded input "
             f"(T={cur_T}, seqlen={real_T}); see "
-            "KDAKernelDispatch.prefill_chunk_kda")
+            "KDAKernelDispatch.prefill_chunk_kda"
+        )
         g_pad = _get_g_sentinel_buffer(B, cur_T, H, K, g.dtype, g.device, real_T)
         g_pad[:, :real_T].copy_(g[:, :real_T])
         g = g_pad
@@ -1060,7 +1154,8 @@ def _chunk_kda_fwd(
             # KDAKernelDispatch.prefill_chunk_kda.
             raise ValueError(
                 f"kda_prefill requires >= 4 total varlen chunks (got {NT}); "
-                "route small varlen batches to the FLA fallback")
+                "route small varlen batches to the FLA fallback"
+            )
         N_seqs = len(cu_seqlens) - 1
     else:
         NT = T // BT
@@ -1079,24 +1174,28 @@ def _chunk_kda_fwd(
         cu_eqlen,
         co_eqlen,
         cute_wrappers,
-    ) = _get_buffers(device, k.dtype, B, T, H, K, V_dim, NT, N_seqs, BT,
-                     varlen=is_varlen)
+    ) = _get_buffers(device, k.dtype, B, T, H, K, V_dim, NT, N_seqs, BT, varlen=is_varlen)
 
     # ===== State copy on side stream, parallel with K123 =====
     # K4 needs S_out populated with initial_state. By doing this copy on a
     # side stream BEFORE K123 launches, the D2D memcpy overlaps with K123's
     # compute. Especially big win for high-N_seqs varlen where state is huge
     # (192MB for N=32, ~64us memcpy) — would otherwise serialize before K4.
-    if initial_state is None:
+    if use_indexed_state:
+        S_in = None
+        needs_copy = False
+    elif initial_state is None:
         S_in = torch.zeros(N_seqs, H, K, V_dim, dtype=torch.float32, device=device)
+        needs_copy = True
     else:
         S_in = initial_state
+        needs_copy = S_in.data_ptr() != S_out.data_ptr()
+
     # Current stream per call — never the buffer-creation-time stream (the
     # executor creates buffers under warmup's stream and calls under
     # execution_stream; syncing against a stale stream un-orders the copy).
     main_stream = torch.cuda.current_stream(device)
     side_stream = cute_wrappers["side_stream"]
-    needs_copy = S_in.data_ptr() != S_out.data_ptr()
     if needs_copy:
         side_stream.wait_stream(main_stream)
         with torch.cuda.stream(side_stream):
@@ -1145,7 +1244,6 @@ def _chunk_kda_fwd(
     _launch_k4_persistent(
         cute_wrappers,
         v,
-        S_in,
         S_out,
         cu_for_k4,
         chunk_offsets_for_k4,
@@ -1153,6 +1251,9 @@ def _chunk_kda_fwd(
         H=H,
         V_dim=V_dim,
         use_fast_sync=(not is_varlen),
+        state_pool=state_pool,
+        state_indices=state_indices,
+        has_initial_states=has_initial_states,
     )
 
     o = O_flat
@@ -1165,7 +1266,7 @@ def _chunk_kda_fwd(
         A_qk_out = A_qk_out[:, :real_T]
         A_kk_out = A_kk_out[:, :real_T]
     # multiseq_info is always None here (Phase 2.2 disabled — see above)
-    final_state = S_out if output_final_state else None
+    final_state = S_out if output_final_state and not use_indexed_state else None
 
     return (
         o,
@@ -1207,6 +1308,9 @@ class KdaPrefillRunner:
         disable_recompute: bool = False,
         return_intermediate_states: bool = False,
         use_fused_k1234: bool = False,
+        state_pool: Optional[torch.Tensor] = None,
+        state_indices: Optional[torch.Tensor] = None,
+        has_initial_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA prefill and return output plus final recurrent state."""
         if not IS_CUTLASS_DSL_AVAILABLE:
@@ -1234,8 +1338,67 @@ class KdaPrefillRunner:
             disable_recompute=disable_recompute,
             return_intermediate_states=return_intermediate_states,
             use_fused_k1234=use_fused_k1234,
+            state_pool=state_pool,
+            state_indices=state_indices,
+            has_initial_states=has_initial_states,
         )
         return result[0], result[1]
+
+
+def _validate_indexed_state_pool(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_states: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
+) -> None:
+    num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    H, K, V = q.shape[2], q.shape[3], v.shape[3]
+    if state_pool.dtype != torch.float32 or state_pool.ndim != 4:
+        raise ValueError(
+            "Expected state_pool to be a rank-4 fp32 tensor with shape [slots, H, V, K]."
+        )
+    if state_pool.shape[1:] != (H, V, K):
+        raise ValueError(
+            f"Expected state_pool shape [slots, {H}, {V}, {K}], got {tuple(state_pool.shape)}."
+        )
+    expected_inner_strides = (V * K, K, 1)
+    if state_pool.stride()[1:] != expected_inner_strides:
+        raise ValueError(
+            "Indexed KDA prefill requires dense H/V/K inner dimensions; "
+            f"expected strides {expected_inner_strides}, got "
+            f"{state_pool.stride()[1:]}."
+        )
+    if state_pool.stride(0) < H * V * K or state_pool.stride(0) % 4 != 0:
+        raise ValueError(
+            "Indexed KDA prefill requires a non-overlapping, 16-byte-aligned slot stride."
+        )
+    if state_pool.data_ptr() % 16 != 0:
+        raise ValueError("Indexed KDA prefill requires a 16-byte-aligned state pool.")
+    if state_indices.ndim != 1 or state_indices.shape[0] != num_sequences:
+        raise ValueError(
+            f"Expected state_indices shape [{num_sequences}], got {tuple(state_indices.shape)}."
+        )
+    if state_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("state_indices must have dtype int32 or int64.")
+    if not state_indices.is_contiguous():
+        raise ValueError("state_indices must be contiguous.")
+    if has_initial_states.ndim != 1 or has_initial_states.shape[0] != num_sequences:
+        raise ValueError(
+            f"Expected has_initial_states shape [{num_sequences}], got "
+            f"{tuple(has_initial_states.shape)}."
+        )
+    if has_initial_states.dtype != torch.bool or not has_initial_states.is_contiguous():
+        raise ValueError("has_initial_states must be a contiguous bool tensor.")
+    for name, tensor in (
+        ("q", q),
+        ("v", v),
+        ("state_indices", state_indices),
+        ("has_initial_states", has_initial_states),
+    ):
+        if tensor.device != state_pool.device:
+            raise ValueError(f"{name} and state_pool must be on the same device.")
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -1329,3 +1492,84 @@ if IS_CUTLASS_DSL_AVAILABLE:
         else:
             final_state = q.new_empty(0, dtype=torch.float32)
         return output, final_state
+
+    @torch.library.custom_op(
+        "trtllm::kda_prefill_indexed",
+        mutates_args=("state_pool",),
+        device_types="cuda",
+    )
+    def kda_prefill_indexed(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        scale: float,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        chunk_indices: Optional[torch.Tensor] = None,
+        chunk_size: int = 64,
+        safe_gate: bool = False,
+        lower_bound: Optional[float] = None,
+        use_gate_in_kernel: bool = False,
+        A_log: Optional[torch.Tensor] = None,
+        dt_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run KDA prefill directly against a V-first recurrent-state pool."""
+        _validate_indexed_state_pool(
+            q,
+            v,
+            state_pool,
+            state_indices,
+            has_initial_states,
+            cu_seqlens,
+        )
+        output, _ = KdaPrefillRunner.forward(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            scale=scale,
+            dt_bias=dt_bias,
+            initial_state=None,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=use_gate_in_kernel,
+            state_pool=state_pool,
+            state_indices=state_indices,
+            has_initial_states=has_initial_states,
+        )
+        return output
+
+    @kda_prefill_indexed.register_fake
+    def _(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        scale: float,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        chunk_indices: Optional[torch.Tensor] = None,
+        chunk_size: int = 64,
+        safe_gate: bool = False,
+        lower_bound: Optional[float] = None,
+        use_gate_in_kernel: bool = False,
+        A_log: Optional[torch.Tensor] = None,
+        dt_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del q, k, g, beta, state_pool, state_indices, has_initial_states
+        del scale, cu_seqlens, chunk_indices, chunk_size, safe_gate
+        del lower_bound, use_gate_in_kernel, A_log, dt_bias
+        return v.new_empty(v.shape)

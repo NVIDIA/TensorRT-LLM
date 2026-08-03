@@ -138,6 +138,16 @@ def _read_fused_finalize_ar_rms_max_tokens() -> int:
 
 _K3_FUSED_MOE_FINALIZE_AR_RMS_MAX_TOKENS = _read_fused_finalize_ar_rms_max_tokens()
 
+_KDA_FUSED_STATE_IO_ENV = "TLLM_KDA_USE_FUSED_STATE_IO"
+
+
+def _fused_prefill_state_io_enabled() -> bool:
+    value = os.environ.get(_KDA_FUSED_STATE_IO_ENV, "1")
+    if value not in ("0", "1"):
+        raise ValueError(f"{_KDA_FUSED_STATE_IO_ENV} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
 
 # Routed-expert MoE TP/EP split overrides (read per model init, not import).
@@ -1044,6 +1054,7 @@ class KimiKDARuntime(nn.Module):
 
         lin = cfg.linear_attn_config
         self.layer_idx = layer_idx
+        self._use_fused_prefill_state_io = _fused_prefill_state_io_enabled()
         self._use_indexed_ssm_pool = _KDA_INDEXED_STATE_POOL_ENABLED
         # Attention-family TP semantics (Qwen3-Next GatedDeltaNet pattern,
         # gdn_mixer.py): replicated under attention-DP — each rank runs
@@ -1336,15 +1347,23 @@ class KimiKDARuntime(nn.Module):
         # Initial states: present for continuation chunks (chunked prefill)
         # and for prefix-cache hits (block reuse), where the previous
         # conv/recurrent state was onboarded into this request's slot.
+        has_init = mamba_metadata.has_initial_states[:num_prefills]
+        use_indexed_state = self._use_fused_prefill_state_io and mixer.can_use_indexed_prefill(
+            state_pool=ssm_pool,
+            state_indices=slot_indices,
+            has_initial_states=has_init,
+            cu_seqlens=cu_seqlens,
+            num_tokens=x2d.shape[0],
+        )
         conv_q_in = conv_k_in = conv_v_in = None
         recurrent_in = None
         if mamba_metadata.use_initial_states:
-            has_init = mamba_metadata.has_initial_states[:num_prefills]
             cs = conv_pool.index_select(0, slot_indices)
             cs[~has_init] = 0
             conv_q_in, conv_k_in, conv_v_in = _kda_split_conv_sections(cs, d)
-            recurrent_in = ssm_pool.index_select(0, slot_indices)
-            recurrent_in[~has_init] = 0
+            if not use_indexed_state:
+                recurrent_in = ssm_pool.index_select(0, slot_indices)
+                recurrent_in[~has_init] = 0
 
         q, conv_q = mixer.q_conv1d(
             q_proj_states, cache=conv_q_in, output_final_state=True, cu_seqlens=cu_seqlens
@@ -1365,9 +1384,9 @@ class KimiKDARuntime(nn.Module):
         k = rearrange(k, "... (h d) -> ... h d", d=mixer.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=mixer.head_dim)
 
-        # Kernel dispatch (in-tree trtllm::kda_prefill or FLA chunk_kda).
-        # Both paths exchange states in the pool's V-first [N, H, V, K]
-        # layout, so recurrent_in / final_state map to ssm_pool 1:1.
+        # The indexed optimized path reads and writes the V-first pool
+        # directly. Unsupported layouts/batches retain the original
+        # gather/transpose/op/transpose/scatter path.
         lower_bound = mixer.gate_lower_bound
         o, final_state = mixer.prefill_chunk_kda(
             q=q,
@@ -1382,13 +1401,18 @@ class KimiKDARuntime(nn.Module):
             safe_gate=lower_bound is not None,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
+            state_pool=ssm_pool if use_indexed_state else None,
+            state_indices=slot_indices if use_indexed_state else None,
+            has_initial_states=has_init if use_indexed_state else None,
         )
 
         # Persist per-request states into the pools.
         conv_pool.index_copy_(
             0, slot_indices, torch.cat([conv_q, conv_k, conv_v], dim=1).to(conv_pool.dtype)
         )
-        ssm_pool.index_copy_(0, slot_indices, final_state.to(ssm_pool.dtype))
+        if not use_indexed_state:
+            assert final_state is not None
+            ssm_pool.index_copy_(0, slot_indices, final_state.to(ssm_pool.dtype))
         # Fused-verify replay caches: seed the committed conv window so the
         # first verify round convolves the correct history (pending drafts
         # are zero for a fresh request, so the tail columns are unused).

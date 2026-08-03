@@ -303,6 +303,10 @@ class KimiKDALinearAttention(nn.Module):
         """
         return self._dispatch.prefill_chunk_kda(**kwargs)
 
+    def can_use_indexed_prefill(self, **kwargs) -> bool:
+        """Return whether prefill can update a recurrent-state pool directly."""
+        return self._dispatch.can_use_indexed_prefill(**kwargs)
+
     # ------------------------------------------------------------------
     # Prefill entry (Goal 2.1 pass path).
     # ------------------------------------------------------------------
@@ -414,11 +418,9 @@ class KimiKDALinearAttention(nn.Module):
         assert q_len == 1, f"KimiKDALinearAttention.forward_decode expects T=1, got T={q_len}"
 
         if self._dispatch.decode_kernel_path == KimiKDAKernelPath.OPTIMIZED:
-            return self._decode_via_optimized(hidden_states, cache, b,
-                                              ssm_state_indices)
+            return self._decode_via_optimized(hidden_states, cache, b, ssm_state_indices)
         if ssm_state_indices is not None:
-            raise ValueError(
-                "ssm_state_indices requires the optimized KDA decode kernel")
+            raise ValueError("ssm_state_indices requires the optimized KDA decode kernel")
         return self._decode_via_fla(hidden_states, cache, b)
 
     # ------------------------------------------------------------------
@@ -452,19 +454,20 @@ class KimiKDALinearAttention(nn.Module):
         # their own calls.
         fused_qkvg = getattr(self, "qkvg_proj", None)
         if fused_qkvg is not None:
-            parts = fused_qkvg(hidden_states).split(self.qkvg_split_sizes,
-                                                    dim=-1)
-            q_proj_states, k_proj_states, v_proj_states = parts[0], parts[
-                1], parts[2]
-            onorm_g_hidden = parts[3] if self.use_full_rank_gate else \
-                self.g_b_proj(self.g_a_proj(hidden_states))
+            parts = fused_qkvg(hidden_states).split(self.qkvg_split_sizes, dim=-1)
+            q_proj_states, k_proj_states, v_proj_states = parts[0], parts[1], parts[2]
+            onorm_g_hidden = (
+                parts[3] if self.use_full_rank_gate else self.g_b_proj(self.g_a_proj(hidden_states))
+            )
         else:
             q_proj_states = self.q_proj(hidden_states)
             k_proj_states = self.k_proj(hidden_states)
             v_proj_states = self.v_proj(hidden_states)
-            onorm_g_hidden = self.g_proj(hidden_states) \
-                if self.use_full_rank_gate else \
-                self.g_b_proj(self.g_a_proj(hidden_states))
+            onorm_g_hidden = (
+                self.g_proj(hidden_states)
+                if self.use_full_rank_gate
+                else self.g_b_proj(self.g_a_proj(hidden_states))
+            )
 
         g_hidden = self.f_b_proj(self.f_a_proj(hidden_states))
 
@@ -526,17 +529,13 @@ class KimiKDALinearAttention(nn.Module):
         if cache is not None and cache.recurrent_state is not None:
             if ssm_state_indices is not None:
                 if self.wrong_state_layout:
-                    raise ValueError(
-                        "ssm_state_indices is incompatible with wrong_state_layout"
-                    )
+                    raise ValueError("ssm_state_indices is incompatible with wrong_state_layout")
                 state_full = cache.recurrent_state
             else:
-                state_full = cache.recurrent_state.to(
-                    dtype=torch.float32).contiguous()
+                state_full = cache.recurrent_state.to(dtype=torch.float32).contiguous()
         else:
             if ssm_state_indices is not None:
-                raise ValueError(
-                    "ssm_state_indices requires a recurrent state pool")
+                raise ValueError("ssm_state_indices requires a recurrent state pool")
             state_full = torch.zeros(b, HV, V_dim, K_dim, device=dev, dtype=torch.float32)
 
         # The decode op requires fp32 A_log/dt_bias even in a bf16-cast module.
