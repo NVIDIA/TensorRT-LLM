@@ -269,6 +269,11 @@ class DiffusionResponse:
             model-specific fields populated. Set to ``None`` on the error
             path; on the READY signal it carries a ``dict`` instead.
         error_msg: Error message if generation failed.
+        error_type: Failure class when ``error_msg`` is set: ``"client"``
+            (unusable request content → 400 / ``ValueError``), ``"capacity"``
+            (valid request does not fit the deployment → 503 /
+            ``MemoryError``), or ``None`` for unclassified runtime failures
+            (500 / ``RuntimeError``).
         generation: Wall-clock time the executor measured around request
             preparation and the engine's inference call (host
             ``time.perf_counter()``), in seconds. Default ``0.0`` so the
@@ -279,6 +284,7 @@ class DiffusionResponse:
     request_id: int
     output: Optional[PipelineOutput] = None
     error_msg: Optional[str] = None
+    error_type: Optional[str] = None
     generation: float = 0.0
 
 
@@ -485,7 +491,11 @@ class DiffusionExecutor:
             logger.error(traceback.format_exc())
             if self.rank == 0:
                 self.response_queue.put(
-                    DiffusionResponse(request_id=req.request_id, error_msg=str(e))
+                    DiffusionResponse(
+                        request_id=req.request_id,
+                        error_msg=str(e),
+                        error_type=self.pipeline.classify_request_failure(e),
+                    )
                 )
 
     def _reset_cuda_peak_memory_stats(self) -> None:

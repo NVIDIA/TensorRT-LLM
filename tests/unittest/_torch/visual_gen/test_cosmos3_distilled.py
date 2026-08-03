@@ -24,6 +24,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     load_scheduler,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+from tensorrt_llm._torch.visual_gen.profiler import VisualGenProfiler
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
@@ -76,10 +77,10 @@ def _base_policy() -> Cosmos3SamplingPolicy:
 
 
 def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
-    """A pipeline instance without heavyweight __init__; ``rank``/``dtype``/
-    ``device`` are BasePipeline properties and must not be set here."""
+    """A pipeline instance without heavyweight ``__init__``."""
     pipeline = object.__new__(Cosmos3OmniMoTPipeline)
     defaults = dict(
+        _device=torch.device("cpu"),
         audio_gen=False,
         action_gen=False,
         sampling=Cosmos3SamplingPolicy(),
@@ -527,10 +528,8 @@ def _denoise_ready_pipeline() -> Cosmos3OmniMoTPipeline:
     return _bare_pipeline(
         pipeline_config=SimpleNamespace(visual_gen_mapping=None),
         cache_accelerator=None,
-        _predenoise_pending=False,
-        _postdenoise_pending=False,
         _is_warmup=False,
-        _profile_range=None,
+        _profiler=VisualGenProfiler(),
     )
 
 
@@ -802,16 +801,20 @@ class TestSystemPromptDefault:
         pipeline = self._loaded_pipeline(tmp_path)
 
         assert pipeline.default_use_system_prompt is True
-        assert pipeline.extra_param_specs["use_system_prompt"].default is True
-        # The shared spec table must stay untouched (model_copy, not mutation).
+        # The published spec default stays None ("model decides"): the executor
+        # materializes spec defaults into every request, so publishing the
+        # checkpoint boolean here would destroy "unset" before forward() could
+        # resolve it by mode. The checkpoint value lives on the pipeline.
+        assert pipeline.extra_param_specs["use_system_prompt"].default is None
+        # The shared spec table must stay untouched.
         from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
 
-        assert COSMOS3_EXTRA_SPECS["use_system_prompt"].default is False
+        assert COSMOS3_EXTRA_SPECS["use_system_prompt"].default is None
 
     def test_missing_model_index_keeps_false(self, tmp_path):
         pipeline = self._loaded_pipeline(tmp_path)
         assert pipeline.default_use_system_prompt is False
-        assert pipeline.extra_param_specs["use_system_prompt"].default is False
+        assert pipeline.extra_param_specs["use_system_prompt"].default is None
 
     def test_model_index_without_field_keeps_false(self, tmp_path):
         self._write_model_index(tmp_path, {"_class_name": "Cosmos3OmniPipeline"})
@@ -942,3 +945,130 @@ class TestRegistryDispatch:
         entry = PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"]
         assert "nvidia/Cosmos3-Super-Text2Image-4Step" in entry.hf_ids
         assert "nvidia/Cosmos3-Super-Image2Video-4Step" in entry.hf_ids
+
+
+class TestDistilledForwardDefaults:
+    """A distilled checkpoint's step count and guidance are checkpoint facts.
+
+    Requests through ``infer()`` carry them already, merged from
+    ``default_generation_params``. A direct ``forward()`` leaving them unset
+    passes ``validate_request`` (it only rejects *conflicting* values), so
+    without checkpoint-first resolution it would fall through to the base mode
+    tables and run CFG at 6.0 against weights with guidance baked in.
+    """
+
+    def _resolved_recipe(self, monkeypatch, **forward_kwargs):
+        """Run forward() far enough to see the recipe it reports, then bail."""
+        import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as mod
+
+        pipeline = _bare_pipeline(sampling=_distilled_policy())
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.scheduler = SimpleNamespace(config=SimpleNamespace(flow_shift=1.0))
+
+        class StopAfterDims(Exception):
+            pass
+
+        def stop(*args, **kwargs):
+            raise StopAfterDims
+
+        pipeline._tokenize_prompt = stop
+
+        lines = []
+        monkeypatch.setattr(mod, "logger", SimpleNamespace(info=lines.append, warning=print))
+
+        with pytest.raises(StopAfterDims):
+            pipeline.forward(
+                prompt="a distilled render",
+                negative_prompt="",
+                num_frames=COSMOS3_720P_PARAMS["num_frames"],
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=False,
+                use_guardrails=False,
+                **forward_kwargs,
+            )
+        dims = next(line for line in lines if "Cosmos3 generation dims" in line)
+        return dims
+
+    def test_unset_resolves_to_checkpoint_not_base_table(self, monkeypatch):
+        dims = self._resolved_recipe(monkeypatch, num_inference_steps=None, guidance_scale=None)
+        assert f"num_inference_steps={len(DISTILLED_SIGMAS)}" in dims
+        assert f"guidance_scale={DISTILLED_GUIDANCE_SCALE:.2f}" in dims
+        # The base video table's values must not have been substituted.
+        assert f"num_inference_steps={COSMOS3_720P_PARAMS['num_inference_steps']}" not in dims
+        assert f"guidance_scale={COSMOS3_720P_PARAMS['guidance_scale']:.2f}" not in dims
+
+    def test_base_checkpoint_still_uses_the_mode_table(self, monkeypatch):
+        """The checkpoint-first step must be a no-op for a base checkpoint:
+        ``generation_default_overrides()`` is empty, so the mode tables win."""
+        import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as mod
+
+        pipeline = _bare_pipeline()
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.scheduler = SimpleNamespace(config=SimpleNamespace(flow_shift=1.0))
+
+        class StopAfterDims(Exception):
+            pass
+
+        def stop(*args, **kwargs):
+            raise StopAfterDims
+
+        pipeline._tokenize_prompt = stop
+        lines = []
+        monkeypatch.setattr(mod, "logger", SimpleNamespace(info=lines.append, warning=print))
+
+        with pytest.raises(StopAfterDims):
+            pipeline.forward(
+                prompt="a base render",
+                negative_prompt="",
+                num_frames=COSMOS3_720P_PARAMS["num_frames"],
+                num_inference_steps=None,
+                guidance_scale=None,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=False,
+                use_guardrails=False,
+            )
+        dims = next(line for line in lines if "Cosmos3 generation dims" in line)
+        assert f"num_inference_steps={COSMOS3_720P_PARAMS['num_inference_steps']}" in dims
+        assert f"guidance_scale={COSMOS3_720P_PARAMS['guidance_scale']:.2f}" in dims
+
+
+class TestSystemPromptSurvivesDefaultMerge:
+    """The executor materializes every extra-param spec default into the
+    request before ``infer()`` runs. If Cosmos3 published a boolean default for
+    ``use_system_prompt``, an omitted value would arrive at ``forward()`` as
+    that boolean instead of ``None``, and the mode-dependent resolution (V2V
+    uses the system prompt) would never run. Tests that call ``infer()`` or
+    ``forward()`` directly skip this merge, so it needs covering here.
+    """
+
+    def _merged_extra_params(self, extra_params):
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor
+        from tensorrt_llm.visual_gen.params import VisualGenParams
+
+        pipeline = _bare_pipeline()
+        pipeline.default_use_system_prompt = False  # base checkpoint
+        pipeline.derive_output_size_from_reference = False
+        executor = object.__new__(DiffusionExecutor)
+        executor.pipeline = pipeline
+
+        params = VisualGenParams()
+        params.extra_params = dict(extra_params)
+        req = SimpleNamespace(params=params, request_id=1)
+        DiffusionExecutor._merge_defaults(executor, req)
+        return req.params.extra_params
+
+    def test_omitted_value_stays_unset_through_the_merge(self):
+        merged = self._merged_extra_params({"video": b"fake"})
+        assert merged["use_system_prompt"] is None
+
+    def test_explicit_value_survives_the_merge(self):
+        merged = self._merged_extra_params({"video": b"fake", "use_system_prompt": False})
+        assert merged["use_system_prompt"] is False

@@ -14,6 +14,7 @@
 # limitations under the License.
 """Tests for visual generation module parameter offloading."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
@@ -515,6 +516,27 @@ def test_cosmos3_offload_components_expose_towers_vae_and_guardrails():
     video_component = components[COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT]
     assert isinstance(text_component, nn.ModuleList) and list(text_component) == [text_model]
     assert isinstance(video_component, nn.ModuleList) and list(video_component) == [video_model]
+
+
+def test_cosmos3_video_encoding_uses_vae_offload_context():
+    pipeline = _make_cosmos3_unit_pipeline(offload_enable=False)
+    pipeline.pipeline_config.torch_dtype = torch.float32
+    video = torch.zeros(1, 3, 1, 2, 2)
+    pipeline.vae = SimpleNamespace(
+        dtype=torch.float32,
+        config=SimpleNamespace(scaling_factor=1.0),
+        encode=lambda value: SimpleNamespace(latent_dist=SimpleNamespace(mode=lambda: value)),
+    )
+
+    with patch.object(
+        pipeline.offloader,
+        "context_if_requested",
+        return_value=nullcontext(),
+    ) as offload_context:
+        encoded = pipeline._encode_video_tensor(video)
+
+    offload_context.assert_called_once_with("vae")
+    assert torch.equal(encoded, video)
 
 
 def test_cosmos3_guardrail_components_absent_without_safety_checker():
