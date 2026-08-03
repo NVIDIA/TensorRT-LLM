@@ -122,7 +122,8 @@ class Eagle3MLAttention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         next_layer_regular: bool = False,
     ):
         config = model_config.pretrained_config
@@ -152,7 +153,7 @@ class Eagle3MLAttention(MLA):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            aux_stream=aux_stream,
+            aux_stream_dict=aux_stream_dict,
         )
 
         # Override the kv_a_proj_with_mqa projection for first layer.
@@ -200,7 +201,7 @@ class Eagle3DecoderLayer(DecoderLayer):
             self.self_attn = Eagle3MLAttention(
                 model_config,
                 layer_idx,
-                aux_stream=aux_stream,
+                aux_stream_dict={AuxStreamType.Attention: aux_stream},
                 next_layer_regular=self._next_layer_regular,
             )
         else:
@@ -1936,11 +1937,22 @@ def get_draft_model(model_config, draft_config, lm_head, model):
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
-    def __init__(self, model: TModel, model_config: ModelConfig[TConfig]):
+    def __init__(self,
+                 model: TModel,
+                 model_config: ModelConfig[TConfig],
+                 hidden_size: int | None = None,
+                 vocab_size: int | None = None) -> None:
+        # Composite configs (e.g. vision-language wrappers) may not expose
+        # hidden_size/vocab_size at the top level; callers can pass the
+        # text-config values explicitly.
+        if hidden_size is None:
+            hidden_size = model_config.pretrained_config.hidden_size
+        if vocab_size is None:
+            vocab_size = model_config.pretrained_config.vocab_size
         super().__init__(model,
                          config=model_config,
-                         hidden_size=model_config.pretrained_config.hidden_size,
-                         vocab_size=model_config.pretrained_config.vocab_size)
+                         hidden_size=hidden_size,
+                         vocab_size=vocab_size)
         self.draft_model = None
         self.draft_config = None
         self.spec_worker = None

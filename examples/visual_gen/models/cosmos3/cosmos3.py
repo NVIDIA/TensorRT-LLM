@@ -136,7 +136,13 @@ def main():
         help="Disable resolution metadata template (enabled by default, matching cosmos-framework CLI)",
     )
     parser.add_argument(
-        "--use_system_prompt", action="store_true", help="Use system prompt in prompt"
+        "--use_system_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Prepend the Cosmos3 system prompt (--no-use_system_prompt to disable). "
+            "When omitted, the checkpoint's declared default applies."
+        ),
     )
     parser.add_argument("--enable_audio", action="store_true", help="Enable audio generation")
     parser.add_argument(
@@ -181,7 +187,8 @@ def main():
         params.extra_params["use_duration_template"] = False
     if args.disable_resolution_template:
         params.extra_params["use_resolution_template"] = False
-    params.extra_params["use_system_prompt"] = args.use_system_prompt
+    if args.use_system_prompt is not None:
+        params.extra_params["use_system_prompt"] = args.use_system_prompt
     params.extra_params["enable_audio"] = enable_audio
     params.extra_params["use_guardrails"] = not args.disable_guardrails
     params.extra_params["output_type"] = output_type
