@@ -430,22 +430,16 @@ Qwen/Qwen3.5-35B-A3B:
   - dtype: bfloat16
     accuracy: 81.092
 # Inkling NVFP4 (thinkingmachines/Inkling-NVFP4): RoPE-free hybrid-attention
-# reasoning model, text-only path. Reference is the cached SGLang NVFP4
-# measurement under the trtllm-eval MMLU harness (Hendrycks, 5-shot, completion,
-# max_tokens=2, startswith scoring) on the full 14042-sample set:
-# weighted_accuracy 85.6573.
+# reasoning model, text-only path. Measured on the FULL 14042-sample set
+# (Hendrycks, 5-shot, completion, max_tokens=2) at TP=4 with CUDA graph and the
+# overlap scheduler on, batch 8: 85.35 (11985/14042). SGLang NVFP4, driven by
+# the same client under the same settings, scores 85.48 (12003/14042) -- a
+# -0.13 pt gap.
 #
-# TRT-LLM WAS measured on that full set once, early in the bring-up
-# (2026-07-20, 14042 samples): weighted_accuracy 82.2176, i.e. -3.44 pt, which
-# failed the campaign's 2-point gate. That gap was later traced to an
-# fp4-expert-GEMM family difference (CUTLASS/trtllm-gen vs SGLang's flashinfer)
-# and to non-terminating generation on hard prompts, and subsequent fixes moved
-# the subset numbers up -- 570-item stratified canary 84.21 (-1.45, inside the
-# 2-point gate), and a 5-seed 114-item regression at 83.33 / 84.21 / 85.09 /
-# 85.96 / 87.72 (mean ~85.3). But the full set has NOT been re-measured since
-# those fixes, so whether TRT-LLM now meets 85.66 at full scale is unverified.
-# KV cache is unquantized (the checkpoint's hf_quant_config sets
-# kv_cache_quant_algo=none).
+# An earlier full-set run at 82.22 (-3.44 pt) predates the bring-up fixes; the
+# routed experts now run on CUTLASS only, and the non-terminating-generation
+# cases were fixed. KV cache is unquantized (the checkpoint's hf_quant_config
+# sets kv_cache_quant_algo=none).
 thinkingmachines/Inkling-NVFP4:
   - quant_algo: NVFP4
-    accuracy: 85.66
+    accuracy: 85.35

@@ -520,18 +520,11 @@ stepfun-ai/Step-3.7-Flash:
     spec_dec_algo: MTP
     accuracy: 88
 # Inkling NVFP4 (thinkingmachines/Inkling-NVFP4): RoPE-free hybrid-attention
-# reasoning model, text-only path. Reference is the cached SGLang NVFP4
-# measurement under the same harness on the full GSM8K set (0.9553).
-#
-# TRT-LLM has NOT been measured on the full 1319-item set. The evidence is:
-#   - paired 5x100 protocol (greedy, temp=0, matched chat template),
-#     flexible-parse mean 0.968;
-#   - the four cuda-graph x overlap-scheduler corners each 0.98-0.99 on the 100
-#     paired items where SGLang scored 0.99;
-#   - one early full-set attempt that only completed its first chunk
-#     (120/1319: TRT 0.925 vs reference 0.975).
-# KV cache is unquantized (the checkpoint's hf_quant_config sets
-# kv_cache_quant_algo=none).
+# reasoning model, text-only path. Measured on the FULL 1319-item set at TP=4
+# with CUDA graph and the overlap scheduler on, batch 8, greedy: 96.13
+# (1268/1319). SGLang NVFP4, driven by the same client under the same settings,
+# scores 96.59 (1274/1319) -- a -0.45 pt gap. KV cache is unquantized (the
+# checkpoint's hf_quant_config sets kv_cache_quant_algo=none).
 thinkingmachines/Inkling-NVFP4:
   - quant_algo: NVFP4
-    accuracy: 95.53
+    accuracy: 96.13
