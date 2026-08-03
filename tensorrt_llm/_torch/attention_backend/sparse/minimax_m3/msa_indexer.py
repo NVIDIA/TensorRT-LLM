@@ -177,15 +177,6 @@ class MsaIndexer:
                 causal=True,
                 block_size=int(idx_k_paged.shape[2]),
             )
-            # Empty-selection guard. n_valid_blocks is a host tensor on
-            # this path, so the .item() read does not sync the device.
-            if n_valid_blocks.numel() == 0 or int(n_valid_blocks.max().item()) <= 0:
-                return torch.full(
-                    (idx_q.shape[0], config.num_kv_heads, MSA_REQUIRED_TOPK),
-                    -1,
-                    dtype=torch.int32,
-                    device=idx_q.device,
-                )
         return select_blocks_from_maxscore(
             max_score_kv,
             topk=MSA_REQUIRED_TOPK,

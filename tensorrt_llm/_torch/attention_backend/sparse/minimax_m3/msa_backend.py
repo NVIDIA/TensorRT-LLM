@@ -32,6 +32,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm.bindings import DataType
 
 from .common import (
     MiniMaxM3SparseConfig,
@@ -251,12 +252,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # Eager (prefill/mixed) per-token valid-block count. It is layer-invariant
     # (a function of qo/kv lengths and page size), so it is computed on the host
     # and staged to the device once per step via a non-blocking copy_, then
-    # reused by every sparse layer's indexer. _msa_eager_all_blocks_empty caches
-    # the host-side empty-selection result so the indexer can short-circuit without
-    # a device read. _msa_eager_n_valid_buf is the persistent backing store for the view.
+    # reused by every sparse layer's indexer. _msa_eager_n_valid_buf is the
+    # persistent backing store for the view.
     _msa_eager_n_valid_buf: Optional[torch.Tensor] = None
     _msa_eager_n_valid_blocks: Optional[torch.Tensor] = None
-    _msa_eager_all_blocks_empty: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -330,11 +329,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         step was prepared (a decode step or a structural test)."""
         return self._msa_eager_n_valid_blocks
 
-    @property
-    def msa_eager_all_blocks_empty(self) -> bool:
-        """Whether the eager step has no valid KV blocks for any query token."""
-        return self._msa_eager_all_blocks_empty
-
     def _msa_main_kv_is_fp8(self) -> bool:
         """Whether the main paged K/V cache is stored as FP8 E4M3.
 
@@ -343,19 +337,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         decode planner. Mirrors the k_paged.dtype check in run_msa_paged_gqa.
         """
         kv_cache_manager = self.kv_cache_manager
-        if kv_cache_manager is None:
-            return False
-        try:
-            buffers = kv_cache_manager.get_buffers(0, kv_layout="HND")
-        except TypeError:
-            buffers = kv_cache_manager.get_buffers(0)
-        except Exception:
-            return False
-
-        try:
-            return buffers[:, 0].dtype == torch.float8_e4m3fn
-        except Exception:
-            return False
+        return kv_cache_manager is not None and kv_cache_manager.dtype == DataType.FP8
 
     def _create_msa_buffers(self) -> None:
         """Allocate the CUDA-graph-stable MSA device buffers.
@@ -528,7 +510,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_eager_gqa_plan = None
         self._msa_eager_dense_plan = None
         self._msa_eager_n_valid_blocks = None
-        self._msa_eager_all_blocks_empty = False
         if not self._msa_fields_ready:
             return
         # Geometry is captured in __post_init__; skip when it is unavailable.
@@ -605,13 +586,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_eager_gqa_plan = gqa_plan
             self._msa_eager_dense_plan = dense_plan
             # Stage the valid-block count to the device once for the whole step
-            # (see _msa_eager_n_valid_blocks). The empty-selection check runs
-            # here on the host, so run_indexer can short-circuit cheaply.
+            # (see _msa_eager_n_valid_blocks).
             n_valid_host = per_token_valid_blocks(
                 qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
             )
             total_q = int(n_valid_host.shape[0])
-            self._msa_eager_all_blocks_empty = total_q == 0 or int(n_valid_host.max().item()) <= 0
             if total_q > 0:
                 dev_buf = self._ensure_eager_n_valid_buffer(total_q, device)
                 dev_buf[:total_q].copy_(n_valid_host.to(torch.int32), non_blocking=True)
@@ -868,14 +847,6 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         else:
             proxy_plan = metadata.msa_eager_proxy_plan
             max_score = None
-            # The empty case was resolved on the host, so short-circuit here.
-            if metadata.msa_eager_all_blocks_empty:
-                return torch.full(
-                    (num_tokens, config.num_kv_heads, MSA_REQUIRED_TOPK),
-                    -1,
-                    dtype=torch.int32,
-                    device=idx_q.device,
-                )
             n_valid_blocks = metadata.msa_eager_n_valid_blocks
             if n_valid_blocks is not None:
                 n_valid_blocks = n_valid_blocks[:num_tokens]
