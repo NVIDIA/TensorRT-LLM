@@ -1850,7 +1850,14 @@ class PyTorchModelEngine(ModelEngine):
                 int(t)
                 for t in self.spec_config.verify_len_tiers if int(t) >= 0
             })
-            if getattr(self.spec_config, "enable_ragged_verify", False):
+            # The MODE, not the config flag. `cap-accept` is configured with
+            # enable_ragged_verify=True as well, but submits the FULL block, so
+            # capturing the ragged token ladder for it builds synthetic batches
+            # at token totals its real steps never produce -- which fails
+            # during capture, inside MoE, long before any of it is explicable.
+            from ..speculative.dspark_observability import \
+                trims_submitted_tokens
+            if trims_submitted_tokens(self.spec_config):
                 # Ragged always drafts the full block -- only verification is
                 # trimmed -- so draft_len is pinned to the top tier and the
                 # ladder moves to the *token* axis: one bucket per tier, i.e.

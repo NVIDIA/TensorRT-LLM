@@ -296,7 +296,10 @@ class CUDAGraphRunner:
         build for every model, and a per-request scan there is pure overhead for
         the ~all of them that will never be ragged.
         """
-        if not getattr(self.spec_config, "enable_ragged_verify", False):
+        # Keyed on the MODE: `cap-accept` shares this config flag but never
+        # shrinks the token axis, so it must keep the ordinary uniform key.
+        from ..speculative.dspark_observability import trims_submitted_tokens
+        if not trims_submitted_tokens(self.spec_config):
             return None
         # The bucket the fit agreed on, not a fresh sum over the batch. Summing
         # here walks generation_requests *after* _get_padded_batch has appended

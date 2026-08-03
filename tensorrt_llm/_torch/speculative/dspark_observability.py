@@ -122,6 +122,31 @@ def read_ragged_verify_mode(
         f"{', '.join(repr(m.value) for m in RaggedVerifyMode)}")
 
 
+def resolve_ragged_verify_mode(spec_config) -> RaggedVerifyMode:
+    """The mode a config plus the environment actually select.
+
+    The config flag alone is not the answer, and using it as one is a bug with
+    a long fuse: ``enable_ragged_verify`` is what ``cap-accept`` is configured
+    with too, but cap-accept submits the FULL block. Anything that shapes the
+    batch -- the CUDA-graph capture set, the graph key -- has to ask whether
+    the token axis actually shrinks (:attr:`RaggedVerifyMode.trims_submitted_tokens`),
+    not whether ragged was requested.
+
+    Resolved identically to the DSpark worker's own resolution, and separately
+    from it, because the capture set is built before any batch exists.
+    """
+    configured = (RaggedVerifyMode.COMPACT if getattr(
+        spec_config, "enable_ragged_verify", False) else RaggedVerifyMode.STATIC)
+    return read_ragged_verify_mode(default=configured)
+
+
+def trims_submitted_tokens(spec_config) -> bool:
+    """Whether this config+environment shrinks the token axis. See above."""
+    if spec_config is None:
+        return False
+    return resolve_ragged_verify_mode(spec_config).trims_submitted_tokens
+
+
 class DSparkRaggedStats:
     """Per-step counters for the ragged verification path.
 

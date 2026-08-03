@@ -21,6 +21,9 @@ mode and never a serving one -- and why the counters must not report it as
 though it had saved any.
 """
 
+import os
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -340,6 +343,47 @@ def test_the_cuda_graph_padding_dummy_carries_a_cap():
     assert "if cap_accept else None" in src, (
         "the dummy's cap is not cleared for non-cap-accept batches, so a "
         "stale cap would trim a static step")
+
+
+def test_the_capture_set_follows_the_mode_not_the_config_flag():
+    """The bug the first end-to-end run found, in CUDA-graph capture.
+
+    cap-accept is configured with enable_ragged_verify=True -- the config is
+    byte-identical to compact, only the environment differs. Anything that
+    SHAPES the batch must therefore ask whether the token axis actually
+    shrinks, not whether ragged was requested. The capture set asked the flag,
+    so it built synthetic batches at ragged token totals (bs*(t+1)) for a mode
+    whose real steps always submit the full block, and the capture pass died
+    inside MoE on `unmatched tensor shape` -- before any request had run, with
+    nothing pointing at the scheduler.
+
+    Unit tests could not have caught it: it needs a real capture pass. This
+    pins the predicate instead.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.speculative.dspark_observability import (
+        resolve_ragged_verify_mode, trims_submitted_tokens)
+
+    ragged_cfg = SimpleNamespace(enable_ragged_verify=True)
+
+    with patch.dict(os.environ,
+                    {"TLLM_DSPARK_RAGGED_VERIFY_MODE": "cap-accept"}):
+        assert resolve_ragged_verify_mode(
+            ragged_cfg) is RaggedVerifyMode.CAP_ACCEPT
+        assert not trims_submitted_tokens(ragged_cfg), (
+            "cap-accept submits the full block; a capture set built for it "
+            "must be the uniform one")
+
+    with patch.dict(os.environ, {"TLLM_DSPARK_RAGGED_VERIFY_MODE": "compact"}):
+        assert trims_submitted_tokens(ragged_cfg)
+
+    # Unset: the config flag decides, which is the pre-existing behaviour.
+    with patch.dict(os.environ, {}, clear=True):
+        assert trims_submitted_tokens(ragged_cfg)
+        assert not trims_submitted_tokens(
+            SimpleNamespace(enable_ragged_verify=False))
+    assert not trims_submitted_tokens(None)
 
 
 def test_accept_caps_is_not_the_ragged_flag():
