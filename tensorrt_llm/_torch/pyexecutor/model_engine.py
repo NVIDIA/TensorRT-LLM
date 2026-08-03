@@ -3820,9 +3820,29 @@ class PyTorchModelEngine(ModelEngine):
         # where the local count IS the maximum.
         all_can_graph = (bool(peer_stats[0][2]) if peer_stats
                          and len(peer_stats[0]) > 2 else True)
-        widest_rows = (max([int(s[0]) for s in peer_stats],
-                           default=len(token_lens)) if peer_stats
-                       and all_can_graph else len(token_lens))
+        if not all_can_graph:
+            # Some rank holds a context request, so no rank will replay a graph
+            # this step -- and everything below exists to land the batch on a
+            # captured one. Two things then go wrong at once if we continue:
+            # _get_padded_batch declines the cross-rank row maximum AND pads the
+            # TOTAL batch size (context + generation) while this fit counts
+            # generation rows only, so its budget goes to rows that never
+            # appear. Observed as `requests carry 18 generation tokens but the
+            # CUDA-graph key's token axis is 24` -- 3 generation rows fitted as
+            # 4 -- which throws inside the forward and, since a rank that throws
+            # stops issuing collectives, deadlocks every other rank behind it.
+            #
+            # An eager ragged step would still save real compute, so this is
+            # conservative rather than necessary; making it safe means teaching
+            # the bucket machinery that a step may have no graph at all, which
+            # is a larger change than the saving justifies on a mixed batch.
+            logger.debug(
+                "DSpark ragged: some rank cannot run a CUDA graph this step, "
+                "so no captured bucket applies; falling back to uniform")
+            return None
+        widest_rows = max([int(s[0]) for s in peer_stats],
+                          default=len(token_lens)) if peer_stats else len(
+                              token_lens)
         padded_bs = runner._round_up_batch_size(widest_rows)
         if padded_bs == 0:
             return None

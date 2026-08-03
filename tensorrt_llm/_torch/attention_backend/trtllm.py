@@ -1846,7 +1846,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         token_major_view = (metadata.token_major_gen_view() if
                             forward_args.attention_input_type
                             == AttentionInputType.generation_only else None)
-        with self._presented_token_major(metadata, token_major_view):
+        with metadata.presented_token_major(token_major_view):
             for fmha in self.fmha_libs:
                 if fmha.is_supported(q, k, v, metadata, forward_args):
                     fmha.forward(q, k, v, metadata, forward_args)
@@ -2123,45 +2123,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 mla_bmm2_scale, quant_q_buffer, out_scale, helix_tensor_params)
 
     @contextlib.contextmanager
-    def _presented_token_major(self, metadata, view):
-        """Metadata swap plus the one op parameter that lives on the module.
-
-        ``predicted_tokens_per_seq`` is the op's ``s_q``. Under this
-        presentation every row IS a length-one sequence, and the op already
-        knows it -- the generation path recomputes ``s_q = acc_q_len /
-        batch_beam`` and asserts it equals this field
-        (``common/attentionOp.cpp:1232``). That assert has been false here all
-        along: the runtime value is 1 while the field still says
-        ``max_draft_len + 1``. It never fired because release builds compile
-        ``assert`` out.
-
-        The visible cost is workspace. Sizing reads the FIELD
-        (``getWorkspaceSizeForGeneration``, s_q = 6) while the run reads the
-        RECOMPUTED value (s_q = 1), so the generation workspace -- whose main
-        terms are all linear in ``batch_beam * s_q`` -- is allocated six times
-        larger than the layout it ends up holding. On top of the row ceiling
-        this presentation already passes as ``max_num_requests``, that is where
-        the reported 68 MiB -> 604 MiB came from. Over-allocation is safe, which
-        is why nothing ever failed.
-
-        ``mMLAParams`` is rebuilt from the argument on every call
-        (``thop/attentionOp.cpp:1285``), so telling the truth here is enough.
-        """
-        if view is None:
-            yield
-            return
-        saved = self.predicted_tokens_per_seq
-        try:
-            self.predicted_tokens_per_seq = 1
-            with metadata.presented_token_major(view):
-                yield
-        finally:
-            self.predicted_tokens_per_seq = saved
-
-    @contextlib.contextmanager
     def presented_token_major_for(self, metadata):
-        with self._presented_token_major(metadata,
-                                         metadata.token_major_gen_view()):
+        with metadata.presented_token_major(metadata.token_major_gen_view()):
             yield
 
     def _mla_rope_generation_impl(self, metadata, fused_q, q_pe, latent_cache,
