@@ -1330,6 +1330,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
             self._penalty_handler = PenaltyHandler(
                 max_num_sequences=self.max_num_sequences,
+                max_beam_width=self.max_beam_width,
                 device="cuda",
             )
 
@@ -1757,11 +1758,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
     @override
     def validate_request(self, request: LlmRequest) -> None:
-        # Reject unsupported top-p-decay and penalty combinations at admission, so
-        # only the offending request fails (raising later, inside setup_sampler_step
-        # or sampling, would abort the whole executor step).
+        # Reject unsupported top-p-decay combinations at admission, so only the offending
+        # request fails (raising later, inside setup_sampler_step or sampling, would abort
+        # the whole executor step). Occurrence penalties have no unsupported combination
+        # left: beam search is supported, and beam search with speculative decoding is
+        # rejected for the whole sampler in __init__.
         self._top_p_decay.validate_request(request)
-        self._penalty_handler.validate_request(request)
         if self._use_beam_search:
             if request.py_return_log_probs:
                 if request.py_num_logprobs > 1:
@@ -3223,7 +3225,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # Apply repetition/presence/frequency penalties in place, before the greedy fast
-        # path, so both greedy and grouped-sampling logits are penalized.
+        # path, so both greedy and grouped-sampling logits are penalized. With beam search
+        # this also re-parents the per-beam counts, which reads the predecessor map the
+        # step's sampling is about to overwrite -- so it has to stay ahead of sampling.
+        beam_search_store = self.store.beam_search_store
         self._penalty_handler.apply(
             logits_cuda,
             sampling_requests,
@@ -3231,6 +3236,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots=seq_slots_cuda,
             request_offsets=sampling_requests_metadata.req_offsets,
             request_num_steps=sampling_requests_metadata.req_num_steps,
+            request_num_beams=sampling_requests_metadata.req_num_beams,
+            predecessor_beams=(
+                beam_search_store.predecessor_beams if beam_search_store is not None else None
+            ),
             # _is_draft_batch reads requests[0]; an empty batch has no penalties to apply
             # anyway, so short-circuit rather than index into it.
             is_draft_batch=bool(sampling_requests) and self._is_draft_batch(sampling_requests),
