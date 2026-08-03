@@ -944,6 +944,14 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         patch_size, temporal = _resolve_vision_geometry(config)
         self.image_token_id = _resolve_image_token_id(config)
         self.audio_token_id = _resolve_audio_token_id(config)
+        if self.image_token_id == self.audio_token_id:
+            # assemble() dispatches on the token value, so a shared id would send
+            # every audio placeholder down the image branch and report the
+            # mismatch against the wrong modality.
+            raise ValueError(
+                f"InklingInputProcessor: image_token_id and audio_token_id must "
+                f"differ; both resolved to {self.image_token_id}."
+            )
         self._dtype = torch.bfloat16
         self._preprocessor = InklingImagePreprocessor(
             patch_size=patch_size,

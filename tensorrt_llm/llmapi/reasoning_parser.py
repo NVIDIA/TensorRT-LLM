@@ -788,10 +788,14 @@ class InklingReasoningParser(BaseReasoningParser):
         remaining = self._buffer
         self._buffer = ""
         if not remaining:
+            self._kind = None
             return ReasoningParserResult()
         content: list = []
         reasoning: list = []
         self._consume(remaining, content, reasoning)
+        # Reset the block kind too, so reusing this instance for a second stream
+        # does not route its first segment by the previous stream's channel.
+        self._kind = None
         return ReasoningParserResult(content="".join(content),
                                      reasoning_content="".join(reasoning))
 

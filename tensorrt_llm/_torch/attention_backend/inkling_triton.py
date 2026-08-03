@@ -334,8 +334,11 @@ def inkling_prefill_attention(
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
-    total_tokens, num_heads, head_dim = q.shape
+    _total_tokens, num_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
+    # The kernel maps a query head to its KV head as ``cur_head // kv_group_num``;
+    # a non-divisible pair would silently mis-map instead of failing.
+    assert num_heads % num_kv_heads == 0, (num_heads, num_kv_heads)
     kv_group_num = num_heads // num_kv_heads
     o = torch.empty_like(q)
 
@@ -420,6 +423,7 @@ def inkling_decode_attention(
     q = q.contiguous()  # kernel indexes head_dim as the stride-1 axis
     batch, num_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
+    assert num_heads % num_kv_heads == 0, (num_heads, num_kv_heads)
     kv_group_num = num_heads // num_kv_heads
     o = out if out is not None else torch.empty_like(q)
 
