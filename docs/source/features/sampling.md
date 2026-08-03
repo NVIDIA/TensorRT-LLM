@@ -196,9 +196,6 @@ modes.
     `repetition_penalty`. Values `<= 0` have no effect, and values larger than the prompt
     are clamped to the prompt length.
 
-  * Occurrence penalties are not supported in combination with beam search; such requests
-    are rejected.
-
 * If `no_repeat_ngram_size = n` is specified, any token that would recreate an `n`-gram already
   present in the sequence (prompt included) is excluded from sampling. `None` or `0` disables
   the restriction.
