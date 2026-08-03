@@ -29,13 +29,10 @@ SELFKONLY, exactly like DeepSeek MLA.
 
 MLA prefill routing
 -------------------
-The parity-tested in-tree ``KimiK3MLAAttention`` routes prefill through the
-MLA *generation* FMHA (the context FMHA cubin was found numerically wrong for
-the K3 head configuration; see the module docstring). That path requires
-generation-shaped metadata with one request, so the model builds one derived
-``TrtllmAttentionMetadata`` per context request per forward step (B=1 each)
-and runs the decode path on the whole generation batch at once using the
-executor-provided metadata with ``AttentionInputType.generation_only``.
+The in-tree ``KimiK3MLAAttention`` routes prefill through the normal
+unabsorbed MLA context FMHA. It consumes the executor's original mixed-batch
+metadata, letting the shared MLA implementation dispatch context and cached
+generation work in one forward call.
 
 Parallelism
 -----------
@@ -78,7 +75,6 @@ from __future__ import annotations
 
 import copy
 import os
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -88,13 +84,13 @@ from ..._utils import is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
-from ..attention_backend import AttentionMetadata, TrtllmAttentionMetadata
+from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceStrategy
-from ..metadata import KVCacheParams
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
 from ..modules.kimi_k3_moe._mlp import KimiK3MLP, KimiK3RMSNorm
 from ..modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
+from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActType_TrtllmGen, MxFp8QuantizedTensor
@@ -170,14 +166,16 @@ _K3_MOE_EP_ENV = "TLLM_K3_MOE_EP_SIZE"
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
-    from ..modules.kimi_k3_mla import KimiK3MLARuntimeInputs
-
 # Identity-RoPE table positions for the MLA backends. K3 is NoPE (the table
 # holds cos=1/sin=0 and the rope kernels are skipped), but the backend still
 # allocates a table of this size per instance; the checkpoint's 1M
 # max_position_embeddings would cost ~512MB per backend, so cap it.
 _KIMI_K3_MLA_MAX_POSITIONS_ENV = "KIMI_K3_MLA_MAX_POSITIONS"
 _KIMI_K3_MLA_MAX_POSITIONS_DEFAULT = 65536
+_KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
+    ".self_attn.mixer.k_b_proj_trans",
+    ".self_attn.mixer.v_b_proj",
+)
 
 # Opt-in FP8 weight read — default OFF (weights stay BF16 as shipped by the
 # checkpoint). Set KIMI_K3_FP8_WEIGHT_READ=1 to serve the large replicated
@@ -381,6 +379,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor, out_features: int
     ) -> None:
         super().__init__()
+        self.in_features = weight_fp8.shape[1]
         self.out_features = out_features
         # Buffers (not parameters): these are the module's weights post-load;
         # there is nothing further to load into them and they must not be
@@ -582,6 +581,82 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
     return count
 
 
+@torch.no_grad()
+def _load_kimi_k3_mla_kv_b_proj(
+    mixer: nn.Module,
+    source: torch.Tensor,
+    *,
+    head_start: int,
+) -> None:
+    """Load checkpoint-interleaved KV-B rows into MLA runtime tensors."""
+    weight = mixer.kv_b_proj.weight
+    h = mixer.num_heads
+    n = mixer.qk_nope_head_dim
+    v = mixer.v_head_dim
+    kv = mixer.kv_lora_rank
+    head_width = n + v
+
+    if source.ndim != 2 or source.shape[1] != kv:
+        raise ValueError(
+            "Kimi K3 MLA kv_b_proj checkpoint shape "
+            f"{tuple(source.shape)} is not [heads * {head_width}, {kv}]"
+        )
+    if source.shape[0] % head_width != 0:
+        raise ValueError(
+            "Kimi K3 MLA kv_b_proj checkpoint rows "
+            f"{source.shape[0]} are not divisible by {head_width}"
+        )
+    if head_start < 0:
+        raise ValueError(
+            f"Kimi K3 MLA head_start must be non-negative, got {head_start}"
+        )
+    if weight.device.type == "meta":
+        raise RuntimeError(
+            "Kimi K3 MLA kv_b_proj loading requires materialized weights"
+        )
+
+    source_heads = source.shape[0] // head_width
+    source = source.view(source_heads, head_width, kv)
+    num_local_source_heads = max(0, min(source_heads - head_start, h))
+    if num_local_source_heads == h:
+        local = source[head_start : head_start + h]
+    else:
+        local = source.new_zeros((h, head_width, kv))
+        if num_local_source_heads > 0:
+            local[:num_local_source_heads].copy_(
+                source[head_start : head_start + num_local_source_heads]
+            )
+
+    k_weight, v_weight = local.split([n, v], dim=1)
+    grouped = torch.cat(
+        [
+            k_weight.reshape(h * n, kv),
+            v_weight.reshape(h * v, kv),
+        ],
+        dim=0,
+    )
+    if grouped.shape != weight.shape:
+        raise ValueError(
+            "Kimi K3 MLA grouped kv_b_proj shape "
+            f"{tuple(grouped.shape)} does not match {tuple(weight.shape)}"
+        )
+    weight.copy_(grouped.to(weight.dtype))
+
+    loaded_k, loaded_v = weight.split([h * n, h * v], dim=0)
+    k_b_proj_trans = loaded_k.view(h, n, kv).transpose(1, 2).contiguous()
+    if k_b_proj_trans.shape != mixer.k_b_proj_trans.shape:
+        raise ValueError(
+            "Kimi K3 MLA k_b_proj_trans shape "
+            f"{tuple(k_b_proj_trans.shape)} does not match "
+            f"{tuple(mixer.k_b_proj_trans.shape)}"
+        )
+    mixer.k_b_proj_trans.copy_(k_b_proj_trans)
+    mixer.v_b_proj = nn.Parameter(
+        loaded_v.view(h, v, kv),
+        requires_grad=False,
+    )
+
+
 def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
     """Swap the MLA q_a/q_b/o and output-gate projections to an FP8 weight read.
 
@@ -592,11 +667,10 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
     weights re-read in full by every rank each decode step under attention
     data-parallelism. Two MLA projections are left in BF16 on purpose:
     ``kv_a_proj_with_mqa`` outputs ``kv_lora_rank + qk_rope_head_dim`` (576, not
-    a multiple of 128), and ``kv_b_proj`` is consumed by ``_kv_b_absorb_split``
-    reading its ``weight`` directly (the absorbed generation path never calls
-    its ``forward``) to build the k/v absorb matrices, a path with no FP8
-    dequant — so an FP8 ``kv_b_proj`` would feed raw FP8 bytes into the absorb
-    einsums. Returns the number of projections converted.
+    a multiple of 128), and ``kv_b_proj`` supplies ``k_b_proj_trans`` and
+    ``v_b_proj`` directly (the absorbed generation path never calls its
+    ``forward``), with no FP8 dequant path. Returns the number of projections
+    converted.
     """
     import gc
 
@@ -605,8 +679,9 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
     def _swap(parent: nn.Module, attr: str) -> None:
         nonlocal count
         child = getattr(parent, attr, None)
-        if isinstance(child, nn.Linear):
-            setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
+        if isinstance(child, (nn.Linear, TrtllmLinear)):
+            setattr(parent, attr,
+                    _Fp8BlockScaleWeightReadLinear.from_linear(child))
             # Free the original BF16 storage now (as in the MLP/KDA conversions
             # above): the loader's transient name->Parameter map would otherwise
             # keep it alive until load returns, making the FP8 copy purely
@@ -1748,79 +1823,8 @@ class KimiKDARuntime(nn.Module):
         return mixer.o_proj(o)
 
 
-# ---------------------------------------------------------------------------
-# MLA per-step runtime bundle.
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _MLAStepRuntime:
-    """Per-forward MLA runtime inputs shared by all MLA layers."""
-
-    ctx_rts: List["KimiK3MLARuntimeInputs"] = field(default_factory=list)
-    ctx_lens: List[int] = field(default_factory=list)
-    gen_rt: Optional["KimiK3MLARuntimeInputs"] = None
-
-
-def _build_mla_step_runtime(attn_metadata: AttentionMetadata) -> _MLAStepRuntime:
-    from ..modules.kimi_k3_mla import KimiK3MLARuntimeInputs
-
-    rt = _MLAStepRuntime()
-    num_contexts = attn_metadata.num_contexts
-    batch_size = attn_metadata.seq_lens.shape[0]
-    num_cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
-
-    if num_contexts > 0:
-        seq_lens = attn_metadata.seq_lens[:num_contexts].tolist()
-        for i in range(num_contexts):
-            ctx_len = int(seq_lens[i])
-            cached = int(num_cached[i])
-            # Present this context request as a single "generation" request
-            # with q_len = ctx_len: the MLA generation FMHA under a causal
-            # mask with kv_len == cached + q_len reproduces causal-prefill
-            # semantics exactly (see KimiK3MLAAttention.forward_prefill).
-            md = TrtllmAttentionMetadata(
-                seq_lens=torch.tensor([ctx_len], dtype=torch.int),
-                request_ids=[attn_metadata.request_ids[i]],
-                max_num_requests=1,
-                max_num_sequences=1,
-                num_contexts=0,
-                prompt_lens=[cached + ctx_len],
-                max_num_tokens=ctx_len,
-                kv_cache_manager=attn_metadata.kv_cache_manager,
-                kv_cache_params=KVCacheParams(
-                    use_cache=True,
-                    num_cached_tokens_per_seq=[cached],
-                ),
-                mapping=attn_metadata.mapping,
-                # KDA layers use the outer metadata's mamba_metadata; skip
-                # re-preparing it for the derived MLA-only metadata.
-                mamba_metadata=False,
-                enable_flash_mla=getattr(attn_metadata, "enable_flash_mla", False),
-            )
-            md.prepare()
-            rt.ctx_rts.append(
-                KimiK3MLARuntimeInputs(
-                    metadata=md,
-                    request_ids=[attn_metadata.request_ids[i]],
-                    seq_lens=[ctx_len],
-                    num_cached_tokens_per_seq=[cached],
-                )
-            )
-            rt.ctx_lens.append(ctx_len)
-
-    if batch_size - num_contexts > 0:
-        rt.gen_rt = KimiK3MLARuntimeInputs(
-            metadata=attn_metadata,
-            request_ids=list(attn_metadata.request_ids[num_contexts:]),
-            seq_lens=attn_metadata.seq_lens[num_contexts:].tolist(),
-            num_cached_tokens_per_seq=list(num_cached[num_contexts:]),
-        )
-    return rt
-
-
 class KimiMLARuntime(nn.Module):
-    """Wraps ``KimiK3MLAAttention`` with the mixed-batch executor dispatch."""
+    """Owns K3 MLA head padding, TP sharding, and output reduction."""
 
     def __init__(
         self,
@@ -1831,7 +1835,6 @@ class KimiMLARuntime(nn.Module):
         allreduce_strategy=AllReduceStrategy.AUTO,
     ):
         super().__init__()
-        import os
 
         from ..modules.kimi_k3_mla import KimiK3MLAAttention
 
@@ -1891,21 +1894,9 @@ class KimiMLARuntime(nn.Module):
             quant_config=quant_config,
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata, mla_rt: _MLAStepRuntime
-    ) -> torch.Tensor:
-        num_ctx_tokens = attn_metadata.num_ctx_tokens
-        outputs: List[torch.Tensor] = []
-        offset = 0
-        for ctx_rt, ctx_len in zip(mla_rt.ctx_rts, mla_rt.ctx_lens):
-            outputs.append(
-                self.mixer.forward_prefill(hidden_states[offset : offset + ctx_len], ctx_rt)
-            )
-            offset += ctx_len
-        assert offset == num_ctx_tokens, f"MLA context split mismatch: {offset} != {num_ctx_tokens}"
-        if hidden_states.shape[0] > num_ctx_tokens:
-            outputs.append(self.mixer.forward_decode(hidden_states[num_ctx_tokens:], mla_rt.gen_rt))
-        out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+    def forward(self, hidden_states: torch.Tensor,
+                attn_metadata: AttentionMetadata) -> torch.Tensor:
+        out = self.mixer(hidden_states, attn_metadata)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
@@ -2037,7 +2028,6 @@ class KimiLinearDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        mla_rt: Optional[_MLAStepRuntime],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
@@ -2060,10 +2050,7 @@ class KimiLinearDecoderLayer(nn.Module):
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
-        if self.is_kda:
-            hidden_states = self.self_attn(hidden_states, attn_metadata)
-        else:
-            hidden_states = self.self_attn(hidden_states, attn_metadata, mla_rt)
+        hidden_states = self.self_attn(hidden_states, attn_metadata)
 
         if prefix_sum is not None:
             prefix_sum = prefix_sum + hidden_states
@@ -2122,8 +2109,6 @@ class KimiLinearModel(DecoderModel):
         )
         self.output_attn_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
 
-        self.has_mla = any(not layer.is_kda for layer in self.layers)
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -2147,13 +2132,12 @@ class KimiLinearModel(DecoderModel):
             "tokens); disable CUDA graphs and the overlap scheduler."
         )
 
-        mla_rt = _build_mla_step_runtime(attn_metadata) if self.has_mla else None
-
-        block_residual = hidden_states.new_zeros(0, hidden_states.shape[0], hidden_states.shape[1])
+        block_residual = hidden_states.new_zeros(0, hidden_states.shape[0],
+                                                 hidden_states.shape[1])
         for layer in self.layers:
-            hidden_states, block_residual = layer(
-                hidden_states, block_residual, attn_metadata, mla_rt
-            )
+            hidden_states, block_residual = layer(hidden_states,
+                                                  block_residual,
+                                                  attn_metadata)
             if spec_metadata is not None:
                 # DFlash hidden-state capture. K3's attn-residual scheme
                 # already folds the residual into the running prefix sum
@@ -2245,11 +2229,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         """Named parameters of the trunk only. Spec-dec draft modules
         (e.g. the DFlash drafter attached by SpecDecOneEngineForCausalLM)
         live in a separate checkpoint loaded by
-        ModelLoader.load_draft_weights, not in the target checkpoint."""
+        ModelLoader.load_draft_weights, not in the target checkpoint. MLA
+        K/V absorb Parameters are derived by the KV-B loader and are likewise
+        excluded from checkpoint jobs."""
         return {
             name: param
             for name, param in self.named_parameters()
             if not name.startswith("draft_model.")
+            and not name.endswith(_KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES)
         }
 
     def checkpoint_name_plan(self, prefix: str):
@@ -2306,6 +2293,18 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         from .modeling_utils import run_concurrently
 
         prefix = "language_model." if any(k.startswith("language_model.") for k in weights) else ""
+
+        # The checkpoint stores every MLA KV-B head as interleaved [K | V]
+        # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
+        # instead, so context can project directly into the FMHA layout and
+        # absorbed decode can take zero-copy K/V views.
+        mla_mixers = [
+            layer.self_attn.mixer for layer in self.model.layers
+            if not getattr(layer, "is_kda", True)
+        ]
+        mla_kv_b_mixers = {
+            id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers
+        }
 
         params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
@@ -2395,6 +2394,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 # load_weights shards the full checkpoint tensor.
                 self.lm_head.load_weights(weights=[{"weight": src}])
                 return
+            mla_mixer = mla_kv_b_mixers.get(id(param))
+            if mla_mixer is not None:
+                _load_kimi_k3_mla_kv_b_proj(
+                    mla_mixer,
+                    src,
+                    head_start=mla_tp_rank * mla_mixer.num_heads,
+                )
+                return
             if name.endswith(".A_log") and src.numel() != param.numel():
                 # The checkpoint pads A_log from [num_heads] to [head_dim]
                 # (e.g. [96] -> [128]); the tail must be zeros. Under KDA
@@ -2443,17 +2450,16 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 # the real 96 heads; the param holds this rank's slice of
                 # the zero-PADDED 128-head layout (pad before divide, so
                 # per-rank counts stay a power of two). Head-major output
-                # rows for q_b/kv_b/g_proj, input columns for o_proj; a
-                # rank whose padded range lies beyond the real heads gets
-                # zeros (its v_absorb rows are zero -> exact zero output).
-                # KDA layers never reach here: their identically named
-                # g/o projections match the exact-ratio branch above.
+                # rows for q_b/g_proj and input columns for o_proj. KV-B has
+                # a dedicated head-aware loader above. A rank whose padded
+                # range lies beyond the real heads gets zeros. KDA layers
+                # never reach here: their identically named g/o projections
+                # match the exact-ratio branch above.
                 if mla_tp_size > 1 and ".self_attn." in name:
-                    if (
-                        name.endswith((".q_b_proj.weight", ".kv_b_proj.weight", ".g_proj.weight"))
-                        and src.shape[1:] == param.shape[1:]
-                        and src.shape[0] < param.shape[0] * mla_tp_size
-                    ):
+                    if (name.endswith((".q_b_proj.weight",
+                                       ".g_proj.weight"))
+                            and src.shape[1:] == param.shape[1:]
+                            and src.shape[0] < param.shape[0] * mla_tp_size):
                         s = param.shape[0]
                         lo = mla_tp_rank * s
                         param.data.zero_()
@@ -2500,15 +2506,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         return
                 # MLA head padding (96 -> 128 query heads, see
                 # KimiMLARuntime): pad the head-major output rows
-                # (q_b_proj / kv_b_proj / g_proj) or the head-major input
-                # columns (o_proj) with zeros. KDA layers' identically named
-                # projections match exactly and never take this path.
-                if (
-                    ".self_attn." in name
-                    and name.endswith((".q_b_proj.weight", ".kv_b_proj.weight", ".g_proj.weight"))
-                    and src.shape[1:] == param.shape[1:]
-                    and src.shape[0] < param.shape[0]
-                ):
+                # (q_b_proj / g_proj) or the head-major input columns
+                # (o_proj) with zeros. KV-B is handled above. KDA layers'
+                # identically named projections match exactly and never take
+                # this path.
+                if (".self_attn." in name and name.endswith(
+                    (".q_b_proj.weight", ".g_proj.weight"))
+                        and src.shape[1:] == param.shape[1:]
+                        and src.shape[0] < param.shape[0]):
                     param.data.zero_()
                     param.data[: src.shape[0]].copy_(src.to(param.dtype))
                     return
@@ -2559,6 +2564,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
         param_jobs = [(name, params[name]) for name in name_map]
         run_concurrently(load_param, param_jobs, num_workers=8)
+
+        logger.info(
+            f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections "
+            "in grouped runtime layout")
 
         # ---- backend expert slots: file-grouped streaming ----
         # The shared lazy ``weights`` dict keeps every shard mmapped for the
