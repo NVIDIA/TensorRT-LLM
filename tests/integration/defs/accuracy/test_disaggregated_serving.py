@@ -1600,61 +1600,70 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3.2-Exp"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2"
 
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(200000)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
-                             ids=["cache_mgr_v1"])
-    def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
-        """Test with KV cache manager v1, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("overlap_scheduler", [False])
+    def test_auto_dtype(self, overlap_scheduler):
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096
+        }
         max_num_tokens = 8192
+        ctx_kv_cache_config = {
+            "free_gpu_memory_fraction": 0.3,
+            "tokens_per_block": 64,
+            "dtype": "fp8",
+        }
         moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
         ctx_server_config = {
             "disable_overlap_scheduler": True,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
-                "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
-            },
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
-            },
-            "tensor_parallel_size": 2,
-            "moe_expert_parallel_size": 2,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": cache_transceiver_config,
+            "kv_cache_config": ctx_kv_cache_config,
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "max_batch_size": 16,
+            "max_num_tokens": max_num_tokens,
             "enable_autotuner": False,
         }
+        gen_kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "tokens_per_block": 64,
+            "dtype": "fp8",
+        }
         gen_server_config = {
-            "disable_overlap_scheduler": False,
+            "disable_overlap_scheduler": overlap_scheduler,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": cache_transceiver_config,
+            "kv_cache_config": gen_kv_cache_config,
             "moe_config": moe_config,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
-                "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
-            },
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
-            },
-            "tensor_parallel_size": 2,
-            "moe_expert_parallel_size": 2,
+            "max_batch_size": 128,
+            "max_num_tokens": 1024,
+            "cuda_graph_config": None,
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
             "enable_autotuner": False,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
+                                      ctx_server_config=ctx_server_config,
+                                      gen_server_config=gen_server_config,
+                                      model_name=self.MODEL_PATH,
+                                      max_workers=128) as llm:
+            run_accuracy_test(llm,
+                              model_name=self.MODEL_NAME,
+                              test_sets=["MMLU", "GSM8K"])
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
