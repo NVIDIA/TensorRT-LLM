@@ -129,7 +129,13 @@ def default_step_timeout_s(max_world):
 
 
 def precheck_prefix_lines(
-    cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, max_world, stage_name=""
+    cfg,
+    benchmark_mode,
+    config_path_expr,
+    ucx_tls_cmd,
+    max_world,
+    stage_name="",
+    llm_models_root=None,
 ):
     """Launch-script export lines wiring the precheck gate.
 
@@ -167,7 +173,7 @@ def precheck_prefix_lines(
         "--work-dir $testOutputDir/cache_transceiver_precheck "
         f"--benchmark-mode {benchmark_mode} --llm-src $llmSrcNode"
     )
-    model_root_env = f"LLM_MODELS_ROOT={shlex.quote(os.environ.get('LLM_MODELS_ROOT', ''))}"
+    model_root_env = f"LLM_MODELS_ROOT={shlex.quote(llm_models_root)}" if llm_models_root else ""
     lines = [
         f"export ctPrecheckEnabled={int(enabled)}",
         # The external srun timeout must cover the driver's first-rep NIXL
@@ -177,9 +183,13 @@ def precheck_prefix_lines(
         f"{int(knobs.get('step_timeout_s', default_step_timeout_s(max_world)))}",
         "export precheckRunScript=$llmSrcNode/jenkins/scripts/perf/"
         "disaggregated/slurm_precheck_run.sh",
-        f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} {model_root_env} '
+        # Quote the complete assignment as an export value. The launch script
+        # expands it into pytestCommand*Precheck, whose later eval interprets
+        # the inner shlex-quoted model path.
+        f"export ctPrecheckModelRootEnv={shlex.quote(model_root_env)}",
+        f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} $ctPrecheckModelRootEnv '
         f'$CTX_WORKER_ENV_VARS $PYTEST_COMMON_VARS {cmd} --role ctx"',
-        f'export pytestCommandGENPrecheck="{ucx_tls_cmd} {model_root_env} '
+        f'export pytestCommandGENPrecheck="{ucx_tls_cmd} $ctPrecheckModelRootEnv '
         f'$GEN_WORKER_ENV_VARS $PYTEST_COMMON_VARS {cmd} --role gen"',
     ]
     if stage_name:

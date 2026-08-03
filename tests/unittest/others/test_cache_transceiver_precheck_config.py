@@ -19,6 +19,8 @@ Target: tests/scripts/perf-sanity/cache_transceiver_precheck/precheck_config.py
 
 import json
 import os
+import shlex
+import subprocess
 import sys
 
 import pytest
@@ -359,16 +361,41 @@ def test_wireup_timeout_derivation():
     assert plan["wireup_timeout_s"] == 42
 
 
-def test_precheck_commands_propagate_model_root(monkeypatch):
-    monkeypatch.setenv("LLM_MODELS_ROOT", "/models with spaces")
-    lines = pcfg.precheck_prefix_lines({}, "e2e", "$config", "unset UCX_TLS &&", max_world=8)
-    commands = [line for line in lines if line.startswith("export pytestCommand")]
+@pytest.mark.parametrize("model_root", ["/models with spaces", "/models/o'hare"])
+def test_precheck_commands_propagate_model_root(monkeypatch, model_root):
+    # CI provides the model root inside its inbound pytest command, not in the
+    # environment of the Python process that generates the launch script.
+    monkeypatch.delenv("LLM_MODELS_ROOT", raising=False)
+    lines = pcfg.precheck_prefix_lines(
+        {},
+        "e2e",
+        "$config",
+        "unset UCX_TLS &&",
+        max_world=8,
+        llm_models_root=model_root,
+    )
+    shell_script = "\n".join(
+        [
+            "CTX_WORKER_ENV_VARS=",
+            "GEN_WORKER_ENV_VARS=",
+            "PYTEST_COMMON_VARS=",
+            "llmSrcNode=/repo",
+            "testOutputDir=/tmp/output",
+            "config=/tmp/config.yaml",
+            *lines,
+            "printf '%s\\n' \"$pytestCommandCTXPrecheck\"",
+            "printf '%s\\n' \"$pytestCommandGENPrecheck\"",
+        ]
+    )
+
+    result = subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True
+    )
+    commands = result.stdout.splitlines()
 
     assert len(commands) == 2
     for command in commands:
-        assert "LLM_MODELS_ROOT='/models with spaces'" in command
-        assert "$PYTEST_COMMON_VARS" in command
-        assert command.index("LLM_MODELS_ROOT=") < command.index("$PYTEST_COMMON_VARS")
+        assert f"LLM_MODELS_ROOT={model_root}" in shlex.split(command)
 
 
 def _enabled_line(cfg):

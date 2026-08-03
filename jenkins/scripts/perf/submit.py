@@ -630,6 +630,31 @@ def get_pytest_commands(script_prefix_lines, runtime_mode):
     return ("", worker_pytest_command, disagg_server_pytest_command, benchmark_pytest_command)
 
 
+def _get_pytest_command_env_var(script_prefix_lines, env_name):
+    """Extract an environment assignment from the inbound pytest command."""
+    pytest_command_line = next(
+        (ln for ln in script_prefix_lines if "export pytestCommand=" in ln), None
+    )
+    if pytest_command_line is None:
+        return None
+
+    command_value = pytest_command_line.split("=", 1)[1]
+    try:
+        parts = shlex.split(command_value)
+        # A fully quoted export value is parsed as one token on the first
+        # pass. Parse that token once more to recover its command words.
+        if len(parts) == 1 and any(char.isspace() for char in parts[0]):
+            parts = shlex.split(parts[0])
+    except ValueError as error:
+        raise ValueError(f"Invalid inbound pytestCommand: {error}") from error
+
+    prefix = f"{env_name}="
+    for part in parts:
+        if part.startswith(prefix):
+            return part[len(prefix) :]
+    return None
+
+
 def get_test_output_dir(script_prefix_lines, test_case_name):
     """Build the per-test output directory from the inbound pytestCommand.
 
@@ -809,6 +834,12 @@ def main():
         ucx_tls_server_cmd = ucx_tls_cmd
 
         pytest_common_vars = ""
+        llm_models_root = _get_pytest_command_env_var(script_prefix_lines, "LLM_MODELS_ROOT")
+        if not llm_models_root:
+            raise ValueError(
+                "LLM_MODELS_ROOT is missing from the inbound pytestCommand; "
+                "the cache-transceiver precheck cannot resolve model defaults"
+            )
         script_prefix_lines.extend(
             [
                 worker_pytest_command,
@@ -863,6 +894,7 @@ def main():
                     hardware_config["gpus_per_gen_server"],
                 ),
                 stage_name=args.stage_name,
+                llm_models_root=llm_models_root,
             )
         )
         srun_args_lines.extend(

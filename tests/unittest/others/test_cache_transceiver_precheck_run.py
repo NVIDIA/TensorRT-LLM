@@ -397,6 +397,17 @@ class TestInternalApiContract:
         rt = inspect.signature(api.resolve_transceiver_runtime_auto).parameters
         assert list(rt)[:1] == ["llm_args"] and len(rt) >= 3
 
+    def test_deepseek_v4_auto_selects_kv_cache_manager_v2(self, api, tmp_path):
+        model_dir = tmp_path / "deepseek-v4"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"architectures": ["DeepseekV4ForCausalLM"]})
+        )
+        side = {"use_kv_cache_manager_v2": "auto"}
+        cache_cfg = api.CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+
+        assert rp.resolve_model_prefs(str(model_dir), side, cache_cfg) is True
+
     def test_enum_members(self, api):
         for enum, members in (
             (api.DataType, ("FP8", "HALF", "BF16")),

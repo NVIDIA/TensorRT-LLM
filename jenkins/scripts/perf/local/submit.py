@@ -967,6 +967,7 @@ def main():
                     hardware_config.get("gpus_per_ctx_server", 0) or 0,
                     hardware_config.get("gpus_per_gen_server", 0) or 0,
                 ),
+                llm_models_root=args.llm_models_root,
             )
         )
 
