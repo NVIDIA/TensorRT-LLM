@@ -76,11 +76,11 @@ is validated only without block reuse (Mixed cache manager).
 
 from __future__ import annotations
 
+import copy
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import copy
 import torch
 from torch import nn
 
@@ -95,6 +95,7 @@ from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
 from ..modules.kimi_k3_moe._mlp import KimiK3MLP, KimiK3RMSNorm
 from ..modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
+from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActType_TrtllmGen
@@ -334,7 +335,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # Lazy imports: only pulled in on the FP8 path.
         from ...deep_gemm.utils.math import per_block_cast_to_fp8
         from ...quantization.utils.fp8_utils import (
-            resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
+            resmooth_to_fp8_e8m0,
+            transform_sf_into_required_layout,
+        )
         # 128x128 block-scale FP8 weight, then the exact SM100 deep_gemm scale
         # preparation the shipping FP8-block-scale Linear uses: resmooth to
         # UE8M0 and pack the scale into deep_gemm's TMA-aligned MN-major
@@ -999,9 +1002,9 @@ class KimiKDARuntime(nn.Module):
         num_prefills = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         batch_size = attn_metadata.seq_lens.shape[0]
-        # index_copy_/index_select need int64 indices; the int64 mirror is
-        # prepared once per step by Mamba2Metadata.prepare() so KDA layers
-        # do not each replay an int32->int64 cast inside the decode graph.
+        # index_copy_/index_select need int64 indices; the K3 metadata prepares
+        # a mirror once per step so KDA layers do not each replay an
+        # int32-to-int64 cast inside the decode graph.
         state_indices = getattr(mamba_metadata, "state_indices_long", None)
         if state_indices is None or state_indices.shape[0] != batch_size:
             state_indices = mamba_metadata.state_indices[:batch_size].long()
@@ -1155,6 +1158,9 @@ class KimiKDARuntime(nn.Module):
             safe_gate=lower_bound is not None,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
+            chunk_indices=mamba_metadata.kda_chunk_indices,
+            varlen_is_aligned=mamba_metadata.kda_varlen_is_aligned,
+            single_sequence_length=mamba_metadata.kda_single_sequence_length,
         )
 
         # Persist per-request states into the pools.
@@ -2018,6 +2024,8 @@ def _materialize(value) -> torch.Tensor:
 class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
                                                         Any]):
     """Kimi K3 text model (the vision tower is ignored; text-only serving)."""
+
+    mamba_metadata_cls = KimiK3MambaMetadata
 
     def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)

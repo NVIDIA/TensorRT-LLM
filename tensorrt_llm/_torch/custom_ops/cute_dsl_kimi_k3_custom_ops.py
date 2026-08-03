@@ -31,9 +31,8 @@ The public ``trtllm::kda_prefill`` operator returns only the KDA output and
 final recurrent state. Intermediate matrices remain private runner workspace.
 """
 
-from typing import Optional, Tuple
-
 import weakref
+from typing import Optional, Tuple
 
 import torch
 
@@ -617,6 +616,7 @@ def _launch_fused_k123_inv(
     akk_out_view=None,
     cute_wrappers=None,
     varlen_pure_override=False,
+    varlen_is_aligned=None,
 ):
     """Persistent K1+K2 (writes A_kk in I+L format with diag=1) chained with
     BF16 akk_inv (in-place inversion). Final A_kk_inv = (I+L)^-1."""
@@ -632,15 +632,17 @@ def _launch_fused_k123_inv(
     T_padded = T if is_varlen else None
     has_bias = dt_bias is not None
 
-    # Auto-detect VARLEN_PURE eligibility, cached by id(cu_seqlens).
-    # First call with a given cu_seqlens object pays one GPU->CPU sync; later
-    # calls with the same tensor object are a dict lookup (~100 ns).
+    # Prefer the host-derived alignment property supplied by the model runtime.
+    # Direct low-level callers that omit it retain the cached device inference
+    # fallback for backward compatibility.
     varlen_pure = False
     if is_varlen and cu_seqlens is not None:
         if varlen_pure_override:
             # Caller (Phase 2.1 single-seq path) sentinel-padded the data for
             # this call; the cached per-object verdict stays untouched.
             varlen_pure = True
+        elif varlen_is_aligned is not None:
+            varlen_pure = varlen_is_aligned
         else:
             _vp_key = id(cu_seqlens)
             if _vp_key not in _varlen_pure_cache:
@@ -898,6 +900,8 @@ def _chunk_kda_fwd(
     return_intermediate_states: bool = False,
     cp_context=None,
     use_fused_k1234: bool = False,
+    varlen_is_aligned: bool | None = None,
+    single_sequence_length: int | None = None,
 ):
     """KDA forward — optimized, FLA-compatible interface."""
     if safe_gate and lower_bound is None:
@@ -1007,17 +1011,31 @@ def _chunk_kda_fwd(
     # Multi-seq optimization needs per-seq dynamic tensormap (Phase 2.2).
     needs_varlen_single_pad = False
     if is_varlen and cu_seqlens is not None and cu_seqlens.shape[0] == 2 and B == 1:
-        _vl_key = id(cu_seqlens)
-        if _vl_key not in _varlen_pure_cache:
-            cu_cpu = cu_seqlens.cpu().tolist()
-            sl = cu_cpu[1] - cu_cpu[0]
-            _varlen_pure_cache[_vl_key] = sl % BT == 0
-            _varlen_single_seqlen_cache[_vl_key] = sl
-            _prune_on_gc(_varlen_pure_cache, _vl_key, cu_seqlens)
-            _prune_on_gc(_varlen_single_seqlen_cache, _vl_key, cu_seqlens)
-        if not _varlen_pure_cache[_vl_key]:
-            real_T = _varlen_single_seqlen_cache[_vl_key]
-            needs_varlen_single_pad = True
+        if single_sequence_length is not None:
+            single_sequence_is_aligned = single_sequence_length % BT == 0
+            if (varlen_is_aligned is not None
+                    and varlen_is_aligned != single_sequence_is_aligned):
+                raise ValueError(
+                    "varlen_is_aligned disagrees with single_sequence_length"
+                )
+            varlen_is_aligned = single_sequence_is_aligned
+            if not single_sequence_is_aligned:
+                real_T = single_sequence_length
+                needs_varlen_single_pad = True
+        else:
+            _vl_key = id(cu_seqlens)
+            if _vl_key not in _varlen_pure_cache:
+                cu_cpu = cu_seqlens.cpu().tolist()
+                sl = cu_cpu[1] - cu_cpu[0]
+                _varlen_pure_cache[_vl_key] = sl % BT == 0
+                _varlen_single_seqlen_cache[_vl_key] = sl
+                _prune_on_gc(_varlen_pure_cache, _vl_key, cu_seqlens)
+                _prune_on_gc(_varlen_single_seqlen_cache, _vl_key,
+                             cu_seqlens)
+            varlen_is_aligned = _varlen_pure_cache[_vl_key]
+            if not varlen_is_aligned:
+                real_T = _varlen_single_seqlen_cache[_vl_key]
+                needs_varlen_single_pad = True
     varlen_pure_override = False
     if needs_varlen_single_pad:
         # q/k/v/beta already zero-padded by caller (FLA convention). Re-build g
@@ -1128,6 +1146,7 @@ def _chunk_kda_fwd(
         akk_out_view=cute_wrappers["akk_out_view"],
         cute_wrappers=cute_wrappers,
         varlen_pure_override=varlen_pure_override,
+        varlen_is_aligned=varlen_is_aligned,
     )
 
     # ===== K4: persistent kernel (eqlen + varlen via cu_seqlens) =====
@@ -1207,6 +1226,8 @@ class KdaPrefillRunner:
         disable_recompute: bool = False,
         return_intermediate_states: bool = False,
         use_fused_k1234: bool = False,
+        varlen_is_aligned: Optional[bool] = None,
+        single_sequence_length: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA prefill and return output plus final recurrent state."""
         if not IS_CUTLASS_DSL_AVAILABLE:
@@ -1234,6 +1255,8 @@ class KdaPrefillRunner:
             disable_recompute=disable_recompute,
             return_intermediate_states=return_intermediate_states,
             use_fused_k1234=use_fused_k1234,
+            varlen_is_aligned=varlen_is_aligned,
+            single_sequence_length=single_sequence_length,
         )
         return result[0], result[1]
 
@@ -1261,6 +1284,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         disable_recompute: bool = False,
         return_intermediate_states: bool = False,
         use_fused_k1234: bool = False,
+        varlen_is_aligned: Optional[bool] = None,
+        single_sequence_length: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run Kimi K3 KDA chunked prefill on Blackwell GPUs.
 
@@ -1289,6 +1314,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             disable_recompute=disable_recompute,
             return_intermediate_states=return_intermediate_states,
             use_fused_k1234=use_fused_k1234,
+            varlen_is_aligned=varlen_is_aligned,
+            single_sequence_length=single_sequence_length,
         )
         if final_state is None:
             final_state = q.new_empty(0, dtype=torch.float32)
@@ -1315,11 +1342,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         disable_recompute: bool = False,
         return_intermediate_states: bool = False,
         use_fused_k1234: bool = False,
+        varlen_is_aligned: Optional[bool] = None,
+        single_sequence_length: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         del k, g, beta, A_log, scale, dt_bias, initial_state
         del chunk_indices, chunk_size, safe_gate, lower_bound
         del use_gate_in_kernel, disable_recompute, return_intermediate_states
         del use_fused_k1234
+        del varlen_is_aligned, single_sequence_length
         num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
         output = v.new_empty(v.shape)
         if output_final_state:

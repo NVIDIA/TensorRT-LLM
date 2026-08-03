@@ -249,7 +249,10 @@ class KDAKernelDispatch:
         safe_gate: bool,
         lower_bound: Optional[float],
         cu_seqlens: Optional[torch.Tensor],
+        chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
+        varlen_is_aligned: Optional[bool] = None,
+        single_sequence_length: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA chunked prefill.
 
@@ -262,6 +265,11 @@ class KDAKernelDispatch:
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
 
+        ``chunk_indices``, ``varlen_is_aligned``, and
+        ``single_sequence_length`` are prepared once from Kimi K3 runtime
+        metadata. They keep the optimized path from reading ``cu_seqlens``
+        back from the GPU in every KDA layer.
+
         State layout contract (both paths): ``initial_state`` is consumed
         and ``final_state`` returned in the V-first ``[N, H, V, K]`` layout —
         the layout of the executor's ssm pool and of the fused decode
@@ -271,10 +279,11 @@ class KDAKernelDispatch:
         a mix-up — the transpose is semantic).
         """
         use_optimized = self.prefill_kernel_path == "optimized"
-        chunk_indices = None
         if use_optimized and cu_seqlens is not None:
-            from fla.ops.utils.index import prepare_chunk_indices
-            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+            if chunk_indices is None:
+                from fla.ops.utils.index import prepare_chunk_indices
+
+                chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
             # The persistent K123 scheduler needs at least 4 total chunks
             # (cgs_per_head = NT // 4 cooperative groups per head). The
             # eqlen path guarantees this by padding to a 256-token multiple
@@ -338,6 +347,8 @@ class KDAKernelDispatch:
                 use_gate_in_kernel=True,
                 A_log=A_log_kernel,
                 dt_bias=dt_bias_kernel,
+                varlen_is_aligned=varlen_is_aligned,
+                single_sequence_length=single_sequence_length,
             )
             if out.shape[1] != real_T:
                 out = out[:, :real_T]

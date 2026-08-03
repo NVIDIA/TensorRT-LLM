@@ -2199,6 +2199,9 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
+        if isinstance(self.model, DecoderModelForCausalLM):
+            # Hybrid models may extend the default Mamba metadata contract.
+            self.attn_metadata.mamba_metadata_cls = self.model.mamba_metadata_cls
 
         return self.attn_metadata
 

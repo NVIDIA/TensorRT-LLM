@@ -378,6 +378,8 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
+    mamba_metadata_cls: type | None = None
+
     def __init__(self, model: TModel, *, config: ModelConfig[TConfig],
                  hidden_size: int, vocab_size: int):
         super().__init__()
