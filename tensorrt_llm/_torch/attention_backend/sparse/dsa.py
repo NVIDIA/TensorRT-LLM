@@ -2834,8 +2834,14 @@ class Indexer(nn.Module):
                                 top_k=self.index_topk,
                                 device=q_fp8.device)
                         st = self._gvr_ext
-                        n_comp = indexer_max_seq_len // max(
-                            self.compress_ratio, 1)
+                        # indexer_max_seq_len is ALREADY the compressed
+                        # length - get_indexer_max_seq_len divides by the
+                        # compress ratio, and it is what goes to the top-k
+                        # as max_seq_len below. Dividing again shifted every
+                        # routing threshold by two doublings: the list tier
+                        # became unreachable and 30 of the 154 grid shapes
+                        # fell back to the stock kernel instead of 4.
+                        n_comp = indexer_max_seq_len
                         emit_tier, self._gvr_route = st.plan(
                             batch_size,
                             n_comp,
