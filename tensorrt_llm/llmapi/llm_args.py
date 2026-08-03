@@ -5003,11 +5003,11 @@ class ModelExpressConfig(StrictBaseModel):
 
     server_query_timeout_s: Optional[NonNegativeInt] = Field(
         default=None,
-        description="Timeout in seconds for upstream MxLiveWeightLoader source "
-        "discovery. When unset, TRT-LLM first probes for existing sources: "
-        "no source uses a short 30-second fallback cap, while an existing "
-        "source uses modelexpress's default wait for long donor loads.",
-        status="prototype")
+        description="Deprecated and ignored. ModelExpress performs one source "
+        "discovery query and falls back to native checkpoint loading when no "
+        "compatible source is immediately available.",
+        status="deprecated",
+        deprecated=True)
 
     preshard_strategy: str = Field(
         default="per_module",

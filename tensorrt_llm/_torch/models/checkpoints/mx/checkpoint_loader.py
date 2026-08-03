@@ -22,8 +22,8 @@ through its shared load-strategy chain.
 
 import logging
 import os
-from pathlib import Path
-from typing import Any, Optional, Union
+from importlib import import_module
+from typing import Any, Optional
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
@@ -31,6 +31,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeight
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
 from tensorrt_llm._torch.weight_sharing import SOURCE_IDENTITY_FORMAT_VERSION, SourceIdentity
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 
@@ -55,7 +56,6 @@ class MXCheckpointLoader(HfCheckpointLoader):
         weight_mapper: Optional[BaseWeightMapper] = None,
         config_loader: Optional[BaseConfigLoader] = None,
         mx_server_url: Optional[str] = None,
-        model_name: Optional[Union[str, Path]] = None,
     ):
         super().__init__(
             weight_loader=weight_loader,
@@ -64,7 +64,6 @@ class MXCheckpointLoader(HfCheckpointLoader):
         )
         self._checkpoint_format = "MX"
         self._mx_server_url = mx_server_url
-        self._model_name = str(model_name) if model_name is not None else None
         self._p2p_succeeded = False
         self._post_transform_weights_preloaded = False
         self._source_identity_compatible_for_last_load = False
@@ -79,10 +78,6 @@ class MXCheckpointLoader(HfCheckpointLoader):
     @property
     def mx_server_url(self) -> Optional[str]:
         return self._mx_server_url
-
-    @property
-    def model_name(self) -> Optional[str]:
-        return self._model_name
 
     def is_weights_preloaded(self) -> bool:
         return self._p2p_succeeded
@@ -113,7 +108,6 @@ class MXCheckpointLoader(HfCheckpointLoader):
             after ModelExpress writes the complete shard into ``model``.
 
         Raises:
-            ImportError: ModelExpress is requested but unavailable.
             RuntimeError: Qualified reception lacks its structure,
                 protocol, or current SourceIdentity ABI contract.
         """
@@ -144,14 +138,29 @@ class MXCheckpointLoader(HfCheckpointLoader):
         _enable_mx_transfer_logging()
 
         try:
-            from modelexpress.engines.trtllm import MxModelLoader
-        except ImportError as exc:
-            raise ImportError(
-                "ModelExpress checkpoint loading was explicitly requested, "
-                "but the ModelExpress client could not be imported. Install "
-                'the MX dependencies with `pip install "tensorrt-llm[mx]"`, '
-                "or select a different `checkpoint_format`."
-            ) from exc
+            trtllm_adapter = import_module("modelexpress.engines.trtllm")
+        except ModuleNotFoundError as exc:
+            if exc.name not in {
+                "modelexpress",
+                "modelexpress.engines",
+                "modelexpress.engines.trtllm",
+            }:
+                raise
+            trtllm_adapter = None
+        MxModelLoader = (
+            getattr(trtllm_adapter, "MxModelLoader", None) if trtllm_adapter is not None else None
+        )
+        if MxModelLoader is None:
+            logger.warning(
+                "The installed ModelExpress package does not provide the "
+                "TensorRT-LLM adapter; falling back to native Hugging Face "
+                "checkpoint loading."
+            )
+            return super().load_weights(
+                checkpoint_dir,
+                mapping=mapping,
+                **kwargs,
+            )
 
         if allow_post_transform_weights and prepare_post_transform_receiver is None:
             raise RuntimeError("Qualified MX loading requires receiver structure preparation")
@@ -166,10 +175,12 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 "SourceIdentity format and a transform-layout ABI"
             )
 
-        if self._mx_loader is not None:
-            self._mx_loader.cleanup()
+        previous_loader = self._mx_loader
+        self._mx_loader = None
+        if previous_loader is not None:
+            previous_loader.cleanup()
 
-        self._mx_loader = MxModelLoader(
+        mx_loader = MxModelLoader(
             model_config=model_config,
             load_config=load_config,
             checkpoint_loader=self,
@@ -186,9 +197,10 @@ class MXCheckpointLoader(HfCheckpointLoader):
             p2p_enabled=allow_post_transform_weights,
             mx_server_url=self._mx_server_url,
         )
-        weights = self._mx_loader.load_model(model)
-        self._p2p_succeeded = self._mx_loader.p2p_succeeded
-        self._transform_protocol_version_for_last_load = self._mx_loader.transform_protocol_version
+        self._mx_loader = mx_loader
+        weights = mx_loader.load_model(model)
+        self._p2p_succeeded = mx_loader.p2p_succeeded
+        self._transform_protocol_version_for_last_load = mx_loader.transform_protocol_version
         post_transform_compatible = (
             self._p2p_succeeded
             and transform_protocol_version is not None

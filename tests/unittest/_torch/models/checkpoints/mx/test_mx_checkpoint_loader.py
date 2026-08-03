@@ -29,7 +29,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
     Qwen3NextHfWeightMapper,
 )
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
-from tensorrt_llm._torch.models.checkpoints.mx import checkpoint_loader as mx_checkpoint_loader
+from tensorrt_llm._torch.models.checkpoints.mx import checkpoint_loader as checkpoint_loader_mod
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
@@ -118,17 +118,13 @@ def _install_fake_mx(
 
 
 def test_construction_preserves_checkpoint_loader_contract():
-    loader, _, _ = _loader(
-        mx_server_url="mx:8001",
-        model_name="meta-llama/Llama-3.1-8B-Instruct",
-    )
+    loader, _, _ = _loader(mx_server_url="mx:8001")
 
     assert isinstance(loader, HfCheckpointLoader)
     assert isinstance(loader, BaseCheckpointLoader)
     assert loader.checkpoint_format == "MX"
     assert loader._checkpoint_format == "MX"
     assert loader.mx_server_url == "mx:8001"
-    assert loader.model_name == "meta-llama/Llama-3.1-8B-Instruct"
     assert not loader.is_weights_preloaded()
 
 
@@ -143,8 +139,8 @@ def test_transfer_log_dir_enables_info_records(
     mx_logger = MagicMock()
     mx_logger.getEffectiveLevel.return_value = effective_level
 
-    with patch.object(mx_checkpoint_loader.logging, "getLogger", return_value=mx_logger):
-        mx_checkpoint_loader._enable_mx_transfer_logging()
+    with patch.object(checkpoint_loader_mod.logging, "getLogger", return_value=mx_logger):
+        checkpoint_loader_mod._enable_mx_transfer_logging()
 
     if expected_level is None:
         mx_logger.setLevel.assert_not_called()
@@ -183,6 +179,32 @@ def test_missing_mx_state_uses_native_hf_loader():
         "checkpoint",
         mapping=kwargs["mapping"],
     )
+
+
+def test_missing_trtllm_adapter_uses_native_hf_loader(monkeypatch):
+    module = ModuleType("modelexpress.engines.trtllm")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    loader, weight_loader, _ = _loader(mx_server_url="mx:8001")
+    kwargs = _load_kwargs()
+
+    value = loader.load_weights("checkpoint", **kwargs)
+
+    assert value == weight_loader.load_weights.return_value
+    weight_loader.load_weights.assert_called_once_with(
+        "checkpoint",
+        mapping=kwargs["mapping"],
+    )
+
+
+def test_trtllm_adapter_dependency_error_is_not_hidden(monkeypatch):
+    def fail_import(_name):
+        raise ModuleNotFoundError("No module named 'nixl'", name="nixl")
+
+    monkeypatch.setattr(checkpoint_loader_mod, "import_module", fail_import)
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+
+    with pytest.raises(ModuleNotFoundError, match="nixl"):
+        loader.load_weights("checkpoint", **_load_kwargs())
 
 
 def test_qualified_llama_delegates_to_shared_chain(monkeypatch):
@@ -299,6 +321,32 @@ def test_incompatible_transfer_protocol_fails_closed(monkeypatch):
     assert not loader.is_post_transform_weights_preloaded()
 
 
+def test_repeated_load_clears_cleaned_session_before_replacement(monkeypatch):
+    instances = _install_fake_mx(
+        monkeypatch,
+        p2p_succeeded=False,
+        value={"disk": object()},
+    )
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+    loader.load_weights("checkpoint", **_load_kwargs())
+    first_session = instances[0]
+
+    class FailingMxModelLoader:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("construction failed")
+
+    sys.modules["modelexpress.engines.trtllm"].MxModelLoader = FailingMxModelLoader
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        loader.load_weights("checkpoint", **_load_kwargs())
+
+    first_session.cleanup.assert_called_once_with()
+    assert loader._mx_loader is None
+
+    loader.cleanup()
+    first_session.cleanup.assert_called_once_with()
+
+
 def test_p2p_receiver_republishes_after_trt_post_load(monkeypatch):
     instances = _install_fake_mx(
         monkeypatch,
@@ -309,6 +357,7 @@ def test_p2p_receiver_republishes_after_trt_post_load(monkeypatch):
     kwargs = _load_kwargs()
     model = kwargs["model"]
     loader.load_weights("checkpoint", **kwargs)
+    instances[0].publish_model.assert_not_called()
 
     loader.post_load_publish(
         model,
@@ -330,6 +379,7 @@ def test_native_source_publishes_after_trt_post_load(monkeypatch):
     kwargs = _load_kwargs()
     model = kwargs["model"]
     loader.load_weights("checkpoint", **kwargs)
+    instances[0].publish_model.assert_not_called()
 
     loader.post_load_publish(
         model,

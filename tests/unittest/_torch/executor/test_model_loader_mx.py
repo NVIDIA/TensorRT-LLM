@@ -433,12 +433,10 @@ def test_construct_checkpoint_loader_passes_mx_config():
         None,
         "MX",
         mx_config=mx_config,
-        mx_model_name="Qwen/Qwen2.5-7B-Instruct",
     )
 
     assert isinstance(checkpoint_loader, MXCheckpointLoader)
     assert checkpoint_loader.mx_server_url == "http://mx:8001"
-    assert checkpoint_loader.model_name == "Qwen/Qwen2.5-7B-Instruct"
 
 
 def _format_documented_values(
@@ -605,6 +603,42 @@ def test_cleanup_swallows_checkpoint_loader_failure(monkeypatch):
         checkpoint_loader,
         exc_info=True,
     )
+
+
+def test_cleanup_continues_after_gms_failure(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    gms_backend = MagicMock(name="gms_backend")
+    gms_backend.cleanup.side_effect = RuntimeError("gms cleanup failed")
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    loader._gms_backend = gms_backend
+    loader._checkpoint_loader = checkpoint_loader
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
+
+    loader.cleanup()
+
+    gms_backend.cleanup.assert_called_once_with()
+    checkpoint_loader.cleanup.assert_called_once_with()
+    assert loader._gms_backend is None
+    assert loader._checkpoint_loader is None
+    warning.assert_called_once_with(
+        "Failed to clean up GMS backend %r",
+        gms_backend,
+        exc_info=True,
+    )
+
+
+def test_config_failure_retains_checkpoint_loader_for_cleanup(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    loader._load_and_validate_config.side_effect = RuntimeError("config failed")
+
+    with pytest.raises(RuntimeError, match="config failed"):
+        loader.load("/ckpt", checkpoint_loader)
+
+    assert loader._checkpoint_loader is checkpoint_loader
+    loader.cleanup()
+    checkpoint_loader.cleanup.assert_called_once_with()
 
 
 @pytest.mark.cpu_only

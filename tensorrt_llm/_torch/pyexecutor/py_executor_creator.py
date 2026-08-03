@@ -272,7 +272,6 @@ def _load_config_and_create_checkpoint_loader(
         llm_args.checkpoint_loader,
         llm_args.checkpoint_format,
         mx_config=llm_args.mx_config,
-        mx_model_name=llm_args.model,
     )
     llm_args = ModelLoader.load_config_and_apply_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)

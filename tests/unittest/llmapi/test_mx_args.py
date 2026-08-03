@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import ModelExpressConfig, TorchLlmArgs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -58,6 +58,10 @@ class TestDefaults:
     def test_mx_server_query_timeout_accepts_nonnegative_int(self):
         args = _make_args(checkpoint_format="MX", mx_config={"server_query_timeout_s": 1200})
         assert args.mx_config.server_query_timeout_s == 1200
+
+    def test_mx_server_query_timeout_is_deprecated(self):
+        field = ModelExpressConfig.model_json_schema()["properties"]["server_query_timeout_s"]
+        assert field["deprecated"] is True
 
     def test_mx_server_query_timeout_rejects_negative(self):
         with pytest.raises(ValueError):
