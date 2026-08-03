@@ -112,10 +112,15 @@ def test_minimax_m3_fp8_main_kv_insert_matches_materialize_then_scatter(
     pages = slots.long() // page_size
     within = slots.long() % page_size
 
-    assert torch.equal(q_out.view(torch.uint8), q_ref.contiguous().view(torch.uint8))
-    assert torch.equal(
-        kv_cache[:, 0][pages, :, within, :].view(torch.uint8),
-        k_ref.contiguous().view(torch.uint8),
+    # The specialized kernel uses powf while fused_qk_norm_rope_to_fp8 uses
+    # the exp2f/log2f equivalent, so values at an FP8 boundary can round to
+    # adjacent E4M3 values.
+    torch.testing.assert_close(q_out.float(), q_ref.float(), rtol=0.13, atol=0.05)
+    torch.testing.assert_close(
+        kv_cache[:, 0][pages, :, within, :].float(),
+        k_ref.float(),
+        rtol=0.13,
+        atol=0.05,
     )
     assert torch.equal(
         kv_cache[:, 1][pages, :, within, :].view(torch.uint8),
@@ -155,10 +160,12 @@ def test_minimax_m3_fp8_main_kv_insert_uses_64bit_cache_offsets():
     q_ref, k_ref, v_ref = _reference(qkv, 8, 1, q_weight, k_weight, position_ids)
     torch.cuda.synchronize()
 
-    assert torch.equal(q_out.view(torch.uint8), q_ref.contiguous().view(torch.uint8))
-    assert torch.equal(
-        kv_cache[page, 0, :, 0, :].view(torch.uint8),
-        k_ref[0].contiguous().view(torch.uint8),
+    torch.testing.assert_close(q_out.float(), q_ref.float(), rtol=0.13, atol=0.05)
+    torch.testing.assert_close(
+        kv_cache[page, 0, :, 0, :].float(),
+        k_ref[0].float(),
+        rtol=0.13,
+        atol=0.05,
     )
     assert torch.equal(
         kv_cache[page, 1, :, 0, :].view(torch.uint8),
