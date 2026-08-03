@@ -456,7 +456,7 @@ async def serve_with_lifecycle(
     on_ready: Optional[Callable[[Any], Awaitable[bool]]] = None,
     on_startup_failure: Optional[Callable[[Any], None]] = None,
 ) -> None:
-    """Serve the four-state lifecycle contract from a single uvicorn instance.
+    """Serve the three-state lifecycle contract from a single uvicorn instance.
 
     Starts listening first, runs the blocking ``build`` off the event loop,
     then swaps the built application in without touching the socket.

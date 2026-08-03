@@ -586,8 +586,10 @@ def test_build_failure_stops_listening(loop_factory):
         sock = bound_socket()
         port = sock.getsockname()[1]
 
+        # Long enough that the STARTING window stays open across the
+        # bind()->listen() wait below even on a loaded CI host.
         def build():
-            time.sleep(0.5)
+            time.sleep(FAKE_BUILD_SECONDS)
             raise RuntimeError("engine init exploded")
 
         serve = asyncio.create_task(
@@ -600,8 +602,17 @@ def test_build_failure_stops_listening(loop_factory):
             )
         )
 
-        # While the doomed build runs the server is honestly STARTING.
-        await asyncio.sleep(0.2)
+        # While the doomed build runs the server is honestly STARTING. Poll
+        # out the bind()->listen() window rather than guessing it with a fixed
+        # sleep: a sleep shorter than the window sees "refused" and fails the
+        # assertion below for a reason that has nothing to do with the
+        # contract under test. Same idiom as
+        # test_blocking_build_never_leaves_a_probe_unanswered.
+        listening_at = time.monotonic()
+        while (await probe(port)).outcome == "refused":
+            assert time.monotonic() - listening_at < 5.0, "server did not start listening promptly"
+            await asyncio.sleep(PROBE_INTERVAL_SECONDS)
+
         during = await probe(port)
         assert during.outcome == "answered" and during.status == 503
 
