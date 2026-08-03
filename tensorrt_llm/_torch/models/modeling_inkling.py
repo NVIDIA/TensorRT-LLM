@@ -742,7 +742,28 @@ class InklingDecodeMeta:
         self.cap = 0
         self.seq_lens: Optional[torch.Tensor] = None  # [cap] int32 GPU total-KV
         self.page_table: Optional[torch.Tensor] = None  # [cap, max_pages] int32
-        self.ready = False
+        self._pt_host: Optional[torch.Tensor] = None  # reused pinned staging
+        # Publication epoch. ``prepare_inkling_attn_decode`` bumps the shared
+        # counter once per forward, so a layer whose ``refresh`` did not run this
+        # forward reports ``ready == False`` by construction rather than leaving
+        # a stale True behind. Bound by InklingForCausalLM after construction.
+        self._epoch: List[int] = [0]
+        self._published_epoch = -1
+
+    def bind_epoch(self, epoch: List[int]) -> None:
+        """Share the model's per-forward publication counter."""
+        self._epoch = epoch
+
+    @property
+    def ready(self) -> bool:
+        """True only when these buffers were published for the CURRENT forward.
+
+        The decode kernel reads ``seq_lens``/``page_table`` directly when this
+        is set, so it must never report a previous step's publication: the same
+        requests advance ``num_cached_tokens_per_seq`` every step, and a page
+        table one step out of date silently drops a newly allocated page.
+        """
+        return self._published_epoch == self._epoch[0]
 
     def _ensure(self, num_gen: int, mgr, device, is_graph: bool) -> None:
         if self.max_pages is None:
@@ -760,41 +781,39 @@ class InklingDecodeMeta:
         self.seq_lens = torch.ones(self.cap, dtype=torch.int32, device=device)
         self.page_table = torch.zeros((self.cap, self.max_pages), dtype=torch.int32, device=device)
 
-    def refresh(self, attn_metadata, device) -> bool:
-        """Publish this batch's generation decode metadata into the stable
-        buffers. Returns whether a generation slice was prepared (``ready``)."""
-        self.ready = False
-        request_ids = attn_metadata.request_ids
-        mgr = getattr(attn_metadata, "kv_cache_manager", None)
-        if request_ids is None or mgr is None:
-            return False
-        num_contexts = attn_metadata.num_contexts
-        num_gen = len(request_ids) - num_contexts
-        if num_gen <= 0:
-            return False
-        gen_ids = request_ids[num_contexts:]
-        num_cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[num_contexts:]
-        # Host-side block table for THIS layer (per-pool). This is the SAME call
-        # the previous host path made inside forward; relocating it here (eager,
-        # outside any captured region) is what makes the copy legal.
+    def refresh(self, mgr, gen_ids, sl_host, device, is_graph: bool) -> None:
+        """Publish this batch's generation decode metadata into the stable buffers.
+
+        ``sl_host`` is the total-KV length staging tensor, built once per forward
+        by :meth:`InklingForCausalLM.prepare_inkling_attn_decode` -- its contents
+        do not depend on the layer, so it is shared across all of them. Only the
+        page table is per-layer (``get_batch_cache_indices`` is per pool_id).
+        """
+        num_gen = int(sl_host.shape[0])
+        # Host-side block table for THIS layer (per-pool). Reading it here --
+        # eagerly, outside any captured region -- is what makes the copy legal.
         block_ids = mgr.get_batch_cache_indices(gen_ids, self.layer_idx)
-        is_graph = bool(getattr(attn_metadata, "is_cuda_graph", False))
         self._ensure(num_gen, mgr, device, is_graph)
-        # Build host staging (pinned) then ONE async copy into each stable buffer.
-        pin = prefer_pinned()
-        sl_host = torch.empty(num_gen, dtype=torch.int32, pin_memory=pin)
-        for i in range(num_gen):
-            sl_host[i] = int(num_cached[i]) + 1
-        pt_host = torch.zeros((num_gen, self.max_pages), dtype=torch.int32, pin_memory=pin)
+        # Reused pinned staging: this runs once per layer per decode step, so a
+        # fresh pinned allocation here would be 2x66 cudaHostAllocs per token.
+        if self._pt_host is None or self._pt_host.shape[0] < num_gen:
+            self._pt_host = torch.zeros(
+                (max(num_gen, self.cap), self.max_pages),
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
+        pt_host = self._pt_host[:num_gen]
+        # Fill through the numpy view of the pinned buffer: one vectorized row
+        # assignment instead of a torch.tensor() per row.
+        pt_np = pt_host.numpy()
+        pt_np.fill(0)
         for i, blocks in enumerate(block_ids):
-            valid = [int(b) for b in blocks if int(b) >= 0]
+            valid = [b for b in map(int, blocks) if b >= 0][: self.max_pages]
             if valid:
-                w = min(len(valid), self.max_pages)
-                pt_host[i, :w] = torch.tensor(valid[:w], dtype=torch.int32)
+                pt_np[i, : len(valid)] = valid
         self.seq_lens[:num_gen].copy_(sl_host, non_blocking=True)
         self.page_table[:num_gen].copy_(pt_host, non_blocking=True)
-        self.ready = True
-        return True
+        self._published_epoch = self._epoch[0]
 
 
 class InklingAttention(QKNormRoPEAttention):
@@ -1586,6 +1605,12 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
             hidden_size=config.hidden_size,
             vocab_size=config.unpadded_vocab_size,
         )
+        # Shared per-forward publication counter for the attention layers'
+        # decode metadata; see InklingDecodeMeta.ready.
+        self._decode_epoch = [0]
+        self._decode_sl_host: Optional[torch.Tensor] = None
+        for layer in self.model.layers:
+            layer.attn._decode_meta.bind_epoch(self._decode_epoch)
         self._apply_allreduce_strategy()
 
     def _apply_allreduce_strategy(self) -> None:
@@ -1629,9 +1654,35 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
         ``PyTorchModelEngine._prepare_tp_inputs`` alongside the short-conv pool
         publish, so the captured ``model.forward`` decode path does no host->device
         copy. Cheap and side-effect-free when there is no generation slice."""
+        # Bump first: every layer's `ready` now reports False until its refresh
+        # runs below, so an early return here cannot leave a previous step's
+        # seq_lens/page_table readable.
+        self._decode_epoch[0] += 1
+        request_ids = attn_metadata.request_ids
+        mgr = getattr(attn_metadata, "kv_cache_manager", None)
+        if request_ids is None or mgr is None:
+            return
+        num_contexts = attn_metadata.num_contexts
+        num_gen = len(request_ids) - num_contexts
+        if num_gen <= 0:
+            return
+        # Total-KV lengths are layer-independent: build them once per step here
+        # rather than once per layer inside refresh.
+        num_cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[num_contexts:]
+        if self._decode_sl_host is None or self._decode_sl_host.shape[0] < num_gen:
+            self._decode_sl_host = torch.empty(
+                num_gen, dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+        sl_host = self._decode_sl_host[:num_gen]
+        sl_np = sl_host.numpy()
+        for i in range(num_gen):
+            sl_np[i] = int(num_cached[i]) + 1
+
         device = self.model.embed_tokens.weight.device
+        gen_ids = request_ids[num_contexts:]
+        is_graph = bool(getattr(attn_metadata, "is_cuda_graph", False))
         for layer in self.model.layers:
-            layer.attn._decode_meta.refresh(attn_metadata, device)
+            layer.attn._decode_meta.refresh(mgr, gen_ids, sl_host, device, is_graph)
 
     def forward(
         self,
