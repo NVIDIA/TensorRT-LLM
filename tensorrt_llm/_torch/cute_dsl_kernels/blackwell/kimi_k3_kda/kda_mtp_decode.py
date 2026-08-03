@@ -109,7 +109,13 @@ def kda_decode_mtp_kernel(
     stage_timing: cute.Tensor,
     PROFILE_STAGES: cutlass.Constexpr[bool],
 ):
-    """KDA MTP decode — SMEM pre-compute + register-resident state."""
+    """KDA MTP decode — SMEM pre-compute + register-resident state.
+
+    With ``PROFILE_STAGES=True``, ``stage_timing`` must be an int64 tensor
+    with at least ``HV * N * 4`` elements, indexed as
+    ``(i_hv * grid_n + i_n) * 4``. With profiling off it is never accessed
+    and the host may pass any placeholder tensor.
+    """
     tidx, _, _ = cute.arch.thread_idx()
     in_warp_tid = tidx % 32
     warp_idx = cute.arch.warp_idx()
@@ -118,6 +124,10 @@ def kda_decode_mtp_kernel(
     i_h = i_hv
     if cutlass.const_expr(PROFILE_STAGES):
         t_stage0 = read_globaltimer()
+        # Pre-declare so the dynamic `run_precompute` branch below only
+        # reassigns (first assignment inside a dynamic branch is untraceable;
+        # see the module docstring on v_row_a/v_row_b).
+        t_stage1 = Int64(0)
     if cutlass.const_expr(USE_REGULAR_METADATA):
         bos = i_n * (2 * NUM_SPEC + 1)
         eos = bos + (2 * NUM_SPEC + 1)
@@ -133,6 +143,11 @@ def kda_decode_mtp_kernel(
         commit_len = 0
     else:
         commit_len = num_accepted_tokens[i_n]
+        # Only NUM_SPEC drafts can be pending from the previous round. Clamp
+        # so a malformed count cannot drive T_loop past the t_max-sized SMEM
+        # buffers or the num_spec extents of the replay caches.
+        if commit_len > NUM_SPEC:
+            commit_len = cutlass.Int32(NUM_SPEC)
     if cutlass.const_expr(USE_ZERO_ACCEPTED):
         T_loop = 1 + NUM_SPEC
         t_max = 1 + NUM_SPEC

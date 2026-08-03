@@ -29,8 +29,10 @@
 // Source-integrated from the NVIDIA+Moonshot jointly developed
 // Attention_residual kernel at e7f934124acc915575f9f7561f9d1e373ab43089.
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/kimiK3AttnRes/attnResFwd.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -38,6 +40,7 @@
 #include <cute/arch/tmem_allocator_sm100.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
+#include <mutex>
 
 namespace
 {
@@ -716,6 +719,10 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(bf16_t c
                     plan.logits_all[ng] = local_logit;
                 }
             }
+            // Publish the final chunk's plan.logits_all stores before the
+            // cross-lane reads in consumer warp 0 below (earlier chunks are
+            // covered by the NamedBarrier inside the loop).
+            __syncwarp();
 
             float inv_s = 1.f / s_running;
             bf16_t* out_ptr = output + (long long) tb * H;
@@ -980,14 +987,23 @@ static void launch_fwd(bf16_t const* block_residual, bf16_t const* layer_residua
     constexpr size_t smem_size
         = ((size_t) CHUNK_DEPTH * NC * H * sizeof(bf16_t) + sizeof(FwdSmemPlan<NC>) + 15) & ~size_t(15);
     auto kernel = &attn_res_fwd_online_v2_kernel<H, NC, RELEASE_TMEM, FULL_N12>;
-    static bool attrs_set = false;
-    if (!attrs_set)
+    if (smem_size > 48 * 1024)
     {
-        if (smem_size > 48 * 1024)
+        // cudaFuncSetAttribute applies to the current device only; set it
+        // once per device (per kernel instantiation).
+        static std::once_flag attrs_set[64];
+        int dev = 0;
+        TLLM_CUDA_CHECK(cudaGetDevice(&dev));
+        auto const set_attr = [&]
+        { TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)); };
+        if (dev >= 0 && dev < 64)
         {
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            std::call_once(attrs_set[dev], set_attr);
         }
-        attrs_set = true;
+        else
+        {
+            set_attr();
+        }
     }
     int grid = RELEASE_TMEM ? num_sm * 2 : num_sm;
     kernel<<<grid, BLK, smem_size, stream>>>(
@@ -1329,11 +1345,22 @@ static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_r
     constexpr size_t smem_size
         = (size_t) N * K_PER_CTA * sizeof(float) + (size_t) WARPS * N * sizeof(float2) + (size_t) N * sizeof(float);
     auto kernel = &attn_res_fwd_s1_splitk_kernel<N, GROUPS>;
-    static bool attrs_set = false;
-    if (!attrs_set)
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        attrs_set = true;
+        // cudaFuncSetAttribute applies to the current device only; set it
+        // once per device (per kernel instantiation).
+        static std::once_flag attrs_set[64];
+        int dev = 0;
+        TLLM_CUDA_CHECK(cudaGetDevice(&dev));
+        auto const set_attr = [&]
+        { TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)); };
+        if (dev >= 0 && dev < 64)
+        {
+            std::call_once(attrs_set[dev], set_attr);
+        }
+        else
+        {
+            set_attr();
+        }
     }
     void* args[] = {const_cast<bf16_t**>(&block_residual), const_cast<bf16_t**>(&layer_residual),
         const_cast<bf16_t**>(&res_weight), const_cast<bf16_t**>(&rms_weight), &output, &rsigma, &probs, &logits,
@@ -1361,14 +1388,23 @@ static void launch_n1_ttile(bf16_t const* layer_residual, bf16_t const* res_weig
     constexpr size_t smem_size
         = ((size_t) CHUNK_DEPTH * TB_TILE * H * sizeof(bf16_t) + sizeof(FwdSmemPlan<1>) + 15) & ~size_t(15);
     auto kernel = &attn_res_fwd_n1_ttile_kernel<H, TB_TILE, true>;
-    static bool attrs_set = false;
-    if (!attrs_set)
+    if (smem_size > 48 * 1024)
     {
-        if (smem_size > 48 * 1024)
+        // cudaFuncSetAttribute applies to the current device only; set it
+        // once per device (per kernel instantiation).
+        static std::once_flag attrs_set[64];
+        int dev = 0;
+        TLLM_CUDA_CHECK(cudaGetDevice(&dev));
+        auto const set_attr = [&]
+        { TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)); };
+        if (dev >= 0 && dev < 64)
         {
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+            std::call_once(attrs_set[dev], set_attr);
         }
-        attrs_set = true;
+        else
+        {
+            set_attr();
+        }
     }
     kernel<<<num_sm * 2, BLK, smem_size, stream>>>(
         layer_residual, res_weight, rms_weight, output, rsigma, probs, logits, T, B, rms_eps);
@@ -1421,12 +1457,10 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     float const rms_eps = params.rmsEps;
 
     int dev = 0;
-    cudaGetDevice(&dev);
+    TLLM_CUDA_CHECK(cudaGetDevice(&dev));
     int num_sm = attn_res_fwd_grid_size(dev);
-    if (num_sm <= 0 || N > N_MAX)
-    {
-        return;
-    }
+    TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res_fwd: failed to query the SM count of device %d", dev);
+    TLLM_CHECK_WITH_INFO(N <= N_MAX, "attn_res_fwd: unsupported N=%d (max %d)", N, N_MAX);
 
     if (H == 8192)
     {
@@ -1476,7 +1510,7 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
         else if (N == 12 && T == 1024)
         {
             launch_fwd<7168, 4, false, true>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma,
-                probs, logits, N, T, B, rms_eps, num_sm - 1, stream);
+                probs, logits, N, T, B, rms_eps, std::max(1, num_sm - 1), stream);
         }
         else
         {
@@ -1511,6 +1545,10 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
             launch_fwd<4096, 3, true>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma, probs,
                 logits, N, T, B, rms_eps, num_sm, stream);
         }
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "attn_res_fwd: unsupported hidden size H=%d", H);
     }
 }
 

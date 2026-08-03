@@ -21,26 +21,26 @@ and inter sub-chunk solve + merged inverse (K3) into a single persistent kernel.
 Grid: (NUM_SMS, 1, 1) — 148 persistent blocks, each loops over work units
   Total work units = (NT/4) * H * B, distributed round-robin across SMs
   Block i processes work units i, i+NUM_SMS, i+2*NUM_SMS, ...
-Block: 1024 threads (32 warps), warp-specialized with setmaxnreg (all groups 4-aligned):
+Block: 992 threads (31 warps), warp-specialized with setmaxnreg:
   Warps 0-15:  TMA+K1 fused (8×2, vec2, prefetch pipeline) – 4 WGs, 56 regs
-  Warps 16-27: K2 MMA compute (10 active + 2 idle for WG alignment) – 3 WGs, 72 regs
-  Warps 28-31: Store/Inversion warps – 1 WG, 24 regs
+  Warps 16-26: K2 MMA compute (10 active + warp 26 as TMA producer) – 72 regs
+  Warps 27-30: Store/Inversion warps – 24 regs
 
 Pipeline (single for_generate, warp groups separated by if-blocks):
   per work unit:
     Warps 0-15:  prefetch chunk 0→stage 0 (warp 0), then loop:
                     TMA next chunk (warp 0), wait cur chunk, K1 compute, arrive(k1_done)
-    Warps 16-27: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
-    Warps 28-31: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
+    Warps 16-26: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
+    Warps 27-30: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
   All warp-group invariants are computed inside each group's if-block (not hoisted)
   to eliminate cross-group register pressure — same budget as the _all version.
   Mbarrier phases self-reset after 4 iterations (2 stages × 2 phases).
 
 Mbarriers:
   tma_mbars[2]:          count=1, warp 0 lane 0 → K1+MMA wait for TMA data
-  stage_reuse_mbars[2]:  count=384, MMA(12 warps) → warp 0 waits before TMA reuse
+  stage_reuse_mbars[2]:  count=320, MMA(10 warps) → warp 0 waits before TMA reuse
   k1_done_mbars[2]:      count=512, K1(16 warps) → MMA waits for g_cumsum ready
-  mma_done_mbars[2]:     count=384, MMA(12 warps) → Store waits for sAqk/sAkk ready
+  mma_done_mbars[2]:     count=320, MMA(10 warps) → Store waits for sAqk/sAkk ready
   store_done_mbars[2]:   count=128, Store(4 warps) → MMA waits for sAqk/sAkk stage free
 
 SMEM: ~215KB (q+k+g × [64,128] bf16 × 2 stages + g_cumsum [64,136] fp32 × 2 stages
@@ -85,9 +85,9 @@ NUM_K1_TMA_WARPS = 16  # Warps 0-15:  K1 compute (4 warpgroups, 8×2) -- TMA off
 NUM_MMA_WARPS = 11  # Warps 16-26: MMA (10 active + 1 TMA producer, dropped idle warp 27)
 NUM_MMA_ACTIVE = 10  # mma_warp 0..9: actual MMA work
 TMA_WARP_ID = NUM_K1_TMA_WARPS + NUM_MMA_ACTIVE  # warp 26 = dedicated TMA producer
-NUM_STORE_WARPS = 4  # Warps 28-31: Store/Inversion (1 warpgroup)
-NUM_WARPS = NUM_K1_TMA_WARPS + NUM_MMA_WARPS + NUM_STORE_WARPS  # 32
-THREADS = NUM_WARPS * 32  # 1024
+NUM_STORE_WARPS = 4  # Warps 27-30: Store/Inversion (1 warpgroup)
+NUM_WARPS = NUM_K1_TMA_WARPS + NUM_MMA_WARPS + NUM_STORE_WARPS  # 31
+THREADS = NUM_WARPS * 32  # 992
 
 NUM_SUB_CHUNKS = BT // BC  # 4
 NUM_TILES = NUM_SUB_CHUNKS * (NUM_SUB_CHUNKS + 1) // 2  # 10 lower-tri tiles
@@ -1049,30 +1049,29 @@ def fused_kernel123(
     # or store warps). Required for downstream row-major store optimizations
     # — positions outside MMA-written sub-tiles stay at 0.
     #
-    # Cooperative pattern (32 warps × 32 lanes = 1024 threads):
-    #   - Each warp owns 2 contiguous rows (warp_id*2, warp_id*2+1)
+    # Cooperative pattern (31 warps × 32 lanes = 992 threads):
+    #   - Rows strided by warp count: warp w owns rows w, w+31, w+62 (< BT)
     #   - Each lane owns 2 contiguous bf16 cols (lane*2, lane*2+1)
-    #   - Per lane: 2 stages × 2 rows × 2 buffers × 2 cols = 16 bf16 stores
     #   - Adjacent (lane*2, lane*2+1) bf16 pairs are 4-byte aligned →
-    #     ptxas should fuse into STS.32 (8 wide stores per lane).
+    #     ptxas should fuse into STS.32 wide stores.
     # =====================================================================
-    _warp_id_in_cta = tidx >> 5  # tidx // 32, range 0..31
+    _warp_id_in_cta = tidx >> 5  # tidx // 32, range 0..30
     _lane_id_warp = tidx & 31  # tidx % 32, range 0..31
-    _row_base = _warp_id_in_cta * 2  # this warp owns rows [_row_base, _row_base+1]
     _col_lo = _lane_id_warp * 2  # this lane owns cols [_col_lo, _col_lo+1]
     _col_hi = _col_lo + 1
     for _s in cutlass.range_constexpr(NUM_STAGES):
-        for _ri in cutlass.range_constexpr(2):
-            _row = _row_base + _ri
-            sAqk[_row, _col_lo, _s] = cutlass.BFloat16(0.0)
-            sAqk[_row, _col_hi, _s] = cutlass.BFloat16(0.0)
-            sAkk[_row, _col_lo, _s] = cutlass.BFloat16(0.0)
-            sAkk[_row, _col_hi, _s] = cutlass.BFloat16(0.0)
+        for _ri in cutlass.range_constexpr((BT + NUM_WARPS - 1) // NUM_WARPS):
+            _row = _warp_id_in_cta + _ri * NUM_WARPS
+            if _row < BT:
+                sAqk[_row, _col_lo, _s] = cutlass.BFloat16(0.0)
+                sAqk[_row, _col_hi, _s] = cutlass.BFloat16(0.0)
+                sAkk[_row, _col_lo, _s] = cutlass.BFloat16(0.0)
+                sAkk[_row, _col_hi, _s] = cutlass.BFloat16(0.0)
     cute.arch.barrier()
 
     # =====================================================================
     # Pre-arrive (MMA warps only)
-    # stage_reuse_mbars: warp 0 waits before MMA arrives → pre-arrive all 12 MMA warps
+    # stage_reuse_mbars: warp 0 waits before MMA arrives → pre-arrive all 10 MMA warps
     # store_done_mbars:  MMA waits before Store arrives → pre-arrive first 4 MMA warps
     # =====================================================================
     if (
@@ -1441,7 +1440,7 @@ def fused_kernel123(
                     cute.arch.mbarrier_arrive(tma_mbars + next_stage)
 
         # =============================================================
-        # Warps 16-27 (excluding TMA_WARP_ID=26): K2 MMA Compute
+        # Warps 16-26 (excluding TMA_WARP_ID=26): K2 MMA Compute
         # =============================================================
         if (
             warp_idx >= NUM_K1_TMA_WARPS
@@ -1970,7 +1969,7 @@ def fused_kernel123(
                 cute.arch.mbarrier_arrive(mma_done_mbars + s)
 
         # =============================================================
-        # Warps 28-31: Store/Inversion warps
+        # Warps 27-30: Store/Inversion warps
         # =============================================================
         if warp_idx >= NUM_K1_TMA_WARPS + NUM_MMA_WARPS:
             store_warp = warp_idx - (NUM_K1_TMA_WARPS + NUM_MMA_WARPS)

@@ -511,9 +511,23 @@ def kda_mtp_decode_impl(
     use_setmaxreg = is_benchmark_static_shape
     use_reg_q_weights = is_benchmark_static_shape
     use_regular_metadata = bool(regular_metadata_hint)
-    use_zero_accepted = bool(zero_accepted_hint)
+    # The kernel's USE_ZERO_ACCEPTED fast path unrolls exactly
+    # 1 + NUM_SPEC == 3 new tokens, so it is only valid for num_spec == 2.
+    # For other num_spec fall back to the generic loop (the hint implies
+    # num_accepted_tokens is all zeros, so the generic path computes the
+    # same result).
+    use_zero_accepted = bool(zero_accepted_hint) and num_spec == 2
     # stage_timing is unused (PROFILE_STAGES=False); pass `out` as the
-    # placeholder tensor argument like the drop's runner does.
+    # placeholder tensor argument like the drop's runner does. The alias is
+    # only valid while profiling stays off: with PROFILE_STAGES=True the
+    # kernel writes int64 stage deltas through this tensor, corrupting the
+    # bf16 output. Enabling profiling requires a dedicated int64 buffer of
+    # at least HV * N * 4 elements.
+    profile_stages = False
+    assert not profile_stages, (
+        "stage_timing aliases `out`; allocate a dedicated int64 [HV * N * 4] "
+        "buffer before enabling PROFILE_STAGES"
+    )
     stage_timing_arg = out
 
     key = (
@@ -603,7 +617,7 @@ def kda_mtp_decode_impl(
             USE_ZERO_ACCEPTED=use_zero_accepted,
             FUSE_PRECOMPUTE=True,
             RUNTIME_PRECOMPUTE_FLAG=False,
-            PROFILE_STAGES=False,
+            PROFILE_STAGES=profile_stages,
             stream=stream,
         )
 
@@ -738,4 +752,4 @@ if IS_CUTLASS_DSL_AVAILABLE:
         zero_accepted_hint: bool = False,
         regular_metadata_hint: bool = False,
     ) -> torch.Tensor:
-        return x_v.new_empty(x_v.shape)
+        return x_q.new_empty(x_v.shape)
