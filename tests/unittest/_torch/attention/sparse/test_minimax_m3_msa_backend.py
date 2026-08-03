@@ -98,8 +98,8 @@ def test_per_token_valid_blocks_multi_token_decode():
     n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=4)
     # Row 0: 9 positions -> 3 blocks. Row 1 tokens attend 4, 5, 6 -> 1, 2, 2.
     assert n_valid.tolist() == [3, 1, 2, 2]
-    
-    
+
+
 def test_msa_index_k_uses_hnd_cache_view_and_writer():
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
