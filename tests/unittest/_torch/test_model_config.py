@@ -1,7 +1,6 @@
 import json
 import struct
 import types
-from contextlib import nullcontext
 
 import pytest
 import torch
@@ -41,120 +40,6 @@ def make_pretrained_config(
         torch_dtype=torch.float16,
         is_encoder_decoder=is_encoder_decoder,
     )
-
-
-def test_qwen36_modelopt_mixed_precision_preserves_w4a16_layers(tmp_path):
-    quant_config_file = tmp_path / "hf_quant_config.json"
-    quant_config_file.write_text(
-        json.dumps(
-            {
-                "quantization": {
-                    "quant_algo": "MIXED_PRECISION",
-                    "kv_cache_quant_algo": "FP8",
-                    "exclude_modules": ["mtp.layers.0*"],
-                    "quantized_layers": {
-                        "model.language_model.layers.0.linear_attn.out_proj": {
-                            "quant_algo": "FP8",
-                        },
-                        "model.language_model.layers.0.mlp.experts": {
-                            "quant_algo": "W4A16_NVFP4",
-                            "group_size": 16,
-                        },
-                    },
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    quant_config, layer_quant_config = ModelConfig.load_modelopt_quant_config(
-        str(quant_config_file), str(tmp_path), moe_backend="CUTLASS"
-    )
-
-    assert quant_config.quant_algo is None
-    assert quant_config.group_size == 16
-    assert quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-    assert layer_quant_config is not None
-    experts_config = layer_quant_config["model.language_model.layers.0.mlp.experts"]
-    assert experts_config.quant_algo == QuantAlgo.W4A16_NVFP4
-    assert experts_config.group_size == 16
-
-
-def test_modelopt_mixed_precision_is_not_replaced_by_inline_config(tmp_path, monkeypatch):
-    (tmp_path / "hf_quant_config.json").write_text(
-        json.dumps(
-            {
-                "quantization": {
-                    "quant_algo": "MIXED_PRECISION",
-                    "kv_cache_quant_algo": "FP8",
-                    "quantized_layers": {
-                        "model.language_model.layers.0.mlp.experts": {
-                            "quant_algo": "W4A16_NVFP4",
-                            "group_size": 16,
-                        },
-                    },
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    inline_quant_config = {
-        "quant_method": "compressed-tensors",
-        "format": "nvfp4-pack-quantized",
-        "config_groups": {
-            "group_0": {
-                "weights": {
-                    "type": "float",
-                    "num_bits": 4,
-                    "strategy": "tensor_group",
-                    "group_size": 16,
-                },
-            },
-        },
-    }
-    pretrained_config = types.SimpleNamespace(
-        architectures=["Qwen3_5MoeForConditionalGeneration"],
-        dtype=torch.bfloat16,
-        quantization_config=inline_quant_config,
-    )
-
-    from tensorrt_llm._torch import model_config as model_config_module
-
-    monkeypatch.setattr(
-        model_config_module,
-        "load_pretrained_config",
-        lambda *args, **kwargs: pretrained_config,
-    )
-    monkeypatch.setattr(model_config_module, "config_file_lock", nullcontext)
-    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 121)
-
-    model_config = ModelConfig.from_pretrained(str(tmp_path), moe_backend="CUTLASS")
-
-    assert model_config.quant_config.quant_algo is None
-    assert model_config.quant_config.group_size == 16
-    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-    assert model_config.quant_config_dict is not None
-    experts_config = model_config.quant_config_dict["model.language_model.layers.0.mlp.experts"]
-    assert experts_config.quant_algo == QuantAlgo.W4A16_NVFP4
-    assert experts_config.group_size == 16
-
-
-def test_qwen36_auto_moe_backend_uses_layer_w4a16_on_sm121(monkeypatch):
-    layer_quant_config = {
-        "model.language_model.layers.0.mlp.experts": QuantConfig(
-            quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16
-        ),
-    }
-    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 121)
-
-    moe_backend = ModelConfig.resolve_moe_backend(
-        "AUTO",
-        "Qwen3_5MoeForConditionalGeneration",
-        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
-        layer_quant_config=layer_quant_config,
-    )
-
-    assert moe_backend == "CUTEDSL"
 
 
 def test_deepseek_v4_auto_backend_precedes_w4a16_sm121_override(monkeypatch):

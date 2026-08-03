@@ -31,7 +31,7 @@ import logging
 import os
 from types import SimpleNamespace
 from typing import List, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -325,70 +325,6 @@ def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
     assert result == "loaded"
     backend.load_weights.assert_called_once_with(weights, True)
     assert configurable_moe._weights_transformed is False
-
-
-def test_configurable_moe_backend_uses_effective_layer_quant_config():
-    from tensorrt_llm._torch.modules.fused_moe.configurable_moe import (
-        _BACKEND_SYNC_ATTRS,
-        ConfigurableMoE,
-    )
-
-    global_quant_config = QuantConfig()
-    layer_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16)
-    model_config = ModelConfig(
-        quant_config=global_quant_config,
-        quant_config_dict={
-            "model.layers.3.mlp.experts": layer_quant_config,
-        },
-    )
-
-    configurable_moe = ConfigurableMoE.__new__(ConfigurableMoE)
-    torch.nn.Module.__init__(configurable_moe)
-    configurable_moe.dtype = torch.bfloat16
-    configurable_moe.layer_idx = 3
-    configurable_moe.num_experts = 8
-    configurable_moe.hidden_size = 32
-    configurable_moe.intermediate_size = 64
-    configurable_moe.reduce_results = False
-    configurable_moe.aux_stream_dict = None
-    configurable_moe.weight_loading_mode = MoEWeightLoadingMode.VANILLA
-    configurable_moe.apply_router_weight_on_input = False
-    configurable_moe.activation_type = int(ActivationType.Swiglu)
-    for attr in _BACKEND_SYNC_ATTRS:
-        if not hasattr(configurable_moe, attr):
-            setattr(configurable_moe, attr, None)
-
-    backend = torch.nn.Module()
-    backend.create_weights = MagicMock()
-    captured = {}
-
-    def create_backend(**kwargs):
-        captured.update(kwargs)
-        return backend
-
-    with (
-        patch(
-            "tensorrt_llm._torch.modules.fused_moe.create_moe.resolve_moe_cls",
-            return_value=object,
-        ) as resolve_moe_cls,
-        patch(
-            "tensorrt_llm._torch.modules.fused_moe.create_moe.create_moe_backend",
-            side_effect=create_backend,
-        ),
-    ):
-        configurable_moe._create_and_sync_backend(
-            model_config=model_config,
-            routing_method=MagicMock(),
-            effective_quant_config=layer_quant_config,
-        )
-
-    backend_model_config = captured["model_config"]
-    assert backend_model_config is not model_config
-    assert backend_model_config.quant_config is layer_quant_config
-    assert model_config.quant_config is global_quant_config
-    resolve_moe_cls.assert_called_once()
-    assert resolve_moe_cls.call_args.kwargs["override_quant_config"] is layer_quant_config
-    backend.create_weights.assert_called_once_with()
 
 
 def test_moe_nvfp4_activation_quantization_capability():

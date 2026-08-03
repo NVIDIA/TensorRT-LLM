@@ -160,11 +160,6 @@ class ConfigurableMoE(MoE):
         override_quant_config: Optional["QuantConfig"] = None,
         **kwargs,
     ):
-        from tensorrt_llm._torch.modules.fused_moe.create_moe import _get_effective_moe_quant_config
-
-        effective_quant_config = _get_effective_moe_quant_config(
-            model_config, override_quant_config, layer_idx
-        )
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -177,7 +172,8 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
-        self.quant_config = effective_quant_config
+        if override_quant_config is not None:
+            self.quant_config = override_quant_config
 
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
@@ -190,7 +186,7 @@ class ConfigurableMoE(MoE):
         self._create_and_sync_backend(
             model_config=model_config,
             routing_method=routing_method,
-            effective_quant_config=effective_quant_config,
+            override_quant_config=override_quant_config,
             **kwargs,
         )
 
@@ -273,7 +269,7 @@ class ConfigurableMoE(MoE):
         *,
         model_config: ModelConfig,
         routing_method: BaseMoeRoutingMethod,
-        effective_quant_config: Optional["QuantConfig"],
+        override_quant_config: Optional["QuantConfig"],
         **kwargs,
     ) -> None:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
@@ -299,14 +295,13 @@ class ConfigurableMoE(MoE):
             model_config,
             routing_method,
             self.dtype,
-            override_quant_config=effective_quant_config,
-            layer_idx=self.layer_idx,
+            override_quant_config=override_quant_config,
         )
 
         backend_model_config = model_config
-        if effective_quant_config is not model_config.quant_config:
+        if override_quant_config is not None:
             backend_model_config = copy.deepcopy(model_config)
-            backend_model_config.quant_config = effective_quant_config
+            backend_model_config.quant_config = override_quant_config
 
         with self._temporarily_skip_weight_creation(backend_model_config):
             backend = create_moe_backend(

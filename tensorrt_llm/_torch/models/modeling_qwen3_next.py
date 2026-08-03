@@ -379,8 +379,9 @@ class _DenseMlpAdapter(nn.Module):
         self.mlp = mlp
         self.mapping = mapping
         self.enable_attention_dp = mapping.enable_attention_dp
-        # Match the activation-quantization capability exposed by MoE experts.
-        self.experts = SimpleNamespace(has_nvfp4_activation_quantization=False)
+        # Provide a dummy `experts` attribute so that
+        # `self.mlp.experts.has_nvfp4` checks in decoder forward don't crash.
+        self.experts = SimpleNamespace(has_nvfp4=False)
 
     def forward(
         self,

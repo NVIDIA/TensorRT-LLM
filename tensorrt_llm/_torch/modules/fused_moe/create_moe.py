@@ -45,16 +45,6 @@ def _get_layer_quant_config(
     return None
 
 
-def _get_effective_moe_quant_config(
-    model_config: ModelConfig,
-    override_quant_config: Optional[QuantConfig] = None,
-    layer_idx: Optional[int] = None,
-) -> Optional[QuantConfig]:
-    return (override_quant_config
-            or _get_layer_quant_config(model_config, layer_idx)
-            or model_config.quant_config)
-
-
 def _get_pretrained_megamoe_capability_args(
         model_config: ModelConfig) -> Dict[str, Optional[object]]:
     """Extract dtype / hidden / intermediate kwargs for MegaMoE
@@ -86,9 +76,9 @@ def get_moe_cls(
     layer_idx: Optional[int] = None,
 ) -> Type[MoE]:
     moe_backend = model_config.moe_backend
-    quant_config = _get_effective_moe_quant_config(model_config,
-                                                   override_quant_config,
-                                                   layer_idx)
+    quant_config = model_config.quant_config
+    if override_quant_config is not None:
+        quant_config = override_quant_config
     layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
     if moe_backend.upper() == "MARLIN":
         # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Layers without
@@ -266,8 +256,7 @@ def resolve_moe_cls(
 ) -> Type[MoE]:
     moe_cls = get_moe_cls(model_config, override_quant_config, layer_idx)
 
-    effective_quant_config = _get_effective_moe_quant_config(
-        model_config, override_quant_config, layer_idx)
+    effective_quant_config = override_quant_config or model_config.quant_config
     has_quant = (effective_quant_config is not None
                  and effective_quant_config.layer_quant_mode.has_any_quant(
                      exclude_kv_cache=True))
