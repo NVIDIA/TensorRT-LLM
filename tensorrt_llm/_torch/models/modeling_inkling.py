@@ -92,7 +92,7 @@ from ...inputs import (
     register_input_processor,
 )
 from ..configs.inkling import InklingConfig, InklingTextConfig
-from .modeling_inkling_vision import (
+from .modeling_inkling_multimodal import (
     DEFAULT_AUDIO_TOKEN_ID,
     DEFAULT_IMAGE_TOKEN_ID,
     InklingAudioModel,
