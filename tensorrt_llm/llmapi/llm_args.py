@@ -912,6 +912,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
     )
     index_share_for_mtp_iteration: Optional[bool] = Field(
         default=None,
+        status="prototype",
         description=
         "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
         "it each step. Defaults to the model's HF config value.")
