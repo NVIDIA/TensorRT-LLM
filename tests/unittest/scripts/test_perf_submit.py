@@ -20,6 +20,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from pytest_split.algorithms import LeastDurationAlgorithm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SUBMIT_PATHS = (
@@ -27,6 +28,14 @@ SUBMIT_PATHS = (
     REPO_ROOT / "jenkins" / "scripts" / "perf" / "local" / "submit.py",
 )
 EXAMPLE_SUBMIT_PATH = REPO_ROOT / "examples" / "disaggregated" / "slurm" / "benchmark" / "submit.py"
+
+
+class _FakePytestItem:
+    def __init__(self, nodeid: str):
+        self.nodeid = nodeid
+
+    def __str__(self) -> str:
+        return self.nodeid
 
 
 def _load_module(path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
@@ -143,6 +152,35 @@ def test_ci_submit_selects_same_least_duration_shard_as_pytest_split(ci_submit_m
     )
 
     assert selected == test_lines[1]
+
+
+def test_ci_submit_selector_matches_installed_pytest_split(ci_submit_module):
+    lines = [
+        f"perf/test_perf_sanity.py::test_e2e[case-{case_name}] TIMEOUT (90)"
+        for case_name in ("zeta", "alpha", "gamma", "beta", "epsilon", "delta")
+    ]
+    nodeids = [ci_submit_module._test_nodeid(line) for line in lines]
+    items = [_FakePytestItem(nodeid) for nodeid in nodeids]
+    duration_sets = (
+        {nodeid: float(index + 1) for index, nodeid in enumerate(nodeids)},
+        dict.fromkeys(nodeids, 4.0),
+        {nodeids[1]: 8.0, nodeids[4]: 2.0, "irrelevant::test": 1000.0},
+        {},
+    )
+
+    for durations in duration_sets:
+        for splits in (2, 3, 4):
+            expected_groups = LeastDurationAlgorithm()(splits, items, durations)
+            for group, expected_group in enumerate(expected_groups, start=1):
+                selected = ci_submit_module._select_least_duration_group(
+                    lines,
+                    durations,
+                    splits,
+                    group,
+                )
+                assert [ci_submit_module._test_nodeid(line) for line in selected] == [
+                    item.nodeid for item in expected_group.selected
+                ]
 
 
 def test_ci_submit_rejects_split_group_disagreement(ci_submit_module, tmp_path):
