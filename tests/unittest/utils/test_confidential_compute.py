@@ -22,6 +22,8 @@ import pytest
 
 from tensorrt_llm._utils import confidential_compute_enabled, get_cc_and_nvle_status
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _NvmlError(Exception):
     pass
