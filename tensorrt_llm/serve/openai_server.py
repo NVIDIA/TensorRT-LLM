@@ -32,6 +32,7 @@ from starlette.routing import Mount
 from transformers import AutoProcessor
 
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
@@ -320,15 +321,54 @@ def _normalize_image_output(image) -> list:
     return [image]
 
 
-_IMAGE_EDIT_MODEL_ID_MARKERS = ("qwen-image-edit", "qwen-image-layered")
+_IMAGE_EDIT_PIPELINE_CLASS_NAMES = {
+    "QwenImageEditPlusPipeline",
+    "QwenImageLayeredPipeline",
+}
+
+
+def _resolve_visual_gen_pipeline_class_name(
+        model_id: Optional[str]) -> Optional[str]:
+    if not model_id:
+        return None
+
+    model_key = str(model_id)
+    for class_name, entry in PIPELINE_REGISTRY.items():
+        if model_key in entry.hf_ids:
+            return class_name
+
+    return None
 
 
 def _model_supports_image_edit(model_id: Optional[str]) -> bool:
-    if not model_id:
+    pipeline_class_name = _resolve_visual_gen_pipeline_class_name(model_id)
+    if pipeline_class_name is None:
         return False
-    normalized_model_id = str(model_id).replace("_", "-").lower()
-    return any(marker in normalized_model_id
-               for marker in _IMAGE_EDIT_MODEL_ID_MARKERS)
+    return pipeline_class_name in _IMAGE_EDIT_PIPELINE_CLASS_NAMES
+
+
+def _image_output_size(image) -> Optional[str]:
+    pil_size = getattr(image, "size", None)
+    if isinstance(pil_size, tuple) and len(pil_size) >= 2:
+        width, height = pil_size[:2]
+        return f"{int(width)}x{int(height)}"
+
+    shape = getattr(image, "shape", None)
+    if shape is None:
+        return None
+
+    dims = tuple(int(dim) for dim in shape)
+    if len(dims) == 2:
+        height, width = dims
+    elif len(dims) == 3:
+        if dims[0] in (1, 3, 4) and dims[1] > 4 and dims[2] > 4:
+            height, width = dims[1], dims[2]
+        else:
+            height, width = dims[0], dims[1]
+    else:
+        return None
+
+    return f"{width}x{height}"
 
 
 class OpenAIServer(_VideoRoutesMixin):
@@ -2661,12 +2701,16 @@ class OpenAIServer(_VideoRoutesMixin):
     ) -> ImageEditRequest:
         """Parse an image edit request from JSON or multipart form data."""
         content_type = raw_request.headers.get("content-type", "")
+        normalized_content_type = content_type.lower()
 
-        if "application/json" in content_type:
+        if "application/json" in normalized_content_type:
             body = await raw_request.json()
+            if not isinstance(body, dict):
+                raise ValueError(
+                    "JSON image edit request body must be an object")
             return ImageEditRequest(**body)
 
-        if "multipart/form-data" in content_type:
+        if "multipart/form-data" in normalized_content_type:
             form = await raw_request.form()
             data = {}
             for key in form:
@@ -2685,9 +2729,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 if key == "extra_params":
                     if value == "":
                         continue
+                    if not isinstance(value, str):
+                        raise ValueError(
+                            "'extra_params' must be a JSON object string")
                     try:
                         data[key] = json.loads(value)
-                    except json.JSONDecodeError as exc:
+                    except (json.JSONDecodeError, TypeError) as exc:
                         raise ValueError(
                             f"'extra_params' must be a JSON object string; {exc}"
                         ) from exc
@@ -2750,6 +2797,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # image-edit models such as Qwen-Image-Layered use
             # ``save_layers_to_grid`` to pack all layers into one image here.
             output_images = _normalize_image_output(output.image)
+            output_size = _image_output_size(
+                output_images[0]) if output_images else None
             pil_format = request.output_format.upper()
             ext = f".{request.output_format}"
             if request.response_format == "b64_json":
@@ -2777,7 +2826,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 created=int(time.time()),
                 data=data,
                 output_format=request.output_format,
-                size=f"{params.width}x{params.height}",
+                size=output_size,
             )
 
             latency = time.perf_counter() - image_edit_start

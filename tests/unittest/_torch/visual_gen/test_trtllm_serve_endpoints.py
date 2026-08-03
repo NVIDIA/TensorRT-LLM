@@ -764,7 +764,108 @@ class TestImageEdit:
         assert resp.status_code == 200
         assert str(gen.last_params.image).startswith(str(tmp_path))
         assert not os.path.exists(gen.last_params.image)
-        assert len(resp.json()["data"]) == 1
+        body = resp.json()
+        assert body["size"] == "64x64"
+        assert len(body["data"]) == 1
+
+    def test_image_edit_accepts_case_insensitive_json_content_type(self, tmp_path, monkeypatch):
+        """Media-type matching is case-insensitive."""
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(),
+            model="Qwen/Qwen-Image-Layered",
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+
+        resp = client.post(
+            "/v1/images/edits",
+            content=json.dumps(
+                {
+                    "prompt": "split layers",
+                    "image": _b64_white_png_1x1(),
+                    "response_format": "b64_json",
+                }
+            ),
+            headers={"content-type": "Application/JSON"},
+        )
+
+        assert resp.status_code == 200
+        assert gen.last_params is not None
+
+    def test_image_edit_rejects_json_array_body(self, tmp_path, monkeypatch):
+        """Non-object JSON bodies are client errors, not server errors."""
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(),
+            model="Qwen/Qwen-Image-Layered",
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+
+        resp = client.post(
+            "/v1/images/edits",
+            content=json.dumps(
+                [
+                    {
+                        "prompt": "split layers",
+                        "image": _b64_white_png_1x1(),
+                    }
+                ]
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+        assert resp.status_code == 400
+        assert "must be an object" in resp.json()["message"]
+        assert gen.last_params is None
+
+    def test_image_edit_rejects_file_extra_params(self, tmp_path, monkeypatch):
+        """Multipart extra_params must be a JSON string field."""
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(),
+            model="Qwen/Qwen-Image-Layered",
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+
+        image_bytes = BytesIO(base64.b64decode(_b64_white_png_1x1()))
+        resp = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "split layers",
+                "response_format": "b64_json",
+            },
+            files={
+                "image": ("input.png", image_bytes, "image/png"),
+                "extra_params": ("extra.json", b"{}", "application/json"),
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "extra_params" in resp.json()["message"]
+        assert gen.last_params is None
+
+    def test_image_edit_rejects_empty_image_list(self, tmp_path, monkeypatch):
+        """Empty image lists fail request validation before pipeline dispatch."""
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(),
+            model="Qwen/Qwen-Image-Layered",
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": [],
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="image")
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
 
     def test_image_edit_maps_n_and_output_format(self, tmp_path, monkeypatch):
         """OpenAI edit fields map through the visual-gen serving path."""
@@ -790,6 +891,7 @@ class TestImageEdit:
         assert gen.last_params.num_images_per_prompt == 2
         body = resp.json()
         assert body["output_format"] == "webp"
+        assert body["size"] == "4x4"
         assert len(body["data"]) == 2
 
     def test_image_edit_rejects_mask_with_clear_error(self, tmp_path, monkeypatch):
@@ -867,8 +969,8 @@ class TestImageEdit:
         assert gen.last_params is None
         assert list(tmp_path.iterdir()) == []
 
-    def test_image_edit_rejects_oversized_base64_image(self, tmp_path, monkeypatch):
-        """Decoded image bytes are capped before the generator runs."""
+    def test_image_edit_rejects_oversized_base64_image_before_decode(self, tmp_path, monkeypatch):
+        """Base64 image size is capped before allocating decoded bytes."""
         from tensorrt_llm.serve import visual_gen_utils
 
         gen = MockVisualGen(
@@ -877,13 +979,18 @@ class TestImageEdit:
         )
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
         monkeypatch.setattr(visual_gen_utils, "IMAGE_EDIT_MAX_IMAGE_BYTES", 8)
+        monkeypatch.setattr(
+            visual_gen_utils.base64,
+            "b64decode",
+            lambda *args, **kwargs: pytest.fail("oversized payload was decoded"),
+        )
         client = _create_server(gen, model_name="Qwen/Qwen-Image-Layered")
 
         resp = client.post(
             "/v1/images/edits",
             json={
                 "prompt": "split layers",
-                "image": base64.b64encode(b"x" * 9).decode("utf-8"),
+                "image": "A" * 13,
                 "response_format": "b64_json",
             },
         )

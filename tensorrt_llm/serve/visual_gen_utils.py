@@ -4,7 +4,6 @@ import asyncio
 import base64
 import binascii
 import os
-import shutil
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -124,6 +123,11 @@ def _decode_base64_media(value: str) -> Optional[bytes]:
         _, sep, payload = value.partition(",")
         if not sep:
             return None
+    if len(payload) > ((IMAGE_EDIT_MAX_IMAGE_BYTES + 2) // 3) * 4:
+        raise ValueError(
+            "Image edit input exceeds the per-image byte limit "
+            f"before decoding ({len(payload)} encoded bytes)."
+        )
     try:
         return base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError):
