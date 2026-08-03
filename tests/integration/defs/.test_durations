@@ -6,6 +6,7 @@
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True]": 158.5127857142857,
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=False]": 238.92535714285714,
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True]": 161.73442857142857,
+   "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1dp2cp2]": 276.34350980392156,
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[adp-mtp2]": 311.97010309278346,
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[noadp-mtp0]": 474.63128571428575,
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_spec_dec": 178.47664285714288,
