@@ -207,7 +207,7 @@ class CuteDslMlaFmha(PhasedFmha):
     @staticmethod
     def _is_perf_favorable(
         num_heads: int,
-        batch_size: int,
+        batch_size: Optional[int],
         seq_len_q: int,
         kernel_dtype: Optional[torch.dtype],
     ) -> tuple[bool, str]:
@@ -218,7 +218,10 @@ class CuteDslMlaFmha(PhasedFmha):
         critical batch size (``_PERF_MIN_BATCH_FP8``); everything else falls
         back to the next FMHA library.
 
-        bf16/fp16 KV: only num_heads == 16 is admitted."""
+        bf16/fp16 KV: only num_heads == 16 is admitted.
+
+        ``batch_size=None`` evaluates only the batch-size-independent
+        conditions (dtype, num_heads, seq_len_q) and skips the batch floor."""
         if kernel_dtype != torch.float8_e4m3fn:
             if num_heads == 16:
                 return True, ""
@@ -246,7 +249,7 @@ class CuteDslMlaFmha(PhasedFmha):
                 f"(num_heads, seq_len_q): "
                 f"{sorted(_PERF_MIN_BATCH_FP8)}."
             )
-        if batch_size < min_batch:
+        if batch_size is not None and batch_size < min_batch:
             return False, (
                 f"CuTe DSL MLA decode wins for num_heads={num_heads}, "
                 f"seq_len_q={seq_len_q} only at batch_size >= {min_batch}; "
@@ -288,21 +291,15 @@ class CuteDslMlaFmha(PhasedFmha):
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # Skip the perf gate while the AutoTuner is tuning. The autotuner warmup
-        # issues gen requests at a single batch size, which the perf gate would
-        # very likely reject as not favorable; that rejection would keep this
-        # shape from ever being tuned. Letting tuning through here ensures the
-        # tactics are profiled, so the gate at runtime picks from a tuned cache.
-        if not AutoTuner.get().is_tuning_mode:
-            # Perf gate (NOT a correctness limit)
-            favorable, reason = self._is_perf_favorable(
-                attn.num_heads,
-                batch_size,
-                seq_len_q,
-                self._get_kernel_dtype(attn, q),
-            )
-            if not favorable:
-                return False, reason
+        # Perf gate (NOT a correctness limit).
+        favorable, reason = self._is_perf_favorable(
+            attn.num_heads,
+            None if AutoTuner.get().is_tuning_mode else batch_size,
+            seq_len_q,
+            self._get_kernel_dtype(attn, q),
+        )
+        if not favorable:
+            return False, reason
         if meta.kv_cache_manager is None:
             return False, "KV cache manager is required."
         if fwd.output is None:
