@@ -2599,8 +2599,11 @@ class PyExecutor:
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
                     self._check_disagg_transfer_progress_when_idle(
-                        num_fitting_reqs, fitting_disagg_gen_init_requests,
-                        wait_for_disagg_gen_transfer_progress, all_gen_first)
+                        num_fitting_reqs,
+                        fitting_disagg_gen_init_requests,
+                        wait_for_disagg_gen_transfer_progress,
+                        all_gen_first,
+                        is_idle=scheduled_batch.batch_size == 0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -3528,20 +3531,18 @@ class PyExecutor:
         return int(local_need_check)
 
     def _check_disagg_transfer_progress_when_idle(
-            self, num_fitting_reqs: int,
+            self,
+            num_fitting_reqs: int,
             fitting_disagg_gen_init_requests: List[LlmRequest],
             wait_for_disagg_gen_transfer_progress: bool,
-            all_gen_first: bool) -> None:
-        local_need_check = (num_fitting_reqs == 0
-                            and not fitting_disagg_gen_init_requests)
+            all_gen_first: bool,
+            is_idle: bool = False) -> None:
+        local_needs_progress = (num_fitting_reqs == 0
+                                and not fitting_disagg_gen_init_requests)
 
-        # A synchronous GEN receive is rank-local and blocking. One rank can
-        # still be receiving while another is idle, so entering either the
-        # generation or context progress collective here is unsafe.
-        if not self._uses_async_disagg_gen_transfer():
-            return
+        uses_async_gen_transfer = self._uses_async_disagg_gen_transfer()
 
-        local_need_gen_check = (local_need_check
+        local_need_gen_check = (uses_async_gen_transfer and local_needs_progress
                                 and wait_for_disagg_gen_transfer_progress)
 
         any_need_gen_check = self._sync_disagg_gen_status_entry(
@@ -3554,9 +3555,12 @@ class PyExecutor:
             self._check_disagg_gen_cache_transfer_status(1)
             return
 
-        any_need_check = self._sync_disagg_ctx_status_entry(local_need_check)
+        local_need_ctx_check = is_idle or (uses_async_gen_transfer
+                                           and local_needs_progress)
+        any_need_check = self._sync_disagg_ctx_status_entry(
+            local_need_ctx_check)
         if any_need_check > 0:
-            if local_need_check and not all_gen_first:
+            if local_need_ctx_check and not all_gen_first:
                 logger.warning(
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
@@ -3720,8 +3724,11 @@ class PyExecutor:
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
             self._check_disagg_transfer_progress_when_idle(
-                num_fitting_reqs, admitted_disagg_gen_init_requests,
-                wait_for_disagg_gen_transfer_progress, all_gen_first)
+                num_fitting_reqs,
+                admitted_disagg_gen_init_requests,
+                wait_for_disagg_gen_transfer_progress,
+                all_gen_first,
+                is_idle=scheduled_batch.batch_size == 0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the
