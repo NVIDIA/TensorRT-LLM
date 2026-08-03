@@ -479,6 +479,9 @@ def k4_persistent_kernel(
     nv_b_mn_sl: cute.ComposedLayout,
     mGkLastExp: cute.Tensor,
     mS_fp32: cute.Tensor,
+    state_indices: cute.Tensor,
+    has_initial_states: cute.Tensor,
+    use_indexed_state: cutlass.Constexpr[bool],
     cu_seqlens: cute.Tensor,
     chunk_offsets: cute.Tensor,
     mA: cute.Tensor,
@@ -651,12 +654,22 @@ def k4_persistent_kernel(
         )
         tiled_state_g2r = cute.make_tiled_copy_S(atom_state_g2r, tiled_state_r2t)
         thr_state_g2r = tiled_state_g2r.get_slice(warpgroup_tidx)
+        atom_indexed_state_g2r = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), acc_dtype, num_bits_per_copy=32
+        )
+        tiled_indexed_state_g2r = cute.make_tiled_copy_S(atom_indexed_state_g2r, tiled_state_r2t)
+        thr_indexed_state_g2r = tiled_indexed_state_g2r.get_slice(warpgroup_tidx)
 
         atom_state_r2g = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), acc_dtype, num_bits_per_copy=128
         )
         tiled_state_r2g = cute.make_tiled_copy_D(atom_state_r2g, tiled_state_t2r)
         thr_state_r2g = tiled_state_r2g.get_slice(warpgroup_tidx)
+        atom_indexed_state_r2g = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), acc_dtype, num_bits_per_copy=32
+        )
+        tiled_indexed_state_r2g = cute.make_tiled_copy_D(atom_indexed_state_r2g, tiled_state_t2r)
+        thr_indexed_state_r2g = tiled_indexed_state_r2g.get_slice(warpgroup_tidx)
 
         atom_state_r2s = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mma_dtype, num_bits_per_copy=128
@@ -679,6 +692,9 @@ def k4_persistent_kernel(
 
         while work.is_valid_tile:
             batch_idx, head_idx, _ = work.tile_idx
+            state_idx = (
+                state_indices[batch_idx] if cutlass.const_expr(use_indexed_state) else batch_idx
+            )
             batch_start = cu_seqlens[batch_idx]
             batch_end = cu_seqlens[batch_idx + 1]
             num_chunks = cute.ceil_div(batch_end - batch_start, M)
@@ -686,12 +702,31 @@ def k4_persistent_kernel(
             # batch_start // M only works when all seq lengths are multiples of M.
             chunk_base = chunk_offsets[batch_idx]
 
-            gS_init = cute.flat_divide(mS_fp32[batch_idx, head_idx, None, None], (M6, N6))[
-                None, None, 0, 0
-            ]
-            tGR_tCgState_in = thr_state_g2r.partition_S(gS_init)
-            tGR_tCrState_in = thr_state_g2r.retile(tRrState)
-            cute.copy(tiled_state_g2r, tGR_tCgState_in, tGR_tCrState_in)
+            if cutlass.const_expr(use_indexed_state):
+                state_is_valid = has_initial_states[batch_idx]
+                if state_is_valid:
+                    state_vk = mS_fp32[state_idx, head_idx, None, None]
+                    state_kv = cute.make_tensor(
+                        state_vk.iterator,
+                        cute.make_layout((M6, N6), stride=(1, M6)),
+                    )
+                    gS_init = cute.flat_divide(state_kv, (M6, N6))[None, None, 0, 0]
+                    tGR_tCgState_in = thr_indexed_state_g2r.partition_S(gS_init)
+                    tGR_tCrState_in = thr_indexed_state_g2r.retile(tRrState)
+                    cute.copy(
+                        tiled_indexed_state_g2r,
+                        tGR_tCgState_in,
+                        tGR_tCrState_in,
+                    )
+                else:
+                    tRrState.fill(0.0)
+            else:
+                gS_init = cute.flat_divide(mS_fp32[state_idx, head_idx, None, None], (M6, N6))[
+                    None, None, 0, 0
+                ]
+                tGR_tCgState_in = thr_state_g2r.partition_S(gS_init)
+                tGR_tCrState_in = thr_state_g2r.retile(tRrState)
+                cute.copy(tiled_state_g2r, tGR_tCgState_in, tGR_tCrState_in)
             num_state_subs = tRrState.shape[2]
             for sub in cutlass.range(num_state_subs):
                 cute.copy(tiled_state_r2t, tRrState[None, 0, sub], tRT_tCtState[None, 0, sub])
@@ -736,19 +771,37 @@ def k4_persistent_kernel(
                 global_chunk = global_chunk + 1
 
             cute.arch.mbarrier_wait(mma6_done_mbar, phase=(global_chunk - 1) % 2)
-            gS_out = cute.flat_divide(mS_fp32[batch_idx, head_idx, None, None], (M6, N6))[
-                None, None, 0, 0
-            ]
-            tGR_tCgState_out = thr_state_r2g.partition_D(gS_out)
-            tGR_tCrState_out = thr_state_r2g.retile(tRrState)
             num_state_subs_final = tRrState.shape[2]
             for sub in cutlass.range(num_state_subs_final):
                 cute.copy(tiled_state_t2r, tTR_tCtState[None, 0, sub], tRrState[None, 0, sub])
             cute.arch.fence_view_async_tmem_load()
-            for sub in cutlass.range(num_state_subs_final):
-                cute.copy(
-                    tiled_state_r2g, tGR_tCrState_out[None, 0, sub], tGR_tCgState_out[None, 0, sub]
+            if cutlass.const_expr(use_indexed_state):
+                state_vk = mS_fp32[state_idx, head_idx, None, None]
+                state_kv = cute.make_tensor(
+                    state_vk.iterator,
+                    cute.make_layout((M6, N6), stride=(1, M6)),
                 )
+                gS_out = cute.flat_divide(state_kv, (M6, N6))[None, None, 0, 0]
+                tGR_tCgState_out = thr_indexed_state_r2g.partition_D(gS_out)
+                tGR_tCrState_out = thr_indexed_state_r2g.retile(tRrState)
+                for sub in cutlass.range(num_state_subs_final):
+                    cute.copy(
+                        tiled_indexed_state_r2g,
+                        tGR_tCrState_out[None, 0, sub],
+                        tGR_tCgState_out[None, 0, sub],
+                    )
+            else:
+                gS_out = cute.flat_divide(mS_fp32[state_idx, head_idx, None, None], (M6, N6))[
+                    None, None, 0, 0
+                ]
+                tGR_tCgState_out = thr_state_r2g.partition_D(gS_out)
+                tGR_tCrState_out = thr_state_r2g.retile(tRrState)
+                for sub in cutlass.range(num_state_subs_final):
+                    cute.copy(
+                        tiled_state_r2g,
+                        tGR_tCrState_out[None, 0, sub],
+                        tGR_tCgState_out[None, 0, sub],
+                    )
 
             cute.arch.mbarrier_arrive(final_state_done_mbar)
 
@@ -1258,7 +1311,7 @@ def k4_persistent_kernel(
         o_store_prod.tail()
 
 
-def make_host_fn(num_sm=148):
+def make_host_fn(num_sm=148, use_indexed_state=False):
     """Create one K4 host function for all runtime context batch sizes.
 
     ``num_seqs`` is a runtime scalar. ``H`` and the token extent come from
@@ -1266,6 +1319,7 @@ def make_host_fn(num_sm=148):
     ceiling. The scheduler computes ``min(num_seqs * H, num_sm)`` at launch.
     """
     _num_sm = num_sm
+    _use_indexed_state = use_indexed_state
 
     @cute.jit
     def host_fn(
@@ -1278,6 +1332,8 @@ def make_host_fn(num_sm=148):
         o_raw: cute.Tensor,
         gk_last_exp: cute.Tensor,
         s_fp32: cute.Tensor,
+        state_indices: cute.Tensor,
+        has_initial_states: cute.Tensor,
         cu_seqlens: cute.Tensor,
         chunk_offsets: cute.Tensor,
         tm_workspace: cute.Tensor,
@@ -1442,6 +1498,9 @@ def make_host_fn(num_sm=148):
             sl_nv_b_mn,
             gk_last_exp,
             s_fp32,
+            state_indices,
+            has_initial_states,
+            _use_indexed_state,
             cu_seqlens,
             chunk_offsets,
             a,
@@ -1453,7 +1512,6 @@ def make_host_fn(num_sm=148):
             o_out,
             tm_workspace,
             scheduler_params,
-        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True,
-                 stream=stream)
+        ).launch(grid=grid_shape, block=(threads_per_cta, 1, 1), use_pdl=True, stream=stream)
 
     return host_fn

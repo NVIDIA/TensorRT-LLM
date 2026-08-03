@@ -53,6 +53,15 @@ other GPU architectures may be added in a future release.
   currently pins `flashinfer-python==0.6.14`, so a later
   dependency-resolving TensorRT-LLM install can replace this source revision.
 
+## Select the KDA state I/O path
+
+KDA uses fused recurrent-state pool I/O by default. Set
+`TLLM_KDA_USE_FUSED_STATE_IO=0` in the launch environment to force the legacy
+prefill gather/transpose/scatter path for A/B comparisons or debugging. Set it
+to `1` to enable the fused path; these are the only valid values. This switch
+does not change the decode state path. Unsupported batches or pool layouts
+still fall back to the legacy path automatically.
+
 ## Run the model
 
 Kimi K3 requires a multi-node launch. From the repository root, submit the
