@@ -1342,7 +1342,7 @@ class TxSession(TxSessionBase):
         With blocking=False: polls non-blockingly; returns None if any KV task
         or aux is not yet done.
         """
-        if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+        if self.has_failed():
             return WaitResult.FAILED
         if not self.kv_tasks:
             return None
@@ -1377,7 +1377,9 @@ class TxSession(TxSessionBase):
                 # cancel() leaves a TRANSFERRING task's event unset until the
                 # physical writer finishes. Preserve the bounded-slice control
                 # point so blockAll can still report terminal cancellation.
-                if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                # Check every task: a sibling slice can fail while this one is
+                # still pending without setting the session terminal status.
+                if self.has_failed():
                     return WaitResult.FAILED
             if task.status == TaskStatus.ERROR:
                 return WaitResult.FAILED
@@ -1389,7 +1391,7 @@ class TxSession(TxSessionBase):
                     else None
                 )
             while not self.aux_task.wait(timeout=wait_slice_s):
-                if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                if self.has_failed():
                     return WaitResult.FAILED
             if self.aux_task.status == TaskStatus.ERROR:
                 return WaitResult.FAILED

@@ -412,10 +412,20 @@ def test_tx_session_blocking_wait_treats_task_failure_as_terminal() -> None:
     session = _make_tx_session([failed_task, pending_task])
 
     assert session.wait_complete(blocking=True) == WaitResult.FAILED
-    assert failed_task.wait_calls == [0.25]
+    assert failed_task.wait_calls == []
     # A failed task event does not prove sibling physical writers quiesced, so
     # precheck callers retain the wave instead of treating failure as drained.
     assert pending_task.wait_calls == []
+
+
+def test_tx_session_blocking_wait_detects_failed_sibling_behind_pending_task() -> None:
+    pending_task = _FakeTask(TaskStatus.TRANSFERRING, wait_result=False)
+    failed_task = _FakeTask(TaskStatus.ERROR)
+    session = _make_tx_session([pending_task, failed_task])
+
+    assert session.wait_complete(blocking=True) == WaitResult.FAILED
+    assert pending_task.wait_calls == []
+    assert failed_task.wait_calls == []
 
 
 def test_tx_session_blocking_wait_retries_aux_wait_slices() -> None:
