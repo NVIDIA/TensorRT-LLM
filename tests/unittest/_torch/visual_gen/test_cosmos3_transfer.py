@@ -24,6 +24,10 @@ import torch.nn as nn
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pipeline_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_module
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    COSMOS3_720P_PARAMS,
+    COSMOS3_PIPELINE_DEFAULTS,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     decode_media_to_uint8_cthw,
@@ -36,6 +40,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     uint8_cthw_to_normalized_5d,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import TransformerOutput
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer
 
 pytestmark = pytest.mark.cosmos3
 
@@ -70,16 +75,24 @@ class StubScheduler:
             num_train_timesteps=1000, flow_shift=1.0, use_karras_sigmas=True
         )
         self.set_timesteps_calls = []
+        self.sigmas_calls = []
+        self.step_generators = []
 
-    def set_timesteps(self, num_steps, device=None):
+    def set_timesteps(self, num_steps=None, device=None, sigmas=None):
+        if sigmas is not None:
+            # Distilled: the policy installs a fixed sigma list, not a count.
+            self.sigmas_calls.append(list(sigmas))
+            self.timesteps = torch.arange(len(sigmas), 0, -1, dtype=torch.int64)
+            return
         self.set_timesteps_calls.append((num_steps, device))
         self.timesteps = torch.arange(num_steps, 0, -1, dtype=torch.int64)
 
-    def step(self, noise_pred, timestep, latents, return_dict=False):
-        # No **kwargs on purpose: new pipeline-side arguments must fail loudly
-        # here, not get silently swallowed. `timestep` is accepted (the
-        # pipeline passes it) but unused.
+    def step(self, noise_pred, timestep, latents, return_dict=False, generator=None):
+        # `generator` is accepted but nothing else is: a new pipeline-side
+        # argument must fail loudly here, not get silently swallowed.
         assert return_dict is False
+        if generator is not None:
+            self.step_generators.append(generator)
         return (latents + noise_pred,)
 
 
@@ -121,11 +134,48 @@ class StubTransformer(nn.Module):
     calls_num_train_timesteps = 1000
 
 
-def _make_pipeline():
+class StubSamplingPolicy:
+    """Base-checkpoint stand-in for Cosmos3SamplingPolicy.
+
+    Transfer programs the scheduler through the policy, so the stub records
+    what it was asked for; ``is_distilled`` flips the distilled contract on.
+    """
+
+    def __init__(self, is_distilled=False, fixed_sigmas=(1.0, 0.75, 0.5, 0.25)):
+        self.is_distilled = is_distilled
+        self.fixed_sigmas = fixed_sigmas
+        self.set_timesteps_calls = []
+        self.step_kwargs_calls = 0
+
+    def set_timesteps(self, scheduler, num_inference_steps, device=None):
+        self.set_timesteps_calls.append(num_inference_steps)
+        if self.is_distilled:
+            scheduler.set_timesteps(sigmas=list(self.fixed_sigmas), device=device)
+        else:
+            scheduler.set_timesteps(num_inference_steps, device=device)
+
+    def scheduler_step_kwargs(self, generator):
+        self.step_kwargs_calls += 1
+        return {"generator": generator} if self.is_distilled else {}
+
+    def num_steps(self, default):
+        return len(self.fixed_sigmas) if self.is_distilled else default
+
+
+def _started_timer() -> CudaPhaseTimer:
+    """A timer in the state `forward()` hands to `_forward_transfer`."""
+    timer = CudaPhaseTimer()
+    timer.mark_pre_start()
+    return timer
+
+
+def _make_pipeline(sampling=None):
     pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
     nn.Module.__init__(pipeline)
     pipeline.transformer = StubTransformer()
     pipeline.scheduler = StubScheduler()
+    pipeline.sampling = sampling or StubSamplingPolicy()
+    pipeline.safety_checker = None
     pipeline.pipeline_config = SimpleNamespace(torch_dtype=torch.float32)
     pipeline.vae_scale_factor_temporal = 4
     pipeline._guidance_scale = None
@@ -166,6 +216,28 @@ class TestTransferConfig:
     def test_wsm_fps_preset_default_and_override(self):
         assert resolve_transfer_config({"wsm": True}, _req()).fps == 10
         assert resolve_transfer_config({"wsm": True, "fps": 24.0}, _req()).fps == 24.0
+
+    def test_wsm_clip_presets_survive_merged_request_defaults(self):
+        """wsm wants 101 frames at 10 fps, but `num_frames` and `frame_rate`
+        are advertised defaults the executor merges into every request before
+        `infer()` sees it. A request carrying only those merged values must
+        still get the preset; values the caller actually chose must win."""
+        merged = _req(
+            num_frames=COSMOS3_PIPELINE_DEFAULTS["num_frames"],
+            frame_rate=COSMOS3_PIPELINE_DEFAULTS["frame_rate"],
+        )
+        cfg = resolve_transfer_config({"wsm": True}, merged)
+        assert (cfg.num_frames, cfg.fps) == (101, 10)
+
+        chosen = _req(num_frames=200, frame_rate=30.0)
+        cfg = resolve_transfer_config({"wsm": True}, chosen)
+        assert (cfg.num_frames, cfg.fps) == (200, 30.0)
+
+    def test_advertised_defaults_are_left_intact(self):
+        """The preset is recovered inside transfer, not by nulling the model's
+        published defaults — clients read those to learn the output shape."""
+        assert COSMOS3_PIPELINE_DEFAULTS["num_frames"] == COSMOS3_720P_PARAMS["num_frames"]
+        assert COSMOS3_PIPELINE_DEFAULTS["frame_rate"] == COSMOS3_720P_PARAMS["frame_rate"]
 
     def test_precomputed_control_bytes_reach_the_decoder(self, monkeypatch):
         monkeypatch.setattr(
@@ -365,6 +437,7 @@ class TestDiffuseTransferCFG:
             },
             velocity_mask=velocity_mask,
             condition_latents=torch.zeros_like(latents),
+            generator=torch.Generator().manual_seed(0),
         )
         kwargs.update(overrides)
         return pipeline.diffuse_transfer(**kwargs), latents
@@ -473,6 +546,8 @@ class TestForwardTransferChunks:
                 seed=1,
                 frame_rate=24.0,
                 num_frames=189,
+                use_guardrails=False,
+                timer=_started_timer(),
                 transfer_config=cfg,
                 video=b"input-clip",
             )
@@ -547,6 +622,8 @@ class TestForwardTransferChunks:
             seed=123,
             frame_rate=24.0,
             num_frames=8,
+            use_guardrails=False,
+            timer=_started_timer(),
             transfer_config=cfg,
             video=b"input-clip",
         )
@@ -567,6 +644,85 @@ class TestForwardTransferChunks:
         torch.testing.assert_close(
             captured["targets"][0][:, :, 2:], torch.full((1, 3, 3, 16, 16), 1.0)
         )
+
+
+class TestTransferSamplingAndSafety:
+    """The transfer branch must not skip what every other mode goes through."""
+
+    def _run(self, pipeline, monkeypatch, *, use_guardrails=False, cfg_extra=None):
+        monkeypatch.setattr(
+            transfer_module, "decode_video_reference_window", _fake_decode_window(5)
+        )
+        monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
+        tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
+        pipeline._tokenize_prompt = lambda *a, **k: next(tokenized)
+        pipeline._apply_flow_shift = lambda *a, **k: None
+        pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)
+        cfg = resolve_transfer_config(
+            {"edge": {"control": b"clip"}, "num_video_frames_per_chunk": 5, **(cfg_extra or {})},
+            _req(num_frames=5, guidance_scale=1.0),
+        )
+        return pipeline._forward_transfer(
+            prompt="transfer",
+            negative_prompt="",
+            height=16,
+            width=16,
+            max_frames=cfg.max_frames,
+            num_inference_steps=35,
+            max_sequence_length=8,
+            use_system_prompt=False,
+            use_duration_template=False,
+            use_resolution_template=False,
+            seed=1,
+            frame_rate=24.0,
+            num_frames=5,
+            use_guardrails=use_guardrails,
+            timer=_started_timer(),
+            transfer_config=cfg,
+            video=None,
+        )
+
+    def test_schedule_is_programmed_through_the_sampling_policy(self, monkeypatch):
+        """A distilled checkpoint runs a fixed sigma list, not a step count."""
+        sampling = StubSamplingPolicy(is_distilled=True)
+        pipeline = _make_pipeline(sampling=sampling)
+        self._run(pipeline, monkeypatch)
+        assert sampling.set_timesteps_calls, "transfer bypassed the sampling policy"
+        # Distilled: the policy substitutes its own step count for the request's.
+        assert pipeline.scheduler.sigmas_calls == [list(sampling.fixed_sigmas)]
+
+    def test_distilled_step_draws_noise_from_the_seeded_generator(self, monkeypatch):
+        """Unseeded SDE noise diverges the replicated latents across ranks."""
+        sampling = StubSamplingPolicy(is_distilled=True)
+        pipeline = _make_pipeline(sampling=sampling)
+        self._run(pipeline, monkeypatch)
+        assert pipeline.scheduler.step_generators, "scheduler.step() got no generator"
+        assert all(g is not None for g in pipeline.scheduler.step_generators)
+
+    def test_base_checkpoint_passes_no_generator(self, monkeypatch):
+        pipeline = _make_pipeline(sampling=StubSamplingPolicy(is_distilled=False))
+        self._run(pipeline, monkeypatch)
+        assert pipeline.scheduler.step_generators == []
+
+    def test_output_is_screened_when_guardrails_are_on(self, monkeypatch):
+        pipeline = _make_pipeline()
+        seen = {}
+
+        class Checker:
+            pass
+
+        pipeline.safety_checker = Checker()
+        monkeypatch.setattr(
+            pipeline_module,
+            "check_video_safety",
+            lambda video, checker: seen.setdefault("called", True) and video,
+        )
+        self._run(pipeline, monkeypatch, use_guardrails=True)
+        assert seen.get("called"), "transfer returned generated video unscreened"
+
+    def test_phase_timings_are_populated(self, monkeypatch):
+        output = self._run(_make_pipeline(), monkeypatch)
+        assert output.denoise > 0.0, "transfer reported a zero denoise phase"
 
 
 class TestFindClosestTargetSize:

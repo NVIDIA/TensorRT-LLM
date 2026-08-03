@@ -57,7 +57,7 @@ from .defaults import (
     _normalize_condition_video_latent_indexes,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
-from .sampling import Cosmos3SamplingPolicy, load_scheduler
+from .sampling import DISTILLED_GUIDANCE_SCALE, Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
     Cosmos3TransferConfig,
@@ -1054,6 +1054,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 seed=seed,
                 frame_rate=frame_rate,
                 num_frames=num_frames,
+                use_guardrails=use_guardrails,
+                timer=timer,
                 transfer_config=transfer_config,
                 video=video,
             )
@@ -1456,6 +1458,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         shared_kwargs: dict[str, Any],
         velocity_mask: torch.Tensor,
         condition_latents: torch.Tensor,
+        generator: torch.Generator,
         guidance_interval: tuple[float, float] | None = None,
     ) -> torch.Tensor:
         """Run Cosmos3 transfer denoising with sequential control/text CFG branches."""
@@ -1546,7 +1549,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     control_guidance=step_control,
                 )
                 noise_pred = noise_pred * velocity_mask
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                latents = self.scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    return_dict=False,
+                    **self.sampling.scheduler_step_kwargs(generator),
+                )[0]
                 latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
         finally:
             self.transformer.reset_cache()
@@ -1569,6 +1578,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         seed,
         frame_rate: float,
         num_frames: int,
+        use_guardrails: bool,
+        timer: CudaPhaseTimer,
         transfer_config: Cosmos3TransferConfig,
         video: Any,
     ) -> PipelineOutput:
@@ -1659,6 +1670,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             if transfer_config.guidance_scale is not None
             else COSMOS3_720P_PARAMS["guidance_scale"]
         )
+        if self.sampling.is_distilled:
+            # A distilled checkpoint runs one schedule and bakes guidance into
+            # the weights, so the per-hint guidance presets cannot apply. Say so
+            # rather than silently sampling off-distribution.
+            num_inference_steps = self.sampling.num_steps(num_inference_steps)
+            if guidance_scale != DISTILLED_GUIDANCE_SCALE:
+                logger.warning(
+                    f"Cosmos3 transfer on a distilled checkpoint: overriding "
+                    f"guidance_scale {guidance_scale} with the mandated "
+                    f"{DISTILLED_GUIDANCE_SCALE}; per-hint guidance presets do not apply."
+                )
+            guidance_scale = DISTILLED_GUIDANCE_SCALE
         flow_shift_target = float(
             transfer_config.flow_shift
             if transfer_config.flow_shift is not None
@@ -1696,6 +1719,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         }
         previous_output: torch.Tensor | None = None
 
+        # Every chunk's decode is part of generation here (it feeds the next
+        # chunk), so the whole loop counts as denoise; post covers assembly.
+        timer.mark_denoise_start()
         for chunk_id in range(num_chunks):
             start_frame = chunk_id * stride
             end_frame = min(start_frame + chunk_frames, total_frames)
@@ -1772,7 +1798,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 transfer_share_vision_temporal_positions=transfer_config.share_vision_temporal_positions,
             )
 
-            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            self.sampling.set_timesteps(self.scheduler, num_inference_steps, device=self.device)
             latents = self.diffuse_transfer(
                 latents=latents,
                 timesteps=self.scheduler.timesteps,
@@ -1787,7 +1813,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 shared_kwargs=shared_kwargs,
                 velocity_mask=velocity_mask,
                 condition_latents=condition_latents,
+                generator=generator,
             )
+            # Deliberately the raw decode rather than `decode_latents()`: the
+            # decoded chunk is this loop's *input* as well as its output — the
+            # next chunk conditions on its tail — so every rank needs it. Owning
+            # one rank's decode and broadcasting would ship ~0.5 GB per chunk
+            # and serialize the loop behind a collective, which costs more than
+            # recomputing the decode locally.
             output_video = self._decode_latents_raw(latents).clamp(-1, 1)
             previous_output = output_video
 
@@ -1806,17 +1839,29 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             for key, chunks in control_chunks_per_hint.items()
         }
 
+        timer.mark_post_start()
+
         if transfer_config.show_control_condition:
             all_controls = torch.cat([full_controls[key] for key in per_hint_frames], dim=-1)
-            all_controls = all_controls.to(full_output)
-            full_output = torch.cat([all_controls, full_output], dim=-1)
+            full_output = torch.cat([all_controls.to(full_output), full_output], dim=-1)
         if transfer_config.show_input and input_frames is not None:
             normalized_input = uint8_cthw_to_normalized_5d(
                 input_frames[:, :total_frames], dtype=torch.float32
             )
             full_output = torch.cat([normalized_input.to(full_output), full_output], dim=-1)
         video = postprocess_video_tensor(full_output)
-        return PipelineOutput(
-            video=video,
-            frame_rate=frame_rate,
+
+        # Same screening the other modes get: rank 0, post-processed frames,
+        # and a None result means the guardrail rejected the clip. With the
+        # debug panels enabled the caller's own control frames ride along in
+        # the same tensor and are screened too, which errs safe.
+        if self.rank == 0 and use_guardrails and self.safety_checker is not None:
+            video = check_video_safety(video, self.safety_checker)
+
+        timer.mark_end()
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                frame_rate=frame_rate,
+            )
         )
