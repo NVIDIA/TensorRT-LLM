@@ -2237,23 +2237,24 @@ class PyTorchModelEngine(ModelEngine):
         # Mirror add_dummy_requests' actual allocation: on top of the raw
         # token count, every sequence gets num_extra_kv_tokens +
         # num_extra_decoding_steps add_token calls, and generation dummies
-        # additionally reserve the draft-loop tokens. When a sequence length
-        # lands near a block boundary (e.g. spec decoding's extra tokens on
-        # top of an exactly block-aligned split), each of those add_token
-        # calls costs one extra block per sequence. Under-counting them here
-        # let warmup start an allocation that fails midway and, before the
-        # partial-allocation cleanup below existed, permanently leaked most
-        # of the estimation-sized KV pool (TRTLLM-14903).
-        tokens_per_block = kv_cache_manager.tokens_per_block
+        # additionally reserve max_draft_loop_tokens for the draft loop.
+        # Under-counting these let warmup start an allocation that fails
+        # midway and, before the partial-allocation cleanup existed,
+        # permanently leaked most of the estimation-sized KV pool
+        # (TRTLLM-14903).
+        def blocks_for_seq(num_tokens: int) -> int:
+            return math.ceil(num_tokens / kv_cache_manager.tokens_per_block)
+
         extra_ctx_tokens = (getattr(kv_cache_manager, "num_extra_kv_tokens", 0)
                             or 0) + num_extra_decoding_steps
         extra_gen_tokens = extra_ctx_tokens + self.max_draft_loop_tokens
-        blocks_to_use = (num_full_seqs * math.ceil(
-            (max_seq_len + extra_ctx_tokens) / tokens_per_block) + (math.ceil(
-                (num_left_over_tokens + extra_ctx_tokens) /
-                tokens_per_block) if num_left_over_tokens > 0 else 0) +
-                         num_gen_requests * self.max_beam_width * math.ceil(
-                             (1 + extra_gen_tokens) / tokens_per_block))
+        blocks_to_use = num_full_seqs * blocks_for_seq(max_seq_len +
+                                                       extra_ctx_tokens)
+        if num_left_over_tokens > 0:
+            blocks_to_use += blocks_for_seq(num_left_over_tokens +
+                                            extra_ctx_tokens)
+        blocks_to_use += (num_gen_requests * self.max_beam_width *
+                          blocks_for_seq(1 + extra_gen_tokens))
 
         if blocks_to_use > available_blocks and isinstance(
                 kv_cache_manager, KVCacheManager):
