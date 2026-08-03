@@ -236,6 +236,9 @@ class FusedMoEMethodBase(ABC):
     weight_alignment: int = 1
     """int: Required byte alignment for MoE weight tensors."""
 
+    quantizes_nvfp4_activations: bool = False
+    """Whether this method converts high-precision activations to NVFP4."""
+
     eplb_support_status: EplbSupportStatus = EplbSupportStatus.NOT_SUPPORTED
     """EplbSupportStatus: Online EPLB support status for this quantization method.
 
@@ -2095,6 +2098,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     Base class for NVFP4 fused MoE methods for all backends.
     """
     eplb_support_status = EplbSupportStatus.SUPPORTED
+    quantizes_nvfp4_activations = True
 
     # Whether raw per-expert block-scale staging is an EPLB migration
     # target. Children that migrate derived formats and free the raw
@@ -3076,6 +3080,8 @@ class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     into a static [E_total, N, K] workspace, then runs the bf16 ``fused_moe``.
     """
 
+    quantizes_nvfp4_activations = False
+
     def process_weights_after_loading(self, module: torch.nn.Module):
         super().process_weights_after_loading(module)
 
@@ -3084,8 +3090,6 @@ class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # block_scale_interleave_reverse accepts.
         def _unswizzle_inplace(scale_param: torch.nn.Parameter):
             sf_view = scale_param.data.view(float4_sf_dtype)
-            E, pad_rows, pad_cols = (sf_view.shape[0], sf_view.shape[1],
-                                     sf_view.shape[2])
             linear = torch.ops.trtllm.block_scale_interleave_reverse(sf_view)
             scale_param.data.view(float4_sf_dtype).copy_(linear)
 

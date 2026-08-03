@@ -135,11 +135,14 @@ class MLP(nn.Module):
         # may be downgraded to unquantized after create_weights (e.g. LTX-2
         # quant-exclusion), so re-check the NVFP4 _input_prepare at runtime (a
         # torch.compile trace-time guard, not a per-step cost); else fall back to eager.
-        if self._use_fused_gelu and hasattr(
-                getattr(self.up_proj, "quant_method", None), "_input_prepare"):
-            if self._use_fused_gelu_fp4out and hasattr(
-                    getattr(self.down_proj, "quant_method", None),
-                    "_input_prepare"):
+        if (self._use_fused_gelu
+                and self.up_proj.has_nvfp4_activation_quantization
+                and hasattr(getattr(self.up_proj, "quant_method", None),
+                            "_input_prepare")):
+            if (self._use_fused_gelu_fp4out
+                    and is_static_nvfp4_input_eligible(self.down_proj)
+                    and hasattr(getattr(self.down_proj, "quant_method", None),
+                                "_input_prepare")):
                 m = self._token_count(x)
                 return self.down_proj(
                     self._fused_gelu(x, fp4_out=m >= MLP._FP4OUT_MIN_M))
@@ -168,16 +171,14 @@ class MLP(nn.Module):
         applied in forward (quant_method can be downgraded after this).
         """
         if (self.activation is not gelu_tanh
-                or get_sm_version() not in (100, 103)
-                or not getattr(self.up_proj, "has_nvfp4", False)):
+                or get_sm_version() not in (100, 103) or not getattr(
+                    self.up_proj, "has_nvfp4_activation_quantization", False)):
             return False, False
         bf16_ok = hasattr(torch.ops.trtllm,
                           "cute_dsl_nvfp4_dense_gemm_gelu_blackwell")
         fp4_ok = (bf16_ok and hasattr(
             torch.ops.trtllm, "cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell")
-                  and getattr(self.down_proj, "has_nvfp4", False)
-                  and not self.down_proj.force_dynamic_quantization
-                  and self.down_proj.input_scale is not None)
+                  and is_static_nvfp4_input_eligible(self.down_proj))
         return bf16_ok, fp4_ok
 
     @staticmethod

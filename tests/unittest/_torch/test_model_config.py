@@ -1,6 +1,7 @@
 import json
 import struct
 import types
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -79,6 +80,65 @@ def test_qwen36_modelopt_mixed_precision_preserves_w4a16_layers(tmp_path):
     assert experts_config.group_size == 16
 
 
+def test_modelopt_mixed_precision_is_not_replaced_by_inline_config(tmp_path, monkeypatch):
+    (tmp_path / "hf_quant_config.json").write_text(
+        json.dumps(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "kv_cache_quant_algo": "FP8",
+                    "quantized_layers": {
+                        "model.language_model.layers.0.mlp.experts": {
+                            "quant_algo": "W4A16_NVFP4",
+                            "group_size": 16,
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    inline_quant_config = {
+        "quant_method": "compressed-tensors",
+        "format": "nvfp4-pack-quantized",
+        "config_groups": {
+            "group_0": {
+                "weights": {
+                    "type": "float",
+                    "num_bits": 4,
+                    "strategy": "tensor_group",
+                    "group_size": 16,
+                },
+            },
+        },
+    }
+    pretrained_config = types.SimpleNamespace(
+        architectures=["Qwen3_5MoeForConditionalGeneration"],
+        dtype=torch.bfloat16,
+        quantization_config=inline_quant_config,
+    )
+
+    from tensorrt_llm._torch import model_config as model_config_module
+
+    monkeypatch.setattr(
+        model_config_module,
+        "load_pretrained_config",
+        lambda *args, **kwargs: pretrained_config,
+    )
+    monkeypatch.setattr(model_config_module, "config_file_lock", nullcontext)
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 121)
+
+    model_config = ModelConfig.from_pretrained(str(tmp_path), moe_backend="CUTLASS")
+
+    assert model_config.quant_config.quant_algo is None
+    assert model_config.quant_config.group_size == 16
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert model_config.quant_config_dict is not None
+    experts_config = model_config.quant_config_dict["model.language_model.layers.0.mlp.experts"]
+    assert experts_config.quant_algo == QuantAlgo.W4A16_NVFP4
+    assert experts_config.group_size == 16
+
+
 def test_qwen36_auto_moe_backend_uses_layer_w4a16_on_sm121(monkeypatch):
     layer_quant_config = {
         "model.language_model.layers.0.mlp.experts": QuantConfig(
@@ -95,6 +155,58 @@ def test_qwen36_auto_moe_backend_uses_layer_w4a16_on_sm121(monkeypatch):
     )
 
     assert moe_backend == "CUTEDSL"
+
+
+def test_deepseek_v4_auto_backend_precedes_w4a16_sm121_override(monkeypatch):
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 121)
+
+    moe_backend = ModelConfig.resolve_moe_backend(
+        "AUTO",
+        "DeepseekV4ForCausalLM",
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.W4A16_NVFP4,
+            group_size=16,
+        ),
+    )
+
+    assert moe_backend == "CUTLASS"
+
+
+def test_modelopt_nvfp4_uses_inline_w4a16_activation_semantics(tmp_path):
+    hf_quant_config = {
+        "quant_method": "compressed-tensors",
+        "format": "nvfp4-pack-quantized",
+        "ignore": ["mtp.layers"],
+        "config_groups": {
+            "group_0": {
+                "targets": ["Linear", "lm_head"],
+                "weights": {
+                    "type": "float",
+                    "num_bits": 4,
+                    "strategy": "tensor_group",
+                    "group_size": 16,
+                },
+                "input_activations": None,
+            },
+        },
+    }
+
+    quant_config, layer_quant_config = ModelConfig._build_modelopt_quant_config(
+        {
+            "quant_algo": "NVFP4",
+            "kv_cache_quant_algo": None,
+            "group_size": 16,
+            "exclude_modules": ["mtp*"],
+        },
+        str(tmp_path),
+        moe_backend="CUTLASS",
+        hf_quant_config=hf_quant_config,
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
+    assert quant_config.group_size == 16
+    assert quant_config.exclude_modules == ["mtp.layers"]
+    assert layer_quant_config is None
 
 
 @pytest.mark.parametrize(

@@ -34,6 +34,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import QuantAlgo  # noqa: E402
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
@@ -42,6 +43,7 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MoEWeightLoadingMode, create_moe
+from ..modules.fused_moe.create_moe import _get_layer_quant_config
 from ..modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from ..modules.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
                                               W4A16NVFP4CutlassFusedMoEMethod)
@@ -162,30 +164,26 @@ class TransformerLayer(Attention):
                                **kwargs)
 
 
-def _get_nemotron_h_moe_model_config(
+def _get_nemotron_h_moe_quant_config(
         model_config: ModelConfig[PretrainedConfig],
-        layer_idx: int) -> ModelConfig[PretrainedConfig]:
+        layer_idx: int) -> QuantConfig | None:
     # Per-expert mixed precision config is more specific than the global config.
-    if model_config.quant_config_dict is not None:
-        experts_prefix = f"model.layers.{layer_idx}.mixer.experts."
-        for key, cfg in model_config.quant_config_dict.items():
-            if key.startswith(experts_prefix):
-                return replace(model_config, quant_config=cfg)
+    layer_quant_config = _get_layer_quant_config(model_config, layer_idx,
+                                                 "mixer.experts")
+    if layer_quant_config is not None:
+        return layer_quant_config
 
     quant_config = model_config.quant_config
     if (quant_config is not None and quant_config.quant_algo
             in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4")
             and model_config.moe_backend.upper() != "CUTEDSL"):
-        moe_quant_config = quant_config.model_copy(deep=True)
-        moe_quant_config.quant_algo = QuantAlgo.NVFP4
-        moe_quant_config.__dict__.pop("quant_mode", None)
-        moe_quant_config.__dict__.pop("layer_quant_mode", None)
-        return replace(model_config, quant_config=moe_quant_config)
+        values = quant_config.model_dump()
+        values["quant_algo"] = QuantAlgo.NVFP4
+        return QuantConfig.model_validate(values)
 
-    return model_config
+    return None
 
 
-# Ref code: https://huggingface.co/nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024/blob/main/modeling_nemotron_h.py#L818
 class NemotronHMOE(nn.Module):
 
     def __init__(
@@ -270,7 +268,7 @@ class NemotronHMOE(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
-        moe_model_config = _get_nemotron_h_moe_model_config(
+        moe_quant_config = _get_nemotron_h_moe_quant_config(
             model_config, layer_idx)
 
         # Setup MoE experts.
@@ -282,7 +280,8 @@ class NemotronHMOE(nn.Module):
             aux_stream_dict=aux_stream_dict,
             dtype=config.torch_dtype,
             reduce_results=self.reduce_results,
-            model_config=moe_model_config,
+            model_config=model_config,
+            override_quant_config=moe_quant_config,
             layer_idx=self.layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             bias=self.mlp_bias,

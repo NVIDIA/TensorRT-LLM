@@ -52,12 +52,13 @@ def test_nemotron_h_moe_uses_w4a4_nvfp4_expert_config_for_w4a16_checkpoint():
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16, exclude_modules=["lm_head"]
     )
-    quant_config.mamba_ssm_cache_dtype = torch.float32
+    quant_config.mamba_ssm_cache_dtype = "float32"
+    _ = quant_config.quant_mode
     model_config = _make_nemotron_h_moe_config(quant_config)
     captured = {}
 
     def fake_create_moe(**kwargs):
-        captured["model_config"] = kwargs["model_config"]
+        captured.update(kwargs)
         return nn.Identity()
 
     with patch(
@@ -67,12 +68,14 @@ def test_nemotron_h_moe_uses_w4a4_nvfp4_expert_config_for_w4a16_checkpoint():
             aux_stream_dict = {AuxStreamType.MoeShared: None}
             NemotronHMOE(model_config=model_config, layer_idx=1, aux_stream_dict=aux_stream_dict)
 
-    moe_quant_config = captured["model_config"].quant_config
+    moe_quant_config = captured["override_quant_config"]
     assert moe_quant_config is not quant_config
     assert moe_quant_config.quant_algo == QuantAlgo.NVFP4
+    assert moe_quant_config.quant_mode.has_nvfp4()
     assert moe_quant_config.group_size == 16
     assert moe_quant_config.exclude_modules == ["lm_head"]
-    assert moe_quant_config.mamba_ssm_cache_dtype == torch.float32
+    assert moe_quant_config.mamba_ssm_cache_dtype == "float32"
+    assert captured["model_config"] is model_config
     assert model_config.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
 
 
@@ -84,7 +87,7 @@ def test_nemotron_h_moe_preserves_w4a16_config_for_cutedsl_sm12x():
     captured = {}
 
     def fake_create_moe(**kwargs):
-        captured["model_config"] = kwargs["model_config"]
+        captured.update(kwargs)
         return nn.Identity()
 
     with patch(
@@ -94,9 +97,35 @@ def test_nemotron_h_moe_preserves_w4a16_config_for_cutedsl_sm12x():
             aux_stream_dict = {AuxStreamType.MoeShared: None}
             NemotronHMOE(model_config=model_config, layer_idx=1, aux_stream_dict=aux_stream_dict)
 
-    moe_quant_config = captured["model_config"].quant_config
-    assert moe_quant_config is quant_config
-    assert moe_quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
+    assert captured["override_quant_config"] is None
+    assert captured["model_config"] is model_config
+
+
+def test_nemotron_h_moe_uses_mixer_expert_layer_quant_config():
+    global_quant_config = QuantConfig()
+    layer_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16)
+    model_config = _make_nemotron_h_moe_config(global_quant_config)
+    model_config.quant_config_dict = {
+        "model.layers.1.mixer.experts.0.up_proj": layer_quant_config,
+    }
+    captured = {}
+
+    def fake_create_moe(**kwargs):
+        captured.update(kwargs)
+        return nn.Identity()
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_nemotron_h.create_moe",
+        side_effect=fake_create_moe,
+    ):
+        with patch("torch.cuda.Event", side_effect=lambda: object()):
+            NemotronHMOE(
+                model_config=model_config,
+                layer_idx=1,
+                aux_stream_dict={AuxStreamType.MoeShared: None},
+            )
+
+    assert captured["override_quant_config"] is layer_quant_config
 
 
 def test_nemotron_h_mtp_bf16_body_uses_cutlass_moe_backend():

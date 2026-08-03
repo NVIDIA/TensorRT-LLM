@@ -31,7 +31,6 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_nvfp4_marlin_enabled,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
 
@@ -97,6 +96,29 @@ class TensorParallelMode(str, enum.Enum):
     @classmethod
     def flip(cls, mode):
         return cls.ROW if mode == cls.COLUMN else cls.COLUMN
+
+
+def quant_config_has_nvfp4_activation_quantization(
+        quant_config: Optional[QuantConfig]) -> bool:
+    """Whether the quantization algorithm converts activations to NVFP4."""
+    return (quant_config is not None
+            and quant_config.layer_quant_mode.has_nvfp4()
+            and quant_config.quant_algo != QuantAlgo.W4A16_NVFP4)
+
+
+_DEFAULT_NVFP4_ALLOWED_BACKENDS = ('cutlass', 'cublaslt', 'cuda_core')
+
+
+def _uses_hopper_marlin_nvfp4(module) -> bool:
+    """Whether a regular NVFP4 linear should use Marlin on Hopper."""
+    allowed_backends = tuple(getattr(module, "nvfp4_allowed_backends", ()))
+    marlin_selected = (allowed_backends == _DEFAULT_NVFP4_ALLOWED_BACKENDS
+                       or "marlin" in allowed_backends)
+    return (marlin_selected and 90 <= get_sm_version() < 100
+            and getattr(module, "dtype", None) == torch.bfloat16
+            and not getattr(module, "use_fused_gemm_allreduce", False)
+            and hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
+            and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
 
 
 def load_weight_shard(
@@ -354,6 +376,7 @@ class LinearMethodBase(ABC):
     # window buffer. apply() reads this ClassVar to derive output_buffer_kind
     # internally; callers do not pass output_buffer_kind as a parameter.
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
+    quantizes_nvfp4_activations: ClassVar[bool] = False
 
     @abstractmethod
     def create_weights(self, module: Linear, in_features: int,
@@ -1338,6 +1361,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 class NVFP4LinearMethod(LinearMethodBase):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+    quantizes_nvfp4_activations: ClassVar[bool] = True
 
     # Temporary workaround which will be resolved by TRTLLM-11958
     # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
@@ -1489,8 +1513,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
-        sm_version = get_sm_version()
-        use_marlin = (90 <= sm_version < 100 and module.dtype == torch.bfloat16)
+        use_marlin = _uses_hopper_marlin_nvfp4(module)
         allowed_backends_str = ('marlin' if use_marlin else ','.join(
             module.nvfp4_allowed_backends))
         output_buffer_kind = (
@@ -1977,6 +2000,8 @@ class NVFP4LinearMethod(LinearMethodBase):
 class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
     """W4A16 NVFP4 linear using on-the-fly weight dequantization."""
 
+    quantizes_nvfp4_activations: ClassVar[bool] = False
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         module.scaling_vector_size = 16
@@ -2070,9 +2095,13 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
             module.in_features // module.scaling_vector_size, 4)
         scale_swizzled = module.weight_scale.data.view(
             fp4_utils.float4_sf_dtype).reshape(pad_rows, pad_cols)
-        module._w4a16_weight_scale_linear = (
-            torch.ops.trtllm.block_scale_interleave_reverse(
-                scale_swizzled).reshape(-1))
+        scale_linear = torch.ops.trtllm.block_scale_interleave_reverse(
+            scale_swizzled).reshape(-1)
+        buffer_name = "_w4a16_weight_scale_linear"
+        if buffer_name in module._buffers:
+            module._buffers[buffer_name] = scale_linear
+        else:
+            module.register_buffer(buffer_name, scale_linear, persistent=False)
 
     @staticmethod
     def _prepare_input(module: Linear, input: torch.Tensor):
@@ -3312,10 +3341,7 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.has_nvfp4():
         if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
             return NVFP4ARCLinearMethod()
-        elif is_nvfp4_marlin_enabled():
-            return MarlinNVFP4LinearMethod()
-        else:
-            return NVFP4LinearMethod()
+        return NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
         return W4A8NVFP4FP8LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
@@ -3486,8 +3512,8 @@ class Linear(nn.Module):
         in_features_aligned = self.in_features % 128 == 0
         out_features_aligned = self.out_features % 64 == 0
         tp_valid = self.tp_mode is not None and self.tp_mode == TensorParallelMode.ROW and self.tp_size > 1
-        quant_valid = self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
-        )
+        quant_valid = quant_config_has_nvfp4_activation_quantization(
+            self.quant_config)
 
         device_supported = get_sm_version() >= 100
         enable_gemm_allreduce_fusion_env = (os.environ.get(
@@ -3514,8 +3540,8 @@ class Linear(nn.Module):
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
         quant_method = get_quant_method(quant_config)
-        if (type(quant_method) is W4A16NVFP4LinearMethod
-                and MarlinNVFP4LinearMethod.is_supported(self)):
+        use_marlin = type(quant_method) is W4A16NVFP4LinearMethod
+        if use_marlin and MarlinNVFP4LinearMethod.is_supported(self):
             return MarlinNVFP4LinearMethod()
         return quant_method
 
@@ -3683,6 +3709,12 @@ class Linear(nn.Module):
         if self._weights_created:
             return
 
+        # Mixed-precision loading may replace quant_config after __init__.
+        # Weight-only W4A16 must not retain the activation-quantized fused path.
+        if not quant_config_has_nvfp4_activation_quantization(
+                self.quant_config):
+            self.use_fused_gemm_allreduce = False
+
         self.rebuild_tensor_metadata = {}
 
         self.quant_method = self.get_quant_method(self.quant_config)
@@ -3722,6 +3754,18 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+    @property
+    def has_nvfp4_activation_quantization(self):
+        assert self._weights_created
+        return self.quant_method.quantizes_nvfp4_activations
+
+    @property
+    def uses_marlin_nvfp4(self):
+        assert self._weights_created
+        return (isinstance(self.quant_method, MarlinNVFP4LinearMethod)
+                or (type(self.quant_method) is NVFP4LinearMethod
+                    and _uses_hopper_marlin_nvfp4(self)))
 
     @property
     def has_weight_only_quant(self):
@@ -3895,16 +3939,16 @@ def is_static_nvfp4_input_eligible(linear) -> bool:
     """Whether `linear` consumes a static (calibrated) NVFP4 input, making it
     eligible to have its input-quantize folded into a producing RMSNorm.
 
-    Eligible iff the Linear has NVFP4 weights, a calibrated (static)
-    `input_scale`, no AWQ `pre_quant_scale`, and is not forced to dynamic
-    quantization. This is the single canonical definition shared by every
-    NVFP4-fold site (the layer-boundary / dense folds in modeling_deepseekv3.py
-    and the q_a_layernorm -> q_b_proj fold in attention.py's MLA) so the gate
-    cannot drift between them.
+    Eligible iff the Linear quantizes activations to NVFP4, has a calibrated
+    (static) `input_scale`, has no AWQ `pre_quant_scale`, and is not forced to
+    dynamic quantization. This is the single canonical definition shared by
+    every NVFP4-fold site (the layer-boundary / dense folds in
+    modeling_deepseekv3.py and the q_a_layernorm -> q_b_proj fold in
+    attention.py's MLA) so the gate cannot drift between them.
     """
     if linear is None:
         return False
-    return (getattr(linear, "has_nvfp4", False)
+    return (getattr(linear, "has_nvfp4_activation_quantization", False)
             and not getattr(linear, "force_dynamic_quantization", False)
             and getattr(linear, "input_scale", None) is not None
             and getattr(linear, "pre_quant_scale", None) is None)

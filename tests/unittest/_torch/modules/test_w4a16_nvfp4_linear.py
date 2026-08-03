@@ -21,17 +21,24 @@ import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.embedding import LMHead
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import (
     Linear,
     MarlinNVFP4LinearMethod,
     NVFP4LinearMethod,
+    TensorParallelMode,
     W4A16NVFP4LinearMethod,
     get_quant_method,
     get_sm_version,
+    quant_config_has_nvfp4_activation_quantization,
 )
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.utils import relu2
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.utils import gelu_tanh, is_nvfp4_marlin_enabled, model_extra_attrs, relu2
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
@@ -129,6 +136,147 @@ def test_get_quant_method_returns_w4a16_nvfp4_linear_method():
     assert type(method) is W4A16NVFP4LinearMethod
 
 
+def test_nvfp4_activation_quantization_excludes_w4a16():
+    assert quant_config_has_nvfp4_activation_quantization(QuantConfig(quant_algo=QuantAlgo.NVFP4))
+    assert not quant_config_has_nvfp4_activation_quantization(
+        QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    )
+
+
+def test_nvfp4_marlin_utility_requires_explicit_opt_in():
+    with (
+        patch("tensorrt_llm._torch.utils.get_sm_version", return_value=90),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
+    ):
+        assert not is_nvfp4_marlin_enabled()
+        with model_extra_attrs({"nvfp4_gemm_allowed_backends": ["cutlass", "marlin"]}):
+            assert is_nvfp4_marlin_enabled()
+
+
+def test_nvfp4_rmsnorm_keeps_high_precision_output_for_hopper_marlin():
+    with (
+        patch("tensorrt_llm._torch.modules.rms_norm.get_sm_version", return_value=90),
+        patch("tensorrt_llm._torch.modules.rms_norm.is_nvfp4_marlin_enabled", return_value=True),
+    ):
+        norm = RMSNorm(
+            hidden_size=32,
+            eps=1e-5,
+            dtype=torch.bfloat16,
+            quantize_type="nvfp4",
+            return_hp_output=True,
+        )
+
+    assert not norm.is_nvfp4
+    assert not norm.return_hp_output
+    assert norm.nvfp4_scale is None
+
+
+def test_w4a16_attention_does_not_quantize_output_to_fp4():
+    quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    o_proj = Linear(
+        32,
+        32,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=quant_config,
+        reduce_output=False,
+    )
+    attention = SimpleNamespace(
+        attn=SimpleNamespace(has_nvfp4=False),
+        o_proj=o_proj,
+        quant_config=quant_config,
+        has_quant_scale=True,
+        attn_output_gate=False,
+        is_marlin_enabled=False,
+    )
+
+    assert not Attention._use_quantize_output(attention)
+
+
+def test_static_nvfp4_attention_can_quantize_output_to_fp4_on_blackwell():
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    with patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=100):
+        o_proj = Linear(
+            32,
+            32,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=quant_config,
+            reduce_output=False,
+        )
+    attention = SimpleNamespace(
+        attn=SimpleNamespace(has_nvfp4=False),
+        o_proj=o_proj,
+        quant_config=quant_config,
+        has_quant_scale=True,
+        attn_output_gate=False,
+        is_marlin_enabled=False,
+    )
+
+    assert Attention._use_quantize_output(attention)
+
+
+def test_nvfp4_attention_keeps_high_precision_output_for_hopper_marlin():
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    with (
+        patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=90),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
+        patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
+    ):
+        o_proj = Linear(
+            32,
+            32,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=quant_config,
+            reduce_output=False,
+        )
+        attention = SimpleNamespace(
+            attn=SimpleNamespace(has_nvfp4=False),
+            o_proj=o_proj,
+            quant_config=quant_config,
+            has_quant_scale=o_proj.has_nvfp4_activation_quantization,
+            attn_output_gate=False,
+            is_marlin_enabled=o_proj.uses_marlin_nvfp4,
+        )
+
+        assert o_proj.uses_marlin_nvfp4
+        assert type(o_proj.quant_method) is NVFP4LinearMethod
+        assert o_proj.has_nvfp4_activation_quantization
+        assert not Attention._use_quantize_output(attention)
+
+
+def test_w4a16_disables_fused_gemm_allreduce(monkeypatch):
+    monkeypatch.setenv("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "1")
+    mapping = Mapping(world_size=2, rank=0, tp_size=2)
+
+    with (
+        patch("tensorrt_llm._torch.modules.linear.mpi_disabled", return_value=False),
+        patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=120),
+        patch("tensorrt_llm._torch.modules.linear.ipc_nvls_supported", return_value=True),
+        patch("tensorrt_llm._torch.distributed.AllReduce"),
+    ):
+        linear = Linear(
+            256,
+            64,
+            bias=False,
+            dtype=torch.bfloat16,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            reduce_output=True,
+            skip_create_weights_in_init=True,
+        )
+        assert linear.use_fused_gemm_allreduce
+
+        # Simulate apply_layerwise_quant_config rebinding a mixed-precision
+        # layer after Linear.__init__ but before deferred weight creation.
+        linear.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+        linear.create_weights()
+
+    assert not linear.use_fused_gemm_allreduce
+
+
 @pytest.mark.parametrize(
     ("sm_version", "dtype", "expected_backends"),
     [
@@ -170,6 +318,8 @@ def test_nvfp4_linear_uses_architecture_default_backend(sm_version, dtype, expec
             side_effect=fake_nvfp4_gemm,
             create=True,
         ),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
+        patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
     ):
         output = method.apply(module, input_tensor, bias=None)
 
@@ -178,12 +328,16 @@ def test_nvfp4_linear_uses_architecture_default_backend(sm_version, dtype, expec
 
 
 @pytest.mark.parametrize("sm_version", [90, 120, 121])
-def test_nvfp4_linear_keeps_normal_quant_method(sm_version):
+def test_nvfp4_linear_preserves_activation_quant_method(sm_version):
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
 
-    with patch(
-        "tensorrt_llm._torch.modules.linear.get_sm_version",
-        return_value=sm_version,
+    with (
+        patch(
+            "tensorrt_llm._torch.modules.linear.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
+        patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
     ):
         linear = Linear(
             32,
@@ -191,6 +345,25 @@ def test_nvfp4_linear_keeps_normal_quant_method(sm_version):
             bias=False,
             dtype=torch.bfloat16,
             quant_config=quant_config,
+            reduce_output=False,
+        )
+        assert type(linear.quant_method) is NVFP4LinearMethod
+        assert linear.has_nvfp4_activation_quantization
+        assert linear.uses_marlin_nvfp4 is (sm_version == 90)
+
+
+def test_nvfp4_linear_hopper_fp16_keeps_normal_method():
+    with (
+        patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=90),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
+        patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
+    ):
+        linear = Linear(
+            32,
+            32,
+            bias=False,
+            dtype=torch.float16,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
             reduce_output=False,
         )
 
@@ -230,6 +403,8 @@ def test_nvfp4_linear_hopper_marlin_applies_bias_as_post_op():
             side_effect=fake_nvfp4_gemm,
             create=True,
         ),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
+        patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
     ):
         output = method.apply(module, input_tensor, bias=bias)
 
@@ -317,6 +492,96 @@ def test_w4a16_nvfp4_mlp_rechecks_relu2_fp4_fusion_before_forward():
         output = mlp(torch.empty((1, 32), dtype=torch.bfloat16))
 
     torch.testing.assert_close(output, relu2(x_up))
+
+
+def test_w4a16_nvfp4_mlp_disables_cutedsl_gelu_fusion():
+    model_config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4))
+
+    with (
+        patch("tensorrt_llm._torch.modules.mlp.get_sm_version", return_value=100),
+        patch("torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_blackwell", create=True),
+        patch(
+            "torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell",
+            create=True,
+        ),
+    ):
+        mlp = MLP(
+            hidden_size=32,
+            intermediate_size=64,
+            bias=False,
+            activation=gelu_tanh,
+            dtype=torch.bfloat16,
+            config=model_config,
+            reduce_output=False,
+        )
+        mlp.create_weights()
+
+    assert not mlp._use_fused_gelu
+    assert not mlp._use_fused_gelu_fp4out
+
+
+def test_dynamic_nvfp4_mlp_keeps_bf16_cutedsl_gelu_fusion():
+    model_config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        force_dynamic_quantization=True,
+    )
+
+    with (
+        patch("tensorrt_llm._torch.modules.mlp.get_sm_version", return_value=100),
+        patch("torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_blackwell", create=True),
+        patch(
+            "torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell",
+            create=True,
+        ),
+    ):
+        mlp = MLP(
+            hidden_size=32,
+            intermediate_size=64,
+            bias=False,
+            activation=gelu_tanh,
+            dtype=torch.bfloat16,
+            config=model_config,
+            reduce_output=False,
+        )
+        mlp.create_weights()
+
+    assert mlp._use_fused_gelu
+    assert not mlp._use_fused_gelu_fp4out
+
+
+def test_w4a16_nvfp4_gated_mlp_disables_cutedsl_swiglu_fusion():
+    model_config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4))
+    mlp = GatedMLP(
+        hidden_size=32,
+        intermediate_size=64,
+        bias=False,
+        dtype=torch.bfloat16,
+        config=model_config,
+        reduce_output=False,
+        use_cute_dsl_blockscaling_mm=True,
+    )
+
+    assert not mlp._can_fuse_gate_up_swiglu()
+    assert not mlp._can_fuse_gate_up_swiglu_fp4out()
+
+
+def test_dynamic_nvfp4_gated_mlp_keeps_bf16_cutedsl_swiglu_fusion():
+    model_config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        force_dynamic_quantization=True,
+    )
+    mlp = GatedMLP(
+        hidden_size=32,
+        intermediate_size=64,
+        bias=False,
+        dtype=torch.bfloat16,
+        config=model_config,
+        reduce_output=False,
+        use_cute_dsl_blockscaling_mm=True,
+    )
+
+    assert mlp._can_fuse_gate_up_swiglu()
+    assert not mlp._can_fuse_gate_up_swiglu_fp4out()
 
 
 def test_w4a16_nvfp4_linear_uses_high_precision_activation_without_fp4_quantize():
@@ -431,6 +696,29 @@ def test_w4a16_nvfp4_linear_uses_triton_dequant():
     assert captured["sf_vec_size"] == 16
     expected = torch.tensor([33.0, 34.0, 35.0, 36.0], dtype=torch.bfloat16).expand(2, 4)
     torch.testing.assert_close(output, expected)
+
+
+def test_w4a16_nvfp4_linear_scale_cache_is_nonpersistent_buffer():
+    with patch.object(MarlinNVFP4LinearMethod, "is_supported", return_value=False):
+        linear = Linear(
+            32,
+            4,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4),
+            reduce_output=False,
+        )
+
+    scale_linear = torch.arange(128 * 4, dtype=torch.int32).to(torch.uint8)
+    with patch(
+        "torch.ops.trtllm.block_scale_interleave_reverse",
+        return_value=scale_linear,
+        create=True,
+    ):
+        linear.quant_method.cache_derived_state(linear)
+
+    assert linear._buffers["_w4a16_weight_scale_linear"].data_ptr() == scale_linear.data_ptr()
+    assert "_w4a16_weight_scale_linear" not in linear.state_dict()
 
 
 def test_w4a16_nvfp4_linear_uses_marlin_op_after_weight_transform():
@@ -651,6 +939,51 @@ def test_lm_head_uses_w4a16_nvfp4_quant_method_for_packed_lm_head():
     assert lm_head.weight.shape == (3, 8)
     assert lm_head.weight_scale.shape == (128 * 4,)
     assert lm_head.weight_scale_2.shape == (1,)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_has_scale", "exclude_modules", "expected_width"),
+    [
+        (True, None, 1344),
+        (True, ["lm_head"], 2688),
+        (False, None, 2688),
+    ],
+)
+def test_causal_lm_head_uses_global_w4a16_nvfp4_config(
+    checkpoint_has_scale,
+    exclude_modules,
+    expected_width,
+):
+    quant_config = QuantConfig(
+        quant_algo=QuantAlgo.W4A16_NVFP4,
+        exclude_modules=exclude_modules,
+    )
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            torch_dtype=torch.float16,
+            tie_word_embeddings=False,
+        ),
+        quant_config=quant_config,
+    )
+
+    with patch.object(
+        DecoderModelForCausalLM,
+        "_checkpoint_has_lm_head_scale",
+        return_value=checkpoint_has_scale,
+    ):
+        causal_lm = DecoderModelForCausalLM(
+            torch.nn.Module(),
+            config=model_config,
+            hidden_size=2688,
+            vocab_size=32,
+        )
+
+    assert causal_lm.lm_head.weight.shape == (32, expected_width)
+    if checkpoint_has_scale and exclude_modules is None:
+        assert causal_lm.lm_head.quant_config is quant_config
+        assert isinstance(causal_lm.lm_head.quant_method, W4A16NVFP4LinearMethod)
+    else:
+        assert not causal_lm.lm_head.has_any_quant
 
 
 def test_lm_head_w4a16_nvfp4_forward_uses_triton_dequant():

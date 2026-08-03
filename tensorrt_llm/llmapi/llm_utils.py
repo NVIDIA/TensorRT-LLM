@@ -160,11 +160,14 @@ class ModelLoader:
             # Cross-check against inline config.json.quantization_config if any.
             # Done before _apply_modelopt_quant_config since the apply step
             # mutates ``normalized`` via ``.pop()``.
+            inline_quant_config = None
             try:
                 with open(f"{self._model_dir}/config.json", "r") as f:
+                    inline_quant_config = json.load(f).get(
+                        "quantization_config")
                     warn_if_inline_diverges(
                         normalized,
-                        json.load(f).get("quantization_config"),
+                        inline_quant_config,
                         source_file="hf_quant_config.json",
                     )
             except FileNotFoundError:
@@ -180,8 +183,22 @@ class ModelLoader:
                     raise ValueError(
                         "Pre-quantized checkpoint must have quant_algo.")
             else:
+                normalized_quant_algo = normalized.get("quant_algo")
                 self._apply_modelopt_quant_config(normalized,
                                                   explicit_kv_cache_quant_algo)
+                if (normalized_quant_algo == QuantAlgo.NVFP4
+                        and inline_quant_config is not None
+                        and inline_quant_config.get("quant_method")
+                        == "compressed-tensors"):
+                    effective_quant_config = self.llm_args.quant_config.model_copy(
+                        deep=True)
+                    update_quant_config_from_compressed_tensors(
+                        effective_quant_config, inline_quant_config)
+                    if effective_quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+                        logger.info(
+                            "Using W4A16_NVFP4 activation semantics from the "
+                            "inline compressed-tensors config.")
+                        self.llm_args.quant_config = effective_quant_config
                 return True
 
         hf_config_path = f"{self._model_dir}/config.json"

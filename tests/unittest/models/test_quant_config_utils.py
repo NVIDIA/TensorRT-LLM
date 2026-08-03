@@ -79,7 +79,6 @@ def test_update_quant_config_from_compressed_tensors_parses_w4a16_nvfp4():
                         "strategy": "tensor_group",
                         "group_size": 16,
                     },
-                    "input_activations": None,
                 },
             },
             "ignore": ["lm_head"],

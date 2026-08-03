@@ -38,7 +38,7 @@ def update_quant_config_from_compressed_tensors(
             )
         group_config = next(iter(config_groups.values()))
     weights_quant_config = group_config["weights"]
-    inputs_quant_config = group_config["input_activations"]
+    inputs_quant_config = group_config.get("input_activations")
     weights_quant_strategy = weights_quant_config["strategy"]
 
     if inputs_quant_config is None:

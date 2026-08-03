@@ -1024,8 +1024,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         tactics = []
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
-        # Add Marlin tactics (SM90 Hopper only) — users must opt-in explicitly
-        # by listing "marlin" in ``allowed_backends``.
+        # Add Marlin tactics (SM90 Hopper only) when selected by the caller.
         if self._is_backend_allowed("marlin"):
             marlin_runner = MarlinNVFP4Runner(self.output_buffer_kind,
                                               self.output_dtype)
@@ -1153,8 +1152,8 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     ) -> torch.Tensor:
         # Handle fallback tactic on cache miss
         if tactic == -1:
-            # Prefer marlin on Hopper (SM90) when explicitly allowed, cutlass
-            # otherwise, falling back to whatever backend is available.
+            # Prefer Marlin on Hopper (SM90) when allowed, Cutlass otherwise,
+            # falling back to whichever backend is available.
             assert len(
                 self.allowed_backends) > 0, "No allowed backends available"
             sm_version = get_sm_version()
@@ -1236,7 +1235,7 @@ def nvfp4_gemm(
         allowed_backends: Comma-separated list of backends to consider for auto-selection.
             Default: "cutlass,cublaslt,cuda_core" (excludes cutedsl for faster build)
             Add 'cutedsl' for extreme performance at the cost of longer build time.
-            Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
+            Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
 
     Returns:
         Output tensor [m, n] with dtype=output_dtype

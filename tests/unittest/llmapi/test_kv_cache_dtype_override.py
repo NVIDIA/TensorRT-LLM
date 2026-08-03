@@ -43,6 +43,15 @@ def _compressed_tensors_nvfp4_config(**overrides):
     return config
 
 
+def _compressed_tensors_w4a16_nvfp4_config():
+    config = _compressed_tensors_nvfp4_config(
+        format="nvfp4-pack-quantized",
+        ignore=["mtp.layers"],
+    )
+    config["config_groups"]["group_0"]["input_activations"] = None
+    return config
+
+
 def test_get_llm_args_plumbs_kv_cache_dtype():
     llm_args, _ = get_llm_args(model="dummy", kv_cache_dtype="nvfp4")
     assert llm_args["kv_cache_config"].dtype == "nvfp4"
@@ -86,6 +95,36 @@ def test_update_from_hf_quant_config_explicit_dtype_overrides(tmp_path):
 
     assert model_loader._update_from_hf_quant_config() is True
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+def test_update_from_hf_quant_config_uses_inline_w4a16_semantics(tmp_path):
+    with open(tmp_path / "hf_quant_config.json", "w") as f:
+        json.dump(
+            {
+                "quantization": {
+                    "quant_algo": "NVFP4",
+                    "kv_cache_quant_algo": None,
+                    "group_size": 16,
+                    "exclude_modules": ["mtp*"],
+                },
+            },
+            f,
+        )
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "quantization_config": _compressed_tensors_w4a16_nvfp4_config(),
+            },
+            f,
+        )
+
+    llm_args = TorchLlmArgs(model=str(tmp_path))
+    model_loader = ModelLoader(llm_args)
+
+    assert model_loader._update_from_hf_quant_config() is True
+    assert llm_args.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
+    assert llm_args.quant_config.group_size == 16
+    assert llm_args.quant_config.exclude_modules == ["mtp.layers"]
 
 
 def test_update_from_hf_quant_config_parses_compressed_tensors_model_kwargs(tmp_path):
