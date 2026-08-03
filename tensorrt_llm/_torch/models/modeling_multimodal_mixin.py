@@ -221,6 +221,10 @@ if TYPE_CHECKING:
 
 
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
+# Raw-input keys that may hold a plain per-item dim-0 stack, tried in this order by
+# `MultimodalModelMixin._stacked_item_key`. Which key belongs to which modality is not
+# encoded here: the leading-axis check in that helper is what selects the right one.
+_MM_STACKED_ITEM_KEYS = ("pixel_values_videos", "pixel_values", "audio_features")
 _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 _MM_ENCODER_CACHE_LOG_NAME = "mm_encoder_cache"
 
@@ -601,7 +605,7 @@ class MultimodalModelMixin:
         """Return a `MultimodalParams` whose raw modality inputs contain only
         `item_indices` from `param`, in that order.
 
-        Default handles three common single-modality layouts:
+        Default handles four common single-modality layouts:
 
         - Image, stacked on dim 0 (Mistral 3 / Pixtral / LLaVA-family): `pixel_values`
           `[B, C, H, W]` with a parallel `image_sizes` list; both sliced by item.
@@ -611,6 +615,14 @@ class MultimodalModelMixin:
           is sliced in parallel.
         - Audio, stacked on dim 0 (Whisper / Qwen2-Audio / Gemma4 audio):
           `input_features` `[B, mel_bins, T]` sliced by item.
+        - Any modality, plain stack on dim 0 with no companion size/grid field
+          (Gemma4 image / video / audio): the raw input's first axis is already one
+          row per item, so a dim-0 index is the whole slice. Unlike the
+          `image_sizes` case there is nothing to crop, because such layouts pad to
+          a model constant (e.g. Gemma4's fixed per-image patch count, with `-1`
+          sentinels in `image_position_ids`) rather than to a request-wide max. Only
+          taken when the leading axis matches the declared item count -- see
+          `_stacked_item_key`.
 
         Any additional sibling field in the modality dict whose first-axis length equals
         the item count is also sliced -- covers per-item metadata such as
@@ -638,6 +650,7 @@ class MultimodalModelMixin:
         indices = list(item_indices)
         grid_key = {"image": "image_grid_thw", "video": "video_grid_thw"}.get(modality)
         pixel_key = {"image": "pixel_values", "video": "pixel_values_videos"}.get(modality)
+        declared_items = len(param.multimodal_data.get("multimodal_embedding_lengths") or ())
 
         if (
             (grid_key and pixel_key)
@@ -685,6 +698,13 @@ class MultimodalModelMixin:
             sliced = {
                 "input_features": modality_data["input_features"][indices],
             }
+        elif (stacked_key := self._stacked_item_key(modality_data, declared_items)) is not None:
+            # Plain per-item dim-0 stack with no companion size/grid field. Every
+            # per-item sibling (Gemma4's `image_position_ids` / `image_seq_lens`,
+            # an audio mask, ...) is picked up by the sibling-slice pass below.
+            # `_stacked_item_key` already proved `shape[0] == declared_items`.
+            n_items = declared_items
+            sliced = {stacked_key: modality_data[stacked_key][indices]}
         else:
             raise NotImplementedError(
                 f"Default `build_multimodal_encoder_input` cannot slice {modality} layout "
@@ -709,6 +729,27 @@ class MultimodalModelMixin:
             multimodal_data={**param.multimodal_data, modality: sliced},
             multimodal_input=residual_input,
         )
+
+    @staticmethod
+    def _stacked_item_key(modality_data: Dict[str, Any], item_count: int) -> Optional[str]:
+        """Return the raw-input key holding a plain per-item dim-0 stack, if any.
+
+        A dim-0 index is only a per-item slice when the first axis really is one row
+        per item, so this requires `shape[0]` to equal `item_count` (the request's
+        declared item count). That check is what makes the branch safe for a model
+        whose raw tensor is flattened along a sub-item axis instead -- Gemma4 video
+        reshapes `(B, frames, patches, C)` to `(B * frames, patches, C)`, so its first
+        axis counts frames, not items, and slicing it by item index would silently
+        encode the wrong frames. Such layouts fall through to the `NotImplementedError`
+        and must override `build_multimodal_encoder_input`.
+        """
+        if item_count == 0:
+            return None
+        for key in _MM_STACKED_ITEM_KEYS:
+            value = modality_data.get(key)
+            if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == item_count:
+                return key
+        return None
 
     @staticmethod
     def _slice_per_item_sibling_fields(

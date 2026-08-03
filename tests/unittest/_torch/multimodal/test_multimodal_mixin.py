@@ -704,15 +704,81 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
     torch.testing.assert_close(residual_audio["input_features_mask"], mask[[1, 0]])
 
 
+@pytest.mark.parametrize("modality", ["image", "video", "audio"])
+def test_build_multimodal_encoder_input_slices_plain_dim0_stack(modality):
+    # Gemma4 layout: a plain per-item dim-0 stack with no companion `image_sizes` or
+    # `*_grid_thw` field, padded to a model constant (fixed patch count) rather than to
+    # a request-wide max -- so slicing needs no trailing crop. `image_position_ids` and
+    # `image_seq_lens` must slice in parallel with the raw input, which is what the
+    # partial-hit encode path depends on (nvbugs/6550127).
+    pixel_key = "audio_features" if modality == "audio" else "pixel_values"
+    # 3 items x 4 padded rows x 2 feats; item i has i + 2 valid rows.
+    raw = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(3, 4, 2)
+    position_ids = torch.arange(3 * 4 * 2).reshape(3, 4, 2)
+    seq_lens = [2, 3, 4]
+    param = MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=[[i] * 8 for i in range(3)],
+            multimodal_positions=[0, 0, 0],
+            multimodal_lengths=[1, 1, 1],
+        ),
+        multimodal_data={
+            modality: {
+                pixel_key: raw,
+                "image_position_ids": position_ids,
+                "image_seq_lens": seq_lens,
+                "per_request_scalar": torch.tensor(7.0),
+            },
+            "multimodal_embedding_lengths": [1, 1, 1],
+            "mm_processor_kwargs_hash": "kw",
+        },
+    )
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    residual = model.build_multimodal_encoder_input(param, [2, 0])
+
+    residual_data = residual.multimodal_data[modality]
+    torch.testing.assert_close(residual_data[pixel_key], raw[[2, 0]])
+    # Both per-item siblings follow the raw input, in the requested item order.
+    torch.testing.assert_close(residual_data["image_position_ids"], position_ids[[2, 0]])
+    assert residual_data["image_seq_lens"] == [4, 2]
+    # Non-per-item siblings pass through untouched.
+    torch.testing.assert_close(residual_data["per_request_scalar"], torch.tensor(7.0))
+
+
+def test_build_multimodal_encoder_input_frame_flattened_video_raises():
+    # Gemma4 video reshapes `(B, frames, patches, C)` -> `(B * frames, patches, C)`, so
+    # dim 0 counts frames rather than items. Indexing it by item would silently encode
+    # the wrong frames, so this must fall through to the override request instead of
+    # being caught by the plain dim-0 branch.
+    param = MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=[[i] * 8 for i in range(2)],
+            multimodal_positions=[0, 0],
+            multimodal_lengths=[1, 1],
+        ),
+        multimodal_data={
+            # 2 videos x 3 frames flattened to 6 rows against an item count of 2.
+            "video": {"pixel_values": torch.zeros(6, 4, 2)},
+            "multimodal_embedding_lengths": [1, 1],
+            "mm_processor_kwargs_hash": "kw",
+        },
+    )
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
+    with pytest.raises(NotImplementedError, match="cannot slice video layout"):
+        model.build_multimodal_encoder_input(param, [0])
+
+
 @pytest.mark.parametrize(
     "mm_data, expected_match",
     [
         # `_encoder_cache_modality` returns None -> single-modality guard fires.
         ({}, "only supports single-modality"),
-        # Modality present but layout is neither pattern A (image_sizes) nor pattern B
-        # (grid_thw); default has nothing to dispatch on.
+        # Modality present but no layout matches: no `image_sizes`, no `grid_thw`, and
+        # without `multimodal_embedding_lengths` the plain dim-0 branch cannot confirm
+        # that the first axis is per-item either.
         ({"image": {"pixel_values": torch.zeros(2)}}, "cannot slice image layout"),
-        # Audio modality but no `input_features`; default falls through.
+        # Audio modality with no recognized raw-input key at all.
         ({"audio": {"nonsense": torch.zeros(2)}}, "cannot slice audio layout"),
     ],
     ids=["no_modality", "unhandled_image_layout", "unhandled_audio_layout"],
