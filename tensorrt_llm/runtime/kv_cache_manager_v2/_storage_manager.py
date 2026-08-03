@@ -44,7 +44,7 @@ from ._config import (
 from ._copy_engine import CopyTask, batched_copy
 from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
-from ._exceptions import OutOfPagesError
+from ._exceptions import LogicError, OutOfPagesError
 from ._life_cycle_registry import (
     AttnLifeCycle,
     LifeCycleId,
@@ -219,6 +219,7 @@ class StorageManager:
         constraints: list[BatchDesc] | None = None,
         initial_pool_ratio: list[float] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
+        max_util_for_resume: float = 1.0,
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
@@ -243,9 +244,12 @@ class StorageManager:
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
-        constraints_for_min_slots = [] if initial_pool_ratio is not None else constraints or []
+        # Constraints stay feasibility floors even under an explicit initial pool
+        # ratio (a share below what a declared batch needs is clamped up), and the
+        # floors are scaled by 1/max_util_for_resume because _KVCache.resume rejects
+        # any pool group above that utilization. Mirrors PR #16269.
         self._min_slots = self._compute_min_slots_from_constraints(
-            constraints_for_min_slots, tokens_per_block, swa_scratch_reuse
+            constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
 
         # Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
@@ -327,6 +331,8 @@ class StorageManager:
         lc2pg = self._life_cycle_grouping
         pg_num_slots = filled_list(0, self.num_pool_groups)
         for lc in typed_range(self.num_life_cycles):
+            if num_slots[lc] < 0:
+                raise LogicError("StorageManager.new_slots: slot count must be non-negative")
             pg_num_slots[lc2pg[lc]] += num_slots[lc]
         storage = self._levels[level].storage
         if any(
@@ -360,6 +366,10 @@ class StorageManager:
         migration_recorder: MigrationRecorder | None = None,
         drop_recorder: DropRecorder | None = None,
     ) -> list[Slot]:
+        if num_slots < 0:
+            raise LogicError(
+                "StorageManager.new_slots_for_pool_group: slot count must be non-negative"
+            )
         storage = self._levels[level].storage
         if num_slots > storage.get_num_free_slots(pg_idx):
             num_slots_list = filled_list(0, self.num_pool_groups)
@@ -901,11 +911,15 @@ class StorageManager:
         constraints: list[BatchDesc],
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
+        max_util_for_resume: float,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum slots per pool group across all constraints (element-wise max).
 
-        All returned elements are positive.
+        All returned elements are positive. Constraint-derived floors include
+        headroom for the utilization gate checked by ``_KVCache.resume``.
         """
+        if not 0 < max_util_for_resume <= 1:
+            raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
         max_slots = filled_list(0, self.num_pool_groups)
 
         def swa_floor_blocks(lc: AttnLifeCycle) -> int:
@@ -931,7 +945,8 @@ class StorageManager:
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for pg_idx in typed_range(self.num_pool_groups):
-                max_slots[pg_idx] = max(max_slots[pg_idx], slots[pg_idx])
+                scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
+                max_slots[pg_idx] = max(max_slots[pg_idx], scaled_slots)
         return max_slots
 
     def _compute_slots_for_batch(

@@ -208,6 +208,10 @@ class BounceTransport(ABC):
         """Immediately free a reservation cancelled before any address went out."""
 
     @abstractmethod
+    def orphan_reservation(self, rid_slice) -> None:
+        """Give up on an in-flight reservation (cancel/timeout/lost result); quarantine, don't leak."""
+
+    @abstractmethod
     def record_result(
         self, rid_slice, peer_rank, dst_ptrs=None, sizes=None, src_base=None, on_done=None
     ) -> None:

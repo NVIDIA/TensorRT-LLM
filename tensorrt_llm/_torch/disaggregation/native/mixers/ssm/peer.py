@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -338,13 +352,17 @@ class MambaPolicy:
         overlapping_layers: List[int],
         slot: int,
     ) -> np.ndarray:
-        """Build per-layer pointers for a given pool (conv or ssm) and slot."""
-        ptrs = []
-        for glid in overlapping_layers:
-            lid = layer_offsets[glid]
-            ptrs.append(
-                pool.base_address + lid * pool.num_slots * pool.slot_bytes + slot * pool.slot_bytes
-            )
+        """Build per-layer pointers from a pool's affine layer/slot layout."""
+        slot_stride_bytes = pool.slot_stride_bytes
+        layer_stride_bytes = pool.layer_stride_bytes
+        assert slot_stride_bytes is not None
+        assert layer_stride_bytes is not None
+        ptrs = [
+            pool.base_address
+            + layer_offsets[global_layer_id] * layer_stride_bytes
+            + slot * slot_stride_bytes
+            for global_layer_id in overlapping_layers
+        ]
         return np.array(ptrs, dtype=np.int64)
 
     @staticmethod
@@ -431,10 +449,16 @@ class MambaPolicy:
             (self_mlg.ssm_states, peer_mlg.ssm_states, False),
         ]:
             src_ptrs = MambaPolicy._build_layer_ptrs(
-                self_pool, self_mlg.mamba_layer_offsets, overlapping_layers, src_slot
+                self_pool,
+                self_mlg.mamba_layer_offsets,
+                overlapping_layers,
+                src_slot,
             )
             dst_ptrs = MambaPolicy._build_layer_ptrs(
-                peer_pool, peer_mlg.mamba_layer_offsets, overlapping_layers, dst_slot
+                peer_pool,
+                peer_mlg.mamba_layer_offsets,
+                overlapping_layers,
+                dst_slot,
             )
 
             src_region = SpecRegion(

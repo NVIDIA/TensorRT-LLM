@@ -31,14 +31,12 @@ from ...custom_ops.cute_dsl_custom_ops import (
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
     Sm100BlockScaledContiguousGroupedGemmRunner,
     Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
-from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
 from .fused_moe_cutlass import CutlassFusedMoE
-from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
@@ -436,7 +434,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
@@ -453,7 +450,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
-            without_comm=without_comm,
             activation_type=activation_type,
         )
         self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
@@ -481,9 +477,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             expert_size_per_partition=self.expert_size_per_partition,
             slot_start=self.slot_start,
         )
-
-    def select_alltoall_method_type(self) -> AlltoallMethodType:
-        return AlltoallMethodType.NotEnabled
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -854,44 +847,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 f"{self.__class__.__name__} doesn't support quantization mode {self.quant_config.quant_mode}."
             )
         return result
-
-    def forward_chunk(
-            self,
-            x: Union[torch.Tensor, Fp4QuantizedTensor],
-            router_logits: torch.Tensor,
-            input_ids: Optional[torch.IntTensor] = None,
-            output_dtype: Optional[torch.dtype] = None,
-            all_rank_num_tokens: Optional[List[int]] = None,
-            use_dp_padding: Optional[bool] = None,
-            repeating_info: tuple = (True, True),
-    ) -> torch.Tensor:
-        # Currently, the default path is that ConfigurableMoE calls CuteDslFusedMoE.run_moe.
-        # This forward_chunk method is a reference implementation of the legacy path.
-        # Apply routing
-        token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits, input_ids)
-        assert token_selected_experts.shape[
-            1] == self.routing_method.experts_per_token
-        assert token_selected_experts.shape == token_final_scales.shape
-        assert token_selected_experts.shape[0] == router_logits.shape[0]
-        assert token_final_scales.dtype == torch.float32
-        assert token_selected_experts.dtype == torch.int32
-
-        x, x_sf = self.quantize_input(x)
-
-        if self.use_dp and self.parallel_size > 1:
-            x, x_sf, token_selected_experts, token_final_scales = allgather(
-                [x, x_sf, token_selected_experts, token_final_scales],
-                self.mapping,
-                dim=0,
-                sizes=None if use_dp_padding else all_rank_num_tokens)
-
-        x = self.run_moe(x=x,
-                         token_selected_experts=token_selected_experts,
-                         token_final_scales=token_final_scales,
-                         x_sf=x_sf,
-                         enable_alltoall=False)
-        return x
 
     def load_weights(self,
                      weights: List[Dict],

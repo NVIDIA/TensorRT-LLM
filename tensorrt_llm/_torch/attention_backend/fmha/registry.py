@@ -22,10 +22,24 @@ from .interface import Fmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
-FMHA_LIBS: dict[str, FmhaCls] = {
-    "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
-    "fallback": FallbackFmha,
-}
+
+def init_fmha_libs() -> dict[str, "FmhaCls"]:
+    """Build the ordered FMHA library registry.
+
+    Backend classes are imported inside this factory rather than at module
+    scope, so backends can import trtllm attention classes at module scope
+    without an import cycle.
+    """
+    from .msa_sparse_gqa import MsaSparseGqaFmha
+
+    return {
+        "msa_sparse_gqa": MsaSparseGqaFmha,
+        "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
+        "fallback": FallbackFmha,
+    }
+
+
+FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(FMHA_LIBS)
 
 
@@ -78,4 +92,5 @@ __all__ = [
     "FMHA_LIBS",
     "FmhaCls",
     "get_enabled_fmha_lib_classes",
+    "init_fmha_libs",
 ]

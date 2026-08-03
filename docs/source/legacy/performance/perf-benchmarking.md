@@ -202,7 +202,7 @@ can simply read a line and assume a complete entry. When creating a dataset, be 
 JSON entry is on every line.
 ```
 
-In order to prepare a synthetic dataset, you can use the provided script in the `benchmarks/cpp`
+In order to prepare a synthetic dataset, you can use the provided script in the `benchmarks`
 directory. For example, to generate a synthetic dataset of 1000 requests with a uniform ISL/OSL of
 128/128 for [meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B), run:
 
@@ -481,7 +481,7 @@ The PyTorch workflow supports benchmarking with LoRA (Low-Rank Adaptation) adapt
 Use `prepare_dataset.py` with LoRA-specific options to generate requests with LoRA metadata:
 
 ```shell
-python3 benchmarks/cpp/prepare_dataset.py \
+python3 benchmarks/prepare_dataset.py \
   --stdout \
   --rand-task-id 0 1 \
   --tokenizer /path/to/tokenizer \
@@ -555,7 +555,7 @@ To benchmark multi-modal models with PyTorch workflow, you can follow the simila
 
 First, prepare the dataset:
 ```
-python ./benchmarks/cpp/prepare_dataset.py \
+python ./benchmarks/prepare_dataset.py \
   --tokenizer Qwen/Qwen2-VL-2B-Instruct \
   --stdout \
   dataset \
@@ -846,7 +846,7 @@ The following table summarizes the commands needed for running benchmarks:
 
 | Scenario | Phase | Command |
 | - | - | - |
-| Dataset | Preparation | `python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer $HF_MODEL token-norm-dist --input-mean $ISL --output-mean $OSL --input-stdev 0 --output-stdev 0 --num-requests $NUM_REQUESTS > $DATASET_PATH` |
+| Dataset | Preparation | `python benchmarks/prepare_dataset.py --stdout --tokenizer $HF_MODEL token-norm-dist --input-mean $ISL --output-mean $OSL --input-stdev 0 --output-stdev 0 --num-requests $NUM_REQUESTS > $DATASET_PATH` |
 | Throughput | Build | `trtllm-bench --model $HF_MODEL build --dataset $DATASET_PATH` |
 | Throughput | Benchmark | `trtllm-bench --model $HF_MODEL throughput --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
 | Latency | Build | See [section about building low latency engines](#low-latency-tensorrt-llm-engine-for-llama-3-70b) |

@@ -1,3 +1,12 @@
+# Disaggregated config that exercises the KV-cache bounce buffer.
+#
+# Same as disagg_config_overlap_transceiver_runtime_python.yaml, plus the bounce switch on both the
+# context (sender) and generation (receiver) cache_transceiver_config:
+#   kv_cache_bounce_size_mb: >0 turns bounce on and sizes the per-region fabric-VMM arena.
+# The block-count gate below which a transfer keeps the per-block path is lowered to 1 via the
+# TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS env (set by the test) so the ordinary short test prompts still
+# take the coalesced-bounce WRITE path (the production default of 96 would need a ~2k-token prompt).
+# GB200/GB300 only, since the bounce arena is fabric (MNNVL) VMM memory.
 model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 hostname: localhost
 port: 8000
@@ -18,7 +27,7 @@ context_servers:
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
-    kv_cache_bounce_size_mb: 64
+    kv_cache_bounce_size_mb: 128
   urls:
       - "localhost:8001"
 generation_servers:
@@ -35,6 +44,6 @@ generation_servers:
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON
-    kv_cache_bounce_size_mb: 64
+    kv_cache_bounce_size_mb: 128
   urls:
       - "localhost:8002"

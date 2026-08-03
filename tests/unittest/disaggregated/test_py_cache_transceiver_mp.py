@@ -15,8 +15,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
+# Force a deterministic UCX/NIXL config regardless of what the cluster/CI
+# injects; see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
 import tensorrt_llm
 import tensorrt_llm.bindings

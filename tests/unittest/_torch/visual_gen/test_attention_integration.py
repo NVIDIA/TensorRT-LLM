@@ -7,7 +7,6 @@ naive implementation to ensure numerical equivalence.
 """
 
 from types import SimpleNamespace
-from typing import Optional
 
 import pytest
 import torch
@@ -167,7 +166,7 @@ def create_model_config(
     return config
 
 
-def _require_attention_backend(attn_backend: str, head_dim: Optional[int] = None) -> None:
+def _require_attention_backend(attn_backend: str) -> None:
     if attn_backend == "FA4" and not _flash_attn4_available:
         pytest.fail("FlashAttention 4 backend is required for FA4 attention test")
     if attn_backend == "CUTEDSL" and not _cute_dsl_available:
@@ -177,8 +176,6 @@ def _require_attention_backend(attn_backend: str, head_dim: Optional[int] = None
         gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
         if gpu_arch not in ("sm_100a", "sm_103a"):
             pytest.skip("CUTEDSL attention test requires a supported Blackwell-class GPU")
-        if head_dim is not None and head_dim != 128:
-            pytest.skip("CUTEDSL attention test requires head_dim=128")
 
 
 def _make_cross_attention_with_mapping(
@@ -357,7 +354,7 @@ def test_self_attention_equivalence(
     head_dim: int, attn_backend: str, quant_attention_config: "QuantAttentionConfig | None"
 ):
     """Test that integrated self-attention produces same output as naive."""
-    _require_attention_backend(attn_backend, head_dim)
+    _require_attention_backend(attn_backend)
 
     print("\n" + "=" * 60)
     print("Testing Self-Attention Equivalence")
@@ -550,7 +547,7 @@ def test_cross_attention_equivalence(
     head_dim: int, attn_backend: str, quant_attention_config: "QuantAttentionConfig | None"
 ):
     """Test that integrated cross-attention produces same output as naive."""
-    _require_attention_backend(attn_backend, head_dim)
+    _require_attention_backend(attn_backend)
 
     print("\n" + "=" * 60)
     print("Testing Cross-Attention Equivalence")
@@ -651,7 +648,7 @@ def test_fast_cross_attention_wan_shapes(
     quant_attention_config: "QuantAttentionConfig | None",
 ):
     """Test fast cross-attention correctness at Wan-realistic shapes."""
-    _require_attention_backend(attn_backend, head_dim)
+    _require_attention_backend(attn_backend)
 
     hidden_size = num_heads * head_dim
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

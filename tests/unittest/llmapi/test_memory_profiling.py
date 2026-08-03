@@ -4,8 +4,8 @@ import torch
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     create_py_executor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 DynamicBatchConfig, SchedulerConfig)
+from tensorrt_llm.llmapi import (CapacitySchedulerPolicy, DynamicBatchConfig,
+                                 SchedulerConfig)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, KvCacheConfig,
                                           TorchLlmArgs)
 
@@ -23,7 +23,6 @@ def test_profile_kvcache():
     VLM_MODEL = "Qwen2.5-VL-7B-Instruct"
     VLM_MODEL_PATH = get_model_path(VLM_MODEL)
 
-    build_config = BuildConfig(max_beam_width=1, max_num_tokens=16384)
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
         enable_max_num_tokens_tuning=False,
@@ -42,10 +41,8 @@ def test_profile_kvcache():
         "moe_expert_parallel_size": None,
         "gpus_per_node": 1,
         "trust_remote_code": False,
-        "max_batch_size": build_config.max_batch_size,
-        "max_num_tokens": build_config.max_num_tokens,
-        "max_beam_width": build_config.max_beam_width,
-        "max_seq_len": build_config.max_seq_len,
+        "max_num_tokens": 16384,
+        "max_beam_width": 1,
         "kv_cache_config": kv_cache_config,
         "backend": backend,
         "num_postprocess_workers": 0,
@@ -92,7 +89,6 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.5)
 
-    build_config = BuildConfig(max_beam_width=1, max_num_tokens=4096)
     scheduler_config = SchedulerConfig(
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT, )
     backend = "pytorch"
@@ -105,10 +101,8 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
         "moe_expert_parallel_size": None,
         "gpus_per_node": 1,
         "trust_remote_code": False,
-        "max_batch_size": build_config.max_batch_size,
-        "max_num_tokens": build_config.max_num_tokens,
-        "max_beam_width": build_config.max_beam_width,
-        "max_seq_len": build_config.max_seq_len,
+        "max_num_tokens": 4096,
+        "max_beam_width": 1,
         "kv_cache_config": kv_cache_config,
         "backend": backend,
         "num_postprocess_workers": 0,

@@ -25,7 +25,6 @@ from unittest.mock import patch
 import pytest
 
 from tensorrt_llm import LLM as LLM_torch
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, llm_args
 from tensorrt_llm.usage import usage_lib
 
@@ -81,54 +80,6 @@ class TestTelemetryPyTorchBackend:
         assert pretrained_config.architectures[0] == "LlamaForCausalLM"
 
         assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
-
-
-class TestTelemetryTRTBackend:
-    """Verify pretrained_config lifecycle with TensorRT backend (engine build).
-
-    When starting from an HF model, _TrtLLM builds a TRT engine and
-    overwrites self.args.model to point to the engine dir.  The telemetry
-    hook must still receive the *original* HF PretrainedConfig (loaded from
-    _hf_model_dir before the overwrite), not the TRT-LLM engine config.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _setup(self):
-        self.model_path = _get_model_path()
-
-    def test_telemetry_receives_hf_config_trt(self):
-        captured, spy = _make_spy()
-
-        with patch("tensorrt_llm.usage.report_usage", side_effect=spy):
-            with LLM(model=self.model_path, kv_cache_config=_kv_cache_config) as _:
-                pass
-
-        pretrained_config = captured.get("pretrained_config")
-        assert pretrained_config is not None, "report_usage was not called with pretrained_config"
-        # The config should be an HF PretrainedConfig with .architectures
-        # (plural list), NOT a TRT-LLM config with .architecture (singular).
-        assert hasattr(pretrained_config, "architectures"), (
-            "pretrained_config missing .architectures attribute"
-        )
-        assert isinstance(pretrained_config.architectures, list)
-        assert len(pretrained_config.architectures) > 0
-        assert pretrained_config.architectures[0] == "LlamaForCausalLM"
-
-        assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
-
-    def test_telemetry_arch_extraction_trt(self):
-        """End-to-end: _extract_architecture_class_name with TRT backend config."""
-        captured, spy = _make_spy()
-
-        with patch("tensorrt_llm.usage.report_usage", side_effect=spy):
-            with LLM(model=self.model_path, kv_cache_config=_kv_cache_config) as _:
-                pass
-
-        pretrained_config = captured.get("pretrained_config")
-        assert pretrained_config is not None
-
-        arch = usage_lib._extract_architecture_class_name(pretrained_config)
-        assert arch == "LlamaForCausalLM", f"Expected 'LlamaForCausalLM', got '{arch}'"
 
 
 class TestTelemetryArchitectureExtraction:

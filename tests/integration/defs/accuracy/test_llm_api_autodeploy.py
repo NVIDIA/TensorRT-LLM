@@ -1144,6 +1144,7 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             "compile_backend": "torch-cudagraph",
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7,
+                "enable_block_reuse": False,
             },
             "max_batch_size": 64,
             "max_seq_len": self.MAX_SEQ_LEN,

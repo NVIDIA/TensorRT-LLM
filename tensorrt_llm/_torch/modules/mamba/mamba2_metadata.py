@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
 from typing import Tuple
 
@@ -214,6 +215,23 @@ def cu_seqlens_to_chunk_indices_offsets(
 
 class Mamba2Metadata:
 
+    # Warmup-only knob: when set via ``force_initial_states_for_warmup``,
+    # ``prepare()`` forces ``has_initial_states_cpu[:num_contexts]`` to True so
+    # the ``HAS_INITSTATES=True`` variants of the SSD Triton kernels compile
+    # during warmup. Class-scoped (not env-var) so it cannot leak into real
+    # inference from a stray shell export or a forked worker.
+    _warmup_force_initial_states: bool = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def force_initial_states_for_warmup(cls):
+        prev = cls._warmup_force_initial_states
+        cls._warmup_force_initial_states = True
+        try:
+            yield
+        finally:
+            cls._warmup_force_initial_states = prev
+
     def __init__(self, max_batch_size: int, chunk_size: int):
         self.max_batch_size = max_batch_size
         self.chunk_size = chunk_size
@@ -369,9 +387,14 @@ class Mamba2Metadata:
                     self.state_indices_cpu[:batch_size], non_blocking=True)
             else:
                 # indices is a Python sequence (e.g. List[int]); data
-                # already lives on host, CPU staging is fine.
-                for i, idx in enumerate(indices):
-                    self.state_indices_cpu[i] = idx
+                # already lives on host, CPU staging is fine. One bulk
+                # conversion instead of a per-element tensor write.
+                assert len(indices) == batch_size, (
+                    f"get_state_indices() returned {len(indices)} entries for "
+                    f"a batch of {batch_size} requests.")
+                self.state_indices_cpu[:batch_size].copy_(
+                    torch.as_tensor(indices,
+                                    dtype=self.state_indices_cpu.dtype))
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
 
@@ -414,6 +437,15 @@ class Mamba2Metadata:
                                                   device='cpu')
 
             self.has_initial_states_cpu[:num_contexts].copy_(initial_states_cpu)
+            # Warmup-only override: force HAS_INITSTATES=True path so the
+            # HAS_INITSTATES=True variants of _state_passing_fwd_kernel,
+            # _chunk_scan_fwd_kernel, and _chunk_state_varlen_kernel compile
+            # during warmup instead of the first real-request iter that hits
+            # chunked prefill with cached tokens. Gate is a class-scoped
+            # context manager (see ``force_initial_states_for_warmup``) so it
+            # cannot silently affect real inference.
+            if Mamba2Metadata._warmup_force_initial_states:
+                self.has_initial_states_cpu[:num_contexts].fill_(True)
             # Mirror CPU staging flags to the CUDA-side buffer asynchronously.
             self.has_initial_states[:num_contexts].copy_(
                 self.has_initial_states_cpu[:num_contexts], non_blocking=True)

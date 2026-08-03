@@ -25,13 +25,6 @@ namespace tk = tensorrt_llm::kernels::speculative_decoding;
 
 TRTLLM_NAMESPACE_BEGIN
 
-namespace kernels::speculative_decoding
-{
-th::Tensor computeProbsFromLogits(th::Tensor const& logits, th::Tensor const& temperatures,
-    th::optional<th::Tensor> const& topK, th::optional<th::Tensor> const& topP, bool skipTemperature,
-    runtime::SizeType32 kMax);
-} // namespace kernels::speculative_decoding
-
 namespace torch_ext
 {
 
@@ -124,26 +117,6 @@ void verify_dynamic_tree_greedy_out_packed_op(th::Tensor& candidates, th::Tensor
     tk::invokeVerifyDynamicTreeGreedyPacked(acceptIndex.data_ptr<int32_t>(), acceptTokenNum.data_ptr<int32_t>(),
         acceptToken.data_ptr<int32_t>(), candidates.data_ptr<int32_t>(), retrievePacked.data_ptr<int32_t>(),
         targetPredict.data_ptr<int32_t>(), treeValid.data_ptr<bool>(), batchSize, numDraftTokens, numSpecStep, stream);
-}
-
-th::Tensor compute_probs_from_logits_op(th::Tensor logits, th::Tensor temperatures, th::optional<th::Tensor> topK,
-    th::optional<th::Tensor> topP, bool skipTemperature)
-{
-    TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor");
-    TORCH_CHECK(temperatures.is_cuda(), "temperatures must be a CUDA tensor");
-    TORCH_CHECK(logits.dim() == 2, "logits must be a 2D tensor");
-    TORCH_CHECK(temperatures.dim() == 1, "temperatures must be a 1D tensor");
-    TORCH_CHECK(logits.size(0) == temperatures.size(0), "logits and temperatures size mismatch");
-    if (topK.has_value() && topK->defined())
-    {
-        TORCH_CHECK(topK->is_cuda(), "top_k must be a CUDA tensor");
-    }
-    if (topP.has_value() && topP->defined())
-    {
-        TORCH_CHECK(topP->is_cuda(), "top_p must be a CUDA tensor");
-    }
-
-    return tk::computeProbsFromLogits(logits, temperatures, topK, topP, skipTemperature, /*kMax=*/0);
 }
 
 //! \brief Target-only rejection sampling verify op (no draft probabilities needed).
@@ -285,17 +258,4 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("verify_dynamic_tree_rejection_out_op", &tensorrt_llm::torch_ext::verify_dynamic_tree_rejection_out_op);
-}
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
-{
-    m.def(
-        "compute_probs_from_logits_op("
-        "Tensor logits, Tensor temperatures, Tensor? top_k=None, Tensor? top_p=None, "
-        "bool skip_temperature=False) -> Tensor");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-{
-    m.impl("compute_probs_from_logits_op", &tensorrt_llm::torch_ext::compute_probs_from_logits_op);
 }

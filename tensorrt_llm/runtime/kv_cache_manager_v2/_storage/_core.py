@@ -96,7 +96,7 @@ class SlotPoolBase(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def slot_address(self, slot: int) -> Address:
+    def slot_address(self, slot: SlotId) -> Address:
         pass
 
     def __del__(self) -> None:
@@ -136,8 +136,8 @@ class GpuSlotPool(SlotPoolBase):
         return self.num_slots
 
     @override
-    def slot_address(self, slot: int) -> MemAddress:
-        return MemAddress(int(self._vm.address) + self.slot_size * slot)
+    def slot_address(self, slot: SlotId) -> MemAddress:
+        return MemAddress(int(self._vm.address) + self.slot_size * int(slot))
 
     @property
     @override
@@ -172,8 +172,8 @@ class HostSlotPool(SlotPoolBase):
         self._host_mem.resize(self.aligned_size(new_num_slots))
 
     @override
-    def slot_address(self, slot: int) -> MemAddress:
-        return MemAddress(self._host_mem._address + self.slot_size * slot)
+    def slot_address(self, slot: SlotId) -> MemAddress:
+        return MemAddress(self._host_mem._address + self.slot_size * int(slot))
 
     @property
     @override
@@ -232,7 +232,7 @@ class DiskSlotPool(SlotPoolBase):
         resize_file(self.fd, file_size)
 
     @override
-    def slot_address(self, slot: int) -> DiskAddress:
+    def slot_address(self, slot: SlotId) -> DiskAddress:
         assert slot < self.num_slots
         return DiskAddress(self.fd, slot * self.slot_size)
 
@@ -370,6 +370,8 @@ class SlotAllocator:
     # and when we don't have enough free slots, we will free these newly allocated slots by appending
     # them to the back of the recycled slot queue, which may impact perf.
     def allocate_multiple(self, num_slots: int) -> list[Slot]:
+        if num_slots < 0:
+            raise LogicError("SlotAllocator.allocate_multiple: slot count must be non-negative")
         if self.num_free_slots < num_slots:
             raise OutOfPagesError("Not enough free slots")
         return [self.allocate() for _ in range(num_slots)]
@@ -395,8 +397,7 @@ class SlotAllocator:
     def expand(self, new_num_slots: int) -> None:
         assert NDEBUG or self._check()
         assert self._target_capacity == self._capacity
-        old_num_slots = self._capacity
-        assert new_num_slots > old_num_slots
+        assert new_num_slots > self._capacity
         self._occupied_mask.resize(new_num_slots)
         self._capacity = new_num_slots
         self._target_capacity = self._capacity
@@ -511,7 +512,7 @@ class PoolGroupBase:
         if self._destroyed:
             return
         allocator = self._slot_allocator
-        if allocator._capacity != 0:
+        if allocator.num_slots != 0:
             allocator._synchronize()
             allocator.prepare_for_shrink(0)
             allocator.finish_shrink()
@@ -525,7 +526,7 @@ class PoolGroupBase:
 
     @property
     def num_slots(self) -> int:
-        num_slots = self._slot_allocator._capacity
+        num_slots = self._slot_allocator.num_slots
         assert num_slots <= self._get_num_slots_from_pools()
         return num_slots
 
@@ -604,7 +605,10 @@ class GpuPoolGroup(PoolGroupBase):
             slot_size_list,
             lambda slot_size: GpuSlotPool(
                 slot_size,
-                round_down(int(total_gpu_memory * slot_size / max_slot_size), phys_mem_size),
+                max(
+                    round_down(int(total_gpu_memory * slot_size / max_slot_size), phys_mem_size),
+                    round_up(num_slots * slot_size, phys_mem_size),
+                ),
                 shared_phys_mem_pool,
                 num_slots,
             ),
@@ -763,7 +767,7 @@ class CacheLevelStorage:
         min_pool_grains = typed_map(slot_size_list, lambda s: div_up(s, granularity))
         if pg_grains < sum(min_pool_grains):
             return (0, 0)
-        num_slots: int = 1 << 63
+        num_slots = 1 << 63
         remaining_pg_grains = pg_grains
         pool_idx_lst = sorted(typed_range(num_pools), key=lambda i: slot_size_list[i])
         for j, pool in enumerate(pool_idx_lst):

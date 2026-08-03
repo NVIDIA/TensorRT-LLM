@@ -13,13 +13,18 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.weight_sharing import (
-    IdentityCheckPolicy, SourceIdentity, check_weight_sharing_compatibility)
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity, IdentityCheckPolicy,
+    PostTransformConfigIdentity, PostTransformFeature, PostTransformProfile,
+    PostTransformProfileRegistry, PostTransformQualificationDecision,
+    PostTransformTransferScope, SourceIdentity,
+    check_weight_sharing_compatibility)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -31,13 +36,15 @@ from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM, LlamaForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
+from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
+                                     DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import resolve_hf_torch_dtype, resolve_ssm_cache_dtype
+from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
+                           resolve_ssm_cache_dtype)
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -45,6 +52,36 @@ _KV_CACHE_MAP = {
     "auto": "auto"
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
+
+
+def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
+                                               llm_args: TorchLlmArgs) -> None:
+    """Validate snapshot reuse after the model and V2 setting are resolved."""
+    if not is_hybrid_linear(config.pretrained_config):
+        return
+
+    kv_cache_config = llm_args.kv_cache_config
+    state_config = kv_cache_config.mamba_state_config
+    has_additional_snapshots = bool(
+        state_config.additional_snapshot_offsets_from_start
+        or state_config.additional_snapshot_offsets_from_end)
+    if (has_additional_snapshots
+            and kv_cache_config.use_kv_cache_manager_v2 is not True):
+        raise ValueError(
+            "Mamba additional snapshot offsets require "
+            "kv_cache_config.use_kv_cache_manager_v2=True after resolving "
+            "the model configuration.")
+
+    has_periodic_snapshots = state_config.periodic_snapshot_interval > 0
+    if (kv_cache_config.enable_block_reuse and not has_periodic_snapshots
+            and not has_additional_snapshots):
+        logger.warning(
+            "Disabling KV cache block reuse for the hybrid Mamba model "
+            "because no Mamba state snapshot policy is configured. Set "
+            "kv_cache_config.mamba_state_config.periodic_snapshot_interval "
+            "to a positive value or provide additional snapshot offsets to "
+            "enable block reuse.")
+        kv_cache_config.enable_block_reuse = False
 
 
 def validate_and_set_mamba_ssm_cache_dtype(
@@ -66,7 +103,7 @@ def validate_and_set_mamba_ssm_cache_dtype(
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
-                                    pyt_kv_cache_dtype: str) -> QuantAlgo:
+                                    pyt_kv_cache_dtype: str) -> None:
     logger.info(
         f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
     )
@@ -100,6 +137,14 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
+    # MIXED_PRECISION checkpoints carry per-layer QuantConfigs in
+    # quant_config_dict; modules built from them (e.g. attention) must agree
+    # with the global config on the KV element size, otherwise the KV pool is
+    # allocated with the overridden dtype while attention layers read/write
+    # with the checkpoint dtype -> out-of-bounds access.
+    if model_config.quant_config_dict is not None:
+        for layer_quant_config in model_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
@@ -297,9 +342,17 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
     _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
-    _MX_STAGED_RECEIVER_ALLOWLIST = frozenset({
-        (LlamaForCausalLM, _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION)
-    })
+    _POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
+        profiles=(PostTransformProfile(
+            profile_id="llama-for-causal-lm-target-v1",
+            root_model_class=LlamaForCausalLM,
+            architecture="LlamaForCausalLM",
+            model_type="llama",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        ), ))
 
     def __init__(self,
                  llm_args: TorchLlmArgs,
@@ -346,6 +399,9 @@ class ModelLoader:
             checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
         """Load model config and apply model-specific defaults to llm_args."""
         if checkpoint_loader is None:
+            # No config to resolve a model class from; still resolve the
+            # "auto" sentinel so it never leaks past config loading.
+            _resolve_transceiver_runtime_auto(llm_args)
             return llm_args
 
         config_kwargs = {
@@ -368,6 +424,8 @@ class ModelLoader:
                                                  config.pretrained_config)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
+        use_kv_cache_manager_v2 = (
+            llm_args.kv_cache_config.use_kv_cache_manager_v2)
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -381,8 +439,22 @@ class ModelLoader:
                         f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
                     )
 
-        use_kv_cache_manager_v2 = llm_args.kv_cache_config.use_kv_cache_manager_v2
-        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+        # The transceiver preference follows the checkpoint's original
+        # architecture: _resolve_class may rewrite it to an execution class
+        # (e.g. MTPDraftModelForCausalLM), which must not drop the target
+        # model's preference.
+        preference_cls = model_cls
+        architectures = getattr(config.pretrained_config, 'architectures', None)
+        if architectures:
+            preference_cls = MODEL_CLASS_MAPPING.get(architectures[0],
+                                                     model_cls)
+
+        # Resolve "auto" sentinel values after model defaults are applied.
+        _resolve_transceiver_runtime_auto(llm_args, preference_cls,
+                                          config.pretrained_config)
+        _resolve_kv_cache_manager_v2_auto(
+            llm_args, model_defaults, original_setting=use_kv_cache_manager_v2)
+        _validate_and_adjust_mamba_snapshot_config(config, llm_args)
         if use_kv_cache_manager_v2 == "auto":
             logger.info(
                 "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
@@ -403,6 +475,41 @@ class ModelLoader:
         """
         return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == "MX"
 
+    @staticmethod
+    def _build_source_identity(
+        config: ModelConfig,
+        model: DecoderModelForCausalLM,
+        *,
+        checkpoint_dir: str,
+        model_name: str,
+        transform_abi_id: Optional[str],
+        fallback_on_artifact_error: bool,
+    ) -> Optional[SourceIdentity]:
+        """Build the local identity without weakening artifact validation.
+
+        Artifact construction remains fail-closed. MX may convert an artifact
+        error into an unavailable local identity so its compatibility gate
+        falls back to disk; GMS propagates the error because it has no fallback.
+        """
+        try:
+            artifact_identity = ArtifactIdentity.from_checkpoint(checkpoint_dir)
+        except (OSError, RuntimeError, ValueError) as error:
+            if not fallback_on_artifact_error:
+                raise
+            logger.warning(
+                "Unable to build checkpoint artifact identity for MX checkpoint "
+                f"{checkpoint_dir}; falling back to regular checkpoint loading: {error}"
+            )
+            return None
+
+        return SourceIdentity.from_model_config(
+            config,
+            model,
+            artifact_identity=artifact_identity,
+            model_name=model_name,
+            transform_abi_id=transform_abi_id,
+        )
+
     def load(
         self,
         checkpoint_dir: str,
@@ -420,6 +527,12 @@ class ModelLoader:
         """
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
+        # Some model constructors normalize or rewrite config fields. Capture
+        # the registry identity from the resolved input before construction so
+        # publication and reception qualify the architecture the user asked
+        # to load, not a post-construction alias.
+        post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
+            config)
         load_format = self.llm_args.load_format
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
@@ -438,6 +551,16 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
+            loads_draft_weights = (
+                self.spec_config is not None
+                and self.spec_config.spec_dec_mode.need_load_draft_weights())
+            speculative_mode = self._speculative_mode_name(self.spec_config)
+            post_transform_qualification = self._qualify_post_transform_profile(
+                model,
+                config_identity=post_transform_config_identity,
+                speculative_mode=speculative_mode,
+                loads_draft_weights=loads_draft_weights)
+
             self._source_identity: Optional[SourceIdentity] = None
             if self._needs_source_identity(checkpoint_loader, load_format):
                 # Receiver's local SourceIdentity, built once from the final
@@ -446,12 +569,18 @@ class ModelLoader:
                 # ground truth; building it here (post-construction,
                 # pre-weight-load) gives producer and consumer a common,
                 # comparable lifecycle point.
-                self._source_identity = SourceIdentity.from_model_config(
+                self._source_identity = self._build_source_identity(
                     config,
                     model,
+                    checkpoint_dir=checkpoint_dir,
                     model_name=str(
                         getattr(self.llm_args, "model", None)
                         or checkpoint_dir),
+                    transform_abi_id=(
+                        post_transform_qualification.transform_abi_id),
+                    fallback_on_artifact_error=(
+                        load_format != LoadFormat.GMS
+                        and checkpoint_loader.checkpoint_format == "MX"),
                 )
 
             memo: dict[torch.Tensor, torch.Tensor] = {}
@@ -527,9 +656,6 @@ class ModelLoader:
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
             weights_preloaded = False
-            loads_draft_weights = (
-                self.spec_config is not None
-                and self.spec_config.spec_dec_mode.need_load_draft_weights())
             # Set when either GMS RW or GMS RO branch has already run the
             # post_load_* hooks itself, so the shared post-load block below
             # must skip them. RW handles them inside `mem_pool_scope` so the
@@ -554,9 +680,11 @@ class ModelLoader:
                     # do not accept post-transform bytes for only the target
                     # model. Enable this only after target and draft subgraphs
                     # have an explicit mixed-layout policy.
-                    load_weights_kwargs["allow_post_transform_weights"] = (
-                        self._is_mx_staged_receiver_allowlisted(model)
-                        and not loads_draft_weights)
+                    load_weights_kwargs[
+                        "allow_post_transform_weights"] = post_transform_qualification.qualified
+                    if post_transform_qualification.qualified:
+                        load_weights_kwargs[
+                            "prepare_post_transform_receiver"] = self._setup_aliases
 
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
@@ -676,9 +804,10 @@ class ModelLoader:
                             }
                             if checkpoint_loader.checkpoint_format == "MX":
                                 load_weights_kwargs[
-                                    "allow_post_transform_weights"] = (
-                                        self._is_mx_staged_receiver_allowlisted(
-                                            model) and not loads_draft_weights)
+                                    "allow_post_transform_weights"] = post_transform_qualification.qualified
+                                if post_transform_qualification.qualified:
+                                    load_weights_kwargs[
+                                        "prepare_post_transform_receiver"] = self._setup_aliases
                             weights = checkpoint_loader.load_weights(
                                 weight_source, **load_weights_kwargs)
 
@@ -742,7 +871,7 @@ class ModelLoader:
                                 checkpoint_loader,
                                 model,
                                 weights_preloaded=weights_preloaded,
-                                loads_draft_weights=loads_draft_weights)
+                                qualification=post_transform_qualification)
                             if mx_staged_receiver_path:
                                 self._setup_aliases(model)
                                 self._mark_weights_transformed(model)
@@ -767,7 +896,8 @@ class ModelLoader:
                                 checkpoint_loader,
                                 model,
                                 checkpoint_dir=checkpoint_dir,
-                                weights_preloaded=weights_preloaded)
+                                weights_preloaded=weights_preloaded,
+                                qualification=post_transform_qualification)
 
                         # Pool closed. Commit the post-post_load layout.
                         gms_backend.finalize_write(model)
@@ -815,10 +945,12 @@ class ModelLoader:
                         gms_backend.materialize_module(model)
                         self._walk_cache_state(model)
 
-                        self._post_load_publish(checkpoint_loader,
-                                                model,
-                                                checkpoint_dir=checkpoint_dir,
-                                                weights_preloaded=True)
+                        self._post_load_publish(
+                            checkpoint_loader,
+                            model,
+                            checkpoint_dir=checkpoint_dir,
+                            weights_preloaded=True,
+                            qualification=post_transform_qualification)
                         gms_post_load_handled = True
                         logger.info("LoadFormat.GMS (RO): materialized weights")
                     else:
@@ -857,17 +989,19 @@ class ModelLoader:
                     checkpoint_loader,
                     model,
                     weights_preloaded=weights_preloaded,
-                    loads_draft_weights=loads_draft_weights)
+                    qualification=post_transform_qualification)
                 if mx_staged_receiver_path:
                     self._setup_aliases(model)
                     self._mark_weights_transformed(model)
                     self._walk_cache_state(model)
                 else:
                     self._walk_full_post_load(model)
-                self._post_load_publish(checkpoint_loader,
-                                        model,
-                                        checkpoint_dir=checkpoint_dir,
-                                        weights_preloaded=weights_preloaded)
+                self._post_load_publish(
+                    checkpoint_loader,
+                    model,
+                    checkpoint_dir=checkpoint_dir,
+                    weights_preloaded=weights_preloaded,
+                    qualification=post_transform_qualification)
 
             # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
             # `register_weight_slots_after_to_cuda` and `finalize_model`
@@ -922,16 +1056,13 @@ class ModelLoader:
 
     @classmethod
     def _should_run_mx_staged_receiver_path(
-            cls,
-            checkpoint_loader: BaseCheckpointLoader,
-            model: DecoderModelForCausalLM,
-            *,
-            weights_preloaded: bool,
-            loads_draft_weights: bool = False) -> bool:
+            cls, checkpoint_loader: BaseCheckpointLoader,
+            model: DecoderModelForCausalLM, *, weights_preloaded: bool,
+            qualification: PostTransformQualificationDecision) -> bool:
         """Whether an MX receiver can skip one-shot weight transforms.
 
         MXCheckpointLoader only accepts post-transform P2P bytes when this same
-        allow-list check passes before transfer. It also refuses
+        exact-profile check passes before transfer. It also refuses
         target-plus-draft mixed layouts until there is an explicit policy for
         that combination, so this post-load branch should never see an unsafe
         post-transform receiver in normal use.
@@ -945,49 +1076,90 @@ class ModelLoader:
         ):
             return False
 
-        if loads_draft_weights:
-            raise RuntimeError(
-                "MX receiver accepted post-transform weights while a separate "
-                "draft-model load is required. This is unsafe because the "
-                "target and draft subgraphs may need different post-load "
-                "transform handling. Disable post-transform MX for this load "
-                "or add an explicit mixed target/draft policy.")
-
-        if cls._is_mx_staged_receiver_allowlisted(model):
+        profile = qualification.profile
+        if qualification.qualified and profile is not None:
             logger.info(
-                "MX receiver using staged post-load path for %s "
-                "(transform protocol v%d).",
+                "MX receiver using staged post-load profile %s for %s "
+                "(transform protocol v%d, layout ABI %s).",
+                profile.profile_id,
                 type(model).__name__,
                 cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+                profile.transform_abi_id,
             )
             return True
 
+        unsupported_features = ",".join(
+            sorted(feature.value
+                   for feature in qualification.unsupported_features))
+        feature_detail = (f"; unsupported_features={unsupported_features}"
+                          if unsupported_features else "")
         raise RuntimeError(
             f"MX receiver got post-transform weights for {type(model).__name__}, "
-            "but the model is not allow-listed for staged post-load transform "
-            f"protocol v{cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION}. "
+            "but the load does not match a qualified staged post-load profile "
+            f"for protocol v{cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION}: "
+            f"reason={qualification.reason.value}{feature_detail}. "
             "Refusing to run the full post-load path on already-transformed "
             "weights.")
 
-    @classmethod
-    def _is_mx_staged_receiver_allowlisted(
-            cls, model: DecoderModelForCausalLM) -> bool:
-        for model_type, protocol_version in cls._MX_STAGED_RECEIVER_ALLOWLIST:
-            if (protocol_version
-                    == cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
-                    and isinstance(model, model_type)):
-                return True
-        return False
+    @staticmethod
+    def _speculative_mode_name(
+            spec_config: Optional[DecodingBaseConfig]) -> Optional[str]:
+        if spec_config is None:
+            return None
+        spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
+        mode_name = getattr(spec_dec_mode, "name", None)
+        if not isinstance(mode_name, str):
+            logger.warning(
+                "Unable to identify the speculative decoding mode from %s; "
+                "post-transform sharing is disabled for this load.",
+                type(spec_dec_mode).__name__,
+            )
+            return "unknown"
+        return mode_name.lower()
 
-    def _post_load_publish(self, checkpoint_loader: BaseCheckpointLoader,
-                           model: DecoderModelForCausalLM, *,
-                           checkpoint_dir: str,
-                           weights_preloaded: bool) -> None:
+    @classmethod
+    def _qualify_post_transform_profile(
+            cls,
+            model: DecoderModelForCausalLM,
+            *,
+            config_identity: Optional[PostTransformConfigIdentity] = None,
+            speculative_mode: Optional[str],
+            loads_draft_weights: bool) -> PostTransformQualificationDecision:
+        if config_identity is None:
+            config_identity = PostTransformConfigIdentity.from_model_config(
+                model.model_config)
+        enabled_features = set()
+        if loads_draft_weights:
+            enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
+        return cls._POST_TRANSFORM_PROFILE_REGISTRY.qualify(
+            root_model_class=type(model),
+            architecture=config_identity.architecture,
+            model_type=config_identity.model_type,
+            speculative_mode=speculative_mode,
+            protocol_version=cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            enabled_features=frozenset(enabled_features),
+        )
+
+    def _post_load_publish(
+            self, checkpoint_loader: BaseCheckpointLoader,
+            model: DecoderModelForCausalLM, *, checkpoint_dir: str,
+            weights_preloaded: bool,
+            qualification: PostTransformQualificationDecision) -> None:
         kwargs = {
             "checkpoint_dir": checkpoint_dir,
             "weights_preloaded": weights_preloaded,
         }
         if checkpoint_loader.checkpoint_format == "MX":
+            if not qualification.qualified:
+                if not weights_preloaded:
+                    logger.info(
+                        "Skipping MX post-transform publish for %s: "
+                        "qualification reason=%s.",
+                        type(model).__name__,
+                        qualification.reason.value,
+                    )
+                return
             kwargs["source_identity"] = self._source_identity
         checkpoint_loader.post_load_publish(model, **kwargs)
 
@@ -1144,6 +1316,25 @@ class ModelLoader:
                                 allow_partial_loading=allow_partial_loading)
         torch.cuda.current_stream().synchronize()
 
+    def begin_update_weights(self) -> None:
+        """Start an incremental update session on the persistent mapper."""
+        if self.weight_mapper is None:
+            raise RuntimeError(
+                "Cannot update weights: weight_mapper was not initialized")
+        self.weight_mapper.begin_update_weights()
+
+    def finalize_update_weights(self) -> None:
+        """Validate and close the persistent mapper update session."""
+        if self.weight_mapper is None:
+            raise RuntimeError(
+                "Cannot update weights: weight_mapper was not initialized")
+        self.weight_mapper.finalize_update_weights()
+
+    def abort_update_weights(self) -> None:
+        """Discard persistent mapper state after a failed update session."""
+        if self.weight_mapper is not None:
+            self.weight_mapper.abort_update_weights()
+
     def cleanup(self) -> None:
         """Release backend resources acquired during :meth:`load`.
 
@@ -1177,6 +1368,8 @@ class ModelLoader:
             force_dynamic_quantization=self.llm_args.force_dynamic_quantization,
             spec_config=self.spec_config,
             sparse_attention_config=self.sparse_attention_config,
+            kv_cache_compression_config=(
+                self.llm_args.kv_cache_compression_config),
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,
@@ -1184,6 +1377,7 @@ class ModelLoader:
             lora_config=self.lora_config,
             allreduce_strategy=self.llm_args.allreduce_strategy,
             mm_encoder_only=self.llm_args.mm_encoder_only,
+            disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
             moe_backend=self.llm_args.moe_config.backend,
             moe_disable_finalize_fusion=self.llm_args.moe_config.

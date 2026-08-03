@@ -25,10 +25,11 @@ import triton  # type: ignore[import]
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._torch.distributed.allreduce_helper import \
+    CustomAllReduceHelper
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
-from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 from tensorrt_llm.quantization.utils import fp8_quantize
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
@@ -1111,6 +1112,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     # SM version OK, check if CuteDSL supports the current shape
                     cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
                         self.output_dtype)
+                    # get_valid_tactics ranks/prunes with nvMatmulHeuristics
+                    # internally when TRTLLM_CUTEDSL_NVMMH_ENABLE=1 (no-op
+                    # otherwise), so the returned list already reflects any
+                    # opt-in pruning before it enters the unified tactic list.
                     cutedsl_tactics = cutedsl_runner.get_valid_tactics(
                         inputs, profile)
 
@@ -2036,7 +2041,9 @@ def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
 def silu_and_mul(x: torch.Tensor,
                  scale: Optional[torch.Tensor] = None,
                  dtype: Optional[torch.dtype] = None,
-                 swiglu_limit: Optional[float] = None) -> torch.Tensor:
+                 swiglu_limit: Optional[float] = None,
+                 swiglu_alpha: Optional[float] = None,
+                 swiglu_beta: Optional[float] = None) -> torch.Tensor:
     b, n = x.shape
 
     assert n % 2 == 0
@@ -2056,6 +2063,8 @@ def silu_and_mul(x: torch.Tensor,
         x_stride=x.stride(0),
         d=d,
         swiglu_limit=swiglu_limit or 0.0,
+        swiglu_alpha=swiglu_alpha if swiglu_alpha is not None else 1.0,
+        swiglu_beta=swiglu_beta if swiglu_beta is not None else 0.0,
         BLOCK_SIZE=1024,
         HAS_O_SCALE=scale is not None,
         HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
@@ -2070,6 +2079,8 @@ def _(
     scale: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = None,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
 ) -> torch.Tensor:
     b, n = x.shape
 

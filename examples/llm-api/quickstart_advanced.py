@@ -194,6 +194,11 @@ def add_llm_args(parser):
     parser.add_argument('--apply_chat_template',
                         default=False,
                         action='store_true')
+    parser.add_argument('--custom_tokenizer',
+                        type=str,
+                        default=None,
+                        help='Override the tokenizer. Accepts a built-in alias '
+                        " or a fully-qualified class import path.")
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -310,6 +315,9 @@ def setup_llm(args, **kwargs):
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
             mtp_eagle_one_model=args.use_one_model,
+            use_dynamic_tree=args.use_dynamic_tree,
+            dynamic_tree_max_topK=args.dynamic_tree_max_topK,
+            max_total_draft_tokens=args.max_total_draft_tokens,
             speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = Eagle3DecodingConfig(
@@ -387,6 +395,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        custom_tokenizer=args.custom_tokenizer,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
