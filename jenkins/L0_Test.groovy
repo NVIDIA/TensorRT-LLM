@@ -2058,7 +2058,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // wrote the file avoids this cross-client visibility window entirely.
                 // After the mtime check confirms a change, sshRefreshCacheCmd primes
                 // the login node's NFS cache before the SCP step reads the file.
-                def sshStatCmd = Utils.sshUserCmd(remote, "\"srun --overlap --quiet --jobid='${slurmJobId}' --ntasks=1 stat -c %Y '${remoteWorkspaceTrk}/results.xml' 2>/dev/null || echo 0\"")
+                def sshStatCmd = Utils.sshUserCmd(remote, "\"srun --overlap --quiet --jobid='${slurmJobId}' --ntasks=1 stat -c %Y '${remoteWorkspaceTrk}/results.xml' || echo 0\"")
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
                 def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
