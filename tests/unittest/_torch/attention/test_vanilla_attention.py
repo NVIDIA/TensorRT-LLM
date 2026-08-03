@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import unittest
 from unittest.mock import patch
 
@@ -10,12 +13,87 @@ from tensorrt_llm._torch.attention_backend import (VanillaAttention,
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 
 class TestVanillaAttention(unittest.TestCase):
+
+    def test_kv_cache_manager_v2_sliding_window_eviction(self):
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        tokens_per_block = 2
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        manager = KVCacheManagerV2(
+            LlmKvCacheConfig(max_tokens=16,
+                             max_attention_window=[4],
+                             enable_block_reuse=False),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=2,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=8,
+            max_batch_size=1,
+            mapping=mapping,
+            dtype=tensorrt_llm.bindings.DataType.BF16,
+        )
+
+        try:
+            manager.add_dummy_requests([0], [7], is_gen=True)
+            block_ids = manager.get_batch_cache_indices([0], 0)[0]
+            self.assertEqual(block_ids[0], -1)
+
+            cached_k = torch.tensor(
+                [[0.2, -0.1], [0.4, 0.3], [-0.2, 0.5], [0.1, 0.7]],
+                device=device,
+                dtype=dtype)
+            cached_v = torch.tensor(
+                [[0.6, -0.4], [0.8, 0.2], [-0.3, 0.9], [0.5, 0.1]],
+                device=device,
+                dtype=dtype)
+            kv_cache = manager.get_buffers(0, kv_layout="NHD")
+            for offset, position in enumerate(range(2, 6)):
+                block = block_ids[position // tokens_per_block]
+                block_offset = position % tokens_per_block
+                kv_cache[block, 0, block_offset, 0].copy_(cached_k[offset])
+                kv_cache[block, 1, block_offset, 0].copy_(cached_v[offset])
+
+            q = torch.tensor([[0.3, -0.6]], device=device, dtype=dtype)
+            new_k = torch.tensor([[0.7, 0.2]], device=device, dtype=dtype)
+            new_v = torch.tensor([[-0.5, 0.4]], device=device, dtype=dtype)
+            metadata = VanillaAttentionMetadata(
+                seq_lens=torch.tensor([1], dtype=torch.int),
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(use_cache=True,
+                                              num_cached_tokens_per_seq=[6]),
+                max_num_requests=1,
+                max_num_tokens=1,
+                kv_cache_manager=manager,
+                request_ids=[0],
+            )
+            metadata.prepare()
+
+            vanilla_attn = VanillaAttention(layer_idx=0,
+                                            num_heads=1,
+                                            head_dim=2,
+                                            num_kv_heads=1)
+            actual = vanilla_attn.forward(q,
+                                          new_k,
+                                          new_v,
+                                          metadata,
+                                          attention_window_size=4)
+
+            reference_k = torch.cat((cached_k[1:], new_k)).view(1, 1, 4, 2)
+            reference_v = torch.cat((cached_v[1:], new_v)).view(1, 1, 4, 2)
+            expected = F.scaled_dot_product_attention(q.view(
+                1, 1, 1, 2), reference_k, reference_v).view_as(actual)
+            torch.testing.assert_close(actual, expected)
+        finally:
+            manager.shutdown()
 
     def test_sdpa_fallback_uses_metadata_cross_flag_for_causal_mask(self):
         vanilla_attn = VanillaAttention(layer_idx=0,
