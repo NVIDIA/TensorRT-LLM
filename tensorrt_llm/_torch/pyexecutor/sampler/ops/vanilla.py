@@ -18,6 +18,7 @@ Pure tensor functions that operate on logits and probabilities with no
 dependency on the sampler_strategy interface or other backend implementation modules.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional, cast
 
@@ -50,32 +51,60 @@ class BeamSearchMetadata(StrategyMetadata):
     beam_idx_arange: torch.Tensor
 
 
+def min_p_renorm_probs(
+    probs: torch.Tensor,
+    min_p: torch.Tensor | float,
+) -> torch.Tensor:
+    """Keep tokens with prob >= ``min_p`` times the per-row max, then renormalize.
+
+    ``min_p`` is a scalar or a per-request tensor.
+    """
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    if isinstance(min_p, torch.Tensor):
+        min_p = min_p.reshape(-1, 1)
+    thresholds = min_p * max_probs
+    probs = probs.masked_fill(probs < thresholds, 0.0)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    return probs
+
+
 def top_k_top_p_sampling_batch(
     logits: torch.Tensor,
     *,
     temperature: float,
     top_k: Optional[int] = None,
     top_p: float = 1.0,
+    min_p: float = 0.0,
     generator: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Temperature + optional top-k / top-p filtering + multinomial sampling.
+    """Temperature + optional min-p / top-k / top-p filtering + multinomial sampling.
 
     ``top_k=None`` (or ``vocab_size``) disables top-k filtering; ``top_p=1``
-    disables top-p filtering. With both disabled this is plain temperature
-    sampling.
+    disables top-p filtering; ``min_p=0`` disables min-p filtering. With all
+    disabled this is plain temperature sampling.
     """
     logits_dim = logits.dim()
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
     assert temperature > 0, "non-greedy sampling requires valid temperature"
     logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
-    if top_k is None:
+    # 0 / non-positive means "keep all" (the min_p disabled-top_k sentinel),
+    # matching sanitize_top_k on the flashinfer path.
+    if top_k is None or top_k <= 0:
         top_k = vocab_size
 
     assert top_k > 1, "non-greedy sampling requires valid top_k"
     need_top_k = top_k < vocab_size
     assert top_p > 0, "non-greedy sampling requires valid top_p"
     need_top_p = top_p < 1
+    assert 0 <= min_p < 1, "non-greedy sampling requires valid min_p"
+    need_min_p = min_p > 0
+
+    if need_min_p:
+        # Thresholding logits at max_logit + log(min_p) keeps the tokens with
+        # prob >= min_p * max_prob; the softmax below renormalizes.
+        min_values = logits.max(dim=-1, keepdim=True).values + math.log(min_p)
+        logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
 
     if need_top_k:
         values, _ = torch.topk(logits, top_k, dim=-1)
@@ -293,29 +322,6 @@ GREEDY_TEMPERATURE_THRESHOLD = 1e-4
 class Fusions:
     @staticmethod
     @torch.compile(dynamic=None, fullgraph=True)
-    def _gather_scatter_impl(
-        dst_cuda: torch.Tensor,
-        dst_index_cuda: torch.Tensor,
-        src_cuda: torch.Tensor,
-        src_index_cuda: torch.Tensor,
-    ) -> None:
-        dst_cuda[dst_index_cuda] = src_cuda[src_index_cuda]
-
-    @staticmethod
-    def gather_scatter(
-        dst_cuda: torch.Tensor,
-        dst_index_cuda: torch.Tensor,
-        src_cuda: torch.Tensor,
-        src_index_cuda: torch.Tensor,
-    ) -> None:
-        torch._dynamo.mark_dynamic(dst_cuda, 0)
-        torch._dynamo.mark_dynamic(dst_index_cuda, 0)
-        torch._dynamo.mark_dynamic(src_cuda, 0)
-        torch._dynamo.mark_dynamic(src_index_cuda, 0)
-        Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
-
-    @staticmethod
-    @torch.compile(dynamic=None, fullgraph=True)
     def _determine_sampled_rank_impl(
         group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
     ) -> torch.Tensor:
@@ -342,18 +348,25 @@ class Fusions:
         ),
     )
     def _gather_log_softmax_impl(
-        inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.nn.functional.log_softmax(
+        inputs_cuda: torch.Tensor,
+        indices_cuda: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
+        #     materializing the index select and output the results directly into the destination tensor.
+        out[...] = torch.nn.functional.log_softmax(
             inputs_cuda[indices_cuda],
             dim=-1,
         )
 
     @staticmethod
-    def gather_log_softmax(inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor) -> torch.Tensor:
+    def gather_log_softmax_with_output(
+        inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor, out: torch.Tensor
+    ) -> None:
         torch._dynamo.mark_dynamic(inputs_cuda, 0)
         torch._dynamo.mark_dynamic(indices_cuda, 0)
-        return Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)
+        torch._dynamo.mark_dynamic(out, 0)
+        Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda, out)
 
     # --- Top-P Decay ops ---------------------------------------------------
     # Host-launch-bound per-step ops (a few dozen elements per row), fused with
