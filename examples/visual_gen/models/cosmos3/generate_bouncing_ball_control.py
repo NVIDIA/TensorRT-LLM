@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 import PIL.Image
 import PIL.ImageDraw
+import torch
 
 
 def parse_args() -> argparse.Namespace:
@@ -106,21 +107,13 @@ def main() -> None:
             vy = -vy
             y = max(lo_y, min(y, hi_y))
 
-    # mpeg4 is a built-in FFmpeg encoder, available on any PyAV wheel.
-    import av
+    # Same encoder the pipeline saves its outputs through, so this needs
+    # nothing installed beyond what running a generation already needs.
+    from tensorrt_llm.media.encoding import save_video
 
     video_path = out_dir / "control.mp4"
-    with av.open(str(video_path), "w") as container:
-        stream = container.add_stream("mpeg4", rate=args.fps)
-        stream.width = args.width
-        stream.height = args.height
-        stream.pix_fmt = "yuv420p"
-        stream.bit_rate = 8_000_000  # keep the thin white lines crisp
-        for frame in frames:
-            container.mux(
-                stream.encode(av.VideoFrame.from_ndarray(np.asarray(frame), format="rgb24"))
-            )
-        container.mux(stream.encode())
+    clip = torch.from_numpy(np.stack([np.asarray(frame) for frame in frames]))
+    save_video(clip, video_path, frame_rate=args.fps)
 
     print(
         f"Wrote {video_path}" + (f" and {args.num_frames} PNG frames" if args.save_frames else "")
