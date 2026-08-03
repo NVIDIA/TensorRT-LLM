@@ -237,13 +237,19 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 assert blk != BAD_PAGE_INDEX, (
                     f"Writing new KV into an evicted/invalid page (pos {pos}); "
                     "block_ids/metadata are inconsistent.")
-                dst = torch.arange(off, off + n, device=kv_cache_tensor.device)
-                kv_cache_tensor[blk, 0].view(dtype=access_type).index_copy_(
-                    0, dst,
-                    k_selected[0, written:written + n].view(dtype=access_type))
-                kv_cache_tensor[blk, 1].view(dtype=access_type).index_copy_(
-                    0, dst,
-                    v_selected[0, written:written + n].view(dtype=access_type))
+                # Slicing the outermost (token) dim keeps the destination
+                # contiguous, so a plain copy_ avoids the per-iteration arange
+                # and scatter. view(access_type) reinterprets to an int of the
+                # same width so copy_ works for dtypes (e.g. fp8) it otherwise
+                # rejects.
+                kv_cache_tensor[blk, 0,
+                                off:off + n].view(dtype=access_type).copy_(
+                                    k_selected[0, written:written +
+                                               n].view(dtype=access_type))
+                kv_cache_tensor[blk, 1,
+                                off:off + n].view(dtype=access_type).copy_(
+                                    v_selected[0, written:written +
+                                               n].view(dtype=access_type))
                 written += n
 
         if sparse_kv_indices is not None:
