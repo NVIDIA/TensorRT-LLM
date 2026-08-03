@@ -353,6 +353,24 @@ def test_single_node_transfer(tmp_path):
                 f"ctx log tail:\n{_log_tail(ctx_log)}\n"
                 f"gen log tail:\n{_log_tail(gen_log)}"
             )
+            # Bandwidth must actually be parsed from the perf CSVs, not just
+            # the transfer verified. The PYTHON+NIXL combination writes its
+            # perf CSVs via PerfLogManager into TRTLLM_KVCACHE_TIME_OUTPUT_PATH
+            # (set by the driver) as "<instanceUuid>_<rank>.csv"; a naming or
+            # glob mismatch between perf_logger.py and report.py leaves
+            # per_gpu_BW_GBps None while status stays PASS, so assert on it
+            # explicitly.
+            ctx_csv_dir = os.path.join(work_dir, "csv", "0", "ctx")
+            csv_listing = os.listdir(ctx_csv_dir) if os.path.isdir(ctx_csv_dir) else []
+            assert sweep["per_gpu_BW_GBps"] is not None and sweep["per_gpu_BW_GBps"] > 0, (
+                f"per_gpu_BW_GBps missing for {combo['combination']} "
+                f"sweep={sweep['sweep']} — perf CSVs were not parsed "
+                f"(ctx csv dir contents: {csv_listing})"
+            )
+            assert sweep["num_samples"] > 0, (
+                f"num_samples is 0 for {combo['combination']} sweep={sweep['sweep']} "
+                f"(ctx csv dir contents: {csv_listing})"
+            )
 
     best_path = os.path.splitext(results_path)[0] + ".best.json"
     assert os.path.exists(best_path), "results.best.json was not created"

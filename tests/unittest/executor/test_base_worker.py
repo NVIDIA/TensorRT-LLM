@@ -35,6 +35,9 @@ def test_enqueue_request_wraps_lora_load_error():
         raise RuntimeError("bad adapter")
 
     worker = object.__new__(BaseWorker)
+    # GC-time __del__ -> shutdown() reads this; __init__ is bypassed here, so
+    # seed it to keep teardown a clean no-op.
+    worker.doing_shutdown = False
     worker._lora_manager = LoraManager()
     worker._load_lora_adapter = raise_load_error
     request = type(

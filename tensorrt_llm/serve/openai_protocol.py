@@ -555,6 +555,15 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description=("Parameters for disaggregated serving"),
     )
+    priority: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=
+        ("Scheduling priority in [0.0, 1.0]; higher is served first. Only honored "
+         "when the engine runs with scheduler_config.waiting_queue_policy=priority. "
+         "If unset, the engine default (0.5) is used."),
+    )
     conversation_params: Optional[ConversationParams] = Field(
         default=None,
         description=("Parameters for multi-turn conversation routing"),
@@ -954,6 +963,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ("If specified, KV cache will be salted with the provided string "
          "to limit the kv cache reuse on with the requests having the same string."
          ))
+    priority: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=
+        ("Scheduling priority in [0.0, 1.0]; higher is served first. Only honored "
+         "when the engine runs with scheduler_config.waiting_queue_policy=priority. "
+         "If unset, the engine default (0.5) is used."),
+    )
 
     agent_hierarchy: Optional[AgentHierarchy] = Field(
         default=None, description="Agent hierarchy ")

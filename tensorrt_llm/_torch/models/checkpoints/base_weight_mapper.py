@@ -36,6 +36,15 @@ class BaseWeightMapper(ABC):
         self._model = None
         self._config = None
 
+    def begin_update_weights(self) -> None:
+        """Prepare mapper-owned state for an incremental weight update."""
+
+    def finalize_update_weights(self) -> None:
+        """Validate and release mapper-owned incremental update state."""
+
+    def abort_update_weights(self) -> None:
+        """Release mapper-owned state after a failed incremental update."""
+
     @abstractmethod
     def map_weights(self) -> None:
         """
