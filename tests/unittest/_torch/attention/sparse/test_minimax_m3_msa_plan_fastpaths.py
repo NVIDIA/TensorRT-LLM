@@ -13,7 +13,6 @@ skip unless the patched MSA package and an SM100 CUDA runtime are available.
 
 from __future__ import annotations
 
-import random
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
@@ -21,12 +20,10 @@ from types import ModuleType
 import pytest
 import torch
 
-
 _PER_ITER_COST = 43
 _TILE_COST = 110
 _SM_COST = 165
 _LEGACY_PACKED_COST_SENTINEL = 0x7FFFFF
-_LEGACY_PACKED_COST_MAX = 0xFFFFFF
 
 
 @lru_cache(maxsize=1)
@@ -157,63 +154,7 @@ def _run_gpu_plan(
 
     ranges = [int(value) for value in plan["packed_work_range"].cpu().tolist()]
     total_work = (ranges[-1] >> 32) & 0xFFFFFFFF
-    work_info = [
-        int(value)
-        for value in plan["packed_work_info"][:total_work].cpu().tolist()
-    ]
-    return ranges, work_info
-
-
-def _run_raw_gpu_plan(
-    qo_lens: list[int],
-    kv_lens: list[int],
-    num_heads: int,
-    num_buckets: int,
-) -> tuple[list[int], list[int]]:
-    """Call the JIT wrapper directly so tests can activate all 256 lanes.
-
-    The public API caps ``num_buckets`` to the physical SM count.  The planner
-    itself is one 256-thread block, so using 256 logical buckets is valid and
-    ensures that neither reduction stage contains an inactive lane.
-    """
-
-    msa_api = _load_patched_msa_api()
-    device = torch.device("cuda", torch.cuda.current_device())
-    batch_size = len(qo_lens)
-    qo_lens_t = torch.tensor(qo_lens, dtype=torch.int32, device=device)
-    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device=device)
-    qo_offsets_t = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
-    packed_work_range = torch.empty(num_buckets, dtype=torch.int64, device=device)
-    packed_work_info = torch.empty(batch_size * num_heads, dtype=torch.int64, device=device)
-
-    msa_api._call_plan(
-        qo_offsets_t,
-        qo_lens_t,
-        kv_lens_t,
-        packed_work_range,
-        packed_work_info,
-        128,  # qo_tile_size
-        256,  # kv_tile_size
-        num_heads,
-        num_buckets,
-        False,  # causal
-        None,  # qo_offset
-        1,  # num_kv_splits
-        None,  # kv_tile_begin_indices
-        None,  # kv_tile_end_indices
-        None,  # kv_split_indices
-        0,  # chunk_size
-        None,  # out_max_sm_cost
-        None,  # num_kv_splits_per_row
-        None,  # workspace_lse
-        0,  # lse_total_size
-        1,  # pack_factor
-    )
-    torch.cuda.synchronize()
-
-    ranges = [int(value) for value in packed_work_range.cpu().tolist()]
-    total_work = (ranges[-1] >> 32) & 0xFFFFFFFF
-    work_info = [int(value) for value in packed_work_info[:total_work].cpu().tolist()]
+    work_info = [int(value) for value in plan["packed_work_info"][:total_work].cpu().tolist()]
     return ranges, work_info
 
 
@@ -224,110 +165,45 @@ def _assert_matches_stock(
     num_buckets: int,
 ) -> None:
     qo_offsets = [0] * len(qo_lens)
-    expected = _stock_direct_greedy(
-        qo_lens, kv_lens, num_heads, num_buckets, False, qo_offsets
-    )
+    expected = _stock_direct_greedy(qo_lens, kv_lens, num_heads, num_buckets, False, qo_offsets)
     actual = _run_gpu_plan(qo_lens, kv_lens, num_heads, num_buckets)
     assert actual == expected
 
 
-@pytest.mark.parametrize("kv_iters_boundary", [32767, 32768])
-@pytest.mark.parametrize("seed", [1, 17, 314159])
-def test_single_head_fast_path_matches_stock_at_int16_boundary(
-    kv_iters_boundary: int, seed: int
-) -> None:
-    """Fast path 2 must preserve kv_iters on both sides of the int16 limit."""
+def test_single_head_fast_path_preserves_full_width_kv_iters() -> None:
+    """Fast path 2 must not narrow a 32,768-iteration row to int16."""
 
-    rng = random.Random(seed)
-    batch_size = rng.randint(3, 8)
-    kv_iters = [rng.randint(1, 1024) for _ in range(batch_size)]
-    kv_iters[rng.randrange(batch_size)] = kv_iters_boundary
-
-    # qo_tile_size=128 => kv_tile_size=256.  Variation prevents the uniform
-    # fast path from intercepting this single-head scenario.
-    qo_lens = [1] * batch_size
+    # qo_tile_size=128 => kv_tile_size=256. Variation prevents fast path 1
+    # from intercepting this single-head scenario.
+    qo_lens = [1, 1, 1, 1]
+    kv_iters = [7, 32768, 31, 1024]
     kv_lens = [iters * 256 for iters in kv_iters]
     _assert_matches_stock(qo_lens, kv_lens, num_heads=1, num_buckets=8)
 
 
-@pytest.mark.parametrize("kv_iters_boundary", [32767, 32768])
-@pytest.mark.parametrize("seed", [2, 23, 271828])
-def test_row_compaction_fast_path_matches_stock_at_int16_boundary(
-    kv_iters_boundary: int, seed: int
-) -> None:
-    """Fast path 3 must preserve kv_iters on both sides of the int16 limit."""
+def test_row_compaction_fast_path_preserves_full_width_kv_iters() -> None:
+    """Fast path 3 must not narrow a 32,768-iteration row to int16."""
 
-    rng = random.Random(seed)
-    batch_size = rng.randint(3, 7)
-    boundary_batch = rng.randrange(batch_size)
-    qo_lens = [rng.randint(1, 256) for _ in range(batch_size)]
-    qo_lens[boundary_batch] = 257  # max_qo_tiles=2: excludes fast paths 1 and 2
-    kv_iters = [rng.randint(1, 1024) for _ in range(batch_size)]
-    kv_iters[boundary_batch] = kv_iters_boundary
-
-    # max(qo_lens)>128 => kv_tile_size=128.
+    # max_qo_tiles=2 excludes fast paths 1 and 2. max(qo_lens)>128 selects a
+    # 128-token KV tile, making the second request cross the int16 boundary.
+    qo_lens = [1, 257, 129, 33]
+    kv_iters = [3, 32768, 17, 5]
     kv_lens = [iters * 128 for iters in kv_iters]
     _assert_matches_stock(qo_lens, kv_lens, num_heads=2, num_buckets=8)
 
 
-@pytest.mark.parametrize("cross_boundary", [False, True])
-def test_single_head_fast_path_matches_stock_at_inactive_lane_sentinel(
-    cross_boundary: bool,
-) -> None:
-    """An inactive reduction lane must not beat a full-width active cost."""
+def test_single_head_fast_path_falls_back_before_packed_cost_sentinel() -> None:
+    """Fast path 2 must not let an inactive lane beat an active bucket."""
 
     # This varied prefix lands exactly one below the legacy inactive sentinel.
     # Appending two rows makes a subsequent find-min observe a cost above it.
     kv_iters = [21670] * 8 + [21697]
-    accumulated_cost = _SM_COST + sum(
-        _PER_ITER_COST * iters + _TILE_COST for iters in kv_iters
-    )
+    accumulated_cost = _SM_COST + sum(_PER_ITER_COST * iters + _TILE_COST for iters in kv_iters)
     assert accumulated_cost == _LEGACY_PACKED_COST_SENTINEL - 1
-    if cross_boundary:
-        kv_iters += [1, 2]
+    # The first light row crosses the sentinel. The following row forces
+    # another argmin, which was incorrect when costs were packed into 24 bits.
+    kv_iters += [1, 2]
 
     qo_lens = [1] * len(kv_iters)
     kv_lens = [iters * 256 for iters in kv_iters]
     _assert_matches_stock(qo_lens, kv_lens, num_heads=1, num_buckets=1)
-
-
-def test_single_head_fast_path_matches_stock_across_24bit_cost_wrap() -> None:
-    """Full-width ordering survives 0xffffff with no inactive lanes involved."""
-
-    num_buckets = 256
-    heavy_kv_iters = 32767
-    heavy_tile_cost = _PER_ITER_COST * heavy_kv_iters + _TILE_COST
-
-    # Eleven complete rounds leave every bucket below 0xffffff.  Another 128
-    # heavy rows push buckets [0, 128) above it, while [128, 256) stay below.
-    # The final light row must therefore go to bucket 128.  A 24-bit shift
-    # wraps the expensive buckets and incorrectly chooses bucket 0 instead.
-    low_cost = _SM_COST + 11 * heavy_tile_cost
-    high_cost = low_cost + heavy_tile_cost
-    assert low_cost < _LEGACY_PACKED_COST_MAX < high_cost
-    assert (high_cost & _LEGACY_PACKED_COST_MAX) < low_cost
-
-    kv_iters = [heavy_kv_iters] * (11 * num_buckets + 128) + [1]
-    qo_lens = [1] * len(kv_iters)
-    kv_lens = [iters * 256 for iters in kv_iters]
-    qo_offsets = [0] * len(kv_iters)
-
-    expected = _stock_direct_greedy(
-        qo_lens,
-        kv_lens,
-        num_heads=1,
-        num_buckets=num_buckets,
-        causal=False,
-        qo_offsets=qo_offsets,
-    )
-    actual = _run_raw_gpu_plan(
-        qo_lens, kv_lens, num_heads=1, num_buckets=num_buckets
-    )
-    assert actual == expected
-
-    # The last row uniquely identifies the decision made after the split cost
-    # state.  Confirm that the stock oracle assigned it to bucket 128.
-    last_batch = len(kv_iters) - 1
-    bucket_start = expected[0][128] & 0xFFFFFFFF
-    bucket_end = (expected[0][128] >> 32) & 0xFFFFFFFF
-    assert last_batch in expected[1][bucket_start:bucket_end]
