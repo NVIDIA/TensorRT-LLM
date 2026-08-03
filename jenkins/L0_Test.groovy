@@ -7018,6 +7018,8 @@ pipeline {
                             }
                             if (singleGpuJobs.size() > 0) {
                                 runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast, stageInfraScope)
+                            } else if (isInfraDryRun()) {
+                                error "Skip single-GPU testing. No test to run for infrastructure dry run."
                             } else {
                                 echo "Skip single-GPU testing. No test to run."
                             }
