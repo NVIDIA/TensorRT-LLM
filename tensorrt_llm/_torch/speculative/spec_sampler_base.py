@@ -219,35 +219,6 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             per_request = getattr(request, "py_verify_len", None)
         return runtime_draft_len if per_request is None else int(per_request)
 
-    @staticmethod
-    def _apply_verify_cap(num_new_tokens: int,
-                          cap: Optional[int]) -> tuple[int, int]:
-        """Trim a commit to the scheduler's window. ``cap-accept`` only.
-
-        The target scored the whole drafted block, so ``num_new_tokens`` is the
-        UNCAPPED chain: ``accepted + 1``, the accepted drafts plus the bonus at
-        the first unaccepted position. A window of ``cap`` drafted positions
-        therefore admits ``cap + 1`` tokens.
-
-        Truncating there keeps every committed token one the target already
-        verified. When the cap bites, the last token kept is ``draft[cap]``,
-        which was accepted, rather than the target's own sample at that
-        position -- a different provenance from SGLang's ``cap_correct_len``,
-        identical under greedy, and lossless either way, since a token is only
-        committed if verification accepted it. The committed COUNT matches.
-
-        Returns:
-            (tokens to commit, positions the cap discarded). The second value
-            is the exact acceptance the schedule cost, which is the number
-            ``compact`` cannot produce because it never scores those positions.
-        """
-        if cap is None:
-            return num_new_tokens, 0
-        admitted = int(cap) + 1
-        if num_new_tokens <= admitted:
-            return num_new_tokens, 0
-        return admitted, num_new_tokens - admitted
-
     def update_requests(
         self,
         state: SampleStateSpec,
@@ -275,11 +246,12 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
-            # cap-accept only: the target scored the whole block, so this is the
-            # uncapped chain and the scheduler's window has to be applied here.
+            # cap-accept: `num_new_tokens` has ALREADY been capped, on device,
+            # inside acceptance (`interface.apply_accept_caps`) -- it has to be,
+            # because the drafter reads the same count later in that forward to
+            # advance its own state. The cap is read here only to report the
+            # window the request was actually given.
             cap = None if caps is None else caps.get(req.py_request_id)
-            num_new_tokens, cap_trim = self._apply_verify_cap(
-                num_new_tokens, cap)
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
                 if TorchSampler._handle_stop_criteria(
@@ -305,8 +277,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             if self.acceptance_stats is not None:
                 self.acceptance_stats.record_acceptance(
                     accepted=req.py_num_accepted_draft_tokens,
-                    window=verified_len if cap is None else int(cap),
-                    cap_trim=cap_trim)
+                    window=verified_len if cap is None else int(cap))
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(

@@ -891,10 +891,19 @@ verify-all 的退化情形出现。
 正确**(`rewind = 整块 − capped`)。这样就不必在「为 compact 调了三个 bug 才对」的
 记账代码里再加一组条件分支——§10.6 那个 KV leak 正是这类记账错误。
 
-截断在 `SpecSamplerBase._apply_verify_cap`:`num_new_tokens` 是未截断链
-(`accepted + 1`),窗口 `w` 允许 `w + 1` 个 token。截断后末位是 `draft[w]`,它已通过
-验证,提交合法。与 SGLang 取「cut 处 target 自己的采样」来源不同,**贪婪下相同**,
-两者提交 token 数一致且都无损。
+**截断必须在设备端 acceptance 内部**(`interface.apply_accept_caps`)。第一版写在主机侧
+`update_requests`,是错的——这条值得单独记:
+
+`num_accepted_tokens` 在**同一次 forward 的后续、设备上还要被消费**。`dspark.py:606-652`
+里 drafter 用它挑下一块的条件隐状态、回填滚动 KV 窗口、并推进持久解码位置
+(`_ctx_len += nacc`)。主机同步后再截断,设备已按未截断的数推进过 drafter 状态,而主机
+只提交 capped 前缀——输出因验证权威仍无损,但 drafter 状态永久漂移,这个模式也就不再
+是它存在意义所在的可信参照。SGLang 截在同一位置(`dspark_accept.py:138`)。
+
+**且不能借 `is_ragged_verify` 触发已有的 clamp**:那个标志同时意味着「draft 缓冲已按
+窗口打包」(`_padded_gen_draft_tokens` 切 `draft_tokens[:total−num_gens]`)。cap-accept
+的缓冲是普通矩形,借用会把矩形当 ragged 解包,一个请求的 draft 记到另一个头上,**全程
+不报错**。所以新增独立字段 `SpecMetadata.accept_caps`。
 
 **它产出 `compact` 结构上拿不到的数**:`cap_trim_tokens` = 被丢弃的、本可接受的位置
 数,即裁剪的真实接受代价。`compact` 下那些位置根本没算,SGLang 为此专门养了一个
@@ -912,4 +921,5 @@ verify-all 的退化情形出现。
 代价是**不省任何算力**,所以它是诊断模式,永远不是服务配置。
 
 覆盖:`tests/unittest/_torch/speculative/hw_agnostic/test_dspark_cap_accept.py`
-(51 项,含截断算术的全枚举不变式、两个计数器坑的回归)。**尚未 e2e 跑过。**
+(59 项,含 clamp 的全枚举不变式、context 请求不受影响、累加器是运行总量而非增量、
+两个计数器坑的回归)。dspark 全套 **306 passed**。**尚未 e2e 跑过。**

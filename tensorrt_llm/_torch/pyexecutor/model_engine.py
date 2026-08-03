@@ -726,6 +726,18 @@ class PyTorchModelEngine(ModelEngine):
         self.ragged_qo_indptr_cuda = torch.empty((self.batch_size + 2, ),
                                                  dtype=torch.int,
                                                  device='cuda')
+        # cap-accept: per-request acceptance ceilings for an UNTRIMMED batch,
+        # plus a device-side accumulator for the positions they discarded.
+        # Same stable-address requirement as the two above -- both are read and
+        # written inside the captured graph. The accumulator is int64 because
+        # it runs for the length of a benchmark, and it is only ever read back
+        # when the summary is logged, so the hot path never syncs on it.
+        self.accept_caps_cuda = torch.empty((self.batch_size + 1, ),
+                                            dtype=torch.int,
+                                            device='cuda')
+        self.accept_cap_trim_cuda = torch.zeros((1, ),
+                                                dtype=torch.int64,
+                                                device='cuda')
         self.input_ids_cuda = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,
                                           device='cuda')
@@ -4016,6 +4028,43 @@ class PyTorchModelEngine(ModelEngine):
                 f"presentation is {expected_rows} rows -- that tensor's shape "
                 f"IS what the ops read as their sequence count.")
 
+    def _attach_accept_caps(self, spec_metadata, generation_requests) -> None:
+        """Publish ``cap-accept`` ceilings, without touching the layout.
+
+        ``py_verify_cap`` is the cap-accept twin of ``py_verify_len``: the
+        scheduler's window for a batch whose token axis was deliberately NOT
+        trimmed. Keeping them on separate attributes is what makes the mode a
+        pure addition -- every layout consumer keys off ``py_verify_len``, so
+        the input packing, the DSA row expansion, the graph key and the KV
+        rewind all keep seeing an ordinary uniform batch with no changes.
+
+        The cap is in ``num_accepted_tokens`` units (accepted drafts plus the
+        bonus), matching ``verify_lens``, hence ``1 + py_verify_cap``.
+        """
+        caps = [
+            getattr(request, "py_verify_cap", None)
+            for request in generation_requests
+        ]
+        if not caps or any(cap is None for cap in caps):
+            # Partial caps are worse than none: the uncapped requests would
+            # commit their full block while the rest honoured a window, which
+            # is neither mode and reproducible by neither.
+            spec_metadata.accept_caps = None
+            spec_metadata.accept_cap_trim = None
+            return
+
+        n = len(caps)
+        # Written through the persistent buffer for the same reason as
+        # verify_lens: acceptance runs inside the target's captured graph, so a
+        # freshly allocated tensor here would be invisible to every replay.
+        caps_view = self.accept_caps_cuda[:n]
+        caps_view.copy_(torch.tensor([1 + int(cap) for cap in caps],
+                                     dtype=torch.int32,
+                                     pin_memory=prefer_pinned()),
+                        non_blocking=True)
+        spec_metadata.accept_caps = caps_view
+        spec_metadata.accept_cap_trim = self.accept_cap_trim_cuda
+
     def _attach_ragged_verify_layout(self, spec_metadata, attn_metadata,
                                      generation_requests) -> None:
         """Publish this step's per-request verify windows to both metadatas.
@@ -4027,6 +4076,7 @@ class PyTorchModelEngine(ModelEngine):
         right place, and the DSA indexer has to expand kv_lens/block tables one
         row per query token instead of a fixed count per request.
         """
+        self._attach_accept_caps(spec_metadata, generation_requests)
         token_lens = self._ragged_token_lens(generation_requests)
         if token_lens is None:
             spec_metadata.verify_lens = None

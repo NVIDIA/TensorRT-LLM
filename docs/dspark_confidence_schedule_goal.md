@@ -318,7 +318,7 @@ cd /code/tensorrt_llm && python -m pytest \
 | 测试 | 内容 | 为什么锐利 |
 |---|---|---|
 | **A1 逐 token 等价** | 同一 engine 配置、同一批 prompt，`static`（verify 全量）与开启调度后，temperature=0 下断言每个 prompt 的 `token_ids` **完全相等** | 贪婪投机解码定义上是 lossless，任何分歧都是 bug。把 6 题的容忍度变成 1 token 的容忍度。**注意**：跨不同 graph 形状的严格 bitwise 相等 TRT-LLM 并不保证（MoE/attention 规约顺序会变），所以诚实的形式是允许极少数 prompt 分歧并设硬上限，或用 `cap-accept` 模式（下条）。 |
-| **A2 `cap-accept` 差分** | 实现 SGLang 的三模式（`static` / `cap-accept` / `compact`）。`cap-accept` 跑**均匀 kernel 路径**（`next_n=6`）但只提交每请求窗口内的 token，输出应与 `compact` **逐 token 相同** | `cap-accept` vs `compact` 的差异 ⇒ **必然是 ragged kernel bug**；`static` vs `cap-accept` 的差异 ⇒ **必然是调度/接受逻辑 bug**。把 pass/fail 变成可定位。**已实现**：窗口写在独立属性 `py_verify_cap` 上（不碰 `py_verify_len`），布局侧因此看不见窗口、自动走整块；截断在 `SpecSamplerBase._apply_verify_cap`。 |
+| **A2 `cap-accept` 差分** | 实现 SGLang 的三模式（`static` / `cap-accept` / `compact`）。`cap-accept` 跑**均匀 kernel 路径**（`next_n=6`）但只提交每请求窗口内的 token，输出应与 `compact` **逐 token 相同** | `cap-accept` vs `compact` 的差异 ⇒ **必然是 ragged kernel bug**；`static` vs `cap-accept` 的差异 ⇒ **必然是调度/接受逻辑 bug**。把 pass/fail 变成可定位。**已实现**：窗口写在独立属性 `py_verify_cap` 上（不碰 `py_verify_len`），布局侧因此看不见窗口、自动走整块；截断在设备端 acceptance 内部（`interface.apply_accept_caps`，经独立字段 `SpecMetadata.accept_caps` 触发，不借用 `is_ragged_verify` 以免连带走进 draft 缓冲的打包分支）。 |
 | **A3 布局一致性断言** | host 侧断言：`sum(1 + py_verify_len over padded generation_requests) == attn_metadata.num_tokens - num_ctx_tokens == spec_metadata.total_verify_tokens == key[bucket]` | 这一条就能同时抓住 H0、H5、H8 |
 | **A4 时序断言** | 断言 `attn_metadata.ragged_verify_lens` 在 `prepare()` 执行的那一刻是**本步**的（而非上一步） | 抓 H2、H4 |
 | **A5 接受长度分布** | 记录并断言每请求接受长度直方图，以及 `sum(accepted)` 与接受 kernel 报告一致 | 抓「token 落到了错误请求的槽位但整批仍生成合法文本」这一类 |

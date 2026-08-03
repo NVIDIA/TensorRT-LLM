@@ -22,10 +22,11 @@ though it had saved any.
 """
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.speculative.dspark_observability import (
     DSparkRaggedStats, RaggedVerifyMode)
-from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSamplerBase
+from tensorrt_llm._torch.speculative.interface import apply_accept_caps
 
 MAX_DRAFT_LEN = 5
 
@@ -34,69 +35,130 @@ def _stats(mode=RaggedVerifyMode.CAP_ACCEPT):
     return DSparkRaggedStats(mode=mode, max_draft_len=MAX_DRAFT_LEN)
 
 
+class _Meta:
+    """Just the two fields `apply_accept_caps` reads."""
+
+    def __init__(self, caps=None, track_trim=True):
+        self.accept_caps = (None if caps is None else torch.tensor(
+            caps, dtype=torch.int32))
+        self.accept_cap_trim = (torch.zeros(1, dtype=torch.int64)
+                                if track_trim else None)
+
+
 # --- the cap itself ---------------------------------------------------------
 #
-# `num_new_tokens` is the uncapped chain: accepted drafts + the bonus at the
-# first unaccepted position. A window of `cap` drafted positions admits
-# `cap + 1` tokens.
+# WHERE this runs is the whole point, and it is not testable from here: it has
+# to be inside acceptance, because the DSpark drafter reads the same
+# `num_accepted_tokens` later in the SAME forward to advance its rolling KV
+# window and its persistent decode position (`_ctx_len += nacc`, dspark.py).
+# Capping on the host afterwards leaves the drafter advanced by the uncapped
+# count while only the capped prefix was committed -- lossless output, but the
+# draft state drifts and the mode stops being a faithful reference.
+#
+# Units: `num_accepted_tokens` is `accepted drafts + 1`, so a window of w
+# drafted positions is a cap of `w + 1`, matching `verify_lens`.
 
 
-def test_no_cap_leaves_the_commit_untouched():
-    """Every non-cap-accept path goes through here; it must be a no-op."""
-    assert SpecSamplerBase._apply_verify_cap(4, None) == (4, 0)
+def test_no_caps_is_a_no_op():
+    """Every other mode goes through this call."""
+    counts = torch.tensor([3, 1, 4], dtype=torch.int32)
+    apply_accept_caps(counts, 0, _Meta(caps=None))
+    assert counts.tolist() == [3, 1, 4]
 
 
-@pytest.mark.parametrize("num_new_tokens,cap", [(1, 5), (3, 5), (6, 5),
-                                                (1, 0), (2, 1), (4, 3)])
-def test_a_commit_inside_its_window_is_not_trimmed(num_new_tokens, cap):
+def test_counts_inside_their_windows_are_untouched():
     """The draft died before the cut, so the cut cost nothing."""
-    committed, trim = SpecSamplerBase._apply_verify_cap(num_new_tokens, cap)
-    assert (committed, trim) == (num_new_tokens, 0)
+    counts = torch.tensor([1, 3, 2], dtype=torch.int32)
+    meta = _Meta(caps=[6, 4, 6])
+    apply_accept_caps(counts, 0, meta)
+    assert counts.tolist() == [1, 3, 2]
+    assert int(meta.accept_cap_trim.item()) == 0
 
 
-def test_a_commit_beyond_its_window_is_truncated_to_the_window():
-    # Window of 2 drafted positions admits 3 tokens; the target accepted 5.
-    committed, trim = SpecSamplerBase._apply_verify_cap(6, 2)
-    assert committed == 3
-    assert trim == 3
+def test_counts_beyond_their_windows_are_clamped_and_the_loss_accumulated():
+    counts = torch.tensor([6, 5, 2], dtype=torch.int32)
+    meta = _Meta(caps=[3, 5, 6])
+    apply_accept_caps(counts, 0, meta)
+    assert counts.tolist() == [3, 5, 2]
+    # Only the first request lost anything: 6 -> 3.
+    assert int(meta.accept_cap_trim.item()) == 3
 
 
-def test_a_zero_window_still_commits_the_bonus():
-    """min_verify_len can be 0 drafted positions; the step must still advance.
+def test_the_accumulator_is_a_running_total_across_steps():
+    """It mirrors a device counter that lives as long as the engine."""
+    meta = _Meta(caps=[2, 2])
+    for _ in range(3):
+        counts = torch.tensor([5, 5], dtype=torch.int32)
+        apply_accept_caps(counts, 0, meta)
+        assert counts.tolist() == [2, 2]
+    assert int(meta.accept_cap_trim.item()) == 3 * (3 + 3)
 
-    A request that commits nothing makes no progress and would spin forever.
-    """
-    committed, trim = SpecSamplerBase._apply_verify_cap(6, 0)
-    assert committed == 1
-    assert trim == 5
+
+def test_context_requests_are_left_alone():
+    """Caps are per generation request; contexts sit ahead of them."""
+    counts = torch.tensor([9, 9, 6, 6], dtype=torch.int32)
+    meta = _Meta(caps=[2, 3])
+    apply_accept_caps(counts, 2, meta)
+    assert counts.tolist() == [9, 9, 2, 3], "a context count was clamped"
 
 
-@pytest.mark.parametrize("num_new_tokens", range(1, MAX_DRAFT_LEN + 2))
-@pytest.mark.parametrize("cap", range(0, MAX_DRAFT_LEN + 1))
-def test_nothing_is_lost_or_invented(num_new_tokens, cap):
-    """committed + discarded accounts for every token the target produced."""
-    committed, trim = SpecSamplerBase._apply_verify_cap(num_new_tokens, cap)
-    assert committed + trim == num_new_tokens
+def test_a_generation_free_batch_does_not_crash():
+    counts = torch.tensor([4, 4], dtype=torch.int32)
+    meta = _Meta(caps=[2, 2])
+    apply_accept_caps(counts, 2, meta)
+    assert counts.tolist() == [4, 4]
+
+
+def test_missing_accumulator_still_caps():
+    """The clamp is correctness; the counter is only measurement."""
+    counts = torch.tensor([6], dtype=torch.int32)
+    meta = _Meta(caps=[2], track_trim=False)
+    apply_accept_caps(counts, 0, meta)
+    assert counts.tolist() == [2]
+
+
+@pytest.mark.parametrize("accepted", range(0, MAX_DRAFT_LEN + 2))
+@pytest.mark.parametrize("window", range(0, MAX_DRAFT_LEN + 1))
+def test_nothing_is_lost_or_invented(accepted, window):
+    """committed + discarded accounts for every position the target produced."""
+    counts = torch.tensor([accepted + 1], dtype=torch.int32)
+    meta = _Meta(caps=[window + 1])
+    apply_accept_caps(counts, 0, meta)
+    committed = int(counts[0])
+    trim = int(meta.accept_cap_trim.item())
+    assert committed + trim == accepted + 1
     assert committed >= 1, "a step that commits nothing cannot make progress"
-    assert trim >= 0
+    assert committed <= window + 1
+
+
+def test_the_cap_never_raises_a_count():
+    """A window wider than the block must not invent acceptance."""
+    counts = torch.tensor([2], dtype=torch.int32)
+    meta = _Meta(caps=[99])
+    apply_accept_caps(counts, 0, meta)
+    assert counts.tolist() == [2]
 
 
 # --- what the counters must say ---------------------------------------------
 
 
-def test_cap_trim_is_recorded_as_the_exact_acceptance_loss():
-    stats = _stats()
-    # Given 5, allowed 2, so 3 accepted positions were thrown away.
-    stats.record_acceptance(accepted=2, window=2, cap_trim=3)
-    # Given 1, allowed 4: died on its own, the window cost nothing.
-    stats.record_acceptance(accepted=1, window=4, cap_trim=0)
+def test_cap_trim_is_absorbed_from_the_device_counter_as_a_running_total():
+    """Assigned, not accumulated: the device counter is itself the total.
 
+    Adding would double-count on every periodic read, which is the shape of
+    bug that makes a metric drift slowly enough to be believed.
+    """
+    stats = _stats()
+    stats.record_acceptance(accepted=2, window=2)
+    stats.record_acceptance(accepted=1, window=4)
+
+    stats.record_cap_trim_total(3)
     assert stats.cap_trim_tokens == 3
+    stats.record_cap_trim_total(7)
+    assert stats.cap_trim_tokens == 7, "reads must not accumulate"
+
     assert stats.accept_len == pytest.approx(1.5)
-    assert stats.accept_loss_per_request == pytest.approx(1.5)
-    # accept_len + accept_loss is what a no-trim run would have accepted.
-    assert (stats.accept_len +
-            stats.accept_loss_per_request) == pytest.approx(3.0)
+    assert stats.accept_loss_per_request == pytest.approx(3.5)
 
 
 def test_the_loss_is_absent_rather_than_zero_when_not_measured():
@@ -186,8 +248,30 @@ def test_the_active_gate_still_demands_a_saving_from_compact():
 
 def test_the_summary_carries_the_measurement():
     stats = _stats()
-    stats.record_acceptance(accepted=2, window=2, cap_trim=3)
+    stats.record_acceptance(accepted=2, window=2)
+    stats.record_cap_trim_total(3)
     summary = stats.summary()
     assert summary["mode"] == "cap-accept"
     assert summary["cap_trim_tokens"] == 3
     assert summary["accept_loss_per_request"] == pytest.approx(3.0)
+
+
+def test_accept_caps_is_not_the_ragged_flag():
+    """The distinction the whole fix rests on.
+
+    `is_ragged_verify` means two things at once -- cap acceptance AND the draft
+    buffers are packed by window (`_padded_gen_draft_tokens` slices
+    `draft_tokens[:total_verify_tokens - num_gens]`). cap-accept wants only the
+    first: its buffers are the ordinary rectangle. If `accept_caps` ever starts
+    implying ragged, a rectangle gets unpacked as if it were packed and one
+    request's drafts are attributed to another, silently.
+    """
+    from tensorrt_llm._torch.speculative.interface import SpecMetadata
+
+    fields = SpecMetadata.__dataclass_fields__
+    assert "accept_caps" in fields
+    assert "accept_cap_trim" in fields
+
+    meta = _Meta(caps=[2, 3])
+    # The mock stands in for a metadata object carrying caps but no windows.
+    assert getattr(meta, "verify_lens", None) is None

@@ -167,19 +167,36 @@ P0-3/5/6 属于「跑出来的数字看着正常但其实是错的」：replay �
 token 轴**——整块照算,超出窗口的接受位置被丢弃。它绝不能 alias 成 `compact`:唯一
 价值就是那个对照。
 
-实现方式是把窗口写在**独立属性 `py_verify_cap`** 上,不碰 `py_verify_len`。于是布局侧
+窗口写在**独立属性 `py_verify_cap`** 上,不碰 `py_verify_len`。于是布局侧
 (`model_engine` / `cuda_graph_runner` / `dsa.py`)完全看不见窗口,自动走整块;
 `_verified_len` 因为 `py_verify_len is None` 自动返回整块,**KV rewind 随之正确**
-(`rewind = 整块 - capped`)。这样新模式是纯增量,而不是在「为 compact 调了三个 bug
+(`rewind = 整块 − capped`)。新模式因此是纯增量,不必在「为 compact 调了三个 bug
 才对」的记账代码里再加一组条件分支。
 
-截断在 `SpecSamplerBase._apply_verify_cap`:`num_new_tokens` 是未截断链
-(`accepted + 1`),窗口 `w` 允许 `w + 1` 个 token。截断后末位是 `draft[w]`——它**已通过
-验证**,提交合法。与 SGLang 取「cut 处 target 自己的采样」来源不同,贪婪下相同,两者
-提交 token 数一致且都无损。
+**截断必须在设备端、acceptance 内部**——`interface.apply_accept_caps`,由
+`sample_and_accept_draft_tokens` 的两个出口调用。这一点第一版写错了(截断放在主机侧
+`update_requests`),原因值得记下来:
+
+`num_accepted_tokens` **在同一次 forward 的后续、设备上还要被消费**。`dspark.py:606-652`
+里 drafter 用它挑下一块的条件隐状态、把中间接受 token 回填进滚动 KV 窗口,并推进自己的
+持久解码位置(`_ctx_len += nacc`)。等主机同步后再截断,设备已经按**未截断**的数推进过
+drafter 状态,而主机只提交了 capped 前缀——输出因为验证是权威的仍然无损,但 drafter
+状态从此永久漂移,这个模式也就不再是它存在意义所在的那个可信参照。SGLang 截在同一
+位置(`cap_correct_len`,`dspark_accept.py:138`),同样是在任何下游读取之前。
+
+**不能直接复用 `is_ragged_verify` 来触发那个 clamp**:它同时意味着「在此停止接受」和
+「draft 缓冲已按窗口打包」(`_padded_gen_draft_tokens` 会切
+`draft_tokens[:total_verify_tokens − num_gens]`)。cap-accept 只要前者,缓冲是普通矩形。
+借用它会连带走进打包分支,把矩形当 ragged 解包——一个请求的 draft 记到另一个头上,
+**全程不报错**。所以是独立字段 `SpecMetadata.accept_caps`。
+
+单位与 `verify_lens` 一致:`num_accepted_tokens` 是「接受 draft 数 + 1」,所以窗口 `w`
+对应的 cap 是 `w + 1`。
 
 它产出 `compact` 结构上拿不到的数:`cap_trim_tokens`,即**被丢弃的、本可接受的位置数**
 ——裁剪的真实接受代价。`compact` 下那些位置根本没算,只能用 `trim_regret_rate` 卡下界。
+该计数在设备端累加(`accept_cap_trim`,int64,持久),**只在打摘要时(每 32 步)读回**;
+在 acceptance 里同步会把这个模式本该原样保留的 forward 串行化。
 
 代价是**不省任何算力**,所以它是诊断模式,永远不是服务配置。`assert_ragged_active()`
 的 `require_trim` 因此对该模式豁免,否则那条门在它唯一该跑的模式里恒不可满足。

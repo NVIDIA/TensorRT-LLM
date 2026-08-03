@@ -331,30 +331,30 @@ class DSparkRaggedStats:
         """How many different window sizes were ever handed out."""
         return len(self.verify_len_hist)
 
-    def record_acceptance(self,
-                          *,
-                          accepted: int,
-                          window: int,
-                          cap_trim: int = 0) -> None:
+    def record_acceptance(self, *, accepted: int, window: int) -> None:
         """Record one request's acceptance against the window it was given.
 
         Args:
             accepted: drafted positions accepted (excludes the bonus token).
             window: drafted positions the request was allowed to verify.
-            cap_trim: positions the target accepted but the window discarded.
-                Non-zero only in ``cap-accept``, the one mode where those
-                positions are actually scored, so this is a measurement rather
-                than an estimate. Zero elsewhere -- under ``compact`` they were
-                never computed and cannot be counted, only bounded from below
-                by ``trimmed_hit_ceiling``.
         """
         self.requests_scored += 1
         self.accepted_tokens += int(accepted)
-        self.cap_trim_tokens += int(cap_trim)
         if int(window) < self.max_draft_len:
             self.requests_trimmed += 1
             if int(accepted) >= int(window):
                 self.trimmed_hit_ceiling += 1
+
+    def record_cap_trim_total(self, total: int) -> None:
+        """Absorb the device-side cap-accept accumulator.
+
+        Assigned, not added: the counter it mirrors runs for the lifetime of
+        the engine, so this is a running total rather than a delta. Reading it
+        costs a device-to-host copy, which is why the caller does it when the
+        summary is logged rather than every step -- the acceptance path itself
+        must never sync.
+        """
+        self.cap_trim_tokens = int(total)
 
     @property
     def accept_len(self) -> float:

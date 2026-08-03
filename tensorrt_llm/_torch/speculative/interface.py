@@ -538,9 +538,32 @@ class SpecMetadata:
     # ``RaggedVerifyLayout.fill_bucket``.
     total_verify_tokens: Optional[int] = None
 
+    # ``cap-accept``: per-request ceilings on the accepted count, in the same
+    # token units as ``verify_lens``, for a batch whose layout was NOT trimmed.
+    #
+    # Deliberately a separate field rather than reusing ``verify_lens``. That
+    # one carries two meanings at once -- "stop acceptance here" AND "the draft
+    # buffers are packed by these windows" (see ``_padded_gen_draft_tokens``,
+    # which slices ``draft_tokens[:total_verify_tokens - num_gens]``). Under
+    # cap-accept only the first holds: the target scored the full block and the
+    # buffers are the usual rectangle. Setting ``verify_lens`` to get the clamp
+    # would silently take the packed-buffer branch too, and unpack a rectangle
+    # as if it were ragged -- one request's drafts attributed to another, with
+    # no error anywhere.
+    accept_caps: Optional[torch.Tensor] = None
+    # [1] int64 accumulator for positions the caps discarded, summed on device
+    # so the hot path never syncs. This is the exact acceptance the schedule
+    # cost, and the number ``compact`` cannot produce: there those positions
+    # are never scored.
+    accept_cap_trim: Optional[torch.Tensor] = None
+
     @property
     def is_ragged_verify(self) -> bool:
-        """Whether this iteration uses per-request verify lengths."""
+        """Whether this iteration uses per-request verify lengths.
+
+        Implies the packed layout. ``cap-accept`` is deliberately NOT ragged by
+        this test -- it caps acceptance without packing anything.
+        """
         return self.verify_lens is not None
 
     # Auto-detected per step from populated sampling params:
@@ -1031,6 +1054,39 @@ class SpecMetadata:
             (tk for tk in request_top_ks if 0 < tk < _disable_topk), default=0)
 
 
+def apply_accept_caps(num_accepted_tokens: torch.Tensor, num_contexts: int,
+                      spec_metadata) -> None:
+    """``cap-accept``: hold each request to its scheduled window, in place.
+
+    This has to run HERE, inside acceptance, and not on the host after the
+    sampler syncs. ``num_accepted_tokens`` is consumed on device later in the
+    same forward: the DSpark drafter reads it to pick the hidden state the next
+    block is conditioned on, to back-fill the accepted tokens into its rolling
+    KV window, and to advance its persistent decode position
+    (``_ctx_len += nacc``). Capping after that leaves the drafter advanced by
+    the uncapped count while only the capped prefix was committed -- the output
+    stays lossless, because verification is authoritative, but the draft state
+    drifts permanently and the mode stops being the faithful reference it
+    exists to be. SGLang caps at the same point, before anything downstream
+    reads the count.
+
+    In-place on the caller's tensor and on a persistent accumulator, so this is
+    safe to record into a CUDA graph and never synchronizes.
+    """
+    caps = getattr(spec_metadata, "accept_caps", None)
+    if caps is None:
+        return
+    gen = num_accepted_tokens[num_contexts:]
+    if gen.numel() == 0:
+        return
+    caps = caps[:gen.shape[0]].to(gen.dtype)
+    capped = torch.minimum(gen, caps)
+    trim = getattr(spec_metadata, "accept_cap_trim", None)
+    if trim is not None:
+        trim += (gen - capped).sum()
+    num_accepted_tokens[num_contexts:] = capped
+
+
 def _padded_gen_draft_tokens(spec_metadata, num_gens: int,
                              runtime_draft_len: int) -> torch.Tensor:
     """Unpack ragged-packed draft tokens into ``[num_gens, runtime_draft_len]``.
@@ -1478,6 +1534,7 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens[num_contexts:] = torch.minimum(
                 num_accepted_tokens[num_contexts:],
                 spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
+        apply_accept_caps(num_accepted_tokens, num_contexts, spec_metadata)
 
         return accepted_tokens, num_accepted_tokens
 
@@ -1919,6 +1976,7 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens[num_contexts:] = torch.minimum(
                 num_accepted_tokens[num_contexts:],
                 spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
+        apply_accept_caps(num_accepted_tokens, num_contexts, spec_metadata)
         return accepted_tokens, num_accepted_tokens
 
     def _update_advance_draft_sampling_seed(self, device):
