@@ -620,6 +620,29 @@ goal doc 引用的 `.dspark-logs/gsm8k.log` 和 `hang-stack-299685.txt` 不在�
 本节由执行 agent 追加，记录实际跑出来的结论。**与前文冲突处以本节为准**，因为前文
 是任务下达时的认知，本节是实测。
 
+> **硬件与配置口径:全部实测都在 x86 + NVIDIA B300 SXM6 AC(275040 MiB / 卡,
+> 驱动 580.167.08)、8 卡单节点、DEP8(TP8 + EP8 + attention-DP)上取得。MoE
+> backend 为 MEGAMOE_DEEPGEMM 或 TRTLLM,`max_draft_len=5`,tier 阶梯 `{1,3,5}`。
+>
+> **换到 GB300(或任何 Grace-Blackwell 一体机)结论可能不同**,以下几组明确依赖
+> 硬件:
+>
+> * **显存(10.4)**:「ragged 的 CUDA graph 开销 ≈0」是在 267 GiB HBM、
+>   `free_gpu_memory_fraction=0.5` 下测的。GB300 的显存容量、NVLink 拓扑和
+>   C2C 一致性内存会改变 graph 池与 KV 的相对占比。
+> * **裁剪是否划算(10.3)**:planner 的 argmax 比较「每秒接受 token 数」,分母
+>   是实测的 `T(bs, M)`。不同的算力/带宽比会改变 `theta(M)` 的斜率,从而移动
+>   「裁剪开始划算」的接受率阈值。本文结论是「p≈0.90 时任何批次档位都不该裁」,
+>   **这个阈值不可跨硬件搬运**。
+> * **SPS cost table 必须在目标硬件上重采**。`sps_real_final.json` 只对 B300
+>   有效,在目标机上重跑 `dspark_sps_profiler` 即可。
+> * **每 rank 批次 = 并发 / DP 数**,本文按 DP=8 计算。
+>
+> 与硬件**无关**的部分:10.5 的机制验证(每请求不同 verify len 能否正确运行)、
+> 10.6 的六个 bug 及其修复(都是 host 侧逻辑错误)、10.7 的方法论。这些是正确性
+> 问题,不是性能问题。
+
+
 ### 10.1 核心结论：K1/K2 已解除，纯 Python，不需要编译
 
 ragged 原本卡在 `mla_rope_generation`（`mlaKernels.cu:1161`）和 FMHA dispatch
