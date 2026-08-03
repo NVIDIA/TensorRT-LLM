@@ -3422,10 +3422,21 @@ class PyExecutor:
         #
         # Carries everything the rest of the step needs, so the `peer_stats`
         # gather that used to follow is folded in here rather than added to it:
-        #   [wants_ragged, num_rows, total_verify_tokens, max_window]
+        #   [wants_ragged, num_rows, total_verify_tokens, max_window, can_graph]
         # `_can_queue` already runs `tp_allgather(batch_size)` just before this
         # hook and could absorb this too, but that would mean computing the
         # local draft length inside a hot path shared by every speculation mode.
+        #
+        # `can_graph` rides along because the ragged fit has to know what row
+        # padding will actually do, and it runs before the graph runner's own
+        # allgather answers that. `_get_padded_batch` only takes the cross-rank
+        # row maximum when EVERY rank can graph this step; one rank holding a
+        # context request makes each rank keep its local count instead, so a fit
+        # that assumed the maximum budgets tokens for pad rows that are never
+        # appended. Predicting that from size rules alone is what `will_pad_to`
+        # tried and got wrong. Carrying the input costs nothing here -- the
+        # collective is already being issued, and one more int does not change
+        # its cost -- and it replaces a second derivation with the same data.
         local_rows = len(ragged_lens) if ragged_lens is not None else 0
         local_tokens = (sum(1 + int(v)
                             for v in ragged_lens) if ragged_lens else 0)
@@ -3437,6 +3448,7 @@ class PyExecutor:
                 local_rows,
                 local_tokens,
                 local_max_window,
+                1 if scheduled_batch.can_run_cuda_graph else 0,
             ])
             if not all(int(payload[0]) for payload in payloads):
                 # Any rank that cannot go ragged takes the whole group with it:
@@ -3450,8 +3462,14 @@ class PyExecutor:
             else:
                 agreed_max = max(int(payload[3]) for payload in payloads)
                 ragged_lens = [min(int(v), agreed_max) for v in ragged_lens]
-                peer_stats = [[int(payload[1]),
-                               int(payload[2])] for payload in payloads]
+                # Third element is the group's answer, identical on every rank
+                # by construction, not each rank's own flag: what the fit needs
+                # to know is whether the row maximum will be taken at all.
+                all_can_graph = all(int(payload[4]) for payload in payloads)
+                peer_stats = [[
+                    int(payload[1]),
+                    int(payload[2]), 1 if all_can_graph else 0
+                ] for payload in payloads]
 
         # --- Phase 3: no more collectives -------------------------------------
         #

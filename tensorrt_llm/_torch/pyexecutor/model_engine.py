@@ -3764,11 +3764,18 @@ class PyTorchModelEngine(ModelEngine):
         out of graph replay.
 
         ``peer_stats`` is every attention-DP rank's ``[num_requests,
-        total_tokens]``, including this rank's. It is required under ADP
-        because ``_get_padded_batch`` pads to the *maximum* batch size across
-        ranks: sizing the bucket from the local count alone makes each rank
-        pick a different shape, which is the graph-key divergence this whole
-        path exists to avoid.
+        total_tokens, all_can_graph]``, including this rank's. The first two
+        are required under ADP because ``_get_padded_batch`` pads to the
+        *maximum* batch size across ranks: sizing the bucket from the local
+        count alone makes each rank pick a different shape, which is the
+        graph-key divergence this whole path exists to avoid.
+
+        The third is the group's answer to "will that maximum be taken at
+        all", identical on every rank. ``_get_padded_batch`` only takes it when
+        every rank can graph the step; one rank holding a context request makes
+        each keep its own row count instead. It is gathered rather than
+        predicted because the graph runner's own allgather, which decides this,
+        runs after the fit.
         """
         runner = self.cuda_graph_runner
         # Cleared on entry so that every early return leaves no stale
@@ -3804,9 +3811,18 @@ class PyTorchModelEngine(ModelEngine):
             return None
         # The token bucket grid depends on the row count, which itself depends
         # on the widest rank, so resolve the rows first and then the tokens.
-        widest_rows = max(
-            [int(s[0]) for s in peer_stats],
-            default=len(token_lens)) if peer_stats else len(token_lens)
+        # Whether _get_padded_batch will take the cross-rank row maximum at all
+        # is a group decision, gathered with the peer stats rather than guessed
+        # here: it only does so when EVERY rank can graph this step. One rank
+        # holding a context request makes each rank keep its own row count, and
+        # a fit that assumed the maximum would budget tokens for pad rows that
+        # never arrive. Third element of a peer stat; absent means single-rank,
+        # where the local count IS the maximum.
+        all_can_graph = (bool(peer_stats[0][2]) if peer_stats
+                         and len(peer_stats[0]) > 2 else True)
+        widest_rows = (max([int(s[0]) for s in peer_stats],
+                           default=len(token_lens)) if peer_stats
+                       and all_can_graph else len(token_lens))
         padded_bs = runner._round_up_batch_size(widest_rows)
         if padded_bs == 0:
             return None
@@ -3829,6 +3845,18 @@ class PyTorchModelEngine(ModelEngine):
         # Decline to go ragged rather than fit against rows that will not exist.
         # Uniform always has a captured graph, so the fallback is cheap and the
         # step still runs.
+        # `will_pad_to` mirrors _get_padded_batch's SIZE guards. It cannot see
+        # the group's graph-capability answer -- that is what `all_can_graph`
+        # above now supplies -- and it deliberately does not model the
+        # resource-dependent bails (KV capacity for the dummy). Being wrong
+        # optimistically there does not "leave the pre-existing behaviour", as
+        # an earlier version of this comment claimed: it budgets tokens for a
+        # row that never appears, so the layout carries n_real*(w+1) tokens
+        # while the graph key says padded_bs*(w+1). Observed as
+        #   requests carry 18 generation tokens but the key's token axis is 24
+        # on 2 of 8 ranks, which threw inside the forward, and under
+        # attention-DP a rank that throws stops issuing collectives -- the
+        # other six deadlocked and the run was hard-killed after 300s.
         if not runner.will_pad_to(padded_bs, len(token_lens)):
             logger.debug(
                 f"DSpark ragged: padding to {padded_bs} rows is not available "

@@ -366,8 +366,11 @@ def choose_ragged_capture_shape(
         )
 
     stats = list(peer_stats) if peer_stats else [(num_real_requests, total_verify_tokens)]
-    max_real = max(int(real) for real, _ in stats)
-    max_slack = max(int(total) - int(real) for real, total in stats)
+    # Tolerate extra trailing fields: the caller's payload has grown before
+    # (the group's graph-capability answer rides along with the row and token
+    # counts) and only the first two are this function's business.
+    max_real = max(int(peer[0]) for peer in stats)
+    max_slack = max(int(peer[1]) - int(peer[0]) for peer in stats)
 
     sorted_bs = sorted({int(b) for b in bs_buckets})
     if max_real > sorted_bs[-1]:

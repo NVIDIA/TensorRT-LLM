@@ -687,3 +687,16 @@ def test_pad_length_never_yields_an_infeasible_real_target():
     # Declining is safe (the step stays uniform) but should stay rare, or the
     # bucket grid is too coarse to be worth capturing.
     assert declined / checked < 0.15, f"{declined}/{checked} shapes have no valid split"
+
+
+def test_extra_peer_stat_fields_are_ignored_here():
+    """The payload grows; this function's contract does not.
+
+    peer_stats gained a third element -- the group's answer to whether row
+    padding will take the cross-rank maximum at all -- which the caller uses
+    before reaching this function. A two-element unpack here turned that into
+    a ValueError on the first ragged step.
+    """
+    two = _shape(num_real=3, total=12, peers=[[3, 12], [4, 16]])
+    three = _shape(num_real=3, total=12, peers=[[3, 12, 1], [4, 16, 1]])
+    assert (three.padded_bs, three.bucket) == (two.padded_bs, two.bucket)
