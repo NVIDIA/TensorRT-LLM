@@ -1352,14 +1352,14 @@ dev = ["pytest", "pytest-xdist", "ruff"]
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.15"
+version = "0.6.16"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.15-py3-none-any.whl", hash = "sha256:da6c339e14db4831ade0d593324f02907d44bd4b86b640faad4727d9e089477b"},
-    {file = "flashinfer_python-0.6.15.tar.gz", hash = "sha256:2a3f1ed47129f9ac9505a26a8f12cadefc0f27d3104fb623ae281032f49eae5f"},
+    {file = "flashinfer_python-0.6.16-py3-none-any.whl", hash = "sha256:059d629cf352dae2d2e17c9b632f1be7c12fd7feb4979d71cdffd96104219e53"},
+    {file = "flashinfer_python-0.6.16.tar.gz", hash = "sha256:0c89970ee42b0640d3dfd65ea4770710e21101ce2b43a09eda3e29cd1874fe48"},
 ]
 
 [package.dependencies]
@@ -1371,7 +1371,7 @@ einops = "*"
 nccl4py = ">=0.3.1"
 ninja = "*"
 numpy = "*"
-nvidia-cudnn-frontend = ">=1.13.0"
+nvidia-cudnn-frontend = ">=1.25.0"
 nvidia-cutlass-dsl = ">=4.5.0"
 nvidia-ml-py = "*"
 packaging = ">=24.2"
@@ -7187,4 +7187,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "6efb69c9fb5cf45baaebd398f9dc04301991dad63096035bf05152f009334b3d"
+content-hash = "4a5add9776e2a34402b10a4635c87123fc38efb1c580ec4559ae7fb09837a13c"
