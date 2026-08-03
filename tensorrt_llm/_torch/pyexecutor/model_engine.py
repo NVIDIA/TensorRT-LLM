@@ -1570,8 +1570,8 @@ class PyTorchModelEngine(ModelEngine):
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         with self.no_cuda_graph(), autotune(cache_path=cache_path):
-            model_autotuner_warmup = getattr(self.model, "warmup_dsv4_fused_ob",
-                                             None)
+            model_autotuner_warmup = getattr(self.model,
+                                             "warmup_dsv4_deep_gemm_ob", None)
             if model_autotuner_warmup is not None:
                 model_autotuner_warmup(curr_max_num_tokens)
 

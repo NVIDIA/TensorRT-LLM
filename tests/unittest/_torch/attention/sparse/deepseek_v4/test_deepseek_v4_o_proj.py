@@ -87,16 +87,16 @@ def test_dsv4_fused_oproj_requires_split_output_consumer(
     assert MLA._should_use_fused_oproj(module) is expected
 
 
-def test_dsv4_deep_gemm_ob_warmup_skips_cute_backend(
+def test_dsv4_deep_gemm_ob_warmup_only_for_disabled_cute_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = SimpleNamespace(_should_use_fused_oproj=lambda: True)
 
     monkeypatch.delenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", raising=False)
-    assert MLA._should_warmup_dsv4_deep_gemm_ob(module)
-
-    monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "1")
     assert not MLA._should_warmup_dsv4_deep_gemm_ob(module)
+
+    monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "0")
+    assert MLA._should_warmup_dsv4_deep_gemm_ob(module)
 
 
 @pytest.mark.parametrize(
@@ -136,6 +136,40 @@ def test_dsv4_fmha_epilogue_output_uses_fused_oproj() -> None:
 
     assert output is expected
     assert calls == [(attn_fp8, attn_scale, 4)]
+
+
+def test_dsv4_fused_oa_exposes_padding_only_to_producer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    num_tokens, num_groups, o_lora_rank = 3, 4, 128
+    attn_fp8 = torch.empty((num_groups, num_tokens, 128), device="meta", dtype=torch.float8_e4m3fn)
+    attn_scale = torch.empty((num_groups, 1, 4), device="meta")
+    expected = torch.empty((num_tokens, 7168), device="meta", dtype=torch.bfloat16)
+    calls = []
+
+    def oa_fp8out(*args) -> None:
+        calls.append(("oa", args[-1].shape, args[-1].stride()))
+
+    def ob_gemm(output: torch.Tensor, scales: torch.Tensor, m: int) -> torch.Tensor:
+        calls.append(("ob", output.shape, scales.shape, scales.stride(), m))
+        return expected
+
+    module = SimpleNamespace(
+        n_local_groups=num_groups,
+        o_lora_rank=o_lora_rank,
+        o_a_proj=torch.empty((1,), device="meta", dtype=torch.float8_e4m3fn),
+        o_a_proj_scale=torch.empty((1,), device="meta"),
+        _fused_ob_gemm=ob_gemm,
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_fp8_bmm_blackwell_fp8out", oa_fp8out)
+
+    output = MLA._fused_oa_ob_proj(module, attn_fp8, attn_scale, num_tokens)
+
+    assert output is expected
+    assert calls == [
+        ("oa", torch.Size([4, 1]), (1, 4)),
+        ("ob", torch.Size([3, 512]), torch.Size([3, 1]), (1, 4), num_tokens),
+    ]
 
 
 def test_dsv4_fmha_epilogue_output_uses_unsplit_fallback_without_fused_hc(
@@ -304,7 +338,7 @@ def test_dsv4_model_warmup_deduplicates_deep_gemm_signatures(
         calls.append((input, weight, weight_scale, kwargs))
 
     monkeypatch.setattr(torch.ops.trtllm, "fp8_swap_ab_gemm", warmup)
-    DeepseekV4ForCausalLM.warmup_dsv4_fused_ob(module, 8192)
+    DeepseekV4ForCausalLM.warmup_dsv4_deep_gemm_ob(module, 8192)
 
     assert len(calls) == 1
     dummy_input, weight, weight_scale, kwargs = calls[0]
@@ -331,8 +365,7 @@ def _check_dsv4_oa_fp8out_tensor_contract() -> None:
     sf_padded = torch.empty_strided(
         (sf_m, packed_sf_n), (1, sf_m), device="cuda", dtype=torch.int32
     )
-    sf_out = sf_padded[:m]
-    inputs = [a, b, a_sf, b_sf, output, sf_out]
+    inputs = [a, b, a_sf, b_sf, output, sf_padded]
     runner = cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner
 
     assert runner._validate_fp8out_inputs(inputs) == (batch_size, m, n, k, sf_m, sf_n, sf_k)
@@ -348,8 +381,6 @@ def _check_dsv4_oa_fp8out_tensor_contract() -> None:
     overlapping_output = torch.empty((m, 1), device="cuda", dtype=torch.float8_e4m3fn).expand(
         -1, batch_size * n
     )
-    bad_sf_storage = torch.empty(sf_m * 2, device="cuda", dtype=torch.int32)
-    bad_sf_shape = torch.as_strided(bad_sf_storage, (m, 2), (1, sf_m))
     invalid_cases = (
         (replace(0, torch.empty_like(a, device="cpu")), ValueError, "CUDA tensors"),
         (replace(0, a.to(torch.float16)), TypeError, "input must have dtype"),
@@ -358,7 +389,7 @@ def _check_dsv4_oa_fp8out_tensor_contract() -> None:
         (replace(2, a_sf[..., :3]), ValueError, "input_scale must have shape"),
         (replace(0, noncontiguous_a), ValueError, "input must be contiguous"),
         (replace(4, overlapping_output), ValueError, "output_fp8 must be"),
-        (replace(5, bad_sf_shape), ValueError, "sf_out must have shape"),
+        (replace(5, sf_padded[:m]), ValueError, "sf_out must have shape"),
     )
     for invalid, error_type, match in invalid_cases:
         with pytest.raises(error_type, match=match):
@@ -382,7 +413,7 @@ def test_dsv4_oa_fp8out_clears_packed_scale_padding(m: int) -> None:
         0x7F7F7F7F
     )
 
-    torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(a, b, a_sf, b_sf, output, sf_padded[:m])
+    torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(a, b, a_sf, b_sf, output, sf_padded)
 
     assert torch.count_nonzero(sf_padded[m:]).item() == 0
 
@@ -443,7 +474,7 @@ def test_dsv4_ob_split_k_one_uses_cute_dsl_and_caches_weight_scale(
         transforms.append((scale, kwargs))
         return transformed_scale
 
-    monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "1")
+    monkeypatch.delenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", raising=False)
     monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", "1")
     monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", fail_deep_gemm)
     monkeypatch.setattr(fp8_utils, "transform_sf_into_required_layout", transform_weight_scale)
@@ -481,7 +512,7 @@ def test_dsv4_ob_auto_split_uses_cute_dsl(
         calls.append((a, sfa, b, sfb))
         return torch.empty((expected_split * m, n), device=a.device, dtype=torch.bfloat16)
 
-    monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "1")
+    monkeypatch.delenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", raising=False)
     monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", fail_deep_gemm)
     monkeypatch.setattr(torch.ops.trtllm, "dsv4_fp8_splitk_gemm", splitk_gemm)
     output = MLA._fused_ob_gemm(module, activation, activation_scale, m)
@@ -491,12 +522,12 @@ def test_dsv4_ob_auto_split_uses_cute_dsl(
 
 
 @pytest.mark.parametrize(
-    ("m", "enable_cute"),
-    [(160, False), (0, True)],
-    ids=["default", "zero-m"],
+    ("m", "env_value"),
+    [(160, "0"), (0, None)],
+    ids=["disabled", "zero-m"],
 )
 def test_dsv4_ob_uses_deep_gemm_fallback(
-    m: int, enable_cute: bool, monkeypatch: pytest.MonkeyPatch
+    m: int, env_value: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from tensorrt_llm import deep_gemm
     from tensorrt_llm.quantization.utils import fp8_utils
@@ -517,10 +548,10 @@ def test_dsv4_ob_uses_deep_gemm_fallback(
     def fail_autotuner(*args, **kwargs):
         raise AssertionError("DeepGEMM inference must not consult AutoTuner")
 
-    if enable_cute:
-        monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "1")
-    else:
+    if env_value is None:
         monkeypatch.delenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", env_value)
     monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", deep_gemm_nt)
     monkeypatch.setattr(fp8_utils, "transform_sf_into_required_layout", fail_transform)
     monkeypatch.setattr(AutoTuner, "get", fail_autotuner)
@@ -1106,9 +1137,9 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(
     # Keep the standalone CuTe result model-shaped.
     monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", "1")
     fused_outputs: dict[str, torch.Tensor] = {}
-    monkeypatch.delenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", raising=False)
+    monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "0")
     fused_outputs["DeepGEMM"] = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
-    monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "1")
+    monkeypatch.delenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", raising=False)
     fused_outputs["CuTe"] = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
 
     # Analytic reference (same correctness bar as the unfused correctness test).

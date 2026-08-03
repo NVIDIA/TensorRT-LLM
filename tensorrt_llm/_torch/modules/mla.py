@@ -76,8 +76,11 @@ except ImportError:
     flash_mla_sparse_fwd = None
 
 
-def _is_env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "on")
+def _is_env_truthy(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "on")
 
 
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
@@ -1259,8 +1262,10 @@ class MLA(nn.Module):
         )
 
     def _should_warmup_dsv4_deep_gemm_ob(self) -> bool:
+        # CuTe is the default and participates in the regular AutoTuner warmup.
+        # The opt-out DeepGEMM path needs its separate startup-only JIT warmup.
         return self._should_use_fused_oproj() and not _is_env_truthy(
-            "TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ"
+            "TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", default=True
         )
 
     def _fused_oa_ob_proj(
@@ -1279,20 +1284,21 @@ class MLA(nn.Module):
         )
         # Both O_b backends consume MN-major packed UE8M0 scales. Allocate the
         # final layout directly; the O_a epilogue also clears its M padding.
-        sf_out = torch.empty_strided(
+        sf_out_padded = torch.empty_strided(
             (aligned_m, packed_k),
             (1, aligned_m),
             device=attn_fp8.device,
             dtype=torch.int32,
-        )[:num_tokens]
+        )
         torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(
             attn_fp8,
             self.o_a_proj,
             attn_scale,
             self.o_a_proj_scale,
             o_lora_fp8,
-            sf_out,
+            sf_out_padded,
         )
+        sf_out = sf_out_padded[:num_tokens]
         return self._fused_ob_gemm(o_lora_fp8, sf_out, num_tokens)
 
     def _fused_ob_gemm(
@@ -1302,8 +1308,9 @@ class MLA(nn.Module):
         m, n = num_tokens, self.hidden_size
         k_ob = o_lora_fp8.shape[1]
         weight, weight_scale = self.o_b_proj.weight, self.o_b_proj.weight_scale
+        # Default to CuTe; setting the env to 0 retains the DeepGEMM rollback.
         use_cute_ob_proj = (
-            _is_env_truthy("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ")
+            _is_env_truthy("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", default=True)
             and m > 0
             and n == _DSV4_PRO_OB_N
             and k_ob == _DSV4_PRO_OB_K

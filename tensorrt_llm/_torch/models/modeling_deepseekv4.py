@@ -2652,8 +2652,14 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             **kwargs,
         )
 
-    def warmup_dsv4_fused_ob(self, max_num_tokens: int) -> None:
-        """Precompile each fused DeepGEMM O_b signature during startup."""
+    def warmup_dsv4_deep_gemm_ob(self, max_num_tokens: int) -> None:
+        """Seed the JIT cache used by the opt-out DeepGEMM O_b backend.
+
+        The default CuTe backend is compiled by the regular AutoTuner forward.
+        DeepGEMM inference deliberately calls ``fp8_gemm_nt`` directly to avoid
+        custom-op and AutoTuner overhead, so startup reuses ``fp8_swap_ab_gemm``
+        to compile the same signature without changing that hot path.
+        """
         if max_num_tokens <= 0:
             return
 

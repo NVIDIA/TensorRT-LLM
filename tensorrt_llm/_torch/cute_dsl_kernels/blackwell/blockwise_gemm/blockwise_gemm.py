@@ -44,7 +44,7 @@
 # This file is copied and modified from cutlass example https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/blockwise_gemm/blockwise_gemm.py
 
 import math
-from typing import Optional, Tuple, Type, Union
+from typing import Optional, Tuple, Type, TypeVar, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -59,6 +59,11 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 _FP8_E4M3_MAX = 448.0
 _MIN_AMAX = 1e-4
+_T = TypeVar("_T")
+
+
+def _identity_epilogue_op(x: _T) -> _T:
+    return x
 
 
 @dsl_user_op
@@ -543,7 +548,7 @@ class Sm100BlockwiseGemmKernel:
         sfb: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        epilogue_op: cutlass.Constexpr = lambda x: x,
+        epilogue_op: cutlass.Constexpr = _identity_epilogue_op,
         sf_out_tensor: Optional[cute.Tensor] = None,
         sf_aligned_mn: int = 0,
         n_tiles_per_group: int = 0,
@@ -786,6 +791,19 @@ class Sm100BlockwiseGemmKernel:
         if cutlass.const_expr(self.fp8_sf_mode and len(self.epilog_warp_id) != 4):
             raise ValueError(
                 f"fp8+SF mode requires exactly 4 epilogue warps, got {len(self.epilog_warp_id)}."
+            )
+        # These contracts are checked while CuTe traces the kernel; they do not
+        # emit predicates or instructions into the device hot path.
+        if cutlass.const_expr(self.fp8_sf_mode and epilogue_op is not _identity_epilogue_op):
+            raise ValueError("fp8+SF mode does not support a custom epilogue_op.")
+        if cutlass.const_expr(
+            self.fp8_smem_epi_mode
+            and (cute.size(self.epi_tile[1]) != 32 or self.fp8_bf16_stage_count != 4)
+        ):
+            raise ValueError(
+                "The cooperative fp8 epilogue requires epi_tile_n==32 and 4 subtiles, got "
+                f"epi_tile_n={cute.size(self.epi_tile[1])} and "
+                f"{self.fp8_bf16_stage_count} subtiles."
             )
 
         # Keep the scale pointer as a tensor for CuTe ABI compatibility.

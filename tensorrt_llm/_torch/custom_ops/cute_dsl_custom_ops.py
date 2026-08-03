@@ -5071,7 +5071,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ("input_scale", a_sf, (batch_size, sf_k, sf_m)),
                 ("weight_scale", b_sf, (batch_size, sf_n, sf_k)),
                 ("output_fp8", output, (m, batch_size * n)),
-                ("sf_out", sf_out, (m, packed_sf_n)),
+                ("sf_out", sf_out, (sf_m, packed_sf_n)),
             )
             for name, tensor, shape in expected_shapes:
                 if tensor.shape != shape:
@@ -5280,7 +5280,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_fp8: torch.Tensor,
         sf_out: torch.Tensor,
     ) -> None:
-        """Write flattened [M,L*N] FP8 output and MN-major packed scales."""
+        """Write flattened [M,L*N] FP8 output and padded MN-major packed scales."""
         if not is_sm_100f():
             raise ValueError(
                 f"cute_dsl_fp8_bmm_blackwell_fp8out requires SM100 family, got {get_sm_version()}"
