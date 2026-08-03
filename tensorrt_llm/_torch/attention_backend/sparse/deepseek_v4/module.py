@@ -18,6 +18,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
@@ -31,6 +32,10 @@ _q_b_proj_cute_dsl_import_ok: Optional[bool] = None
 
 
 # Module initialization and weight lifecycle for DeepSeek-V4 MLA.
+
+
+def _has_dsv4_indexer(self) -> bool:
+    return self.layer_idx is not None and self.sparse_params.compress_ratios[self.layer_idx] == 4
 
 
 def initialize_sparse_attn(self) -> None:
@@ -90,16 +95,16 @@ def initialize_sparse_attn(self) -> None:
         use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
     )
 
-    self.has_dsv4_indexer = (
-        self.layer_idx is not None and self.sparse_params.compress_ratios[self.layer_idx] == 4
+    self.has_dsv4_indexer = _has_dsv4_indexer(self)
+    self.indexer_stream = (
+        self.aux_stream_dict.get(AuxStreamType.MlaIndexer) if self.has_dsv4_indexer else None
     )
-    self.indexer_stream = None
-    self.indexer_aux_stream = None
-    self.compressor_stream = None
-    if self.has_dsv4_indexer and self.aux_stream is not None:
-        self.indexer_stream = torch.cuda.Stream(device=self.aux_stream.device)
-        self.indexer_aux_stream = torch.cuda.Stream(device=self.aux_stream.device)
-        self.compressor_stream = torch.cuda.Stream(device=self.aux_stream.device)
+    self.indexer_aux_stream = (
+        self.aux_stream_dict.get(AuxStreamType.MlaIndexerAux) if self.has_dsv4_indexer else None
+    )
+    self.compressor_stream = (
+        self.aux_stream_dict.get(AuxStreamType.MlaCompressor) if self.has_dsv4_indexer else None
+    )
     if self.indexer_aux_stream is not None:
         assert self.indexer is not None
         self.indexer.aux_stream = self.indexer_aux_stream
@@ -804,6 +809,11 @@ class DeepSeekV4Hooks(MLASparseHooks):
     need_absorption = False
     need_dense_mha = False
     need_default_o_proj = False
+
+    def get_mqa_aux_stream(self, mla: MLA) -> Optional[torch.cuda.Stream]:
+        if _has_dsv4_indexer(mla):
+            return mla.aux_stream_dict.get(AuxStreamType.MlaIndexerAux)
+        return mla.aux_stream
 
     def initialize(self, mla: MLA) -> None:
         initialize_sparse_attn(mla)

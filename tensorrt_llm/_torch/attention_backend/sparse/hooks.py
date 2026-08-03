@@ -46,6 +46,10 @@ class MLASparseHooks(ABC):
     def initialize(self, mla: "MLA") -> None:
         """Initialize algorithm-specific MLA state."""
 
+    def get_mqa_aux_stream(self, mla: "MLA") -> Optional["torch.cuda.Stream"]:
+        """Return the auxiliary stream used to initialize the MQA backend."""
+        return mla.aux_stream
+
     def create_weights(self, mla: "MLA") -> None:
         """Create algorithm-specific weights."""
 

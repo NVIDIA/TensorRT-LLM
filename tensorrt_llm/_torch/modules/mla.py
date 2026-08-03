@@ -248,8 +248,7 @@ class MLA(nn.Module):
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
             aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary
-                CUDA streams by role. The DSv4 lanes are read only when the layer has
-                a DSv4 indexer.
+                CUDA streams by role.
             pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
             layer_idx (int): The layer index.
             dtype (torch.dtype): The data type.
@@ -505,6 +504,11 @@ class MLA(nn.Module):
 
         self.aux_stream_dict = aux_stream_dict or {}
         self.aux_stream = self.aux_stream_dict.get(AuxStreamType.Attention)
+        mqa_aux_stream = (
+            self.sparse_attn_hooks.get_mqa_aux_stream(self)
+            if self.sparse_attn_hooks is not None
+            else self.aux_stream
+        )
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         need_absorption = self.sparse_attn_hooks is None or self.sparse_attn_hooks.need_absorption
         if need_absorption:
@@ -553,7 +557,7 @@ class MLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
             sparse_params=self.sparse_params,
             dtype=dtype,
-            aux_stream=self.aux_stream,
+            aux_stream=mqa_aux_stream,
             rope_append=True,
         )
         if self.mqa is None:
