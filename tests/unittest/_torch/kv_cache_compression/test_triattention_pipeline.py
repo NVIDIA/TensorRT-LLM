@@ -36,7 +36,9 @@ from conftest import mocked_eviction_internals as _mocked_eviction_internals
 
 # TriAttention lives in the kv_cache_compression package. It exposes only the
 # compression manager -- no attention classes or KV-cache-manager subclass.
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+    TriAttentionCompressionManager,
+)
 
 # Framework base class lives in pyexecutor.resource_manager; the factory lives
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
@@ -81,10 +83,12 @@ class TestConfigAndFactory:
                 "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
                 return_value=True,
             ),
-            mock.patch.object(TriAttention, "_initialize_eviction_state") as initialize,
+            mock.patch.object(
+                TriAttentionCompressionManager, "_initialize_eviction_state"
+            ) as initialize,
         ):
             mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
-        assert isinstance(mgr, TriAttention)
+        assert isinstance(mgr, TriAttentionCompressionManager)
         assert mgr.budget == 32
         assert mgr.beta == 16
         assert mgr.eviction_mode == "per_head"
@@ -96,7 +100,7 @@ class TestConfigAndFactory:
         initialize.assert_called_once_with()
 
 
-class TestTriAttentionClass:
+class TestTriAttentionCompressionManager:
     def test_loads_flat_pt(self, flat_calibration_pt):
         mgr = _make_triattention()
         mgr.calibration_path = flat_calibration_pt
@@ -275,8 +279,8 @@ class TestEvictionLifecycle:
         fake_v2 = _make_fake_v2()
         fake_v2.num_extra_kv_tokens = num_extra_kv_tokens
         fake_v2._kv_reserve_draft_tokens = kv_reserve_draft_tokens
-        with mock.patch.object(TriAttention, "_initialize_eviction_state"):
-            mgr = TriAttention(_make_tri_config(budget=8), fake_v2)
+        with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
+            mgr = TriAttentionCompressionManager(_make_tri_config(budget=8), fake_v2)
         cache = SimpleNamespace(
             capacity=seq_len,
             history_length=1024,
@@ -415,8 +419,8 @@ class TestEvictionLifecycle:
     @pytest.mark.parametrize("spec_mode", ["mtp", "eagle3"])
     def test_one_model_draft_co_compression_is_accepted(self, spec_mode):
         draft_manager = _make_fake_v2(is_draft=True)
-        with mock.patch.object(TriAttention, "_initialize_eviction_state"):
-            TriAttention(
+        with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
+            TriAttentionCompressionManager(
                 _make_tri_config(budget=8),
                 _make_fake_v2(),
                 draft_kv_cache_manager=draft_manager,

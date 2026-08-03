@@ -11,7 +11,9 @@ from conftest import make_request as _make_request
 from conftest import make_staging_manager as _make_staging_manager
 from conftest import rect_to_score_scratch as _rect_to_score_scratch
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+    TriAttentionCompressionManager,
+)
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     reduce_per_head_scores,
 )
@@ -44,7 +46,7 @@ def _make_selection_buffers(
     num_kv_heads=1,
 ):
     """Allocate the production selection buffers without score or compaction."""
-    tri = TriAttention.__new__(TriAttention)
+    tri = TriAttentionCompressionManager.__new__(TriAttentionCompressionManager)
     tri.eviction_mode = eviction_mode
     tri._request_capacity = max_requests
     tri._selection_width_capacity = width

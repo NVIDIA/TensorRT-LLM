@@ -140,8 +140,8 @@ class _MeanPhaseTable:
         self.rows = target
 
 
-class TriAttention(KVCacheCompressionManager):
-    """Periodic physical KV eviction driven by trigonometric importance scoring."""
+class TriAttentionCompressionManager(KVCacheCompressionManager):
+    """KV-cache compression manager for periodic TriAttention eviction."""
 
     # ---- construction ----
 

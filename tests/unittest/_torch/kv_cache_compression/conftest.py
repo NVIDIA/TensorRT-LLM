@@ -218,9 +218,11 @@ def run_compaction(compaction):
 
 def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
     """A bare manager carrying only the page-table staging attributes."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        TriAttentionCompressionManager,
+    )
 
-    staging = TriAttention.__new__(TriAttention)
+    staging = TriAttentionCompressionManager.__new__(TriAttentionCompressionManager)
     staging.kv_cache_manager = None
     staging.draft_kv_cache_manager = None
     staging._request_capacity = max_requests
@@ -335,10 +337,12 @@ def make_tri_config(**overrides):
 
 def make_triattention(**overrides):
     """Construct a manager while isolating GPU-owned persistent state."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        TriAttentionCompressionManager,
+    )
 
-    with mock.patch.object(TriAttention, "_initialize_eviction_state"):
-        return TriAttention(make_tri_config(**overrides), make_fake_v2())
+    with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
+        return TriAttentionCompressionManager(make_tri_config(**overrides), make_fake_v2())
 
 
 def make_eviction_request(
@@ -480,7 +484,9 @@ def make_cute_buffers(
     normalize_scores=True,
 ):
     """Build a bare manager with a real score pipeline over test pools."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        TriAttentionCompressionManager,
+    )
 
     num_layers = len(layer_pools)
     assert int(q_real.shape[1]) == num_q_heads
@@ -499,7 +505,7 @@ def make_cute_buffers(
         swa_window=None,
         layer_pool_ids=layer_pool_ids,
     )
-    manager = TriAttention.__new__(TriAttention)
+    manager = TriAttentionCompressionManager.__new__(TriAttentionCompressionManager)
     manager.kv_cache_manager = SimpleNamespace(
         num_pools=max(layer_pool_ids) + 1,
         tokens_per_block=tokens_per_block,

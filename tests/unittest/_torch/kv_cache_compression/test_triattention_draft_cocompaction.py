@@ -15,14 +15,16 @@ from conftest import make_tri_config as _make_tri_config
 from conftest import make_triattention as _make_triattention
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+    TriAttentionCompressionManager,
+)
 
 
 def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
     """Keep target and draft work on the caller stream before manager handoff."""
     event = mock.Mock()
     host = torch.zeros(6, 9, dtype=torch.int32)
-    tri = TriAttention.__new__(TriAttention)
+    tri = TriAttentionCompressionManager.__new__(TriAttentionCompressionManager)
     tri._request_capacity = 8
     tri.budget = 4
     tri._swa_window = None

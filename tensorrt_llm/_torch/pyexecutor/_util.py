@@ -2336,9 +2336,9 @@ def create_kv_cache_compression_manager(
             )
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
         from ..kv_cache_compression.triattention.triattention import \
-            TriAttention
+            TriAttentionCompressionManager
 
-        return TriAttention(
+        return TriAttentionCompressionManager(
             config,
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
