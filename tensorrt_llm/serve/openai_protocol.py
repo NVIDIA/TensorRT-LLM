@@ -1706,6 +1706,8 @@ class ImageEditRequest(OpenAIBaseModel):
 
     @model_validator(mode="after")
     def _check_paired_dimensions(self):
+        if isinstance(self.image, list) and not self.image:
+            raise ValueError("image must contain at least one input image")
         if (self.width is None) != (self.height is None):
             raise ValueError(
                 "width and height must be sent together; got width="
