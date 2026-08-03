@@ -40,12 +40,17 @@ constant edit, not a logic edit.
 from dataclasses import dataclass
 from typing import Optional
 
-# ---- measured thresholds (B200, f15 grid) --------------------------------
+# ---- measured thresholds (B200) ------------------------------------------
+#
+# UNITS: every threshold here is fitted on KERNEL-ONLY time for both the
+# indexer and the top-k. An earlier fit compared a wall-clock indexer
+# (which carries a ~22us launch floor) against kernel-only top-k times;
+# that inflated the apparent emission budget at small shapes and is what
+# put the counts tier behind a batch gate it never needed.
 
-# The kernel's fixed cost does not shrink with N (~12us at K=1024), so
-# once the stock kernel finishes under that floor no tier can win. The
-# whole n_comp/K < 1.5 band measures below parity.
-ASSIST_MIN_N_COMP = 4096  # ~8k raw context at compress_ratio 4
+# The kernel's fixed cost does not shrink with N, so once the stock
+# kernel finishes under that floor no tier can win.
+ASSIST_MIN_N_COMP = 2048
 
 # Block-skip prefix pays for the counts tier from 65536 up, but not for
 # the zero-emission rungs tier below 131072. Measured on captured V4
@@ -61,43 +66,43 @@ SKIP_MIN_N_RUNGS_FLASH = 131072  # vb (flash): bm pays from here
 # at cs 1 / 4 / 8 (batch 4) and cs8 spills to 31.5us at batch 16.
 SKIP_CS_MIN_N_RUNGS = 196608  # vb: cluster split from here up
 
-# Emission tax measured on the FP4 indexer itself (ctx 256k and 1M,
-# batch 1..128), as the wall delta of the same kernel with the emission
-# outputs attached:
+# Emission cost measured on the FP4 indexer KERNEL (nsys kernel-only,
+# ABBA-interleaved NVTX blocks, batch 1..64 x ctx 32k..512k) as the delta
+# of the same kernel with the emission outputs attached:
 #
-# What the list tier costs tracks B*N - the total emitted volume - not
-# batch on its own:
+#   batch                1     2     4     8    16    64
+#   counts (us)        +5.6  +4.4  +2.9  +2.0  +0.4   0.0
+#   list, bucketed     +6.2  +6.2  +6.8 +10.5 +25.0  +63.1  (ctx 32k)
+#                     +10.3 +14.7 +25.6 +44.5 +85.7 +417.8  (ctx 512k)
 #
-#   B*N (raw tokens)   <=0.5M    1M      >=2M
-#   list                +11-14%  +55-71%  +150-270%
-#   counts               +1-3%    +1-3%     +0-3%
-#
-# Volume is the main term but not the only one: at the same 1M tokens
-# the tax is +21% as 1M x B1 and +71% as 128k x B8, so there is a
-# per-row cost on top. Both measured-cheap regions are covered by
-# "half a megatoken, or a single row". The counts tax stays inside 3%
-# everywhere, which is why it remains the default; past RUNGS_MIN_B
-# even that is not repaid and the zero-emission rungs tier takes over.
-LIST_EMIT_MAX_TOKENS = 786432  # B * raw length; between the measured
-# cheap band (<=0.52M) and the first expensive point (1.05M)
-LIST_EMIT_MIN_N = 16384
-RUNGS_MIN_B = 16
+# The counts cost is a fixed reduction-latency chain that depends on
+# BATCH ONLY and hides once there are enough rows to overlap it - it is
+# not a fraction of the indexer, so it cannot price the tier out at
+# scale. An earlier fit modelled it as 3% of a WALL-clock indexer time
+# (which carries a ~22us launch floor) and so charged 12us at batch 64 /
+# 512k, where the true cost is zero; that is what put the counts tier
+# behind a batch gate. The list cost is real per-emitted-entry work and
+# grows with batch and context alike; an unbucketed single-segment list
+# measures 1.5-5.8x cheaper, but rescoring the grid with it moves the
+# geomean by +0.5%, so the bucketed contract stays as is.
+LIST_EMIT_MIN_N = 65536  # shorter rows: the emission outweighs the saving
+LIST_EMIT_MAX_B = 1  # past one row the list never repays its emission
+COUNTS_MIN_TOKENS = 524288  # B * raw length; below this the counts
+# latency chain is exposed and the zero-emission rungs tier wins
+RUNGS_ONLY_MIN_N = 16384  # short-row band where rungs also beats counts
+RUNGS_ONLY_MAX_N = 49152
 
 # Mid-row weak band: rows long enough that the stock kernel splits them
 # across a cluster, but short enough (and at a small enough batch) that
 # its split grid still fits one wave. The assist tiers cannot follow -
-# splitting a row costs them more than the scan it saves - so the stock
-# kernel wins outright and the epilogue should emit nothing. Measured
-# against the stock kernel on the captured grid: without this band 15 of
-# 154 cells run below stock (worst 0.86 at flash 512k batch 16); with it,
-# 2 cells at 0.99. Longer K needs less row before the tiers pay, hence
-# the two upper bounds. Batch 1-2 still take the list tier (checked
-# first): there the emitted list beats stock by 1.5x even inside the band.
+# splitting a row costs them more than the scan it saves, with or without
+# the block-skip prefix - so the stock kernel wins outright and the
+# epilogue should emit nothing.
 ASSIST_WEAK_MIN_N = 49152
-ASSIST_WEAK_MAX_N_SMALL_K = 196608  # k <= ASSIST_WEAK_K
-ASSIST_WEAK_MAX_N_LARGE_K = 98304
+ASSIST_WEAK_MAX_N_SMALL_K = 262144  # k <= ASSIST_WEAK_K
+ASSIST_WEAK_MAX_N_LARGE_K = 196608
 ASSIST_WEAK_K = 512
-ASSIST_WEAK_MAX_B = 32
+ASSIST_WEAK_MAX_B = 8
 
 # rungs-tier block_max pays only at small K: with K=1024 the tight-line
 # pass rate runs too high and the prefix read is pure overhead.
@@ -138,20 +143,18 @@ def plan_emission(
         # and this holds for the zero-emission rungs tier too - it is
         # the same kernel, so the floor is the same
         return "none"
-    if (
-        have_epilogue
-        and n_comp >= LIST_EMIT_MIN_N
-        and (batch == 1 or batch * n_comp * compress_ratio <= LIST_EMIT_MAX_TOKENS)
-    ):
-        return "list"
     weak_max = ASSIST_WEAK_MAX_N_SMALL_K if k <= ASSIST_WEAK_K else ASSIST_WEAK_MAX_N_LARGE_K
     if batch <= ASSIST_WEAK_MAX_B and ASSIST_WEAK_MIN_N <= n_comp < weak_max:
         return "none"  # stock's split grid wins this band outright
-    if not have_epilogue:
-        return "rungs"  # closed-loop lines cost nothing to carry
-    if batch >= RUNGS_MIN_B:
-        return "rungs"  # throughput regime: emitting anything is a loss
-    return "counts"
+    if have_epilogue and n_comp >= LIST_EMIT_MIN_N and batch <= LIST_EMIT_MAX_B:
+        return "list"
+    if (
+        have_epilogue
+        and batch * n_comp * compress_ratio >= COUNTS_MIN_TOKENS
+        and not (RUNGS_ONLY_MIN_N <= n_comp < RUNGS_ONLY_MAX_N)
+    ):
+        return "counts"
+    return "rungs"  # closed-loop lines cost nothing to carry
 
 
 def pick_config(tier: str, batch: int, n_comp: int, k: int, num_sms: int) -> TopkRoute:
