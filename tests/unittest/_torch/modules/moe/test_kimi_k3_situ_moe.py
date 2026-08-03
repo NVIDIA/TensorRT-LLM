@@ -619,20 +619,22 @@ def _load_bank(moe, bank, tp_size=1, tp_rank=0):
     """
     backend = moe.backend
     if hasattr(backend.quant_method, "load_packed_mxfp4_expert"):
-        proxy = SimpleNamespace(
-            expert_size_per_partition=backend.expert_size_per_partition,
-            initial_local_expert_ids=backend.initial_local_expert_ids,
-            scaling_vector_size=backend.scaling_vector_size,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            w3_w1_weight=backend.w3_w1_weight,
-            w2_weight=backend.w2_weight,
-            w3_w1_weight_scale=backend.w3_w1_weight_scale,
-            w2_weight_scale=backend.w2_weight_scale,
-        )
+        loader_module = backend
+        if hasattr(backend, "scaling_vector_size"):
+            loader_module = SimpleNamespace(
+                expert_size_per_partition=backend.expert_size_per_partition,
+                initial_local_expert_ids=backend.initial_local_expert_ids,
+                scaling_vector_size=backend.scaling_vector_size,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                w3_w1_weight=backend.w3_w1_weight,
+                w2_weight=backend.w2_weight,
+                w3_w1_weight_scale=backend.w3_w1_weight_scale,
+                w2_weight_scale=backend.w2_weight_scale,
+            )
         for expert_id, tensors in enumerate(bank):
             backend.quant_method.load_packed_mxfp4_expert(
-                proxy,
+                loader_module,
                 global_expert_id=expert_id,
                 local_slot_id=expert_id,
                 w1_weight=tensors["w1"],
