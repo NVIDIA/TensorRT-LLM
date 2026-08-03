@@ -940,6 +940,11 @@ class KimiK3MoERuntime(nn.Module):
             self.aux_stream,
             disable_on_compile=True,
         )
+        if self.aux_stream is not None:
+            # ``shared_out`` may be allocated on the aux stream but is
+            # consumed by the addition below on the current stream. Keep its
+            # storage live until that cross-stream use completes.
+            shared_out.record_stream(torch.cuda.current_stream())
         return routed_out + shared_out
 
 
