@@ -3532,7 +3532,15 @@ class PyExecutor:
                 # Trimming still saves real compute here; only the alignment is
                 # unnecessary. `agreed_ragged_bucket` stays cleared so the graph
                 # key keeps its uniform shape.
-                self.model_engine.cuda_graph_runner.agreed_ragged_bucket = None
+                runner = self.model_engine.cuda_graph_runner
+                runner.agreed_ragged_bucket = None
+                # A rank whose OWN batch is gen-only still pads locally even
+                # when the group cannot graph, and it stamps the padding dummy
+                # with this. Skipping the fit leaves the previous ragged step's
+                # value, so the dummy would join the batch carrying a window
+                # from a layout that no longer exists. There is no bucket to
+                # spend here, so the pad rows get the minimum.
+                runner.ragged_pad_verify_len = 0
                 for request, window in zip(gen_requests, ragged_lens):
                     request.py_verify_len = int(window)
                 ragged_active = True
