@@ -16,3 +16,4 @@ l0_cpu_arm:
   - unittest/executor/test_rpc.py
   - unittest/executor/test_event_loop_error_broadcast.py
   - unittest/others/test_http_utils_fail_fast.py
+  - unittest/llmapi/test_bench_async.py
