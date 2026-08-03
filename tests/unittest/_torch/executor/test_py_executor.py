@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -433,6 +436,91 @@ class TestDisaggTransferIdleProgress:
         PyExecutor._check_disagg_gen_transfer_status(executor)
 
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+
+    def test_gen_transfer_status_caller_guard_skips_without_active_transfers(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=3)
+        executor.active_requests = []
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._gen_status_entry_guard_enabled = True
+        executor._gen_status_entry_guard_checks = 0
+        executor._gen_status_entry_guard_loop_status_calls = 0
+        executor._gen_status_entry_guard_skipped_loop_calls = 0
+        executor._gen_status_entry_guard_active_requests_max = 0
+        executor._gen_status_entry_guard_status_time_ms_total = 0.0
+        executor._gen_status_entry_guard_status_time_ms_max = 0.0
+        executor._gen_status_entry_guard_first_active_logged = False
+        executor._gen_status_entry_guard_first_skip_logged = False
+        executor._gen_status_entry_guard_summary_logged = False
+
+        PyExecutor._check_disagg_gen_transfer_status(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        assert executor._gen_status_entry_guard_checks == 1
+        assert executor._gen_status_entry_guard_loop_status_calls == 0
+        assert executor._gen_status_entry_guard_skipped_loop_calls == 1
+
+    def test_gen_transfer_status_caller_guard_keeps_nonblocking_active_poll(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=5)
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._gen_status_entry_guard_enabled = True
+        executor._gen_status_entry_guard_checks = 0
+        executor._gen_status_entry_guard_loop_status_calls = 0
+        executor._gen_status_entry_guard_skipped_loop_calls = 0
+        executor._gen_status_entry_guard_active_requests_max = 0
+        executor._gen_status_entry_guard_status_time_ms_total = 0.0
+        executor._gen_status_entry_guard_status_time_ms_max = 0.0
+        executor._gen_status_entry_guard_first_active_logged = False
+        executor._gen_status_entry_guard_first_skip_logged = False
+        executor._gen_status_entry_guard_summary_logged = False
+
+        PyExecutor._check_disagg_gen_transfer_status(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+        assert executor._gen_status_entry_guard_checks == 1
+        assert executor._gen_status_entry_guard_loop_status_calls == 1
+        assert executor._gen_status_entry_guard_skipped_loop_calls == 0
+        assert executor._gen_status_entry_guard_active_requests_max == 1
+
+    def test_gen_transfer_status_caller_guard_preserves_warmup_poll(self):
+        executor = object.__new__(PyExecutor)
+        executor._is_warmup = True
+        executor.active_requests = []
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._gen_status_entry_guard_enabled = True
+        executor._gen_status_entry_guard_checks = 0
+
+        PyExecutor._check_disagg_gen_transfer_status(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+        assert executor._gen_status_entry_guard_checks == 0
+
+    def test_gen_transfer_status_caller_guard_summary_is_idempotent(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=7)
+        executor._gen_status_entry_guard_enabled = True
+        executor._gen_status_entry_guard_checks = 8
+        executor._gen_status_entry_guard_loop_status_calls = 3
+        executor._gen_status_entry_guard_skipped_loop_calls = 5
+        executor._gen_status_entry_guard_active_requests_max = 2
+        executor._gen_status_entry_guard_status_time_ms_total = 4.5
+        executor._gen_status_entry_guard_status_time_ms_max = 2.0
+        executor._gen_status_entry_guard_summary_logged = False
+        info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", info)
+
+        PyExecutor._log_gen_status_caller_guard_summary(executor)
+        PyExecutor._log_gen_status_caller_guard_summary(executor)
+
+        info.assert_called_once()
+        message = info.call_args.args[0]
+        assert "event=summary" in message
+        assert "rank=7" in message
+        assert "checks=8" in message
+        assert "loop_status_calls=3" in message
+        assert "skipped_loop_calls=5" in message
 
     def test_polls_generation_transfer_when_admission_blocked(self):
         executor = object.__new__(PyExecutor)

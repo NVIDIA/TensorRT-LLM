@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import functools
@@ -101,6 +104,11 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+# TEST ONLY: isolate the pre-PR15356 caller guard without changing the
+# nonblocking status-poll argument or the C++ consensus implementation.
+_RESTORE_PRE_PR15356_GEN_STATUS_CALLER_GUARD_ENV = (
+    "TRTLLM_NVBUG_6448152_RESTORE_GEN_STATUS_CALLER_GUARD")
 
 
 class PPCommTag(IntEnum):
@@ -774,6 +782,22 @@ class PyExecutor:
                                    None)
         self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer, tokens_per_block)
+        self._gen_status_entry_guard_enabled = (
+            os.getenv(_RESTORE_PRE_PR15356_GEN_STATUS_CALLER_GUARD_ENV) == "1")
+        self._gen_status_entry_guard_checks = 0
+        self._gen_status_entry_guard_loop_status_calls = 0
+        self._gen_status_entry_guard_skipped_loop_calls = 0
+        self._gen_status_entry_guard_active_requests_max = 0
+        self._gen_status_entry_guard_status_time_ms_total = 0.0
+        self._gen_status_entry_guard_status_time_ms_max = 0.0
+        self._gen_status_entry_guard_first_active_logged = False
+        self._gen_status_entry_guard_first_skip_logged = False
+        self._gen_status_entry_guard_summary_logged = False
+        if self._gen_status_entry_guard_enabled:
+            logger.info(
+                "NVBUG6448152_GEN_STATUS_CALLER_GUARD event=effective_config "
+                "mode=pre_pr15356_entry_guard_only poll=nonblocking "
+                f"at_least=0 {self._gen_status_entry_guard_topology()}")
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
@@ -2020,6 +2044,7 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+        self._log_gen_status_caller_guard_summary()
 
         for i in range(self.num_micro_batches):
             try:
@@ -4479,10 +4504,80 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
-        # Gen-transfer status performs cross-rank consensus internally.
-        # Enter it symmetrically; ranks with no ready local future contribute
-        # an empty ready set.
-        self._check_disagg_gen_cache_transfer_status(0)
+        if (not getattr(self, "_gen_status_entry_guard_enabled", False)
+                or getattr(self, "is_warmup", False)):
+            # Gen-transfer status performs cross-rank consensus internally.
+            # Enter it symmetrically; ranks with no ready local future
+            # contribute an empty ready set.
+            self._check_disagg_gen_cache_transfer_status(0)
+            return
+
+        self._gen_status_entry_guard_checks += 1
+        active_transfer_count = sum(
+            req.is_disagg_generation_transmission_in_progress
+            for req in self.active_requests)
+        self._gen_status_entry_guard_active_requests_max = max(
+            self._gen_status_entry_guard_active_requests_max,
+            active_transfer_count)
+        if active_transfer_count == 0:
+            self._gen_status_entry_guard_skipped_loop_calls += 1
+            if not self._gen_status_entry_guard_first_skip_logged:
+                logger.info(
+                    "NVBUG6448152_GEN_STATUS_CALLER_GUARD event=exercised "
+                    "decision=skip_no_active_transfer poll=nonblocking "
+                    f"at_least=0 {self._gen_status_entry_guard_topology()}")
+                self._gen_status_entry_guard_first_skip_logged = True
+            return
+
+        if not self._gen_status_entry_guard_first_active_logged:
+            logger.info(
+                "NVBUG6448152_GEN_STATUS_CALLER_GUARD event=exercised "
+                "decision=call_active_transfer poll=nonblocking at_least=0 "
+                f"active_transfers={active_transfer_count} "
+                f"{self._gen_status_entry_guard_topology()}")
+            self._gen_status_entry_guard_first_active_logged = True
+
+        self._gen_status_entry_guard_loop_status_calls += 1
+        call_start = time.perf_counter()
+        try:
+            # Gen-transfer status performs cross-rank consensus internally.
+            self._check_disagg_gen_cache_transfer_status(0)
+        finally:
+            elapsed_ms = (time.perf_counter() - call_start) * 1000.0
+            self._gen_status_entry_guard_status_time_ms_total += elapsed_ms
+            self._gen_status_entry_guard_status_time_ms_max = max(
+                self._gen_status_entry_guard_status_time_ms_max, elapsed_ms)
+
+    def _gen_status_entry_guard_topology(self) -> str:
+        return (
+            f"rank={getattr(self.dist, 'rank', -1)} "
+            f"world_size={getattr(self.dist, 'world_size', 1)} "
+            f"tp_size={getattr(self.dist, 'tp_size', 1)} "
+            f"pp_size={getattr(self.dist, 'pp_size', 1)} "
+            f"cp_size={getattr(self.dist, 'cp_size', 1)} "
+            f"attention_dp={int(getattr(self, 'enable_attention_dp', False))}")
+
+    def _log_gen_status_caller_guard_summary(self) -> None:
+        if (not getattr(self, "_gen_status_entry_guard_enabled", False) or
+                getattr(self, "_gen_status_entry_guard_summary_logged", False)
+                or getattr(self, "_gen_status_entry_guard_checks", 0) == 0):
+            return
+        self._gen_status_entry_guard_summary_logged = True
+        logger.info(
+            "NVBUG6448152_GEN_STATUS_CALLER_GUARD event=summary "
+            "mode=pre_pr15356_entry_guard_only poll=nonblocking at_least=0 "
+            f"{self._gen_status_entry_guard_topology()} "
+            f"checks={self._gen_status_entry_guard_checks} "
+            "loop_status_calls="
+            f"{self._gen_status_entry_guard_loop_status_calls} "
+            "skipped_loop_calls="
+            f"{self._gen_status_entry_guard_skipped_loop_calls} "
+            "active_transfers_max="
+            f"{self._gen_status_entry_guard_active_requests_max} "
+            "status_time_ms_total="
+            f"{self._gen_status_entry_guard_status_time_ms_total:.3f} "
+            "status_time_ms_max="
+            f"{self._gen_status_entry_guard_status_time_ms_max:.3f}")
 
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):
