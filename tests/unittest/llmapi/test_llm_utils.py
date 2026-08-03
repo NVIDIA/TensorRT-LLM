@@ -47,6 +47,21 @@ def test_load_hf_generation_config_dict_returns_empty_without_file(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_load_hf_generation_config_dict_returns_empty_for_malformed_json(
+        tmp_path):
+    (tmp_path / "generation_config.json").write_text("{", encoding="utf-8")
+
+    assert ModelLoader.load_hf_generation_config_dict(tmp_path) == {}
+
+
+@pytest.mark.cpu_only
+def test_load_hf_generation_config_dict_returns_empty_for_json_array(tmp_path):
+    (tmp_path / "generation_config.json").write_text("[1, 2]", encoding="utf-8")
+
+    assert ModelLoader.load_hf_generation_config_dict(tmp_path) == {}
+
+
+@pytest.mark.cpu_only
 def test_LlmArgs_default_gpus_per_node():
     # default
     llm_args = TorchLlmArgs(model=llama_model_path)

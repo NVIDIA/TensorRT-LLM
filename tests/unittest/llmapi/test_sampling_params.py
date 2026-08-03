@@ -104,6 +104,17 @@ def test_generation_config_applies_all_supported_sampling_fields():
         if field_name != "typical_p":
             assert getattr(prepared, field_name) == expected
 
+    unsupported_values = _apply_generation_config_sampling_defaults(
+        "auto",
+        SamplingParams(end_id=1),
+        {
+            "top_p": None,
+            "early_stopping": "never",
+        },
+    )
+    assert unsupported_values.top_p is None
+    assert unsupported_values.early_stopping is None
+
 
 @pytest.mark.parametrize(
     "request_obj",

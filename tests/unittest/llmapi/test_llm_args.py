@@ -70,13 +70,20 @@ from .test_llm import llama_model_path
 
 
 @pytest.mark.cpu_only
-def test_generation_config_mode_defaults_and_validation():
+def test_generation_config_mode_defaults_and_validation() -> None:
     assert TorchLlmArgs(model=llama_model_path).generation_config == "trtllm"
     assert (TorchLlmArgs(model=llama_model_path,
                          generation_config="auto").generation_config == "auto")
 
     with pytest.raises(ValidationError, match="generation_config"):
         TorchLlmArgs(model=llama_model_path, generation_config="invalid")
+
+
+@pytest.mark.cpu_only
+def test_generation_config_auto_rejects_autodeploy() -> None:
+    with pytest.raises(ValidationError,
+                       match="AutoDeploy does not support generation_config"):
+        AutoDeployLlmArgs(model=llama_model_path, generation_config="auto")
 
 
 @pytest.mark.cpu_only
@@ -2533,31 +2540,49 @@ class TestServeDefaults:
         )
         assert merged["tensor_parallel_size"] == 1
 
-    def test_serve_generation_config_cli_over_yaml_precedence(self):
+    def test_serve_generation_config_cli_over_yaml_precedence(self,
+                                                              tmp_path) -> None:
         """YAML wins when CLI omits the mode; an explicit CLI mode wins otherwise."""
-        default_args, _ = get_llm_args(
-            model=llama_model_path,
-            backend="pytorch",
-            generation_config="trtllm",
-        )
-        assert "generation_config" not in default_args
+        from unittest import mock
 
-        yaml_merged = update_llm_args_with_extra_dict(
-            default_args, {"generation_config": "auto"})
-        assert yaml_merged["generation_config"] == "auto"
+        from tensorrt_llm.commands.serve import main as serve_main
 
-        explicit_args, _ = get_llm_args(
-            model=llama_model_path,
-            backend="pytorch",
-            generation_config="trtllm",
-            explicit_cli_keys={"generation_config"},
-        )
-        cli_merged = update_llm_args_with_extra_dict(
-            explicit_args,
-            {"generation_config": "auto"},
-            explicit_cli_keys={"generation_config"},
-        )
-        assert cli_merged["generation_config"] == "trtllm"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("generation_config: auto\n", encoding="utf-8")
+
+        with (
+                mock.patch(
+                    "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                    return_value=False),
+                mock.patch("tensorrt_llm.commands.serve.device_count",
+                           return_value=1),
+                mock.patch("tensorrt_llm.commands.serve.launch_server") as
+                mock_launch_server,
+        ):
+            serve_main(
+                args=["dummy/model", "--config",
+                      str(config_path)],
+                standalone_mode=False,
+            )
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
+
+            mock_launch_server.reset_mock()
+            config_path.write_text("generation_config: trtllm\n",
+                                   encoding="utf-8")
+            serve_main(
+                args=[
+                    "dummy/model",
+                    "--config",
+                    str(config_path),
+                    "--generation-config",
+                    "auto",
+                ],
+                standalone_mode=False,
+            )
+
+            assert mock_launch_server.call_args.args[2][
+                "generation_config"] == "auto"
 
     def test_serve_is_non_default_or_required_helper(self):
         # Test always_include parameters
