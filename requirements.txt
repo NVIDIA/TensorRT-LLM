@@ -23,14 +23,12 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.12.0a0.
-# The floor admits the NGC alpha builds (2.12.0a0+...); torch<2.12 pins triton==3.6.0,
-# which conflicts with the triton pin below.
-torch>=2.12.0a0,<=2.13.0a0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-07.html#rel-26-07 uses 2.13.0a0.
+# Floor is 2.13.0a0 (not 2.13.0): NGC alphas sort below the final release under PEP 440.
+torch>=2.13.0a0,<2.14.0
 torchvision
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05 uses 2.30.4
-# torch 2.12.0+cu130 uses NCCL 2.29.7; NGC 26.05 uses NCCL 2.30.4.
-nvidia-nccl-cu13>=2.29.7,<=2.30.4
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-07.html#rel-26-07 uses 2.30.7
+nvidia-nccl-cu13>=2.29.7,<=2.30.7
 # NcclEP uses nccl4py's nccl.ep package without changing the NCCL wheel constraint.
 nccl4py>=0.3.1,<0.4
 nvidia-cuda-nvrtc

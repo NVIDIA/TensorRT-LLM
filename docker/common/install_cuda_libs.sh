@@ -3,18 +3,19 @@
 set -ex
 
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05
-CUDA_VER="13.2" # 13.2.1
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-07.html#rel-26-07
+CUDA_VER="13.3" # 13.3.1
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.22.0.52-1"
-NCCL_VER="2.30.4-1+cuda13.2"
-CUBLAS_VER="13.4.1.2-1"
+CUDNN_VER="9.24.0.43-1"
+NCCL_VER="2.30.7-1+cuda13.3"
+# Container ships cuBLAS 13.6.0.2; public cuda-13 package channel publishes 13.6.1.10.
+CUBLAS_VER="13.6.1.10-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.2.78-1"
-CUDA_RUNTIME="13.2.75-1"
-CUDA_DRIVER_VERSION="595.58.03-1.el8"
+NVRTC_VER="13.3.33-1"
+CUDA_RUNTIME="13.3.29-1"
+CUDA_DRIVER_VERSION="610.43.02-1.el8"
 
 for i in "$@"; do
     case $i in
