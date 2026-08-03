@@ -141,6 +141,294 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # DeepSeek V4 Pro throughput knobs, from
+        # examples/configs/curated/deepseek-v4-pro-throughput.yaml (ADP + EP,
+        # small per-rank batch). MTP-1 matches the checkpoint's
+        # num_nextn_predict_layers and the curated throughput recipe.
+        {
+            'patterns': [
+                'deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:32-maxnt:8448',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_lm_head_tp_in_adp': True,
+                'attention_dp_config': {
+                    'enable_balance': True,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 9256,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.6,
+                    'tokens_per_block': 128,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 24, 32],
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 1,
+                },
+                'stream_interval': 100,
+                'num_postprocess_workers': 4,
+            }
+        },
+        # DeepSeek V4 Pro latency knobs, from
+        # examples/configs/curated/deepseek-v4-pro-latency.yaml (pure TP, no
+        # attention DP, deeper MTP, larger KV fraction).
+        {
+            'patterns': [
+                'deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:128-maxnt:8448',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'enable_lm_head_tp_in_adp': False,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 9256,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.9,
+                    'tokens_per_block': 128,
+                },
+                'cuda_graph_config': {
+                    'enable_padding':
+                    True,
+                    'batch_sizes': [
+                        1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96,
+                        104, 112, 120, 128
+                    ],
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+                'stream_interval': 100,
+                'num_postprocess_workers': 4,
+            }
+        },
+        # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
+        # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
+        # backend (see accuracy/test_llm_api_pytorch.py::TestGLM52).
+        # Spec decoding is intentionally left off so the sweep measures kernel
+        # time rather than MTP acceptance rate.
+        {
+            'patterns': ['glm_5.2_fp4'],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_chunked_prefill': True,
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+                'max_seq_len': 10240,
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.7,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 128,
+                },
+            }
+        },
+        # MiniMax-M3 NVFP4 (MXFP8 base layers with NVFP4 routed experts, run on
+        # the CUTLASS MoE backend). Scoped to the NVFP4 checkpoint only; the
+        # MXFP8 checkpoint has its own block below and must not inherit the
+        # 'msa' implementation.
+        # The block-sparse attention path is mandatory (there is no dense
+        # fallback), it does not support KV-cache block reuse, and max_seq_len
+        # must be capped just above ISL+OSL -- left at the checkpoint default
+        # (1M) the CUDA-graph warmup decode allocates gigabyte-scale temporaries
+        # and capture fails with cudaErrorStreamCaptureUnsupported. Every NVFP4
+        # case keeps ISL+OSL <= 2048. See
+        # docs/source/deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md
+        {
+            'patterns': ['minimax_m3_fp4'],
+            'config': {
+                'trust_remote_code': True,
+                'enable_attention_dp': True,
+                'max_seq_len': 2560,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'sparse_attention_config': {
+                    'algorithm': 'minimax_m3',
+                    # 'msa' is the fmha_sm100 path that the MiniMax-M3 perf
+                    # work targets ('triton' is the reference implementation);
+                    # it requires SM100/SM103, so these cases are Blackwell-only.
+                    'implementation': 'msa',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.6,
+                    # The MSA path runs an FP8 KV cache.
+                    'dtype': 'fp8',
+                },
+                'stream_interval': 10,
+                'num_postprocess_workers': 4,
+            }
+        },
+        # Gemma 4 NVFP4: VSWA (1024-token sliding window) plus per-layer
+        # head_dim 256/512. The FLASHINFER backend is selected by the model's
+        # own get_model_defaults(), so it is not repeated here. KV-cache reuse
+        # is disabled to match the validated accuracy configuration.
+        {
+            'patterns': ['gemma_4_'],
+            'config': {
+                'enable_chunked_prefill': True,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'enable_partial_reuse': False,
+                    'free_gpu_memory_fraction': 0.6,
+                },
+            }
+        },
+        # DeepSeek R1 models with MTP speculative decoding
+        {
+            'patterns': [
+                'deepseek_r1-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-reqs:10-ep:4-gpus:8',
+                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8'
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'cuda_graph_config': {},
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3
+                }
+            }
+        },
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-reqs:20-con:1-ep:1-gpus:4'
+            ],
+            'config': {
+                'enable_iter_perf_stats': True,
+                'print_iter_log': False,
+                'cuda_graph_config': {
+                    'max_batch_size': 16,
+                    'enable_padding': False
+                },
+                'moe_config': {
+                    'max_num_tokens': 32768
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3
+                },
+                'disable_overlap_scheduler': True,
+                'enable_autotuner': True,
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.6,
+                    'enable_block_reuse': True,
+                    'enable_partial_reuse': False
+                },
+                'enable_chunked_prefill': True
+            }
+        },
+        # DeepSeek R1 models with large batch sizes and cuda graph padding
+        {
+            'patterns': [
+                'deepseek_r1_fp8-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-gpus:8',
+                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-gpus:8'
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
+                }
+            }
+        },
+        # DeepSeek R1 model with specific batch size 128
+        {
+            'patterns':
+            'deepseek_r1_fp8-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-reqs:5120-con:1024-ep:8-gpus:8',
+            'config': {
+                'enable_attention_dp': True,
+                'cuda_graph_config': {
+                    'batch_sizes': [128]
+                }
+            }
+        },
+        # Deepseek R1 model with chunked prefill
+        {
+            'patterns': [
+                'deepseek_r1_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_r1_fp8-bench-pytorch-float8-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000',
+                'deepseek_v3_lite_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_v3_lite_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:5000,500',
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:256-maxnt:1024-kv_frac:0.85-input_output_len:2000,2000',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_chunked_prefill': True,
+            }
+        },
+        # Deepseek R1 NVFP4 with chunked prefill, large seq len, and fp8 KV cache
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:4096-kv_frac:0.80-input_output_len:8192,512-reqs:3000-ep:2-tp:4-gpus:4',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_chunked_prefill': True,
+                'max_num_tokens': 4096,
+                'max_batch_size': 32,
+                'max_seq_len': 81920,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'free_gpu_memory_fraction': 0.80,
+                    'enable_block_reuse': False,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 32,
+                },
+            }
+        },
+        # Deepseek R1 model with CUTLASS backend
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:512-maxnt:5220-input_output_len:4000,2000',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                    'max_num_tokens': 3072,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32, 64],
+                },
+            }
+        },
+        # Deepseek_v3_lite_cases
+        {
+            'patterns':
+            'deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-reqs:200',
+            'config': {
+                'print_iter_log': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 512, 1024, 2048]
+                }
+            }
+        },
         # Model-specific cases with attention_dp disabled to prevent hangs
         {
             'patterns': [
