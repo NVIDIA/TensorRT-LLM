@@ -109,6 +109,9 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
+# Environment variable to control the benchmark disagg fill target.
+BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME = "TLLM_BENCHMARK_REQ_QUEUES_SIZE"
+
 # Environment variable to control which ranks print step logging.
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
@@ -732,8 +735,7 @@ class PyExecutor:
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
-        self.benchmark_req_queues_size = int(
-            os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
+        self._configure_benchmark_req_queues_size()
 
         # list of requests in each PP micro batch
         self.num_micro_batches = max(self.dist.pp_size,
@@ -3717,7 +3719,7 @@ class PyExecutor:
                     f"one or more requests are waiting for KV cache allocation "
                     f"on a model-parallel rank whose scheduler could not fit "
                     f"any of them. Increase free_gpu_memory_fraction or reduce "
-                    f"TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
+                    f"{BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} (currently "
                     f"{self.benchmark_req_queues_size}).")
                 logger.error(error_msg)
                 # Fail all active and waiting requests on every rank so every
@@ -4964,6 +4966,30 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
+    def _get_request_admission_capacity(self) -> int:
+        """Return the maximum number of distinct requests admitted at once."""
+        if self.enable_attention_dp:
+            return self.dist.tp_size * self.max_num_active_requests
+        return self.max_num_active_requests
+
+    def _configure_benchmark_req_queues_size(self) -> None:
+        """Clamp the benchmark fill target to the request admission ceiling."""
+        requested_fill_target = int(
+            os.environ.get(BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME, 0))
+        admission_capacity = self._get_request_admission_capacity()
+        self.benchmark_req_queues_size = min(requested_fill_target,
+                                             admission_capacity)
+
+        if (requested_fill_target > self.benchmark_req_queues_size
+                and self.dist.rank == 0):
+            logger.warning(
+                f"[PyExecutor] {BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME} "
+                f"requested fill target {requested_fill_target} exceeds the "
+                f"executor request admission capacity {admission_capacity}; "
+                f"using effective fill target "
+                f"{self.benchmark_req_queues_size} to prevent an unreachable "
+                f"benchmark disagg fill gate.")
+
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
@@ -4971,12 +4997,9 @@ class PyExecutor:
         all_ranks_num_active_requests: Optional[List[int]] = None
     ) -> List[RequestQueueItem]:
         """Pop requests from waiting_queue based on available capacity."""
-        if self.enable_attention_dp:
-            total_max = self.dist.tp_size * self.max_num_active_requests
-        else:
-            total_max = self.max_num_active_requests
+        admission_capacity = self._get_request_admission_capacity()
 
-        max_new_requests = total_max - total_num_active_requests
+        max_new_requests = admission_capacity - total_num_active_requests
 
         # Benchmark disagg fill-phase admission throttle (slow-start ramp).
         if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
@@ -4984,7 +5007,8 @@ class PyExecutor:
             if self._fill_admit_cap == 0:
                 self._fill_admit_cap = self.dist.tp_size
             else:
-                self._fill_admit_cap = min(self._fill_admit_cap * 2, total_max)
+                self._fill_admit_cap = min(self._fill_admit_cap * 2,
+                                           admission_capacity)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
         return get_from_waiting_queue(
@@ -5271,6 +5295,63 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    def _get_ctx_mla_kv_len_cap(self):
+        """Cap on the summed context attended-KV length (total_kv_len) per forward step, cached.
+
+        The KV-cache estimator is the single decision point: it reserves the fp8 context-MLA workspace only
+        when KV-cache reuse can grow it past the profiled floor, and carries the exact token cap that reserve
+        covers onto the KV manager as `fp8_ctx_mla_kv_len_cap` (`min(L_cap, budget/(k+w))`). The scheduler
+        reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
+        (`blocks_in_primary_pool` forwards `get_page_index_upper_bound`, not the available-page count).
+        A carried value of None -- non-fp8-MLA model, no reservation needed (reuse off / chunked prefill),
+        or estimation skipped -- means no admission cap is applied.
+        """
+        cap = getattr(self, "_ctx_mla_kv_len_cap", "unset")
+        if cap != "unset":
+            return cap
+        if getattr(self, "is_warmup", False):
+            # Estimation/warmup runs fresh-prefill dummies against a throwaway manager that reserved
+            # nothing; don't cap them (and don't cache -- real serving recomputes from the real manager).
+            return None
+        carried = getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None)
+        self._ctx_mla_kv_len_cap = int(carried) if carried else None
+        return self._ctx_mla_kv_len_cap
+
+    @staticmethod
+    def _context_attended_kv_len(ctx_req) -> int:
+        """Attended KV length this context request contributes to total_kv_len this step.
+
+        Cached prefix (post-reuse begin position) plus this chunk's new tokens, clamped to the prompt length.
+        V1 leaves `context_current_position` at 0 with the reuse credit in `estimated_reusable_tokens` (first
+        chunk only); V2 has already advanced `context_current_position`.
+        """
+        begin = ctx_req.context_current_position
+        if ctx_req.is_first_context_chunk:
+            begin = max(begin, ctx_req.estimated_reusable_tokens)
+        attended = begin + ctx_req.context_chunk_size
+        return min(attended, ctx_req.orig_prompt_len)
+
+    def _cap_context_by_total_kv_len(self, context_requests):
+        """Trim scheduled context requests so their summed attended KV length stays within the fp8
+        context-MLA workspace reservation (KV-cache reuse can push total_kv_len far past `max_num_tokens`).
+        The first request is always kept: it attends at most `max_seq_len` and at most its pool, both covered
+        by the cap, so one request always fits and forward progress is guaranteed. Deferred requests stay
+        active and retry next iteration, mirroring `_waiting_requests`.
+        """
+        cap = self._get_ctx_mla_kv_len_cap()
+        if cap is None or len(context_requests) <= 1:
+            return context_requests
+        cumulative = 0
+        for i, ctx_req in enumerate(context_requests):
+            cumulative += self._context_attended_kv_len(ctx_req)
+            if i > 0 and cumulative > cap:
+                logger.debug(
+                    f"Deferring {len(context_requests) - i} context request(s): summed attended "
+                    f"KV length {cumulative} would exceed the fp8 context-MLA workspace cap {cap}."
+                )
+                return context_requests[:i]
+        return context_requests
+
     @nvtx_range("_schedule")
     def _schedule(self):
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
@@ -5306,6 +5387,11 @@ class PyExecutor:
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
+
+        # Cap summed context attended-KV length so the fp8 context-MLA attention workspace stays within the
+        # headroom the estimator reserved for it (no-op for non-fp8-MLA models).
+        scheduled_context_requests = self._cap_context_by_total_kv_len(
+            scheduled_context_requests)
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = scheduler_output.encoder_requests
@@ -5778,7 +5864,30 @@ class PyExecutor:
         token_nums = None
         if (not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None
                 and self.max_num_tokens is not None):
-            token_nums = [self.max_num_tokens]
+            # max_num_tokens is the aggregate per-iteration budget and can
+            # exceed the legal capacity of one sequence.
+            token_num = min(
+                self.max_num_tokens,
+                self.model_engine.max_num_tokens,
+                self.model_engine.max_seq_len,
+                self.kv_cache_manager.max_seq_len,
+            )
+            # One-engine speculative decoding appends extra KV tokens after
+            # add_sequence_batch(). Keep them in the same block count that
+            # the capacity scheduler reserves from the prompt length.
+            extra_kv_tokens = self.kv_cache_manager.num_extra_kv_tokens
+            tokens_per_block = self.kv_cache_manager.tokens_per_block
+            block_capacity = ((token_num + tokens_per_block - 1) //
+                              tokens_per_block) * tokens_per_block
+            token_num = max(1, min(token_num, block_capacity - extra_kv_tokens))
+            token_nums = [token_num]
+
+        if not self._has_adp_dummy_kv_capacity(token_nums):
+            logger.warning_once(
+                "Unable to fit the complete attention-DP dummy KV allocation; "
+                "skipping this forward iteration and retrying",
+                key="attention_dp_dummy_insufficient_kv_capacity")
+            return
 
         if (not self._enable_dsv4_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
@@ -5801,8 +5910,7 @@ class PyExecutor:
         has_live_adp_dummy = any(
             request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
             for request in self.active_requests)
-        if has_live_adp_dummy or not self._has_adp_dummy_kv_capacity(
-                token_nums):
+        if has_live_adp_dummy:
             return
 
         try:
