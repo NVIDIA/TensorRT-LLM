@@ -2238,6 +2238,9 @@ class PyTorchModelEngine(ModelEngine):
         # token count, every sequence gets num_extra_kv_tokens +
         # num_extra_decoding_steps add_token calls, and generation dummies
         # additionally reserve max_draft_loop_tokens for the draft loop.
+        # In one-engine spec modes that is (max_draft_len - 1) extra KV
+        # tokens plus max_draft_len draft-loop tokens per gen dummy, i.e.
+        # 2 * max_draft_len - 1 on top of the single prompt token.
         # Under-counting these let warmup start an allocation that fails
         # midway and, before the partial-allocation cleanup existed,
         # permanently leaked most of the estimation-sized KV pool
