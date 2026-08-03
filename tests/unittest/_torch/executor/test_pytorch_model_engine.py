@@ -242,6 +242,7 @@ def _make_forward_only_engine(
     outputs = {"logits": object()}
     engine._forward_step = Mock(return_value=outputs)
     engine._execute_logit_post_processors = Mock()
+    engine.breakable_cuda_graph_runner = None
 
     runner = Mock()
     runner.enabled = runner_enabled
