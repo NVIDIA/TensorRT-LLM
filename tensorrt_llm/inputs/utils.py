@@ -8,7 +8,7 @@ from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import ParseResult, urlparse
 
 import numpy as np
 import soundfile
@@ -43,8 +43,8 @@ from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 logger = logging.get_logger(__name__)
 
 
-def load_base64_image(parsed_url: str) -> Image.Image:
-    _, data = parse_data_uri(urlunparse(parsed_url))
+def load_base64_image(parsed_url: ParseResult) -> Image.Image:
+    _, data = parse_data_uri(parsed_url)
     content = base64.b64decode(data)
     image = _load_and_convert_image(BytesIO(content))
     return image

@@ -29,7 +29,7 @@ from typing import (
     TypeVar,
     Union,
 )
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import ParseResult, unquote, urljoin, urlparse
 
 import aiohttp
 import numpy as np
@@ -586,7 +586,16 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
-def parse_data_uri(url: str) -> Tuple[str, str]:
+class UnsupportedDataURIEncodingError(NotImplementedError, ValueError):
+    """A data: URI whose payload is not base64-encoded.
+
+    Inherits NotImplementedError so callers already catching it keep working,
+    and ValueError so a malformed client payload maps to a client error rather
+    than an internal one.
+    """
+
+
+def parse_data_uri(url: Union[str, ParseResult]) -> Tuple[str, str]:
     """Parse an RFC 2397 data URI into its media type and base64 payload.
 
     The payload is returned as the still-encoded base64 string rather than as
@@ -594,7 +603,10 @@ def parse_data_uri(url: str) -> Tuple[str, str]:
     `BaseMediaIO.load_base64`, which decodes it per modality.
 
     Args:
-        url: A complete `data:` URI, e.g. `data:image/png;base64,iVBORw0...`.
+        url: A complete `data:` URI, e.g. `data:image/png;base64,iVBORw0...`,
+            or an already-parsed `ParseResult`. Callers holding a parsed URL
+            should pass it through rather than re-serializing it, since the
+            payload can be large.
 
     Returns:
         A `(media_type, data)` pair. `media_type` is the empty string for URIs
@@ -602,12 +614,14 @@ def parse_data_uri(url: str) -> Tuple[str, str]:
 
     Raises:
         ValueError: The URI has no `,` separating the header from the payload.
-        NotImplementedError: The payload is not base64-encoded.
+        UnsupportedDataURIEncodingError: The payload is not base64-encoded. This is
+            both a NotImplementedError and a ValueError.
     """
-    path = urlparse(url).path
+    parsed = url if isinstance(url, ParseResult) else urlparse(url)
+    path = parsed.path
     if "," not in path:
         raise ValueError(
-            f"Malformed data URI {url[:64]!r}: expected "
+            f"Malformed data URI {parsed.geturl()[:64]!r}: expected "
             "'data:[<media type>][;<parameter>]*,<data>', but found no ',' separating "
             "the header from the payload."
         )
@@ -617,7 +631,7 @@ def parse_data_uri(url: str) -> Tuple[str, str]:
     media_type, *parameters = data_spec.split(";")
     # Parameter names are case-insensitive per RFC 2045.
     if not any(parameter.lower() == "base64" for parameter in parameters):
-        raise NotImplementedError("Only base64 data URLs are supported for now.")
+        raise UnsupportedDataURIEncodingError("Only base64 data URLs are supported for now.")
     return media_type, data
 
 

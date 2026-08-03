@@ -29,6 +29,7 @@ import tensorrt_llm.inputs.utils as utils_module
 from tensorrt_llm.inputs.media_io import (
     AudioMediaIO,
     ImageMediaIO,
+    UnsupportedDataURIEncodingError,
     _get_aiohttp_session,
     parse_data_uri,
 )
@@ -129,9 +130,10 @@ class TestParseDataUri:
         """A well-formed but unencoded data URI is unsupported, not malformed."""
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             parse_data_uri("data:image/png,hello")
-        # Regression guard: this used to surface as ValueError("not enough
-        # values to unpack"), indistinguishable from a genuinely broken URI.
-        assert not isinstance(excinfo.value, ValueError)
+        # NotImplementedError so callers already catching it keep working;
+        # ValueError so a bad client payload maps to a client error.
+        assert isinstance(excinfo.value, NotImplementedError)
+        assert isinstance(excinfo.value, ValueError)
 
     def test_missing_comma_raises_readable_value_error(self):
         with pytest.raises(ValueError, match="Malformed data URI") as excinfo:
@@ -139,6 +141,54 @@ class TestParseDataUri:
         message = str(excinfo.value)
         assert "unpack" not in message, "should not leak a tuple-unpacking error"
         assert "data:image/png;base64" in message
+
+    def test_malformed_and_unsupported_are_distinguishable_by_type(self):
+        """The two failure modes must not collapse into one bare ValueError.
+
+        Both are ValueErrors so either maps to a client error, but only the
+        unsupported-encoding case is an UnsupportedDataURIEncodingError. Callers can
+        therefore tell them apart without matching on message text.
+        """
+        with pytest.raises(ValueError) as malformed:
+            parse_data_uri("data:image/png;base64")  # no comma
+        with pytest.raises(ValueError) as unsupported:
+            parse_data_uri("data:image/png,hello")  # comma, but not base64
+
+        assert type(malformed.value) is ValueError
+        assert not isinstance(malformed.value, UnsupportedDataURIEncodingError)
+        assert isinstance(unsupported.value, UnsupportedDataURIEncodingError)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "data:image/jpeg;charset=utf-8;base64,QUJD",
+            "data:;base64,QUJD",
+            "data:audio/wav;codecs=opus;base64,QUJD",
+            "data:image/png,hello",
+            "data:image/png;base64",
+        ],
+    )
+    def test_accepts_str_and_parseresult_identically(self, url):
+        """Callers holding a parsed URL pass it through, avoiding a re-serialize."""
+
+        def outcome(value):
+            try:
+                return ("ok", parse_data_uri(value))
+            except Exception as exc:  # noqa: BLE001 - comparing failure modes
+                return (type(exc), str(exc))
+
+        assert outcome(url) == outcome(urlparse(url))
+
+
+class TestUnsupportedDataURIEncodingError:
+    def test_subclasses_both_not_implemented_error_and_value_error(self):
+        assert issubclass(UnsupportedDataURIEncodingError, NotImplementedError)
+        assert issubclass(UnsupportedDataURIEncodingError, ValueError)
+
+    def test_is_caught_by_either_except_clause(self):
+        for exception_type in (NotImplementedError, ValueError):
+            with pytest.raises(exception_type):
+                raise UnsupportedDataURIEncodingError("boom")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -169,8 +219,9 @@ class TestLoadBase64Image:
     def test_non_base64_raises_not_implemented(self):
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             load_base64_image(urlparse("data:image/png,hello"))
-        # Previously ValueError("not enough values to unpack").
-        assert not isinstance(excinfo.value, ValueError)
+        # Both, so callers catching either builtin behave sensibly.
+        assert isinstance(excinfo.value, NotImplementedError)
+        assert isinstance(excinfo.value, ValueError)
 
     def test_base64_as_parameter_value_raises_not_implemented(self):
         with pytest.raises(NotImplementedError, match="Only base64 data URLs"):
@@ -179,11 +230,22 @@ class TestLoadBase64Image:
     def test_empty_spec_raises_not_implemented(self):
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             load_base64_image(urlparse("data:,hello"))
-        assert not isinstance(excinfo.value, ValueError)
+        assert isinstance(excinfo.value, NotImplementedError)
+        assert isinstance(excinfo.value, ValueError)
 
     def test_missing_comma_raises_value_error(self):
         with pytest.raises(ValueError, match="Malformed data URI"):
             load_base64_image(urlparse("data:image/png;base64"))
+
+    def test_parsed_url_is_not_re_serialized(self, monkeypatch):
+        """The ParseResult is handed to the parser as-is, not urlunparse'd back."""
+        monkeypatch.setattr(
+            media_io_module,
+            "urlparse",
+            lambda _: pytest.fail("parse_data_uri re-parsed an already-parsed URL"),
+        )
+        url = _data_uri("image/jpeg;base64", _make_jpeg_bytes())
+        assert isinstance(load_base64_image(urlparse(url)), Image.Image)
 
 
 class TestLoadBase64Video:
@@ -215,7 +277,8 @@ class TestLoadBase64Video:
     def test_non_base64_raises_not_implemented(self):
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             load_base64_video("data:video/mp4,hello")
-        assert not isinstance(excinfo.value, ValueError)
+        assert isinstance(excinfo.value, NotImplementedError)
+        assert isinstance(excinfo.value, ValueError)
 
     def test_base64_as_parameter_value_raises_not_implemented(self):
         with pytest.raises(NotImplementedError, match="Only base64 data URLs"):
@@ -224,7 +287,8 @@ class TestLoadBase64Video:
     def test_empty_spec_raises_not_implemented(self):
         with pytest.raises(NotImplementedError, match="Only base64 data URLs") as excinfo:
             load_base64_video("data:,hello")
-        assert not isinstance(excinfo.value, ValueError)
+        assert isinstance(excinfo.value, NotImplementedError)
+        assert isinstance(excinfo.value, ValueError)
 
     def test_missing_comma_raises_value_error(self):
         with pytest.raises(ValueError, match="Malformed data URI"):
