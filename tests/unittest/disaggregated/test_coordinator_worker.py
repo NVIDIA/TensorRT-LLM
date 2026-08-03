@@ -624,9 +624,7 @@ def test_coordinator_session_gives_up_idle_connections_before_the_server():
         ):
             dc.make_coordinator_session(url)
         assert connector.call_args.kwargs["limit"] == 0
-        assert (
-            connector.call_args.kwargs["keepalive_timeout"] == dc.COORDINATOR_KEEPALIVE_TIMEOUT_S
-        )
+        assert connector.call_args.kwargs["keepalive_timeout"] == dc.COORDINATOR_KEEPALIVE_TIMEOUT_S
 
 
 @pytest.mark.asyncio
