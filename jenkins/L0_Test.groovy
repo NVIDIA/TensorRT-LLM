@@ -2120,7 +2120,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     # Record the verdict and always exit 0: a re-run can't change a
                     # terminal state, so numRetries should only fire on transport loss.
-                    printf '%s %s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
+                    printf '%s|%s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
                     else
@@ -2157,10 +2157,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     )
                 )
 
-                // Verdict: "<STATE> <EXIT_CODE>"; success is COMPLETED + exit 0.
+                // Verdict: "<STATE>|<EXIT_CODE>"; success is COMPLETED + exit 0.
+                // STATE may contain spaces.
                 def jobResult = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_result.txt", stageName, 3)
-                def resultFields = jobResult ? jobResult.tokenize(' ') : []
-                def jobState = resultFields ? resultFields[0] : null
+                def resultFields = jobResult ? jobResult.tokenize('|') : []
+                def jobState = resultFields ? resultFields[0]?.tokenize(' ')?.getAt(0) : null
                 def jobExit = resultFields.size() > 1 ? resultFields[1] : null
                 if (jobState != "COMPLETED" || jobExit != "0") {
                     // Verdict unreadable: fall back to an authoritative sacct query.
