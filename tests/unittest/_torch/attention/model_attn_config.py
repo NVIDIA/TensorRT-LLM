@@ -57,9 +57,9 @@ elsewhere):
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-AttentionPhase = Literal["ctx", "gen"]
-
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, SparseAttentionConfig
+
+AttentionPhase = Literal["ctx", "gen"]
 
 
 @dataclass(frozen=True)
@@ -89,6 +89,14 @@ class ModelAttnConfig:
     # User-facing sparse config, lowered by production `to_sparse_params()`. The
     # sparse sweep derives its other parameters from this and `is_mla`.
     sparse_attention_config: Optional[SparseAttentionConfig] = None
+
+    @property
+    def sparse_topk(self) -> Optional[int]:
+        """Per-token selection budget (``index_topk``) from the sparse config."""
+        cfg = self.sparse_attention_config
+        if cfg is None:
+            return None
+        return cfg.index_topk
 
 
 # ---------------------------------------------------------------------------

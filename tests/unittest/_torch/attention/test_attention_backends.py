@@ -90,7 +90,7 @@ _SPARSE_USE_KVM_V2 = False
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
     if cfg.sparse_attention_config is not None:
-        return _phases(cfg.sparse_attention_config.sparse_topk + 32, gen_len=1)
+        return _phases(cfg.sparse_topk + 32, gen_len=1)
     if cfg.mask != "sliding":
         return _PHASES
 

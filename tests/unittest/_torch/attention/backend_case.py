@@ -150,10 +150,11 @@ class BackendCase:
 
     @property
     def sparse_topk(self) -> Optional[int]:
-        """Per-token selection budget, resolved from the sparse config."""
-        if self.sparse_attention_config is None:
+        """Per-token selection budget (``index_topk``) from the sparse config."""
+        cfg = self.sparse_attention_config
+        if cfg is None:
             return None
-        return self.sparse_attention_config.sparse_topk
+        return cfg.index_topk
 
     @property
     def prompt_lens(self) -> List[int]:
