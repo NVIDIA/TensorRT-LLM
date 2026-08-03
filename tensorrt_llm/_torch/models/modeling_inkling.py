@@ -553,44 +553,6 @@ def _module_excluded_from_quant(model_config: ModelConfig, name: str) -> bool:
 # ----------------------------------------------------------------------------
 # Routing method
 # ----------------------------------------------------------------------------
-def _inkling_trtllm_moe_backend() -> bool:
-    """True when the routed NVFP4 experts should run on the trtllm-gen
-    (blockScaleMoe) MoE kernel instead of the default CUTLASS backend.
-
-    Gated by ``INKLING_MOE_BACKEND=TRTLLM``. The trtllm-gen kernel is the same
-    family SGLang runs (``flashinfer_trtllm_routed``) and has a deterministic
-    finalize/combine, which removes the CUTLASS fused-combine cross-row
-    non-determinism that craters served nc>1 GSM8K. When the env is unset the
-    default CUTLASS path is byte-for-byte unchanged.
-    """
-    return os.environ.get("INKLING_MOE_BACKEND", "").upper() == "TRTLLM"
-
-
-def _moe_config_with_trtllm_backend(model_config: ModelConfig) -> ModelConfig:
-    """Return a shallow ``ModelConfig`` copy whose ``moe_backend`` is ``TRTLLM``.
-
-    ``ModelConfig`` freezes itself after construction (``_frozen=True``) and its
-    ``__setattr__`` rejects every field except a small documented allowlist
-    (``_frozen``/``extra_attrs``/``pretrained_config``/``quant_config``), so the
-    naive ``mc = copy.copy(model_config); mc.moe_backend = "TRTLLM"`` raises
-    ``AttributeError: Cannot modify ModelConfig.'moe_backend' - instance is
-    frozen``. Use the sanctioned escape hatch named in
-    ``ModelConfig.__setattr__``: unfreeze the *copy*, retarget only the scalar
-    ``moe_backend``, then re-freeze. ``copy.copy`` is a shallow copy, so the
-    ``_frozen`` bool on the copy is independent of the original -- the global
-    config the rest of the model shares stays frozen and byte-unchanged on the
-    default CUTLASS backend; only the routed-expert ``create_moe`` build below
-    sees the trtllm-gen selection.
-    """
-    moe_config = copy.copy(model_config)
-    # '_frozen' is explicitly writable even on a frozen instance (see
-    # ModelConfig.__setattr__); flip it on the copy, set the field, re-freeze.
-    moe_config._frozen = False
-    moe_config.moe_backend = "TRTLLM"
-    moe_config._frozen = True
-    return moe_config
-
-
 class InklingMoeRoutingMethod(BaseMoeRoutingMethod):
     """Sigmoid gate + additive-bias top-k selection + log-sigmoid renorm.
 
@@ -618,13 +580,6 @@ class InklingMoeRoutingMethod(BaseMoeRoutingMethod):
         self._callable_gate_bias = callable_gate_bias
         self._callable_global_scale = callable_global_scale
         self.route_scale = route_scale
-        # When the trtllm-gen MoE backend is selected, the routed experts run the
-        # blockScaleMoe kernel with EXTERNALLY precomputed routing, so the routing
-        # must be computed here (separated routing) and tagged with the Inkling
-        # routing enum. CUTLASS (default) also computes routing via ``apply`` but
-        # keeps ``Unspecified`` and integrated (non-separated) dispatch, so its
-        # behavior is unchanged.
-        self._trtllm_backend = _inkling_trtllm_moe_backend()
 
     def apply(
         self, router_logits: torch.Tensor, input_ids=None
@@ -643,24 +598,9 @@ class InklingMoeRoutingMethod(BaseMoeRoutingMethod):
 
     @property
     def routing_method_type(self):
-        # TRTLLM backend (INKLING_MOE_BACKEND=TRTLLM): tag the routing with the
-        # dedicated Inkling enum so the blockScaleMoe kernel dispatches its
-        # precomputed-routing branch (``InklingSinkRenorm`` in
-        # runner.h/runner.cu) -- permute + fp4 GEMM + deterministic finalize on
-        # the topk_ids/topk_weights this method precomputes. Default (CUTLASS):
-        # keep ``Unspecified`` so CUTLASS/VANILLA compute routing torch-side via
-        # :meth:`apply` exactly as before (byte-unchanged).
-        if self._trtllm_backend:
-            return RoutingMethodType.InklingSinkRenorm
+        # CUTLASS computes the dispatch torch-side via :meth:`apply`, so the
+        # kernel needs no routing enum of its own.
         return RoutingMethodType.Unspecified
-
-    @property
-    def requires_separated_routing(self) -> bool:
-        # Force the trtllm-gen backend to compute routing here (via
-        # :meth:`apply`) and pass precomputed (topk_ids, topk_weights) to the
-        # kernel rather than a routing_logits tensor. Only when the trtllm-gen
-        # backend is selected; CUTLASS keeps the default (False).
-        return self._trtllm_backend
 
 
 def inkling_joint_renorm(
@@ -1585,16 +1525,8 @@ class InklingMoE(nn.Module):
         # itself diverges ~0.3% from the full TP=1 GEMM (magnitude-dependent, in
         # the FP4 weight/scale sharding, not the reduce), so bf16 all-reduce
         # cancellation is not the cause.
-        # Select the routed-expert MoE backend. Default: whatever
-        # ``model_config.moe_backend`` resolves to (CUTLASS for this checkpoint).
-        # When ``INKLING_MOE_BACKEND=TRTLLM`` route the NVFP4 routed experts
-        # (layers 3..65) through the trtllm-gen blockScaleMoe kernel via a
-        # frozen-safe shallow model_config copy so the global config is not
-        # mutated (see ``_moe_config_with_trtllm_backend``). The bf16 layer-2
-        # experts (no quant) auto-fall back to CUTLASS inside ``resolve_moe_cls``.
-        moe_model_config = model_config
-        if _inkling_trtllm_moe_backend():
-            moe_model_config = _moe_config_with_trtllm_backend(model_config)
+        # The routed experts run whatever ``model_config.moe_backend`` resolves
+        # to, which is CUTLASS for this checkpoint.
         self.experts = create_moe(
             routing_method=self.gate.routing_method,
             num_experts=self.num_routed,
@@ -1602,23 +1534,9 @@ class InklingMoE(nn.Module):
             intermediate_size=config.intermediate_size,
             dtype=config.torch_dtype,
             reduce_results=True,
-            model_config=moe_model_config,
+            model_config=model_config,
             override_quant_config=experts_quant_config,
             layer_idx=layer_idx,
-        )
-        # Log the resolved routed-expert backend (introspect ``.backend`` -- the
-        # ConfigurableMoE wrapper class name does not reveal it) so a run can
-        # confirm the trtllm-gen kernel is selected under INKLING_MOE_BACKEND=TRTLLM
-        # rather than silently falling back to CUTLASS. Pre-format with an
-        # f-string: the TRT-LLM logger appends args instead of %-interpolating.
-        backend_cls = type(getattr(self.experts, "backend", self.experts)).__name__
-        logger.info(
-            f"INKLING_MOE_SELECT layer={layer_idx} "
-            f"requested_backend={moe_model_config.moe_backend} "
-            f"experts_cls={type(self.experts).__name__} "
-            f"backend_cls={backend_cls} "
-            f"routing_type={self.gate.routing_method.routing_method_type.name} "
-            f"separated={self.gate.routing_method.requires_separated_routing}"
         )
         self.shared_experts = InklingSharedExperts(config)
 
@@ -2076,9 +1994,7 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         # per-slot short-conv/KV-state bug: identical decode rows fork first at
         # the first (bf16) MoE layer by ~1 ULP, which the deep residual stack
         # amplifies enough to flip the greedy argmax, while the dense layers and
-        # attention stay bit-identical. The deterministic-combine fix is the
-        # trtllm-gen backend (``INKLING_MOE_BACKEND=TRTLLM``), mirroring SGLang's
-        # flashinfer_trtllm_routed.
+        # attention stay bit-identical.
         return {
             "kv_cache_config": {"use_kv_cache_manager_v2": True},
         }
