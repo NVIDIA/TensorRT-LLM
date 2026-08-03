@@ -100,12 +100,28 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn("if (isInfraDryRun())", cbts_body)
         self.assertIn("return false", cbts_body)
 
+    def test_empty_single_gpu_filter_fails_only_for_dry_run(self):
+        single_branch_start = GROOVY.index("if (env.JOB_NAME ==~ /.*Single-GPU.*/)")
+        single_branch_end = GROOVY.index(
+            "} else if (env.JOB_NAME ==~ /.*Multi-GPU.*/)",
+            single_branch_start,
+        )
+        single_branch = GROOVY[single_branch_start:single_branch_end]
+        dry_guard = single_branch.index("else if (isInfraDryRun())")
+        dry_error = single_branch.index(
+            'error "Skip single-GPU testing. No test to run for infrastructure dry run."'
+        )
+        normal_skip = single_branch.index('echo "Skip single-GPU testing. No test to run."')
+        self.assertLess(dry_guard, dry_error)
+        self.assertLess(dry_error, normal_skip)
+
 
 class InfraDryRunParentPipelineTest(unittest.TestCase):
     def test_parameter_is_propagated_to_the_helper_filter(self):
         filter_setup = PARENT_GROOVY[
-            PARENT_GROOVY.index("boolean infraDryRun ="):
-            PARENT_GROOVY.index("String reuseBuild =")
+            PARENT_GROOVY.index("boolean infraDryRun =") : PARENT_GROOVY.index(
+                "String reuseBuild ="
+            )
         ]
         self.assertIn("params.InfraDryRun?.toString()?.toBoolean()", filter_setup)
         self.assertIn("(INFRA_DRY_RUN): infraDryRun", filter_setup)
@@ -159,9 +175,7 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
         self.assertIn("parameters += [", launch_job)
 
         start = PARENT_GROOVY.index("def launchStages")
-        launch_stages = PARENT_GROOVY[
-            start:PARENT_GROOVY.index("\npipeline {", start)
-        ]
+        launch_stages = PARENT_GROOVY[start : PARENT_GROOVY.index("\npipeline {", start)]
         expected_keys = {
             "x86_64": {
                 "dockerImage",
@@ -171,9 +185,7 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
             "SBSA": {"dockerImage", "wheelDockerImage"},
         }
         for arch, expected in expected_keys.items():
-            dry_call = launch_stages.index(
-                f'launchInfraDryRunTestJobs(pipeline, "{arch}"'
-            )
+            dry_call = launch_stages.index(f'launchInfraDryRunTestJobs(pipeline, "{arch}"')
             dry_map = launch_stages.rindex("def imageParameters = [", 0, dry_call)
             normal_stage = launch_stages.index(
                 f'testStageName = "[Test-{arch}-Single-GPU] Remote Run"',
@@ -191,13 +203,9 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
 
     def test_dry_run_branch_precedes_normal_single_gpu_gating(self):
         start = PARENT_GROOVY.index("def launchStages")
-        launch_stages = PARENT_GROOVY[
-            start:PARENT_GROOVY.index("\npipeline {", start)
-        ]
+        launch_stages = PARENT_GROOVY[start : PARENT_GROOVY.index("\npipeline {", start)]
         for arch in ("x86_64", "SBSA"):
-            dry_run_call = launch_stages.index(
-                f'launchInfraDryRunTestJobs(pipeline, "{arch}"'
-            )
+            dry_run_call = launch_stages.index(f'launchInfraDryRunTestJobs(pipeline, "{arch}"')
             build_call = launch_stages.rindex(
                 f'launchJob(pipeline, "/LLM/helpers/Build-{arch}"',
                 0,
@@ -230,11 +238,61 @@ class InfraDryRunParentPipelineTest(unittest.TestCase):
             setup.index("getCbtsResult("),
         )
         self.assertIn(
-            "!testFilter[INFRA_DRY_RUN]) {\n"
-            "                    collectTestResults(",
+            "!testFilter[INFRA_DRY_RUN]) {\n                    collectTestResults(",
             PARENT_GROOVY,
         )
         self.assertNotIn("L0_Stability", PARENT_GROOVY)
+
+    def test_dry_run_skips_changed_file_analysis(self):
+        setup = _function_body(
+            PARENT_GROOVY,
+            "setupPipelineEnvironment",
+            "mergeWaiveList",
+        )
+        first_guard = setup.index("if (testFilter[INFRA_DRY_RUN])")
+        second_guard = setup.index("if (testFilter[INFRA_DRY_RUN])", first_guard + 1)
+        changed_file_block = setup[first_guard:second_guard]
+        normal_path = changed_file_block.index("} else {")
+        self.assertIn("Changed-file analysis is skipped", changed_file_block[:normal_path])
+        self.assertIn("(MULTI_GPU_FILE_CHANGED)] = false", changed_file_block[:normal_path])
+        self.assertIn('(ONLY_ONE_GROUP_CHANGED)] = ""', changed_file_block[:normal_path])
+        self.assertIn("(AUTO_TRIGGER_TAG_LIST)] = []", changed_file_block[:normal_path])
+        for call in (
+            "getMultiGpuFileChanged(",
+            "getOnlyOneGroupChanged(",
+            "getAutoTriggerTagList(",
+        ):
+            self.assertGreater(changed_file_block.index(call), normal_path)
+
+    def test_dry_run_skips_waive_merge_and_release_check(self):
+        preparation = _function_body(PARENT_GROOVY, "preparation", "launchReleaseCheck")
+        waive_stage = preparation[preparation.index('stage("Merge Test Waive List")') :]
+        waive_guard = waive_stage.index("if (testFilter[INFRA_DRY_RUN])")
+        waive_skip = waive_stage.index("Skipping Merge Test Waive List")
+        waive_normal = waive_stage.index("mergeWaiveList(")
+        self.assertLess(waive_guard, waive_skip)
+        self.assertLess(waive_skip, waive_normal)
+
+        launch_stages_start = PARENT_GROOVY.index("def launchStages")
+        launch_stages = PARENT_GROOVY[
+            launch_stages_start : PARENT_GROOVY.index("\npipeline {", launch_stages_start)
+        ]
+        release_branch = launch_stages[
+            launch_stages.index('"Release-Check":') : launch_stages.index('"x86_64-Linux":')
+        ]
+        self.assertLess(
+            release_branch.index("if (testFilter[INFRA_DRY_RUN])"),
+            release_branch.index("launchReleaseCheck("),
+        )
+
+        release_mode = PARENT_GROOVY.index("if (isReleaseCheckMode)")
+        release_only = PARENT_GROOVY[
+            release_mode : PARENT_GROOVY.index("launchStages(this", release_mode)
+        ]
+        self.assertLess(
+            release_only.index("if (testFilter[INFRA_DRY_RUN])"),
+            release_only.index("launchReleaseCheck("),
+        )
 
 
 if __name__ == "__main__":

@@ -362,9 +362,16 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
         trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
     }
-    testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-    testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
-    testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    if (testFilter[INFRA_DRY_RUN]) {
+        pipeline.echo("Changed-file analysis is skipped for the infrastructure dry run.")
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = false
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = ""
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = []
+    } else {
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    }
     if (testFilter[INFRA_DRY_RUN]) {
         pipeline.echo("CBTS is skipped for the infrastructure dry run.")
     } else {
@@ -472,7 +479,11 @@ def preparation(pipeline, testFilter, globalVars)
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
         stage("Merge Test Waive List") {
-            mergeWaiveList(pipeline, globalVars)
+            if (testFilter[INFRA_DRY_RUN]) {
+                echo "Skipping Merge Test Waive List for the infrastructure dry run."
+            } else {
+                mergeWaiveList(pipeline, globalVars)
+            }
         }
     })
 }
@@ -1722,7 +1733,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     stages = [
         "Release-Check": {
             script {
-                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                if (testFilter[INFRA_DRY_RUN]) {
+                    echo "Skipping Release-Check for the infrastructure dry run."
+                    return
+                } else if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
                     return
                 }
@@ -2381,7 +2395,11 @@ pipeline {
                     if (isReleaseCheckMode) {
                         stage("Release-Check") {
                             script {
-                                launchReleaseCheck(this, globalVars)
+                                if (testFilter[INFRA_DRY_RUN]) {
+                                    echo "Skipping Release-Check for the infrastructure dry run."
+                                } else {
+                                    launchReleaseCheck(this, globalVars)
+                                }
                             }
                         }
                     } else {
