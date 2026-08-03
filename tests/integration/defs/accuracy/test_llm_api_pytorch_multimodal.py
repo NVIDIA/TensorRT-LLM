@@ -712,9 +712,11 @@ class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
         """NVFP4 accuracy on the MMMU vision benchmark (Blackwell).
 
         The vision path exercises image attach + placeholder expansion + fusion.
-        Reference is the SGLang baseline-off measurement the bring-up paired
-        against (see references/mmmu.yaml); Inkling is validated to match it
-        item-for-item.
+        The reference is TRT-LLM's own full-pool measurement (see
+        references/mmmu.yaml). Validation is on aggregate accuracy, not per-item
+        identity: 74 of the 858 pool items score differently from SGLang in both
+        directions, which is inherent to two different NVFP4 implementations
+        resolving near-ties differently deep in a long-CoT decode.
         """
         with LLM(
             self.MODEL_PATH,
