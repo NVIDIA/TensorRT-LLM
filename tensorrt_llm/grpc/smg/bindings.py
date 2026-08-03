@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,4 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""gRPC protocol integrations for TensorRT-LLM."""
+"""Generated protobuf bindings used by the SMG adapter."""
+
+from smg_grpc_proto.generated import trtllm_service_pb2, trtllm_service_pb2_grpc
+
+__all__ = ["trtllm_service_pb2", "trtllm_service_pb2_grpc"]

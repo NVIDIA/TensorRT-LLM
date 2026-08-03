@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""gRPC Request Manager for TensorRT-LLM.
+"""Request manager for the TensorRT-LLM SMG gRPC adapter.
 
 Manages request lifecycle for gRPC requests, converting between protobuf
 and TensorRT-LLM types. Designed for high-performance communication with
@@ -35,7 +35,7 @@ from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
-from . import trtllm_service_pb2 as pb2
+from .bindings import trtllm_service_pb2 as pb2
 
 
 class GrpcRequestManager:
