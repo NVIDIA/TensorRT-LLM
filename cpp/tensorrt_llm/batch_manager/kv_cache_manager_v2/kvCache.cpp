@@ -809,12 +809,13 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
         copySlotData(storageMgr, lvl, srcPage->cacheLevel, pgIdx, newSlot.slotId(), srcPage->slotId(), stream);
 
-        CachedCudaEvent readyEv(reinterpret_cast<CudaStream>(stream));
-        auto tempPage = makeShared<UncommittedPage>(*this, treeBlock->ordinal(), lcIdx, lvl, kDefaultBeamIndex);
-        tempPage->setSlot(newSlot);
+        newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
+        auto committed = makeShared<CommittedPage>(
+            &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
+        committed->setSlot(newSlot);
         // Drops the superseded page, deferred until the copy is issued: an
         // OutOfPagesError above must not destroy a usable shorter snapshot.
-        auto committed = tempPage->convertToCommitted(treeBlock, std::move(readyEv), numTokensInBlock);
+        treeBlock->replacePage(lcIdx, committed.get());
 
         // Schedule for eviction so eviction controller keeps a strong reference,
         // preventing the page from being destroyed.
