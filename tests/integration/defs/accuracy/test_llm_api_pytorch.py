@@ -4769,8 +4769,15 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(2, 1, 1, False, False, True)],
         ids=["tp2_ep1"])
-    def test_w4a8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
-                  overlap_scheduler):
+    def test_w4a8(
+        self,
+        tp_size: int,
+        pp_size: int,
+        ep_size: int,
+        attention_dp: bool,
+        cuda_graph: bool,
+        overlap_scheduler: bool,
+    ) -> None:
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
