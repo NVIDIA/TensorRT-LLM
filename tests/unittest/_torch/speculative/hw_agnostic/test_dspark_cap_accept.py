@@ -38,10 +38,11 @@ def _stats(mode=RaggedVerifyMode.CAP_ACCEPT):
 class _Meta:
     """Just the two fields `apply_accept_caps` reads."""
 
-    def __init__(self, caps=None, track_trim=True):
+    def __init__(self, caps=None, track_trim=True, rows=8):
         self.accept_caps = (None if caps is None else torch.tensor(
             caps, dtype=torch.int32))
-        self.accept_cap_trim = (torch.zeros(1, dtype=torch.int64)
+        # Persistent per-request buffer, sized like the engine's.
+        self.accept_cap_trim = (torch.zeros(rows, dtype=torch.int32)
                                 if track_trim else None)
 
 
@@ -72,7 +73,7 @@ def test_counts_inside_their_windows_are_untouched():
     meta = _Meta(caps=[6, 4, 6])
     apply_accept_caps(counts, 0, meta)
     assert counts.tolist() == [1, 3, 2]
-    assert int(meta.accept_cap_trim.item()) == 0
+    assert meta.accept_cap_trim[:3].tolist() == [0, 0, 0]
 
 
 def test_counts_beyond_their_windows_are_clamped_and_the_loss_accumulated():
@@ -80,18 +81,22 @@ def test_counts_beyond_their_windows_are_clamped_and_the_loss_accumulated():
     meta = _Meta(caps=[3, 5, 6])
     apply_accept_caps(counts, 0, meta)
     assert counts.tolist() == [3, 5, 2]
-    # Only the first request lost anything: 6 -> 3.
-    assert int(meta.accept_cap_trim.item()) == 3
+    # Only the first request lost anything: 6 -> 3. And we can say WHICH.
+    assert meta.accept_cap_trim[:3].tolist() == [3, 0, 0]
 
 
-def test_the_accumulator_is_a_running_total_across_steps():
-    """It mirrors a device counter that lives as long as the engine."""
+def test_each_step_overwrites_the_previous_step_s_losses():
+    """Per step, not cumulative: the buffer is what THIS step lost.
+
+    The host accumulates across steps. A buffer that added would double-count
+    every request still in the batch next step.
+    """
     meta = _Meta(caps=[2, 2])
     for _ in range(3):
         counts = torch.tensor([5, 5], dtype=torch.int32)
         apply_accept_caps(counts, 0, meta)
         assert counts.tolist() == [2, 2]
-    assert int(meta.accept_cap_trim.item()) == 3 * (3 + 3)
+        assert meta.accept_cap_trim[:2].tolist() == [3, 3]
 
 
 def test_context_requests_are_left_alone():
@@ -100,6 +105,8 @@ def test_context_requests_are_left_alone():
     meta = _Meta(caps=[2, 3])
     apply_accept_caps(counts, 2, meta)
     assert counts.tolist() == [9, 9, 2, 3], "a context count was clamped"
+    # Context slots are zeroed, not left stale.
+    assert meta.accept_cap_trim[:4].tolist() == [0, 0, 4, 3]
 
 
 def test_a_generation_free_batch_does_not_crash():
@@ -125,7 +132,7 @@ def test_nothing_is_lost_or_invented(accepted, window):
     meta = _Meta(caps=[window + 1])
     apply_accept_caps(counts, 0, meta)
     committed = int(counts[0])
-    trim = int(meta.accept_cap_trim.item())
+    trim = int(meta.accept_cap_trim[0])
     assert committed + trim == accepted + 1
     assert committed >= 1, "a step that commits nothing cannot make progress"
     assert committed <= window + 1
@@ -142,23 +149,56 @@ def test_the_cap_never_raises_a_count():
 # --- what the counters must say ---------------------------------------------
 
 
-def test_cap_trim_is_absorbed_from_the_device_counter_as_a_running_total():
-    """Assigned, not accumulated: the device counter is itself the total.
-
-    Adding would double-count on every periodic read, which is the shape of
-    bug that makes a metric drift slowly enough to be believed.
-    """
+def test_cap_trim_is_recorded_per_request():
     stats = _stats()
-    stats.record_acceptance(accepted=2, window=2)
-    stats.record_acceptance(accepted=1, window=4)
+    # Given 5, allowed 2 -> 3 accepted positions thrown away.
+    stats.record_acceptance(accepted=2, window=2, cap_trim=3)
+    # Died on its own inside a wide window: the schedule cost it nothing.
+    stats.record_acceptance(accepted=1, window=4, cap_trim=0)
 
-    stats.record_cap_trim_total(3)
     assert stats.cap_trim_tokens == 3
-    stats.record_cap_trim_total(7)
-    assert stats.cap_trim_tokens == 7, "reads must not accumulate"
-
+    assert stats.requests_cap_trimmed == 1
     assert stats.accept_len == pytest.approx(1.5)
-    assert stats.accept_loss_per_request == pytest.approx(3.5)
+    assert stats.accept_loss_per_request == pytest.approx(1.5)
+    # accept_len + accept_loss is what a no-trim run would have accepted.
+    assert (stats.accept_len +
+            stats.accept_loss_per_request) == pytest.approx(3.0)
+
+
+def test_the_same_total_loss_is_distinguished_by_its_shape():
+    """The reason this is per request at all.
+
+    Both runs lose 20 tokens over 10 requests. The first spreads it; the
+    second takes it all out of one request. A total cannot tell them apart,
+    and they mean opposite things about the planner.
+    """
+    spread = _stats()
+    for _ in range(10):
+        spread.record_acceptance(accepted=1, window=1, cap_trim=2)
+
+    concentrated = _stats()
+    concentrated.record_acceptance(accepted=1, window=1, cap_trim=20)
+    for _ in range(9):
+        concentrated.record_acceptance(accepted=3, window=5, cap_trim=0)
+
+    assert spread.cap_trim_tokens == concentrated.cap_trim_tokens == 20
+    assert spread.accept_loss_per_request == pytest.approx(
+        concentrated.accept_loss_per_request)
+
+    # ...and the shape separates them.
+    assert spread.cap_trim_concentration == pytest.approx(1.0)
+    assert concentrated.cap_trim_concentration == pytest.approx(0.1)
+    assert spread.cap_trim_max == 2
+    assert concentrated.cap_trim_max == 20
+    assert spread.cap_trim_hist == {2: 10}
+    assert concentrated.cap_trim_hist == {20: 1}
+
+
+def test_concentration_is_zero_when_nothing_was_measured():
+    stats = _stats(mode=RaggedVerifyMode.COMPACT)
+    stats.record_acceptance(accepted=3, window=5)
+    assert stats.cap_trim_concentration == 0.0
+    assert stats.cap_trim_max == 0
 
 
 def test_the_loss_is_absent_rather_than_zero_when_not_measured():
@@ -248,12 +288,32 @@ def test_the_active_gate_still_demands_a_saving_from_compact():
 
 def test_the_summary_carries_the_measurement():
     stats = _stats()
-    stats.record_acceptance(accepted=2, window=2)
-    stats.record_cap_trim_total(3)
+    stats.record_acceptance(accepted=2, window=2, cap_trim=3)
     summary = stats.summary()
     assert summary["mode"] == "cap-accept"
     assert summary["cap_trim_tokens"] == 3
     assert summary["accept_loss_per_request"] == pytest.approx(3.0)
+    for key in ("requests_cap_trimmed", "cap_trim_max", "cap_trim_hist",
+                "cap_trim_concentration"):
+        assert key in summary, f"{key} missing from the summary"
+
+
+def test_a_slot_left_unwritten_cannot_inherit_the_previous_occupant_s_loss():
+    """The stale-buffer hazard, guarded at the one place it can arise.
+
+    cap_trim_lens is persistent and slot-indexed. A step that produces no
+    caps -- static, or any other speculation mode -- must still write ZEROS
+    into this batch's slots, or a slot recycled to a new request would report
+    whatever its previous occupant lost.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSamplerBase
+
+    src = inspect.getsource(SpecSamplerBase.sample_async)
+    assert "zeros_like" in src and "cap_trim_lens" in src, (
+        "_process_outputs no longer writes zeros when the step produced no "
+        "cap_trim_lens; recycled slots will report a stale request's loss")
 
 
 def test_the_cuda_graph_padding_dummy_carries_a_cap():

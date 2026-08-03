@@ -47,6 +47,8 @@ class SampleStateTensorsSpec(SampleStateTensors):
 
     new_tokens_lens: torch.Tensor
     next_draft_tokens: torch.Tensor
+    #: cap-accept only; None on every other path.
+    cap_trim_lens: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -98,6 +100,11 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_new_tokens: torch.Tensor
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
+        #: cap-accept: per-request positions the verify window discarded.
+        #: Slot-indexed like new_tokens_lens, and rewritten for every slot in
+        #: the batch each step -- a slot left alone would hand the previous
+        #: occupant's loss to whoever holds it now.
+        cap_trim_lens: torch.Tensor
 
     def __init__(self, args: TorchSampler.Args, *, draft_len: int):
         """
@@ -124,6 +131,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
             next_draft_tokens=int_tensor((seq_slots, draft_tokens_size)),
             new_tokens_lens=int_tensor((seq_slots,)),
+            cap_trim_lens=int_tensor((seq_slots,)),
         )
 
     def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
@@ -237,6 +245,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens.tolist()
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
+        cap_trim_list = (state.host.cap_trim_lens.tolist()
+                         if state.host.cap_trim_lens is not None else None)
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
@@ -277,7 +287,9 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             if self.acceptance_stats is not None:
                 self.acceptance_stats.record_acceptance(
                     accepted=req.py_num_accepted_draft_tokens,
-                    window=verified_len if cap is None else int(cap))
+                    window=verified_len if cap is None else int(cap),
+                    cap_trim=(0 if cap_trim_list is None else
+                              cap_trim_list[req.py_seq_slot]))
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(
@@ -348,6 +360,18 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
         self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
         self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
+        # cap-accept: absent on every other path, and written as ZEROS then
+        # rather than skipped. The buffer is persistent and slot-indexed, so a
+        # slot left untouched would keep whatever the previous occupant lost
+        # and hand it to the current one -- the stale-buffer bug this branch
+        # has already paid for twice.
+        o_cap_trim = outputs.get("cap_trim_lens")
+        if o_cap_trim is None:
+            o_cap_trim = torch.zeros_like(o_new_tokens_lens)
+        else:
+            o_cap_trim = o_cap_trim[num_skip:num_skip + num_sampling_requests]
+        self.store.cap_trim_lens.index_copy_(
+            0, slots, o_cap_trim.to(self.store.cap_trim_lens.dtype))
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(
@@ -360,6 +384,9 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens=self._copy_to_host(self.store.new_tokens),
             new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
             next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+            # [max_num_sequences] int32 -- kilobytes next to new_tokens above,
+            # and it rides the same event, so no extra synchronization.
+            cap_trim_lens=self._copy_to_host(self.store.cap_trim_lens),
         )
         sampler_event = self._record_sampler_event()
 

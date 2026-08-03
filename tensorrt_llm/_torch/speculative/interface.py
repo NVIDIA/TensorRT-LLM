@@ -551,10 +551,14 @@ class SpecMetadata:
     # as if it were ragged -- one request's drafts attributed to another, with
     # no error anywhere.
     accept_caps: Optional[torch.Tensor] = None
-    # [1] int64 accumulator for positions the caps discarded, summed on device
-    # so the hot path never syncs. This is the exact acceptance the schedule
-    # cost, and the number ``compact`` cannot produce: there those positions
-    # are never scored.
+    # [batch] positions the cap discarded, PER REQUEST -- the exact acceptance
+    # the schedule cost each one, and the number ``compact`` cannot produce
+    # because it never scores those positions.
+    #
+    # Per request rather than a running total, because the total cannot tell
+    # "every request gave up a little" from "a few requests were cut to
+    # pieces" -- and those call for opposite conclusions about the planner,
+    # while summing to exactly the same number.
     accept_cap_trim: Optional[torch.Tensor] = None
 
     @property
@@ -1070,8 +1074,10 @@ def apply_accept_caps(num_accepted_tokens: torch.Tensor, num_contexts: int,
     exists to be. SGLang caps at the same point, before anything downstream
     reads the count.
 
-    In-place on the caller's tensor and on a persistent accumulator, so this is
-    safe to record into a CUDA graph and never synchronizes.
+    In-place on the caller's tensor and on persistent buffers, so this is safe
+    to record into a CUDA graph and never synchronizes. The per-request losses
+    ride back to the host on the sampler's existing copy, so measuring them
+    costs no sync of its own.
     """
     caps = getattr(spec_metadata, "accept_caps", None)
     if caps is None:
@@ -1083,7 +1089,12 @@ def apply_accept_caps(num_accepted_tokens: torch.Tensor, num_contexts: int,
     capped = torch.minimum(gen, caps)
     trim = getattr(spec_metadata, "accept_cap_trim", None)
     if trim is not None:
-        trim += (gen - capped).sum()
+        # Zero the context slots too. The buffer is persistent and the batch
+        # composition moves every step, so a slot left unwritten would carry
+        # the previous step's loss and be attributed to whoever holds it now.
+        rows = num_contexts + gen.shape[0]
+        trim[:rows].zero_()
+        trim[num_contexts:rows] = (gen - capped).to(trim.dtype)
     num_accepted_tokens[num_contexts:] = capped
 
 

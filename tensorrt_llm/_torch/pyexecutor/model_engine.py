@@ -727,16 +727,15 @@ class PyTorchModelEngine(ModelEngine):
                                                  dtype=torch.int,
                                                  device='cuda')
         # cap-accept: per-request acceptance ceilings for an UNTRIMMED batch,
-        # plus a device-side accumulator for the positions they discarded.
-        # Same stable-address requirement as the two above -- both are read and
-        # written inside the captured graph. The accumulator is int64 because
-        # it runs for the length of a benchmark, and it is only ever read back
-        # when the summary is logged, so the hot path never syncs on it.
+        # and the per-request positions those ceilings discarded. Same
+        # stable-address requirement as the two above -- both are read and
+        # written inside the captured graph. The losses ride back to the host
+        # on the sampler's existing copy, so nothing here ever syncs.
         self.accept_caps_cuda = torch.empty((self.batch_size + 1, ),
                                             dtype=torch.int,
                                             device='cuda')
-        self.accept_cap_trim_cuda = torch.zeros((1, ),
-                                                dtype=torch.int64,
+        self.accept_cap_trim_cuda = torch.zeros((self.batch_size + 1, ),
+                                                dtype=torch.int,
                                                 device='cuda')
         self.input_ids_cuda = torch.empty((self.max_num_tokens, ),
                                           dtype=torch.int,

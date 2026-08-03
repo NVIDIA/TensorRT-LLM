@@ -920,6 +920,16 @@ verify-all 的退化情形出现。
 
 代价是**不省任何算力**,所以它是诊断模式,永远不是服务配置。
 
+损失**逐请求**记录,不是只记总量:总量分不出「每个请求丢一点」和「少数请求被砍烂」,
+两者 `cap_trim_tokens` 相同而结论相反。因此另记 `requests_cap_trimmed` /
+`cap_trim_max` / `cap_trim_hist` / `cap_trim_concentration`。链路是
+`apply_accept_caps` 写持久 `[bs]` 缓冲 → worker 返回 `cap_trim_lens` → 采样器 store →
+随**已有的** host 拷贝回来,**不额外引入同步**。
+
+这里的真风险是**陈旧缓冲**:缓冲持久且按 slot 索引,不产出 caps 的步必须往本批次
+slot **写零**,否则 slot 回收给新请求后会报上一个占用者的损失——今晚已经踩过两次的
+同一类。`_process_outputs` 显式 `zeros_like`,有测试卡住。
+
 覆盖:`tests/unittest/_torch/speculative/hw_agnostic/test_dspark_cap_accept.py`
-(59 项,含 clamp 的全枚举不变式、context 请求不受影响、累加器是运行总量而非增量、
-两个计数器坑的回归)。dspark 全套 **306 passed**。**尚未 e2e 跑过。**
+(63 项,含 clamp 的全枚举不变式、context slot 清零、同一总量的两种分布可区分、
+三个计数器坑的回归)。dspark 全套 **335 passed**。**尚未 e2e 跑过。**

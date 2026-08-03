@@ -3503,13 +3503,6 @@ class PyExecutor:
             # and cannot reach it. Emit a periodic summary so the decision is
             # recoverable from the log, which is the only shared channel.
             if stats.steps_total and stats.steps_total % 32 == 0:
-                if cap_accept:
-                    # The only device read on this path, and deliberately not
-                    # per step: the accumulator is written inside acceptance,
-                    # so syncing on it there would serialize the very forward
-                    # the mode is supposed to leave untouched.
-                    stats.record_cap_trim_total(
-                        int(self.model_engine.accept_cap_trim_cuda.item()))
                 stats.log_summary(prefix="DSpark ragged verify [periodic]")
             self._maybe_assert_dspark_ragged_active(stats)
             fitted = None

@@ -838,10 +838,17 @@ class DSparkWorker(SpecWorkerBase):
             if saved_confidence is not None:
                 self._confidence_logits.copy_(saved_confidence)
 
-        return {
+        outputs = {
             "logits": raw_logits,
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+        # cap-accept only: what each request's window threw away, written by
+        # `apply_accept_caps` above. Rides the sampler's existing copy rather
+        # than a read of its own, so the measurement costs no synchronization.
+        cap_trim = getattr(spec_metadata, "accept_cap_trim", None)
+        if cap_trim is not None and spec_metadata.accept_caps is not None:
+            outputs["cap_trim_lens"] = cap_trim[:batch_size]
+        return outputs

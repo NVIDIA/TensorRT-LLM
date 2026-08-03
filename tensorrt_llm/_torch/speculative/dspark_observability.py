@@ -199,6 +199,15 @@ class DSparkRaggedStats:
         #: it stays 0 under ``compact``, where the honest answer is that the
         #: number is unknowable without re-running.
         self.cap_trim_tokens = 0
+        #: The distribution, not just the total. "Every request gave up a
+        #: little" and "a few were cut to pieces" sum to the same
+        #: cap_trim_tokens and mean opposite things about the planner: the
+        #: first is a tuning knob, the second is the scheduler concentrating
+        #: its whole cost on a subpopulation it selected. A total cannot tell
+        #: them apart, which is the reason this is kept per request at all.
+        self.requests_cap_trimmed = 0
+        self.cap_trim_max = 0
+        self.cap_trim_hist: Counter = Counter()
 
         #: Graph replay is the whole point of landing on a bucket; an eager
         #: step costs far more than the tokens it saved.
@@ -331,12 +340,20 @@ class DSparkRaggedStats:
         """How many different window sizes were ever handed out."""
         return len(self.verify_len_hist)
 
-    def record_acceptance(self, *, accepted: int, window: int) -> None:
+    def record_acceptance(self,
+                          *,
+                          accepted: int,
+                          window: int,
+                          cap_trim: int = 0) -> None:
         """Record one request's acceptance against the window it was given.
 
         Args:
             accepted: drafted positions accepted (excludes the bonus token).
             window: drafted positions the request was allowed to verify.
+            cap_trim: positions this request accepted that its window then
+                discarded. Non-zero only under ``cap-accept``, the one mode
+                that scores them; elsewhere 0 means "not measured", not "no
+                loss".
         """
         self.requests_scored += 1
         self.accepted_tokens += int(accepted)
@@ -344,17 +361,13 @@ class DSparkRaggedStats:
             self.requests_trimmed += 1
             if int(accepted) >= int(window):
                 self.trimmed_hit_ceiling += 1
-
-    def record_cap_trim_total(self, total: int) -> None:
-        """Absorb the device-side cap-accept accumulator.
-
-        Assigned, not added: the counter it mirrors runs for the lifetime of
-        the engine, so this is a running total rather than a delta. Reading it
-        costs a device-to-host copy, which is why the caller does it when the
-        summary is logged rather than every step -- the acceptance path itself
-        must never sync.
-        """
-        self.cap_trim_tokens = int(total)
+        cap_trim = int(cap_trim)
+        if cap_trim > 0:
+            self.cap_trim_tokens += cap_trim
+            self.requests_cap_trimmed += 1
+            self.cap_trim_hist[cap_trim] += 1
+            if cap_trim > self.cap_trim_max:
+                self.cap_trim_max = cap_trim
 
     @property
     def accept_len(self) -> float:
@@ -376,6 +389,19 @@ class DSparkRaggedStats:
         if not self.requests_scored:
             return 0.0
         return self.cap_trim_tokens / self.requests_scored
+
+    @property
+    def cap_trim_concentration(self) -> float:
+        """Share of scored requests that lost anything at all. ``cap-accept``.
+
+        Read it together with :attr:`accept_loss_per_request`. The same mean
+        loss at 0.9 concentration is a broad, mild trim; at 0.02 it is the
+        scheduler paying for its throughput out of two percent of the traffic.
+        Only the second is a problem, and the mean alone cannot see it.
+        """
+        if not self.requests_scored:
+            return 0.0
+        return self.requests_cap_trimmed / self.requests_scored
 
     @property
     def trim_regret_rate(self) -> float:
@@ -416,6 +442,10 @@ class DSparkRaggedStats:
             "trim_regret_rate": round(self.trim_regret_rate, 4),
             "cap_trim_tokens": self.cap_trim_tokens,
             "accept_loss_per_request": round(self.accept_loss_per_request, 4),
+            "requests_cap_trimmed": self.requests_cap_trimmed,
+            "cap_trim_max": self.cap_trim_max,
+            "cap_trim_hist": dict(sorted(self.cap_trim_hist.items())),
+            "cap_trim_concentration": round(self.cap_trim_concentration, 4),
             "graph_replays": self.graph_replays,
             "graph_eager": self.graph_eager,
             "fallbacks": dict(self.fallbacks),

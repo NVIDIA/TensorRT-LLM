@@ -193,10 +193,28 @@ drafter 状态,而主机只提交了 capped 前缀——输出因为验证是权
 单位与 `verify_lens` 一致:`num_accepted_tokens` 是「接受 draft 数 + 1」,所以窗口 `w`
 对应的 cap 是 `w + 1`。
 
-它产出 `compact` 结构上拿不到的数:`cap_trim_tokens`,即**被丢弃的、本可接受的位置数**
-——裁剪的真实接受代价。`compact` 下那些位置根本没算,只能用 `trim_regret_rate` 卡下界。
-该计数在设备端累加(`accept_cap_trim`,int64,持久),**只在打摘要时(每 32 步)读回**;
-在 acceptance 里同步会把这个模式本该原样保留的 forward 串行化。
+它产出 `compact` 结构上拿不到的数:**被丢弃的、本可接受的位置数**——裁剪的真实接受
+代价。`compact` 下那些位置根本没算,只能用 `trim_regret_rate` 卡下界。
+
+**逐请求记录,不是只记总量。** 理由是总量分不出这两种情况:
+
+| 500 个请求共丢 1000 | 含义 |
+|---|---|
+| 每个丢 2 | planner 均匀小幅收割,大概率是合理取舍 |
+| 20 个各丢 50、480 个丢 0 | planner **系统性掐死一小撮请求** |
+
+两者 `cap_trim_tokens` 和 `accept_loss_per_request` 完全相同,结论却相反。所以另外记
+`requests_cap_trimmed` / `cap_trim_max` / `cap_trim_hist` / `cap_trim_concentration`
+(有损失的请求占比):平均损失相同的情况下,concentration 0.9 是普遍轻微裁剪,0.02 是
+调度器拿 2% 的流量在补贴吞吐——只有后者是问题。
+
+链路:`apply_accept_caps` 写进持久 `[bs]` 缓冲 → DSpark worker 的返回字典
+`cap_trim_lens` → 采样器 store(slot 索引)→ 随**已有的** host 拷贝回来。因此这个测量
+**不额外引入任何同步**,也不需要设备端累加器。
+
+**陈旧缓冲是这里唯一的真风险**:缓冲持久且按 slot 索引,不产出 caps 的步(static、以及
+其它任何投机模式)必须往本批次的 slot **写零**而不是跳过,否则 slot 被回收给新请求后
+会报上一个占用者的损失。`_process_outputs` 里显式 `zeros_like`,并有测试卡住。
 
 代价是**不省任何算力**,所以它是诊断模式,永远不是服务配置。`assert_ragged_active()`
 的 `require_trim` 因此对该模式豁免,否则那条门在它唯一该跑的模式里恒不可满足。
