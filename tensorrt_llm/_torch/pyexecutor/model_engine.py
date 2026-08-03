@@ -3721,6 +3721,10 @@ class PyTorchModelEngine(ModelEngine):
         path exists to avoid.
         """
         runner = self.cuda_graph_runner
+        # Cleared on entry so that every early return leaves no stale
+        # value behind: the graph key reads this, and a bucket carried
+        # over from a previous step would key into the wrong graph.
+        runner.agreed_ragged_bucket = None
         if not runner.enabled or not verify_lens:
             return None
         if len(verify_lens) != len(generation_requests):
@@ -3800,6 +3804,18 @@ class PyTorchModelEngine(ModelEngine):
         # Remembered so a graph miss can report the shape it actually submitted
         # rather than just that one happened.
         self._dspark_last_total_tokens = int(bucket)
+        # The graph key uses THIS value rather than re-summing the
+        # per-request windows. Both used to be derived independently --
+        # the key walked generation_requests *after* padding was
+        # appended, while the fit worked from the allgathered peer
+        # stats -- so their agreement across attention-DP ranks was
+        # incidental rather than structural, and when they diverged the
+        # shape gate dropped every rank out of replay
+        # (peer_shape_mismatch: 2/265 steps without trimming, 16/318
+        # with). This value comes from data every rank allgathered and
+        # rules every rank runs identically, so it agrees by
+        # construction.
+        runner.agreed_ragged_bucket = int(bucket)
 
         # The CUDA-graph padding rows are appended later by _get_padded_batch,
         # which appends a *single shared dummy object*, so every pad row

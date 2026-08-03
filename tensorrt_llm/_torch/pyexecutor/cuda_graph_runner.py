@@ -298,13 +298,14 @@ class CUDAGraphRunner:
         """
         if not getattr(self.spec_config, "enable_ragged_verify", False):
             return None
-        total = 0
-        for request in batch.generation_requests:
-            verify_len = getattr(request, "py_verify_len", None)
-            if verify_len is None:
-                return None
-            total += 1 + int(verify_len)
-        return total if total else None
+        # The bucket the fit agreed on, not a fresh sum over the batch. Summing
+        # here walks generation_requests *after* _get_padded_batch has appended
+        # padding, so it is a second, independent derivation of a quantity every
+        # attention-DP rank must match exactly -- agreement was incidental. The
+        # fitted value is computed from allgathered peer stats by rules every
+        # rank runs identically, so it agrees by construction. None means this
+        # step is not ragged, which keeps the key exactly what it was.
+        return getattr(self, "agreed_ragged_bucket", None)
 
     @staticmethod
     def _local_draft_len(batch: ScheduledRequests) -> int:

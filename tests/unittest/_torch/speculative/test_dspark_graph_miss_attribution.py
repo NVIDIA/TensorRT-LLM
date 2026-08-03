@@ -133,3 +133,42 @@ def test_will_pad_to_rejects_row_counts_the_ladder_cannot_reach():
     assert not will(_Runner([256, 512], cfg_batch_size=256), 512, 300)
     assert not will(runner, 0, 10)
     assert not will(runner, 256, 0)
+
+
+def test_graph_key_uses_the_agreed_bucket_not_a_fresh_sum():
+    """Every attention-DP rank must key on the same bucket, by construction.
+
+    The key used to re-sum 1 + py_verify_len over generation_requests, which
+    walks the batch *after* padding is appended -- a second, independent
+    derivation of a value all ranks must match exactly. When the two
+    derivations diverged the shape gate dropped every rank out of replay
+    (peer_shape_mismatch: 2/265 steps without trimming, 16/318 with it, since
+    trimming widens the per-rank window spread). Reading the fitted value
+    instead makes agreement structural: it comes from allgathered peer stats
+    through rules every rank runs identically.
+    """
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+        CUDAGraphRunner
+
+    class _R:
+        spec_config = type("S", (), {"enable_ragged_verify": True})()
+
+    r = _R()
+    get = CUDAGraphRunner._ragged_verify_bucket
+
+    # Nothing fitted yet -> not ragged, key unchanged from the uniform one.
+    assert get(r, object()) is None
+
+    # A fitted bucket is returned verbatim, regardless of the batch contents:
+    # the batch is not even inspected, which is the point.
+    r.agreed_ragged_bucket = 449
+    assert get(r, object()) == 449
+
+    # Cleared between steps so a stale bucket cannot key into the wrong graph.
+    r.agreed_ragged_bucket = None
+    assert get(r, object()) is None
+
+    # Config gate still wins: a non-ragged engine keeps the original key shape.
+    r.agreed_ragged_bucket = 512
+    r.spec_config = type("S", (), {"enable_ragged_verify": False})()
+    assert get(r, object()) is None
