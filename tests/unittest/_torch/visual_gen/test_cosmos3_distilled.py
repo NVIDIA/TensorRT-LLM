@@ -24,6 +24,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     load_scheduler,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+from tensorrt_llm._torch.visual_gen.profiler import VisualGenProfiler
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
@@ -524,13 +525,15 @@ class _GeneratorRecordingScheduler(_AdditiveScheduler):
 
 
 def _denoise_ready_pipeline() -> Cosmos3OmniMoTPipeline:
+    """``denoise()`` drives its profiling windows through ``self._profiler``,
+    which ``BasePipeline.__init__`` owns — so a double that skips ``__init__``
+    must supply one. Unscoped (``TLLM_PROFILE_VISUAL_GEN_START_STOP`` unset) it
+    opens no window and leaves the loop's iteration a plain ``enumerate``."""
     return _bare_pipeline(
         pipeline_config=SimpleNamespace(visual_gen_mapping=None),
         cache_accelerator=None,
-        _predenoise_pending=False,
-        _postdenoise_pending=False,
         _is_warmup=False,
-        _profile_range=None,
+        _profiler=VisualGenProfiler(),
     )
 
 
