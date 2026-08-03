@@ -26,7 +26,10 @@ sys.path.insert(0, str(REPO_ROOT / "tests" / "integration"))
 from defs.perf import test_perf_sanity as perf_sanity  # noqa: E402
 
 
-def test_sentinel_timeout_falls_back_to_current_gen_logs(monkeypatch, tmp_path):
+def test_sentinel_timeout_falls_back_to_current_gen_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     benchmark_log = tmp_path / "trtllm-benchmark.0.0.log"
     benchmark_log.write_text("benchmark output", encoding="utf-8")
     outputs = ["benchmark output"]
@@ -54,9 +57,13 @@ def test_sentinel_timeout_falls_back_to_current_gen_logs(monkeypatch, tmp_path):
         "wait_for_gen_log_sentinels",
         lambda self: False,
     )
-    parse_calls = []
+    parse_calls: list[tuple[str, int, list[int]]] = []
 
-    def parse_device_step_time(output_dir, num_gen_servers, start_offsets):
+    def parse_device_step_time(
+        output_dir: str,
+        num_gen_servers: int,
+        start_offsets: list[int],
+    ) -> float:
         parse_calls.append((output_dir, num_gen_servers, start_offsets))
         return 7.25
 
