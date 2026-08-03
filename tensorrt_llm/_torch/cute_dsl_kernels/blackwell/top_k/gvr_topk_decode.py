@@ -3493,6 +3493,118 @@ class GvrTopKKernel:
         return thr_out, sel_out
 
     # ------------------------------------------------------------------
+    # _p4_coarse_rw - redundant-warp coarse bin search for the fused
+    # rank-and-scatter path. Same result as the high->low walk it
+    # replaces (the straddling bin and the count strictly above it),
+    # but staged once and then resolved lane-parallel on every warp:
+    # an idx-shuffle scan + ballot locate the target slice, a second
+    # scan + the unique crossing test locate the bin inside it. Two
+    # publish barriers and a bins_per_warp-deep serial LDS+IADD chain in
+    # a single lane disappear; integer sums are associative so every
+    # warp lands on the same answer bit-for-bit. Mirrors
+    # _kth_bin_search_rw, which does the same for the snap path.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _p4_coarse_rw(self, smem_hist, smem_wcnt, warp_id, lane):
+        kK = cutlass.const_expr(self.top_k)
+        kBins = cutlass.const_expr(self.kNumBins)
+        bins_per_warp = cutlass.const_expr(kBins // self.num_warps)
+
+        warp_bin_sum = cutlass.Int32(0)
+        if cutlass.const_expr(bins_per_warp % self.WARP_SIZE == 0):
+            for jm in cutlass.range_constexpr(bins_per_warp // self.WARP_SIZE):
+                bidx_s = (
+                    cutlass.Int32(kBins - 1)
+                    - warp_id * cutlass.Int32(bins_per_warp)
+                    - (lane + cutlass.Int32(jm * self.WARP_SIZE))
+                )
+                warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
+            warp_bin_sum = self.warp_reduce_sum_i32(warp_bin_sum)
+        else:
+            for jb in cutlass.range_constexpr(bins_per_warp):
+                bidx_s = (
+                    cutlass.Int32(kBins - 1)
+                    - warp_id * cutlass.Int32(bins_per_warp)
+                    - cutlass.Int32(jb)
+                )
+                warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
+        if lane == cutlass.Int32(0):
+            smem_wcnt[warp_id] = warp_bin_sum
+        cute.arch.barrier()
+
+        # locate the target slice (lane w holds slot w)
+        v_s = cutlass.Int32(0)
+        if lane < cutlass.Int32(self.num_warps):
+            v_s = smem_wcnt[lane]
+        run2 = v_s
+        for d2 in cutlass.range_constexpr(5):
+            off2 = cutlass.const_expr(1 << d2)
+            src2 = lane - cutlass.Int32(off2)
+            if src2 < cutlass.Int32(0):
+                src2 = cutlass.Int32(0)
+            up2 = cute.arch.shuffle_sync(run2, src2)
+            if lane >= cutlass.Int32(off2):
+                run2 = run2 + up2
+        m2 = cute.arch.vote_ballot_sync(run2 >= cutlass.Int32(kK))
+        tw = cutlass.Int32(self.num_warps - 1)
+        if m2 != cutlass.Uint32(0):
+            low2 = m2 & (cutlass.Uint32(0) - m2)
+            tw = cutlass.Int32(cute.arch.popc(low2 - cutlass.Uint32(1)))
+        incl_tw = cute.arch.shuffle_sync(run2, tw)
+        slot_tw = cute.arch.shuffle_sync(v_s, tw)
+        prefix = incl_tw - slot_tw
+
+        # locate the bin inside the target slice
+        ppl = cutlass.const_expr((bins_per_warp + self.WARP_SIZE - 1) // self.WARP_SIZE)
+        cnt_frag = cute.make_fragment((ppl,), cutlass.Int32)
+        my_sum = cutlass.Int32(0)
+        for j3 in cutlass.range_constexpr(ppl):
+            pos = lane * cutlass.Int32(ppl) + cutlass.Int32(j3)
+            cnt_j = cutlass.Int32(0)
+            if pos < cutlass.Int32(bins_per_warp):
+                bidx3 = cutlass.Int32(kBins - 1) - tw * cutlass.Int32(bins_per_warp) - pos
+                cnt_j = smem_hist[bidx3]
+            cnt_frag[j3] = cnt_j
+            my_sum = my_sum + cnt_j
+        run3 = my_sum
+        for d3 in cutlass.range_constexpr(5):
+            off3 = cutlass.const_expr(1 << d3)
+            src3 = lane - cutlass.Int32(off3)
+            if src3 < cutlass.Int32(0):
+                src3 = cutlass.Int32(0)
+            up3 = cute.arch.shuffle_sync(run3, src3)
+            if lane >= cutlass.Int32(off3):
+                run3 = run3 + up3
+        base3 = prefix + (run3 - my_sum)
+
+        b_loc = cutlass.Int32(kBins - 1)
+        ra_loc = prefix
+        hit = cutlass.Int32(0)
+        r3 = base3
+        for j4 in cutlass.range_constexpr(ppl):
+            pos4 = lane * cutlass.Int32(ppl) + cutlass.Int32(j4)
+            cnt4 = cnt_frag[j4]
+            if (
+                pos4 < cutlass.Int32(bins_per_warp)
+                and r3 < cutlass.Int32(kK)
+                and r3 + cnt4 >= cutlass.Int32(kK)
+                and hit == cutlass.Int32(0)
+            ):
+                b_loc = cutlass.Int32(kBins - 1) - tw * cutlass.Int32(bins_per_warp) - pos4
+                ra_loc = r3
+                hit = cutlass.Int32(1)
+            r3 = r3 + cnt4
+        mask3 = cute.arch.vote_ballot_sync(hit != cutlass.Int32(0))
+        b_out = cutlass.Int32(kBins - 1)
+        ra_out = prefix
+        if mask3 != cutlass.Uint32(0):
+            low = mask3 & (cutlass.Uint32(0) - mask3)
+            src = cutlass.Int32(cute.arch.popc(low - cutlass.Uint32(1)))
+            b_out = cute.arch.shuffle_sync(b_loc, src)
+            ra_out = cute.arch.shuffle_sync(ra_loc, src)
+        return b_out, ra_out
+
+    # ------------------------------------------------------------------
     # Phase 4 (alt): op#7 fused rank-and-scatter (enable_p4_rank_scatter).
     # Ported verbatim from p4_recursive_digit/gvr_topk_decode_p4.py.
     # ------------------------------------------------------------------
@@ -3610,61 +3722,70 @@ class GvrTopKKernel:
             cute.arch.barrier()
             if cutlass.const_expr(_P4_SUB_DBG):
                 sc2 = cute.arch.clock64()
-            # ---- 3-step high→low bin search → straddling bin b* + rank_above ----
-            warp_bin_sum = cutlass.Int32(0)
-            for jb in cutlass.range_constexpr(bins_per_warp):
-                bidx_s = (
-                    cutlass.Int32(kBins - 1)
-                    - warp_id * cutlass.Int32(bins_per_warp)
-                    - cutlass.Int32(jb)
-                )
-                warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
-            if lane == cutlass.Int32(0):
-                smem_wcnt[warp_id] = warp_bin_sum
-            cute.arch.barrier()
-            if tidx == cutlass.Int32(0):
-                cum = cutlass.Int32(0)
-                tw = cutlass.Int32(num_warps - 1)
-                found = cutlass.Int32(0)
-                for w2 in cutlass.range_constexpr(self.num_warps):
-                    cum = cum + smem_wcnt[w2]
-                    if cum >= cutlass.Int32(kK) and found == cutlass.Int32(0):
-                        tw = cutlass.Int32(w2)
-                        found = cutlass.Int32(1)
-                cum2 = cutlass.Int32(0)
-                for w3 in cutlass.range_constexpr(self.num_warps):
-                    if cutlass.Int32(w3) < tw:
-                        cum2 = cum2 + smem_wcnt[w3]
-                s_iscalars[2] = cum2  # prefix-count before target warp
-                s_iscalars[3] = tw
-            cute.arch.barrier()
-            target_warp = s_iscalars[3]
-            if warp_id == target_warp and lane == cutlass.Int32(0):
-                base_cum = s_iscalars[2]
-                b_star = cutlass.Int32(kBins - 1)
-                rank_above = base_cum
-                set_d = cutlass.Int32(0)
-                for jb2 in cutlass.range_constexpr(bins_per_warp):
-                    bidx2 = (
+            # ---- high→low bin search → straddling bin b* + rank_above ----
+            if cutlass.const_expr(self.p4_warp_redundant):
+                b_star, rank_above = self._p4_coarse_rw(smem_hist, smem_wcnt, warp_id, lane)
+                if tidx == cutlass.Int32(0):
+                    s_iscalars[4] = cutlass.Int32(0)  # cnt_above
+                    s_iscalars[1] = cutlass.Int32(0)  # cnt_straddle
+                cute.arch.barrier()
+                if cutlass.const_expr(_P4_SUB_DBG):
+                    sc3 = cute.arch.clock64()
+            else:
+                warp_bin_sum = cutlass.Int32(0)
+                for jb in cutlass.range_constexpr(bins_per_warp):
+                    bidx_s = (
                         cutlass.Int32(kBins - 1)
-                        - target_warp * cutlass.Int32(bins_per_warp)
-                        - cutlass.Int32(jb2)
+                        - warp_id * cutlass.Int32(bins_per_warp)
+                        - cutlass.Int32(jb)
                     )
-                    ra_before = base_cum
-                    base_cum = base_cum + smem_hist[bidx2]
-                    if base_cum >= cutlass.Int32(kK) and set_d == cutlass.Int32(0):
-                        b_star = bidx2
-                        rank_above = ra_before  # count in bins strictly above b*
-                        set_d = cutlass.Int32(1)
-                s_iscalars[2] = rank_above
-                s_iscalars[3] = b_star
-                s_iscalars[4] = cutlass.Int32(0)  # cnt_above
-                s_iscalars[1] = cutlass.Int32(0)  # cnt_straddle
-            cute.arch.barrier()
-            if cutlass.const_expr(_P4_SUB_DBG):
-                sc3 = cute.arch.clock64()
-            b_star = s_iscalars[3]
-            rank_above = s_iscalars[2]
+                    warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
+                if lane == cutlass.Int32(0):
+                    smem_wcnt[warp_id] = warp_bin_sum
+                cute.arch.barrier()
+                if tidx == cutlass.Int32(0):
+                    cum = cutlass.Int32(0)
+                    tw = cutlass.Int32(num_warps - 1)
+                    found = cutlass.Int32(0)
+                    for w2 in cutlass.range_constexpr(self.num_warps):
+                        cum = cum + smem_wcnt[w2]
+                        if cum >= cutlass.Int32(kK) and found == cutlass.Int32(0):
+                            tw = cutlass.Int32(w2)
+                            found = cutlass.Int32(1)
+                    cum2 = cutlass.Int32(0)
+                    for w3 in cutlass.range_constexpr(self.num_warps):
+                        if cutlass.Int32(w3) < tw:
+                            cum2 = cum2 + smem_wcnt[w3]
+                    s_iscalars[2] = cum2  # prefix-count before target warp
+                    s_iscalars[3] = tw
+                cute.arch.barrier()
+                target_warp = s_iscalars[3]
+                if warp_id == target_warp and lane == cutlass.Int32(0):
+                    base_cum = s_iscalars[2]
+                    b_star_s = cutlass.Int32(kBins - 1)
+                    rank_above_s = base_cum
+                    set_d = cutlass.Int32(0)
+                    for jb2 in cutlass.range_constexpr(bins_per_warp):
+                        bidx2 = (
+                            cutlass.Int32(kBins - 1)
+                            - target_warp * cutlass.Int32(bins_per_warp)
+                            - cutlass.Int32(jb2)
+                        )
+                        ra_before = base_cum
+                        base_cum = base_cum + smem_hist[bidx2]
+                        if base_cum >= cutlass.Int32(kK) and set_d == cutlass.Int32(0):
+                            b_star_s = bidx2
+                            rank_above_s = ra_before  # count in bins strictly above b*
+                            set_d = cutlass.Int32(1)
+                    s_iscalars[2] = rank_above_s
+                    s_iscalars[3] = b_star_s
+                    s_iscalars[4] = cutlass.Int32(0)  # cnt_above
+                    s_iscalars[1] = cutlass.Int32(0)  # cnt_straddle
+                cute.arch.barrier()
+                if cutlass.const_expr(_P4_SUB_DBG):
+                    sc3 = cute.arch.clock64()
+                b_star = s_iscalars[3]
+                rank_above = s_iscalars[2]
 
             # ---- EXACT: one fine-histogram recursion on the straddling bin b* ----
             if cutlass.const_expr(self.enable_p4_rank_scatter_exact):
