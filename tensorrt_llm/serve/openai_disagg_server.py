@@ -256,7 +256,6 @@ class OpenAIDisaggServer:
             disagg_id_generator=disagg_id_generator,
             request_perf_metrics=self._collect_perf_metrics,
             internal_disagg_auth_key=self._config.internal_request_auth_key)
-        self._perf_metrics_collector.add_client(client)
         return client
 
     def register_routes(self):
