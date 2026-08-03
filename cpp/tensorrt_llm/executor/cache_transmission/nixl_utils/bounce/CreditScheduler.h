@@ -157,11 +157,13 @@ public:
 private:
     struct FlowState
     {
-        std::deque<std::uint32_t> pending;      // per-chunk byte sizes still wanting a grant (FIFO)
-        std::unordered_set<std::uint64_t> held; // region offsets currently granted to this flow
+        std::deque<std::uint32_t> pending;                   // per-chunk byte sizes still wanting a grant (FIFO)
+        std::unordered_set<std::uint64_t> held;              // region offsets currently granted to this flow
+        std::optional<std::uint64_t> blockedAtGrantSequence; // first grant sequence where head did not fit
     };
 
     std::vector<Grant> schedule();              // grant while the arena has room and eligible flows exist
+    void maybeActivateDrain();                  // age a repeatedly bypassed flow into receiver drain mode
     void ensureInRing(std::string const& flow); // add flow to the round-robin ring if absent
     void dropFromRing(std::string const& flow); // remove flow from the round-robin ring
     void eraseIfDone(std::string const& flow);  // pending empty && held empty -> drop the flow
@@ -188,6 +190,14 @@ private:
     std::size_t mEagerBudgetBytes{0};
     std::unordered_set<std::uint64_t>
         mOrphans; // regions deferred by flow/peer reclamation (busy scatter), awaiting freeOrphanRegion
+    // Receiver-only anti-starvation barrier. Every successful remote grant advances mGrantSequence.
+    // A flow whose head allocation keeps failing while enough other grants pass it becomes mDrainFlow;
+    // schedule() then pauses NEW remote grants until that one head fits. Local acquireLocal() remains
+    // untouched, avoiding a cross-direction circular wait in the shared-arena case.
+    static constexpr std::uint64_t kMinimumBypassGrants{8};
+    static constexpr std::uint64_t kBypassRounds{2};
+    std::uint64_t mGrantSequence{0};
+    std::optional<std::string> mDrainFlow;
     // Round-robin ring of active flow keys (insertion order). NOTE: "ring" not "order" — distinct
     // from BuddyAllocator's size `order` (mArena), which is the power-of-two block exponent.
     std::vector<std::string> mRing;
