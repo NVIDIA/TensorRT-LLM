@@ -52,6 +52,7 @@ from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..pyexecutor.mamba_cache_manager import mamba_manager_override_forces_v1
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
@@ -985,13 +986,15 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Model-specific defaults for NemotronH.
 
-        Uses KV cache manager V2 for the hybrid state layout. Block reuse
+        Uses KV cache manager V2 for the hybrid state layout, unless an env
+        override has pinned the mutually exclusive V1 Mamba route. Block reuse
         remains opt-in because it also requires a Mamba snapshot policy.
         """
+        propose_v2 = not mamba_manager_override_forces_v1(llm_args)
         return {
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True,
+                "use_kv_cache_manager_v2": propose_v2,
             }
         }
 

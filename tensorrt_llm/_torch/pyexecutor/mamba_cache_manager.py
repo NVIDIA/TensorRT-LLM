@@ -26,7 +26,7 @@ import triton.language as tl
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
-    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, TorchLlmArgs
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy, KVCacheManagerV2, Role)
@@ -219,6 +219,28 @@ def use_py_mamba_cache_manager() -> bool:
     Cpp based on the transceiver configuration.
     """
     return os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
+
+
+def mamba_manager_override_forces_v1(llm_args: 'TorchLlmArgs') -> bool:
+    """Whether an env override pins the V1 Mamba route for aggregated serving.
+
+    ``get_kv_cache_manager_cls`` rejects these overrides alongside V2, so a
+    hybrid model must not *propose* ``use_kv_cache_manager_v2=True`` as a
+    default while one is active — an unset setting would resolve to V2 and
+    collide with the route the override already selected.
+
+    ``llm_args`` is read defensively: :meth:`get_model_defaults` is also called
+    with ``None`` (perf-sanity transceiver precheck) and with a plain dict
+    (``tests/unittest/llmapi/test_config_database.py``).
+    """
+    preference = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', '').upper()
+    if not (use_py_mamba_cache_manager() or preference in ('CPP', 'MIXED')):
+        return False
+
+    # Both overrides are agg-mode-only; in disagg the manager follows the
+    # transceiver configuration instead.
+    transceiver_config = getattr(llm_args, 'cache_transceiver_config', None)
+    return getattr(transceiver_config, 'backend', None) is None
 
 
 class ReplayStateUpdateMetadata(NamedTuple):

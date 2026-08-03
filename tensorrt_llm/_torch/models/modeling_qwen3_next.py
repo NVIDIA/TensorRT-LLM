@@ -40,6 +40,8 @@ from tensorrt_llm._torch.modules.fused_shared_expert import \
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
+    mamba_manager_override_forces_v1
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -1058,13 +1060,15 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
         """Use V2 for the hybrid state layout.
 
-        Block reuse remains opt-in because it also requires a recurrent-state
-        snapshot policy.
+        Yields to an env override that pins the mutually exclusive V1 Mamba
+        route. Block reuse remains opt-in because it also requires a
+        recurrent-state snapshot policy.
         """
+        propose_v2 = not mamba_manager_override_forces_v1(llm_args)
         return {
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True,
+                "use_kv_cache_manager_v2": propose_v2,
             }
         }
 

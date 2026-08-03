@@ -515,11 +515,20 @@ def test_hybrid_cache_manager_factory_keeps_v1_disagg_route(monkeypatch, use_v2)
     )
 
 
-def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
+def _hybrid_model_classes():
+    """The hybrid classes that each define their own ``get_model_defaults``.
+
+    ``Qwen3_5VLModel`` delegates to ``Qwen3NextForCausalLM``; the Qwen3.5 text
+    classes inherit it verbatim, so they add no coverage here.
+    """
     from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
     from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5VLModel
     from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
 
+    return (NemotronHForCausalLM, Qwen3NextForCausalLM, Qwen3_5VLModel)
+
+
+def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
     for env_var in (
         "TRTLLM_USE_NIXL_KVCACHE",
         "TRTLLM_USE_UCX_KVCACHE",
@@ -528,7 +537,7 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
     ):
         monkeypatch.delenv(env_var, raising=False)
 
-    for model_cls in (NemotronHForCausalLM, Qwen3NextForCausalLM, Qwen3_5VLModel):
+    for model_cls in _hybrid_model_classes():
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
@@ -540,6 +549,93 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
         assert llm_args.kv_cache_config.enable_block_reuse is False
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+@pytest.mark.parametrize(
+    ("env_name", "env_value"),
+    [
+        ("TRTLLM_USE_PY_MAMBA", "1"),
+        ("TLLM_MAMBA_MANAGER_PREFERENCE", "MIXED"),
+        ("TLLM_MAMBA_MANAGER_PREFERENCE", "CPP"),
+    ],
+)
+def test_hybrid_defaults_do_not_propose_v2_under_v1_override(monkeypatch, env_name, env_value):
+    """A V1-route override must suppress the V2 default, not collide with it."""
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    monkeypatch.setenv(env_name, env_value)
+
+    for model_cls in _hybrid_model_classes():
+        # Block reuse stays off: the Mixed manager the override selects rejects it.
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        )
+        model_defaults = model_cls.get_model_defaults(llm_args)
+        assert model_defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is False
+
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        assert (
+            _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults, original_setting="auto")
+            is False
+        )
+        # The factory previously raised ValueError for this pair.
+        assert get_kv_cache_manager_cls(_hybrid_model_config(), llm_args.kv_cache_config) in (
+            MixedMambaHybridCacheManager,
+            CppMambaHybridCacheManager,
+        )
+
+
+def test_v1_override_is_ignored_for_disagg_and_unknown_values(monkeypatch):
+    """The override is agg-mode-only, and an unrecognized value is not an override."""
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    monkeypatch.setenv("TRTLLM_USE_PY_MAMBA", "1")
+    disagg_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+    )
+    for model_cls in _hybrid_model_classes():
+        defaults = model_cls.get_model_defaults(disagg_args)
+        assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
+
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.setenv("TLLM_MAMBA_MANAGER_PREFERENCE", "V2")
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+    for model_cls in _hybrid_model_classes():
+        defaults = model_cls.get_model_defaults(llm_args)
+        assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
+
+
+@pytest.mark.parametrize("loose_llm_args", [None, {}], ids=["none", "dict"])
+def test_hybrid_defaults_accept_loose_llm_args(monkeypatch, loose_llm_args):
+    """``get_model_defaults`` is called with None and with a plain dict in-tree.
+
+    The perf-sanity transceiver precheck passes ``None`` and
+    ``tests/unittest/llmapi/test_config_database.py`` passes a ``model_dump()``
+    dict, so the override predicate must not require a real ``TorchLlmArgs``.
+    """
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    for model_cls in _hybrid_model_classes():
+        defaults = model_cls.get_model_defaults(loose_llm_args)
+        assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
+
+    monkeypatch.setenv("TRTLLM_USE_PY_MAMBA", "1")
+    for model_cls in _hybrid_model_classes():
+        defaults = model_cls.get_model_defaults(loose_llm_args)
+        assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is False
+
+
+def test_explicit_v2_still_conflicts_with_py_mamba_override(monkeypatch):
+    """An explicit True is a real user contradiction and must keep raising."""
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    monkeypatch.setenv("TRTLLM_USE_PY_MAMBA", "1")
+
+    with pytest.raises(ValueError, match="conflicts with explicit"):
+        get_kv_cache_manager_cls(
+            _hybrid_model_config(),
+            KvCacheConfig(enable_block_reuse=False, use_kv_cache_manager_v2=True),
+        )
 
 
 def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
