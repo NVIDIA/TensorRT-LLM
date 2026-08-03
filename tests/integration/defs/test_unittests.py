@@ -14,6 +14,7 @@
 # limitations under the License.
 import os
 import re
+import shlex
 import warnings
 from subprocess import CalledProcessError
 
@@ -63,6 +64,21 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
 
 
+def _is_executor_unittest_group_case(case: str) -> bool:
+    try:
+        case_args = shlex.split(case)
+    except ValueError:
+        case_args = case.split()
+    if not case_args:
+        return False
+    return case_args[0].replace("\\", "/").rstrip("/") == "unittest/_torch/executor"
+
+
+def _append_case_specific_pytest_options(command: list[str], case: str) -> None:
+    if _is_executor_unittest_group_case(case):
+        command.extend(["-o", "threadleak=False"])
+
+
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
@@ -88,7 +104,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     num_workers = 1
 
-    # This dataframe is not manually edited. Infra team will regularly generate this dataframe based on test execution results.
+    # This dataframe is not manually edited. Infra team will regularly generate this dataframe based on
+    # test execution results.
     # If you need to override this policy, please use postprocess code as below.
     agg_unit_mem_path = f'{test_root}/integration/defs/agg_unit_mem_df.csv'
     print(f'Loading unittest parallel config from: {agg_unit_mem_path}')
@@ -117,7 +134,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         num_workers = min(num_workers, 8)
     else:
         warnings.warn(
-            f'Cannot find parallel config entry for unittest {case} on "{gpu_name}". Fallback to serial test. Please add config entry to agg_unit_mem_df.csv.'
+            f'Cannot find parallel config entry for unittest {case} on "{gpu_name}". '
+            'Fallback to serial test. Please add config entry to agg_unit_mem_df.csv.'
         )
 
     num_workers = max(1, num_workers)
@@ -129,7 +147,6 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     ignore_opt = f"--ignore={test_root}/integration"
 
-    import shlex
     arg_list = shlex.split(case)
     case_fn = re.sub(r'[/\s"\']+', '-', case)
     if len(case_fn) > 80:
@@ -197,6 +214,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         s3_secret_key = request.config.getoption("--s3-secret-key",
                                                  default=None)
 
+    _append_case_specific_pytest_options(command, case)
     command += arg_list
 
     print(f"Running unit test:\"python {' '.join(command)}\"")
