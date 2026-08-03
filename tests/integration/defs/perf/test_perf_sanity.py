@@ -344,13 +344,14 @@ def parse_gen_worker_device_step_time(
     end-of-file are considered for gen_server_{i}.log — used to slice out a
     single client's iteration segment.
 
-    The log is read exactly once. The caller (DisaggTestCmds.run_cmd) blocks
-    on the gen_server_{i}.done sentinels before calling this, so every gen
-    srun has already exited and its &> aggregate log is fully flushed — there
-    is no partially-written tail to poll for. This replaces the earlier
-    settle-poll heuristic, which could return a mean over a truncated prefix
-    when it accepted the first repeated row count while the log was still
-    flushing across NFS (nvbugs 6487036 / 6487040).
+    The log is read exactly once. The caller (DisaggTestCmds.run_cmd) normally
+    waits for the gen_server_{i}.done sentinels first, so every gen srun has
+    exited and its &> aggregate log is fully flushed. If the dedicated
+    sentinel wait expires, the caller parses the current contents instead of
+    consuming the whole-test timeout; a missing metric then hard-fails before
+    upload. This replaces the earlier settle-poll heuristic, which could
+    accept a truncated prefix while the log was still flushing across NFS
+    (nvbugs 6487036 / 6487040 / 6487038).
     """
     per_file_scans, _total_count = _scan_gen_worker_device_step_time(
         output_dir, num_gen_servers, start_offsets
@@ -1337,11 +1338,10 @@ class DisaggTestCmds(NamedTuple):
         which is what lets the gen srun exit — so this is not circular.
 
         Returns True once all sentinels exist, or False if the dedicated
-        sentinel timeout is reached first. On False the caller skips the
-        device-step metric because the GEN logs may still be incomplete. The
-        bounded wait prevents a stuck multi-node srun from consuming the
-        whole-test timeout and triggering Slurm's kill-on-bad-exit cascade
-        (nvbugs 6487036 / 6487040 / 6487038).
+        sentinel timeout is reached first. On False the caller falls back to
+        parsing the current log contents. The bounded wait prevents a stuck
+        multi-node srun from consuming the whole-test timeout and triggering
+        Slurm's kill-on-bad-exit cascade (nvbugs 6487036 / 6487040 / 6487038).
         """
         sentinels = [
             os.path.join(self.test_output_dir, f"gen_server_{i}.done")
@@ -1357,13 +1357,43 @@ class DisaggTestCmds(NamedTuple):
             if elapsed_time > timeout:
                 print_info(
                     f"Timeout ({timeout}s) waiting for gen worker log "
-                    f"sentinels {missing}; skipping the device-step metric."
+                    f"sentinels {missing}; parsing current log contents."
                 )
                 return False
             print_info(
                 f"Waiting for gen worker log sentinels {missing}, elapsed time: {elapsed_time:.0f}s"
             )
             time.sleep(poll_interval)
+
+    def _append_gen_worker_device_step_time(
+        self,
+        pending_device_step_time: List[dict],
+        outputs: List[str],
+    ) -> None:
+        """Wait for GEN log flush, then append each pending client metric.
+
+        A sentinel timeout is a bounded teardown fallback, not a reason to
+        discard metrics that are already present in the GEN logs. If the
+        fallback parse finds no usable metric, check_test_failure still fails
+        the gen_only run before results are uploaded.
+        """
+        if not pending_device_step_time:
+            return
+
+        self.wait_for_gen_log_sentinels()
+        for record in pending_device_step_time:
+            device_step_time_mean = parse_gen_worker_device_step_time(
+                self.test_output_dir,
+                self.num_gen_servers,
+                start_offsets=record["start_offsets"],
+            )
+            if device_step_time_mean is None:
+                continue
+            summary_line = f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
+            with open(record["benchmark_file_path"], "a") as benchmark_ctx:
+                benchmark_ctx.write(f"\n{summary_line}\n")
+            idx = record["output_index"]
+            outputs[idx] = f"{outputs[idx]}\n{summary_line}\n"
 
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
@@ -1478,7 +1508,7 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "BENCHMARK":
             # Perf-benchmark clients whose gen-worker device step time must be
-            # parsed once the gen logs are flushed. The parse is deferred out of
+            # parsed after the gen-log flush wait. The parse is deferred out of
             # the client loop because gen_server_*.log keeps being written until
             # the gen srun exits, and the gen srun only exits after
             # benchmark_status is written in the finally below. Parsing inside
@@ -1590,23 +1620,10 @@ class DisaggTestCmds(NamedTuple):
             # their srun will exit and drop gen_server_{i}.done. Wait once for
             # those sentinels (bounded independently of the whole-test timeout),
             # then parse each benchmark client's gen-worker device step time a
-            # single time. Only gen_only runs populate this queue; other modes
-            # skip both the sentinel wait and device-step-time parsing.
-            if pending_device_step_time and self.wait_for_gen_log_sentinels():
-                for record in pending_device_step_time:
-                    device_step_time_mean = parse_gen_worker_device_step_time(
-                        self.test_output_dir,
-                        self.num_gen_servers,
-                        start_offsets=record["start_offsets"],
-                    )
-                    if device_step_time_mean is not None:
-                        summary_line = (
-                            f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
-                        )
-                        with open(record["benchmark_file_path"], "a") as benchmark_ctx:
-                            benchmark_ctx.write(f"\n{summary_line}\n")
-                        idx = record["output_index"]
-                        outputs[idx] = f"{outputs[idx]}\n{summary_line}\n"
+            # single time. A timeout falls back to the current log contents.
+            # Only gen_only runs populate this queue; other modes skip both the
+            # sentinel wait and device-step-time parsing.
+            self._append_gen_worker_device_step_time(pending_device_step_time, outputs)
 
         return outputs
 
