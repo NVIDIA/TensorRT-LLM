@@ -450,6 +450,7 @@ public:
         // Autotuner has requested a default or 'fallback' config index
         if (tileN == -1 || config == -1)
         {
+            TORCH_CHECK(num_fused_shared_experts.value_or(0) >= 0, "num_fused_shared_experts must be non-negative.");
             int64_t const total_experts_per_token = top_k + num_fused_shared_experts.value_or(0);
             int64_t const num_total_local_experts = local_num_experts + num_fused_shared_experts.value_or(0);
 
