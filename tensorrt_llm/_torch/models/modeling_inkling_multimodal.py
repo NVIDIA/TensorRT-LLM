@@ -347,6 +347,43 @@ def _prime_factors(n: int) -> List[int]:
     return factors
 
 
+def _assign_monotone(cost: np.ndarray) -> List[int]:
+    """Minimum-cost assignment of every row to a distinct, increasing column.
+
+    ``cost[i][j] = |a_i - b_j|`` with both ``a`` (the ideal log-spaced sizes) and
+    ``b`` (the candidate scales' size reductions) strictly increasing, so the
+    matrix is Monge and an optimal assignment is guaranteed to be non-crossing.
+    That makes this O(rows*cols) DP exact, and lets the tower avoid a runtime
+    ``scipy`` dependency that the package does not declare.
+
+    Non-crossing also matters on its own: the caller consumes the result as an
+    ordered scale progression, so a crossing assignment of equal total cost --
+    which a general solver may return -- would hand back a non-monotonic
+    progression and a fold that does not divide.
+    """
+    n_rows, n_cols = cost.shape
+    inf = float("inf")
+    # best[i][j]: cost of assigning the first i rows within the first j columns.
+    best = [[inf] * (n_cols + 1) for _ in range(n_rows + 1)]
+    for j in range(n_cols + 1):
+        best[0][j] = 0.0
+    for i in range(1, n_rows + 1):
+        for j in range(i, n_cols + 1):
+            skip = best[i][j - 1]
+            take = best[i - 1][j - 1] + float(cost[i - 1][j - 1])
+            best[i][j] = skip if skip <= take else take
+    idxs = [0] * n_rows
+    i, j = n_rows, n_cols
+    while i > 0:
+        if best[i][j] == best[i][j - 1]:
+            j -= 1  # column j-1 unused
+        else:
+            idxs[i - 1] = j - 1
+            i -= 1
+            j -= 1
+    return idxs
+
+
 def plan_out_scales(
     temporal_patch_size: int,
     patch_size: int,
@@ -358,8 +395,9 @@ def plan_out_scales(
     Builds the candidate scale progression (spatial folds first, then temporal,
     channels rounded up to a multiple of 64), then assigns ``n_layers + 1``
     scales to the ideal log-spaced size reductions -- ``argmin`` when
-    ``n_layers >= len(scales)`` else a global ``linear_sum_assignment`` --
-    pinning the first scale to the raw patch and the last to the full patch.
+    ``n_layers >= len(scales)`` else a minimum-cost assignment
+    (:func:`_assign_monotone`) -- pinning the first scale to the raw patch and
+    the last to the full patch.
 
     For the checkpoint geometry (``T=2``, ``P=40``, ``n_layers=4``, ``C=3``) this
     resolves to ``[(1,1,1,3), (1,5,5,128), (1,10,10,320), (1,40,40,4800),
@@ -398,9 +436,7 @@ def plan_out_scales(
     if n_layers >= len(scales):
         idxs = np.argmin(cost_matrix, axis=1)
     else:
-        from scipy.optimize import linear_sum_assignment
-
-        idxs = linear_sum_assignment(cost_matrix)[1]
+        idxs = _assign_monotone(cost_matrix)
 
     assert len(idxs) >= 2
     idxs[0] = 0

@@ -136,6 +136,32 @@ def test_vision_scale_plan_and_module_tree():
     assert tower.final_norm is not None
 
 
+# Geometries where the planner takes the assignment branch, i.e. there are more
+# candidate scales than layers to place (the argmin branch above it is a
+# different, pre-existing path that may reuse a scale).
+@pytest.mark.parametrize(
+    "temporal,patch,n_layers",
+    [(2, 40, 4), (2, 40, 3), (2, 40, 5), (1, 16, 2), (2, 64, 5), (4, 32, 3)],
+)
+def test_scale_plan_is_a_strictly_growing_progression(temporal, patch, n_layers):
+    """The planner must hand back an ordered, strictly growing progression.
+
+    Each hMLP layer folds the previous scale into channel depth, so a plan that
+    is not monotonic gives a fold that does not divide. This is the property the
+    (dependency-free) assignment has to preserve; it replaced a scipy solver
+    that could return a crossing assignment of equal cost.
+    """
+    scales = plan_out_scales(temporal, patch, n_layers, 3)
+    assert len(scales) == n_layers + 1
+    assert scales[0] == (1, 1, 1, 3)  # first pinned to the raw patch
+    assert scales[-1][:3] == (temporal, patch, patch)  # last pinned to the full patch
+    sizes = [t * h * w for t, h, w, _ in scales]
+    assert sizes == sorted(sizes) and len(set(sizes)) == len(sizes)
+    # every step must be an integral fold of its predecessor
+    for (t0, h0, w0, _), (t1, h1, w1, _) in zip(scales, scales[1:]):
+        assert t1 % t0 == 0 and h1 % h0 == 0 and w1 % w0 == 0
+
+
 def test_fold_timespace_to_depth_is_value_preserving():
     # (B=1, T=2, H=2, W=2, C=3), fold t=2, hw=1 -> (1, 1, 2, 2, 2*1*1*3=6)
     x = torch.arange(24, dtype=torch.float32).reshape(1, 2, 2, 2, 3)

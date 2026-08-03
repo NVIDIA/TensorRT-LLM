@@ -399,7 +399,7 @@ def test_setup_explicit_end_id_is_not_overridden():
     assert params.end_id == 42
 
 
-def test_setup_without_any_eos_warns_and_leaves_end_id_none(caplog):
+def test_setup_without_any_eos_leaves_end_id_none():
     params = SamplingParams()
     params._setup(_FakeTokenizer(eos_token_id=None), _FakeConfig(eos_token_id=None), None)
     assert params.end_id is None
