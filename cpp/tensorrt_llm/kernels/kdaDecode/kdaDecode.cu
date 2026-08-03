@@ -89,35 +89,51 @@ __device__ __forceinline__ float warp_reduce_sum(float value)
     return value;
 }
 
+// cp.async requires sm_80+; pre-SM80 falls back to a synchronous copy, so the
+// commit/wait helpers become no-ops there.
 __device__ __forceinline__ void cp_async_cg_16b(float* smem_ptr, float const* gmem_ptr)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr), "l"(gmem_ptr));
+#else
+    *reinterpret_cast<float4*>(smem_ptr) = *reinterpret_cast<float4 const*>(gmem_ptr);
+#endif
 }
 
 __device__ __forceinline__ void cp_async_commit()
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;\n" ::);
+#endif
 }
 
 __device__ __forceinline__ void cp_async_wait_all()
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_all;\n" ::);
+#endif
 }
 
 __device__ __forceinline__ void cp_async_wait_group_0()
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
 }
 
 __device__ __forceinline__ void cp_async_wait_group_1()
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 1;\n" ::);
+#endif
 }
 
 __device__ __forceinline__ void cp_async_wait_group_2()
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 2;\n" ::);
+#endif
 }
 
 template <int kStageChunkV>
