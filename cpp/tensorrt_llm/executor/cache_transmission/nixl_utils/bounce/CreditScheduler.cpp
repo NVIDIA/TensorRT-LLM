@@ -64,6 +64,10 @@ void CreditScheduler::ensureInRing(std::string const& flow)
 
 void CreditScheduler::dropFromRing(std::string const& flow)
 {
+    if (mDrainFlow && *mDrainFlow == flow)
+    {
+        mDrainFlow.reset();
+    }
     auto it = std::find(mRing.begin(), mRing.end(), flow);
     if (it != mRing.end())
     {
@@ -83,9 +87,50 @@ void CreditScheduler::dropFromRing(std::string const& flow)
     }
 }
 
+void CreditScheduler::maybeActivateDrain()
+{
+    if (mDrainFlow || mRing.empty())
+    {
+        return;
+    }
+
+    std::uint64_t const ringSize = static_cast<std::uint64_t>(mRing.size());
+    std::uint64_t const bypassThreshold = std::max(kMinimumBypassGrants, kBypassRounds * ringSize);
+    std::optional<std::uint64_t> oldestBlockedSequence;
+
+    // Scan from the round-robin cursor so equal-age candidates retain the scheduler's normal order.
+    for (std::size_t k = 0; k < mRing.size(); ++k)
+    {
+        std::size_t const idx = (mCursor + k) % mRing.size();
+        auto const fit = mFlows.find(mRing[idx]);
+        TLLM_CHECK_DEBUG(fit != mFlows.end());
+        if (fit == mFlows.end())
+        {
+            continue;
+        }
+        auto const& st = fit->second;
+        if (st.pending.empty() || st.held.size() >= mMaxInflightChunksPerRequest || !st.blockedAtGrantSequence)
+        {
+            continue;
+        }
+        std::uint64_t const bypassed = mGrantSequence - *st.blockedAtGrantSequence;
+        if (bypassed < bypassThreshold)
+        {
+            continue;
+        }
+        if (!oldestBlockedSequence || *st.blockedAtGrantSequence < *oldestBlockedSequence)
+        {
+            oldestBlockedSequence = st.blockedAtGrantSequence;
+            mDrainFlow = mRing[idx];
+        }
+    }
+}
+
 // Hand out as many region grants as possible RIGHT NOW, fairly and bounded. Called whenever space
 // frees up or new demand arrives (onWant / onScatterDone / releaseLocal / reclaim*). Three rules:
-//   1. Fair: rotate over flows round-robin (mRing + mCursor) so no flow starves.
+//   1. Fair: rotate over flows round-robin (mRing + mCursor). A head chunk that repeatedly fails to
+//      fit while other grants pass it eventually enters receiver drain mode: no NEW remote grants
+//      are issued until that head fits, so sustained smaller traffic cannot starve it.
 //   2. Per-request cap: a flow may hold at most mMaxInflightChunksPerRequest allocations; more must
 //      wait for scatter completion to free one.
 //   3. Arena capacity: all flows' regions share one buddy arena; if the next chunk doesn't fit, skip
@@ -97,12 +142,47 @@ void CreditScheduler::dropFromRing(std::string const& flow)
 std::vector<Grant> CreditScheduler::schedule()
 {
     std::vector<Grant> grants;
-    bool progress = true;
     // Re-sweep as long as the previous sweep granted something; stop when a whole sweep makes no
     // progress or the ring is empty.
-    while (progress && !mRing.empty())
+    while (!mRing.empty())
     {
-        progress = false;
+        maybeActivateDrain();
+        if (mDrainFlow)
+        {
+            auto fit = mFlows.find(*mDrainFlow);
+            TLLM_CHECK_DEBUG(fit != mFlows.end());
+            if (fit == mFlows.end() || fit->second.pending.empty()
+                || fit->second.held.size() >= mMaxInflightChunksPerRequest)
+            {
+                mDrainFlow.reset();
+                continue;
+            }
+
+            auto& st = fit->second;
+            std::uint32_t const want = st.pending.front();
+            auto off = mArena.alloc(want);
+            if (!off)
+            {
+                // Existing remote regions keep progressing and freeing space, but do not refill them
+                // with smaller chunks. acquireLocal() is deliberately unaffected: this is a
+                // receiver-only admission barrier and cannot introduce a bidirectional circular wait.
+                return grants;
+            }
+
+            auto const ringIt = std::find(mRing.begin(), mRing.end(), *mDrainFlow);
+            TLLM_CHECK_DEBUG(ringIt != mRing.end());
+            std::size_t const idx = static_cast<std::size_t>(ringIt - mRing.begin());
+            st.pending.pop_front();
+            st.held.insert(*off);
+            st.blockedAtGrantSequence.reset();
+            grants.push_back(Grant{*mDrainFlow, *off, mBaseAddr + *off, want});
+            mCursor = (idx + 1) % mRing.size();
+            ++mGrantSequence;
+            mDrainFlow.reset();
+            continue;
+        }
+
+        bool progress = false;
         // One round-robin sweep from the cursor; grant the first eligible flow whose next chunk fits.
         for (std::size_t k = 0; k < mRing.size(); ++k)
         {
@@ -122,22 +202,28 @@ std::vector<Grant> CreditScheduler::schedule()
                 continue; // nothing more wanted, or at the per-request in-flight cap
             }
             std::uint32_t const want = st.pending.front();
-            // NOTE: no aging — a flow whose FRONT chunk can't fit right now is skipped while smaller
-            // chunks elsewhere keep cycling, so a large chunk can be passed over under sustained small
-            // traffic (HOL; never a deadlock — buddy coalescing eventually frees a high-order block,
-            // and maxChunkSizeBytes is clamped so it can fit a drained arena).
             auto off = mArena.alloc(want);
             if (!off)
             {
+                if (!st.blockedAtGrantSequence)
+                {
+                    st.blockedAtGrantSequence = mGrantSequence;
+                }
                 continue; // arena can't fit this chunk now -> try another flow (smaller may fit)
             }
             st.pending.pop_front();
             st.held.insert(*off);
+            st.blockedAtGrantSequence.reset();
             grants.push_back(Grant{mRing[idx], *off, mBaseAddr + *off, want});
             mCursor = (idx + 1) % mRing.size(); // next sweep starts AFTER this flow -> round-robin
+            ++mGrantSequence;
             progress = true;
             // One grant per sweep: break out and let the outer loop re-sweep from the advanced cursor,
             // so grants alternate across flows (strict rotation) rather than filling one flow first.
+            break;
+        }
+        if (!progress)
+        {
             break;
         }
     }
@@ -159,6 +245,7 @@ std::vector<Grant> CreditScheduler::onWant(std::string const& flow, std::vector<
     std::lock_guard<std::mutex> lk(mMu);
     auto& st = mFlows[flow];
     st.pending.assign(chunkBytes.begin(), chunkBytes.end());
+    st.blockedAtGrantSequence.reset();
     if (!chunkBytes.empty())
     {
         ensureInRing(flow);
