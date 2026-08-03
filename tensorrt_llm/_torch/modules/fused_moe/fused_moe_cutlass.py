@@ -33,7 +33,8 @@ from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
 from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
+    DeepSeekFP8BlockScalesFusedMoEMethod,
+    DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm, FP8QDQFusedMoEMethod,
     MoEWeightLoadingMode, MXFP8CutlassFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod, INT8WoqPerChannelFusedMoEMethod,
     W4A16NVFP4CutlassFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
@@ -812,10 +813,9 @@ class CutlassFusedMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
+                # SM120/121 use DeepGemm layout (C++ aliases SM121->120).
                 if get_sm_version() in (120, 121):
                     return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
-                else:
-                    return DeepSeekFP8BlockScalesFusedMoEMethod()
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
@@ -903,7 +903,8 @@ class CutlassFusedMoE(MoE):
 
         # SM120 + FP8 block scales: use Triton kernel (CUTLASS TMA fails on SM120
         # for large token counts due to cuTensorMapEncodeTiled limitations).
-        if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
+        if self.has_deepseek_fp8_block_scales and get_sm_version() in (120,
+                                                                       121):
             from .fused_moe_triton_fp8_block_scale import \
                 run_triton_fp8_block_scale_moe
             _use_alltoall = (enable_alltoall if enable_alltoall is not None else

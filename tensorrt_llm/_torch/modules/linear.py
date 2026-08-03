@@ -1281,17 +1281,13 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 copy_weight_shard(module.weight_scale, scale, shard_offset,
                                   shard_size)
 
-    def post_load_weights(self, module: Linear):
-        super().post_load_weights(module)
-        if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
-                                 or module.disable_deep_gemm)) or \
-           get_sm_version() in (120, 121):
     def transform_weights(self, module: Linear) -> None:
         super().transform_weights(module)
-        use_deep_gemm_layout = (
-            is_sm_100f()
-            and not (module.use_cute_dsl_blockscaling_mm
-                     or module.disable_deep_gemm)) or get_sm_version() == 120
+        # SM121 (GB10) aliases to SM120 on the C++ side; keep Python gates in sync.
+        use_deep_gemm_layout = (is_sm_100f()
+                                and not (module.use_cute_dsl_blockscaling_mm
+                                         or module.disable_deep_gemm)
+                                ) or get_sm_version() in (120, 121)
         use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
             module, "use_indexer_q_cutedsl_fusion", False))
         if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:
