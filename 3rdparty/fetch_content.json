@@ -31,8 +31,8 @@
     },
     {
       "name": "deepgemm",
-      "git_repository": "https://github.com/deepseek-ai/DeepGEMM",
-      "git_tag": "f8e8fb5830fa5cda6e4ea73d360bb3f21f87a3ca",
+      "git_repository": "https://github.com/longlee0622/DeepGEMM",
+      "git_tag": "c35d0ffe906ffcb7382d10a4c497a499ef7ed2d6",
       "git_submodules_recurse": true,
       "source_subdir": "dont-add-this-project-with-add-subdirectory"
     },
