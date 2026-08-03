@@ -310,7 +310,9 @@ llm_perf_core:
   tests:
   #llama_v3.3_70b_instruct_fp8
   #pytorch backend
-  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:4096-maxnt:20000-kv_frac:0.85-input_output_len:20000,2000-reqs:1000-tp:8-gpus:8] TIMEOUT(120)
+  # 20K ISL x 1000 reqs does not finish in 120min on the slowest platform in this
+  # condition (RTX 6000 Server); bumped to 180min.
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:4096-maxnt:20000-kv_frac:0.85-input_output_len:20000,2000-reqs:1000-tp:8-gpus:8] TIMEOUT(180)
   #minimax_m2.5 (FP8 216G, 8-GPU) - use EP=8 + attention DP; TP=8 would split intermediate_size 1536/8=192 (not divisible by 128 block size)
   - perf/test_perf.py::test_perf[minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-gpus:8]
   - perf/test_perf.py::test_perf[minimax_m2.5_fp8-bench-pytorch-float8-input_output_len:500,2000-ep:8-gpus:8]
@@ -328,7 +330,9 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-tp:8-gpus:8] #min_latency
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8-input_output_len:8000,1000-con:250-tp:8-gpus:8] #max_throughput
   #qwen3.5_397b_a17b_fp8 (MoE FP8 380G, 8-GPU ep=8)
-  - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  # 128,128 is a trivial workload but the 380G checkpoint load alone exceeds the
+  # 60min default on the slower platforms in this condition.
+  - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp8-bench-pytorch-float8-input_output_len:500,2000-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp8-bench-pytorch-float8-input_output_len:2000,500-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp8-bench-pytorch-float8-input_output_len:8000,1000-ep:8-tp:8-gpus:8]
@@ -364,7 +368,9 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-ep:8-tp:8-gpus:8] #min_latency
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-maxbs:512-input_output_len:8000,1000-con:512-ep:8-tp:8-gpus:8] #max_throughput
    #llama_v3.1_nemotron_ultra_253b (nemotron-nas BF16 474G, 8-GPU)
-  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:128,128-tp:8-gpus:8]
+  # Largest checkpoint in this list; the 474G load alone blows the 60min default
+  # on H20-3e.
+  - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:128,128-tp:8-gpus:8] TIMEOUT(180)
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:500,2000-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:2000,500-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_nemotron_ultra_253b-bench-pytorch-bfloat16-input_output_len:8000,1000-tp:8-gpus:8]
@@ -384,8 +390,11 @@ llm_perf_core:
   #llama_v3.3_70b
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct-bench-pytorch-bfloat16-maxbs:1-input_output_len:128,128-reqs:10-gpus:2]
   - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-input_output_len:128,128-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:8000,1000-reqs:3000-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:8-ep:8-tp:8-gpus:8]
+  # 3000 reqs x 9K tokens does not finish within the 60min default on RTX 6000 Server.
+  - perf/test_perf.py::test_perf[llama_v3.3_70b_instruct_fp4-bench-pytorch-float4-maxbs:1024-maxnt:4096-kv_frac:0.85-input_output_len:8000,1000-reqs:3000-tp:8-gpus:8] TIMEOUT(120)
+  # con:8 keeps the GPUs far from saturation, so wall time is dominated by the
+  # 2000-token decode of each request; does not fit the 60min default here.
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:8-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-float4-input_output_len:1000,2000-con:512-ep:8-tp:8-gpus:8]
   # deepseek_r1_0528
   - perf/test_perf.py::test_perf[deepseek_r1_0528_fp4-bench-pytorch-float4-maxbs:1-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8] TIMEOUT(120)
