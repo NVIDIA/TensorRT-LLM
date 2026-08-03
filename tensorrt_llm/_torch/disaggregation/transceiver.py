@@ -703,8 +703,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif result is None:
                 continue
             elif result == WaitResult.TIMEOUT:
-                logger.warning(
-                    f"TxSession rid={session.disagg_request_id} timed out after {self._sender_future_timeout_ms}ms"
+                logger.debug(
+                    f"TxSession rid={session.disagg_request_id} not ready after "
+                    f"{self._sender_future_timeout_ms}ms wait slice; keeping it in progress"
                 )
                 timed_out.append(rid)
             else:

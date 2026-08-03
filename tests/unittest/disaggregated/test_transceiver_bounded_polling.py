@@ -82,14 +82,17 @@ class _FakeSession:
 
 
 class _FakeTask:
-    def __init__(self, status: TaskStatus, wait_result: bool = True) -> None:
+    def __init__(self, status: TaskStatus, wait_result: bool | list[bool] = True) -> None:
         self.status = status
-        self._wait_result = wait_result
+        self._wait_results = list(wait_result) if isinstance(wait_result, list) else [wait_result]
         self.wait_calls: list[Optional[float]] = []
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         self.wait_calls.append(timeout)
-        return self._wait_result
+        result = self._wait_results.pop(0) if len(self._wait_results) > 1 else self._wait_results[0]
+        if result and self.status != TaskStatus.ERROR:
+            self.status = TaskStatus.TRANSFERRED
+        return result
 
 
 def _make_transceiver(
@@ -356,11 +359,98 @@ def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
     transceiver._ctx_consensus.assert_called_once()
 
 
-def test_tx_session_wait_complete_defaults_to_blocking() -> None:
-    task = _FakeTask(TaskStatus.INIT, wait_result=False)
+def test_tx_session_blocking_wait_retries_wait_slices_until_complete() -> None:
+    task = _FakeTask(TaskStatus.INIT, wait_result=[False, True])
     session = _make_tx_session([task])
 
-    assert session.wait_complete() == WaitResult.TIMEOUT
+    assert session.wait_complete() == WaitResult.COMPLETED
+    assert task.wait_calls == [0.25, 0.25]
+
+
+def test_context_transfer_status_block_all_drains_wait_slices_before_close() -> None:
+    task = _FakeTask(TaskStatus.INIT, wait_result=[False, True])
+    session = _make_tx_session([task])
+    transceiver = _make_transceiver({15: session}, {15: _FakeRequest()})
+
+    completed, failed = transceiver.check_context_transfer_status(None)
+
+    assert completed == [15]
+    assert failed == []
+    assert task.wait_calls == [0.25, 0.25]
+    assert session._closed
+    assert 15 not in transceiver._send_sessions
+
+
+def test_tx_session_blocking_wait_treats_cancelled_session_as_terminal() -> None:
+    task = _FakeTask(TaskStatus.TRANSFERRING, wait_result=False)
+    session = _make_tx_session([task])
+    session._terminal_status = SessionStatus.CANCELLED
+
+    assert session.wait_complete(blocking=True) == WaitResult.FAILED
+    assert task.wait_calls == []
+
+
+def test_tx_session_blocking_wait_observes_cancellation_between_slices() -> None:
+    task = _FakeTask(TaskStatus.TRANSFERRING, wait_result=False)
+    session = _make_tx_session([task])
+    wait = task.wait
+
+    def cancel_during_wait(timeout: Optional[float] = None) -> bool:
+        result = wait(timeout)
+        session._terminal_status = SessionStatus.CANCELLED
+        return result
+
+    task.wait = cancel_during_wait
+
+    assert session.wait_complete(blocking=True) == WaitResult.FAILED
+    assert task.wait_calls == [0.25]
+
+
+def test_tx_session_blocking_wait_treats_task_failure_as_terminal() -> None:
+    failed_task = _FakeTask(TaskStatus.ERROR)
+    pending_task = _FakeTask(TaskStatus.TRANSFERRING, wait_result=[False, True])
+    session = _make_tx_session([failed_task, pending_task])
+
+    assert session.wait_complete(blocking=True) == WaitResult.FAILED
+    assert failed_task.wait_calls == [0.25]
+    # A failed task event does not prove sibling physical writers quiesced, so
+    # precheck callers retain the wave instead of treating failure as drained.
+    assert pending_task.wait_calls == []
+
+
+def test_tx_session_blocking_wait_retries_aux_wait_slices() -> None:
+    kv_task = _FakeTask(TaskStatus.TRANSFERRED)
+    aux_task = _FakeTask(TaskStatus.INIT, wait_result=[False, True])
+    session = _make_tx_session([kv_task], need_aux=True, aux_task=aux_task)
+
+    assert session.wait_complete(blocking=True) == WaitResult.COMPLETED
+    assert kv_task.wait_calls == [0.25]
+    assert aux_task.wait_calls == [0.25, 0.25]
+
+
+def test_tx_session_blocking_aux_wait_observes_cancellation_between_slices() -> None:
+    kv_task = _FakeTask(TaskStatus.TRANSFERRED)
+    aux_task = _FakeTask(TaskStatus.TRANSFERRING, wait_result=False)
+    session = _make_tx_session([kv_task], need_aux=True, aux_task=aux_task)
+    wait = aux_task.wait
+
+    def cancel_during_wait(timeout: Optional[float] = None) -> bool:
+        result = wait(timeout)
+        session._terminal_status = SessionStatus.CANCELLED
+        return result
+
+    aux_task.wait = cancel_during_wait
+
+    assert session.wait_complete(blocking=True) == WaitResult.FAILED
+    assert kv_task.wait_calls == [0.25]
+    assert aux_task.wait_calls == [0.25]
+
+
+def test_tx_session_blocking_wait_keeps_missing_aux_pending() -> None:
+    task = _FakeTask(TaskStatus.TRANSFERRED)
+    session = _make_tx_session([task], need_aux=True)
+
+    assert session.wait_complete(blocking=True) is None
     assert task.wait_calls == [0.25]
 
 

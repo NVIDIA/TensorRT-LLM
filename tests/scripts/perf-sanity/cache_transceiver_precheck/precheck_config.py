@@ -26,6 +26,7 @@ block, so config parity is by construction rather than by copying values.
 
 import json
 import os
+import shlex
 
 # Optional per-yaml overrides live under a `cache_transceiver_precheck:` block.
 PRECHECK_DEFAULTS = {
@@ -61,8 +62,9 @@ PRECHECK_DEFAULTS = {
     "verify_data": True,
 }
 
-# Fallback KV shape when the model directory cannot be resolved: the precheck
-# still exercises the exact network path, just with a synthetic cache shape.
+# Fallback KV shape for dry-runs and explicitly selected manager versions when
+# the model directory cannot be resolved. Manager-version "auto" resolution
+# fails fast instead of silently pairing this shape with V1.
 FALLBACK_KV_SHAPE = {
     "num_layers": 32,
     "num_kv_heads": 8,
@@ -128,7 +130,13 @@ def default_step_timeout_s(max_world):
 
 
 def precheck_prefix_lines(
-    cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, max_world, stage_name=""
+    cfg,
+    benchmark_mode,
+    config_path_expr,
+    ucx_tls_cmd,
+    max_world,
+    llm_models_root,
+    stage_name="",
 ):
     """Launch-script export lines wiring the precheck gate.
 
@@ -167,6 +175,9 @@ def precheck_prefix_lines(
         f"--benchmark-mode {benchmark_mode} --llm-src $llmSrcNode"
     )
     lines = [
+        # Keep this as a top-level assignment. shlex.quote() is not safe when
+        # nested inside the double-quoted pytestCommand exports below.
+        f"export LLM_MODELS_ROOT={shlex.quote(llm_models_root)}",
         f"export ctPrecheckEnabled={int(enabled)}",
         # The external srun timeout must cover the driver's first-rep NIXL
         # wire-up allowance; the default derives from the same formula the

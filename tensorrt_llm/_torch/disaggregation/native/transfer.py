@@ -1336,7 +1336,9 @@ class TxSession(TxSessionBase):
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
         """Poll or block until KV (and optionally aux) transfer finishes.
 
-        With blocking=True (default): waits up to _timeout_s for each task.
+        With blocking=True (default): retries _timeout_s wait slices until a
+        successful transfer finishes. Errors and cancellation remain terminal;
+        callers must not interpret them as proof that peer writes quiesced.
         With blocking=False: polls non-blockingly; returns None if any KV task
         or aux is not yet done.
         """
@@ -1362,17 +1364,40 @@ class TxSession(TxSessionBase):
                     return None
             return WaitResult.COMPLETED
 
+        # ``_timeout_s`` bounds one scheduler wait slice; it is not a transfer
+        # deadline. A successful blockAll must not return merely because one
+        # slice expired: NIXL may still be reading the request's KV pages.
+        wait_slice_s = self._timeout_s
+        if wait_slice_s is not None and wait_slice_s <= 0:
+            wait_slice_s = None
+        # A None timeout intentionally preserves Event.wait()'s unbounded
+        # standalone behavior; configured transceivers supply a positive slice.
         for task in self.kv_tasks:
-            if not task.wait(timeout=self._timeout_s):
-                return WaitResult.TIMEOUT
+            while not task.wait(timeout=wait_slice_s):
+                # cancel() leaves a TRANSFERRING task's event unset until the
+                # physical writer finishes. Preserve the bounded-slice control
+                # point so blockAll can still report terminal cancellation.
+                if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                    return WaitResult.FAILED
             if task.status == TaskStatus.ERROR:
                 return WaitResult.FAILED
-        if self._need_aux and self.aux_task is not None:
-            if not self.aux_task.wait(timeout=self._timeout_s):
-                return WaitResult.TIMEOUT
+        if self._need_aux:
+            if self.aux_task is None:
+                return (
+                    WaitResult.FAILED
+                    if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+                    else None
+                )
+            while not self.aux_task.wait(timeout=wait_slice_s):
+                if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                    return WaitResult.FAILED
             if self.aux_task.status == TaskStatus.ERROR:
                 return WaitResult.FAILED
-        return WaitResult.COMPLETED
+        return (
+            WaitResult.FAILED
+            if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+            else WaitResult.COMPLETED
+        )
 
     def set_exception(self, reason: str = ""):
         msg = f"TxSession {self.disagg_request_id} exception"

@@ -19,7 +19,9 @@ Target: tests/scripts/perf-sanity/cache_transceiver_precheck/precheck_config.py
 
 import json
 import os
+import subprocess
 import sys
+import types
 
 import pytest
 
@@ -298,6 +300,55 @@ def test_use_kv_cache_manager_v2_flags():
     assert pcfg.side_plan(plan, "gen")["use_kv_cache_manager_v2"] is True
 
 
+def test_resolve_model_prefs_auto_requires_registered_model(monkeypatch):
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: types.SimpleNamespace())
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (None, None))
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
+
+    with pytest.raises(RuntimeError, match="refusing to assume V1"):
+        rp.resolve_model_prefs(None, {"use_kv_cache_manager_v2": "auto"}, cache_cfg)
+
+
+def test_resolve_model_prefs_auto_propagates_model_default_failure(monkeypatch):
+    class FailingModel:
+        @classmethod
+        def get_model_defaults(cls, _llm_args):
+            raise RuntimeError("model hook failed")
+
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: types.SimpleNamespace())
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (FailingModel, object()))
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
+
+    with pytest.raises(RuntimeError, match="get_model_defaults failed.*refusing to assume V1"):
+        rp.resolve_model_prefs("/model", {"use_kv_cache_manager_v2": "auto"}, cache_cfg)
+
+
+def test_resolve_model_prefs_auto_propagates_resolver_failure(monkeypatch):
+    class Model:
+        @classmethod
+        def get_model_defaults(cls, _llm_args):
+            return {"use_kv_cache_manager_v2": True}
+
+    def fail_resolver(_shim, _defaults):
+        raise RuntimeError("resolver failed")
+
+    api = types.SimpleNamespace(resolve_kv_cache_manager_v2_auto=fail_resolver)
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (Model, object()))
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
+
+    with pytest.raises(RuntimeError, match="V2 'auto' resolution failed.*refusing to assume V1"):
+        rp.resolve_model_prefs("/model", {"use_kv_cache_manager_v2": "auto"}, cache_cfg)
+
+
+def test_resolve_model_prefs_explicit_v1_does_not_require_model(monkeypatch):
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: types.SimpleNamespace())
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (None, None))
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
+
+    assert not rp.resolve_model_prefs(None, {"use_kv_cache_manager_v2": False}, cache_cfg)
+
+
 def test_model_kv_shape_vocab_size(tmp_path):
     model_dir = tmp_path / "m"
     model_dir.mkdir()
@@ -360,8 +411,48 @@ def test_wireup_timeout_derivation():
 
 
 def _enabled_line(cfg):
-    lines = pcfg.precheck_prefix_lines(cfg, "e2e", "$c", "unset &&", max_world=8)
+    lines = pcfg.precheck_prefix_lines(
+        cfg,
+        "e2e",
+        "$c",
+        "unset &&",
+        max_world=8,
+        llm_models_root="/models",
+    )
     return next(x for x in lines if x.startswith("export ctPrecheckEnabled"))
+
+
+@pytest.mark.parametrize(
+    "model_root",
+    (
+        "/models with spaces",
+        "/models/it's",
+        "/models/$HOME/$(must-not-run)",
+    ),
+)
+def test_precheck_commands_export_model_root_safely(model_root):
+    lines = pcfg.precheck_prefix_lines(
+        _disagg_yaml(),
+        "e2e",
+        "$config",
+        "unset UCX_TLS &&",
+        max_world=8,
+        llm_models_root=model_root,
+    )
+
+    commands = [line for line in lines if "pytestCommand" in line]
+    assert len(commands) == 2
+    assert all("python3" in line for line in commands)
+
+    script = "\n".join(lines) + '\nprintf "%s" "$LLM_MODELS_ROOT"\n'
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert result.stdout == model_root
 
 
 def test_precheck_env_kill_switch_truthy(monkeypatch):
