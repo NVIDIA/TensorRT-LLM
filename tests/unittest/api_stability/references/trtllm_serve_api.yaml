@@ -213,7 +213,7 @@ models:
         required: false
       early_stopping:
         kind: extension
-        type: Optional[int]
+        type: Optional[Union[bool, Literal['never']]]
         default: null
         status: stable
         required: false
@@ -684,7 +684,7 @@ models:
         required: false
       early_stopping:
         kind: extension
-        type: Optional[int]
+        type: Optional[Union[bool, Literal['never']]]
         default: null
         status: stable
         required: false

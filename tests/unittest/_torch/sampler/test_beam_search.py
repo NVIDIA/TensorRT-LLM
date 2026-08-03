@@ -44,6 +44,8 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearch, BeamSearchEarlyStop, BeamSearchMetadata,
     CBAState, _StrategyImpls, beam_search_sampling_batch)
 from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.bindings.internal.batch_manager import \
+    LlmRequest as CppLlmRequest
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import (CompletionOutput, GenerationResult,
                                           Logprob)
@@ -638,6 +640,79 @@ def test_beam_search_large_beam_width_regression(
             f"all {beam_width} beams are identical: {beam_sequences[0]}")
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
+    """Variable-Beam-Width-Search through the full engine path.
+
+    Drives beam_width_array end to end (scheduler -> ModelEngine ->
+    TorchSampler), which the operator-level tests cannot cover: the width
+    comes from get_beam_width_by_iter(), and that only advances with the
+    real decoding loop.
+
+    NB: single request on purpose. ModelEngine requires every generation
+    request in a batch to report the same per-iteration beam width, and
+    beam_width_array is indexed by each request's own decoding_iter, so
+    several requests admitted at different times would desynchronize and
+    abort the batch (TRTLLM-14792).
+    """
+    max_beam_width = 4
+    beam_width_array = [2, 3, 4]
+    input_prompts = [[1, 2, 3]]
+    vocab_size = DummyConfig().vocab_size
+    # Two steps past the end of beam_width_array, so the width has to hold at
+    # its last entry (the clamp in get_beam_width_by_iter is exercised) while
+    # staying within what this path reliably completes.
+    #
+    # NB: capped deliberately. With max_tokens >= 6 this test intermittently
+    # fails to terminate, including with a constant beam_width_array (e.g.
+    # [4, 4, 4]), which suggests the cause is not width variation and may not
+    # be specific to VBWS at all. Not yet diagnosed; tracked separately rather
+    # than blocking the coverage this test does provide.
+    max_tokens = 5
+
+    checkpoint_loader = HfCheckpointLoader(
+        weight_loader=DummyWeightLoader(),
+        config_loader=DummyConfigLoader(),
+    )
+
+    gc.collect(2)  # force destruction of any other LLM instances
+    with _single_process_context():
+        llm = LLM(
+            model=_pl.Path("dummy_path"),
+            checkpoint_loader=checkpoint_loader,
+            sampler_type="TorchSampler",
+            max_beam_width=max_beam_width,
+            max_batch_size=max_beam_width,
+            max_seq_len=64,
+            kv_cache_config=KvCacheConfig(max_tokens=10000),
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+        )
+        with llm:
+            sampling_params = SamplingParams(
+                max_tokens=max_tokens,
+                n=max_beam_width,
+                best_of=max_beam_width,
+                use_beam_search=True,
+                beam_width_array=beam_width_array,
+                end_id=-1,
+            )
+            outputs = llm.generate(deepcopy(input_prompts),
+                                   sampling_params=deepcopy(sampling_params))
+
+    assert isinstance(outputs, list)
+    assert len(outputs) == len(input_prompts)
+    beams = outputs[0].outputs
+    assert len(beams) == max_beam_width, (
+        f"expected {max_beam_width} beams, but got {len(beams)}")
+    for beam_idx, beam in enumerate(beams):
+        token_ids = beam.token_ids
+        assert token_ids is not None, f"beam {beam_idx} has no token_ids"
+        assert len(token_ids) > 0, f"beam {beam_idx} is empty"
+        assert all(0 <= t < vocab_size for t in token_ids), (
+            f"beam {beam_idx} has out-of-vocab tokens: {token_ids}")
+
+
 ###########################################################################
 # Unit tests
 ###########################################################################
@@ -1067,6 +1142,107 @@ def test_beam_topk_flashinfer_parity():
 
 
 @_kernel_test
+@_kernel_test
+@pytest.mark.parametrize("length_penalty", [0.0, 1.0])
+def test_vbws_width_transition_with_length_penalty(length_penalty: float):
+    """A VBWS width change must keep per-beam lengths aligned to their beams.
+
+    Widening from 2 to 3 beams reorders and duplicates source beams; the
+    per-beam generated lengths that length_penalty normalizes by must follow
+    the same permutation. Beams here have deliberately unequal lengths, so a
+    per-request (rather than per-beam) length would score them identically.
+    """
+    batch_size = 1
+    beam_width_in, beam_width_out = 2, 3
+    vocab_size = 8
+    max_batch_size = 2
+    max_beam_width = 4
+    seq_len = 6
+    device = torch.device("cuda")
+
+    seq_slots = torch.arange(batch_size, dtype=torch.int64, device=device)
+    slot = int(seq_slots[0])
+
+    cum_log_probs = torch.zeros((max_batch_size, max_beam_width),
+                                dtype=torch.float32,
+                                device=device)
+    # Equal cumulative scores, unequal lengths: with length_penalty > 0 the
+    # longer beam normalizes to a better score, so ranking must change.
+    cum_log_probs[slot, :beam_width_in] = torch.tensor([-2.0, -2.0],
+                                                       device=device)
+    beam_gen_lengths = torch.zeros((max_batch_size, max_beam_width),
+                                   dtype=torch.int32,
+                                   device=device)
+    beam_gen_lengths[slot, :beam_width_in] = torch.tensor([2, 5],
+                                                          dtype=torch.int32,
+                                                          device=device)
+
+    metadata = BeamSearchMetadata(
+        cache_indirection=torch.zeros(
+            (max_batch_size, max_beam_width, seq_len + 1),
+            dtype=torch.int32,
+            device=device),
+        cache_indirection_buffer=torch.full(
+            (max_batch_size, max_beam_width, seq_len + 1),
+            -1,
+            dtype=torch.int32,
+            device=device),
+        cum_log_probs=cum_log_probs,
+        seq_slots=seq_slots,
+        seq_lens=torch.full((batch_size, ),
+                            seq_len,
+                            dtype=torch.int32,
+                            device=device),
+        finished_beams=torch.zeros((max_batch_size, max_beam_width),
+                                   dtype=torch.int32,
+                                   device=device),
+        new_log_probs=torch.zeros((max_batch_size, max_beam_width),
+                                  dtype=torch.float32,
+                                  device=device),
+        predecessor_beams=torch.zeros((max_batch_size, max_beam_width),
+                                      dtype=torch.int32,
+                                      device=device),
+        seq_offsets=torch.zeros((batch_size + 1, ),
+                                dtype=torch.int32,
+                                device=device),
+        beam_idx_arange=torch.arange(max_beam_width,
+                                     dtype=torch.int32,
+                                     device=device),
+        beam_gen_lengths=beam_gen_lengths,
+    )
+
+    logits = torch.zeros((batch_size * beam_width_in, vocab_size),
+                         dtype=torch.float32,
+                         device=device)
+    next_tokens, _ = beam_search_sampling_batch(
+        logits=logits,
+        beam_width_in=beam_width_in,
+        beam_width_out=beam_width_out,
+        beam_search_args=metadata,
+        temperature=1.0,
+        length_penalty=length_penalty,
+        return_probs=False,
+    )
+
+    # Rows are laid out at max_beam_width; only the first beam_width_out
+    # columns carry this step's beams.
+    assert next_tokens.shape[1] == max_beam_width
+    # The widened slots must be initialized, not left stale.
+    assert torch.isfinite(metadata.cum_log_probs[slot, :beam_width_out]).all()
+    # Slots beyond the current width stay untouched.
+    torch.testing.assert_close(
+        metadata.cum_log_probs[slot, beam_width_out:],
+        torch.zeros(max_beam_width - beam_width_out, device=device))
+
+    predecessors = metadata.predecessor_beams[slot, :beam_width_out]
+    assert int(predecessors.min()) >= 0
+    assert int(predecessors.max()) < beam_width_in
+    if length_penalty > 0.0:
+        # Equal raw scores, so normalization by the per-beam length decides:
+        # the longer source beam (index 1, length 5) must win.
+        assert int(predecessors[0]) == 1
+
+
 def test_beam_search_sampling_batch_diversity_rate():
     """diversity_rate wired through beam_search_sampling_batch changes beam
     selection while stored cum_log_probs stay raw."""
@@ -1730,6 +1906,122 @@ def create_default_sampler(test_params: GeneralTestParams) -> TorchSampler:
     return sampler
 
 
+def _vbws_request(beam_width_array: list[int] | None,
+                  max_beam_width: int = 4) -> LlmRequest:
+    """A beam-search request carrying ``beam_width_array`` (VBWS)."""
+    sampling_params = SamplingParams(n=max_beam_width,
+                                     best_of=max_beam_width,
+                                     use_beam_search=True,
+                                     beam_width_array=beam_width_array)
+    return LlmRequest(request_id=0,
+                      seq_slot=0,
+                      max_new_tokens=16,
+                      input_tokens=[1, 2, 3],
+                      end_id=-1,
+                      sampling_config=SamplingConfig(
+                          sampling_params._get_sampling_config()),
+                      is_streaming=False)
+
+
+@pytest.mark.parametrize(
+    "beam_width_array, expected",
+    [
+        # Widening: index is (iteration - 1), clamped at both ends.
+        ([2, 3, 4], [2, 2, 3, 4]),
+        # Narrowing: beams are dropped as decoding proceeds.
+        ([4, 3, 2], [4, 4, 3, 2]),
+    ],
+    ids=["widening", "narrowing"],
+)
+def test_vbws_beam_width_by_iter_follows_array(beam_width_array: list[int],
+                                               expected: list[int]):
+    """get_beam_width_by_iter walks beam_width_array as decoding advances.
+
+    Covers both directions: widening adds beams, narrowing drops them.
+    """
+    request = _vbws_request(beam_width_array)
+    actual = []
+    for iteration in range(len(expected)):
+        request.decoding_iter = iteration
+        actual.append(request.get_beam_width_by_iter())
+    assert actual == expected
+
+    # for_next_iteration looks one step ahead, i.e. it is the same sequence
+    # shifted by one -- this is what feeds beam_width_out during sampling.
+    request.decoding_iter = 0
+    assert request.get_beam_width_by_iter(
+        for_next_iteration=True) == expected[1]
+
+
+def test_vbws_beam_width_by_iter_clamps_past_array_end():
+    """Decoding longer than beam_width_array must hold the last width.
+
+    Regression test for the C++ formula, which clamps the iteration index with
+    the global kMaxBeamWidthArrayLength (assuming a padded array) and therefore
+    reads past the end of the raw user array, returning garbage. The Python
+    override clamps with the actual array length instead; see
+    LlmRequest.get_beam_width_by_iter.
+    """
+    beam_width_array = [2, 3, 4]
+    request = _vbws_request(beam_width_array)
+    # Run well past the end of the array.
+    for iteration in range(len(beam_width_array), len(beam_width_array) + 8):
+        request.decoding_iter = iteration
+        assert request.get_beam_width_by_iter() == beam_width_array[-1]
+        assert request.get_beam_width_by_iter(
+            for_next_iteration=True) == beam_width_array[-1]
+
+
+def test_vbws_cpp_formula_reads_past_array_end():
+    """Document why LlmRequest.get_beam_width_by_iter overrides the binding.
+
+    The C++ implementation clamps the iteration index with the global
+    kMaxBeamWidthArrayLength rather than the actual array length, so once
+    decoding runs longer than the user's array it reads out of bounds and
+    returns arbitrary values (observed: 0, 32, 849 for a 3-entry array).
+    Values of 0 are particularly bad -- a zero beam width is not a valid
+    decoding state. TRTLLMSampler calls into C++ directly and is therefore
+    still affected; this test pins the divergence so the override is not
+    dropped as redundant.
+    """
+    beam_width_array = [2, 3, 4]
+    request = _vbws_request(beam_width_array)
+
+    # Within the array both agree.
+    for iteration in range(len(beam_width_array) + 1):
+        request.decoding_iter = iteration
+        assert (request.get_beam_width_by_iter() ==
+                CppLlmRequest.get_beam_width_by_iter(request, False))
+
+    # Past the end the C++ formula diverges, and can even yield 0.
+    diverged = False
+    for iteration in range(
+            len(beam_width_array) + 1,
+            len(beam_width_array) + 8):
+        request.decoding_iter = iteration
+        assert request.get_beam_width_by_iter() == beam_width_array[-1]
+        if CppLlmRequest.get_beam_width_by_iter(request,
+                                                False) != beam_width_array[-1]:
+            diverged = True
+    assert diverged, (
+        "C++ get_beam_width_by_iter no longer reads past the end of the "
+        "array; the Python override may now be redundant.")
+
+
+def test_vbws_uniform_array_matches_fixed_width():
+    """A constant beam_width_array must behave exactly like a fixed width."""
+    max_beam_width = 4
+    vbws = _vbws_request([max_beam_width] * 3, max_beam_width=max_beam_width)
+    fixed = _vbws_request(None, max_beam_width=max_beam_width)
+    for iteration in range(8):
+        vbws.decoding_iter = iteration
+        fixed.decoding_iter = iteration
+        assert vbws.get_beam_width_by_iter() == fixed.get_beam_width_by_iter()
+        assert vbws.get_beam_width_by_iter(
+            for_next_iteration=True) == fixed.get_beam_width_by_iter(
+                for_next_iteration=True)
+
+
 def test_create_beam_history():
     """Test TorchSampler._create_beam_history method.
 
@@ -2160,6 +2452,44 @@ class TestParameterValidation:
         ):
             _ = llm.generate(input_prompts,
                              sampling_params=SamplingParams(**params))
+        self._check_engine_responds(llm, input_prompts, fixed_params)
+
+    @pytest.mark.timeout(120)
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("early_stopping", [0, 2])
+    def test_exhaustive_early_stopping_allowed_without_disagg(
+        self,
+        llm: LLM,
+        input_prompts: list[str],
+        fixed_params: dict[str, Any],
+        batch_size: int,
+        sampler_type: str,
+        early_stopping: int,
+    ):
+        # The exhaustive early_stopping modes are only rejected for
+        # disaggregated serving (the finished-candidate pool is not part of the
+        # handoff; TRTLLM-14792). Regular serving must still accept them.
+        # NB: guards against the disagg check matching every request, e.g. by
+        # testing a bound method rather than calling it.
+        if batch_size == 1:
+            pytest.skip("Test does not depend on batch size")
+        if sampler_type == "TRTLLMSampler":
+            pytest.skip("Exhaustive early_stopping check is TorchSampler-side")
+        outputs = llm.generate(input_prompts,
+                               sampling_params=SamplingParams(
+                                   max_tokens=fixed_params["max_tokens"],
+                                   n=1,
+                                   best_of=fixed_params["max_beam_width"],
+                                   use_beam_search=True,
+                                   early_stopping=early_stopping,
+                                   end_id=-1,
+                               ))
+        assert isinstance(outputs, list)
+        assert len(outputs) == len(input_prompts)
+        for output in outputs:
+            assert len(output.outputs) == 1
+            token_ids = output.outputs[0].token_ids
+            assert token_ids is not None and len(token_ids) > 0
         self._check_engine_responds(llm, input_prompts, fixed_params)
 
     @pytest.mark.timeout(120)

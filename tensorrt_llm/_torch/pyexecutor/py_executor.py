@@ -4998,8 +4998,11 @@ class PyExecutor:
             # would be silently dropped -- reachable under aggregation but not
             # under disaggregation. Reject the combination until the handoff
             # carries the pool; TRTLLM-14792.
+            # NB: is_context_only_request is a property, but
+            # is_generation_only_request is a plain method -- it must be called,
+            # otherwise the bound method is truthy and this matches every request.
             if (request.is_context_only_request
-                    or request.is_generation_only_request):
+                    or request.is_generation_only_request()):
                 early_stopping = _unwrap_singleton(
                     sampling_config.early_stopping)
                 if (early_stopping is not None
