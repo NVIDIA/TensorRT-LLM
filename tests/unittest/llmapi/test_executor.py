@@ -389,7 +389,7 @@ def ResponsePostprocessWorker_worker_task(pull_pipe_addr, push_pipe_addr,
                                           tokenizer_dir):
     worker = PostprocWorker(
         pull_pipe_addr=pull_pipe_addr,
-        push_pipe_addr=push_pipe_addr,
+        push_pipe_addrs=[push_pipe_addr],
         tokenizer_dir=tokenizer_dir,
         record_creator=ResponsePostprocessWorker_record_creator)
     worker.start()

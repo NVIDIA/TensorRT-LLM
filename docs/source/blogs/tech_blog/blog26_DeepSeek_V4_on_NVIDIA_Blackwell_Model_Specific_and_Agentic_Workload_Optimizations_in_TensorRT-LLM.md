@@ -455,6 +455,8 @@ The GB300 results reached 57.5 CPG at SLO20 and 19.2 CPG at SLO60:
 | SLO20 | 6 × CTX DEP4 + 1 × GEN DEP8 | 1,840 | 32 | 57.5 | NVIDIA configuration, run and verified by AA |
 | SLO60 | 6 × CTX DEP4 + 1 × GEN DEP16 | 768 | 40 | 19.2 | NVIDIA configuration, run and verified by AA |
 
+These optimizations are now also available in [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) for readers looking to deploy in production.
+
 ## Reproduction and Future Work
 
 ### How to reproduce

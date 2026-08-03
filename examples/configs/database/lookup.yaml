@@ -558,6 +558,8 @@
   concurrency: 4
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc4.yaml
   num_gpus: 8
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
@@ -582,6 +584,8 @@
   concurrency: 32
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc32.yaml
   num_gpus: 8
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
@@ -590,6 +594,8 @@
   concurrency: 64
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc64.yaml
   num_gpus: 8
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
@@ -598,6 +604,8 @@
   concurrency: 128
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc128.yaml
   num_gpus: 8
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
@@ -606,6 +614,8 @@
   concurrency: 256
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc256.yaml
   num_gpus: 8
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
@@ -750,6 +760,8 @@
   concurrency: 4
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc4.yaml
   num_gpus: 8
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
@@ -782,6 +794,8 @@
   concurrency: 64
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc64.yaml
   num_gpus: 8
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
@@ -790,6 +804,8 @@
   concurrency: 128
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc128.yaml
   num_gpus: 8
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
@@ -798,6 +814,8 @@
   concurrency: 256
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc256.yaml
   num_gpus: 8
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
   arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
@@ -1566,3 +1584,83 @@
   concurrency: 1536
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc1536.yaml
   num_gpus: 8
+- model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
+  gpu: B200_NVL
+  isl: 1024
+  osl: 1024
+  concurrency: 4
+  config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc4.yaml
+  num_gpus: 4
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
+- model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
+  gpu: B200_NVL
+  isl: 1024
+  osl: 1024
+  concurrency: 8
+  config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc8.yaml
+  num_gpus: 4
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
+- model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
+  gpu: B200_NVL
+  isl: 1024
+  osl: 1024
+  concurrency: 16
+  config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc16.yaml
+  num_gpus: 4
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
+- model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
+  gpu: B200_NVL
+  isl: 1024
+  osl: 1024
+  concurrency: 256
+  config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc256.yaml
+  num_gpus: 4
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
+- model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
+  gpu: B200_NVL
+  isl: 8192
+  osl: 1024
+  concurrency: 4
+  config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc4.yaml
+  num_gpus: 4
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
+- model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
+  gpu: B200_NVL
+  isl: 8192
+  osl: 1024
+  concurrency: 8
+  config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc8.yaml
+  num_gpus: 4
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
+- model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
+  gpu: B200_NVL
+  isl: 8192
+  osl: 1024
+  concurrency: 16
+  config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc16.yaml
+  num_gpus: 4
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14
+- model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
+  gpu: B200_NVL
+  isl: 8192
+  osl: 1024
+  concurrency: 256
+  config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc256.yaml
+  num_gpus: 4
+  validated_trtllm_commit: 93cb6518b6d6dbd6095748189e626db731f44545
+  validated_trtllm_version: 1.3.0rc14

@@ -42,10 +42,12 @@ if TYPE_CHECKING:
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
-from ..pyexecutor.sampler.sampling_utils import (
-    compute_probs_from_logits, greedy_search_sampling_batch,
-    sampling_batch_spec_dec_one_model,
-    sampling_batch_spec_dec_one_model_for_rejection)
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
+
+from ..pyexecutor.sampler.ops.flashinfer import (
+    compute_probs_from_logits, resolve_advanced_sampling_filters,
+    sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
+from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
 
 def rejection_sampling_one_model(
@@ -526,8 +528,20 @@ class SpecMetadata:
     # Defaults to True so non-one-engine paths (where populate is a no-op)
     # never accidentally select the advanced graph variant.
     is_all_greedy_sample: bool = True
+    # Group-synchronized override for ``is_all_greedy_sample`` (AND over the
+    # TP group's local flags; None = no group sync configured, use the local
+    # value). Under ADP + LM-head TP with rejection sampling, the greedy-vs-
+    # advanced choice gates group collectives, so all ranks must take the same
+    # path even though their batches (and thus local flags) differ. Set by
+    # ``_sync_group_all_greedy_sample`` before the CUDA graph key is built and
+    # re-applied by ``_scan_one_model_sampling`` on every rescan. AND is safe:
+    # a greedy rank pulled onto the advanced path still samples greedily via
+    # its sentinel params.
+    group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
+    # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
+    advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Sampling parameters for non-greedy sampling (per-request)
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
@@ -707,7 +721,7 @@ class SpecMetadata:
         before the CUDA graph key is built.
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import \
+        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
             GREEDY_TEMPERATURE_THRESHOLD
         from tensorrt_llm.sampling_params import SamplingParams
 
@@ -732,6 +746,13 @@ class SpecMetadata:
             top_p: Optional[float],
         ) -> tuple[float, int, float, bool, bool, bool, bool]:
             """Convert request sampling params into normalized per-request scalars."""
+            # NB: min_p is intentionally omitted here. One-engine speculative
+            # decoding does not support min_p (there is no request_min_p buffer
+            # nor min_p wiring in the sampling_batch_spec_dec_one_model*
+            # kernels); a min_p request is rejected at admission by
+            # SpecSamplerBase.validate_request, so nothing reaching this scan
+            # carries a min_p that would change its classification. The
+            # two-model draft/target path honors min_p via _request_strategy.
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temperature,
                 top_k=top_k,
@@ -830,7 +851,27 @@ class SpecMetadata:
                 for (_, _, _, num_tokens) in per_request_normalized
             ]
 
+        # Apply the group-synchronized override last (semantics: see the
+        # ``group_all_greedy_sample`` field comment). Local contract: the
+        # synced value already incorporates any capture override, and rescans
+        # (e.g. populate after the graph key) must converge to it rather than
+        # resurrect the local value.
+        if self.group_all_greedy_sample is not None:
+            self.is_all_greedy_sample = self.group_all_greedy_sample
         return per_request_normalized, per_request_slot_ids
+
+    @property
+    def wants_advanced_draft_sampling(self) -> bool:
+        """Whether the current batch takes the advanced (rejection) draft
+        path: rejection sampling enabled AND not an all-greedy batch.
+
+        Single source of truth for the greedy-vs-advanced decision: the
+        sampler branch (``sample_draft_tokens``) and the worker's LM-head-TP
+        bypass (``_forward_linear_draft_loop``) must agree exactly -- a
+        divergence feeds the wrong logits layout to the sampler -- so both
+        read this property instead of re-deriving the predicate.
+        """
+        return self.use_rejection_sampling and not self.is_all_greedy_sample
 
     def update_is_all_greedy_sample(self, requests: list["LlmRequest"]) -> None:
         """Refresh ``is_all_greedy_sample`` for the *current* batch.
@@ -978,7 +1019,7 @@ class SpecWorkerBase(nn.Module, ABC):
         self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
         )
         # One-model speculative sampling goes through flashinfer unconditionally
-        # (sampling_batch_spec_dec_one_model), so flashinfer>=0.6.4 is a hard
+        # (sample_from_logits_op), so flashinfer>=0.6.4 is a hard
         # dependency here. Fail at construction with a clear error instead of
         # crashing mid-inference on the first non-greedy sampling step.
         if not IS_FLASHINFER_AVAILABLE or Version(
@@ -1441,15 +1482,16 @@ class SpecWorkerBase(nn.Module, ABC):
         (see ``_draft_logits_are_sharded``); replicated full-vocab logits are
         returned unchanged.
 
-        Plain TP gathers vocab shards over ``self.mapping``. ADP + LM-head TP
-        never reaches this path: rejection sampling (the only consumer of
-        advanced draft sampling) is config-gated off under attention DP, and
-        the group-stacked sharded logits it produces are handled by the greedy
-        path in ``greedy_sample_draft_with_tp_gather``.
+        Plain TP gathers vocab shards over ``self.mapping``. The LM-head-TP
+        stacked/sharded layout never reaches this path: an advanced-sampling
+        batch bypasses the LM-head-TP fast path in the worker and computes
+        full-vocab logits locally from the (ADP-replicated) lm_head weight, so
+        ``mapping_lm_head_tp`` is only ever passed alongside greedy sampling.
         """
         assert mapping_lm_head_tp is None, (
-            "Advanced draft sampling is not supported under ADP + LM-head TP "
-            "(rejection sampling is config-gated off with attention DP)")
+            "Advanced draft sampling must not receive LM-head-TP "
+            "stacked/sharded logits; the worker bypasses the LM-head-TP fast "
+            "path for non-all-greedy batches (see _forward_linear_draft_loop)")
         if (spec_metadata is None or spec_metadata.is_all_greedy_sample
                 or not self._draft_logits_are_sharded(logits, spec_metadata)):
             return logits
@@ -1471,7 +1513,7 @@ class SpecWorkerBase(nn.Module, ABC):
         With rejection enabled and a ``draft_step``, samples via
         ``sampling_batch_spec_dec_one_model_for_rejection`` and scatters this
         step's proposal distribution into the slot-indexed ``draft_probs``
-        buffer; otherwise uses ``sampling_batch_spec_dec_one_model`` (tokens
+        buffer; otherwise uses ``sample_from_logits_op`` (tokens
         only). Returns tokens in draft-vocab space (the caller applies d2t).
         Expects 2D ``[batch_size, vocab]`` logits (one row per request).
         """
@@ -1480,13 +1522,15 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ps = spec_metadata.request_top_ps[:batch_size]
 
         self._update_advance_draft_sampling_seed(logits.device)
+        eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
+            spec_metadata.advanced_sampling_mode, top_ks, top_ps)
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             draft_tokens, probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(
                     logits,
                     temperatures,
-                    top_ks,
-                    top_ps,
+                    eff_top_ks,
+                    eff_top_ps,
                     seed=self.seed,
                     offset=self.offset))
             # Scatter probs into the slot-indexed buffer so each request's data
@@ -1500,12 +1544,12 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
             spec_metadata.draft_probs_last_dim = vocab
         else:
-            draft_tokens = sampling_batch_spec_dec_one_model(logits,
-                                                             temperatures,
-                                                             top_ks,
-                                                             top_ps,
-                                                             seed=self.seed,
-                                                             offset=self.offset)
+            draft_tokens = sample_from_logits_op(logits,
+                                                 temperatures,
+                                                 eff_top_ks,
+                                                 eff_top_ps,
+                                                 seed=self.seed,
+                                                 offset=self.offset)
 
         return draft_tokens.type(torch.int32)
 
@@ -1655,6 +1699,8 @@ class SpecWorkerBase(nn.Module, ABC):
                       spec_metadata.top_ks[gen_start:gen_end])
             top_ps = (None if spec_metadata.skip_top_p else
                       spec_metadata.top_ps[gen_start:gen_end])
+            top_ks, top_ps = resolve_advanced_sampling_filters(
+                spec_metadata.advanced_sampling_mode, top_ks, top_ps)
 
             target_probs_flat = compute_probs_from_logits(
                 gen_logits, temperatures, top_ks, top_ps)
@@ -1862,7 +1908,7 @@ class SpecWorkerBase(nn.Module, ABC):
         With rejection enabled, samples via
         ``sampling_batch_spec_dec_one_model_for_rejection`` and scatters the K
         proposal rows into ``draft_probs[gen_slot_ids, 0:K, :]``; otherwise uses
-        ``sampling_batch_spec_dec_one_model`` (tokens only). Only called for a
+        ``sample_from_logits_op`` (tokens only). Only called for a
         non-greedy batch (the all-greedy path is handled by the caller). Returns
         ``[num_gens, K]`` int32 tokens in draft-vocab space (the caller applies
         d2t); stored probs likewise stay in draft-vocab space.
@@ -1884,14 +1930,16 @@ class SpecWorkerBase(nn.Module, ABC):
 
         self._update_advance_draft_sampling_seed(gen_logits.device)
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
+        eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
+            spec_metadata.advanced_sampling_mode, top_ks, top_ps)
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
             flat_tokens, flat_probs = (
                 sampling_batch_spec_dec_one_model_for_rejection(
                     flat_logits,
                     temps,
-                    top_ks,
-                    top_ps,
+                    eff_top_ks,
+                    eff_top_ps,
                     seed=self.seed,
                     offset=self.offset))
             # Scatter the K prob rows per gen request into its stable slot row.
@@ -1905,12 +1953,12 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.draft_probs[gen_slot_ids, :K, :vocab] = probs
                 spec_metadata.draft_probs_last_dim = vocab
         else:
-            flat_tokens = sampling_batch_spec_dec_one_model(flat_logits,
-                                                            temps,
-                                                            top_ks,
-                                                            top_ps,
-                                                            seed=self.seed,
-                                                            offset=self.offset)
+            flat_tokens = sample_from_logits_op(flat_logits,
+                                                temps,
+                                                eff_top_ks,
+                                                eff_top_ps,
+                                                seed=self.seed,
+                                                offset=self.offset)
 
         return flat_tokens.reshape(num_gens, K).type(torch.int32)
 
@@ -1972,7 +2020,6 @@ class SpecWorkerBase(nn.Module, ABC):
         no slicing is needed.
         """
         is_block = logits.dim() == 3
-        use_rejection = getattr(spec_metadata, "use_rejection_sampling", False)
 
         # Draft tokens use argmax unless rejection sampling is engaged for a
         # non-greedy batch. Rejection sampling is the only path that needs the
@@ -1983,7 +2030,7 @@ class SpecWorkerBase(nn.Module, ABC):
         # max_i p_i >= sum_i p_i^2 = E[accept] for a stochastic draft). This
         # matches sglang/vLLM, which draft with argmax/top-k by default and apply
         # sampling params only on the target/acceptance side.
-        advanced = use_rejection and not spec_metadata.is_all_greedy_sample
+        advanced = spec_metadata.wants_advanced_draft_sampling
 
         # All samplers below return tokens in draft-vocab space; d2t is applied
         # once after the branch.
@@ -2158,7 +2205,7 @@ class SpecWorkerBase(nn.Module, ABC):
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured
             # graph was built for a shorter draft_len, causing a shape mismatch
-            # in sampling_batch_spec_dec_one_model (which is torch.compiled).
+            # in sample_from_logits_op (which is torch.compiled).
             num_tokens = logits.shape[0]
 
             temperatures = spec_metadata.temperatures[:num_tokens]
@@ -2176,13 +2223,14 @@ class SpecWorkerBase(nn.Module, ABC):
             self.seed += 1
             self.seed %= (2**31)
 
-            sampled_tokens = sampling_batch_spec_dec_one_model(
-                logits,
-                temperatures,
-                top_ks,
-                top_ps,
-                seed=self.seed,
-                offset=self.offset)
+            eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
+                spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+            sampled_tokens = sample_from_logits_op(logits,
+                                                   temperatures,
+                                                   eff_top_ks,
+                                                   eff_top_ps,
+                                                   seed=self.seed,
+                                                   offset=self.offset)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 

@@ -32,6 +32,8 @@ if str(REPO_ROOT) not in sys.path:
 from examples.configs.database.database import (  # noqa: E402
     CURATED_LIST_PATH,
     DATABASE_LIST_PATH,
+    PROFILE_DISPLAY_NAMES,
+    PROFILE_ORDER,
     CuratedRecipeList,
     RecipeList,
     assign_profile,
@@ -90,9 +92,9 @@ MODEL_INFO = {
         "display_name": "Kimi-K2-Thinking (NVFP4)",
         "url": "https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4",
     },
-    "MiniMaxAI/MiniMax-M3": {
-        "display_name": "MiniMax-M3 (BF16)",
-        "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3",
+    "MiniMaxAI/MiniMax-M3-MXFP8": {
+        "display_name": "MiniMax-M3 (MXFP8)",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8",
     },
 }
 
@@ -114,6 +116,9 @@ class RecipeRow:
     config_filename: str
     config_github_url: str
     config_raw_url: str
+    profile: str | None
+    validated_trtllm_commit: str | None
+    validated_trtllm_version: str | None
 
 
 @dataclass(frozen=True)
@@ -167,7 +172,7 @@ def build_curated_rows(yaml_path: Path) -> list[CuratedRow]:
     return rows
 
 
-def build_rows(yaml_path) -> list[RecipeRow]:
+def build_rows(yaml_path: Path) -> list[RecipeRow]:
     recipe_list = RecipeList.from_yaml(Path(yaml_path))
 
     model_groups = defaultdict(lambda: defaultdict(list))
@@ -189,7 +194,7 @@ def build_rows(yaml_path) -> list[RecipeRow]:
 
         for key in sorted_keys:
             entries = subgroups[key]
-            entries.sort(key=lambda x: x.concurrency)
+            entries.sort(key=lambda x: (x.concurrency, PROFILE_ORDER.get(x.profile, -1)))
 
             for idx, entry in enumerate(entries):
                 gpu = entry.gpu
@@ -200,7 +205,11 @@ def build_rows(yaml_path) -> list[RecipeRow]:
                 conc = entry.concurrency
                 config_path = entry.config_path
 
-                profile = assign_profile(len(entries), idx, conc)
+                performance_profile = (
+                    PROFILE_DISPLAY_NAMES[entry.profile]
+                    if entry.profile
+                    else assign_profile(len(entries), idx, conc)
+                )
 
                 command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{config_path}"
 
@@ -224,18 +233,23 @@ def build_rows(yaml_path) -> list[RecipeRow]:
                         concurrency=conc,
                         config_path=config_path,
                         gpu_display=gpu_display,
-                        performance_profile=profile,
+                        performance_profile=performance_profile,
                         command=command,
                         config_filename=config_filename,
                         config_github_url=config_github_url,
                         config_raw_url=config_raw_url,
+                        profile=entry.profile,
+                        validated_trtllm_commit=entry.validated_trtllm_commit,
+                        validated_trtllm_version=entry.validated_trtllm_version,
                     )
                 )
 
     return rows
 
 
-def generate_json(yaml_path: Path, output_file: Path, curated_yaml_path: Path | None = None):
+def generate_json(
+    yaml_path: Path, output_file: Path, curated_yaml_path: Path | None = None
+) -> None:
     rows = build_rows(yaml_path)
 
     source_path = Path(yaml_path)
@@ -266,7 +280,9 @@ def generate_json(yaml_path: Path, output_file: Path, curated_yaml_path: Path | 
     payload = {
         "source": source,
         "models": models,
-        "entries": [asdict(r) for r in rows],
+        "entries": [
+            {key: value for key, value in asdict(row).items() if value is not None} for row in rows
+        ],
         "curated_entries": curated_entries,
     }
 

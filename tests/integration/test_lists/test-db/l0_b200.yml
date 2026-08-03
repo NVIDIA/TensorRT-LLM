@@ -97,6 +97,7 @@ l0_b200:
   - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py
   - unittest/_torch/modules/fused_ops/test_gelu_tanh_mul_fp4_quant.py
   - unittest/_torch/modules/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/modules/fused_ops/test_fused_qk_norm_rope_gate.py
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
   - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py
@@ -113,6 +114,7 @@ l0_b200:
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/modules/moe/test_megamoe_streaming_load.py
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
@@ -209,6 +211,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_flux_transformer.py
   - unittest/_torch/visual_gen/test_flux_attention.py
   - unittest/_torch/visual_gen/test_flux_pipeline.py
+  - unittest/_torch/visual_gen/test_flux2_image_conditioning.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_attention.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
@@ -227,13 +230,17 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
+  - unittest/_torch/visual_gen/test_cosmos3_distilled.py
   - examples/visual_gen/test_visual_gen.py::test_wan_t2v_example
   - examples/visual_gen/test_visual_gen.py::test_flux1_example
   - examples/visual_gen/test_visual_gen.py::test_flux2_example
+  - examples/visual_gen/test_visual_gen.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_example
   - examples/visual_gen/test_visual_gen.py::test_qwen_image_example
+  - examples/visual_gen/test_visual_gen.py::test_qwen_image_layered_example
+  - examples/visual_gen/test_visual_gen.py::test_qwen_image_edit_example
   # - examples/visual_gen/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
@@ -258,11 +265,12 @@ l0_b200:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: tensorrt
+      backend: pytorch
   tests:
-  # ------------- TRT tests ---------------
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
   - unittest/disaggregated/test_openai_server_info.py
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
 - condition:
     ranges:
       system_gpu_count:
@@ -335,8 +343,10 @@ l0_b200:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
   - examples/visual_gen/test_visual_gen.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_qwenimage_cuda_graph_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen.py::test_qwen_image_layered_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_lpips_against_golden TIMEOUT (20)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----

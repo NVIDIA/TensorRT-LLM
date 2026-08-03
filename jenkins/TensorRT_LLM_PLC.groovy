@@ -140,7 +140,7 @@ def checkoutSource ()
     def LLM_REPO = getLLMRepo()
     sh "git config --global --add safe.directory ${env.WORKSPACE}"
     def ref = params.ref
-    trtllm_utils.checkoutSource(LLM_REPO, ref, env.WORKSPACE, false, true)
+    trtllm_utils.checkoutSource(LLM_REPO, ref, env.WORKSPACE, true, true)
 }
 
 def getPulseToken(serviceId, scopes) {

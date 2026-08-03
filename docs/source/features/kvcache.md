@@ -74,11 +74,56 @@ scheduler_config:
   enable_prefix_aware_scheduling: false
 ```
 
+### Mamba Snapshot Boundaries
+
+Hybrid Mamba models must retain the recurrent Mamba state together with the
+attention KV prefix. Snapshot policy is grouped under
+`kv_cache_config.mamba_state_config`. `periodic_snapshot_interval` controls
+periodic boundaries. They are disabled by default; set the interval to a
+positive value to enable them. The deprecated
+`kv_cache_config.mamba_state_cache_interval` alias remains accepted for
+compatibility and is copied to the nested field during validation. New code and
+configuration files should use the nested field. The prototype
+`additional_snapshot_offsets_from_start` and
+`additional_snapshot_offsets_from_end` options add fixed boundaries. Start
+offsets count tokens from the beginning of the prompt. End offsets count
+backward from the prompt end, and an end offset of `0` selects the final
+prompt boundary. The `per_conversation` block reuse policy disables periodic
+Mamba snapshots, so configure one or more explicit stable boundaries (usually
+an end offset of `0`) when using it with a hybrid Mamba model. For example:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  avg_seq_len: 2048
+  mamba_state_config:
+    periodic_snapshot_interval: 0
+    additional_snapshot_offsets_from_start: [128]
+    additional_snapshot_offsets_from_end: [0, 32]
+```
+
+This retains snapshots after the first 128 tokens, at the end of the prompt,
+and before the final 32 prompt tokens. Positions outside a particular prompt
+are ignored. Set `avg_seq_len` to the workload's average total sequence length
+so V2 can size the attention KV and Mamba state pools in the right proportion.
+If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
+Mamba models warn and fall back to half of `max_seq_len`, which can produce a
+suboptimal pool split. Exact explicit boundaries currently require
+`MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector. Hybrid
+Mamba models select V2 by default when
+`use_kv_cache_manager_v2: auto`; set it to `false` to select the V1 C++
+compatibility manager. In disaggregated serving, V2 Mamba requires the Python
+NIXL transceiver (`transceiver_runtime: PYTHON`); V1 routes support periodic
+snapshots only.
+
 ### KV Cache Salting for Secure Reuse
 
 KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.
 
 To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.
+
+This isolation is enforced entirely by the block-key hash: the salt is mixed into the hashed input and prefix matching is decided by digest equality alone (blocks are not re-compared token-by-token). The block-key hash is therefore required to be a cryptographic hash with strong collision resistance and a 256-bit digest (SHA-256 provides ~128-bit collision resistance, which is ample here); substituting a non-cryptographic hash would allow crafted collisions to bypass salt isolation and must not be done.
 
 ### Multimodal UUID Support for Cache Identification
 

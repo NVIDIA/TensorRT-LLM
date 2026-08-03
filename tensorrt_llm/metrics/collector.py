@@ -805,7 +805,15 @@ class MetricsCollector:
         kv_iter_by_pool_group = iteration_stats.get(
             "kvCacheIterationStatsByPoolGroup")
         if kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group:
-            reuse_stats = kv_iter_by_lifecycle or kv_iter or {}
+            # Prefer lifecycle-level attention stats when present. An SSM-only
+            # lifecycle report must not hide the legacy/window-level attention
+            # aggregate. Missing kind remains attention-compatible.
+            attention_lifecycle_stats = {
+                key: stats
+                for key, stats in (kv_iter_by_lifecycle or {}).items()
+                if stats.get("kind", "attention") == "attention"
+            }
+            reuse_stats = attention_lifecycle_stats or kv_iter or {}
             pool_group_stats = kv_iter_by_pool_group or kv_iter or {}
             total_secondary_max = 0
             total_secondary_used = 0

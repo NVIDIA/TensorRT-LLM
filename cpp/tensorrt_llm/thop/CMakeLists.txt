@@ -76,6 +76,7 @@ add_library(
   deepseekV4BlockTableOp.cpp
   inverseRopeFp8QuantOp.cpp
   fusedQKNormRopeOp.cpp
+  fusedAdaptiveLayerNormOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
@@ -113,6 +114,7 @@ add_library(
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
+  sparseKvCacheCompactOp.cpp
   mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
