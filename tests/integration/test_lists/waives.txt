@@ -137,8 +137,6 @@ examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5
 examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden SKIP (https://nvbugs/6418815)
 examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden SKIP (https://nvbugs/6437341)
 examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_trtllm_backend SKIP (https://nvbugs/6463822)
-examples/visual_gen/test_visual_gen.py::test_qwenimage_cuda_graph_lpips_against_golden SKIP (https://nvbugs/6550126)
-examples/visual_gen/test_visual_gen.py::test_qwenimage_lpips_against_golden SKIP (https://nvbugs/6550126)
 examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden SKIP (https://nvbugs/6535765)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2] SKIP (https://nvbugs/6535765)
 examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses4] SKIP (https://nvbugs/6535765)
