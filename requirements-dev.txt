@@ -22,7 +22,7 @@ pytest-env
 pytest-forked
 pytest-xdist
 pytest-timeout
-pytest-split==0.10.0
+pytest-split
 pytest-mock
 pytest-threadleak
 pytest-unused-fixtures
