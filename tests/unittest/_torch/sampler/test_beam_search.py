@@ -675,6 +675,27 @@ def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
         config_loader=DummyConfigLoader(),
     )
 
+    # Record the width the engine actually uses at each decoding iteration.
+    # Asserting only on the outputs cannot distinguish a request that really
+    # walked [2, 3, 4] from one that ran at a constant width the whole time,
+    # so wrap the accessor every consumer (scheduler, ModelEngine, sampler)
+    # goes through and keep the current-iteration widths it hands out.
+    observed_widths: dict[int, int] = {}
+    unwrapped_get_beam_width_by_iter = LlmRequest.get_beam_width_by_iter
+
+    def recording_get_beam_width_by_iter(self: LlmRequest,
+                                         for_next_iteration: bool = False
+                                         ) -> int:
+        width = unwrapped_get_beam_width_by_iter(self, for_next_iteration)
+        if not for_next_iteration:
+            # decoding_iter is 1-based once decoding starts; several callers
+            # ask per step, so keep the first answer for each iteration.
+            observed_widths.setdefault(self.decoding_iter, width)
+        return width
+
+    monkeypatch.setattr(LlmRequest, "get_beam_width_by_iter",
+                        recording_get_beam_width_by_iter)
+
     gc.collect(2)  # force destruction of any other LLM instances
     with _single_process_context():
         llm = LLM(
@@ -711,6 +732,28 @@ def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
         assert len(token_ids) > 0, f"beam {beam_idx} is empty"
         assert all(0 <= t < vocab_size for t in token_ids), (
             f"beam {beam_idx} has out-of-vocab tokens: {token_ids}")
+
+    # The width must actually vary along beam_width_array and then hold at its
+    # last entry, rather than staying constant: decoding iteration i (1-based)
+    # uses beam_width_array[i - 1], clamped to the final entry once decoding
+    # outruns the array.
+    decoding_iters = sorted(it for it in observed_widths if it >= 1)
+    assert decoding_iters, (
+        f"no decoding iterations recorded: {observed_widths}")
+    actual = [observed_widths[it] for it in decoding_iters]
+    expected = [
+        beam_width_array[min(it, len(beam_width_array)) - 1]
+        for it in decoding_iters
+    ]
+    assert actual == expected, (
+        f"beam width per decoding iteration {decoding_iters} was {actual}, "
+        f"expected {expected} from beam_width_array={beam_width_array}")
+    # Guard against the whole run happening at a single width, which the
+    # per-iteration comparison above would still accept if the engine only
+    # ever reported one iteration.
+    assert set(actual) == set(beam_width_array), (
+        f"expected every width in {beam_width_array} to be exercised, "
+        f"but only saw {sorted(set(actual))}")
 
 
 ###########################################################################
