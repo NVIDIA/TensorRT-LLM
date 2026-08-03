@@ -48,6 +48,15 @@ def launch_smg_server(
         served_model_name: Model name returned by discovery RPCs. Defaults to
             the model path.
     """
+    if not PROTOS_AVAILABLE:
+        raise click.ClickException(
+            "SMG gRPC support requires smg-grpc-proto. Install it with "
+            "`python -m pip install smg-grpc-proto`."
+        )
+
+    from .request_manager import GrpcRequestManager
+    from .servicer import TrtllmServiceServicer
+
     try:
         from grpc_reflection.v1alpha import reflection
     except ModuleNotFoundError as e:

@@ -1128,10 +1128,13 @@ def launch_visual_gen_server(
     "--grpc",
     is_flag=True,
     default=False,
-    help="Run gRPC server instead of OpenAI HTTP server. "
-    "gRPC server accepts pre-tokenized requests and returns raw token IDs. "
-    "Requires the tensorrt_llm[grpc-smg] extra.",
+    help="Run the selected gRPC protocol instead of the OpenAI HTTP server.",
     status="prototype")
+@stability_option("--grpc-protocol",
+                  type=click.Choice(["smg", "openengine"]),
+                  default="smg",
+                  help="Protocol used when --grpc is enabled.",
+                  status="prototype")
 @stability_option(
     "--served_model_name",
     type=str,
@@ -1190,8 +1193,9 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           agent_types: Optional[str], video_pruning_rate: Optional[float],
           telemetry: bool, custom_module_dirs: list[Path],
           chat_template: Optional[str], allow_request_chat_template: bool,
-          middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
-          served_model_name: Optional[str], visual_gen_args: Optional[str]):
+          middleware: tuple[str, ...], grpc: bool, grpc_protocol: str,
+          enable_visual_gen: bool, served_model_name: Optional[str],
+          visual_gen_args: Optional[str]) -> None:
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1204,6 +1208,9 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             "future release. No new features or models will be added. Please migrate "
             "to the 'pytorch' backend. See "
             "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
+
+    if not grpc and grpc_protocol != "smg":
+        raise click.UsageError("--grpc-protocol requires --grpc")
 
     if moe_cluster_parallel_size is not None:
         logger.warning(
@@ -1352,6 +1359,10 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             media_io_kwargs=parsed_media_io_kwargs)
 
         if grpc:
+            if num_serve_frontends != 1:
+                raise click.UsageError(
+                    "--num_serve_frontends must be 1 when --grpc is enabled.")
+
             # gRPC mode: launch gRPC server instead of OpenAI HTTP server
             # Check for unsupported arguments that are silently ignored in gRPC mode
             unsupported_args = {
@@ -1379,18 +1390,34 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            if find_spec("smg_grpc_proto") is None:
-                raise ValueError(
-                    "gRPC serving with the SMG protocol requires the optional "
-                    "'smg-grpc-proto' package. Install it with: "
-                    'pip install "tensorrt_llm[grpc-smg]"')
+            if grpc_protocol == "smg":
+                if find_spec("smg_grpc_proto") is None:
+                    raise ValueError(
+                        "gRPC serving with the SMG protocol requires the optional "
+                        "'smg-grpc-proto' package. Install it with: "
+                        'pip install "tensorrt_llm[grpc-smg]"')
 
-            from tensorrt_llm.grpc.smg.server import launch_smg_server
+                from tensorrt_llm.grpc.smg.server import launch_smg_server
 
-            launch_smg_server(host,
-                              port,
-                              llm_args,
-                              served_model_name=served_model_name)
+                launch_smg_server(host,
+                                  port,
+                                  llm_args,
+                                  served_model_name=served_model_name)
+            else:
+                try:
+                    from tensorrt_llm.grpc.openengine.server import \
+                        launch_server as launch_grpc_server
+                except ModuleNotFoundError as error:
+                    if error.name == "grpc" or (
+                            error.name and error.name.startswith("openengine")):
+                        raise click.ClickException(
+                            "OpenEngine support requires the optional Python "
+                            "bindings. Install them with `python -m pip install "
+                            "--extra-index-url https://buf.build/gen/python "
+                            "\"tensorrt_llm[openengine]\"`.") from error
+                    raise
+
+                launch_grpc_server(host, port)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
@@ -1425,6 +1452,9 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
     is_visual_gen = (enable_visual_gen or visual_gen_args is not None
                      or get_is_diffusion_only_model(model))
     if is_visual_gen:
+        if grpc:
+            raise click.UsageError(
+                "--grpc is not supported by the VisualGen server")
         _serve_visual_gen()
     else:
         _serve_llm()
