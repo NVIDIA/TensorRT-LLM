@@ -144,8 +144,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_matches_reference(
     torch.testing.assert_close(actual_qkv[:, q_size + kv_size :], qkv[:, 2 * q_size + kv_size :])
 
 
-@pytest.mark.parametrize("inplace", (False, True))
-def test_fused_sigmoid_mul_supports_strided_gate(inplace):
+def test_fused_sigmoid_mul_supports_strided_gate():
     torch.manual_seed(7)
     num_tokens, num_heads, head_dim = 17, 8, 128
     attention = torch.randn((num_tokens, num_heads * head_dim), dtype=torch.bfloat16, device="cuda")
@@ -154,7 +153,8 @@ def test_fused_sigmoid_mul_supports_strided_gate(inplace):
     )
     gate = gate_storage[..., :head_dim]
     expected = attention.float() * torch.sigmoid(gate.reshape(num_tokens, -1).float())
-    actual = fused_sigmoid_mul(attention.clone(), gate, inplace=inplace)
+    actual = attention.clone()
+    fused_sigmoid_mul(actual, gate)  # modifies `actual` in-place
     torch.testing.assert_close(actual.float(), expected, atol=0.02, rtol=0.02)
 
 
@@ -290,5 +290,6 @@ def test_fused_sigmoid_mul_supports_flat_gate():
     attention = torch.randn((9, 512), dtype=torch.float16, device="cuda")
     gate = torch.randn_like(attention)
     expected = attention.float() * torch.sigmoid(gate.float())
-    actual = fused_sigmoid_mul(attention, gate)
+    actual = attention.clone()
+    fused_sigmoid_mul(actual, gate)  # modifies `actual` in-place
     torch.testing.assert_close(actual.float(), expected, atol=0.005, rtol=0.005)
