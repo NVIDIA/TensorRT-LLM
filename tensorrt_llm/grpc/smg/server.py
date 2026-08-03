@@ -95,9 +95,9 @@ def launch_server(
             logger.info("gRPC reflection enabled")
 
         address = f"{host}:{port}"
-        server.add_insecure_port(address)
+        bound_port = server.add_insecure_port(address)
         await server.start()
-        logger.info(f"TensorRT-LLM SMG gRPC server started on {address}")
+        logger.info(f"TensorRT-LLM SMG gRPC server started on {host}:{bound_port}")
         logger.info("Server is ready to accept requests")
 
         loop = asyncio.get_running_loop()

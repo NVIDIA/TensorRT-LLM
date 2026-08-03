@@ -65,7 +65,12 @@ class OpenEngineServer:
 
 
 def launch_server(host: str, port: int) -> None:
-    """Launch the dedicated OpenEngine gRPC server."""
+    """Launch the dedicated OpenEngine gRPC server.
+
+    Args:
+        host: Interface on which the server listens.
+        port: Port on which the server listens.
+    """
 
     async def serve() -> None:
         server = OpenEngineServer(host=host, port=port)

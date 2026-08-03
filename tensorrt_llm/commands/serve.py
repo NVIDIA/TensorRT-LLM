@@ -1319,6 +1319,11 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             media_io_kwargs=parsed_media_io_kwargs)
 
         if grpc:
+            if num_serve_frontends != 1:
+                raise ValueError(
+                    "Argument 'num_serve_frontends' must be 1 when running in gRPC mode."
+                )
+
             # gRPC mode: launch gRPC server instead of OpenAI HTTP server
             # Check for unsupported arguments that are silently ignored in gRPC mode
             unsupported_args = {
