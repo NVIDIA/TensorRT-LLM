@@ -1514,8 +1514,8 @@ class OpenAIServer(_VideoRoutesMixin):
             if self.generator.args.reasoning_parser:
                 reasoning_entry = ReasoningParserFactory._parsers.get(
                     self.generator.args.reasoning_parser.lower())
-                if reasoning_entry and getattr(reasoning_entry[0],
-                                               'needs_raw_special_tokens', False):
+                if reasoning_entry and getattr(
+                        reasoning_entry[0], 'needs_raw_special_tokens', False):
                     sampling_params.skip_special_tokens = False
             if self.tool_parser and request.tools:
                 tool_parser_cls = ToolParserFactory.parsers.get(

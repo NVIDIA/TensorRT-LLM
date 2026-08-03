@@ -67,8 +67,7 @@ def get_model_context(llm: Any) -> tuple[str, str]:
 
 
 def summarize_generation_stats(results: List[Any]) -> dict:
-    """Summarize finish_reason and generated-token counts over a batch of
-    ``RequestOutput`` objects.
+    """Summarize finish_reason and generated-token counts over a result batch.
 
     An exact-match eval (GSM8K, MMLU, ...) can score a correct answer that was
     parsed out of a runaway, never-terminating generation

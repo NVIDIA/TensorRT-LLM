@@ -36,6 +36,7 @@ from tensorrt_llm.llmapi import (
     SADecodingConfig, SamplingParams, SchedulerConfig,
     SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
 # isort: on
+from tensorrt_llm.evaluate.post_processing import extract_inkling_content
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (check_device_contain, get_device_count, llm_models_root,
@@ -43,7 +44,6 @@ from ..conftest import (check_device_contain, get_device_count, llm_models_root,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
                         skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper, skip_ray)
-from tensorrt_llm.evaluate.post_processing import extract_inkling_content
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2)

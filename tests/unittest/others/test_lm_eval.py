@@ -778,8 +778,7 @@ _CES = "<|content_model_end_sampling|>"
 
 def test_inkling_content_only():
     """A single visible content-text block returns exactly that text."""
-    assert extract_inkling_content(
-        f"{_CT}The answer is 42.{_EM}") == "The answer is 42."
+    assert extract_inkling_content(f"{_CT}The answer is 42.{_EM}") == "The answer is 42."
 
 
 def test_inkling_thinking_then_content():
@@ -789,8 +788,7 @@ def test_inkling_thinking_then_content():
     ``<|message_model|>`` header, then the visible content-text answer, closed
     by ``<|end_message|>`` and the sampling-end token.
     """
-    text = (f"{_CTH}Let me compute 6*7=42.{_EM}"
-            f"{_MM}{_CT}42{_EM}{_CES}")
+    text = f"{_CTH}Let me compute 6*7=42.{_EM}{_MM}{_CT}42{_EM}{_CES}"
     assert extract_inkling_content(text) == "42"
 
 
@@ -803,8 +801,7 @@ def test_inkling_thinking_only_returns_empty():
     NOT leak the reasoning text, otherwise flexible-extract would harvest the
     reasoning's trailing number as if it were the answer.
     """
-    assert extract_inkling_content(
-        f"{_CTH}unfinished reasoning says 12") == ""
+    assert extract_inkling_content(f"{_CTH}unfinished reasoning says 12") == ""
 
 
 def test_inkling_reasoning_loop_with_trailing_number_returns_empty():
@@ -820,8 +817,7 @@ def test_inkling_reasoning_loop_with_trailing_number_returns_empty():
 
 def test_inkling_truncated_content_is_kept():
     """A content-text block truncated before its closing marker is kept."""
-    assert extract_inkling_content(
-        f"{_CT}The answer is 4") == "The answer is 4"
+    assert extract_inkling_content(f"{_CT}The answer is 4") == "The answer is 4"
 
 
 def test_inkling_no_markers_passthrough():
@@ -836,26 +832,23 @@ def test_inkling_no_markers_passthrough():
 
 def test_inkling_multi_block_content_concatenated():
     """Multiple visible content-text runs are concatenated in order."""
-    text = (f"{_CT}Part A. {_EM}{_MM}{_CT}Part B.{_EM}")
+    text = f"{_CT}Part A. {_EM}{_MM}{_CT}Part B.{_EM}"
     assert extract_inkling_content(text) == "Part A. Part B."
 
 
 def test_inkling_content_then_thinking_keeps_only_content():
     """Out-of-order blocks: content kept, later reasoning dropped."""
-    assert extract_inkling_content(
-        f"{_CT}Answer: 5{_CTH}wait no") == "Answer: 5"
+    assert extract_inkling_content(f"{_CT}Answer: 5{_CTH}wait no") == "Answer: 5"
 
 
 def test_inkling_non_text_control_closes_content():
     """Non-text content markers close the visible channel."""
-    assert extract_inkling_content(
-        f"{_CT}Answer<|content_image|>not visible{_EM}") == "Answer"
+    assert extract_inkling_content(f"{_CT}Answer<|content_image|>not visible{_EM}") == "Answer"
 
 
 def test_inkling_mmmu_answer_extraction_uses_visible_content_only():
     """MMMU extraction must ignore numbers/options from Inkling reasoning."""
-    text = (f"{_CTH}wrong trail says answer is (D){_EM}"
-            f"{_MM}{_CT}The answer is (B).{_EM}{_CES}")
+    text = f"{_CTH}wrong trail says answer is (D){_EM}{_MM}{_CT}The answer is (B).{_EM}{_CES}"
 
     assert strip_inkling_and_extract_mmmu_answer(text) == "B"
 

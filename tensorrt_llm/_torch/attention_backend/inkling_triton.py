@@ -68,7 +68,7 @@ def _inkling_prefill_kernel(
     Q,
     K,
     V,
-    O,
+    Out,
     RelLogits,
     cu_seqlens,
     sm_scale,
@@ -107,8 +107,7 @@ def _inkling_prefill_kernel(
     q_pos = cur_block_m * BLOCK_M + offs_m  # [BLOCK_M], position within sequence
     mask_m = q_pos < seq_len
 
-    q_ptrs = ((seq_start + q_pos)[:, None] * stride_qt + cur_head * stride_qh +
-              offs_d[None, :])
+    q_ptrs = (seq_start + q_pos)[:, None] * stride_qt + cur_head * stride_qh + offs_d[None, :]
     q = tl.load(Q + q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
@@ -131,26 +130,23 @@ def _inkling_prefill_kernel(
         k_pos = start_n + offs_n  # [BLOCK_N]
         mask_n = k_pos < seq_len
 
-        k_ptrs = ((seq_start + k_pos)[None, :] * stride_kt +
-                  cur_kv_head * stride_kh + offs_d[:, None])
-        k = tl.load(K + k_ptrs,
-                    mask=mask_n[None, :] & mask_d[:, None],
-                    other=0.0)
+        k_ptrs = (
+            (seq_start + k_pos)[None, :] * stride_kt + cur_kv_head * stride_kh + offs_d[:, None]
+        )
+        k = tl.load(K + k_ptrs, mask=mask_n[None, :] & mask_d[:, None], other=0.0)
         qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale  # [BLOCK_M, BLOCK_N]
 
         if HAS_REL:
             rel_dist = q_pos[:, None] - k_pos[None, :]
             rel_idx = tl.minimum(tl.maximum(rel_dist, 0), rel_extent - 1)
-            rel_ptrs = ((seq_start + q_pos)[:, None] * stride_rt +
-                        cur_head * stride_rh + rel_idx)
+            rel_ptrs = (seq_start + q_pos)[:, None] * stride_rt + cur_head * stride_rh + rel_idx
             rel_valid = (rel_dist >= 0) & (rel_dist < rel_extent)
-            bias = tl.load(RelLogits + rel_ptrs,
-                           mask=mask_m[:, None] & mask_n[None, :] & rel_valid,
-                           other=0.0)
+            bias = tl.load(
+                RelLogits + rel_ptrs, mask=mask_m[:, None] & mask_n[None, :] & rel_valid, other=0.0
+            )
             qk += bias
 
-        valid = mask_m[:, None] & mask_n[None, :] & (q_pos[:, None]
-                                                     >= k_pos[None, :])
+        valid = mask_m[:, None] & mask_n[None, :] & (q_pos[:, None] >= k_pos[None, :])
         if WINDOW_LEFT >= 0:
             valid &= (q_pos[:, None] - k_pos[None, :]) <= WINDOW_LEFT
         qk = tl.where(valid, qk, _NEG)
@@ -161,21 +157,16 @@ def _inkling_prefill_kernel(
         p = tl.exp(qk - n_e_max[:, None])
         e_sum = e_sum * re_scale + tl.sum(p, 1)
 
-        v_ptrs = ((seq_start + k_pos)[:, None] * stride_vt +
-                  cur_kv_head * stride_vh + offs_d[None, :])
-        v = tl.load(V + v_ptrs,
-                    mask=mask_n[:, None] & mask_d[None, :],
-                    other=0.0)
-        acc = acc * re_scale[:, None] + tl.dot(
-            p.to(v.dtype), v, out_dtype=tl.float32)
+        v_ptrs = (
+            (seq_start + k_pos)[:, None] * stride_vt + cur_kv_head * stride_vh + offs_d[None, :]
+        )
+        v = tl.load(V + v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+        acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
         e_max = n_e_max
 
     acc = acc / e_sum[:, None]
-    o_ptrs = ((seq_start + q_pos)[:, None] * stride_ot + cur_head * stride_oh +
-              offs_d[None, :])
-    tl.store(O + o_ptrs,
-             acc.to(O.dtype.element_ty),
-             mask=mask_m[:, None] & mask_d[None, :])
+    o_ptrs = (seq_start + q_pos)[:, None] * stride_ot + cur_head * stride_oh + offs_d[None, :]
+    tl.store(Out + o_ptrs, acc.to(Out.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +180,7 @@ def _inkling_decode_kernel(
     Q,
     K_Cache,
     V_Cache,
-    O,
+    Out,
     RelLogits,
     seq_lens,
     page_table,
@@ -227,9 +218,9 @@ def _inkling_decode_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     mask_d = offs_d < Lk
 
-    q = tl.load(Q + cur_batch * stride_qb + cur_head * stride_qh + offs_d,
-                mask=mask_d,
-                other=0.0).to(tl.float32)  # [BLOCK_DMODEL]
+    q = tl.load(
+        Q + cur_batch * stride_qb + cur_head * stride_qh + offs_d, mask=mask_d, other=0.0
+    ).to(tl.float32)  # [BLOCK_DMODEL]
 
     acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
     e_max = -float("inf")
@@ -249,15 +240,19 @@ def _inkling_decode_kernel(
 
         page_local = k_pos // page_size
         tok_in_page = k_pos % page_size
-        page_id = tl.load(page_table + cur_batch * stride_ptb + page_local,
-                          mask=mask_n,
-                          other=0).to(tl.int64)
+        page_id = tl.load(
+            page_table + cur_batch * stride_ptb + page_local, mask=mask_n, other=0
+        ).to(tl.int64)
 
-        k_ptrs = (page_id[:, None] * stride_kp + cur_kv_head * stride_kh +
-                  tok_in_page[:, None] * stride_kt + offs_d[None, :])
-        k = tl.load(K_Cache + k_ptrs,
-                    mask=mask_n[:, None] & mask_d[None, :],
-                    other=0.0).to(tl.float32)
+        k_ptrs = (
+            page_id[:, None] * stride_kp
+            + cur_kv_head * stride_kh
+            + tok_in_page[:, None] * stride_kt
+            + offs_d[None, :]
+        )
+        k = tl.load(K_Cache + k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(
+            tl.float32
+        )
         qk = tl.sum(q[None, :] * k, 1) * sm_scale  # [BLOCK_N]
 
         if HAS_REL:
@@ -265,9 +260,7 @@ def _inkling_decode_kernel(
             rel_idx = tl.minimum(tl.maximum(rel_dist, 0), rel_extent - 1)
             rel_ptrs = cur_batch * stride_rb + cur_head * stride_rh + rel_idx
             rel_valid = (rel_dist >= 0) & (rel_dist < rel_extent)
-            bias = tl.load(RelLogits + rel_ptrs,
-                           mask=mask_n & rel_valid,
-                           other=0.0)
+            bias = tl.load(RelLogits + rel_ptrs, mask=mask_n & rel_valid, other=0.0)
             qk += bias
 
         valid = mask_n & (k_pos <= q_pos)
@@ -280,18 +273,24 @@ def _inkling_decode_kernel(
         p = tl.exp(qk - n_e_max)  # [BLOCK_N]
         e_sum = e_sum * re_scale + tl.sum(p, 0)
 
-        v_ptrs = (page_id[:, None] * stride_vp + cur_kv_head * stride_vh +
-                  tok_in_page[:, None] * stride_vt + offs_d[None, :])
-        v = tl.load(V_Cache + v_ptrs,
-                    mask=mask_n[:, None] & mask_d[None, :],
-                    other=0.0).to(tl.float32)
+        v_ptrs = (
+            page_id[:, None] * stride_vp
+            + cur_kv_head * stride_vh
+            + tok_in_page[:, None] * stride_vt
+            + offs_d[None, :]
+        )
+        v = tl.load(V_Cache + v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(
+            tl.float32
+        )
         acc = acc * re_scale + tl.sum(p[:, None] * v, 0)
         e_max = n_e_max
 
     o = acc / e_sum
-    tl.store(O + cur_batch * stride_ob + cur_head * stride_oh + offs_d,
-             o.to(O.dtype.element_ty),
-             mask=mask_d)
+    tl.store(
+        Out + cur_batch * stride_ob + cur_head * stride_oh + offs_d,
+        o.to(Out.dtype.element_ty),
+        mask=mask_d,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -484,15 +483,19 @@ def build_page_table(block_ids_per_seq, max_pages: int, device) -> torch.Tensor:
     for i, blocks in enumerate(block_ids_per_seq):
         valid = [int(b) for b in blocks if int(b) >= 0]
         if valid:
-            pt[i, :len(valid)] = torch.tensor(valid,
-                                              dtype=torch.int32,
-                                              device=device)
+            pt[i, : len(valid)] = torch.tensor(valid, dtype=torch.int32, device=device)
     return pt
 
 
-def write_kv_cache_hnd(k_cache: torch.Tensor, v_cache: torch.Tensor,
-                       new_k: torch.Tensor, new_v: torch.Tensor, block_ids,
-                       start_slot: int, page_size: int) -> None:
+def write_kv_cache_hnd(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    new_k: torch.Tensor,
+    new_v: torch.Tensor,
+    block_ids,
+    start_slot: int,
+    page_size: int,
+) -> None:
     """Write ``new_k``/``new_v`` (``[n, num_kv_heads, head_dim]``) for ONE
     request into the paged HND cache starting at logical position ``start_slot``.
 
@@ -508,10 +511,10 @@ def write_kv_cache_hnd(k_cache: torch.Tensor, v_cache: torch.Tensor,
         page = valid_blocks[pos // page_size]
         off = pos % page_size
         take = min(page_size - off, n - written)
-        k_cache[page, :,
-                off:off + take, :] = (new_k[written:written + take].transpose(
-                    0, 1).to(k_cache.dtype))
-        v_cache[page, :,
-                off:off + take, :] = (new_v[written:written + take].transpose(
-                    0, 1).to(v_cache.dtype))
+        k_cache[page, :, off : off + take, :] = (
+            new_k[written : written + take].transpose(0, 1).to(k_cache.dtype)
+        )
+        v_cache[page, :, off : off + take, :] = (
+            new_v[written : written + take].transpose(0, 1).to(v_cache.dtype)
+        )
         written += take

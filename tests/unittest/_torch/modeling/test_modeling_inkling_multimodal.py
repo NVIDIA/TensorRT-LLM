@@ -199,7 +199,9 @@ def test_audio_tower_matches_codebook_reference():
     with torch.no_grad():
         tower.encoder.weight.normal_()
         tower.final_norm.weight.normal_()
-    frames = torch.randint(0, AUDIO_CFG.mel_vocab_size, (5, AUDIO_CFG.n_mel_bins), dtype=torch.int32)
+    frames = torch.randint(
+        0, AUDIO_CFG.mel_vocab_size, (5, AUDIO_CFG.n_mel_bins), dtype=torch.int32
+    )
     out = tower(frames)
     # Reference: bin m occupies codebook rows [m*V, (m+1)*V); sum over bins; norm.
     offsets = torch.arange(AUDIO_CFG.n_mel_bins) * AUDIO_CFG.mel_vocab_size
@@ -228,8 +230,13 @@ def test_audio_tower_optional_norm_and_bin_count_guard():
     "total,avg_fps,desired_fps,max_frames,expected",
     [
         # capped by desired_fps
-        (100, 25.0, 5, 200,
-         [0, 5, 10, 15, 20, 26, 31, 36, 41, 46, 52, 57, 62, 67, 72, 78, 83, 88, 93, 99]),
+        (
+            100,
+            25.0,
+            5,
+            200,
+            [0, 5, 10, 15, 20, 26, 31, 36, 41, 46, 52, 57, 62, 67, 72, 78, 83, 88, 93, 99],
+        ),
         (10, 10.0, 100, 5, [0, 2, 4, 6, 9]),  # capped by max_frames
         (50, 25.0, 50, 200, list(range(50))),  # capped by total frames
         (1, 30.0, 0, 0, [0]),  # always at least one frame
@@ -338,7 +345,11 @@ def test_image_placeholder_expands_to_num_patches():
     assert feat["num_patches"] == [n_patches]
     assert feat["offsets"] == [(2, 2 + n_patches - 1)]
     assert tuple(feat["vision_patches_bthwc"].shape) == (
-        n_patches, TEMPORAL, PATCH_SIZE, PATCH_SIZE, 3
+        n_patches,
+        TEMPORAL,
+        PATCH_SIZE,
+        PATCH_SIZE,
+        3,
     )
 
 
@@ -362,9 +373,7 @@ def test_image_and_audio_expand_independently():
     img, wav = _image(80, 120, seed=2), _waveform(0.4)
     n_patches = _expected_num_patches(80, 120)
     n_frames = proc._audio_preprocessor.preprocess(wav)["num_frames"][0]
-    out_ids, mm = proc.assemble(
-        [DEFAULT_IMAGE_TOKEN_ID, 9, DEFAULT_AUDIO_TOKEN_ID], [img], [wav]
-    )
+    out_ids, mm = proc.assemble([DEFAULT_IMAGE_TOKEN_ID, 9, DEFAULT_AUDIO_TOKEN_ID], [img], [wav])
     assert set(mm) == {"image", "audio"}
     assert out_ids.count(DEFAULT_IMAGE_TOKEN_ID) == n_patches
     assert out_ids.count(DEFAULT_AUDIO_TOKEN_ID) == n_frames

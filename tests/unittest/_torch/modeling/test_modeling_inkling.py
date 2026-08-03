@@ -30,16 +30,18 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.configs.inkling import InklingConfig, InklingTextConfig
 from tensorrt_llm._torch.models.checkpoints.hf.inkling_weight_mapper import (
-    inkling_account_checkpoint, inkling_nvfp4_expert_layers)
+    inkling_account_checkpoint,
+    inkling_nvfp4_expert_layers,
+)
 
 _models_root = llm_models_root()
 CHECKPOINT = os.environ.get(
-    "INKLING_CHECKPOINT",
-    str(_models_root / "Inkling-NVFP4") if _models_root else "")
+    "INKLING_CHECKPOINT", str(_models_root / "Inkling-NVFP4") if _models_root else ""
+)
 
 requires_checkpoint = pytest.mark.skipif(
-    not CHECKPOINT or not os.path.isdir(CHECKPOINT),
-    reason="Inkling checkpoint not available")
+    not CHECKPOINT or not os.path.isdir(CHECKPOINT), reason="Inkling checkpoint not available"
+)
 
 # The checkpoint's hybrid attention pattern: every 6th layer at offset 5 is a
 # global (full-causal) layer, the rest are local (sliding-window).
@@ -128,8 +130,8 @@ def test_text_weight_accounting(ckpt_config):
     assert not acct["unaccounted"], sorted(acct["unaccounted"])[:10]
     assert not acct["missing"], sorted(acct["missing"])[:10]
     assert all(
-        k.startswith(("model.audio.", "model.visual.", "model.mtp."))
-        for k in acct["deferred"])
+        k.startswith(("model.audio.", "model.visual.", "model.mtp.")) for k in acct["deferred"]
+    )
     assert len(acct["consumed_text"]) + len(acct["deferred"]) == len(all_keys)
 
     # NVFP4 routed experts are exactly layers 3..65 (layer-2 experts are bf16).
@@ -146,26 +148,41 @@ def test_checkpoint_tensor_shapes_match_geometry(ckpt_config):
 
     # q/k/v/r projection out-dims (layer 0 is local: 16 kv-heads).
     assert _safetensors_shape(CHECKPOINT, "model.llm.layers.0.attn.wq_du.weight")[0] == [
-        tc.num_attention_heads * hd, hidden]
+        tc.num_attention_heads * hd,
+        hidden,
+    ]
     assert _safetensors_shape(CHECKPOINT, "model.llm.layers.0.attn.wk_dv.weight")[0] == [
-        tc.swa_num_key_value_heads * hd, hidden]
+        tc.swa_num_key_value_heads * hd,
+        hidden,
+    ]
     assert _safetensors_shape(CHECKPOINT, "model.llm.layers.5.attn.wk_dv.weight")[0] == [
-        tc.num_key_value_heads * hd, hidden]  # global layer
+        tc.num_key_value_heads * hd,
+        hidden,
+    ]  # global layer
     assert _safetensors_shape(CHECKPOINT, "model.llm.layers.0.attn.wr_du.weight")[0] == [
-        tc.num_attention_heads * tc.d_rel, hidden]
+        tc.num_attention_heads * tc.d_rel,
+        hidden,
+    ]
 
     # short-conv depthwise weight: [channels, 1, kernel].
     assert _safetensors_shape(CHECKPOINT, "model.llm.layers.0.attn.k_sconv.weight")[0] == [
-        tc.swa_num_key_value_heads * hd, 1, tc.sconv_kernel_size]
+        tc.swa_num_key_value_heads * hd,
+        1,
+        tc.sconv_kernel_size,
+    ]
 
     # NVFP4 routed experts: [E, 2*inter, hidden/2] packed uint8 + block scale.
     shape, dtype = _safetensors_shape(CHECKPOINT, "model.llm.layers.3.mlp.experts.w13_weight")
     assert shape == [tc.n_routed_experts, 2 * tc.intermediate_size, hidden // 2]
     assert dtype in ("U8", "UINT8")
-    assert _safetensors_shape(
-        CHECKPOINT, "model.llm.layers.3.mlp.experts.w13_weight.scale")[0] == [
-            tc.n_routed_experts, 2 * tc.intermediate_size, hidden // 16]
+    assert _safetensors_shape(CHECKPOINT, "model.llm.layers.3.mlp.experts.w13_weight.scale")[0] == [
+        tc.n_routed_experts,
+        2 * tc.intermediate_size,
+        hidden // 16,
+    ]
 
     # The router covers routed + shared experts.
     assert _safetensors_shape(CHECKPOINT, "model.llm.layers.3.mlp.gate.weight")[0] == [
-        tc.n_routed_experts + tc.n_shared_experts, hidden]
+        tc.n_routed_experts + tc.n_shared_experts,
+        hidden,
+    ]

@@ -41,7 +41,10 @@ Architecture summary:
 import copy
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 import torch
 from torch import nn
@@ -77,7 +80,6 @@ from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, ca
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.logger import logger
 
 from ...inputs import (
     ContentFormat,

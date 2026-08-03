@@ -389,9 +389,8 @@ class ModelConfig(Generic[TConfig]):
             # null (-> None) OR as the string "none"/"null" (e.g. the Inkling
             # NVFP4 checkpoint uses ``"kv_cache_quant_algo": "none"``); both must
             # map to None rather than QuantAlgo("none"), which is not a member.
-            if value is None or (isinstance(value, str)
-                                 and value.strip().lower() in ("none", "null",
-                                                               "")):
+            if value is None or (isinstance(value, str) and
+                                 value.strip().lower() in ("none", "null", "")):
                 return None
             return QuantAlgo(value)
 

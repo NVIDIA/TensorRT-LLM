@@ -839,16 +839,21 @@ def test_inkling_reasoning_parser(text: str, content: str, reasoning: str):
 
 
 def test_inkling_reasoning_parser_registered_needs_raw_special_tokens():
-    """The parser must be registered and declare needs_raw_special_tokens so the
-    OpenAI server keeps <|content_*|> delimiters in the decoded text."""
+    """The parser is registered and declares needs_raw_special_tokens.
+
+    That flag is what makes the OpenAI server keep the <|content_*|>
+    delimiters in the decoded text.
+    """
     assert "inkling" in ReasoningParserFactory.keys()
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
     assert getattr(parser, "needs_raw_special_tokens", False) is True
 
 
 def test_inkling_reasoning_parser_stream_across_deltas():
-    """Streaming parse across deltas, including a control token split over two
-    deltas, must reconstruct the same visible content as the full parse."""
+    """Streaming parse reconstructs the same visible content as a full parse.
+
+    Covers a control token split across two deltas.
+    """
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
     # Split the <|content_text|> marker across two deltas to exercise the
     # partial-control holdback.
@@ -896,8 +901,11 @@ def _ink_stream(text, splits):
 
 @pytest.mark.parametrize("text", _INK_STREAM_CASES)
 def test_inkling_reasoning_parser_stream_equals_batch_any_split(text: str):
-    """Streamed result must equal the full parse for char-by-char streaming AND for a
-    split at EVERY single index (each may land mid-control-token)."""
+    """Streamed result equals the full parse for every possible split.
+
+    Covers char-by-char streaming and a split at every single index, each of
+    which may land mid-control-token.
+    """
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
     batch = parser.parse(text)
     c, r = _ink_stream(text, range(1, len(text)))
@@ -909,9 +917,12 @@ def test_inkling_reasoning_parser_stream_equals_batch_any_split(text: str):
 
 
 def test_inkling_reasoning_parser_tool_and_repetition_segmentation():
-    """Tool-invocation blocks route to visible content (matching SGLang); the pre-fix
-    separator-interleaved repetition splits into one reasoning block plus the repeated
-    visible answers, with NO control tokens leaking into either channel."""
+    """Tool-invocation blocks route to visible content, not to reasoning.
+
+    A separator-interleaved repetition splits into one reasoning block plus the
+    repeated visible answers, with no control tokens leaking into either
+    channel.
+    """
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
     r = parser.parse(
         f'{INK_CH}need tool{INK_EM}{INK_MM}<|content_invoke_tool_json|>{{"n":1}}{INK_EM}{INK_END}'
@@ -931,8 +942,11 @@ def test_inkling_reasoning_parser_tool_and_repetition_segmentation():
 
 
 def test_inkling_reasoning_parser_end_tokens_split_across_deltas():
-    """<|end_message|> and <|content_model_end_sampling|> split across delta
-    boundaries must still close their block (partial-control holdback)."""
+    """A control token split across delta boundaries still closes its block.
+
+    Covers <|end_message|> and <|content_model_end_sampling|>, both of which go
+    through the partial-control holdback.
+    """
     parser = ReasoningParserFactory.create_reasoning_parser("inkling")
     deltas = [
         f"{INK_CH}think{INK_EM}{INK_MM}{INK_CT}ANS<|end_mes",

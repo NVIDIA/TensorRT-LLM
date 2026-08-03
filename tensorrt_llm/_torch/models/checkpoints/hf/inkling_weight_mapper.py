@@ -39,8 +39,7 @@ from typing import Dict, List, Set, Tuple
 import torch
 
 from tensorrt_llm._torch.configs.inkling import InklingTextConfig
-from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
-    HfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
 # NVFP4 two-level-scale maxima: E2M1 element max (6.0) and E4M3 block-scale max
@@ -96,10 +95,11 @@ _MOE_COMMON_KEYS: Tuple[str, ...] = (
 )
 
 # NVFP4 sidecars attached to each routed-expert weight tensor (layers 3..65).
-_NVFP4_SIDECARS: Tuple[str, ...] = (".input_amax", ".original_shape", ".scale",
-                                    ".scale2")
-_NVFP4_QUANTIZED_EXPERT_TENSORS: Tuple[str, ...] = ("mlp.experts.w13_weight",
-                                                    "mlp.experts.w2_weight")
+_NVFP4_SIDECARS: Tuple[str, ...] = (".input_amax", ".original_shape", ".scale", ".scale2")
+_NVFP4_QUANTIZED_EXPERT_TENSORS: Tuple[str, ...] = (
+    "mlp.experts.w13_weight",
+    "mlp.experts.w2_weight",
+)
 
 _NON_LAYER_TEXT_KEYS: Tuple[str, ...] = (
     "model.llm.embed.weight",
@@ -108,13 +108,13 @@ _NON_LAYER_TEXT_KEYS: Tuple[str, ...] = (
     "model.llm.unembed.weight",
 )
 
+
 def _experts_are_nvfp4(layer_idx: int, exclude_modules: Set[str]) -> bool:
     """Routed experts of an MoE layer are NVFP4 unless explicitly excluded."""
     return f"model.llm.layers.{layer_idx}.mlp.experts" not in exclude_modules
 
 
-def inkling_expected_text_keys(config: InklingTextConfig,
-                               exclude_modules: Set[str]) -> Set[str]:
+def inkling_expected_text_keys(config: InklingTextConfig, exclude_modules: Set[str]) -> Set[str]:
     """Exact set of ``model.llm.*`` checkpoint keys the text loader consumes."""
     keys: Set[str] = set(_NON_LAYER_TEXT_KEYS)
     for n in range(config.num_hidden_layers):
@@ -134,8 +134,9 @@ def inkling_expected_text_keys(config: InklingTextConfig,
     return keys
 
 
-def inkling_account_checkpoint(all_keys: Set[str], config: InklingTextConfig,
-                               exclude_modules: Set[str]) -> Dict[str, Set[str]]:
+def inkling_account_checkpoint(
+    all_keys: Set[str], config: InklingTextConfig, exclude_modules: Set[str]
+) -> Dict[str, Set[str]]:
     """Classify every checkpoint key into consumed-text / deferred /
     unaccounted.
 
@@ -146,10 +147,7 @@ def inkling_account_checkpoint(all_keys: Set[str], config: InklingTextConfig,
     """
     expected = inkling_expected_text_keys(config, exclude_modules)
     consumed_text = all_keys & expected
-    deferred = {
-        k
-        for k in all_keys if k.startswith(INKLING_DEFERRED_PREFIXES)
-    }
+    deferred = {k for k in all_keys if k.startswith(INKLING_DEFERRED_PREFIXES)}
     missing = expected - all_keys
 
     unaccounted = all_keys - consumed_text - deferred
@@ -161,13 +159,12 @@ def inkling_account_checkpoint(all_keys: Set[str], config: InklingTextConfig,
     }
 
 
-def inkling_nvfp4_expert_layers(config: InklingTextConfig,
-                                exclude_modules: Set[str]) -> List[int]:
+def inkling_nvfp4_expert_layers(config: InklingTextConfig, exclude_modules: Set[str]) -> List[int]:
     """Layers whose routed experts are stored as NVFP4 (expected: 3..65)."""
     return [
-        n for n in range(config.num_hidden_layers)
-        if not config.is_dense_layer(n) and _experts_are_nvfp4(
-            n, exclude_modules)
+        n
+        for n in range(config.num_hidden_layers)
+        if not config.is_dense_layer(n) and _experts_are_nvfp4(n, exclude_modules)
     ]
 
 
@@ -214,13 +211,11 @@ _LAYER_RENAMES = {
     "mlp.shared_experts.shared_w2_weight": "mlp.shared_experts.shared_w2",
 }
 
-_EXPERT_RE = re.compile(
-    r"layers\.(\d+)\.mlp\.experts\.(w13_weight|w2_weight)(\.\w+)?$")
+_EXPERT_RE = re.compile(r"layers\.(\d+)\.mlp\.experts\.(w13_weight|w2_weight)(\.\w+)?$")
 _DENSE_W13_RE = re.compile(r"layers\.(\d+)\.mlp\.w13_dn\.weight$")
 
 
-def _split_interleaved_gate_up(t: torch.Tensor,
-                               dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def _split_interleaved_gate_up(t: torch.Tensor, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """Split an Inkling gate/up-INTERLEAVED fused tensor into ``(gate, up)`` STRIDED
     VIEWS (no copy) along ``dim``: gate = even indices, up = odd indices.
 
@@ -242,8 +237,7 @@ def _split_interleaved_gate_up(t: torch.Tensor,
     """
     dim = dim % t.dim()
     if t.shape[dim] % 2 != 0:
-        raise ValueError(
-            f"cannot split odd gate/up dim {dim}: {tuple(t.shape)}")
+        raise ValueError(f"cannot split odd gate/up dim {dim}: {tuple(t.shape)}")
     even = [slice(None)] * t.dim()
     odd = [slice(None)] * t.dim()
     even[dim] = slice(0, None, 2)
@@ -266,8 +260,12 @@ class InklingHfWeightMapper(HfWeightMapper):
     def preprocess_weights(self, weights: Dict) -> Dict:
         new_weights: Dict[str, torch.Tensor] = {}
         unpadded_vocab = int(
-            getattr(self.config.pretrained_config, "unpadded_vocab_size",
-                    self.config.pretrained_config.vocab_size))
+            getattr(
+                self.config.pretrained_config,
+                "unpadded_vocab_size",
+                self.config.pretrained_config.vocab_size,
+            )
+        )
         for name, tensor in weights.items():
             if name in _SIMPLE_RENAMES:
                 if name == "unembed.weight" and tensor.shape[0] > unpadded_vocab:
@@ -313,8 +311,7 @@ class InklingHfWeightMapper(HfWeightMapper):
             new_weights[name] = tensor
         return new_weights
 
-    def _map_expert(self, name: str, tensor: torch.Tensor,
-                    match: "re.Match", out: Dict) -> None:
+    def _map_expert(self, name: str, tensor: torch.Tensor, match: "re.Match", out: Dict) -> None:
         """Unfuse a stacked expert tensor into per-expert fused-MoE keys.
 
         ``w13_weight[e]`` is ``[2*inter, hidden]`` (gate rows first, up rows
@@ -351,8 +348,7 @@ class InklingHfWeightMapper(HfWeightMapper):
             # already correct, so ONLY the activation input scale needs this.
             tensor = tensor.to(torch.float32) / (_NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX)
 
-        n_experts = int(getattr(self.config.pretrained_config,
-                                "n_routed_experts", tensor.shape[0]))
+        n_experts = int(getattr(self.config.pretrained_config, "n_routed_experts", tensor.shape[0]))
         projs = ("w1", "w3") if which == "w13_weight" else ("w2",)
 
         def _assign(e, vals):
@@ -373,12 +369,12 @@ class InklingHfWeightMapper(HfWeightMapper):
                     # it is correct for both the uint8 weight and the fp8 scale.
                     per = _split_interleaved_gate_up(tensor[e], dim=0)
                 else:
-                    per = (tensor[e], )
+                    per = (tensor[e],)
                 _assign(e, per)
         elif tensor.dim() >= 1 and tensor.shape[0] == n_experts:
             for e in range(n_experts):
-                _assign(e, (tensor[e], ) * len(projs))
+                _assign(e, (tensor[e],) * len(projs))
         else:  # global scalar (input_amax [1]) -> broadcast to all experts
             val = tensor.reshape(-1)[0]
             for e in range(n_experts):
-                _assign(e, (val, ) * len(projs))
+                _assign(e, (val,) * len(projs))

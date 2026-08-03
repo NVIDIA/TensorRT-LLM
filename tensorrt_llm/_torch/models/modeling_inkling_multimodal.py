@@ -86,7 +86,7 @@ def _load_tower_weights(
     exactly, so a missing or extra key fails loudly rather than silently leaving
     a layer at init.
     """
-    mapped = {(k[len(prefix):] if k.startswith(prefix) else k): v for k, v in weights.items()}
+    mapped = {(k[len(prefix) :] if k.startswith(prefix) else k): v for k, v in weights.items()}
     if any(p.is_meta for p in tower.parameters()):
         # Built under a meta-device init context (the full-model load path):
         # copy_ into a meta tensor is illegal, so assign the checkpoint tensors
@@ -156,7 +156,9 @@ def scaled_image_dimensions(
     return scale(width), scale(height)
 
 
-def patch_grid(height: int, width: int, patch_size: int = DEFAULT_PATCH_SIZE) -> Tuple[int, int, int]:
+def patch_grid(
+    height: int, width: int, patch_size: int = DEFAULT_PATCH_SIZE
+) -> Tuple[int, int, int]:
     """Return ``(num_patches, nph, npw)``.
 
     ``nph = ceil(H / P)``, ``npw = W // P + 1`` (the asymmetric ``+1`` width
@@ -190,7 +192,7 @@ def _to_pil_rgb(image: Any):
                 "InklingImagePreprocessor received a URL/data: image; resolve "
                 "it to bytes upstream before preprocessing."
             )
-        path = image[len("file://"):] if image.startswith("file://") else image
+        path = image[len("file://") :] if image.startswith("file://") else image
         with open(path, "rb") as f:
             return Image.open(io.BytesIO(f.read())).convert("RGB")
     if isinstance(image, torch.Tensor):
@@ -211,7 +213,9 @@ class InklingImagePreprocessor:
         patch_size: int = DEFAULT_PATCH_SIZE,
         temporal_patch_size: int = DEFAULT_TEMPORAL_PATCH_SIZE,
         rescale_image_frac: Optional[float] = DEFAULT_RESCALE_IMAGE_FRAC,
-        rescale_image_max_upscaled_long_edge: Optional[int] = DEFAULT_RESCALE_MAX_UPSCALED_LONG_EDGE,
+        rescale_image_max_upscaled_long_edge: Optional[
+            int
+        ] = DEFAULT_RESCALE_MAX_UPSCALED_LONG_EDGE,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         if patch_size <= 0:
@@ -635,7 +639,7 @@ class InklingAudioPreprocessor:
         elif hasattr(audio, "read"):
             raw = audio.read()
         elif isinstance(audio, str):
-            path = audio[len("file://"):] if audio.startswith("file://") else audio
+            path = audio[len("file://") :] if audio.startswith("file://") else audio
             with open(path, "rb") as f:
                 raw = f.read()
         else:

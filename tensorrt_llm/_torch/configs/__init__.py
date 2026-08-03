@@ -7,10 +7,7 @@ from tensorrt_llm._torch.configs.gemma4_unified import (
     Gemma4UnifiedTextConfig,
     Gemma4UnifiedVisionConfig,
 )
-from tensorrt_llm._torch.configs.inkling import (
-    InklingConfig,
-    InklingTextConfig,
-)
+from tensorrt_llm._torch.configs.inkling import InklingConfig, InklingTextConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 
 

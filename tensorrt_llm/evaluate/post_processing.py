@@ -203,8 +203,9 @@ _INK_CONTROL_TOKENS = (
     "<|audio_end|>",
     "<|model_trigger_generation|>",
 )
-_INK_CONTROL_RE = re.compile("|".join(
-    re.escape(t) for t in sorted(_INK_CONTROL_TOKENS, key=len, reverse=True)))
+_INK_CONTROL_RE = re.compile(
+    "|".join(re.escape(t) for t in sorted(_INK_CONTROL_TOKENS, key=len, reverse=True))
+)
 
 
 def extract_inkling_content(text: str) -> str:
@@ -226,7 +227,7 @@ def extract_inkling_content(text: str) -> str:
     kind = None  # None | "content" | "reasoning" | "other"
     pos = 0
     for m in _INK_CONTROL_RE.finditer(text):
-        segment = text[pos:m.start()]
+        segment = text[pos : m.start()]
         if kind == "content" and segment:
             content_parts.append(segment)
         token = m.group(0)
