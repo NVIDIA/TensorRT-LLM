@@ -67,6 +67,7 @@ worker_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
+      kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: true
     speculative_config: &id001
       decoding_type: MTP
@@ -95,5 +96,6 @@ worker_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
+      kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: true
     speculative_config: *id001

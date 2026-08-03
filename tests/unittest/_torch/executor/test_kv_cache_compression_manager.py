@@ -2,11 +2,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Unit tests for the KV-cache compression manager framework
-(``BaseKVCacheCompressionManager`` in ``resource_manager.py``) — the
+(``KVCacheCompressionManager`` in ``resource_manager.py``) — the
 ``BaseResourceManager``-based single-manager design.
 
 Covers:
-- :class:`BaseKVCacheCompressionManager` contract: the four lifecycle hooks
+- :class:`KVCacheCompressionManager` contract: the four lifecycle hooks
   default to no-op, zero resource counts, and it inherits
   :class:`BaseResourceManager` (so PyExecutor auto-drives it once registered).
 - The resource-manager API -> lifecycle-hook translation, gated on PyExecutor's
@@ -31,8 +31,8 @@ import pytest
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseKVCacheCompressionManager,
     BaseResourceManager,
+    KVCacheCompressionManager,
     ResourceManager,
     ResourceManagerType,
 )
@@ -55,7 +55,7 @@ class _RecordingMixin:
         self._record_list.append(f"{self._name}:{hook_name}")
 
 
-class _MockCompressionManager(_RecordingMixin, BaseKVCacheCompressionManager):
+class _MockCompressionManager(_RecordingMixin, KVCacheCompressionManager):
     """Mock manager that records the four lifecycle hooks."""
 
     def on_request_init(self, request):
@@ -71,7 +71,7 @@ class _MockCompressionManager(_RecordingMixin, BaseKVCacheCompressionManager):
         self._record("on_request_finish")
 
 
-class _LengthAdjustingCompressionManager(BaseKVCacheCompressionManager):
+class _LengthAdjustingCompressionManager(KVCacheCompressionManager):
     adjusts_generation_kv_length: ClassVar[bool] = True
 
 
@@ -108,17 +108,17 @@ def _batch(context=(), generation=(), last_chunk=()):
 
 
 # ---------------------------------------------------------------------- #
-# 1. BaseKVCacheCompressionManager contract                               #
+# 1. KVCacheCompressionManager contract                                   #
 # ---------------------------------------------------------------------- #
 
 
 class TestBaseABC:
     def test_inherits_base_resource_manager(self):
         # So PyExecutor's main loop auto-invokes prepare/update/free_resources.
-        assert issubclass(BaseKVCacheCompressionManager, BaseResourceManager)
+        assert issubclass(KVCacheCompressionManager, BaseResourceManager)
 
     def test_four_hooks_default_noop(self, fake_kv_cache_manager):
-        m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
+        m = KVCacheCompressionManager(fake_kv_cache_manager)
         assert m.on_request_init(MagicMock()) is None
         assert m.on_context_step_end([MagicMock()]) is None
         assert m.on_generation_step_begin(MagicMock()) is None
@@ -128,12 +128,12 @@ class TestBaseABC:
     def test_hooks_accept_extra_kwargs(self, fake_kv_cache_manager):
         # **kwargs lets the framework pass new args later without breaking
         # existing overrides.
-        m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
+        m = KVCacheCompressionManager(fake_kv_cache_manager)
         assert m.on_request_init(MagicMock(), future_arg=1) is None
         assert m.on_generation_step_end(MagicMock(), future_arg=1) is None
 
     def test_resource_counts_are_zero(self, fake_kv_cache_manager):
-        m = BaseKVCacheCompressionManager(fake_kv_cache_manager)
+        m = KVCacheCompressionManager(fake_kv_cache_manager)
         # The manager owns no physical resources (the V2 cache manager does),
         # so it must not gate the scheduler.
         assert m.get_max_resource_count() == 0
@@ -155,9 +155,9 @@ class TestBaseABC:
 
     def test_rejects_non_v2_ownership(self):
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
-            BaseKVCacheCompressionManager(MagicMock())
+            KVCacheCompressionManager(MagicMock())
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
-            BaseKVCacheCompressionManager(_v2_manager(is_draft=False), MagicMock())
+            KVCacheCompressionManager(_v2_manager(is_draft=False), MagicMock())
 
     def test_request_field_defaults_to_zero(self):
         """LlmRequest carries the compression count (the manager's only
@@ -300,7 +300,7 @@ class TestFactory:
 
         config = KvCacheCompressionConfig(algorithm="offload")
         assert config.kv_cache_compression_mode.is_eviction_method() is False
-        m = BaseKVCacheCompressionManager(_v2_manager(is_draft=False))
+        m = KVCacheCompressionManager(_v2_manager(is_draft=False))
         assert not hasattr(m, "spec_config")
 
     def test_spec_gate_only_restricts_eviction_methods(self):
@@ -326,7 +326,7 @@ class TestCanonicalImports:
 
         # Base class stays in resource_manager (it IS a resource manager); the
         # factory lives in _util next to _create_kv_cache_manager.
-        assert hasattr(resource_manager, "BaseKVCacheCompressionManager")
+        assert hasattr(resource_manager, "KVCacheCompressionManager")
         assert hasattr(_util, "create_kv_cache_compression_manager")
 
     def test_names_not_in_sparse_module(self):
@@ -334,7 +334,7 @@ class TestCanonicalImports:
         # sparse-attention backend); the sparse package no longer exports it.
         from tensorrt_llm._torch.attention_backend import sparse
 
-        assert not hasattr(sparse, "BaseKVCacheCompressionManager")
+        assert not hasattr(sparse, "KVCacheCompressionManager")
         assert not hasattr(sparse, "create_kv_cache_compression_manager")
 
 
@@ -354,7 +354,7 @@ class TestBlockReuseGuard:
 
     def test_raises_when_reuse_on(self):
         with pytest.raises(ValueError, match="block reuse"):
-            BaseKVCacheCompressionManager(self._mgr(enable_block_reuse=True))
+            KVCacheCompressionManager(self._mgr(enable_block_reuse=True))
 
     def test_ok_when_reuse_off(self):
-        BaseKVCacheCompressionManager(self._mgr(enable_block_reuse=False))  # no raise
+        KVCacheCompressionManager(self._mgr(enable_block_reuse=False))  # no raise

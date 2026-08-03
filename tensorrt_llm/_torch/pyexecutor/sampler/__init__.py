@@ -16,14 +16,14 @@
 
 The upper-level orchestration (``Sampler`` / ``TorchSampler`` / ``TRTLLMSampler``)
 lives in ``sampler.py`` and depends on operation-level APIs in
-``sampling_utils.py``. Implementation-specific kernel providers (FlashInfer,
+``sampler_strategy.py``. Implementation-specific kernel providers (FlashInfer,
 vanilla/PyTorch, TRT-LLM ops) live under ``ops/`` and are selected
 internally, never exposed as interchangeable backends to callers.
 
 Public symbols from ``sampler.py`` are re-exported here so existing
 ``pyexecutor.sampler`` import paths keep working. The re-export is lazy
 (PEP 562 ``__getattr__``) so that importing lightweight submodules such as
-``pyexecutor.sampler.sampling_utils`` does not eagerly pull in ``sampler.py``
+``pyexecutor.sampler.sampler_strategy`` does not eagerly pull in ``sampler.py``
 and its heavy dependency chain (which would create import cycles with
 ``speculative.interface``).
 """
@@ -32,7 +32,7 @@ import importlib
 
 # Submodules of this package — never forward these to sampler.py (that would
 # recurse, since accessing e.g. `.sampler` before it is bound re-enters here).
-_SUBMODULES = frozenset({"sampler", "sampling_utils", "ops"})
+_SUBMODULES = frozenset({"sampler", "sampler_common", "sampler_strategy", "ops"})
 
 
 def __getattr__(name: str):

@@ -72,11 +72,19 @@ class CUDAGraphRunner:
     ):
         self.config = config
         self.enabled = config.use_cuda_graph
+        # When False, uncaptured keys run eagerly instead of triggering capture.
+        self.allow_capture = True
         self._shared_pool = shared_pool
         self._extra_key_fns: Dict[str, ExtraKeyFn] = {}
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType, Any] = {}  # weak refs
+        # Keep the capture-created output tensors alive. Some pipelines keep
+        # outputs from multiple graph keys live at once, for example true CFG
+        # combines positive and negative Qwen-Image-Edit transformer outputs.
+        # Without strong refs, a later graph capture using the same memory pool
+        # can reuse the earlier output storage and make those outputs alias.
+        self._graph_output_refs: Dict[KeyType, Any] = {}
         self.static_inputs: Dict[KeyType, Tuple[List[Any], Dict[str, Any]]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
 
@@ -147,6 +155,7 @@ class CUDAGraphRunner:
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)
+        self._graph_output_refs[key] = output
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
@@ -194,6 +203,8 @@ class CUDAGraphRunner:
             key = self.get_graph_key(*args, **kwargs)
 
             if key not in self.graphs:
+                if not self.allow_capture:
+                    return fn(*args, **kwargs)
                 self.capture(key, fn, args, kwargs)
                 return self.replay(key, args, kwargs)
             else:
@@ -209,5 +220,6 @@ class CUDAGraphRunner:
             graph.reset()
         self.graphs.clear()
         self.graph_outputs.clear()
+        self._graph_output_refs.clear()
         self.static_inputs.clear()
         self.memory_pool = None

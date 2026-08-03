@@ -1207,11 +1207,23 @@ class TestConversationAwareADPRouter:
         assert len(router._conv_to_rank) == 2
         assert set(router._conv_to_rank) == {"c3", "c4"}
 
-    def test_explicit_target_dp_rank_respected(self):
+    def test_explicit_target_dp_rank_establishes_binding(self):
         router = self._router(tp_size=4)
-        item = _make_conv_request_item(1, "A", target_dp_rank=2, attention_dp_relax=False)
-        pos = self._route(router, self._states(4), [item])
-        assert pos[1] == 2
+        first = _make_conv_request_item(1, "A", target_dp_rank=2, attention_dp_relax=False)
+        assert self._route(router, self._states(4), [first])[1] == 2
+        assert router._conv_to_rank["A"] == 2
+
+        second = _make_conv_request_item(2, "A")
+        assert self._route(router, self._states(4), [second])[2] == 2
+
+    def test_existing_binding_wins_over_later_explicit_target(self):
+        router = self._router(tp_size=4)
+        first = _make_conv_request_item(1, "A", target_dp_rank=2, attention_dp_relax=False)
+        self._route(router, self._states(4), [first])
+
+        second = _make_conv_request_item(2, "A", target_dp_rank=1, attention_dp_relax=False)
+        assert self._route(router, self._states(4), [second])[2] == 2
+        assert router._conv_to_rank["A"] == 2
 
     def test_sticky_overflow_keeps_mapping(self):
         """When the home rank is saturated at the HARD cap (max_num_active_requests),

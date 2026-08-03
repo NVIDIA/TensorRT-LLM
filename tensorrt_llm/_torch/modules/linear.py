@@ -1458,10 +1458,18 @@ class NVFP4LinearMethod(LinearMethodBase):
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
-        # NVFP4 GEMM requires a 2D mat1; flatten here and unflatten the output below.
+        # GEMM requires 2D. Fp4QuantizedTensor from fused LayerNorm paths may
+        # arrive as 3D [B, S, D/8] — flatten fp4_tensor and restore after.
         original_shape = None
-        if not isinstance(input,
-                          (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
+        if isinstance(input, Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
+            original_shape = input.fp4_tensor.shape
+            input = Fp4QuantizedTensor(
+                input.fp4_tensor.reshape(-1, input.fp4_tensor.shape[-1]),
+                input.scaling_factor,
+                input.is_sf_swizzled,
+            )
+        elif not isinstance(input,
+                            (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
         elif isinstance(input,
@@ -3401,9 +3409,8 @@ class Linear(nn.Module):
         if torch.cuda.is_available():
             capability = torch.cuda.get_device_capability(
                 torch.device('cuda:0'))
-            # enable cuda core for sm89 and sm120
-            self.enable_cuda_core = (capability[0] == 8 and capability[1] == 9) \
-                or (capability[0] == 12 and capability[1] == 0)
+            # enable cuda core for sm89, sm120, and sm121
+            self.enable_cuda_core = capability in ((8, 9), (12, 0), (12, 1))
 
         if not skip_create_weights_in_init:
             self.create_weights()

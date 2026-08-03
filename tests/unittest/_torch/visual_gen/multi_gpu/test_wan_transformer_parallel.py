@@ -51,6 +51,8 @@ try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _visual_gen_dist_utils import spawn_with_retry
 
+    from .tp_shard_utils import copy_tp_parameter
+
     MODULES_AVAILABLE = True
 except ImportError:
     MODULES_AVAILABLE = False
@@ -158,8 +160,8 @@ SEED_INPUT = 100
 ATOL = 1e-2
 RTOL = 1e-3
 
-# All valid 8-GPU combinations of (ulysses, ring, attn2d):
-# world_size = (ring or attn2d_row*attn2d_col or 1) * ulysses = 8
+# All valid 8-GPU combinations of (tp, ulysses, ring, attn2d):
+# world_size = tp * (ring or attn2d_row*attn2d_col or 1) * ulysses = 8
 _WAN_8GPU_PARALLEL_COMBINATIONS = [
     # Ulysses-only family (no ring / no attn2d)
     ("ulysses_only_ul8", dict(dit_ulysses_size=8)),
@@ -170,6 +172,15 @@ _WAN_8GPU_PARALLEL_COMBINATIONS = [
     # Attention2D/Ulysses family
     ("attn2d_1x8_ul1", dict(dit_attn2d_row_size=1, dit_attn2d_col_size=8, dit_ulysses_size=1)),
     ("attn2d_2x4_ul1", dict(dit_attn2d_row_size=2, dit_attn2d_col_size=4, dit_ulysses_size=1)),
+    # TP + Attention2D (guard removed in mapping.py — commit 084755212d)
+    (
+        "tp2_attn2d_2x1_ul2",
+        dict(dit_tp_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=1, dit_ulysses_size=2),
+    ),
+    (
+        "tp2_attn2d_2x2_ul1",
+        dict(dit_tp_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=2),
+    ),
 ]
 
 
@@ -194,6 +205,7 @@ def _make_model_config(
     pretrained_dict,
     *,
     cfg_size=1,
+    tp_size=1,
     ulysses_size=1,
     ring_size=1,
     attn2d_row_size=1,
@@ -204,6 +216,7 @@ def _make_model_config(
     # Accept both shorthand names (cfg_size, ...) and VisualGen-style names
     # (dit_cfg_size, ...), since tests pass the latter.
     cfg_size = parallel_kwargs.pop("dit_cfg_size", cfg_size)
+    tp_size = parallel_kwargs.pop("dit_tp_size", tp_size)
     ulysses_size = parallel_kwargs.pop("dit_ulysses_size", ulysses_size)
     ring_size = parallel_kwargs.pop("dit_ring_size", ring_size)
     attn2d_row_size = parallel_kwargs.pop("dit_attn2d_row_size", attn2d_row_size)
@@ -213,7 +226,11 @@ def _make_model_config(
 
     pretrained_config = SimpleNamespace(**pretrained_dict)
     use_dist = (
-        cfg_size > 1 or ulysses_size > 1 or ring_size > 1 or attn2d_row_size * attn2d_col_size > 1
+        cfg_size > 1
+        or tp_size > 1
+        or ulysses_size > 1
+        or ring_size > 1
+        or attn2d_row_size * attn2d_col_size > 1
     ) and dist.is_initialized()
     if use_dist:
         ws = dist.get_world_size()
@@ -225,6 +242,7 @@ def _make_model_config(
         world_size=ws,
         rank=rk,
         cfg_size=cfg_size,
+        tp_size=tp_size,
         ulysses_size=ulysses_size,
         ring_size=ring_size,
         attn2d_row_size=attn2d_row_size,
@@ -246,6 +264,27 @@ def _free(*objs) -> None:
         del o
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def _copy_ref_weights_to_tp(ref_model, tp_model, pretrained_config) -> None:
+    """Copy reference weights into a TP model using its local parameter layouts."""
+    ref_params = dict(ref_model.named_parameters())
+    vgm = tp_model.model_config.visual_gen_mapping
+    num_heads = int(pretrained_config["num_attention_heads"])
+    head_dim = int(pretrained_config["attention_head_dim"])
+
+    with torch.no_grad():
+        for tp_name, tp_param in tp_model.named_parameters():
+            copy_tp_parameter(
+                tp_name,
+                ref_params[tp_name],
+                tp_param,
+                vgm.tp_rank,
+                vgm.tp_size,
+                num_heads,
+                head_dim,
+                ulysses_size=vgm.ulysses_size,
+            )
 
 
 # =============================================================================
@@ -282,7 +321,10 @@ def _logic_wan_transformer_parallel_vs_single_gpu(
     except (ImportError, ValueError, NotImplementedError) as e:
         pytest.skip(f"[{label}] Parallel backend unavailable: {e}")
 
-    dist_model.load_state_dict(ref_state)
+    if dist_config.visual_gen_mapping.tp_size > 1:
+        _copy_ref_weights_to_tp(ref_model, dist_model, pretrained_cfg)
+    else:
+        dist_model.load_state_dict(ref_state)
 
     torch.manual_seed(SEED_INPUT)
     hidden_states = torch.randn((B, C, T, H, W), device=device, dtype=dtype) * 0.1

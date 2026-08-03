@@ -1,7 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from itertools import chain
 from typing import Any, Callable, Dict, List, Optional, cast
 
@@ -33,7 +47,10 @@ from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import LlmRequestState
@@ -140,7 +157,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManager) and not isinstance(
+            self._kv_cache_manager, MambaHybridCacheManagerV2
+        ):
             layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
@@ -149,6 +168,48 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         logger.info(f"transfer worker ctx_server_endpoints: {endpoints}")
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self._context_info_endpoint: {self._context_info_endpoint}")
+
+    def get_status_dump(self) -> str:
+        """Return a one-line summary of transceiver state for debugging hangs."""
+
+        def summarize(
+            sessions: Dict[int, Any],
+            include_receiver_ready: bool,
+        ) -> str:
+            sessions_snapshot = list(sessions.values())
+            status_counts = Counter()
+            receiver_ready = 0
+            for session in sessions_snapshot:
+                status = session.status
+                if isinstance(status, SessionStatus):
+                    status_counts[status] += 1
+                else:
+                    status_counts["unknown"] += 1
+
+                if include_receiver_ready:
+                    receiver_ready += int(bool(session.receiver_ready))
+
+            fields = [
+                f"sessions={len(sessions_snapshot)}",
+                f"init={status_counts[SessionStatus.INIT]}",
+                f"ready_to_transfer={status_counts[SessionStatus.READY]}",
+                f"transferring={status_counts[SessionStatus.TRANSFERRING]}",
+                f"kv_transferred={status_counts[SessionStatus.KV_TRANSFERRED]}",
+                f"fully_transferred={status_counts[SessionStatus.FULLY_TRANSFERRED]}",
+                f"error={status_counts[SessionStatus.ERROR]}",
+                f"cancelled={status_counts[SessionStatus.CANCELLED]}",
+                f"unknown={status_counts['unknown']}",
+            ]
+            if include_receiver_ready:
+                fields.append(f"peer_ready={receiver_ready}/{len(sessions_snapshot)}")
+            return ", ".join(fields)
+
+        tx_status = summarize(self._send_sessions, include_receiver_ready=True)
+        rx_status = summarize(self._recv_sessions, include_receiver_ready=False)
+        return (
+            f"KV cache transceiver | backend=NIXL | TX({tx_status}) | RX({rx_status}) | "
+            f"waiting_for_peer_info={len(self._wait_reqs)}"
+        )
 
     def shutdown(self):
         if getattr(self, "_shutdown", False):
@@ -233,7 +294,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             groups.append(block_ids)
 
         mamba_state_index = None
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
+            if self._kv_cache_manager.local_num_mamba_layers > 0:
+                mamba_state_index = self._kv_cache_manager._request_id_to_state_index[
+                    req.py_request_id
+                ]
+        elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
             mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
 
         return KVSlice(
@@ -609,12 +675,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
+        need_progress = wait_num > 0
+        if need_progress:
+            self._poll_sessions_for_interval(
+                self._send_sessions,
+                self._send_reqs,
+                wait_num,
+                self._sender_future_timeout_ms,
+            )
 
         local_completed, local_failed = self._collect_done(self._send_sessions, self._send_reqs)
         to_process = self._build_to_process(
             self._send_sessions,
             self._ctx_consensus(local_completed + local_failed),
-            wait_num,
+            0 if need_progress else wait_num,
             block_all,
         )
 
@@ -747,16 +821,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed, cancelled_reqs
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
-        poll_interval_s = (self.kv_transfer_poll_interval_ms or 0) / 1000.0
+        self._poll_sessions_for_interval(
+            self._recv_sessions,
+            self._recv_reqs,
+            wait_num,
+            self.kv_transfer_poll_interval_ms,
+        )
+
+    def _poll_sessions_for_interval(
+        self,
+        sessions: dict,
+        reqs: dict,
+        wait_num: int,
+        poll_interval_ms: Optional[int],
+    ) -> None:
+        poll_interval_s = (poll_interval_ms or 0) / 1000.0
         deadline = time.monotonic() + poll_interval_s
         while True:
-            completed, failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+            completed, failed = self._collect_done(sessions, reqs)
             if len(completed) + len(failed) >= wait_num:
                 return
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 return
-            for session in self._recv_sessions.values():
+            for session in sessions.values():
                 session.wait_complete(blocking=False)
             time.sleep(min(0.001, remaining_s))
 

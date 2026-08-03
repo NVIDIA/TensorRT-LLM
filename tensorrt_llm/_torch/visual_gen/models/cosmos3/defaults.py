@@ -35,10 +35,7 @@ COSMOS3_720P_PARAMS = {
     "frame_rate": 24.0,
 }
 
-# Text-to-image (``output_type="image"``) defaults. Applied by the pipeline when
-# the corresponding request field still carries the merged video default, since
-# the executor merges a single ``default_generation_params`` dict (the video
-# params above) into the request before ``infer()`` runs.
+# Text-to-image (``output_type="image"``) defaults; resolved in ``infer()``.
 COSMOS3_T2I_PARAMS = {
     "height": 1024,
     "width": 1024,
@@ -47,6 +44,18 @@ COSMOS3_T2I_PARAMS = {
     "flow_shift": 3.0,
     "guidance_interval": (400.0, 1000.0),
 }
+
+# Fields merged by the executor into every request. Mode-dependent values
+# remain None until infer() selects the request mode; key membership also
+# declares these fields supported during request validation.
+COSMOS3_PIPELINE_DEFAULTS = {
+    **COSMOS3_720P_PARAMS,
+    "height": None,
+    "width": None,
+    "num_inference_steps": None,
+    "guidance_scale": None,
+}
+
 
 COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "use_duration_template": ExtraParamSchema(
