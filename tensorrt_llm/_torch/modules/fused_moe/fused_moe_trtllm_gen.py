@@ -16,7 +16,6 @@
 import inspect
 import os
 from dataclasses import dataclass
-from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -29,7 +28,7 @@ from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
-from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
+from .interface import MoE, MoEWeightLoadingMode
 from .moe_op_backend import MoEOpBackend, get_op_backend
 
 # isort: off
@@ -41,7 +40,7 @@ from .quantization import (
 # isort: on
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       DeepSeekV4MoeRoutingMethod, DefaultMoeRoutingMethod,
-                      MiniMaxM2MoeRoutingMethod)
+                      MiniMaxM2MoeRoutingMethod, MiniMaxM3MoeRoutingMethod)
 
 
 @dataclass
@@ -204,7 +203,6 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
@@ -254,12 +252,6 @@ class TRTLLMGenFusedMoE(MoE):
         # - self.num_slots = self.num_experts
         # - self.expert_size_per_partition = self.num_experts // self.ep_size
         # - self.initial_global_assignments, self.slot_start, self.slot_end, etc.
-
-        self.alltoall_method_type = AlltoallMethodType.NotEnabled
-        self.alltoall_workspace = None
-        self.alltoall_prepare_workspace = None
-        self.use_low_precision_combine = False
-        self.moe_a2a = None
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -360,12 +352,6 @@ class TRTLLMGenFusedMoE(MoE):
         if self._requires_separated_routing():
             return True
         return self.use_dp and self.parallel_size > 1
-
-    @cached_property
-    def enable_alltoall(self):
-        """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
-        """
-        return self.alltoall_method_type != AlltoallMethodType.NotEnabled
 
     def _check_configs(self):
         assert not self.has_any_quant \
@@ -556,6 +542,14 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_group=self.routing_method.routing_impl.topk_group,
                 routed_scaling_factor=self.routing_method.routing_impl.
                 routed_scaling_factor,
+            )
+        elif isinstance(self.routing_method, MiniMaxM3MoeRoutingMethod):
+            return RoutingParams(
+                top_k=self.routing_method.top_k,
+                routing_bias=self.routing_method.e_score_correction_bias,
+                n_group=None,
+                topk_group=None,
+                routed_scaling_factor=self.routing_method.routed_scaling_factor,
             )
         elif isinstance(self.routing_method, MiniMaxM2MoeRoutingMethod):
             return RoutingParams(

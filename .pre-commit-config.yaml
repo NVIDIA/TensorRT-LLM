@@ -488,6 +488,7 @@ common-files: &common_files |
         tests/integration/defs/accuracy/accuracy_core.py |
         tests/integration/defs/accuracy/scripts/collect_evaluated_accuracies.py |
         tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py |
+        tests/integration/defs/accuracy/test_cli_flow.py |
         tests/integration/defs/accuracy/test_disaggregated_serving.py |
         tests/integration/defs/accuracy/test_llm_api_autodeploy.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch.py |
@@ -1258,6 +1259,7 @@ legacy-files: &legacy_files |
         tests/integration/defs/accuracy/accuracy_core.py |
         tests/integration/defs/accuracy/scripts/collect_evaluated_accuracies.py |
         tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py |
+        tests/integration/defs/accuracy/test_cli_flow.py |
         tests/integration/defs/accuracy/test_disaggregated_serving.py |
         tests/integration/defs/accuracy/test_llm_api_autodeploy.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch.py |
@@ -1559,7 +1561,7 @@ static-analysis-files: &static_analysis_files |
     )$
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/)'
+exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:

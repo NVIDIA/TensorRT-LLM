@@ -111,10 +111,10 @@ def create_trtllm_worker(model_path):
 
 def test_trtllm_worker_generation(default_prompt, deepseek_distill_7b_path):
     worker = create_trtllm_worker(deepseek_distill_7b_path)
-    task = GenerationTask.create_from_prompt(default_prompt)
-    status = asyncio.run(worker.run_task(task))
     try:
+        task = GenerationTask.create_from_prompt(default_prompt)
+        task.max_tokens = 100
+        status = asyncio.run(worker.run_task(task))
         assert status == TaskStatus.SUCCESS, "Generation Task is not successful with TRTLLMWorker"
-    except AssertionError as e:
+    finally:
         worker.shutdown()
-        raise e

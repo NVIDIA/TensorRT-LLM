@@ -203,7 +203,6 @@ class MegaMoEDeepGemm(MoE):
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         # DG tunables. ``swiglu_limit_scalar`` mirrors the upstream MoE
         # kwarg; bridged to DG's ``activation_clamp`` at the call site.
         activation: str = "swiglu",
@@ -564,8 +563,9 @@ class MegaMoEDeepGemm(MoE):
                 self.routing_method.experts_per_token,
                 self.hidden_size,
                 self.intermediate_size,
-                True,
-                self.activation,
+                num_shared_experts=0,
+                mma_type="fp8xfp4",
+                activation=self.activation,
             )
             _MEGA_MOE_SYMM_BUFFER_CACHE[key] = cached
             # Log only on the first layer; deeper layers reuse the cache

@@ -11,7 +11,7 @@ LLM_ROOT = "llm"
 def createKubernetesPodConfig(image, arch = "amd64")
 {
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     def podConfig = [
         cloud: "kubernetes-cpu",
