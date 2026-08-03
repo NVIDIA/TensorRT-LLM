@@ -1,5 +1,21 @@
 # DSpark confidence-head 调度 P0 阶段：执行报告
 
+> # ⚠️ 本文是中途快照,主要结论已被推翻
+>
+> **当前事实以 `docs/dspark_p0_task_prompt.md` 第 10 节为准。** 本文写于
+> token-major 实现之前,其核心判断已不成立:
+>
+> | 本文的说法 | 现在的事实 |
+> |---|---|
+> | 「ragged 被 K1 挡住,从未真正跑起来过」(§0.4) | K1/K2 已由 token-major 呈现解除,**纯 Python,零 C++ 改动** |
+> | 「ragged 在 DSv4 上结构上不可能端到端跑通」 | 已跑通:planner 自主产出 4 种窗口、211/318 步 ragged、裁剪 60.6% |
+> | 「吞吐今天无法测量」 | 已测:此 checkpoint 无收益,因接受率 ~90% 时 planner 正确地不裁 |
+> | 引用 `TLLM_DSPARK_FORCE_VERIFY_LENS` | 该开关已从代码中删除,改用合成陡峭 cost table 驱动真实 planner |
+>
+> 仍然有效的部分:§B2 的 token-major microbenchmark(0.93–1.00×)、对 K1/K2
+> 检查本身的代码分析、以及各处 `file:line` 锚点。
+
+
 > 分支：`dspark-p0`（基于 PR #17056 head `d8897046`，PR 分支未改动）
 > 硬件：`bia` 集群，8× B300 SXM6（sm103），x86_64
 > 构建：`/lustre/fsw/coreai_comparch_trtllm/laliao/build/dspark-p0/`（`-a '103-real;'`，rc23）

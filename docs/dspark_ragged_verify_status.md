@@ -151,20 +151,33 @@ P0-3/5/6 属于「跑出来的数字看着正常但其实是错的」：replay �
 | 开关 | 作用 |
 |---|---|
 | `TLLM_DSPARK_RAGGED_VERIFY_MODE=static\|compact` | 选路径。`cap-accept` **未实现，显式抛 `NotImplementedError`** |
-| `TLLM_DSPARK_FORCE_VERIFY_LENS=1` | 按 tier 阶梯轮转出确定性非均匀切分 |
+| ~~`TLLM_DSPARK_FORCE_VERIFY_LENS=1`~~ | **已删除**。改用 `tests/microbenchmarks/dspark_make_steep_sps_table.py` 造陡峭 cost table,让**真实 planner** 自己产出不等窗口 |
 | `DSparkRaggedStats.assert_ragged_active()` | 断言 ragged 真的生效 |
 
-`assert_ragged_active()` 检查四条：`steps_ragged > 0`、`distinct_verify_lens >= 2`、
-`trim_ratio > 0`、`graph_eager == 0`，失败时带完整计数器摘要。
+`assert_ragged_active()` 检查:`steps_ragged > 0`、`distinct_verify_lens >= 2`、
+`trim_ratio > 0`,以及 graph miss 中**可归因于 ragged 的那几类**,失败时带完整计数器摘要。
+
+最后一条原为 `graph_eager == 0`,**已修正**:连续批处理下,某个 rank 带 context 请求
+就会让全体掉出 replay,uniform 路径同样如此(实测约 1.7%),所以按原判据这个断言在
+任何真实负载上都不可满足。现在按原因归类,只对 `key_not_captured`、
+`bs_not_supported`、`peer_shape_mismatch` 三类失败——它们分别表示 bucket 网格错了、
+批次档位没捕获、以及跨 rank 形状发散。
 
 **`cap-accept` 为什么不能 alias 成 `compact`**：它唯一的价值是「输出必须与 `static`
 逐 token 一致」，别名化会让这个对照失去意义。
 
-**`FORCE_VERIFY_LENS` 解决的循环依赖**：没有 profiled SPS cost table 时
-planner 在构造上不会 trim（`llm_args.py` 自述「the budget degenerates to
-verify-all」），于是验证 ragged 打包正确性需要先有 table，而产出 table 又需要
-能跑的 run。这个开关替换的是 **planner 的决策**，不绕开任何下游代码路径——
-所以 forced-ragged 与 static 在 `temperature=0` 下必须逐 token 一致。
+**「循环依赖」这个理由已被证伪**:产出 cost table **不需要** ragged 能跑。
+`dspark_sps_profiler` 会把 `RAGGED_VERIFY_MODE` 钉成 `static`,并通过逐个 verify_len
+重建引擎来扫成本曲线——采表全程 ragged 关闭(`sps_real_final.json` 就是这么采的)。
+
+真正的问题是另一个:**即使有真实 table,planner 在接受率够高时依然不裁**——在
+DeepSeek-V4-Pro-DSpark 上是每一种实测工况(accept_len 3.3–4.1)。所以裁剪路径需要
+一个刻意的手段才能被执行,否则它会带着全绿的测试合入。
+
+现在这个手段是**造一张陡峭的 cost table**,而不是按 batch 位置轮转的开关。区别是
+本质的:位置与 confidence 正交,轮转只能复现 ragged 的**形状**、复现不了**策略**,
+测不出「置信度高的是否拿到更长窗口」。造表则驱动真实 planner,窗口经同一个
+confidence 排序的 top-k 分配。三个只在真裁剪时可达的 bug 正是这样被逼出来的。
 
 ---
 

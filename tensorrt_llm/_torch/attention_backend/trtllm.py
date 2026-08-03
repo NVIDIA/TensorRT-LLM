@@ -564,13 +564,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # JIT-warmup hint, and the per-step request count comes from the
             # batch, not from here.
             #
-            # It is not free: the attention workspace is sized from the same
-            # number, and on DEP8 (128 requests -> 896 rows) it was measured
-            # growing from 68 MiB to 604 MiB per rank. The op resizes itself, so
-            # this costs GPU memory that would otherwise hold KV cache rather
-            # than correctness. Shrinking it would mean sizing the generation
-            # workspace from the row count only where the row count is what the
-            # kernels actually use, which is a C++ change.
+            # The attention workspace is sized from the same number, so it
+            # grows with the row ceiling. An earlier version of this comment
+            # quoted 68 MiB -> 604 MiB per rank as the cost; that figure came
+            # from a single ragged log with no uniform control, and the one
+            # memory claim that WAS controlled -- CUDA graph pool size -- came
+            # out at parity (8.746 vs 8.740 GiB at max_batch_size 128), so the
+            # uncontrolled figure should not be relied on. The op resizes
+            # itself, so whatever the true delta is, it costs GPU memory that
+            # would otherwise hold KV cache rather than correctness.
             self.max_num_requests = view.max_num_rows
             # Every runtime view has to agree on batch_size with
             # kv_lens_cuda_runtime, and the op reads request_types over all of
