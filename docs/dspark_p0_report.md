@@ -66,7 +66,11 @@ goal doc §6.3 称它是「性价比最高的一个测试」。参数化之后�
 
 ---
 
-## 0.4 ⛔ 最重要的结论：ragged 在 DSv4 上被 K1 挡住，从未真正跑起来过
+## 0.4 ~~⛔ 最重要的结论：ragged 在 DSv4 上被 K1 挡住，从未真正跑起来过~~
+
+> **【已推翻】** K1/K2 已由 token-major 呈现解除(纯 Python,`cpp/` 零改动),
+> ragged 已端到端跑通。以下分析对「K1 检查本身做了什么」仍然准确,但结论
+> 「结构上不可能跑通」不成立。
 
 端到端跑到真实 decode 之后，第一件撞上的事是：
 
@@ -201,7 +205,7 @@ L=1 与 L=3 两组样本齐了之后，第一次可以把 `theta(M)` 从 `alpha(
 **上界性质**：profiler 通过缩小 `block_size` 来扫 L，draft pass 也跟着缩，
 所以测得的 Δθ 里混入了 draft 代价，是**上界**。这使得「小值」是可靠的否定结论，
 而「大值」需要进一步确认。要测无泄漏的版本，就是保持 `block_size=5` 不动、
-改用 `TLLM_DSPARK_FORCE_VERIFY_LENS=<tier>` 强制窗口 —— 该能力本轮已实现
+改用 `TLLM_DSPARK_FORCE_VERIFY_LENS=<tier>` 强制窗口 —— **【该开关已删除】**,现由合成陡峭 cost table 驱动真实 planner
 （见 §2 的 commit）。这是下一步该做的测量。
 
 ## 2. 交付物 1：修复清单
@@ -520,7 +524,7 @@ graph_replays: 520, graph_eager: 9
 ### Q4：`cap-accept` 要不要实现 —— **建议实现，但优先级低于 Q5**
 
 任务书倾向实现，理由是把 pass/fail 硬币变成可定位诊断。这个理由成立，但要注意
-**PR head 已经有了一个更便宜的等价物**：`TLLM_DSPARK_FORCE_VERIFY_LENS=1`
+**【已删除】** ~~PR head 已经有了一个更便宜的等价物~~：`TLLM_DSPARK_FORCE_VERIFY_LENS=1`
 （`dspark_observability.py:131-162`）从 tier ladder 里按批内位置轮转发窗口，
 确定性、每个 rank 一致、且不需要 cost table。它已经能把
 「ragged packing 对不对」与「planner 要不要 trim」分开 —— 而这正是 A2 想要的那一半。
