@@ -366,6 +366,7 @@ def test_precheck_commands_propagate_model_root(monkeypatch, model_root):
     # CI provides the model root inside its inbound pytest command, not in the
     # environment of the Python process that generates the launch script.
     monkeypatch.delenv("LLM_MODELS_ROOT", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
     lines = pcfg.precheck_prefix_lines(
         {},
         "e2e",

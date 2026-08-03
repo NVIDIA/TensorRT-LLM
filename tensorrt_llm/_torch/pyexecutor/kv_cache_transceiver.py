@@ -43,6 +43,12 @@ def maybe_enable_fabric_memory_for_python_transceiver(
     This must run before any KV pool allocation because the C++ environment
     getter caches the value on first read. Explicit user settings are always
     respected.
+
+    Args:
+        cache_transceiver_config: Configuration used to select the cache
+            transceiver runtime and backend.
+        kv_cache_manager_cls: KV-cache manager class to check for C++ V1 pool
+            allocation.
     """
     if (cache_transceiver_config is None
             or cache_transceiver_config.backend is None

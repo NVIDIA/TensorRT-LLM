@@ -297,3 +297,10 @@ def test_ci_missing_model_root_is_detectable(ci_submit_module):
     prefix_lines = ["export pytestCommand='LLM_ROOT=/repo pytest -q'"]
 
     assert ci_submit_module._get_pytest_command_env_var(prefix_lines, "LLM_MODELS_ROOT") is None
+
+
+def test_ci_rejects_invalid_pytest_command(ci_submit_module):
+    prefix_lines = ['export pytestCommand="LLM_MODELS_ROOT=/models']
+
+    with pytest.raises(ValueError, match="Invalid inbound pytestCommand"):
+        ci_submit_module._get_pytest_command_env_var(prefix_lines, "LLM_MODELS_ROOT")
