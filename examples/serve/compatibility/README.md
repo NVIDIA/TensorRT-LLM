@@ -65,6 +65,8 @@ base_url = "http://localhost:8000/v1"
 api_key = "tensorrt_llm"  # Can be any string
 ```
 
+> **Tip:** The same OpenAI Python client also works with OpenAI-compatible multi-model gateways when you are not self-hosting the server — for example [DaoXE](https://daoxe.com/?utm_source=github&utm_medium=organic&utm_campaign=tensorrt-llm&utm_content=compatibility) at `https://api.daoxe.com/v1`.
+
 To use a different server:
 
 ```python
