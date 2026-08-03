@@ -214,24 +214,13 @@ def select_test_case_line(test_list_path, llm_src, script_prefix_lines, split_gr
     return selected[0]
 
 
-def parse_test_case_name(test_list_path, llm_src, split_group=0, selected_line=None):
-    """Parse the selected line of the test list.
+def parse_test_case_name(llm_src, selected_line):
+    """Parse the selected test-list line.
 
     Returns (config_yaml_path, server_name, benchmark_mode, runtime_mode).
     See the module docstring for the supported test name shapes.
     """
-    if selected_line is not None:
-        line = selected_line
-    else:
-        lines = _read_test_list_lines(test_list_path)
-        if split_group > 0:
-            if split_group > len(lines):
-                raise ValueError(
-                    f"split_group {split_group} exceeds number of tests in test list ({len(lines)})"
-                )
-            line = lines[split_group - 1]
-        else:
-            line = lines[0]
+    line = selected_line
 
     if "[" not in line or "]" not in line:
         raise ValueError(f"Invalid test list format. Expected name with brackets: {line}")
@@ -659,10 +648,8 @@ def main():
         args.split_group,
     )
     config_yaml, server_name, benchmark_mode, runtime_mode = parse_test_case_name(
-        args.test_list,
         args.llm_src,
-        args.split_group,
-        selected_line=selected_test_line,
+        selected_test_line,
     )
 
     with open(config_yaml, "r") as f:
