@@ -13,9 +13,7 @@ import uvloop
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.logger import logger
 
-from . import trtllm_service_pb2, trtllm_service_pb2_grpc
-from .request_manager import GrpcRequestManager
-from .servicer import TrtllmServiceServicer
+from . import PROTOS_AVAILABLE, trtllm_service_pb2, trtllm_service_pb2_grpc
 
 __all__ = ["launch_server"]
 
@@ -36,6 +34,15 @@ def launch_server(
         llm_args: Arguments used to initialize the LLM.
         served_model_name: Model name exposed by the server. Defaults to the model path.
     """
+    if not PROTOS_AVAILABLE:
+        raise click.ClickException(
+            "SMG gRPC support requires smg-grpc-proto. Install it with "
+            "`python -m pip install smg-grpc-proto`."
+        )
+
+    from .request_manager import GrpcRequestManager
+    from .servicer import TrtllmServiceServicer
+
     try:
         from grpc_reflection.v1alpha import reflection
 

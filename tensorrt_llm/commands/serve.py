@@ -526,7 +526,7 @@ def launch_server(
         allow_request_chat_template: bool = False,
         num_input_processor_workers: int = 8,
         num_media_load_workers: int = 8,
-        multi_frontend_enabled: bool = True):
+        multi_frontend_enabled: bool = True) -> None:
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -1099,8 +1099,7 @@ def launch_visual_gen_server(
     "--grpc",
     is_flag=True,
     default=False,
-    help="Run gRPC server instead of OpenAI HTTP server. "
-    "gRPC server accepts pre-tokenized requests and returns raw token IDs.",
+    help="Run the selected gRPC protocol instead of the OpenAI HTTP server.",
     status="prototype")
 @stability_option("--grpc-protocol",
                   type=click.Choice(["smg", "openengine"]),
@@ -1166,7 +1165,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           chat_template: Optional[str], allow_request_chat_template: bool,
           middleware: tuple[str, ...], grpc: bool, grpc_protocol: str,
           enable_visual_gen: bool, served_model_name: Optional[str],
-          visual_gen_args: Optional[str]):
+          visual_gen_args: Optional[str]) -> None:
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1175,9 +1174,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
 
     if not grpc and grpc_protocol != "smg":
         raise click.UsageError("--grpc-protocol requires --grpc")
-    if grpc and grpc_protocol == "openengine":
-        raise click.UsageError(
-            "OpenEngine gRPC support is not available in this build")
 
     if moe_cluster_parallel_size is not None:
         logger.warning(
@@ -1348,13 +1344,29 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            from tensorrt_llm.grpc.smg.server import \
-                launch_server as launch_smg_server
+            if grpc_protocol == "smg":
+                from tensorrt_llm.grpc.smg.server import \
+                    launch_server as launch_grpc_server
 
-            launch_smg_server(host,
-                              port,
-                              llm_args,
-                              served_model_name=served_model_name)
+                launch_grpc_server(host,
+                                   port,
+                                   llm_args,
+                                   served_model_name=served_model_name)
+            else:
+                try:
+                    from tensorrt_llm.grpc.openengine.server import \
+                        launch_server as launch_grpc_server
+                except ModuleNotFoundError as error:
+                    if error.name == "grpc" or (
+                            error.name and error.name.startswith("openengine")):
+                        raise click.ClickException(
+                            "OpenEngine support requires the optional Python "
+                            "bindings. Install them with `python -m pip install "
+                            "--extra-index-url https://buf.build/gen/python "
+                            "\"tensorrt_llm[openengine]\"`.") from error
+                    raise
+
+                launch_grpc_server(host, port)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
@@ -1386,6 +1398,9 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
     is_visual_gen = (enable_visual_gen or visual_gen_args is not None
                      or get_is_diffusion_only_model(model))
     if is_visual_gen:
+        if grpc:
+            raise click.UsageError(
+                "--grpc is not supported by the VisualGen server")
         _serve_visual_gen()
     else:
         _serve_llm()

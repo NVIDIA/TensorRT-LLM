@@ -47,29 +47,37 @@ except ImportError:
     trtllm_service_pb2 = None
     trtllm_service_pb2_grpc = None
 
-# Try to import request manager
-try:
-    from .request_manager import (
-        GrpcRequestManager,
-        create_disaggregated_params_from_proto,
-        create_lora_request_from_proto,
-        create_sampling_params_from_proto,
-    )
+# Import protobuf-dependent modules only when the generated package is present.
+if PROTOS_AVAILABLE:
+    try:
+        from .request_manager import (
+            GrpcRequestManager,
+            create_disaggregated_params_from_proto,
+            create_lora_request_from_proto,
+            create_sampling_params_from_proto,
+        )
 
-    REQUEST_MANAGER_AVAILABLE = True
-except ImportError:
+        REQUEST_MANAGER_AVAILABLE = True
+    except ImportError:
+        REQUEST_MANAGER_AVAILABLE = False
+        GrpcRequestManager = None
+        create_sampling_params_from_proto = None
+        create_lora_request_from_proto = None
+        create_disaggregated_params_from_proto = None
+
+    try:
+        from .servicer import TrtllmServiceServicer
+
+        SERVICER_AVAILABLE = True
+    except ImportError:
+        SERVICER_AVAILABLE = False
+        TrtllmServiceServicer = None
+else:
     REQUEST_MANAGER_AVAILABLE = False
     GrpcRequestManager = None
     create_sampling_params_from_proto = None
     create_lora_request_from_proto = None
     create_disaggregated_params_from_proto = None
-
-# Try to import servicer
-try:
-    from .servicer import TrtllmServiceServicer
-
-    SERVICER_AVAILABLE = True
-except ImportError:
     SERVICER_AVAILABLE = False
     TrtllmServiceServicer = None
 
