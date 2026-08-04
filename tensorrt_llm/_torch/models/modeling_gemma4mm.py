@@ -33,6 +33,7 @@ from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 
 from ..._utils import nvtx_range
 from ...inputs import (
@@ -53,7 +54,11 @@ from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
-from .modeling_multimodal_mixin import MultimodalModelMixin, PreparedLlmInputs
+from .modeling_multimodal_mixin import (
+    EncoderCachePartition,
+    MultimodalModelMixin,
+    PreparedLlmInputs,
+)
 from .modeling_multimodal_utils import _MULTIMODAL_ENV_NAME, _is_mm_disagg
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -578,23 +583,59 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         ]
 
     # TODO(TRTLLM-14981): Implement finer-grained caching for videos.
-    @staticmethod
-    def _encoder_cache_modality(param: MultimodalParams) -> Optional[str]:
-        """Return the cacheable Gemma4 modality, excluding video."""
-        modality = MultimodalModelMixin._encoder_cache_modality(param)
-        # Gemma4 flattens each video's frames into dim 0 before encoding, so the persistent cache
-        # cannot (yet) rebuild a partial-hit input by video item.
-        # Treat video as uncacheable to retain the pre-cache behavior: encode the complete video
-        # payload and reuse only its request-local embedding for chunked prefill.
-        if modality == "video":
+    @classmethod
+    def partition_encoder_cache(
+        cls,
+        param: MultimodalParams,
+        encoder_cache: TensorLRUCache,
+    ) -> Optional[EncoderCachePartition]:
+        """Treat unsupported partial Gemma4 cache hits as full misses."""
+        partition = super().partition_encoder_cache(param, encoder_cache)
+        modality = cls._encoder_cache_modality(param)
+        if (
+            modality == "video"
+            and partition is not None
+            and not partition.is_full_hit
+            and not partition.is_full_miss
+        ):
+            # Gemma4 flattens each video's frames into dim 0 before encoding, so the persistent
+            # cache cannot (yet) rebuild a partial-hit input by video item. Re-encode the complete
+            # video payload while retaining cache lookup and reuse for full hits.
             logger.warning_once(
-                "Gemma4 video inputs currently bypass the persistent multimodal encoder "
-                "cache because partial-hit frame slicing is not supported; video inputs "
-                "will be re-encoded for each request.",
-                key="gemma4_video_encoder_cache_unsupported",
+                "Gemma4 video encoder cache has a partial hit, but frame slicing is not "
+                "supported; re-encoding the complete video payload.",
+                key="gemma4_video_encoder_cache_partial_hit_unsupported",
             )
-            return None
-        return modality
+            return EncoderCachePartition(
+                hits={},
+                miss_indices=list(range(len(partition.keys))),
+                keys=partition.keys,
+            )
+        if (
+            modality in ("image", "audio")
+            and partition is not None
+            and not partition.is_full_hit
+            and not partition.is_full_miss
+        ):
+            input_key = {"image": "pixel_values", "audio": "audio_features"}[modality]
+            modality_data = param.multimodal_data[modality]
+            input_tensor = modality_data.get(input_key) if isinstance(modality_data, dict) else None
+            if (
+                not isinstance(input_tensor, torch.Tensor)
+                or input_tensor.dim() == 0
+                or input_tensor.shape[0] != len(partition.keys)
+            ):
+                logger.warning_once(
+                    f"Gemma4 {modality} encoder cache has a partial hit, but {input_key} is not "
+                    "item-major; re-encoding the complete payload.",
+                    key=f"gemma4_{modality}_encoder_cache_partial_hit_unsupported",
+                )
+                return EncoderCachePartition(
+                    hits={},
+                    miss_indices=list(range(len(partition.keys))),
+                    keys=partition.keys,
+                )
+        return partition
 
     def build_multimodal_encoder_input(
         self,
@@ -611,10 +652,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         with their per-item position, length, and mask fields.
         """
         modality = self._encoder_cache_modality(param)
-        # Video is marked uncacheable above, so it cannot produce the partial-hit partition that
-        # calls this hook; the normal path re-encodes its complete payload. Delegate unexpected
-        # direct calls to the generic validation so they fail instead of returning an incorrectly
-        # unsliced input.
+        # Partial video partitions are converted to full misses above, so they cannot call this
+        # hook. Delegate unexpected direct calls to the generic validation so they fail instead of
+        # returning an incorrectly unsliced input.
         if modality not in ("image", "audio"):
             return super().build_multimodal_encoder_input(param, item_indices)
         input_key = {"image": "pixel_values", "audio": "audio_features"}[modality]
