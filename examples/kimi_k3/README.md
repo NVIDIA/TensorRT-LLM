@@ -74,13 +74,13 @@ should report `True` for all four checks.
 For a full GSM8K evaluation, submit:
 
 ```bash
-sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model /path/to/kimi-k3-checkpoint \
     --image /path/to/tensorrt-llm-container.sqsh
 ```
 
 This job writes progress and results to
-`kimi-k3-gsm8k-<job-id>.log`. If no local dataset path is configured,
+`kimi-k3-eval-<job-id>.log`. If no local dataset path is configured,
 `trtllm-eval` downloads GSM8K from the Hugging Face Hub. The completed log
 contains a results table with the normalized GSM8K exact-match scores. With
 the tested checkpoint and the settings in this example, users should expect
@@ -97,7 +97,7 @@ possible with different checkpoint or dependency revisions.
 To evaluate with suffix-automaton (SA) speculative decoding, add `--sa`:
 
 ```bash
-sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model /path/to/kimi-k3-checkpoint \
     --image /path/to/tensorrt-llm-container.sqsh \
     --sa
@@ -164,7 +164,7 @@ Request a longer allocation if the time is not sufficient for your environment:
 sbatch --time=02:00:00 examples/kimi_k3/quick_start_kimi_k3.sbatch \
     --model MODEL --image IMAGE
 
-sbatch --time=04:00:00 examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch --time=04:00:00 examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model MODEL --image IMAGE
 ```
 
@@ -183,7 +183,7 @@ job (which selects `eval_extra_llm_options_reuse.yaml`):
 sbatch examples/kimi_k3/quick_start_kimi_k3.sbatch \
     --model MODEL --image IMAGE --enable-block-reuse
 
-sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model MODEL --image IMAGE --reuse
 ```
 

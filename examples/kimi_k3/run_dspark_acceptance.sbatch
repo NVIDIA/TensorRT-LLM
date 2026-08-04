@@ -22,7 +22,7 @@
 # (rerun only the DSpark leg, e.g. for a threshold sweep).
 #
 # Worktree submits: export REPO=<worktree>, EXTRA_MOUNTS="$MAIN:$MAIN:rw",
-# and submit with --export=ALL (mirrors run_gsm8k_kimi_k3.sbatch).
+# and submit with --export=ALL (mirrors run_eval_kimi_k3.sbatch).
 #
 #SBATCH --job-name=kimi-k3-dspark-accept
 #SBATCH --partition=batch
@@ -121,7 +121,7 @@ run_leg() {
         bash -c "
             set -x
             ulimit -n 65536
-            # Node-local JIT caches (shared-NFS races; see run_gsm8k_kimi_k3.sbatch)
+            # Node-local JIT caches (shared-NFS races; see run_eval_kimi_k3.sbatch)
             export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}
             mkdir -p \"\$TRITON_CACHE_DIR\"
             export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer-rank\${SLURM_PROCID:-0}
