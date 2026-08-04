@@ -38,6 +38,11 @@ void invokeDeepseekV4ComputeSlidingBlockTablesWithScratch(int32_t const* blockOf
     int32_t numAttnTypes, int32_t numTables, int32_t maxBlocksPerSeq, int32_t scratchCapacity, int32_t maxScratchSlots,
     cudaStream_t stream);
 
+
+void invokeDeepseekV4ComputeCompressBlockTable(int32_t const* blockOffsets, int32_t const* copyIdx, int32_t* output,
+    int32_t poolId, int32_t scale, int32_t copyIdxCapacity, int32_t numTables, int32_t maxBlocksPerSeq,
+    cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

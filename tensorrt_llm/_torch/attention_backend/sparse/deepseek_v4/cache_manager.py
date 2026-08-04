@@ -1095,6 +1095,37 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         base = self.host_kv_cache_block_offsets[pool_id, copy_idx, 0, :]
         return torch.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale)
 
+    def _compute_shared_block_table_device(
+        self, pool_id: int, scale: int, copy_idx: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Device-side equivalent of `_compute_shared_block_table`.
+
+        Writes `where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale)` for
+        `host_kv_cache_block_offsets[pool_id, copy_idx, 0, :]` straight into `out`
+        (shape [num_seqs, max_blocks_per_seq]) without any host-side gather.
+        """
+        device_copy_idx = self._copy_idx_to_device(copy_idx)
+        # host_kv_cache_block_offsets is [num_pools, capacity, 2, max_blocks] and can be
+        # several MB; it is uploaded once per prepare() and shared by every consumer
+        # (sliding + one call per compression ratio + the indexer table).
+        self._ensure_device_block_offsets()
+        torch.ops.trtllm.deepseek_v4_compute_compress_block_table(
+            self._device_kv_cache_block_offsets_input,
+            device_copy_idx[: copy_idx.size(0)],
+            int(pool_id),
+            int(scale),
+            out,
+        )
+
+    def _ensure_device_block_offsets(self) -> None:
+        """Upload host_kv_cache_block_offsets to the device at most once per iteration."""
+        if getattr(self, "_block_offsets_uploaded", False):
+            return
+        self._device_kv_cache_block_offsets_input.copy_(
+            self.host_kv_cache_block_offsets, non_blocking=True
+        )
+        self._block_offsets_uploaded = True
+
     def _copy_idx_to_device(self, copy_idx: torch.Tensor) -> torch.Tensor:
         num_tables = copy_idx.size(0)
         device_copy_idx = self._device_copy_idx_staging[:num_tables]
@@ -1145,6 +1176,23 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._device_scratch_slots_staging,
         )
 
+    def _get_copy_index_cached(self, request_ids, num_contexts, beam_width):
+        """`IndexMapper.get_copy_index` memoized for one prepare() step.
+
+        Keyed on the request-id list *contents*, not its identity: the caller may
+        reuse a single list object and mutate it between steps. The memo is reset
+        at the top of every step by ``compute_sliding_block_tables``, which always
+        runs before the other users.
+        """
+        key = (tuple(request_ids), num_contexts, beam_width)
+        if getattr(self, "_copy_idx_memo_key", None) == key:
+            return self._copy_idx_memo_val
+        val = self.index_mapper.get_copy_index(request_ids, num_contexts,
+                                              beam_width)
+        self._copy_idx_memo_key = key
+        self._copy_idx_memo_val = val
+        return val
+
     @nvtx_range_debug("dsv4_compute_sliding_block_tables")
     def compute_sliding_block_tables(
         self,
@@ -1152,7 +1200,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         num_contexts: int,
     ) -> None:
         """Compute all per-layer sliding-window block tables for this batch."""
-        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, 1)
+        # One get_copy_index walk per step instead of three. This function,
+        # copy_batch_compress_block_tables (once per compression ratio) and
+        # copy_batch_indexer_compress_block_tables all call it with the same
+        # (request_ids, num_contexts, beam_width). The mapping is deterministic in
+        # those arguments and returns a view of one shared pinned buffer, so the
+        # later calls were recomputing a result equal to the one already there.
+        # Each walk costs O(num_seqs) ATen dispatches (select + as_strided + fill_
+        # per entry). This is the first call of the step, so it seeds the memo.
+        self._copy_idx_memo_key = None
+        copy_idx = self._get_copy_index_cached(request_ids, num_contexts, 1)
         num_tables = copy_idx.size(0)
         self._num_tables = num_tables
 
@@ -1167,10 +1224,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             ]
 
         device_copy_idx = self._copy_idx_to_device(copy_idx)
-        self._device_kv_cache_block_offsets_input.copy_(
-            self.host_kv_cache_block_offsets,
-            non_blocking=True,
-        )
+        # compute_sliding_block_tables runs first in
+        # DeepseekV4TrtllmAttentionMetadata.prepare, so this is where the
+        # per-iteration upload normally happens; the per-ratio and indexer tables
+        # then reuse it instead of re-uploading.
+        self._block_offsets_uploaded = False
+        self._ensure_device_block_offsets()
 
         if scratch_descs_by_pool is not None:
             scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
@@ -1223,7 +1282,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         assert dst_tensor.is_cuda, "copy_batch_block_offsets expects a CUDA destination"
-        dst_tensor.fill_(BAD_PAGE_INDEX)
+        # Fill only what the copy below does not overwrite. The copy fully
+        # populates [:, :_num_tables, 0, :], so pre-filling those entries was
+        # wasted work; the rows past _num_tables and the beams past 0 still have
+        # to carry BAD_PAGE_INDEX because padded CUDA-graph token slots can index
+        # them through req_idx_per_token.
+        if self._num_tables < dst_tensor.size(1):
+            dst_tensor[:, self._num_tables :, :, :].fill_(BAD_PAGE_INDEX)
+        dst_tensor[:, : self._num_tables, 1:, :].fill_(BAD_PAGE_INDEX)
         dst_tensor[:, : self._num_tables, 0, :].copy_(
             self._precomputed_sliding_block_tables[
                 :, DeepseekV4AttentionType.SWA.value, : self._num_tables, :
@@ -1243,7 +1309,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         Copy the per-layer block tables for attentions managed in sliding-window mode to the GPU tensor.
         """
         assert dst_tensor.is_cuda, "copy_batch_sliding_block_tables expects a CUDA destination"
-        dst_tensor.fill_(BAD_PAGE_INDEX)
+        # Fill only the rows the copy below does not overwrite. The tail past
+        # _num_tables must stay BAD_PAGE_INDEX because padded CUDA-graph token
+        # slots can still index it through req_idx_per_token; the head is fully
+        # overwritten by the copy, so filling the whole
+        # [num_local_layers, num_sliding_types, capacity, max_blocks] tensor first
+        # was redundant.
+        if self._num_tables < dst_tensor.size(2):
+            dst_tensor[:, :, self._num_tables :, :].fill_(BAD_PAGE_INDEX)
         dst_tensor[:, :, : self._num_tables, :].copy_(
             self._precomputed_sliding_block_tables[:, :, : self._num_tables, :],
             non_blocking=True,
@@ -1261,7 +1334,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     ) -> None:
         """Build the COMPRESS block table for one compression ratio and copy it to the destination."""
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
-        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        copy_idx = self._get_copy_index_cached(request_ids, num_contexts, beam_width)
         staging = self._host_compress_block_tables_staging[compress_ratio]
         if compress_ratio == 4:
             pool_id = self._csa_compress_pool_id
@@ -1278,8 +1351,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             raise RuntimeError(
                 f"Missing COMPRESS pool metadata for compress ratio {compress_ratio}"
             )
-        staging[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
-        dst_tensor[:num_seqs].copy_(staging[:num_seqs], non_blocking=True)
+        if dst_tensor.is_cuda:
+            # Build the table on the GPU. The CPU fallback below gathers a few
+            # hundred KB out of host_kv_cache_block_offsets and runs torch.where on
+            # it once per compression ratio, on the decode critical path; the device
+            # op does the same arithmetic (BAD_PAGE_INDEX passthrough, otherwise
+            # base * scale) and also removes the host->device staging copy.
+            self._compute_shared_block_table_device(
+                pool_id, scale, copy_idx, dst_tensor[:num_seqs]
+            )
+        else:
+            staging[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
+            dst_tensor[:num_seqs].copy_(staging[:num_seqs], non_blocking=True)
 
     @nvtx_range_debug("dsv4_copy_batch_indexer_compress_block_tables")
     def copy_batch_indexer_compress_block_tables(
@@ -1289,15 +1372,29 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        device_block_table: Optional[torch.Tensor] = None,
     ) -> None:
-        """Build the shared INDEXER_COMPRESS compatibility block table."""
+        """Build the shared INDEXER_COMPRESS compatibility block table.
+
+        When `device_block_table` is given the table is produced directly on the
+        device and `host_block_table` is left untouched.
+        """
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
-        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        copy_idx = self._get_copy_index_cached(request_ids, num_contexts, beam_width)
         pool_id = self._csa_indexer_compress_pool_id
         scale = self._csa_indexer_compress_scale
         if pool_id is None or scale is None:
             raise RuntimeError("Missing INDEXER_COMPRESS pool metadata")
-        host_block_table[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
+        if device_block_table is not None:
+            # Same rationale as copy_batch_compress_block_tables: build on device
+            # and skip both the host gather and the staging copy.
+            self._compute_shared_block_table_device(
+                pool_id, scale, copy_idx, device_block_table[:num_seqs]
+            )
+        else:
+            host_block_table[:num_seqs] = self._compute_shared_block_table(
+                pool_id, scale, copy_idx
+            )
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping, **kwargs):

@@ -423,6 +423,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.empty_topk_indices_buffer.fill_(-1)
 
+        # token_positions: absolute position of each token in its sequence.
+        # Persistent so the fused token-position kernel writes in place instead
+        # of allocating a fresh tensor per iteration.
+        self.token_positions_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_tokens,),
+            cache_name="token_positions_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
         # SWA local indices
         self.swa_local_indices_cuda = self.get_empty(
             self.cuda_graph_buffers,
@@ -526,10 +537,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             beam_width=self.beam_width,
             num_contexts=self.num_contexts,
             num_seqs=self.num_seqs,
-        )
-        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
-            self.host_indexer_k_cache_block_offsets[: self.num_seqs],
-            non_blocking=True,
+            device_block_table=self.indexer_k_cache_block_offsets,
         )
         # Columns beyond each sequence's allocated indexer blocks contain BAD_PAGE_INDEX (-1).
         # CUDA-graph padded token slots may still compute scatter addresses from those columns
@@ -554,35 +562,81 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_seqs=self.num_seqs,
             )
 
+    def prepare_for_indices_conversion(self):
+        """Device-side req_idx_per_token (overrides the CPU staging path).
+
+        The base class builds this with a CPU ``repeat_interleave`` plus a
+        pinned H2D memcpy. DeepSeek-V4 already keeps ``seq_lens`` on device, so
+        one kernel computes ``cu_seq_lens`` and the per-token request index
+        together -- and ``prepare()`` reuses that ``cu_seq_lens`` instead of
+        recomputing it on the host.
+        """
+        num_requests = self.num_seqs
+        if num_requests <= 0:
+            return
+        if self._seq_lens_cuda is None:
+            # seq_lens has not been set yet; fall back to the base implementation.
+            super().prepare_for_indices_conversion()
+            return
+        torch.ops.trtllm.deepseek_v4_compute_token_positions(
+            self._seq_lens_cuda[:num_requests],
+            None,
+            self.cu_seq_lens_cuda,
+            self.req_idx_per_token,
+            None,
+            self.num_tokens,
+            True,
+        )
+
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
         window_size = self.window_size
         device = self.swa_local_indices_cuda.device
 
         if token_positions is None:
-            # Initial prepare() path — build token_positions from CPU data.
+            # Initial prepare() path. cu_seq_lens_cuda is already populated by
+            # prepare_for_indices_conversion, so reuse the scan and only run the
+            # per-token phase (one kernel instead of arange + searchsorted +
+            # two gathers + two adds).
             num_tokens = self.num_tokens
             num_requests = self.num_seqs
+            token_positions = self.token_positions_cuda[:num_tokens]
+            torch.ops.trtllm.deepseek_v4_compute_token_positions(
+                self._seq_lens_cuda[:num_requests],
+                self.cached_token_lens_cuda[:num_requests],
+                self.cu_seq_lens_cuda,
+                self.req_idx_per_token,
+                token_positions,
+                num_tokens,
+                False,
+            )
 
-            # cu_seq_lens_cuda must already be populated before this call
-            cu_seq_lens = self.cu_seq_lens_cuda[: num_requests + 1]
-            cached_tokens = self.cached_token_lens_cuda[:num_requests]
-
-            token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
-            req_idx = torch.searchsorted(cu_seq_lens[1:].to(torch.int32), token_idx, right=True)
-            offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
-            token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
-
-        self._prepare_deepseek_v4_indices_compiled(
-            token_positions,
-            window_size,
-            self.max_compressed_indices[128],
-            self.sparse_mla_topk,
-            self.swa_local_indices_cuda,
-            self.compressed_local_indices_cuda,
-            self.sparse_mla_topk_lens,
-            self._compress_ratios_sorted,
-        )
+        if token_positions.is_cuda:
+            # Single fused CUDA kernel: replaces ~15 ATen launches (arange x2,
+            # unsqueeze/expand, clamp, add, where x2, floordiv, full, plus one
+            # clamp/add/copy per compress_ratio) and their temporaries.
+            torch.ops.trtllm.deepseek_v4_compute_indices(
+                token_positions,
+                window_size,
+                self.max_compressed_indices[128],
+                self.sparse_mla_topk,
+                self.swa_local_indices_cuda,
+                self.compressed_local_indices_cuda,
+                self.sparse_mla_topk_lens.get(1),
+                self.sparse_mla_topk_lens.get(4),
+                self.sparse_mla_topk_lens.get(128),
+            )
+        else:
+            self._prepare_deepseek_v4_indices_compiled(
+                token_positions,
+                window_size,
+                self.max_compressed_indices[128],
+                self.sparse_mla_topk,
+                self.swa_local_indices_cuda,
+                self.compressed_local_indices_cuda,
+                self.sparse_mla_topk_lens,
+                self._compress_ratios_sorted,
+            )
 
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})
@@ -778,13 +832,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
         self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda, ctx_output_sizes)
 
-        self._compute_compressed_mask(
-            self.new_comp_kv_lens_cuda,
-            self.cu_new_comp_kv_cuda,
-            self.compressed_mask_cuda,
+        ratios = self._compress_ratios_sorted
+        torch.ops.trtllm.deepseek_v4_compute_compressed_mask(
+            [self.new_comp_kv_lens_cuda[r] for r in ratios],
+            [self.cu_new_comp_kv_cuda[r] for r in ratios],
+            [self.compressed_mask_cuda[r] for r in ratios],
+            [int(self.num_total_compressed_tokens[r]) for r in ratios],
             num_requests,
-            self.num_total_compressed_tokens,
-            self._compress_ratios_sorted,
         )
 
     def prepare_compressed_kv_metadata(
@@ -811,26 +865,53 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         num_contexts = self.num_contexts
         num_generations = self.num_generations
 
-        self._compute_per_ratio_kv_lens(
-            kv_lens,
-            cached_tokens,
-            batch_size,
-            self.compressed_kv_lens_cuda,
-            self.past_kv_lens_cuda,
-            self.new_comp_kv_lens_cuda,
-            self.cu_new_comp_kv_cuda,
-            self._compress_ratios_sorted,
-        )
+        ratios = self._compress_ratios_sorted
+        if kv_lens.is_cuda:
+            # One launch for all ratios: replaces 4 ATen ops + a cumsum + a pad
+            # per ratio (~18 dispatches at 3 ratios) with a single fused kernel.
+            torch.ops.trtllm.deepseek_v4_compute_per_ratio_kv_lens(
+                kv_lens,
+                cached_tokens,
+                ratios,
+                [self.compressed_kv_lens_cuda[r] for r in ratios],
+                [self.past_kv_lens_cuda[r] for r in ratios],
+                [self.new_comp_kv_lens_cuda[r] for r in ratios],
+                [self.cu_new_comp_kv_cuda[r] for r in ratios],
+            )
+        else:
+            self._compute_per_ratio_kv_lens(
+                kv_lens,
+                cached_tokens,
+                batch_size,
+                self.compressed_kv_lens_cuda,
+                self.past_kv_lens_cuda,
+                self.new_comp_kv_lens_cuda,
+                self.cu_new_comp_kv_cuda,
+                ratios,
+            )
 
         if num_contexts > 0:
-            self._compute_ctx_compressed_position_ids(
-                self.past_kv_lens_cuda,
-                self.cu_new_comp_kv_cuda,
-                self.compressed_position_ids_cuda,
-                num_contexts,
-                self._compress_ratios_sorted,
-                ctx_output_sizes,
-            )
+            if ctx_output_sizes is not None:
+                # Host-side counts are already available, so the whole per-ratio
+                # loop (arange + searchsorted + gather + mul per ratio) collapses
+                # into one launch.
+                torch.ops.trtllm.deepseek_v4_compute_ctx_compressed_position_ids(
+                    [self.past_kv_lens_cuda[r] for r in ratios],
+                    [self.cu_new_comp_kv_cuda[r] for r in ratios],
+                    [self.compressed_position_ids_cuda[r] for r in ratios],
+                    ratios,
+                    [int(ctx_output_sizes[r]) for r in ratios],
+                    num_contexts,
+                )
+            else:
+                self._compute_ctx_compressed_position_ids(
+                    self.past_kv_lens_cuda,
+                    self.cu_new_comp_kv_cuda,
+                    self.compressed_position_ids_cuda,
+                    num_contexts,
+                    ratios,
+                    ctx_output_sizes,
+                )
 
         if self.num_gen_tokens_per_seq > 0 and num_generations > 0:
             # Extract output_offset as Python int per ratio to avoid
@@ -840,15 +921,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 r: self.cu_new_comp_kv_cuda[r][num_contexts].item() if num_contexts > 0 else 0
                 for r in self._compress_ratios_sorted
             }
-            self._compute_gen_compressed_position_ids(
-                self.past_kv_lens_cuda,
-                self.cu_new_comp_kv_cuda,
-                self.compressed_position_ids_cuda,
+            gen_comp_counts = [
+                num_generations * ((self.num_gen_tokens_per_seq + r - 1) // r) for r in ratios
+            ]
+            torch.ops.trtllm.deepseek_v4_compute_gen_compressed_position_ids(
+                [self.past_kv_lens_cuda[r] for r in ratios],
+                [self.cu_new_comp_kv_cuda[r] for r in ratios],
+                [self.compressed_position_ids_cuda[r] for r in ratios],
+                ratios,
+                gen_comp_counts,
+                [int(gen_output_offsets[r]) for r in ratios],
                 num_contexts,
-                num_generations,
-                self.num_gen_tokens_per_seq,
-                self._compress_ratios_sorted,
-                gen_output_offsets,
+                num_contexts + num_generations,
             )
 
     def on_update_kv_lens(self):
@@ -874,13 +958,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.prepare_compressed_kv_metadata(kv_lens, cached_tokens, ctx_output_sizes)
 
-        self._compute_compressed_mask(
-            self.new_comp_kv_lens_cuda,
-            self.cu_new_comp_kv_cuda,
-            self.compressed_mask_cuda,
+        ratios = self._compress_ratios_sorted
+        torch.ops.trtllm.deepseek_v4_compute_compressed_mask(
+            [self.new_comp_kv_lens_cuda[r] for r in ratios],
+            [self.cu_new_comp_kv_cuda[r] for r in ratios],
+            [self.compressed_mask_cuda[r] for r in ratios],
+            [int(self.num_total_compressed_tokens[r]) for r in ratios],
             batch_size,
-            self.num_total_compressed_tokens,
-            self._compress_ratios_sorted,
         )
 
         token_positions = self._compute_token_positions(
@@ -890,6 +974,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             num_tokens,
             self.cu_seq_lens_cuda,
             self.req_idx_per_token,
+            self.token_positions_cuda,
         )
 
         self.prepare_for_deepseek_v4_indices(token_positions)
@@ -930,8 +1015,25 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         num_tokens: int,
         cu_seq_lens_buf: torch.Tensor,
         req_idx_per_token_buf: torch.Tensor,
+        token_positions_buf: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute cu_seq_lens, req_idx_per_token, and token_positions (eager)."""
+        """Compute cu_seq_lens, req_idx_per_token, and token_positions."""
+        if seq_lens.is_cuda:
+            # One kernel: scan + per-token binary search + position math,
+            # replacing ~8 ATen dispatches (pad/cumsum/arange/searchsorted/two
+            # gathers/two adds) and their temporaries.
+            token_positions = token_positions_buf[:num_tokens]
+            torch.ops.trtllm.deepseek_v4_compute_token_positions(
+                seq_lens,
+                cached_tokens,
+                cu_seq_lens_buf,
+                req_idx_per_token_buf,
+                token_positions,
+                num_tokens,
+                True,
+            )
+            return token_positions
+
         device = seq_lens.device
 
         # cu_seq_lens
