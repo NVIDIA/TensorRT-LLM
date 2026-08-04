@@ -403,6 +403,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2ep2pp2_gentp4_deepseek_v3_lite_one_mtp_block_reuse_chunked.yaml",
         "deepseek_v3_lite_bf16_empty_batch":
         f"{test_configs_root}/disagg_config_deepseek_v3_lite_empty_batch.yaml",
+        "deepseek_v3_lite_bf16_gentp2_cute_dsl":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp2_deepseek_v3_lite_bf16_cute_dsl.yaml",
         "llama4_kv_cache_overflow":
         f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml",
         "deepseek_v3_lite_bf16_tllm_gen_helix":
@@ -2004,6 +2006,44 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
                            env=llm_venv._new_env,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(3)
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="CuTe DSL MLA decode FMHA lib requires SM100 or SM103")
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_gentp2_cute_dsl_mla_smoke(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    """Decode-only smoke for the CuTe DSL MLA decode FMHA lib in disagg.
+
+    A disaggregated generation server runs decode-only batches, so this
+    decode-only lib takes essentially every forward there (vs a fraction in
+    aggregated serving) and has no coverage from the aggregated tests. Run a
+    minimal ctxTP1+genTP2 disagg cluster on DeepSeek MLA geometry (gen TP2
+    yields the 16 heads/rank the bf16 path admits at any batch size) and
+    require the lib's kernel-compile marker in a generation-worker log:
+    correct client output alone would not distinguish the CuTe DSL path from
+    a silent fallback to flashinfer_trtllm_gen. The lib stays enabled by
+    default; TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
+    documented off switch.
+    """
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
+
+    env = llm_venv._new_env.copy()
+    # The kernel-compile marker is logged at INFO level.
+    env["TLLM_LOG_LEVEL"] = "INFO"
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_bf16_gentp2_cute_dsl",
+        env=env,
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory(),
+        assert_gen_log_contains="CuteDSL MLA decode: compiling kernel variant")
 
 
 @pytest.mark.skip_less_device(4)
