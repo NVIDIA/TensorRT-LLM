@@ -555,6 +555,47 @@
       "path": "iter_stats_max_iterations"
     },
     {
+      "allowed_values": [
+        "triattention"
+      ],
+      "annotation": "Literal['triattention']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.beta"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.budget"
+    },
+    {
+      "allowed_values": [
+        "union",
+        "per_head",
+        "per_layer_perhead"
+      ],
+      "annotation": "Literal['union', 'per_head', 'per_layer_perhead']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.eviction_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
@@ -655,6 +696,13 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.event_buffer_max_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.fp8_context_mla_kv_len_cap"
     },
     {
       "allowed_values": [],
