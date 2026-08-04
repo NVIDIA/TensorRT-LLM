@@ -32,12 +32,14 @@ if ENABLE_MULTI_DEVICE:
 T = TypeVar("T")
 
 _FLASHINFER_WORKER_BOOTSTRAP = (
-    "import os,tempfile;"
+    "import os,shutil,tempfile;"
     "from mpi4py import MPI;"
-    "workspace=f'trtllm-flashinfer-{MPI.COMM_WORLD.Get_rank()}-{os.getpid()}';"
-    "os.environ.setdefault('FLASHINFER_WORKSPACE_BASE',"
-    "os.path.join(tempfile.gettempdir(),workspace));"
-    "from mpi4py.futures.server import main;main()")
+    "workspace=tempfile.mkdtemp("
+    "prefix=f'trtllm-flashinfer-{MPI.COMM_WORLD.Get_rank()}-{os.getpid()}-');"
+    "os.environ.setdefault('FLASHINFER_WORKSPACE_BASE',workspace);"
+    "from mpi4py.futures.server import main\n"
+    "try:main()\n"
+    "finally:shutil.rmtree(workspace,ignore_errors=True)")
 
 
 class MPINodeState:
@@ -442,12 +444,21 @@ class MpiPoolSession(MpiSession):
         env = {
             key: value
             for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM")
+            if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
+                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
         }
         env.update(self._env_overrides)
-        # Configure FlashInfer before workers import the main module.
-        python_args = ["-c", _FLASHINFER_WORKER_BOOTSTRAP
-                       ] if self.n_workers > 1 else None
+        isolate_workspace = (self.n_workers > 1 and env.get(
+            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
+                             and "FLASHINFER_WORKSPACE_BASE" not in env)
+        if isolate_workspace:
+            # Keep downloaded cubins shared; only generated JIT sources race.
+            env.setdefault(
+                "FLASHINFER_CUBIN_DIR",
+                os.path.join(os.path.expanduser("~"), ".cache", "flashinfer",
+                             "cubins"))
+        python_args = (["-c", _FLASHINFER_WORKER_BOOTSTRAP]
+                       if isolate_workspace else None)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env,
