@@ -113,6 +113,8 @@ def build_document(
         "l_hit_stages": len(affected),
         "l_total_cases": total_cases,
         "l_cbts_cases": cbts_cases,
+        # Post-merge build of the consulted touch DB; 0 when no DB was used.
+        "l_coverage_db_build": int(decision.get("coverage_db_build") or 0),
         "d_case_skip_rate": round(case_skip_rate, 4),
         "flat_detail": {
             "hit_stages": affected,
