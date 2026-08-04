@@ -54,9 +54,10 @@ class ReuseScope(NamedTuple):
 class ReuseMatch(NamedTuple):
     """Volatile result of a KV cache prefix match.
 
-    ``num_tokens_before_ssm_pruning`` is the longest reusable attention-prefix
-    match after attention-page availability checks but before an SSM snapshot
-    is required. For Kimi K3, the attention life cycles hold MLA cache pages.
+    ``num_tokens_before_ssm_pruning`` is the attention-prefix match after
+    attention-page availability checks but before SSM and SWA-window pruning.
+    For Kimi K3, which uses full attention, the attention life cycles hold MLA
+    cache pages.
     """
 
     blocks: list["Block"]

@@ -2133,7 +2133,7 @@ def test_v2_hybrid_uses_upstream_min_snapshot_policy():
 
 
 @pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])
-def test_v2_hybrid_logs_prefix_reuse_only_on_rank_zero(
+def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
     monkeypatch: pytest.MonkeyPatch,
     rank: int,
     expected_log_count: int,
@@ -2143,9 +2143,11 @@ def test_v2_hybrid_logs_prefix_reuse_only_on_rank_zero(
         num_committed_tokens=64,
     )
     create_kv_cache = MagicMock(return_value=kv_cache)
-    log_info = MagicMock()
+    log_debug = MagicMock()
     monkeypatch.setattr(KVCacheManagerV2, "_create_kv_cache", create_kv_cache)
-    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.info", log_info)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.debug", log_debug
+    )
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.mapping = SimpleNamespace(rank=rank)
@@ -2158,9 +2160,9 @@ def test_v2_hybrid_logs_prefix_reuse_only_on_rank_zero(
     )
 
     assert result is kv_cache
-    assert log_info.call_count == expected_log_count
+    assert log_debug.call_count == expected_log_count
     if rank == 0:
-        log_info.assert_called_once_with(
+        log_debug.assert_called_once_with(
             "[MambaHybridCacheManagerV2] prefix reuse rank=0 request_id=123 "
             "request_total_tokens=128 "
             "longest_attention_match_tokens=96 "
@@ -2169,12 +2171,12 @@ def test_v2_hybrid_logs_prefix_reuse_only_on_rank_zero(
 
 
 @pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])
-def test_v2_hybrid_logs_recurrent_cache_status_only_on_rank_zero(
+def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     monkeypatch: pytest.MonkeyPatch,
     rank: int,
     expected_log_count: int,
 ) -> None:
-    stats = SimpleNamespace(
+    first_stats = SimpleNamespace(
         iter_offload_blocks=3,
         iter_offload_bytes=300,
         iter_onboard_blocks=1,
@@ -2187,8 +2189,24 @@ def test_v2_hybrid_logs_recurrent_cache_status_only_on_rank_zero(
         secondary_used_num_blocks=7,
         secondary_free_num_blocks=9,
     )
+    second_stats = SimpleNamespace(
+        iter_offload_blocks=2,
+        iter_offload_bytes=200,
+        iter_onboard_blocks=4,
+        iter_onboard_bytes=400,
+        iter_host_dropped_blocks=1,
+        iter_host_dropped_bytes=100,
+        primary_used_num_blocks=13,
+        primary_free_num_blocks=6,
+        primary_evictable_num_blocks=5,
+        secondary_used_num_blocks=8,
+        secondary_free_num_blocks=10,
+    )
     report = SimpleNamespace(
-        by_pool_group={6: SimpleNamespace(stats=stats)},
+        by_pool_group={
+            6: SimpleNamespace(stats=first_stats),
+            7: SimpleNamespace(stats=second_stats),
+        },
     )
     monkeypatch.setattr(KVCacheManagerV2, "get_iteration_stats", MagicMock(return_value=report))
     log_info = MagicMock()
@@ -2200,6 +2218,8 @@ def test_v2_hybrid_logs_recurrent_cache_status_only_on_rank_zero(
         return_value={
             0: (4, 4096, "attention"),
             1: (6, None, "ssm"),
+            2: (7, None, "ssm"),
+            3: (6, None, "ssm"),
         }
     )
     mgr._recurrent_evicted_blocks_total = 0
@@ -2208,23 +2228,23 @@ def test_v2_hybrid_logs_recurrent_cache_status_only_on_rank_zero(
     mgr._recurrent_status_logged = False
 
     assert mgr.get_iteration_stats() is report
-    assert mgr._recurrent_evicted_blocks_total == 3
-    assert mgr._recurrent_onboarded_blocks_total == 1
-    assert mgr._recurrent_dropped_blocks_total == 2
+    assert mgr._recurrent_evicted_blocks_total == 5
+    assert mgr._recurrent_onboarded_blocks_total == 5
+    assert mgr._recurrent_dropped_blocks_total == 3
     assert log_info.call_count == expected_log_count
     if rank == 0:
         log_info.assert_called_once_with(
             "[MambaHybridCacheManagerV2] recurrent cache status "
-            "rank=0 pool_group_id=6 "
-            "evicted_recurrent_blocks=3 evicted_recurrent_bytes=300 "
-            "onboarded_recurrent_blocks=1 onboarded_recurrent_bytes=100 "
-            "dropped_recurrent_blocks=2 dropped_recurrent_bytes=200 "
-            "total_evicted_recurrent_blocks=3 "
-            "total_onboarded_recurrent_blocks=1 "
-            "total_dropped_recurrent_blocks=2 "
-            "gpu_used_recurrent_blocks=11 gpu_free_recurrent_blocks=5 "
-            "gpu_evictable_recurrent_blocks=4 "
-            "host_used_recurrent_blocks=7 host_free_recurrent_blocks=9"
+            "rank=0 pool_group_ids=[6, 7] "
+            "evicted_recurrent_blocks=5 evicted_recurrent_bytes=500 "
+            "onboarded_recurrent_blocks=5 onboarded_recurrent_bytes=500 "
+            "dropped_recurrent_blocks=3 dropped_recurrent_bytes=300 "
+            "total_evicted_recurrent_blocks=5 "
+            "total_onboarded_recurrent_blocks=5 "
+            "total_dropped_recurrent_blocks=3 "
+            "gpu_used_recurrent_blocks=24 gpu_free_recurrent_blocks=11 "
+            "gpu_evictable_recurrent_blocks=9 "
+            "host_used_recurrent_blocks=15 host_free_recurrent_blocks=19"
         )
 
 

@@ -282,7 +282,7 @@ public:
         int numTokens;
         // Total query length passed to match() (== len(tokens)).
         int numLookupTokens;
-        // Longest attention prefix after attention-page checks and before SSM snapshot pruning.
+        // Attention prefix after attention-page checks and before SSM and SWA-window pruning.
         int numTokensBeforeSsmPruning;
     };
 

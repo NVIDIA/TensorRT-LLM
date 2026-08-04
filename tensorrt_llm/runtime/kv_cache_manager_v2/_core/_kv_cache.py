@@ -435,12 +435,6 @@ class _KVCache:
         else:
             self.manager.clear_stats_dirty(self.id)
 
-    def _stats_life_cycle_key(self, life_cycle: LifeCycleId) -> LifeCycleId | None:
-        life_cycle_obj = self.manager._life_cycles.get_life_cycle(life_cycle)
-        if isinstance(life_cycle_obj, AttnLifeCycle):
-            return life_cycle
-        return None
-
     def _refresh_generation_alloc_ready(self) -> None:
         expected_prompt_length = self._expected_prompt_length
         if expected_prompt_length is not None and self._history_length >= expected_prompt_length:
@@ -1053,10 +1047,10 @@ class _KVCache:
 
     @property
     def num_tokens_before_ssm_pruning(self) -> int:
-        """Return the longest reusable attention prefix before SSM pruning.
+        """Return the attention prefix before SSM and SWA-window pruning.
 
-        For Kimi K3, this is the MLA cache prefix before the shared KDA
-        recurrent-state snapshot requirement is applied.
+        For Kimi K3, which uses full attention, this is the MLA cache prefix
+        before the shared KDA recurrent-state snapshot requirement is applied.
         """
         return self._num_tokens_before_ssm_pruning
 
@@ -1298,10 +1292,9 @@ class _KVCache:
                         self.cuda_stream,
                     )
                 if lc_idx != ssm_lc_id:
-                    life_cycle_key = self._stats_life_cycle_key(lc_idx)
-                    if life_cycle_key is not None and self._should_record_stats():
+                    if self._should_record_stats():
                         changed = self._pending_stats.record_allocation_range(
-                            life_cycle_key,
+                            lc_idx,
                             last_ordinal,
                             BlockOrdinal(last_ordinal + 1),
                             beam_width=1,

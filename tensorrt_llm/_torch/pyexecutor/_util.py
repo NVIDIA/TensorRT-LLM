@@ -2036,9 +2036,15 @@ def _create_kv_cache_manager(
         # flow for KDA layers.
         kimi_extra_kwargs = dict(manager_extra_kwargs)
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            kimi_extra_kwargs["conv_state_layout"] = "q_k_v"
+            kimi_manager_key = "conv_state_layout"
+            kimi_manager_value = "q_k_v"
         else:
-            kimi_extra_kwargs["model_type"] = "qwen3_next"
+            kimi_manager_key = "model_type"
+            kimi_manager_value = "qwen3_next"
+        if kimi_manager_key in kimi_extra_kwargs:
+            raise TypeError(
+                f"Duplicate Kimi cache-manager keyword: {kimi_manager_key}")
+        kimi_extra_kwargs[kimi_manager_key] = kimi_manager_value
         if spec_config is not None and issubclass(kv_cache_manager_cls,
                                                   MixedMambaHybridCacheManager):
             from ..modules.kimi_kda._kda_kernels import \

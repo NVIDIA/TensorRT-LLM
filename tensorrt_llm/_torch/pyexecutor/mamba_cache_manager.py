@@ -2992,7 +2992,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # Prefix lookup excludes the final prompt token because it must be
             # recomputed by prefill. Restore it for the request-length metric.
             request_total_tokens = len(input_tokens) + 1
-            logger.info(
+            logger.debug(
                 f"[MambaHybridCacheManagerV2] prefix reuse rank={self.mapping.rank} "
                 f"request_id={request_id} "
                 f"request_total_tokens={request_total_tokens} "
@@ -3008,21 +3008,26 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if report is None:
             return None
 
-        pool_group_id = next(
-            (pool_group_id for pool_group_id, _, kind in
-             self._stats_life_cycle_metadata().values() if kind == "ssm"),
-            None,
-        )
-        if pool_group_id is None:
+        pool_group_ids = sorted({
+            pool_group_id
+            for pool_group_id, _, kind in
+            self._stats_life_cycle_metadata().values() if kind == "ssm"
+        })
+        if not pool_group_ids:
             return report
-        pool_group_report = report.by_pool_group.get(pool_group_id)
-        if pool_group_report is None:
-            return report
+        pool_group_reports = [
+            report.by_pool_group[pool_group_id]
+            for pool_group_id in pool_group_ids
+        ]
 
-        stats = pool_group_report.stats
-        evicted_blocks = stats.iter_offload_blocks
-        onboarded_blocks = stats.iter_onboard_blocks
-        dropped_blocks = stats.iter_host_dropped_blocks
+        stats = [pool_group_report.stats
+                 for pool_group_report in pool_group_reports]
+        evicted_blocks = sum(stat.iter_offload_blocks for stat in stats)
+        evicted_bytes = sum(stat.iter_offload_bytes for stat in stats)
+        onboarded_blocks = sum(stat.iter_onboard_blocks for stat in stats)
+        onboarded_bytes = sum(stat.iter_onboard_bytes for stat in stats)
+        dropped_blocks = sum(stat.iter_host_dropped_blocks for stat in stats)
+        dropped_bytes = sum(stat.iter_host_dropped_bytes for stat in stats)
         has_movement = bool(evicted_blocks or onboarded_blocks
                             or dropped_blocks)
         if has_movement:
@@ -3033,25 +3038,29 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 and (has_movement or not self._recurrent_status_logged)):
             logger.info(
                 f"[MambaHybridCacheManagerV2] recurrent cache status "
-                f"rank={self.mapping.rank} pool_group_id={pool_group_id} "
+                f"rank={self.mapping.rank} pool_group_ids={pool_group_ids} "
                 f"evicted_recurrent_blocks={evicted_blocks} "
-                f"evicted_recurrent_bytes={stats.iter_offload_bytes} "
+                f"evicted_recurrent_bytes={evicted_bytes} "
                 f"onboarded_recurrent_blocks={onboarded_blocks} "
-                f"onboarded_recurrent_bytes={stats.iter_onboard_bytes} "
+                f"onboarded_recurrent_bytes={onboarded_bytes} "
                 f"dropped_recurrent_blocks={dropped_blocks} "
-                f"dropped_recurrent_bytes={stats.iter_host_dropped_bytes} "
+                f"dropped_recurrent_bytes={dropped_bytes} "
                 f"total_evicted_recurrent_blocks="
                 f"{self._recurrent_evicted_blocks_total} "
                 f"total_onboarded_recurrent_blocks="
                 f"{self._recurrent_onboarded_blocks_total} "
                 f"total_dropped_recurrent_blocks="
                 f"{self._recurrent_dropped_blocks_total} "
-                f"gpu_used_recurrent_blocks={stats.primary_used_num_blocks} "
-                f"gpu_free_recurrent_blocks={stats.primary_free_num_blocks} "
+                f"gpu_used_recurrent_blocks="
+                f"{sum(stat.primary_used_num_blocks for stat in stats)} "
+                f"gpu_free_recurrent_blocks="
+                f"{sum(stat.primary_free_num_blocks for stat in stats)} "
                 f"gpu_evictable_recurrent_blocks="
-                f"{stats.primary_evictable_num_blocks} "
-                f"host_used_recurrent_blocks={stats.secondary_used_num_blocks} "
-                f"host_free_recurrent_blocks={stats.secondary_free_num_blocks}")
+                f"{sum(stat.primary_evictable_num_blocks for stat in stats)} "
+                f"host_used_recurrent_blocks="
+                f"{sum(stat.secondary_used_num_blocks for stat in stats)} "
+                f"host_free_recurrent_blocks="
+                f"{sum(stat.secondary_free_num_blocks for stat in stats)}")
             self._recurrent_status_logged = True
         return report
 
