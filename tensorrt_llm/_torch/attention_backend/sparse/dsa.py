@@ -825,6 +825,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # caches so they are recomputed (and captured) on every _forward_step". Invalidate the
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.
+        self._refresh_req_idx_per_token()
         self._invalidate_pool_view_cache()
         # Clear per-step cross-layer top-k, but keep it inside the MTP draft
         # loop so the step-0 stash survives for the reuse branch.
@@ -1108,6 +1109,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.host_req_idx_per_token = torch.empty_like(
             self.req_idx_per_token, device='cpu', pin_memory=prefer_pinned())
+        # Static arange used to refresh ``req_idx_per_token`` when the batch
+        # layout becomes one token per request (see _refresh_req_idx_per_token).
+        # Content is constant, so it is filled once here and only ever read;
+        # refreshing via copy_ from it allocates nothing and is therefore safe
+        # under CUDA graph capture (which is why prepare_for_indices_conversion
+        # avoids repeat_interleave in the first place).
+        self._arange_req_idx = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_tokens, ),
+            cache_name="arange_req_idx",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        torch.arange(self.max_num_tokens,
+                     dtype=torch.int32,
+                     out=self._arange_req_idx)
         # Block table for topk_indices conversion (shared for context and generation)
         self.block_table = self.get_empty(
             self.cuda_graph_buffers,
@@ -1694,6 +1711,38 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 non_blocking=True)
         else:
             self.max_gen_seq_len = 0
+
+    def _refresh_req_idx_per_token(self):
+        """Keep ``req_idx_per_token`` consistent with the *current* batch layout.
+
+        ``prepare_for_indices_conversion`` builds this mapping once per target
+        forward and it is deliberately reused afterwards to keep
+        ``repeat_interleave`` out of the CUDA-graph-captured region. That reuse
+        is only valid while the layout is unchanged.
+
+        The MTP-Eagle draft loop breaks that assumption: after draft step 0 it
+        rewrites the batch to one token per request
+        (``eagle3.py::_forward_linear_draft_loop`` -> ``_seq_lens.fill_(1)`` +
+        ``on_update()``), but ``AttentionMetadata.on_update`` only refreshes
+        num_tokens / num_ctx_tokens / num_generations -- it does not rebuild
+        this mapping. Draft steps 1..k then read the stale *target* layout
+        ([0]*next_n + [1]*next_n + ...) where the correct mapping is
+        arange(num_seqs), which mis-addresses both the indexer-K slot mapping
+        (``on_update_kv_lens``) and the top-k -> global index conversion
+        (``_rebuild_pool_view_cache`` -> ``convert_req_index_to_global``).
+        The result is a monotonic acceptance-rate collapse with draft depth at
+        batch>1. It is a no-op at batch==1, where the mapping is [0] either way.
+
+        ``num_tokens == num_seqs`` implies every ``seq_len`` is 1 (seq lens are
+        >= 1 and sum to num_tokens), for which the mapping is exactly
+        ``arange(num_seqs)``. That identity holds for ordinary single-token
+        decode too, so this refresh is unconditionally correct -- it is not
+        specific to speculative decoding.
+        """
+        n = self.num_tokens
+        if n > 0 and n == self.num_seqs:
+            self.req_idx_per_token[:n].copy_(self._arange_req_idx[:n],
+                                             non_blocking=True)
 
     def prepare_for_indices_conversion(self):
         # Build req_idx_per_token for topk_indices conversion
