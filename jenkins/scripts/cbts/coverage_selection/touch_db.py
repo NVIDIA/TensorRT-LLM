@@ -45,6 +45,10 @@ _LAUNCH_MARKERS: tuple[tuple[str, str], ...] = (
     ("tensorrt_llm/executor/executor.py", "GenerationExecutor.generate"),
 )
 _SERVING_PATH_MARKERS: tuple[str, ...] = ("disaggregated/",)
+# Stage-name markers whose capture is structurally partial regardless of footprint:
+# `sitecustomize` opts Ray infra processes out, so a Ray stage's GPU worker lives in
+# an uninstrumented `default_worker.py` and its tests carry only the driver's rows.
+_UNTRUSTED_STAGE_MARKERS: tuple[str, ...] = ("-Ray-",)
 _MIN_FUNCS = 30
 
 
@@ -225,13 +229,15 @@ class TouchDB:
         launch_markers: tuple[tuple[str, str], ...],
         serving_path_markers: tuple[str, ...],
         min_funcs: int,
+        untrusted_stage_markers: tuple[str, ...] = (),
     ) -> set[str]:
         """Stage-prefixed tests whose per-test capture looks incomplete (must always run).
 
         Flags a test that drove execution/serving but is missing `worker_file` —
         matched by a `launch_markers` `(file, qualname_substring)` call or a
-        `serving_path_markers` nodeid substring — or that entered fewer than
-        `min_funcs` functions total.
+        `serving_path_markers` nodeid substring — that entered fewer than
+        `min_funcs` functions total, or that ran on a stage whose name contains an
+        `untrusted_stage_markers` substring.
         """
         drove_execution: set[str] = set()
         for file, qual_substr in launch_markers:
@@ -256,4 +262,11 @@ class TouchDB:
                 (min_funcs,),
             )
         }
-        return missing_worker | tiny
+        on_untrusted_stage: set[str] = set()
+        if untrusted_stage_markers:
+            on_untrusted_stage = {
+                test
+                for test in self.known_tests()
+                if any(marker in split_stage(test)[0] for marker in untrusted_stage_markers)
+            }
+        return missing_worker | tiny | on_untrusted_stage
