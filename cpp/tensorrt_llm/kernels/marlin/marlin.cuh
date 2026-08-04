@@ -34,6 +34,13 @@
 #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
+// Ada Lovelace (SM89, e.g. L40S) and Hopper (SM90-99).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890 && __CUDA_ARCH__ < 1000)
+#define MARLIN_NVFP4_DEVICE_SUPPORTED 1
+#else
+#define MARLIN_NVFP4_DEVICE_SUPPORTED 0
+#endif
+
 namespace MARLIN_NAMESPACE_NAME
 {
 

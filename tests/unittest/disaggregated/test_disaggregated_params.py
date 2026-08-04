@@ -21,6 +21,21 @@ def test_disaggregated_params_ctx_info_endpoint():
     assert params.ctx_info_endpoint == ["tcp://10.0.0.1:5000", "tcp://10.0.0.2:5000"]
 
 
+def test_receiver_ctx_info_endpoint_required():
+    from tensorrt_llm._torch.disaggregation.native.transfer import Receiver
+
+    with pytest.raises(ValueError, match="ctx_info_endpoint is required"):
+        Receiver._extract_info_endpoint(DisaggregatedParams())
+    with pytest.raises(ValueError, match="ctx_info_endpoint is required"):
+        Receiver._extract_info_endpoint(DisaggregatedParams(ctx_info_endpoint=[]))
+    assert (
+        Receiver._extract_info_endpoint(
+            DisaggregatedParams(ctx_info_endpoint="tcp://10.0.0.1:5000")
+        )
+        == "tcp://10.0.0.1:5000"
+    )
+
+
 @patch("tensorrt_llm.disaggregated_params.tllme")
 def test_get_context_phase_params(mock_tllme):
     mock_ctx_params = MagicMock()
@@ -126,6 +141,19 @@ def test_disaggregated_params_conversation_id():
     llm_params = to_llm_disaggregated_params(openai_params)
     assert llm_params.conversation_id == "conv-roundtrip"
     assert to_disaggregated_params(llm_params).conversation_id == "conv-roundtrip"
+
+
+def test_opaque_state_round_trips_through_openai_protocol():
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    openai_params = to_disaggregated_params(
+        DisaggregatedParams(request_type="context_only", opaque_state=b"opaque")
+    )
+    assert openai_params.encoded_opaque_state == "b3BhcXVl"
+    assert to_llm_disaggregated_params(openai_params).opaque_state == b"opaque"
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")

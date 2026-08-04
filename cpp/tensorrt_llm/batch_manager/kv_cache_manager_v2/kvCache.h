@@ -457,11 +457,11 @@ private:
     std::vector<TokenIdExt> _getMatchedTokens(BlockRadixTree::ReuseMatch const& match) const;
     void _clearBlocks();
     // Copy `srcPage` into a new committed page attached to `treeBlock` for lifecycle
-    // `lcIdx`. When `ssmNumTokensInBlock` is set, the copy is an SsmCommittedPage
-    // covering that many tokens; otherwise a plain attention CommittedPage. No-op if
-    // the block already holds a page for this lifecycle, or on OOM in all levels.
-    void _copyPageToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId lcIdx, SharedPtr<Page> const& srcPage,
-        std::optional<int> ssmNumTokensInBlock = std::nullopt);
+    // `lcIdx`, recording `numTokensInBlock` as the page's token count. Returns the page
+    // now in the slot, or nullptr on OOM in all levels. No-op (returning the existing
+    // page) if the block already holds a page covering at least that many tokens.
+    CommittedPage* _copyPageToTreeBlock(
+        SharedPtr<Block> const& treeBlock, LifeCycleId lcIdx, SharedPtr<Page> const& srcPage, int numTokensInBlock);
 
     // Snapshot live SSM state to `treeBlock` reusable at `numTokens` committed tokens.
     // If `move`, the live SSM page is moved (not copied) into the tree — the caller

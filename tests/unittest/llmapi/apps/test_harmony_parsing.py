@@ -23,9 +23,11 @@ Covers two fixes:
 """
 
 import json
+import os
 from unittest.mock import Mock, patch
 
 import pytest
+from utils.llm_data import llm_datasets_root
 
 try:
     from tensorrt_llm.serve.harmony_adapter import (
@@ -47,7 +49,17 @@ try:
 except (ImportError, ModuleNotFoundError):
     _harmony_available = False
 
-pytestmark = pytest.mark.skipif(not _harmony_available, reason="harmony_adapter not importable")
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.skipif(not _harmony_available, reason="harmony_adapter not importable"),
+]
+
+
+@pytest.fixture(autouse=True)
+def _tiktoken_local_cache(monkeypatch):
+    cache_dir = os.path.join(llm_datasets_root(), "tiktoken_vocab")
+    monkeypatch.setenv("TIKTOKEN_RS_CACHE_DIR", cache_dir)
+    monkeypatch.setenv("TIKTOKEN_ENCODINGS_BASE", cache_dir)
 
 
 # ---------------------------------------------------------------------------

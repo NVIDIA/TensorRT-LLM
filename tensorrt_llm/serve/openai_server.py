@@ -63,6 +63,8 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.disagg_auth import (
+    request_requires_internal_disagg_auth, validate_internal_disagg_request)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
@@ -269,7 +271,8 @@ class OpenAIServer(_VideoRoutesMixin):
             embedding_max_queue_delay: float = 0.005,
             embedding_max_queue_size: int = 2048,
             input_processor_workers: int = 8,
-            media_load_workers: int = 8):
+            media_load_workers: int = 8,
+            internal_disagg_auth_key: Optional[str] = None):
         self.generator = generator
         self._is_visual_gen = isinstance(generator, VisualGen)
         self._embedding_max_queue_delay = embedding_max_queue_delay
@@ -293,6 +296,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 cfg.media_io_kwargs = merged
                 self.multimodal_server_config = cfg
         self.allow_request_chat_template = allow_request_chat_template
+        self._internal_disagg_auth_key = internal_disagg_auth_key
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -628,6 +632,25 @@ class OpenAIServer(_VideoRoutesMixin):
             if vocab_size is not None:
                 return int(vocab_size)
         return int(self.tokenizer.tokenizer.vocab_size)
+
+    def _validate_internal_disagg_request(
+            self, request, raw_request: Optional[Request]) -> None:
+        if (request_requires_internal_disagg_auth(request)
+                and not self._has_cache_transceiver_config()):
+            raise ValueError("Protected disaggregated request fields require "
+                             "cache_transceiver_config to be configured")
+        headers = None if raw_request is None else raw_request.headers
+        validate_internal_disagg_request(
+            getattr(self, "_internal_disagg_auth_key", None), request, headers)
+
+    def _has_cache_transceiver_config(self) -> bool:
+        cache_transceiver_config = getattr(
+            getattr(self.generator, "args", None), "cache_transceiver_config",
+            None)
+        if isinstance(cache_transceiver_config, dict):
+            return cache_transceiver_config.get("backend") is not None
+        return (cache_transceiver_config is not None and getattr(
+            cache_transceiver_config, "backend", None) is not None)
 
     def _log_config_info_metrics(self) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
@@ -1476,6 +1499,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     if strict_guided is not None:
                         sampling_params.guided_decoding = strict_guided
             postproc_args = ChatPostprocArgs.from_request(request)
+            self._validate_internal_disagg_request(request, raw_request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
@@ -1869,6 +1893,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
+            self._validate_internal_disagg_request(request, raw_request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
             resolve_request_conversation_id(
@@ -2027,6 +2052,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # for header or JSONL output.
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
+            self._validate_internal_disagg_request(request, raw_request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
             trace_headers = (None if raw_request is None else
