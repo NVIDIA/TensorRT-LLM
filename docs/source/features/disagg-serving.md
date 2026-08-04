@@ -353,6 +353,45 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 * `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `1`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
 
+* `TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS`: Set to `1` to emit the opt-in
+  `[DISAGG_DIAG][lifecycle]` request lifecycle stream. The stream records
+  engine-queue ingress, dequeue, dispatch, and waiting-queue release; local
+  scheduler activation; scheduler/transfer admission; transceiver handoff and
+  return; adapter completion/error observations; and executor-owned timeout
+  boundaries for both Python and C++ transceiver runtimes. It is disabled by
+  default and can generate substantial log volume under high concurrency.
+  Lifecycle records are written to standard output by a background writer,
+  independently of the general `TLLM_LOG_LEVEL`. Publication from executor
+  paths is nonblocking; `records_dropped` reports saturation loss. Normal
+  executor shutdown gives accepted records a bounded drain interval rather
+  than waiting indefinitely on a blocked output sink.
+
+* `TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RANKS`: Optional comma-separated world
+  ranks that may emit lifecycle diagnostics, for example `0,8,16`. The default
+  `*` records all ranks. Retain all potential ADP scheduler ranks when
+  measuring local scheduler activation-to-admission delay.
+
+* `TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_QUEUE_SIZE`: Maximum number of complete
+  lifecycle records buffered per process before new records are dropped. The
+  default is `8192`.
+
+Lifecycle durations are valid only between records with the same `clock_id`;
+sort concurrent records by `(clock_id, seq)`. In attention-DP deployments,
+rank-zero ingress-to-dequeue, dequeue-to-dispatch, dispatch-to-waiting-release,
+and local scheduler activation-to-admission are distinct monotonic-clock
+segments. Wall-clock timestamps only provide best-effort cross-process
+correlation. `timer_basis=executor_watchdog` uses the existing executor timer;
+`handoff_deadline_crossed` with `timer_basis=transceiver_handoff` is only a
+diagnostics latency threshold and is not a runtime timeout.
+`adapter_status_poll_error` is operation-scoped and does not mark every tracked
+request as failed. `disagg_request_id` is the current correlation key; it is not
+a generation-safe attempt, fencing, or allocation identity. These
+executor-boundary diagnostics do not yet identify receiver-information arrival,
+address publication, operation submission, first transport progress,
+backend-local physical completion, or a confirmed user-cancellation terminal.
+They therefore cannot by themselves distinguish every rendezvous and transport
+subphase.
+
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
 * `NCCL_GRAPH_MIXING_SUPPORT`: TensorRT-LLM now initializes common NCCL communicators with graph
