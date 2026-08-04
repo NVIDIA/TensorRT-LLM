@@ -13,81 +13,71 @@
 # limitations under the License.
 """Pytest plugin for CBTS Layer C per-test coverage attribution."""
 
-import inspect
 import os
 import sys
+import tempfile
 
-MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", "/tmp/cbts/current_test.txt")
+# Per-user default marker path (CI overrides via CBTS_MARKER_FILE). Defined once here and imported by
+# sitecustomize so the outer pytest (writer) and its subprocesses (readers) agree on the path.
+DEFAULT_MARKER_FILE = os.path.join(tempfile.gettempdir(), f"cbts-{os.getuid()}", "current_test.txt")
+MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", DEFAULT_MARKER_FILE)
 
-_ENV_WHITELIST_PREFIXES = ("TRTLLM", "TLLM", "COVERAGE_", "CBTS_", "PYTHON")
-
-_PATCHED_MARKER = "_cbts_patched_start_mpi_pool"
+_POOL_PATCHED_MARKER = "_cbts_patched_pool_init"
 
 
-def install_mpi_pool_patch(*, raise_on_refactor=True):
-    """Widen ``MpiPoolSession._start_mpi_pool``'s env whitelist; idempotent."""
+def install_expected_workers_patch():
+    """Patch ``MPIPoolExecutor.__init__`` to count each test's spawned pool workers; idempotent.
+
+    Patching the constructor rather than ``MpiPoolSession._start_mpi_pool`` catches every pool
+    (product ``MpiPoolSession`` and disagg's own raw ``MPIPoolExecutor``) while leaving the
+    product's pool setup — ``env_overrides``, the ``wait_shutdown`` worker-identity barrier, … —
+    intact. Coverage-env reaches workers via default OS-level env inheritance (``CBTS_COVERAGE_CONFIG``,
+    ``PYTHONPATH``, ``CBTS_MARKER_FILE``); ``mpi4py.futures``'s ``env=`` kwarg is applied via
+    ``os.environ.update`` *after* Python startup, so it can't affect sitecustomize activation anyway.
+    """
     try:
-        from mpi4py.futures import MPIPoolExecutor  # noqa: F401
-
-        import tensorrt_llm.llmapi.mpi_session as _ms
+        from mpi4py.futures import MPIPoolExecutor
     except ImportError:
         return False
 
-    method = _ms.MpiPoolSession._start_mpi_pool
-    if getattr(method, _PATCHED_MARKER, False):
+    init = MPIPoolExecutor.__init__
+    if getattr(init, _POOL_PATCHED_MARKER, False):
         return False
 
-    src = inspect.getsource(method)
-    if "TRTLLM" not in src or "MPIPoolExecutor" not in src:
-        msg = (
-            "CBTS: tensorrt_llm.llmapi.mpi_session.MpiPoolSession."
-            "_start_mpi_pool has been refactored upstream; the "
-            "monkeypatch in cbts_plugin.py needs to be updated. See "
-            "jenkins/scripts/cbts/coverage_utils/README.md"
-        )
-        if raise_on_refactor:
-            raise RuntimeError(msg)
-        return False
+    def _patched_init(self, *args, **kwargs):
+        try:
+            max_workers = kwargs.get("max_workers", args[0] if args else None)
+            n = int(max_workers) if max_workers else 1
+        except (ValueError, TypeError):
+            n = 1
+        _sitecustomize_call("note_expected_workers", os.environ.get("CBTS_TEST_ID", ""), n)
+        return init(self, *args, **kwargs)
 
-    def _patched_start_mpi_pool(self):
-        """Widened env whitelist so COVERAGE_* and PYTHON* reach workers."""
-        import sys as _sys
-
-        from mpi4py.futures import MPIPoolExecutor as _MPE
-
-        assert not self.mpi_pool, "MPI session already started"
-        env = {k: v for k, v in os.environ.items() if k.startswith(_ENV_WHITELIST_PREFIXES)}
-        self.mpi_pool = _MPE(
-            max_workers=self.n_workers,
-            path=_sys.path,
-            env=env,
-        )
-
-    setattr(_patched_start_mpi_pool, _PATCHED_MARKER, True)
-    _ms.MpiPoolSession._start_mpi_pool = _patched_start_mpi_pool
+    setattr(_patched_init, _POOL_PATCHED_MARKER, True)
+    MPIPoolExecutor.__init__ = _patched_init
     return True
 
 
-def _switch_test_context(nodeid):
-    """Switch the per-test tracking context via the sitecustomize bootstrap, if active."""
+def _sitecustomize_call(func_name, *args):
+    """Forward to a sitecustomize bootstrap hook (context switch / outcome / worker count), if active."""
     try:
         import sitecustomize
 
-        switch = getattr(sitecustomize, "switch_test_context", None)
+        fn = getattr(sitecustomize, func_name, None)
     except ImportError:
-        switch = None
-    if switch is not None:
-        switch(nodeid)
+        fn = None
+    if fn is not None:
+        fn(*args)
 
 
-# Bind pytest only when already loaded, so importing this module for install_mpi_pool_patch stays cheap.
+# Bind pytest only when already loaded, so importing this module for the patch install stays cheap.
 if "pytest" in sys.modules:
     import pytest
 
     def pytest_configure(config):  # noqa: D401 - pytest hook
-        """Apply ``mpi_session`` monkeypatch with a compatibility guard."""
+        """Install the pool-worker accounting + coverage-env patch."""
         del config
-        install_mpi_pool_patch(raise_on_refactor=True)
+        install_expected_workers_patch()
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_protocol(item, nextitem):  # noqa: D401 - pytest hook
@@ -98,13 +88,29 @@ if "pytest" in sys.modules:
         marker_dir = os.path.dirname(MARKER_FILE)
         if marker_dir:
             os.makedirs(marker_dir, exist_ok=True)
-        with open(MARKER_FILE, "w") as f:
+        # Write + atomic replace so a reader never sees a half-written nodeid.
+        tmp = f"{MARKER_FILE}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
             f.write(nodeid)
             f.flush()
+        os.replace(tmp, MARKER_FILE)
 
         # Propagate nodeid via env so subprocesses pick it up in sitecustomize.py.
         os.environ["CBTS_TEST_ID"] = nodeid
 
-        _switch_test_context(nodeid)
+        _sitecustomize_call("switch_test_context", nodeid)
 
         yield
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_makereport(item, call):  # noqa: D401 - pytest hook
+        """Record each test's outcome so the merge can flag coverage that isn't safe to trust."""
+        del call
+        outcome = yield
+        report = outcome.get_result()
+        # The call phase is the test body; a non-passing setup or teardown is the test's
+        # effective outcome (a failing teardown downgrades an already-recorded pass).
+        if report.when == "call" or (
+            report.when in ("setup", "teardown") and report.outcome != "passed"
+        ):
+            _sitecustomize_call("record_test_outcome", item.nodeid, report.outcome)
