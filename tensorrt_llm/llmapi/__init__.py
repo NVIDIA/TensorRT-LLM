@@ -18,13 +18,15 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
                        LookaheadDecodingConfig, MambaStateConfig,
                        MedusaDecodingConfig, MiniMaxM3SparseAttentionConfig,
-                       MoeConfig, MTPDecodingConfig, NGramDecodingConfig,
-                       PARDDecodingConfig, PrometheusMetricsConfig,
-                       ReorderRequestPolicyConfig, RocketSparseAttentionConfig,
-                       SADecodingConfig, SAEnhancerConfig,
-                       SaveHiddenStatesDecodingConfig, SchedulerConfig,
-                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
-                       TorchLlmArgs, UserProvidedDecodingConfig)
+                       MoeConfig, MTPDecodingConfig, MultimodalConfig,
+                       NGramDecodingConfig, PARDDecodingConfig,
+                       PrometheusMetricsConfig, ReorderRequestPolicyConfig,
+                       RocketSparseAttentionConfig, SADecodingConfig,
+                       SAEnhancerConfig, SaveHiddenStatesDecodingConfig,
+                       SchedulerConfig, SkipSoftmaxAttentionConfig,
+                       TorchCompileConfig, TorchLlmArgs,
+                       TriAttentionKvCacheCompressionConfig,
+                       UserProvidedDecodingConfig)
 from .llm_utils import KvCacheRetentionConfig, QuantAlgo, QuantConfig
 from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
@@ -88,7 +90,9 @@ __all__ = [
     'MiniMaxM3SparseAttentionConfig',
     'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
+    'TriAttentionKvCacheCompressionConfig',
     'PrometheusMetricsConfig',
     'ThinkingBudgetLogitsProcessor',
     'add_thinking_budget_logits_processor',
+    'MultimodalConfig',
 ]

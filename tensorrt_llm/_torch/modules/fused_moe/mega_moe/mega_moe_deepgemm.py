@@ -203,7 +203,6 @@ class MegaMoEDeepGemm(MoE):
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         # DG tunables. ``swiglu_limit_scalar`` mirrors the upstream MoE
         # kwarg; bridged to DG's ``activation_clamp`` at the call site.
         activation: str = "swiglu",

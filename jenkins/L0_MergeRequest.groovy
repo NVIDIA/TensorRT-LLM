@@ -212,7 +212,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
     def nodeLabelPrefix = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -339,6 +339,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
     testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
     // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+    // Coverage runs only on the official post-merge pipeline.
     testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     getContainerURIs().each { k, v ->
