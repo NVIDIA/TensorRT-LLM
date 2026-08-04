@@ -125,9 +125,10 @@ def _make_tx_session(
     *,
     need_aux: bool = False,
     aux_task: Optional[_FakeTask] = None,
+    timeout_s: Optional[float] = 0.25,
 ) -> TxSession:
     session = object.__new__(TxSession)
-    session._timeout_s = 0.25
+    session._timeout_s = timeout_s
     session._need_aux = need_aux
     session._terminal_status = None
     session.receiver_ready = True
@@ -404,6 +405,25 @@ def test_tx_session_blocking_wait_observes_cancellation_between_slices() -> None
 
     assert session.wait_complete(blocking=True) == WaitResult.FAILED
     assert task.wait_calls == [0.25]
+
+
+@pytest.mark.parametrize("timeout_s", [None, 0.0, -1.0])
+def test_tx_session_blocking_wait_uses_fallback_without_positive_timeout(
+    timeout_s: Optional[float],
+) -> None:
+    task = _FakeTask(TaskStatus.TRANSFERRING, wait_result=False)
+    session = _make_tx_session([task], timeout_s=timeout_s)
+    wait = task.wait
+
+    def cancel_during_wait(timeout: Optional[float] = None) -> bool:
+        result = wait(timeout)
+        session._terminal_status = SessionStatus.CANCELLED
+        return result
+
+    task.wait = cancel_during_wait
+
+    assert session.wait_complete(blocking=True) == WaitResult.FAILED
+    assert task.wait_calls == [1.0]
 
 
 def test_tx_session_blocking_wait_treats_task_failure_as_terminal() -> None:

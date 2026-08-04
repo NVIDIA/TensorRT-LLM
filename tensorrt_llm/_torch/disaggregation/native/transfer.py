@@ -83,6 +83,10 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
+# Keep standalone TxSession waits responsive to cancellation even when callers
+# do not configure a sender-future wait slice.
+_FALLBACK_TX_WAIT_SLICE_S = 1.0
+
 
 @dataclass
 class RecvReqInfo:
@@ -1363,7 +1367,7 @@ class TxSession(TxSessionBase):
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
         """Poll or block until KV (and optionally aux) transfer finishes.
 
-        With blocking=True (default): retries _timeout_s wait slices until a
+        With blocking=True (default): retries bounded wait slices until a
         successful transfer finishes. Errors and cancellation remain terminal;
         callers must not interpret them as proof that peer writes quiesced.
         With blocking=False: polls non-blockingly; returns None if any KV task
@@ -1395,10 +1399,10 @@ class TxSession(TxSessionBase):
         # deadline. A successful blockAll must not return merely because one
         # slice expired: NIXL may still be reading the request's KV pages.
         wait_slice_s = self._timeout_s
-        if wait_slice_s is not None and wait_slice_s <= 0:
-            wait_slice_s = None
-        # A None timeout intentionally preserves Event.wait()'s unbounded
-        # standalone behavior; configured transceivers supply a positive slice.
+        if wait_slice_s is None or wait_slice_s <= 0:
+            wait_slice_s = _FALLBACK_TX_WAIT_SLICE_S
+        # The loop preserves standalone block-until-terminal behavior while a
+        # bounded slice keeps cancellation and sibling failure observable.
         for task in self.kv_tasks:
             while not task.wait(timeout=wait_slice_s):
                 # cancel() leaves a TRANSFERRING task's event unset until the
