@@ -339,11 +339,12 @@ def _run_wan22_multinode_slurm_rank(tmp_path):
             _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
     finally:
         if visual_gen is not None:
-            visual_gen.shutdown()
-            # shutdown() joins rank 0's in-client worker thread with a bounded
-            # timeout; 16-rank dist teardown can outlast it and trip
-            # pytest-threadleak, so wait for the thread explicitly.
+            # shutdown() joins rank 0's in-client worker thread with a 2s
+            # timeout and then drops the executor reference, so grab the
+            # thread first: 16-rank dist teardown outlasts 2s and would
+            # otherwise trip pytest-threadleak.
             worker_thread = getattr(visual_gen.executor, "_ext_worker_thread", None)
+            visual_gen.shutdown()
             if worker_thread is not None and worker_thread.is_alive():
                 worker_thread.join(timeout=120)
         _cleanup_cuda()
