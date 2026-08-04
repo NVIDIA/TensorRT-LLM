@@ -806,6 +806,8 @@ class MLA(nn.Module):
         # The hoisted fused kv-norm launch spans the whole Q branch, which itself
         # uses ln_events on some paths, so it needs its own pair.
         self.kv_gen_events = [torch.cuda.Event(), torch.cuda.Event()]
+        # Mode 5 stashes the KV launch here for _q_branch to fire.
+        self._pending_kv_launch = None
 
         self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
@@ -1885,6 +1887,23 @@ class MLA(nn.Module):
             and self.indexer is not None
             and self.indexer_stream is not None
         )
+        # The compressor pre-launch used to ride along with the indexer overlap, so
+        # it only ever fired on CSA layers (compress_ratio 4 -- the only ones with an
+        # indexer). On HCA layers the compressor was left inside the
+        # `maybe_execute_in_parallel` below, which is issued *after* the
+        # kv_a_proj -> LN -> split chain, so on the trace its first kernel starts
+        # ~27 us into the prologue, right after the kv_a_proj GEMM retires. It reads
+        # only hidden_states + attn_metadata, so nothing forces that: pre-launching it
+        # on compressor_stream lets it run underneath the kv_a_proj GEMM instead.
+        # TRTLLM_MLA_COMPRESSOR_PRELAUNCH=0 restores the old placement. The indexer
+        # overlap path has no other call site for the compressor, so it keeps the
+        # pre-launch unconditionally.
+        _prelaunch_compressor = _use_indexer_overlap or (
+            _v4_extra_overlap
+            and do_multi_stream()
+            and self.compressor_stream is not None
+            and os.environ.get("TRTLLM_MLA_COMPRESSOR_PRELAUNCH", "1") == "1"
+        )
 
         # Pre-launch the outer compressor on compressor_stream BEFORE
         # kv_a_proj_with_mqa. The compressor only reads hidden_states +
@@ -1894,12 +1913,16 @@ class MLA(nn.Module):
         # _q_branch will be queued onto this same stream further down so it
         # runs strictly serial after the compressor; dsv4_compressor_event is
         # recorded only at the end of _q_branch, gating the caller's downstream
-        # waits on both compressor + _q_branch completion.
-        if _use_indexer_overlap:
+        # waits on both compressor + _q_branch completion. Without the indexer
+        # (HCA layers) nothing else is queued behind it, so the completion event
+        # is recorded right here instead and joined after _q_branch below.
+        if _prelaunch_compressor:
             self.dsv4_compressor_start_event.record()
             with torch.cuda.stream(self.compressor_stream):
                 self.dsv4_compressor_start_event.wait()
                 self.compressor(hidden_states, attn_metadata)
+                if not _use_indexer_overlap:
+                    self.dsv4_compressor_event.record()
 
         # Pre-launch the qr-independent half of the indexer prepare phase
         # (weights_proj + internal compressor + k_cache_update) on the
@@ -1924,8 +1947,67 @@ class MLA(nn.Module):
         # concat that would only re-materialize its output, and hand the kernels the
         # RAW latent.
         self._fused_kv_norm_active = self._is_fused_kv_norm_enabled(num_generations=num_generations)
+        self._fused_kv_norm_hoisted = False
 
-        if self._fused_kv_norm_active:
+        # TRTLLM_MLA_KV_NORM_HOIST=2/3 launch the fused KV kernel *alongside*
+        # q_a_layernorm rather than after it. The kernel reads only the raw latent,
+        # which kv_a_proj already produced, so it has the same dependency the
+        # standalone kv_a_layernorm used to have -- this is the pairing that used to
+        # sit in the `maybe_execute_in_parallel(q_a_layernorm, kv_a_layernorm)` below,
+        # restored with the fused kernel in the KV slot. Mode 2 joins immediately
+        # (maybe_execute_in_parallel semantics); mode 3 defers the join to the
+        # existing kv_gen_events[1].wait() in front of FMHA.
+        #
+        # Mode 4 is mode 3 with a different stream on HCA layers: the KV kernel is
+        # queued behind the pre-launched compressor on compressor_stream instead of
+        # racing it on aux_stream. CSA layers keep aux_stream -- there
+        # compressor_stream also carries _q_branch, so putting KV on it would push
+        # q_b_proj back.
+        #
+        # Mode 5 moves the launch one stage later still: on HCA it is issued inside
+        # _q_branch, right after q_b_proj, so the KV kernel runs alongside
+        # q_b_layernorm instead of alongside the q_b_proj GEMM.
+        #
+        # Mode 6 keeps mode 5's placement and additionally hands the join to the
+        # attention backend, so `_deepseek_v4_local_to_global_kernel` is no longer
+        # ordered behind the KV kernel it does not read.
+        _hoist_mode = os.environ.get("TRTLLM_MLA_KV_NORM_HOIST", "1")
+        _gen_only = num_generations > 0 and num_contexts == 0
+        self._pending_kv_launch = None
+        self._kv_join_delegated = False
+
+        if self._fused_kv_norm_active and _gen_only and _hoist_mode in ("2", "3", "4", "5", "6"):
+            if _hoist_mode in ("5", "6") and not _use_indexer_overlap:
+                launch = self._make_fused_kv_norm_gen_launch(
+                    kv[num_ctx_tokens:, ...], attn_metadata, ("5", "6")
+                )
+                if launch is not None:
+                    # _q_branch fires it; the pre-FMHA kv_gen_events[1].wait() joins.
+                    self._pending_kv_launch = launch
+                    self._fused_kv_norm_hoisted = True
+                    # Mode 6 hands the join to the attention backend, which waits
+                    # only after `_deepseek_v4_local_to_global_kernel` is queued.
+                    self._kv_join_delegated = _hoist_mode == "6"
+                    if self._kv_join_delegated:
+                        self.mqa._mla_kv_join_event = self.kv_gen_events[1]
+                q = self.q_a_layernorm(q)
+            else:
+                _kv_stream = self.aux_stream
+                if (
+                    _hoist_mode == "4"
+                    and _prelaunch_compressor
+                    and not _use_indexer_overlap
+                    and self.compressor_stream is not None
+                ):
+                    _kv_stream = self.compressor_stream
+                q, self._fused_kv_norm_hoisted = self._q_a_layernorm_with_fused_kv_norm(
+                    q,
+                    kv[num_ctx_tokens:, ...],
+                    attn_metadata,
+                    join=(_hoist_mode == "2"),
+                    stream=_kv_stream,
+                )
+        elif self._fused_kv_norm_active:
             q = self.q_a_layernorm(q)
         else:
             q, kv = maybe_execute_in_parallel(
@@ -1961,8 +2043,12 @@ class MLA(nn.Module):
         # Pure-decode batches only: with contexts present the context half runs
         # first and writes the same cache, and decode steady state is where the
         # idle span being reclaimed actually occurs.
-        self._fused_kv_norm_hoisted = False
-        if self._fused_kv_norm_active and num_generations > 0 and num_contexts == 0:
+        if (
+            self._fused_kv_norm_active
+            and not self._fused_kv_norm_hoisted
+            and num_generations > 0
+            and num_contexts == 0
+        ):
             self._fused_kv_norm_hoisted = self._launch_fused_kv_norm_gen(
                 latent_cache[num_ctx_tokens:, ...], attn_metadata
             )
@@ -1998,6 +2084,19 @@ class MLA(nn.Module):
                 self._fused_q_rope_done = False
                 return self._deepseek_v4_q_b_layernorm(q_proj)
             q_proj = self.q_b_proj(q)
+            if self._pending_kv_launch is not None:
+                # Mode 5/6: fork the KV kernel here, between q_b_proj and
+                # q_b_layernorm. The event is recorded on this stream *after*
+                # q_b_proj is queued, so the KV kernel depends on the GEMM and
+                # therefore runs concurrently with q_b_layernorm rather than
+                # competing with the GEMM for SMs.
+                _launch = self._pending_kv_launch
+                self._pending_kv_launch = None
+                self.kv_gen_events[0].record()
+                with torch.cuda.stream(self.aux_stream):
+                    self.kv_gen_events[0].wait()
+                    _launch()
+                    self.kv_gen_events[1].record()
             if self._is_fused_q_fp8_quant_enabled(
                 num_generations=num_generations, num_contexts=num_contexts
             ):
@@ -2078,6 +2177,14 @@ class MLA(nn.Module):
                 ):
                     if _t is not None:
                         _t.record_stream(cur_stream)
+            elif _prelaunch_compressor:
+                # Compressor already in flight on compressor_stream since before
+                # kv_a_proj; the caller stream only has to run the Q branch and
+                # join. Nothing between here and FMHA reads what the compressor
+                # writes, so the join could be deferred further -- it is kept here
+                # to match the pre-existing control flow.
+                q = _q_branch()
+                self.dsv4_compressor_event.wait()
             else:
                 q, _ = maybe_execute_in_parallel(
                     _q_branch,
@@ -2144,7 +2251,7 @@ class MLA(nn.Module):
                 assert gen_position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
 
-            if self._fused_kv_norm_hoisted:
+            if self._fused_kv_norm_hoisted and not getattr(self, "_kv_join_delegated", False):
                 # FMHA below reads the KV cache the hoisted kernel wrote.
                 self.kv_gen_events[1].wait()
 
@@ -2703,34 +2810,21 @@ class MLA(nn.Module):
     # a null A/B result is indistinguishable from a null effect. Logged once per process.
     _kv_hoist_logged = False
 
-    def _launch_fused_kv_norm_gen(
+    def _make_fused_kv_norm_gen_launch(
         self,
         latent_cache_gen: torch.Tensor,
         attn_metadata: AttentionMetadata,
-    ) -> bool:
-        """Run the fused kv-norm/RoPE/quant KV kernel ahead of the Q branch.
+        modes: tuple,
+    ):
+        """Return a nullary callable that issues the fused KV kernel, or None.
 
-        The kernel reads the raw `kv_a_proj` latent and writes the paged KV cache;
-        it never touches q_pe or `fused_q`. Nothing between here and FMHA reads the
-        KV cache either, so it can run on `aux_stream` concurrently with
-        q_a_layernorm -> q_b_proj -> q_b_layernorm, which is where the standalone
-        `kv_a_layernorm` it replaced used to run. Without this the caller stream
-        stalls on the Q branch and only then issues a ~4.8 us KV kernel -- a mean
-        23.4 us idle span sits in front of it on GB200 dep32/batch32/MTP3.
-
-        OFF by default: that idle span is idle *stream* time, not idle SMs. The Q
-        branch is using the GPU, so overlapping the two makes both slower -- on the
-        A/B the KV kernel went 4565 -> 5730 ns (+25.5%) and the concurrent
-        q_b_layernorm 5874 -> 7439 ns (+26.6%). Since the q branch is on the
-        critical path, relocating 4.6 us costs ~1.6 us there plus the fork/join, and
-        p50 device step time moved 28.889 -> 29.338 ms. Set
-        `TRTLLM_MLA_KV_NORM_HOIST=1` to re-enable for further experiments.
-
-        Returns True when the launch happened, so the later `mla_rope_generation`
-        knows to run Q-only instead of doing the KV half again.
+        Everything the kernel needs beyond the latent -- scheduler scalars and the
+        cu_seqlens pair -- is resolved here, on the caller stream, exactly as the
+        original inline hoist did. Only the launch itself goes in the callable, so
+        the caller decides which stream it lands on and when it is joined.
         """
         reason = None
-        if os.environ.get("TRTLLM_MLA_KV_NORM_HOIST", "0") != "1":
+        if os.environ.get("TRTLLM_MLA_KV_NORM_HOIST", "1") not in modes:
             reason = "off by default (costs more than it saves; see docstring)"
         elif self.aux_stream is None:
             reason = "aux_stream is None"
@@ -2742,7 +2836,7 @@ class MLA(nn.Module):
             if not MLA._kv_hoist_logged:
                 MLA._kv_hoist_logged = True
                 logger.warning(f"[MLA] fused kv-norm hoist disabled: {reason}")
-            return False
+            return None
         if not MLA._kv_hoist_logged:
             MLA._kv_hoist_logged = True
             logger.warning("[MLA] fused kv-norm hoist active on the Attention aux stream")
@@ -2751,20 +2845,15 @@ class MLA(nn.Module):
         counter, bmm1_scale, bmm2_scale = self._mla_gen_scheduler_scalars(
             latent_cache_gen.device, has_fp8_kv_cache
         )
-        _mla_prep = getattr(attn_metadata, "mla_prepare_scheduler_buffers", None)
-        if _mla_prep is None:
-            # The cu_seqlens buffers are Q-kernel state; the KV kernel never reads
-            # them. Only the precomputing metadata exposes them at this point, so
-            # without the hook the hoist is skipped rather than allocating here.
-            return False
-        cu_q_seqlens, cu_kv_seqlens = _mla_prep(self.num_heads_tp)
+        # The cu_seqlens buffers are Q-kernel state; the KV kernel never reads them.
+        # Only the precomputing metadata exposes them at this point, so without the
+        # hook the hoist is skipped rather than allocating here.
+        cu_q_seqlens, cu_kv_seqlens = attn_metadata.mla_prepare_scheduler_buffers(self.num_heads_tp)
 
-        # The latent is produced on the caller stream; gate the aux stream on it and
-        # keep the allocator from recycling the buffer while the aux stream reads it.
-        self.kv_gen_events[0].record()
-        with torch.cuda.stream(self.aux_stream):
-            self.kv_gen_events[0].wait()
-            latent_cache_gen.record_stream(self.aux_stream)
+        def _launch():
+            # Keeps the allocator from recycling the latent while whichever stream
+            # this runs on still reads it.
+            latent_cache_gen.record_stream(torch.cuda.current_stream())
             self.mqa.mla_rope_generation(
                 None,
                 None,
@@ -2784,6 +2873,102 @@ class MLA(nn.Module):
                 ),
                 kv_only=True,
             )
+
+        return _launch
+
+    def _q_a_layernorm_with_fused_kv_norm(
+        self,
+        q: torch.Tensor,
+        latent_cache_gen: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        join: bool,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
+        """q_a_layernorm and the fused KV kernel as a two-stream pair.
+
+        This is the placement the standalone `kv_a_layernorm` had before the fusion:
+        both consume the kv_a_proj output and neither reads the other's result.
+
+        `join=True` uses maybe_execute_in_parallel, so the caller stream waits for the
+        KV kernel before q_b_proj. `join=False` leaves the join to the pre-FMHA
+        `kv_gen_events[1].wait()`, which is all the data dependency actually requires.
+        `stream` selects the lane (aux_stream by default; compressor_stream in mode 4).
+        Returns (q, launched).
+        """
+        launch = self._make_fused_kv_norm_gen_launch(
+            latent_cache_gen, attn_metadata, ("2", "3", "4")
+        )
+        if launch is None:
+            return self.q_a_layernorm(q), False
+        stream = stream if stream is not None else self.aux_stream
+        _q_in = q
+        if join:
+            q_out, _ = maybe_execute_in_parallel(
+                lambda: self.q_a_layernorm(_q_in),
+                launch,
+                self.kv_gen_events[0],
+                self.kv_gen_events[1],
+                stream,
+            )
+            return q_out, True
+        self.kv_gen_events[0].record()
+        q_out = self.q_a_layernorm(_q_in)
+        with torch.cuda.stream(stream):
+            self.kv_gen_events[0].wait()
+            launch()
+            self.kv_gen_events[1].record()
+        return q_out, True
+
+    def _launch_fused_kv_norm_gen(
+        self,
+        latent_cache_gen: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> bool:
+        """Run the fused kv-norm/RoPE/quant KV kernel ahead of the Q branch.
+
+        The kernel reads the raw `kv_a_proj` latent and writes the paged KV cache;
+        it never touches q_pe or `fused_q`. Nothing between here and FMHA reads the
+        KV cache either, so it can run on `aux_stream` concurrently with
+        q_a_layernorm -> q_b_proj -> q_b_layernorm, which is where the standalone
+        `kv_a_layernorm` it replaced used to run. Without this the caller stream
+        stalls on the Q branch and only then issues a ~4.8 us KV kernel -- a mean
+        23.4 us idle span sits in front of it on GB200 dep32/batch32/MTP3.
+
+        ON by default (mode 1), together with the compressor pre-launch. On GB200 /
+        poly, batch 32, the pair is worth -22.6 us of attention prologue per
+        iteration at MTP0 and -35.3 us at MTP3, against the upstream path. Set
+        `TRTLLM_MLA_KV_NORM_HOIST=0` to take the launch back inside the attention
+        call.
+
+        The earlier Lyris A/B that made this off-by-default measured the hoist
+        WITHOUT the compressor pre-launch, and read +1.55% on p50 device step time.
+        With the pre-launch in place the ordering reverses; the pre-launch is where
+        most of the win actually comes from, and the KV placement itself is worth
+        little (modes 1-6 land within ~1 us of each other).
+
+        Modes: 0 off; 1 hoisted onto aux_stream after q_a_layernorm; 2 paired with
+        q_a_layernorm via maybe_execute_in_parallel (immediate join); 3 same pairing
+        with the join deferred to the pre-FMHA wait; 4 queued on compressor_stream
+        behind the pre-launched compressor (HCA only); 5 fired inside _q_branch
+        after q_b_proj so it overlaps q_b_layernorm (HCA only); 6 mode 5 plus the
+        join delegated to the attention backend, past local_to_global.
+
+        CAVEAT on the numbers above: they are single-sample per arm. Run-to-run on
+        this cluster reached 5-20 us over a few hours on unchanged code, so treat
+        differences below ~8 us as noise and compare arms only within one
+        submission batch.
+
+        Returns True when the launch happened, so the later `mla_rope_generation`
+        knows to run Q-only instead of doing the KV half again.
+        """
+        launch = self._make_fused_kv_norm_gen_launch(latent_cache_gen, attn_metadata, ("1",))
+        if launch is None:
+            return False
+        # The latent is produced on the caller stream; gate the aux stream on it.
+        self.kv_gen_events[0].record()
+        with torch.cuda.stream(self.aux_stream):
+            self.kv_gen_events[0].wait()
+            launch()
             self.kv_gen_events[1].record()
         return True
 

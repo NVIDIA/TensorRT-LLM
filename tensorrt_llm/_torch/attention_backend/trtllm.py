@@ -1739,6 +1739,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size=sparse_params.indices_block_size,
             )
 
+        # DSv4 hoisted fused kv-norm (TRTLLM_MLA_KV_NORM_HOIST=6): MLA delegates the
+        # join to here rather than taking it on the caller stream before this call.
+        # The index kernels above read block tables and local indices, never the KV
+        # cache, so only the attention op below truly depends on the KV kernel;
+        # joining earlier makes `_deepseek_v4_local_to_global_kernel` wait on a
+        # dependency it does not have.
+        _mla_kv_join = getattr(self, "_mla_kv_join_event", None)
+        if _mla_kv_join is not None:
+            _mla_kv_join.wait()
+            self._mla_kv_join_event = None
+
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
         # recomputation when cache_seq_lens change. The metadata must always match the
