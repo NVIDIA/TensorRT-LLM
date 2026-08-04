@@ -9,6 +9,23 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, KeywordArg,
 aten = torch.ops.aten
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
+# Torch 2.13+ register_replacement always builds initial_arg_info from
+# example_inputs (via _trace_args_for_initial_trace), even when a
+# search_fn_pattern is supplied. Empty [] raises IndexError. These dummies are
+# only for signature flattening; matching still uses search_fn_pattern.
+_ADD_NORM_EXAMPLE_INPUTS = [
+    torch.empty(1, 1),
+    torch.empty(1, 1),
+    torch.empty(1),
+]
+_ADD_NORM_QUANT_EXAMPLE_INPUTS = [
+    torch.empty(1, 1),
+    torch.empty(1, 1),
+    torch.empty(1),
+    torch.empty(1),
+]
+_EPS_WORKAROUND = {"eps": 1e-5}
+
 
 def register_add_norm(custom_pass: PatternMatcherPass):
     residual = KeywordArg("residual")
@@ -63,11 +80,12 @@ def register_add_norm(custom_pass: PatternMatcherPass):
     register_replacement(
         empty_pattern,
         target_pattern,
-        [],
+        _ADD_NORM_EXAMPLE_INPUTS,
         fwd_only,
         custom_pass,
         search_fn_pattern=add_norm_pattern,
         extra_check=extra_check,
+        scalar_workaround=_EPS_WORKAROUND,
     )
 
 
@@ -137,9 +155,10 @@ def register_add_norm_quant(custom_pass: PatternMatcherPass):
     register_replacement(
         empty_pattern,
         target_pattern,
-        [],
+        _ADD_NORM_QUANT_EXAMPLE_INPUTS,
         fwd_only,
         custom_pass,
         search_fn_pattern=add_norm_quant_pattern,
         extra_check=extra_check,
+        scalar_workaround=_EPS_WORKAROUND,
     )
