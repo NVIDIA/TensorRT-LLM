@@ -4045,6 +4045,9 @@ class GvrTopKKernel:
                             # Staging mirrors the head min/max (wcnt + hist
                             # slots [0..31], both dead here; pairs live at
                             # 260+).
+                            if tidx == cutlass.Int32(0):
+                                s_iscalars[0] = cutlass.Int32(0)
+                            nh7 = cutlass.Int32(0)
                             kmn6 = cutlass.Int32(2147483647)
                             kmx6 = cutlass.Int32(-2147483648)
                             it6 = tidx
@@ -4067,6 +4070,14 @@ class GvrTopKKernel:
                                             kmn6 = k6
                                         if k6 > kmx6:
                                             kmx6 = k6
+                                        # same predicate as the compaction
+                                        # pass used to re-derive: buffer the
+                                        # member here so that pass can go
+                                        for sl7 in cutlass.range_constexpr(nbuf7):
+                                            if cutlass.Int32(sl7) == nh7:
+                                                rv7[sl7] = v6
+                                                ri7[sl7] = smem_vals[it6]
+                                        nh7 = nh7 + cutlass.Int32(1)
                                 it6 = it6 + cutlass.Int32(num_threads)
                             kmn6 = cute.arch.warp_redux_sync(kmn6, "min")
                             kmx6 = cute.arch.warp_redux_sync(kmx6, "max")
@@ -4074,56 +4085,31 @@ class GvrTopKKernel:
                                 smem_wcnt[warp_id] = kmn6
                                 smem_hist[warp_id] = kmx6
                             cute.arch.barrier()
-                            kmn7 = cutlass.Int32(2147483647)
-                            kmx7 = cutlass.Int32(-2147483648)
-                            for w8 in cutlass.range_constexpr(self.num_warps):
-                                pa8 = smem_wcnt[w8]
-                                pb8 = smem_hist[w8]
-                                if pa8 < kmn7:
-                                    kmn7 = pa8
-                                if pb8 > kmx7:
-                                    kmx7 = pb8
+                            # lane-parallel cross-warp fold: lane w holds
+                            # slot w and one warp reduce settles it, instead
+                            # of every thread walking all num_warps slots of
+                            # two arrays with dependent SMEM reads. Same
+                            # inputs in the same order on every warp, so the
+                            # result stays bit-identical and leaderless.
+                            pa8 = cutlass.Int32(2147483647)
+                            pb8 = cutlass.Int32(-2147483648)
+                            if lane < cutlass.Int32(self.num_warps):
+                                pa8 = smem_wcnt[lane]
+                                pb8 = smem_hist[lane]
+                            kmn7 = cute.arch.warp_redux_sync(pa8, "min")
+                            kmx7 = cute.arch.warp_redux_sync(pb8, "max")
                             if kmn7 == kmx7:
                                 fast_done = cutlass.Int32(1)
                             if fast_done == cutlass.Int32(0):
-                                # mixed class: compact it IN PLACE
-                                # into smem_keys/vals[0..cnt_strad) with a
-                                # register-buffered two-phase pass (every
-                                # thread reads its strided candidates first,
-                                # ONE barrier, then claimed compact writes —
-                                # no read/write overlap by construction). The
-                                # candidate array has no readers after the
-                                # tail, and compaction makes the repair cost a
-                                # function of the CLASS size only, for ANY
-                                # class size up to cand_count (the old full-
-                                # candidate radix fallback is gone).
-                                if tidx == cutlass.Int32(0):
-                                    s_iscalars[0] = cutlass.Int32(0)
-                                nh7 = cutlass.Int32(0)
-                                it7 = tidx
-                                while it7 < cand_count:
-                                    v7 = smem_keys[it7]
-                                    b7 = cutlass.Int32((v7 - bmin_r) * inv1)
-                                    if b7 < cutlass.Int32(0):
-                                        b7 = cutlass.Int32(0)
-                                    if b7 > cutlass.Int32(kBins - 1):
-                                        b7 = cutlass.Int32(kBins - 1)
-                                    if b7 == b_star:
-                                        s7 = cutlass.Int32((v7 - f_lo) * finv)
-                                        if s7 < cutlass.Int32(0):
-                                            s7 = cutlass.Int32(0)
-                                        if s7 > cutlass.Int32(fbins - 1):
-                                            s7 = cutlass.Int32(fbins - 1)
-                                        if s7 == sb_star:
-                                            # static predicated fragment write
-                                            # (dodges dynamic register indexing)
-                                            for sl7 in cutlass.range_constexpr(nbuf7):
-                                                if cutlass.Int32(sl7) == nh7:
-                                                    rv7[sl7] = v7
-                                                    ri7[sl7] = smem_vals[it7]
-                                            nh7 = nh7 + cutlass.Int32(1)
-                                    it7 = it7 + cutlass.Int32(num_threads)
-                                cute.arch.barrier()
+                                # mixed class: compact the members buffered by
+                                # the pure-tie pass above into
+                                # smem_keys/vals[0..cnt_strad). The buffering
+                                # pass already read every candidate it needs,
+                                # and the staging barrier above orders those
+                                # reads before these writes, so the second
+                                # full-candidate walk (and its barrier) is
+                                # gone. Repair cost is a function of the CLASS
+                                # size only, for any class size.
                                 # warp-aggregated claim: intra-warp exclusive
                                 # prefix via shfl scan + ONE atomic per warp
                                 # (a thousand same-address claims serialize
