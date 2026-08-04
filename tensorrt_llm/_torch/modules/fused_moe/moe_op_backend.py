@@ -204,11 +204,9 @@ class TRTLLMOpBackend(MoEOpBackend):
 
     def __init__(self):
         from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
-        from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 
         self._MnnvlMemory = MnnvlMemory
         self._MnnvlMoe = MnnvlMoe
-        self._MoeAlltoAll = MoeAlltoAll
 
     # Quantization
     def fp4_quantize(

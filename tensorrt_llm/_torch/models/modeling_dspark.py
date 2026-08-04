@@ -45,6 +45,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..distributed import AllReduceParams
 from ..modules.linear import Linear
@@ -66,6 +67,7 @@ from .modeling_deepseekv4 import (
     DeepseekV4WeightLoader,
     _get_deepseek_v4_routed_moe_scale_name,
     _maybe_view_deepseek_v4_routed_moe_tensor,
+    _normalize_deepseek_v4_nvfp4_mixed_precision_config,
     _rename_deepseek_v4_attn_subkey,
     _rename_deepseek_v4_ffn_subkey,
 )
@@ -75,6 +77,96 @@ from .modeling_deepseekv4 import (
 # prefix; the main model's keys (``layers.*``, ``embed.weight``, ``head.weight``,
 # top-level ``norm.weight`` / ``hc_head_*``) are loaded by the target model.
 _DSPARK_MTP_RE = re.compile(r"^mtp\.(\d+)\.(.+)$")
+
+
+def _active_moe_load_balancer():
+    """The engine-wide ``MoeLoadBalancer``, or None when EPLB is not active.
+
+    Non-None exactly inside ``maybe_create_moe_load_balancer(...)`` when EPLB is
+    really enabled for this engine (supported arch, ``moe_ep_size > 1``, no smart
+    router, ``moe_load_balancer`` configured) -- i.e. exactly the condition under
+    which ``MoE._init_load_balancer`` consumes ``model_config.moe_load_balancer``.
+    Gating every DSpark EPLB check on it keeps the non-EPLB path untouched.
+    """
+    from ..modules.fused_moe.moe_load_balancer import get_moe_load_balancer
+
+    return get_moe_load_balancer()
+
+
+def validate_dspark_eplb_layer_base(model_config, draft_config) -> None:
+    """Require the draft's layer namespace to match the target's, under EPLB.
+
+    DSpark stages take ``layer_idx = draft_config.num_hidden_layers + stage_id``
+    and register as extra EPLB layers in the *target* engine's balancer, whose
+    ``initial_global_assignments`` are keyed by target layer index. If the draft
+    checkpoint's config reports a different depth the stages silently land on the
+    wrong keys, so fail fast instead. Only enforced when EPLB is active; a
+    draft-only checkpoint config remains valid without EPLB.
+    """
+    if _active_moe_load_balancer() is None:
+        return
+    target_layers = model_config.pretrained_config.num_hidden_layers
+    draft_layers = draft_config.pretrained_config.num_hidden_layers
+    if target_layers != draft_layers:
+        raise ValueError(
+            "DSpark + EPLB requires the draft checkpoint config to report the "
+            f"same num_hidden_layers as the target (target={target_layers}, "
+            f"draft={draft_layers}). DSpark stage layer indices are derived as "
+            "draft num_hidden_layers + stage_id and must line up with the "
+            "target layer namespace that initial_global_assignments is keyed by."
+        )
+
+
+def validate_dspark_eplb_stage_layers(model_config, base: int, num_stages: int) -> None:
+    """Validate the EPLB config actually covers the DSpark draft stages.
+
+    DSpark registers each stage as an independent EPLB layer at index
+    ``base + stage_id`` (``base = num_hidden_layers``). Two failure modes are
+    caught here, before any DSpark MoE layer is built, so the user gets one
+    actionable error instead of a bare ``KeyError`` from deep inside MoE init:
+
+      1. online EPLB, which DSpark does not support (see below);
+      2. an ``initial_global_assignments`` map generated without DSpark enabled,
+         which therefore lacks the draft stage indices.
+    """
+    if _active_moe_load_balancer() is None:
+        return
+    lb_config = getattr(model_config, "moe_load_balancer", None)
+    if lb_config is None:
+        return
+
+    draft_layers = list(range(base, base + num_stages))
+
+    # DSpark supports STATIC EPLB only. Online EPLB requires every registered MoE
+    # layer to run exactly once per iteration, but the DSpark draft MoE is skipped
+    # on iterations with no generation requests anywhere (context-only batches,
+    # warmup), and the balancer's CPU worker then spins forever in its untimed
+    # waitCpuStage() waiting for a GPU signal that is only emitted from an MoE
+    # forward -- a silent deadlock.
+    if getattr(lb_config, "layer_updates_per_iter", 0) > 0:
+        raise ValueError(
+            "DSpark speculative decoding supports static EPLB only, but "
+            f"layer_updates_per_iter={lb_config.layer_updates_per_iter} requests "
+            "online EPLB. The DSpark draft MoE does not run on iterations without "
+            "generation requests (context-only batches, warmup), which deadlocks "
+            "the MoE load balancer worker. Set layer_updates_per_iter=0 in the "
+            "load balancer config, or disable DSpark."
+        )
+
+    assignments = getattr(lb_config, "initial_global_assignments", None)
+    if not assignments:
+        # No custom placement: the auto-generated assignment covers every layer.
+        return
+    missing = [layer_idx for layer_idx in draft_layers if layer_idx not in assignments]
+    if missing:
+        raise ValueError(
+            f"initial_global_assignments is missing DSpark layer(s) {missing}. "
+            f"The {num_stages} DSpark draft stages register as additional EPLB "
+            f"layers with indices [{base}, {base + num_stages}). Regenerate the "
+            "EPLB config from statistics collected with DSpark enabled (see "
+            "examples/wide_ep/ep_load_balancer/README.md), or omit "
+            "initial_global_assignments to use the auto-generated placement."
+        )
 
 
 def count_dspark_stages(ckpt_dir: str) -> Optional[int]:
@@ -295,6 +387,11 @@ class DSparkDraftModel(nn.Module):
         target_layer_ids = getattr(config, "dspark_target_layer_ids", [])
         self.num_capture_layers = len(target_layer_ids)
         base = config.num_hidden_layers
+        # Each DSpark stage becomes an independent EPLB layer at index base + s.
+        # Validate the load-balancer config covers them (and rejects online EPLB)
+        # before building any MoE, so a stale config fails with one actionable
+        # error instead of a bare KeyError from inside MoE._init_load_balancer.
+        validate_dspark_eplb_stage_layers(model_config, base, self.num_stages)
         # Derive a draft-only model_config (a shallow copy so the shared config
         # and the target model are untouched) carrying two draft-specific fixes:
         #
@@ -497,7 +594,8 @@ class DSparkDraftModel(nn.Module):
         """
         new_sa = cls._draft_sparse_config(model_config, base, num_stages)
         new_qcd = cls._draft_quant_config_dict(model_config, base, num_stages)
-        if new_sa is None and new_qcd is None:
+        new_qc = cls._draft_normalized_quant_config(model_config)
+        if new_sa is None and new_qcd is None and new_qc is None:
             return model_config
         draft_cfg = copy.copy(model_config)
         # ModelConfig is a frozen dataclass; bypass the guard for these fields.
@@ -505,7 +603,35 @@ class DSparkDraftModel(nn.Module):
             object.__setattr__(draft_cfg, "sparse_attention_config", new_sa)
         if new_qcd is not None:
             object.__setattr__(draft_cfg, "quant_config_dict", new_qcd)
+        if new_qc is not None:
+            object.__setattr__(draft_cfg, "quant_config", new_qc)
         return draft_cfg
+
+    @staticmethod
+    def _draft_normalized_quant_config(model_config):
+        """Resolved global ``quant_config`` for NVFP4 DSpark checkpoints, or None.
+
+        NVFP4 DSpark checkpoints declare a global ``MIXED_PRECISION`` quant algo
+        (per-layer NVFP4 routed experts over an FP8 base). The target resolves it
+        in :func:`_normalize_deepseek_v4_nvfp4_mixed_precision_config`
+        (base -> ``FP8_BLOCK_SCALES``); the separately-built draft config needs
+        the same, otherwise the inherited ``DeepseekV4DecoderLayer`` asserts
+        ``"MIXED_PRECISION is ambiguous"`` when it builds the draft stages.
+        Returns the resolved ``quant_config`` to set on the draft copy, or None
+        when nothing changes (e.g. the MXFP4 checkpoint, whose global algo is not
+        ``MIXED_PRECISION``) so the draft config is left byte-identical.
+        """
+        qc = getattr(model_config, "quant_config", None)
+        if qc is None or getattr(qc, "quant_algo", None) != QuantAlgo.MIXED_PRECISION:
+            return None
+        # Reuse the target normalizer on a throwaway shallow copy so we only
+        # extract the resolved global quant_config; the shared ``model_config``
+        # is left untouched (the normalizer rebinds ``.quant_config`` on the copy).
+        probe = copy.copy(model_config)
+        object.__setattr__(probe, "_frozen", False)
+        normalized = _normalize_deepseek_v4_nvfp4_mixed_precision_config(probe)
+        resolved = getattr(normalized, "quant_config", qc)
+        return resolved if resolved is not qc else None
 
     @staticmethod
     def _draft_sparse_config(model_config, base: int, num_stages: int):
@@ -1110,4 +1236,10 @@ class DSparkForCausalLM(nn.Module):
             self.dspark_model.lm_head = target_model.lm_head
 
 
-__all__ = ["DSparkBlock", "DSparkDraftModel", "DSparkForCausalLM"]
+__all__ = [
+    "DSparkBlock",
+    "DSparkDraftModel",
+    "DSparkForCausalLM",
+    "validate_dspark_eplb_layer_base",
+    "validate_dspark_eplb_stage_layers",
+]

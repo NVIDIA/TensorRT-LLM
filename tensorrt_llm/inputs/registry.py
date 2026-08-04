@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import (Any, Callable, ClassVar, Dict, List, Optional, Protocol,
                     Tuple, Type, TypeVar, Union)
 
+import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor, nn
@@ -535,6 +536,9 @@ class BaseMultimodalInputProcessor(ABC):
         """
         if isinstance(image, torch.Tensor):
             image_h, image_w = int(image.shape[-2]), int(image.shape[-1])
+        elif isinstance(image, np.ndarray):
+            # HWC uint8 from ImageMediaIO's "np" format.
+            image_h, image_w = int(image.shape[0]), int(image.shape[1])
         else:
             image_h, image_w = image.height, image.width
         return self.get_num_multimodal_tokens([(image_h, image_w)],
@@ -572,6 +576,10 @@ class BaseMultimodalInputProcessor(ABC):
         if isinstance(first_frame, torch.Tensor):
             frame_h = int(first_frame.shape[-2])
             frame_w = int(first_frame.shape[-1])
+        elif isinstance(first_frame, np.ndarray):
+            # HWC uint8 from VideoMediaIO's "np" format.
+            frame_h = int(first_frame.shape[0])
+            frame_w = int(first_frame.shape[1])
         else:
             frame_h, frame_w = first_frame.height, first_frame.width
 
@@ -937,8 +945,15 @@ def create_input_processor(
         logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
+        from tensorrt_llm._torch.models.modeling_mistral import \
+            MistralNativeInputProcessor
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
+        return MistralNativeInputProcessor(model_path_or_dir,
+                                           config,
+                                           tokenizer,
+                                           trust_remote_code=trust_remote_code,
+                                           **kwargs)
     else:
         logger.debug(
             f"checkpoint_format={checkpoint_format}; skipping HF config load.")
