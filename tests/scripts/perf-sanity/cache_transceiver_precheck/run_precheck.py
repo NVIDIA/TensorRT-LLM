@@ -326,7 +326,7 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
     """Mirror serving's model-preference resolution (PR #15823 semantics).
 
     - use_kv_cache_manager_v2 == "auto" (yaml absent): require the model
-      class and adopt its get_model_defaults() value
+      class and adopt its get_model_defaults() value when the hook exists
       (llm_utils._resolve_kv_cache_manager_v2_auto).
     - cache_cfg.transceiver_runtime == "auto": adopt
       model_cls.get_preferred_transceiver_runtime(), NIXL-gated, via the
@@ -359,12 +359,14 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
             )
 
     if setting == "auto":
-        try:
-            defaults = model_cls.get_model_defaults(None) or {}
-        except Exception as e:  # noqa: BLE001 - model hooks are third-party extension points
-            raise RuntimeError(
-                f"get_model_defaults failed for {model_cls.__name__}; refusing to assume V1"
-            ) from e
+        defaults = {}
+        if hasattr(model_cls, "get_model_defaults"):
+            try:
+                defaults = model_cls.get_model_defaults(None) or {}
+            except Exception as e:  # noqa: BLE001 - model hooks are third-party extension points
+                raise RuntimeError(
+                    f"get_model_defaults failed for {model_cls.__name__}; refusing to assume V1"
+                ) from e
         try:
             # The REAL serving resolver, via the same shim pattern as the
             # runtime resolution below -- one owner for the 'auto' semantics.

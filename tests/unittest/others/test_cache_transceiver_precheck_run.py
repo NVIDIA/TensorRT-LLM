@@ -358,6 +358,34 @@ def test_timeout_budgets():
 
 
 # --------------------------------------------------------------------------- #
+# Model preference resolution
+# --------------------------------------------------------------------------- #
+def test_resolve_model_prefs_allows_registered_class_without_defaults_hook(monkeypatch):
+    model_cls = type("ModelWithoutDefaultsHook", (), {})
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="CPP")
+    calls = []
+
+    def resolve_v2(shim, defaults):
+        calls.append((shim, defaults))
+        return False
+
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (model_cls, object()))
+    monkeypatch.setattr(
+        rp,
+        "load_internal_apis",
+        lambda: types.SimpleNamespace(resolve_kv_cache_manager_v2_auto=resolve_v2),
+    )
+
+    use_v2 = rp.resolve_model_prefs(
+        "/models/example", {"use_kv_cache_manager_v2": "auto"}, cache_cfg
+    )
+
+    assert use_v2 is False
+    assert len(calls) == 1
+    assert calls[0][1] == {}
+
+
+# --------------------------------------------------------------------------- #
 # Transfer ownership
 # --------------------------------------------------------------------------- #
 def _ctx_finish_runner(monkeypatch, check_status):
