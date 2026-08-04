@@ -560,6 +560,20 @@ class DeepseekV4WeightLoader:
         self.is_draft_model = is_draft_model
 
     def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+        # Scoped pinned staging (opt-in via TRTLLM_PINNED_WEIGHT_STAGING=1):
+        # on driver/platform combinations where pageable H2D copies degrade
+        # into a per-work-item crawl inside the CUDA driver (observed on
+        # GB300 + driver 590.48.01: one rank per node "hangs" in the load
+        # loop for 36 min to 4+ hours with zero errors), stage every
+        # CPU->CUDA weight copy through a pinned buffer for the duration of
+        # this load only. Buffers are freed and the original tensor methods
+        # restored on scope exit, so KV-cache host offloading
+        # (host_cache_size) and steady-state serving copies are untouched.
+        from tensorrt_llm._torch import pinned_weight_staging
+        with pinned_weight_staging.staging_scope():
+            return self._load_weights_impl(weights, skip_modules=skip_modules)
+
+    def _load_weights_impl(self, weights: Dict, skip_modules: List[str] = []):
         # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
         # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
         # named-parameter keys before iterating modules. The detection is by
