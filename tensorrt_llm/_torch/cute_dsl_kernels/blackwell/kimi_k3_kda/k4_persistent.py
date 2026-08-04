@@ -474,7 +474,12 @@ try:
         return result
 
     _CuTeDSL._get_pipeline = _patched_get_pipeline
-except (AttributeError, ImportError) as e:
+# Workaround for a CuTe DSL parser bug: the nvidia-cutlass-dsl 4.5.0 AST
+# preprocessor cannot parse tuple except handlers anywhere in a kernel
+# module ("'Tuple' object has no attribute 'id'"), which breaks every
+# cute.compile of this file. Keep a single bare Exception until the DSL
+# pin moves past the bug.
+except Exception as e:
     _logger.warning(f"k4_persistent ptx-options patch failed: {e}")
     _patch_applied = False
 

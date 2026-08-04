@@ -1228,7 +1228,11 @@ class KdaPrefillRunner:
             raise RuntimeError("Kimi K3 KDA prefill requires NVIDIA CUTLASS DSL")
         if chunk_size != 64:
             raise ValueError(f"Kimi K3 KDA prefill requires chunk_size=64, got {chunk_size}")
-        if A_log is None:
+        # Zero-token calls take the early return in _chunk_kda_fwd and
+        # never touch A_log; the runtime emits such batches (overlap
+        # scheduler + logprobs flows), so only require A_log when there
+        # is work to do.
+        if A_log is None and q.shape[1] != 0:
             raise ValueError("Kimi K3 KDA prefill requires A_log")
 
         result = _chunk_kda_fwd(
