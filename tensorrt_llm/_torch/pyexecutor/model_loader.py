@@ -13,10 +13,12 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.weight_sharing import (
-    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity, IdentityCheckPolicy,
-    PostTransformConfigIdentity, PostTransformFeature, PostTransformProfile,
-    PostTransformProfileRegistry, PostTransformQualificationDecision,
-    PostTransformTransferScope, SourceIdentity,
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
+    IdentityCheckPolicy, PostTransformConfigIdentity, PostTransformFeature,
+    PostTransformProfile, PostTransformProfileRegistry,
+    PostTransformQualificationDecision, PostTransformRuntimeConfig,
+    PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
     check_weight_sharing_compatibility)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
@@ -34,7 +36,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
-from ..models import AutoModelForCausalLM, LlamaForCausalLM
+from ..models import AutoModelForCausalLM, LlamaForCausalLM, Qwen2ForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
                                      DecoderModelForCausalLM, MetaInitMode,
@@ -342,8 +344,8 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
     _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
-    _POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
-        profiles=(PostTransformProfile(
+    _POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(profiles=(
+        PostTransformProfile(
             profile_id="llama-for-causal-lm-target-v1",
             root_model_class=LlamaForCausalLM,
             architecture="LlamaForCausalLM",
@@ -352,7 +354,40 @@ class ModelLoader:
             protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
             transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-        ), ))
+        ),
+        PostTransformProfile(
+            profile_id="qwen2-for-causal-lm-bf16-target-v1",
+            root_model_class=Qwen2ForCausalLM,
+            architecture="Qwen2ForCausalLM",
+            model_type="qwen2",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=PostTransformRuntimeConstraints(
+                dtypes=frozenset({"bfloat16"}),
+                quant_algorithms=frozenset({"none"}),
+                kv_cache_quant_algorithms=frozenset({"none"}),
+                layerwise_quantization=frozenset({False}),
+                force_dynamic_quantization=frozenset({False}),
+                lora_enabled=frozenset({False}),
+                sparse_attention_enabled=frozenset({False}),
+                attention_backends=frozenset({"TRTLLM"}),
+                tp_sizes=frozenset({1, 2}),
+                pp_sizes=frozenset({1}),
+                cp_sizes=frozenset({1}),
+                moe_tp_sizes=frozenset({1, 2}),
+                moe_ep_sizes=frozenset({1}),
+                attention_tp_sizes=frozenset({1, 2}),
+                attention_cp_sizes=frozenset({1}),
+                attention_dp=frozenset({False}),
+                multi_node=frozenset({False}),
+                tied_word_embeddings=frozenset({False}),
+                rope_types=frozenset({"default"}),
+                rope_fusion=frozenset({True}),
+            ),
+        ),
+    ))
 
     def __init__(self,
                  llm_args: TorchLlmArgs,
@@ -1093,11 +1128,16 @@ class ModelLoader:
                    for feature in qualification.unsupported_features))
         feature_detail = (f"; unsupported_features={unsupported_features}"
                           if unsupported_features else "")
+        unsupported_runtime_dimensions = ",".join(
+            sorted(qualification.unsupported_runtime_dimensions))
+        runtime_detail = (
+            f"; unsupported_runtime_dimensions={unsupported_runtime_dimensions}"
+            if unsupported_runtime_dimensions else "")
         raise RuntimeError(
             f"MX receiver got post-transform weights for {type(model).__name__}, "
             "but the load does not match a qualified staged post-load profile "
             f"for protocol v{cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION}: "
-            f"reason={qualification.reason.value}{feature_detail}. "
+            f"reason={qualification.reason.value}{feature_detail}{runtime_detail}. "
             "Refusing to run the full post-load path on already-transformed "
             "weights.")
 
@@ -1139,6 +1179,8 @@ class ModelLoader:
             protocol_version=cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             enabled_features=frozenset(enabled_features),
+            runtime_config=PostTransformRuntimeConfig.from_model_config(
+                model.model_config),
         )
 
     def _post_load_publish(
@@ -1153,11 +1195,15 @@ class ModelLoader:
         if checkpoint_loader.checkpoint_format == "MX":
             if not qualification.qualified:
                 if not weights_preloaded:
+                    unsupported_runtime_dimensions = ",".join(
+                        sorted(qualification.unsupported_runtime_dimensions))
                     logger.info(
                         "Skipping MX post-transform publish for %s: "
-                        "qualification reason=%s.",
+                        "qualification reason=%s, "
+                        "unsupported_runtime_dimensions=%s.",
                         type(model).__name__,
                         qualification.reason.value,
+                        unsupported_runtime_dimensions or "none",
                     )
                 return
             kwargs["source_identity"] = self._source_identity
