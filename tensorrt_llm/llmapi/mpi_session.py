@@ -17,7 +17,6 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
 
-from tensorrt_llm import _FLASHINFER_WORKSPACE_ISOLATION_ENV
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -31,6 +30,14 @@ if ENABLE_MULTI_DEVICE:
     from tensorrt_llm._utils import global_mpi_size, mpi_world_size
 
 T = TypeVar("T")
+
+_FLASHINFER_WORKER_BOOTSTRAP = (
+    "import os,tempfile;"
+    "from mpi4py import MPI;"
+    "workspace=f'trtllm-flashinfer-{MPI.COMM_WORLD.Get_rank()}-{os.getpid()}';"
+    "os.environ.setdefault('FLASHINFER_WORKSPACE_BASE',"
+    "os.path.join(tempfile.gettempdir(),workspace));"
+    "from mpi4py.futures.server import main;main()")
 
 
 class MPINodeState:
@@ -437,13 +444,14 @@ class MpiPoolSession(MpiSession):
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM")
         }
-        if self.n_workers > 1:
-            # Isolate FlashInfer JIT sources across workers.
-            env.setdefault(_FLASHINFER_WORKSPACE_ISOLATION_ENV, "1")
         env.update(self._env_overrides)
+        # Configure FlashInfer before workers import the main module.
+        python_args = ["-c", _FLASHINFER_WORKER_BOOTSTRAP
+                       ] if self.n_workers > 1 else None
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
-                                        env=env)
+                                        env=env,
+                                        python_args=python_args)
 
     def __del__(self):
         self.shutdown_abort()

@@ -14,23 +14,6 @@
 # limitations under the License.
 
 import os
-import tempfile
-
-_FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
-_FLASHINFER_WORKSPACE_ISOLATION_ENV = "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS"
-
-
-def _configure_flashinfer_workspace() -> None:
-    if os.environ.get(_FLASHINFER_WORKSPACE_ISOLATION_ENV) == "1":
-        workspace = f"trtllm-flashinfer-{getattr(os, 'getuid', lambda: 0)()}-{os.getpid()}"
-        os.environ.setdefault(
-            _FLASHINFER_WORKSPACE_ENV,
-            os.path.join(tempfile.gettempdir(), workspace),
-        )
-
-
-# Run before any module can import FlashInfer.
-_configure_flashinfer_workspace()
 
 # Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"

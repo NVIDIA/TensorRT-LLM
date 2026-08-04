@@ -14,65 +14,60 @@
 # limitations under the License.
 
 import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from mpi4py.futures import server
 
-import tensorrt_llm as workaround
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi import mpi_session
 
-
-def test_configure_flashinfer_workspace_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(workaround._FLASHINFER_WORKSPACE_ENV, raising=False)
-    monkeypatch.delenv(workaround._FLASHINFER_WORKSPACE_ISOLATION_ENV, raising=False)
-
-    workaround._configure_flashinfer_workspace()
-
-    assert workaround._FLASHINFER_WORKSPACE_ENV not in os.environ
+_FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
 
 
-def test_configure_flashinfer_workspace_is_per_process(
+def _run_worker_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "main", lambda: None)
+    exec(mpi_session._FLASHINFER_WORKER_BOOTSTRAP, {})
+
+
+def test_worker_bootstrap_uses_rank_and_pid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.delenv(workaround._FLASHINFER_WORKSPACE_ENV, raising=False)
-    monkeypatch.setenv(workaround._FLASHINFER_WORKSPACE_ISOLATION_ENV, "1")
-    monkeypatch.setattr(workaround.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
 
-    workaround._configure_flashinfer_workspace()
+    _run_worker_bootstrap(monkeypatch)
 
-    get_user_id = getattr(os, "getuid", lambda: 0)
-    expected = tmp_path / f"trtllm-flashinfer-{get_user_id()}-{os.getpid()}"
-    assert os.environ[workaround._FLASHINFER_WORKSPACE_ENV] == str(expected)
+    rank = mpi_session.mpi4py.MPI.COMM_WORLD.Get_rank()
+    expected = tmp_path / f"trtllm-flashinfer-{rank}-{os.getpid()}"
+    assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(expected)
 
 
-def test_configure_flashinfer_workspace_preserves_explicit_value(
+def test_worker_bootstrap_preserves_explicit_workspace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     explicit_workspace = tmp_path / "explicit"
-    monkeypatch.setenv(workaround._FLASHINFER_WORKSPACE_ISOLATION_ENV, "1")
-    monkeypatch.setenv(workaround._FLASHINFER_WORKSPACE_ENV, str(explicit_workspace))
+    monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, str(explicit_workspace))
 
-    workaround._configure_flashinfer_workspace()
+    _run_worker_bootstrap(monkeypatch)
 
-    assert os.environ[workaround._FLASHINFER_WORKSPACE_ENV] == str(explicit_workspace)
+    assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(explicit_workspace)
 
 
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
 @pytest.mark.parametrize(
-    "n_workers, override, expected",
+    "n_workers, expected",
     [
-        (1, None, None),
-        (4, None, "1"),
-        (4, "0", "0"),
+        (1, None),
+        (4, ["-c", mpi_session._FLASHINFER_WORKER_BOOTSTRAP]),
     ],
 )
-def test_mpi_pool_configures_worker_workspace_isolation(
+def test_mpi_pool_configures_worker_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
     n_workers: int,
-    override: str | None,
-    expected: str | None,
+    expected: list[str] | None,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -80,19 +75,13 @@ def test_mpi_pool_configures_worker_workspace_isolation(
         def __init__(self, **kwargs: object) -> None:
             captured.update(kwargs)
 
-    monkeypatch.delenv(workaround._FLASHINFER_WORKSPACE_ISOLATION_ENV, raising=False)
     monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor)
-    env_overrides = (
-        {workaround._FLASHINFER_WORKSPACE_ISOLATION_ENV: override} if override is not None else {}
-    )
     session = SimpleNamespace(
         n_workers=n_workers,
-        _env_overrides=env_overrides,
+        _env_overrides={},
         mpi_pool=None,
     )
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
 
-    env = captured["env"]
-    assert isinstance(env, dict)
-    assert env.get(workaround._FLASHINFER_WORKSPACE_ISOLATION_ENV) == expected
+    assert captured["python_args"] == expected
