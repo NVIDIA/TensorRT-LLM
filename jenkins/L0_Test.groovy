@@ -2868,6 +2868,19 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "STAGE_NAME=${stageName}"
             sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
             echo "Upload test results."
+            if (suppressTestReporting) {
+                // This attempt is superseded by a planned retry. Keep the tar for
+                // forensics, but move its result XMLs aside so the top-level Collect
+                // Test Result stage's junit('**/results*.xml') does not re-ingest a
+                // superseded attempt's results (e.g. a results-timeout.xml left by a
+                // monitor-cut still-running job) and flip the build UNSTABLE even
+                // though the stage passed on retry. junit() here was already gated.
+                sh """
+                    cd ${stageName} && for f in results*.xml; do
+                        [ -e "\$f" ] && mv "\$f" "superseded-\$f"
+                    done || true
+                """
+            }
             sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
             trtllm_utils.uploadArtifacts(
                 "results-${stageName}${postTag}.tar.gz",
