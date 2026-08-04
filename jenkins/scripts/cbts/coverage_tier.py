@@ -34,11 +34,12 @@ from blocks import (
     _target_in_filter_subtree,
     block_matches_stage,
 )
+
 from rules.base import PRInputs, RuleResult
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "coverage_selection"))
-from selector import CoverageSelector  # noqa: E402
-from touch_db import TouchDB, db_key  # noqa: E402
+from selector import DEFAULT_NO_DATA_POLICY, NO_DATA_POLICIES, CoverageSelector  # noqa: E402,F401
+from touch_db import TouchDB, db_key, stage_family  # noqa: E402
 
 
 def open_db(path: str) -> TouchDB:
@@ -88,24 +89,29 @@ _R_COARSE = "coarse"
 
 def _entry_reason(
     entry: str,
-    served: list[str],
+    served_families: list[str],
     keep_rule: set[str],
     cov,
     known: dict[str, set[str]],
     untrusted: set[str],
 ) -> str:
-    """Return SAFE or the must-run cause for a candidate YAML entry."""
+    """Return SAFE or the must-run cause for a candidate YAML entry.
+
+    Keyed by stage family, not by shard: pytest-split puts each entry on
+    exactly one shard, so a per-shard lookup would report `no_data` for every
+    entry of any stage split more than one way.
+    """
     if entry in keep_rule:
         return _R_RULE_KEPT
     dbk = db_key(entry)
     if dbk is None:
         return _R_COARSE
-    for name in served:
-        if dbk not in known.get(name, frozenset()):
+    for family in served_families:
+        if dbk not in known.get(family, frozenset()):
             return _R_NO_DATA
-        if dbk in cov.impacted.get(name, frozenset()):
+        if dbk in cov.impacted.get(family, frozenset()):
             return _R_IMPACTED
-        if f"{name}/{dbk}" in untrusted:
+        if f"{family}/{dbk}" in untrusted:
             return _R_UNTRUSTED
     return _R_SAFE
 
@@ -119,6 +125,9 @@ def _build_narrowing(
     untrusted: set[str],
 ) -> tuple[dict[tuple[str, int], set[str]], set[str], Counter]:
     """Classify every candidate entry; remove only SAFE ones.
+
+    `cov.skippable` / `cov.impacted` / `known` / `untrusted` are keyed by stage
+    family, so each block's served stages are mapped through `stage_family`.
 
     Returns (removed per block, fully-emptied instrumented stages, must-run tally).
     """
@@ -137,14 +146,15 @@ def _build_narrowing(
             for s in stages.values()
             if s.yaml_stem == block.yaml_stem and block_matches_stage(block, s)
         ]
+        served_families = sorted({stage_family(name) for name in served})
         # shared-block rule: prune only when every served stage is instrumented
-        if not served or any(name not in instrumented for name in served):
+        if not served or any(f not in instrumented for f in served_families):
             continue
         key = (block.yaml_stem, block.block_index)
         keep_rule = rule_kept.get(key, set())
         rm: set[str] = set()
         for entry in block.tests:
-            reason = _entry_reason(entry, served, keep_rule, cov, known, untrusted)
+            reason = _entry_reason(entry, served_families, keep_rule, cov, known, untrusted)
             if reason == _R_SAFE:
                 rm.add(entry)
             else:
@@ -153,9 +163,8 @@ def _build_narrowing(
             removed[key] = rm
 
     dropped: set[str] = set()
-    for name in instrumented:
-        stage = stages.get(name)
-        if stage is None:
+    for name, stage in stages.items():
+        if stage_family(name) not in instrumented:
             continue
         total = kept = 0
         for block in yaml_index.blocks:
@@ -179,6 +188,7 @@ def apply_coverage_tier(
     yaml_index: YAMLIndex,
     repo_root: Path,
     db: TouchDB,
+    no_data_policy: str = DEFAULT_NO_DATA_POLICY,
 ) -> tuple[CoverageTierResult | None, str]:
     """Return (narrowing, note); narrowing is None when the tier keeps the Tier-1 result."""
     if any(r.scope is None for _, r in pairs):
@@ -187,7 +197,7 @@ def apply_coverage_tier(
     if not residual:
         return None, "coverage tier skipped: no residual (all files handled by rules)"
 
-    selector = CoverageSelector(db, repo_root)
+    selector = CoverageSelector(db, repo_root, no_data_policy=no_data_policy)
     cov = selector.decide(residual, pr.diffs)
     if not cov.ok:
         return None, f"coverage tier declined: {cov.reason}"
@@ -203,10 +213,15 @@ def apply_coverage_tier(
     if cov.no_data_funcs:
         shown = ", ".join(cov.no_data_funcs[:3])
         more = f" (+{len(cov.no_data_funcs) - 3})" if len(cov.no_data_funcs) > 3 else ""
-        nd = f"; new/uncovered function(s), bounded via importers: {shown}{more}"
+        bound = {
+            "file": "bounded to each file's whole test set",
+            "importers": "bounded via importers",
+            "ignore": "NOT bounded",
+        }[no_data_policy]
+        nd = f"; new/uncovered function(s), {bound}: {shown}{more}"
 
-    known = db.known_by_stage()
-    untrusted = selector.untrusted_tests()
+    known = db.known_by_family()
+    untrusted = selector.untrusted_families()
     removed, dropped, must_run_reasons = _build_narrowing(
         cov, stages, yaml_index, rule_block_filters, known, untrusted
     )
@@ -244,6 +259,7 @@ def apply_coverage_tier(
             "removed_cases": n_removed,
             "dropped_stages": len(dropped),
             "outcome": "narrowed" if narrowed else "nothing_removable",
+            "no_data_policy": no_data_policy,
             **({"no_data_funcs": list(cov.no_data_funcs)} if cov.no_data_funcs else {}),
         },
     )
