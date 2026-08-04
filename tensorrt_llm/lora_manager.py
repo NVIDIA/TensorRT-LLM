@@ -1057,17 +1057,15 @@ class LoraManager(object):
                     "with compute-dtype modules such as routed-expert MoE is not supported."
                 )
 
-            if uid not in self._cpp_lora_weights:
-                self._cpp_lora_weights[uid] = []  # Will be converted to tensor later
-            if uid not in self._cpp_lora_config:
-                self._cpp_lora_config[uid] = []  # Will be converted to tensor later
-
-            self._lora_uid_to_low_ranks[uid] = {}
-            self._lora_weights_pointers_list[uid] = {}
+            cpp_lora_weights = []
+            cpp_lora_config = []
+            uid_to_low_ranks = {}
+            lora_weights_pointers = {}
+            retained_lora_weights = []
             for layer_idx in sorted(all_weights.keys()):
                 layer_weights = all_weights[layer_idx]
-                self._lora_uid_to_low_ranks[uid][layer_idx] = {}
-                self._lora_weights_pointers_list[uid][layer_idx] = {}
+                uid_to_low_ranks[layer_idx] = {}
+                lora_weights_pointers[layer_idx] = {}
 
                 for hf_module, module_weights in layer_weights.items():
                     lora_module = hf_modules_to_trtllm_modules[hf_module]
@@ -1075,7 +1073,7 @@ class LoraManager(object):
                         warnings.warn(
                             f"LoRA module '{lora_module}' not in target modules {self.lora_target_modules}, skipping."
                         )
-                        self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
+                        uid_to_low_ranks[layer_idx][lora_module] = 0
                         continue
 
                     has_expert_indices = _is_moe_module_weights(module_weights)
@@ -1168,17 +1166,17 @@ class LoraManager(object):
                         if is_dora and t_mag is not None:
                             t_mag = t_mag.to(model_dtype)
 
-                    self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = effective_rank
+                    uid_to_low_ranks[layer_idx][lora_module] = effective_rank
                     if self._retain_device_tensors:
-                        self._lora_weights_pointers_list[uid][layer_idx][lora_module] = [
+                        lora_weights_pointers[layer_idx][lora_module] = [
                             t_in.data_ptr(),
                             t_out.data_ptr(),
                             t_mag.data_ptr() if (is_dora and t_mag is not None) else 0,
                         ]
-                        self._lora_weights.append(t_in)
-                        self._lora_weights.append(t_out)
+                        retained_lora_weights.append(t_in)
+                        retained_lora_weights.append(t_out)
                         if is_dora and t_mag is not None:
-                            self._lora_weights.append(t_mag)
+                            retained_lora_weights.append(t_mag)
 
                     t_in_cpu = t_in.flatten().cpu()
                     t_out_cpu = t_out.flatten().cpu()
@@ -1188,22 +1186,28 @@ class LoraManager(object):
                         t_mag_cpu = t_mag.flatten().cpu()
                         weights_to_concat.append(t_mag_cpu)
 
-                    self._cpp_lora_weights[uid].append(torch.cat(weights_to_concat))
-                    self._cpp_lora_config[uid].append(
+                    cpp_lora_weights.append(torch.cat(weights_to_concat))
+                    cpp_lora_config.append(
                         torch.tensor(
                             [self.LORA_MODULE_IDS[lora_module], layer_idx, effective_rank, is_dora],
                             dtype=torch.int32,
                         )
                     )
 
-            max_weight_size = max(w.size(0) for w in self._cpp_lora_weights[uid])
-            self._cpp_lora_weights[uid] = torch.stack(
+            max_weight_size = max(w.size(0) for w in cpp_lora_weights)
+            packed_lora_weights = torch.stack(
                 [
                     torch.nn.functional.pad(w, (0, max_weight_size - w.size(0)))
-                    for w in self._cpp_lora_weights[uid]
+                    for w in cpp_lora_weights
                 ]
             )
-            self._cpp_lora_config[uid] = torch.stack([c for c in self._cpp_lora_config[uid]])
+            packed_lora_config = torch.stack(cpp_lora_config)
+
+            self._cpp_lora_weights[uid] = packed_lora_weights
+            self._cpp_lora_config[uid] = packed_lora_config
+            self._lora_uid_to_low_ranks[uid] = uid_to_low_ranks
+            self._lora_weights_pointers_list[uid] = lora_weights_pointers
+            self._lora_weights.extend(retained_lora_weights)
 
         for uid, model_dir, hf_config in zip(new_uids, new_model_dirs, lora_hf_configs):
             load_from_model_dir(uid, model_dir, hf_config)

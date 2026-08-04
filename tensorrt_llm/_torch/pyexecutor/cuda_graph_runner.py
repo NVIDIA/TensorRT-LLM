@@ -36,7 +36,7 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # as a one-token context chunk to write its cross-KV cache, so enc-dec
 # dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
-KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
+KeyType: TypeAlias = Tuple[int, int, bool, bool, bool, Optional[torch.dtype]]
 
 
 def _save_spec_decode_capture_state(
@@ -250,7 +250,8 @@ class CUDAGraphRunner:
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
         spec_metadata: Optional[SpecMetadata] = None,
-        promoted_context_request_ids: frozenset[int] = frozenset()
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+        peft_cache_data_type: Optional[torch.dtype] = None,
     ) -> KeyType:
         batch_size = batch.batch_size
 
@@ -274,7 +275,8 @@ class CUDAGraphRunner:
             # Because we will pad the input to 'max_draft_len' length for the first draft layer.
             draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
-                   short_seq_len_mode, is_all_greedy_sample)
+                   short_seq_len_mode, is_all_greedy_sample,
+                   peft_cache_data_type)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -285,7 +287,7 @@ class CUDAGraphRunner:
             assert len(
                 set(draft_len_list)) == 1, "All draft lengths must be the same"
             key = (batch_size, draft_len, False, short_seq_len_mode,
-                   is_all_greedy_sample)
+                   is_all_greedy_sample, peft_cache_data_type)
         return key
 
     @staticmethod
@@ -327,6 +329,7 @@ class CUDAGraphRunner:
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
+        peft_cache_data_type: Optional[torch.dtype] = None,
     ) -> Tuple[Optional[Any], Optional[Any], Optional[KeyType]]:
         """
         Determines if the current batch can be run with a CUDA graph.
@@ -372,7 +375,8 @@ class CUDAGraphRunner:
         # callers pass the empty default and retain generation-only behavior.
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata,
-                                 promoted_context_request_ids)
+                                 promoted_context_request_ids,
+                                 peft_cache_data_type)
 
         if key in self.graph_metadata:
             return self.graph_metadata[key][

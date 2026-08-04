@@ -429,6 +429,29 @@ class TestLoraManagerFp8(unittest.TestCase):
                     uids=["fp8-mismatched-dtype"],
                 )
 
+            uid = "fp8-mismatched-dtype"
+            self.assertNotIn(uid, manager._cpp_lora_weights)
+            self.assertNotIn(uid, manager._cpp_lora_config)
+            self.assertNotIn(uid, manager._lora_uid_to_low_ranks)
+            self.assertNotIn(uid, manager._lora_weights_pointers_list)
+
+            _create_dummy_hf_lora_adapter(
+                adapter_dir,
+                rank=16,
+                num_layers=1,
+                dtype=torch.float8_e4m3fn,
+            )
+            manager.load_from_hf(
+                model_dirs=[str(adapter_dir)],
+                model_config=model_config,
+                uids=[uid],
+            )
+
+            self.assertIn(uid, manager._cpp_lora_weights)
+            self.assertIn(uid, manager._cpp_lora_config)
+            self.assertIn(uid, manager._lora_uid_to_low_ranks)
+            self.assertIn(uid, manager._lora_weights_pointers_list)
+
     def test_scaled_fp8_e4m3_weights_are_clamped_before_cast(self):
         model_config = MockModelConfig()
         manager = LoraManager(
