@@ -31,6 +31,42 @@ def validate_config_bool(value: Any, field_name: str) -> bool:
         f"{field_name} must be a boolean, got {type(value).__name__}")
 
 
+def _validate_internal_request_auth_key(value: Optional[str]) -> Optional[str]:
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError("internal_request_auth_key must be a non-empty string")
+    return value
+
+
+def _extract_internal_request_auth_key(
+        top_level_key: Optional[str], context_servers: dict,
+        generation_servers: dict) -> Optional[str]:
+    top_level_key = _validate_internal_request_auth_key(top_level_key)
+    section_keys = []
+    for server_type, servers in (("context_servers", context_servers),
+                                 ("generation_servers", generation_servers)):
+        section_key = servers.pop("internal_request_auth_key", None)
+        if section_key is None:
+            continue
+        section_keys.append(
+            (server_type, _validate_internal_request_auth_key(section_key)))
+
+    for server_type, section_key in section_keys:
+        if top_level_key is not None and section_key != top_level_key:
+            raise ValueError(
+                "internal_request_auth_key must match between the top-level "
+                f"config and {server_type}")
+
+    if top_level_key is None and section_keys:
+        unique_keys = {section_key for _, section_key in section_keys}
+        if len(unique_keys) != 1:
+            raise ValueError(
+                "internal_request_auth_key must match between context_servers "
+                "and generation_servers")
+        top_level_key = section_keys[0][1]
+
+    return top_level_key
+
+
 class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
@@ -117,6 +153,7 @@ class DisaggServerConfig():
     # fleet delegates to it; when absent, num_workers>1 starts an implicit in-process
     # coordinator and num_workers==1 runs a single self-contained server.
     disagg_coordinator_url: Optional[str] = None
+    internal_request_auth_key: Optional[str] = None
 
 
 @dataclass
@@ -181,7 +218,6 @@ def parse_disagg_config_file(yaml_config_file: str):
     with open(yaml_config_file, 'r') as file:
 
         config = yaml.safe_load(file)
-
         disagg_server_config = extract_disagg_cfg(**config)
 
         return disagg_server_config
@@ -207,9 +243,12 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        gen_tokids_ctxbytes: bool = False,
                        num_workers: int = 1,
                        disagg_coordinator_url: Optional[str] = None,
+                       internal_request_auth_key: Optional[str] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
+    internal_request_auth_key = _extract_internal_request_auth_key(
+        internal_request_auth_key, context_servers, generation_servers)
 
     inherited_args = dict(kwargs)
 
@@ -274,6 +313,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.num_workers = num_workers
     config.disagg_coordinator_url = disagg_coordinator_url
+    config.internal_request_auth_key = internal_request_auth_key
     return config
 
 

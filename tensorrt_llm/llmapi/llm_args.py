@@ -910,6 +910,12 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "`fp4` requires Blackwell+ (SM>=100) at runtime and "
         "index_head_dim=128.",
     )
+    index_share_for_mtp_iteration: Optional[bool] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
+        "it each step. Defaults to the model's HF config value.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -1038,6 +1044,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
+            mtp_index_share=bool(_value("index_share_for_mtp_iteration",
+                                        False)),
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1801,6 +1809,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
     # If set, drafting will use separate KV cache in one-model speculative decoding.
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
+    # If set, the draft model attends directly over the target model KV cache.
+    _use_shared_kv_cache: bool = PrivateAttr(False)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
@@ -3554,19 +3564,83 @@ class KvCacheCompressionConfig(StrictBaseModel):
     as a resource manager in create_py_executor (_util.py), like the KV cache
     manager itself. Concrete algorithms subclass this and add their parameters.
     """
+
+    changes_physical_kv_length: ClassVar[bool] = False
+    """Whether physical and logical KV lengths can diverge."""
+
     algorithm: str = Field(
         description=
         "Name of the KV-cache compression algorithm to run; selects which "
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
 
-    @property
-    def kv_cache_compression_mode(self):
-        # The mode carries algorithm-level traits (``is_*`` predicates) the
-        # raw algorithm string does not.
-        from tensorrt_llm._torch.kv_cache_compression.interface import \
-            KvCacheCompressionMode
-        return KvCacheCompressionMode.from_string(self.algorithm)
+    def supports_block_reuse(self) -> bool:
+        return False
+
+    def supports_speculative_decoding(self) -> bool:
+        return False
+
+
+class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
+    """TriAttention KV-cache compression: periodic decode-time eviction.
+
+    Scored by offline calibration (github.com/WeianMao/triattention; supply
+    the official .pt via ``calibration_path``). Pure compression — decode
+    runs the model's standard attention over the compacted cache.
+    """
+
+    changes_physical_kv_length: ClassVar[bool] = True
+
+    algorithm: Literal["triattention"] = "triattention"
+    eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
+        default="union",
+        description=
+        "Which token set each eviction round keeps. `union` (default) takes "
+        "the union of each KV head's top-B and re-ranks it by the per-token max "
+        "score; it matches the official base setting (per-head and "
+        "per-layer-per-head pruning both off). `per_head` keeps a per-KV-head "
+        "set shared across layers (mean of per-layer max); `per_layer_perhead` "
+        "keeps a fully independent set per (layer, KV head).")
+    normalize_scores: bool = Field(
+        default=True,
+        description="Z-normalize each head's scores over the decode region "
+        "before selection (upstream default). `union` eviction requires True: "
+        "its fused score+stats+union pipeline always normalizes.")
+    budget: int = Field(
+        default=2048,
+        gt=0,
+        description="Tokens kept at each periodic eviction; prompt tokens are "
+        "always preserved on top.")
+    beta: int = Field(
+        default=128,
+        gt=0,
+        description="Eviction period in confirmed generation tokens (upstream "
+        "`divide_length`): one speculative iteration may advance the counter "
+        "by multiple accepted tokens; at most one eviction is coalesced per update."
+    )
+    model_path: str = Field(
+        min_length=1,
+        description="Checkpoint path used to derive RoPE tables when converting "
+        "the official calibration and to classify kernel-masked sliding-attention "
+        "layers.")
+    calibration_path: str = Field(
+        min_length=1,
+        description="Path to the official TriAttention calibration `.pt` "
+        "(produced by github.com/WeianMao/triattention). TRT-LLM does not "
+        "compute calibration; it converts this file to the runtime schema at "
+        "load.")
+
+    def supports_block_reuse(self) -> bool:
+        return True
+
+    def supports_speculative_decoding(self) -> bool:
+        return self.eviction_mode == "union"
+
+
+KvCacheCompressionConfigType: TypeAlias = Annotated[
+    Union[TriAttentionKvCacheCompressionConfig],
+    Field(discriminator="algorithm"),
+]
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
@@ -3641,6 +3715,35 @@ class MambaStateConfig(StrictBaseModel):
         "the end of each prompt. An offset of 0 selects the prompt end. "
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
+
+
+class BlockReuseConfig(StrictBaseModel):
+    """Configuration for KV cache block reuse policies."""
+
+    block_reuse_policy: Literal[
+        "all_reusable", "per_request", "per_conversation"] = Field(
+            default="all_reusable",
+            status="prototype",
+            description="KV cache manager v2 block reuse policy. "
+            "'all_reusable' commits reusable blocks after every context chunk; "
+            "'per_request' commits them only after the final context chunk; "
+            "'per_conversation' uses 'per_request' commits and retains committed "
+            "SWA-window blocks and Mamba stable-boundary state for up to "
+            "`max_num_turns` completed turns. Periodic Mamba state snapshots "
+            "are disabled with 'per_conversation'. All reusable blocks remain "
+            "subject to normal cache eviction. "
+            "Requests without conversation params use 'per_request' behavior. When "
+            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
+            "blocks are committed for reuse.")
+
+    max_num_turns: PositiveInt = Field(
+        default=1,
+        status="prototype",
+        description=
+        "Maximum number of completed conversation turns whose committed SWA-window "
+        "blocks and Mamba stable-boundary state are retained by KV cache manager v2. "
+        "Only used when "
+        "`block_reuse_policy` is 'per_conversation'.")
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -3845,6 +3948,20 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    fp8_context_mla_kv_len_cap: Optional[int] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Override, in tokens, for the max summed attended-KV length (total_kv_len) per forward step that "
+        "the fp8 context-MLA attention workspace is reserved and scheduled for. Only affects fp8 "
+        "context-MLA models (e.g. DeepSeek / Kimi with an fp8 KV cache). None (default) reserves for the "
+        "never-stall worst case min(max_batch_size, max_num_tokens) * max_seq_len. A smaller value reserves "
+        "less workspace (freeing KV cache) and defers context requests whose summed attended KV would "
+        "exceed it; it is floored at max_seq_len and capped at the worst case. Safe at any value -- the "
+        "scheduler enforces it -- trading prefill batching under heavy reuse for KV cache capacity."
+    )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     pool_ratio: Optional[List[float]] = Field(
         default=None,
         min_length=1,
@@ -3865,21 +3982,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "unset. This does not take effect when pool_ratio is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    block_reuse_policy: Literal[
-        "all_reusable", "per_request", "per_conversation"] = Field(
-            default="all_reusable",
-            status="prototype",
-            description="KV cache manager v2 block reuse policy. "
-            "'all_reusable' commits reusable blocks after every context chunk; "
-            "'per_request' commits them only after the final context chunk; "
-            "'per_conversation' uses 'per_request' commits and drops the previous "
-            "turn's committed SWA-window blocks and Mamba stable-boundary state "
-            "after the current turn's final context chunk. Periodic Mamba state "
-            "snapshots are disabled with 'per_conversation'. All reusable blocks "
-            "remain subject to normal cache eviction. "
-            "Requests without conversation params use 'per_request' behavior. When "
-            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
-            "blocks are committed for reuse.")
+    block_reuse_config: BlockReuseConfig = Field(
+        default_factory=BlockReuseConfig,
+        status="prototype",
+        description="KV cache manager v2 configuration for block reuse policies."
+    )
 
     def _to_pybind(self):
         config = _KvCacheConfig(
@@ -3965,13 +4072,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     def disable_periodic_mamba_snapshots_for_conversations(
             self) -> 'KvCacheConfig':
         """Use only explicit stable boundaries for conversation reuse."""
-        if (self.block_reuse_policy == "per_conversation"
+        if (self.block_reuse_config.block_reuse_policy == "per_conversation"
                 and self.mamba_state_config.periodic_snapshot_interval != 0):
             interval = self.mamba_state_config.periodic_snapshot_interval
             logger.warning(
                 f"'kv_cache_config.mamba_state_config.periodic_snapshot_interval={interval}' "
                 "is ignored because "
-                "'kv_cache_config.block_reuse_policy=per_conversation' disables "
+                "'kv_cache_config.block_reuse_config."
+                "block_reuse_policy=per_conversation' disables "
                 "periodic Mamba snapshots; setting it to 0.")
             self.mamba_state_config = self.mamba_state_config.model_copy(
                 update={"periodic_snapshot_interval": 0})
@@ -4280,8 +4388,7 @@ class BaseLlmArgs(StrictBaseModel):
         "(default), it is read from the HF config.json ('dtype', or the "
         "deprecated 'torch_dtype'); for composite/VLM configs it falls "
         "back to the nested text_config.dtype. Defaults to bfloat16 if "
-        "none is found, and is overridden to float16 on GPUs with compute "
-        "capability < 8.0 (pre-Ampere).",
+        "none is found.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32"))
 
@@ -4413,8 +4520,8 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype")
 
     # KV cache compression config (separate from sparse attention: changes which
-    # KV is stored, not the attention computation)
-    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
+    # KV is stored, not the attention computation).
+    kv_cache_compression_config: Optional[KvCacheCompressionConfigType] = Field(
         default=None,
         description="KV-cache compression config; None disables compression.",
         status="prototype")
@@ -4590,16 +4697,6 @@ class BaseLlmArgs(StrictBaseModel):
         elif not isinstance(config_dict, dict):
             raise ValueError("Configuration file root must be a mapping.")
         return cls(**config_dict)
-
-    @field_validator("dtype")
-    @classmethod
-    def validate_dtype(cls, v, info):
-        if torch.cuda.get_device_properties(0).major < 8:
-            if v == 'auto':
-                v = 'float16'
-            if v == 'bfloat16':
-                raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
-        return v
 
     @field_validator("gpus_per_node", mode='before')
     @classmethod

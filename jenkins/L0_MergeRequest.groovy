@@ -44,6 +44,12 @@ SCAN_ROOT = "scan"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
+// GitLab project id for TRT-LLM repo, used to set GitLab status. Only needed when triggering by timer or by hand.
+withCredentials([string(credentialsId: 'gitlab-llm-repo-id', variable: 'GITLAB_PROJECT_ID')]) {
+    GITLAB_PROJECT_ID = env.gitlabProjectId ? env.gitlabProjectId : "${GITLAB_PROJECT_ID}"
+}
+
+
 // Container configuration
 def getContainerURIs()
 {
@@ -317,9 +323,6 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
     sh "env | sort"
-    if (!GEN_POST_MERGE_BUILDS_ONLY) {
-        updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
-    }
     echo "Using GitLab repo: ${LLM_REPO}."
     sh "git config --global --add safe.directory \"*\""
     // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
@@ -334,11 +337,15 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     }
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
+    if (!GEN_POST_MERGE_BUILDS_ONLY) {
+        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
+    }
     testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
     testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
     // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+    // Coverage runs only on the official post-merge pipeline.
     testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     getContainerURIs().each { k, v ->
@@ -642,6 +649,53 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
         }
     }
     return result
+}
+
+// Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
+// Uses trtllm_utils.validatePRLabelApproval() from the shared lib to verify
+// both label existence and that the labeler is an active team member.
+// Exempt: PostMerge pipelines and GitLab MR builds (no GITHUB_PR_API_URL).
+def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
+    if (!globalVars[GITHUB_PR_API_URL]) {
+        echo "[requireMultiGpuApprovalLabel] Skipping label check: not a GitHub PR (no GITHUB_PR_API_URL)"
+        return false
+    }
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        echo "[requireMultiGpuApprovalLabel] Skipping label check: PostMerge pipeline is exempt"
+        return false
+    }
+
+    def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
+    if (!prMatch) {
+        echo "[requireMultiGpuApprovalLabel] Could not extract PR number from ${globalVars[GITHUB_PR_API_URL]}. Failing open."
+        return false
+    }
+    def prNumber = prMatch[0][1]
+
+    def result = trtllm_utils.validatePRLabelApproval(pipeline, prNumber, "ci: full pre-merge approved")
+    if (!result.checkCompleted) {
+        // API error — fail-open: do not block CI if the label check itself fails
+        echo "[requireMultiGpuApprovalLabel] Label validation incomplete (${result.error}). Failing open."
+        return false
+    }
+    if (result.labelExists && result.authorized) {
+        return false
+    }
+
+    // Label missing or unauthorized — write description marker for wrapper
+    // to surface in PR comment, and return the block reason string.
+    def existingDesc = currentBuild.description ?: ""
+    currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
+        "<span data-multi-gpu-label-required='true'>" +
+        "Multi-GPU tests require label 'ci: full pre-merge approved'" +
+        "</span>"
+    def reason = !result.labelExists
+        ? "label 'ci: full pre-merge approved' is not present on this PR"
+        : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
+    def blockMsg = "${arch} Multi-GPU tests blocked: ${reason}. " +
+         "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
+    echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
+    return blockMsg
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
@@ -1567,6 +1621,19 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
+                // Label gate: check before entering the Remote Run stage so a
+                // missing/unauthorized label shows as "Blocked" (not a Remote Run
+                // failure) and does not trigger fail-fast.
+                def x86LabelBlock = requireMultiGpuApprovalLabel(pipeline, globalVars, "x86_64")
+                if (x86LabelBlock) {
+                    stage("[Test-x86_64-Multi-GPU] Blocked") {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            error x86LabelBlock
+                        }
+                    }
+                    return
+                }
+
                 testStageName = "[Test-x86_64-Multi-GPU] Remote Run"
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -1681,6 +1748,16 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                         return
                     }
+                }
+
+                def sbsaLabelBlock = requireMultiGpuApprovalLabel(pipeline, globalVars, "SBSA")
+                if (sbsaLabelBlock) {
+                    stage("[Test-SBSA-Multi-GPU] Blocked") {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            error sbsaLabelBlock
+                        }
+                    }
+                    return
                 }
 
                 testStageName = "[Test-SBSA-Multi-GPU] Remote Run"
@@ -1888,24 +1965,24 @@ pipeline {
         unsuccessful {
             script {
                 if (!GEN_POST_MERGE_BUILDS_ONLY) {
-                    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "failed"
+                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "failed", GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
         }
         success {
             script {
                 if (enableUpdateGitlabStatus) {
-                    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "success"
+                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
                 } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
-                    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "canceled"
-                    updateGitlabCommitStatus name: "Custom Jenkins build", state: "success"
+                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
         }
         aborted {
             script {
                 if (!GEN_POST_MERGE_BUILDS_ONLY) {
-                    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'canceled'
+                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'canceled', GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
         }

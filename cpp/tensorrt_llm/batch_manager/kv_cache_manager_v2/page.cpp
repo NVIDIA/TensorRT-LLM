@@ -22,7 +22,6 @@
 #include "kv_cache_manager_v2/storageManager.h" // for StorageManager
 
 #include "tensorrt_llm/common/assert.h"
-#include <stdexcept>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -96,18 +95,13 @@ SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal or
 // CommittedPage
 // ---------------------------------------------------------------------------
 
-CommittedPage::CommittedPage(StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio)
+CommittedPage::CommittedPage(
+    StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, int numTokensInBlock_, Priority prio)
     : Page(mgr, lc, level, prio)
     , block(blk.get())
-{
-}
-
-SsmCommittedPage::SsmCommittedPage(
-    StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio, int numTokensInBlock_)
-    : CommittedPage(mgr, std::move(blk), lc, level, prio)
     , numTokensInBlock(numTokensInBlock_)
 {
-    TLLM_CHECK_DEBUG(numTokensInBlock_ > 0);
+    TLLM_CHECK_DEBUG(0 < numTokensInBlock_ && numTokensInBlock_ <= static_cast<int>(blk->tokens.size()));
 }
 
 CommittedPage::~CommittedPage()
@@ -172,17 +166,20 @@ UncommittedPage::~UncommittedPage()
     // Delegate slot release to Page::~Page().
 }
 
-SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(SharedPtr<Block> blk, CachedCudaEvent readyEv)
+SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
+    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
 {
     TLLM_CHECK_DEBUG(!scheduledForEviction());
-    TLLM_CHECK_DEBUG_WITH_INFO(
-        blk->storage.at(lifeCycle) == nullptr, "Block slot for this lifecycle already has a committed page");
+    // Check before building: replacePage() below drops the superseded page, so a failure
+    // in between must not lose a usable snapshot.
+    TLLM_CHECK_DEBUG_WITH_INFO(blk->canReplacePage(lifeCycle, numTokensInBlock),
+        "Block slot for this lifecycle already has a page covering more tokens");
     TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
 
     // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
     this->readyEvent = std::move(readyEv);
 
-    auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, priority);
+    auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority);
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
@@ -193,31 +190,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(SharedPtr<Block> bl
     TLLM_CHECK_DEBUG_WITH_INFO(committed->hasValidSlot(), "committed page must have a valid slot after transfer");
 
     // Register in block storage.
-    blk->storage.at(lifeCycle) = committed.get();
-
-    return committed;
-}
-
-SharedPtr<SsmCommittedPage> UncommittedPage::convertToSsmCommitted(
-    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
-{
-    TLLM_CHECK_DEBUG(!scheduledForEviction());
-    TLLM_CHECK_DEBUG_WITH_INFO(
-        blk->storage.at(lifeCycle) == nullptr, "Block slot for this lifecycle already has a committed page");
-    TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
-
-    this->readyEvent = std::move(readyEv);
-
-    auto committed = makeShared<SsmCommittedPage>(manager, blk, lifeCycle, cacheLevel, priority, numTokensInBlock);
-    committed->setSlotId(slotId()); // asserts valid
-    committed->readyEvent = std::move(readyEvent);
-    resetSlot();
-    readyEvent = CachedCudaEvent::makeNull();
-
-    TLLM_CHECK_DEBUG(!hasValidSlot() && readyEvent.isClosed());
-    TLLM_CHECK_DEBUG_WITH_INFO(committed->hasValidSlot(), "committed page must have a valid slot after transfer");
-
-    blk->storage.at(lifeCycle) = committed.get();
+    blk->replacePage(lifeCycle, committed.get());
 
     return committed;
 }
@@ -244,13 +217,12 @@ PageHolder::~PageHolder()
         if (!page->scheduledForEviction())
             manager->scheduleForEviction(*page);
 
-        // If the block is orphan, exclude from eviction immediately.
-        auto* cp = dynamic_cast<CommittedPage*>(page.get());
-        if (cp)
-        {
-            if (cp->block == nullptr || cp->block->isOrphan())
-                manager->excludeFromEviction(*page);
-        }
+        // A page that no longer sits in its block's slot (orphaned block, or replaced by a
+        // page with a larger recorded token count) is unreachable for reuse, so keeping it
+        // in the eviction LRU would just pin a slot until memory pressure hits.
+        auto* cp = static_cast<CommittedPage*>(page.get());
+        if (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp))
+            manager->excludeFromEviction(*page);
     }
     else
     {

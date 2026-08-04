@@ -43,6 +43,7 @@ from tensorrt_llm.bindings.executor import FinishReason
         ),
     ],
 )
+@pytest.mark.cpu_only
 def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
     """Getter reads top-level lengths and ignores layout metadata."""
     assert get_multimodal_embedding_lengths(req) == expected
@@ -103,6 +104,7 @@ def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
         ),
     ],
 )
+@pytest.mark.cpu_only
 def test_multimodal_embedding_lengths_rejects_invalid_metadata(req, exception, match):
     """Bad length metadata is rejected by the getter."""
     with pytest.raises(exception, match=match):
@@ -132,6 +134,7 @@ class _FakeRequest:
         self.finished_reason = (reason, beam)
 
 
+@pytest.mark.cpu_only
 def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
     """Sparse MM encoder outputs attach to the original request index."""
     text_request = _FakeRequest()
@@ -165,6 +168,7 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
     assert mm_request.py_result.mrope_position == ("mm-pos", "mm-delta")
 
 
+@pytest.mark.cpu_only
 def test_py_result_mm_embedding_handles_use_shared_tensor_handles():
     """MM encoder result handles should preserve the producer tensor device."""
     result = PyResult(prompt_len=1, max_new_tokens=1)
@@ -202,6 +206,7 @@ class _FakeScheduledRequests:
         return len(self.context_requests)
 
 
+@pytest.mark.cpu_only
 def test_mm_encoder_sampler_builds_typed_result_from_model_outputs():
     """Sampler converts raw model-output dicts into typed MM results."""
     sampler = EarlyStopWithMMResult()
@@ -228,6 +233,7 @@ def test_mm_encoder_sampler_builds_typed_result_from_model_outputs():
     }
 
 
+@pytest.mark.cpu_only
 def test_mm_encoder_sampler_rejects_typed_result_batch_mismatch():
     """MM embedding arrays must stay length-aligned with request indices."""
     sampler = EarlyStopWithMMResult()
@@ -244,6 +250,7 @@ def test_mm_encoder_sampler_rejects_typed_result_batch_mismatch():
         )
 
 
+@pytest.mark.cpu_only
 def test_mm_encoder_sampler_rejects_invalid_request_index():
     """MM encoder output cannot target a request outside the scheduled batch."""
     sampler = EarlyStopWithMMResult()
@@ -260,6 +267,7 @@ def test_mm_encoder_sampler_rejects_invalid_request_index():
         )
 
 
+@pytest.mark.cpu_only
 def test_multimodal_result_rejects_embedding_shape_mismatch():
     """Per-item lengths must sum to the attached embedding rows."""
     with pytest.raises(ValueError, match="shape mismatch"):

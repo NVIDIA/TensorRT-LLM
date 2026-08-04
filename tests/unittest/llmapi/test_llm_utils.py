@@ -2,6 +2,7 @@ import asyncio
 import threading
 import time
 
+import pytest
 import torch
 
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -12,6 +13,7 @@ from .test_llm import llama_model_path
 # isort: on
 
 
+@pytest.mark.cpu_only
 def test_LlmArgs_default_gpus_per_node():
     # default
     llm_args = TorchLlmArgs(model=llama_model_path)
@@ -22,6 +24,7 @@ def test_LlmArgs_default_gpus_per_node():
     assert llm_args.gpus_per_node == 6
 
 
+@pytest.mark.cpu_only
 def test_AsyncQueue():
     queue = AsyncQueue()
 
