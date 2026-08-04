@@ -643,8 +643,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         context, so metadata sized with `ceil()` would come up short (a 4x4
         merged grid produces 4 windows, not 1).
         """
-        return (dimension + window_side -
-                dimension % window_side) // window_side
+        return dimension // window_side + 1
 
     @staticmethod
     @lru_cache(maxsize=32)
