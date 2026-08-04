@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal
+import os
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -32,6 +33,48 @@ from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import (
     SplitSpec,
 )
 from tensorrt_llm._torch.visual_gen.utils import as_tuple
+
+TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE = "TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE"
+
+# Keep tuned entries explicit so future sweeps can extend this table by
+# parallel size and tensor dtype without changing the selection policy.
+_NATIVE_DECODE_CHUNK_SIZES: dict[tuple[int, torch.dtype], int] = {
+    (4, torch.bfloat16): 4,
+}
+_DEFAULT_MULTI_GPU_DECODE_CHUNK_SIZE = 2
+
+
+def _native_decode_chunk_size(
+    parallel_size: int,
+    dtype: torch.dtype,
+) -> int:
+    """Choose the internal temporal batch size for native parallel decode.
+
+    The best size depends on the spatial shard size and activation dtype:
+    batching amortizes per-chunk decoder launches, but larger chunks also raise
+    activation pressure. Keep that policy internal and centralized while
+    retaining an environment override for performance experiments.
+    """
+    override = os.environ.get(TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE, "").strip()
+    if override:
+        try:
+            chunk_size = int(override)
+        except ValueError:
+            raise ValueError(
+                f"{TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE} must be a positive integer."
+            ) from None
+        if chunk_size < 1:
+            raise ValueError(
+                f"{TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE} must be a positive integer."
+            )
+        return chunk_size
+
+    if parallel_size <= 1:
+        return 1
+    return _NATIVE_DECODE_CHUNK_SIZES.get(
+        (parallel_size, dtype),
+        _DEFAULT_MULTI_GPU_DECODE_CHUNK_SIZE,
+    )
 
 
 class WanCausalConvHalo(HaloExchangeConv):
@@ -83,7 +126,11 @@ class ParallelVAE_Wan(ParallelVAEBase):
             return (dist,)
         return AutoencoderKLOutput(latent_dist=dist)
 
-    def _decode_impl(self, z: torch.Tensor, **kwargs):
+    def _decode_impl(
+        self,
+        z: torch.Tensor,
+        **kwargs: Any,
+    ) -> DecoderOutput | tuple[torch.Tensor]:
         return_dict = kwargs.pop("return_dict", True)
         z_local, _ = self._split_tensor(z)
         sample = self._gather_tensor(
@@ -215,3 +262,11 @@ class ParallelVAE_TrtllmWan(ParallelVAE_Wan):
 
     _conv3d_cls = wan_vae.WanCausalConv3d
     _attn_cls = wan_vae.WanAttentionBlock
+
+    def _decode_impl(
+        self,
+        z: torch.Tensor,
+        **kwargs: Any,
+    ) -> DecoderOutput | tuple[torch.Tensor]:
+        kwargs["temporal_chunk_size"] = _native_decode_chunk_size(self.world_size, z.dtype)
+        return super()._decode_impl(z, **kwargs)

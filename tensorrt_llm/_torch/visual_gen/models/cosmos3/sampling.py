@@ -232,17 +232,37 @@ class Cosmos3SamplingPolicy:
             return 1.0
         return float(_config_get(self.unipc_base_config, "flow_shift", 1.0) or 1.0)
 
-    def set_flow_shift(self, scheduler: Any, target_shift: Optional[float]) -> Any:
-        """Return ``scheduler`` rebuilt with ``flow_shift=target_shift`` if needed.
+    def set_flow_shift(
+        self,
+        scheduler: Any,
+        target_shift: Optional[float],
+        *,
+        use_karras_sigmas: Optional[bool] = None,
+    ) -> Any:
+        """Return ``scheduler`` rebuilt for the requested sampling knobs.
 
-        The current shift is read from the supplied scheduler's own config, so
-        no tracking state exists to diverge. Structural no-op for distilled
-        checkpoints (no UniPC base config) and for ``target_shift=None``.
+        Current values are read from the supplied scheduler's own config, so
+        no tracking state exists to diverge. ``None`` means "whatever the
+        checkpoint shipped" for either knob: V2V passes
+        ``use_karras_sigmas=False`` to force the uniform sigma schedule.
+        Structural no-op for distilled checkpoints (no UniPC base config) and
+        when neither knob is requested.
         """
-        if target_shift is None or self.unipc_base_config is None:
+        if self.unipc_base_config is None:
             return scheduler
-        target_shift = float(target_shift)
+        if target_shift is None and use_karras_sigmas is None:
+            return scheduler
+
         current_shift = float(_config_get(scheduler.config, "flow_shift", 1.0) or 1.0)
-        if current_shift == target_shift:
+        target_shift = self.checkpoint_flow_shift if target_shift is None else float(target_shift)
+        current_karras = bool(_config_get(scheduler.config, "use_karras_sigmas", False))
+        base_karras = bool(_config_get(self.unipc_base_config, "use_karras_sigmas", False))
+        target_karras = base_karras if use_karras_sigmas is None else bool(use_karras_sigmas)
+
+        if current_shift == target_shift and current_karras == target_karras:
             return scheduler
-        return UniPCMultistepScheduler.from_config(self.unipc_base_config, flow_shift=target_shift)
+        return UniPCMultistepScheduler.from_config(
+            self.unipc_base_config,
+            flow_shift=target_shift,
+            use_karras_sigmas=target_karras,
+        )
