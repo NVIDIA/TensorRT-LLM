@@ -2091,6 +2091,27 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         rows = self._attn_num_rows
         if not self.is_ragged_verify or rows <= 0:
             return
+        # TLLM_DSPARK_ASSERT_ROWS: name the failure instead of taking an
+        # illegal memory access several hundred frames later.
+        #
+        # The docstring above says the row->request map's addresses "are
+        # pinned by the graph key". That is true on the graph path and false
+        # on an eager one, where the same metadata object serves ragged and
+        # non-ragged steps in turn. If `_attn_num_rows` and
+        # `attn_row_req_idx_cuda` are stale relative to this step's
+        # `num_seqs` -- 64 requests last step, 3 now -- the gather below reads
+        # request 63 out of a length-3 tensor, which is exactly the shape of
+        # the fault seen on the eager-ragged path.
+        #
+        # Costs a device-to-host read, so it is opt-in.
+        if os.environ.get("TLLM_DSPARK_ASSERT_ROWS"):
+            worst = int(self.attn_row_req_idx_cuda[:rows].max())
+            assert worst < self.num_seqs, (
+                f"token-major row map is stale: {rows} rows index up to "
+                f"request {worst} but this step has only {self.num_seqs} "
+                f"sequences. The map was staged by a previous prepare() and "
+                f"never restaged; the gather that follows would read out of "
+                f"bounds.")
         torch.index_select(self.kv_lens_cuda[:self.num_seqs], 0,
                            self.attn_row_req_idx_cuda[:rows],
                            out=self.attn_row_kv_lens_cuda[:rows])
