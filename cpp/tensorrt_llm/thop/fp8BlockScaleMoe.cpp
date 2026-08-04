@@ -197,6 +197,15 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     int32_t max_num_padded_tokens_gemm1
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, 2 * args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+    // FC2 reads activation_output through TRTLLM-Gen's TMA-OOB path. Blackwell TMA requires at
+    // least 128 KiB of backing memory when the descriptor's addressable extent is at least
+    // 128 KiB, even when every logical access is in bounds. A gated activation is half as wide as
+    // gemm1_output, so reusing max_num_padded_tokens_gemm1 can leave its backing allocation below
+    // that contract for small decode batches. Compute the capacity from its own row width instead;
+    // this also grows the associated FP32 scale allocation from 2 KiB to the required 4 KiB minimum.
+    int32_t max_num_padded_tokens_activation
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
     int32_t max_num_padded_tokens_gemm2
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
@@ -236,10 +245,11 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
     at::Tensor gemm1_output_scale = at::detail::empty_cuda({2 * intermediate_size / 128, max_num_padded_tokens_gemm1},
         at::ScalarType::Float, routing_device, std::nullopt);
-    at::Tensor activation_output = at::detail::empty_cuda(
-        {max_num_padded_tokens_gemm1, intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
-    at::Tensor activation_output_scale = at::detail::empty_cuda(
-        {intermediate_size / 128, max_num_padded_tokens_gemm1}, at::ScalarType::Float, routing_device, std::nullopt);
+    at::Tensor activation_output = at::detail::empty_cuda({max_num_padded_tokens_activation, intermediate_size},
+        at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
+    at::Tensor activation_output_scale
+        = at::detail::empty_cuda({intermediate_size / 128, max_num_padded_tokens_activation}, at::ScalarType::Float,
+            routing_device, std::nullopt);
     at::Tensor gemm2_output = at::detail::empty_cuda(
         {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 

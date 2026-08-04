@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -31,6 +32,25 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
+
+_DEFAULT_MOE_MAX_NUM_TOKENS = 18688
+
+
+def _get_moe_max_num_tokens_limit() -> int:
+    value = os.environ.get("TRTLLM_DEEPGEMM_MOE_MAX_NUM_TOKENS")
+    if value is None:
+        return _DEFAULT_MOE_MAX_NUM_TOKENS
+    try:
+        limit = int(value)
+    except ValueError as error:
+        raise ValueError(
+            "TRTLLM_DEEPGEMM_MOE_MAX_NUM_TOKENS must be a positive integer; "
+            f"got {value!r}") from error
+    if limit <= 0:
+        raise ValueError(
+            "TRTLLM_DEEPGEMM_MOE_MAX_NUM_TOKENS must be a positive integer; "
+            f"got {value!r}")
+    return limit
 
 
 @triton.jit
@@ -807,7 +827,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         # max_num_tokens = ((mtp+1)*max_batch_size+max_isl+128+63)//64*64 = 9344
         # moe_max_num_tokens = max_num_tokens * 2 = 18688
         # It can avoid OOM for 8k/1k cases.
-        default_moe_max_num_tokens = 18688
+        # Wide-EP deployments have fewer local expert slots and may have room
+        # for a larger workspace. The opt-in override permits measuring that
+        # memory/launch-count tradeoff while retaining the conservative default.
+        default_moe_max_num_tokens = _get_moe_max_num_tokens_limit()
         if model_config.moe_max_num_tokens > default_moe_max_num_tokens:
             model_config._frozen = False
             model_config.moe_max_num_tokens = default_moe_max_num_tokens
