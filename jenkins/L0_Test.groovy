@@ -1577,20 +1577,26 @@ def getInfraDryRunNodeArgs(int nodeCount, int gpuCount) {
 }
 
 def getInfraDryRunDirectCommand(String llmSrc, String outputPath, String stageName, String commit) {
+    def deviceType = stageName.startsWith("CPU-") ? "cpu" : "cuda"
     def benchmarkArgs = [
         "${llmSrc}/jenkins/scripts/infra_dry_run_benchmark.py",
         "--output-dir '${outputPath}'",
         "--stage '${stageName}'",
         "--commit '${commit}'",
+        "--device '${deviceType}'",
     ].join(" ")
     return """
-        set -euo pipefail
+        set -eu
         mkdir -p '${outputPath}'
-        gpu_count=\$(python3 -c 'import torch; print(torch.cuda.device_count())')
-        if [ "\$gpu_count" -gt 1 ]; then
-            torchrun --standalone --nproc-per-node="\$gpu_count" ${benchmarkArgs}
-        else
+        if [ '${deviceType}' = 'cpu' ]; then
             python3 ${benchmarkArgs}
+        else
+            gpu_count=\$(python3 -c 'import torch; print(torch.cuda.device_count())')
+            if [ "\$gpu_count" -gt 1 ]; then
+                torchrun --standalone --nproc-per-node="\$gpu_count" ${benchmarkArgs}
+            else
+                python3 ${benchmarkArgs}
+            fi
         fi
     """
 }
@@ -3772,7 +3778,7 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def runLLMDocBuild(pipeline, config)
+def runLLMDocBuild(pipeline, config, stageName)
 {
     // Step 1: cloning source code
     sh "pwd && ls -alh"
@@ -3796,6 +3802,17 @@ def runLLMDocBuild(pipeline, config)
     }
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
+
+    if (isInfraDryRun()) {
+        def commit = env.artifactCommit ?: env.gitlabCommit ?: ""
+        sh getInfraDryRunDirectCommand(
+            llmSrc,
+            "${WORKSPACE}/${stageName}",
+            stageName,
+            commit,
+        )
+        return
+    }
 
     // Step 3: build doc
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y doxygen python3-pip graphviz")
@@ -6357,7 +6374,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     docBuildConfigs = [
         "CPU-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
-            runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
+            runLLMDocBuild(pipeline, VANILLA_CONFIG, "A10-Build_Docs")
         }],
     ]
 
@@ -6372,7 +6389,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // pod-launch attempt; isFinalAttempt suppresses synthetic stage-fail XML
         // and junit() on intermediate retryable infra failures.
         stage("[${key}] Run") {
-            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
+            cacheErrorAndUploadResult("${key}", values[1], {}, !isInfraDryRun(), attemptTag, isFinalAttempt, retryContext)
         }
     }]]}
 

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run a small CUDA/NCCL smoke test and emit CI-friendly result artifacts."""
+"""Run a small CPU or CUDA/NCCL smoke test and emit CI-friendly result artifacts."""
 
 import argparse
 import json
@@ -38,8 +38,9 @@ class BenchmarkError(RuntimeError):
 
 def _load_runtime_modules() -> tuple[Any, Any]:
     # Normal imports intentionally exercise the installed package and PyTorch.
-    import tensorrt_llm
     import torch
+
+    import tensorrt_llm
 
     return tensorrt_llm, torch
 
@@ -63,12 +64,17 @@ def _new_result(
     stage: str | None,
     commit: str | None,
     environ: Mapping[str, str],
+    device_type: str,
 ) -> dict[str, Any]:
     return {
         "name": NAME,
         "status": "failed",
         "product_tests_executed": 0,
         **context,
+        "device_type": device_type,
+        "distributed_backend": (
+            "nccl" if device_type == "cuda" and context["world_size"] > 1 else "none"
+        ),
         "stage": stage or environ.get("STAGE_NAME") or environ.get("stageName") or "",
         "commit": commit or environ.get("GIT_COMMIT") or environ.get("gitlabCommit") or "",
         "tensorrt_llm_version": "unknown",
@@ -110,6 +116,26 @@ def _cuda_matmul(torch: Any, local_rank: int, device: str) -> dict[str, Any]:
     }
 
 
+def _cpu_matmul(torch: Any) -> dict[str, Any]:
+    torch.manual_seed(0)
+    left = torch.full((MATRIX_SIZE, MATRIX_SIZE), 0.5, dtype=torch.float32, device="cpu")
+    right = torch.full((MATRIX_SIZE, MATRIX_SIZE), 0.25, dtype=torch.float32, device="cpu")
+    output = torch.matmul(left, right)
+    if int(output.numel()) == 0:
+        raise BenchmarkError("CPU matrix multiplication returned an empty tensor")
+    if not bool(torch.isfinite(output).all().item()):
+        raise BenchmarkError("CPU matrix multiplication returned non-finite values")
+    checksum = float(output.float().sum().item())
+    if not math.isfinite(checksum):
+        raise BenchmarkError("CPU matrix multiplication checksum is non-finite")
+    return {
+        "device": "cpu",
+        "matrix_size": MATRIX_SIZE,
+        "dtype": "float32",
+        "checksum": checksum,
+    }
+
+
 def _initialize_distributed(torch: Any, context: Mapping[str, int], timeout_seconds: int) -> bool:
     if context["world_size"] == 1:
         return False
@@ -126,11 +152,12 @@ def _initialize_distributed(torch: Any, context: Mapping[str, int], timeout_seco
 
 
 def _summary(result: Mapping[str, Any]) -> dict[str, Any]:
+    device_type = str(result.get("device_type", "cuda"))
     return {
         "rank": int(result["rank"]),
         "world_size": int(result["world_size"]),
         "status": str(result["status"]),
-        "checksum": result.get("cuda", {}).get("checksum"),
+        "checksum": result.get(device_type, {}).get("checksum"),
         "error": str(result.get("error", "")),
     }
 
@@ -173,11 +200,9 @@ def _validate(summaries: list[Mapping[str, Any]], world_size: int) -> list[str]:
     if failed:
         errors.append(f"rank(s) {sorted(failed)} reported failure")
     try:
-        checksums = [
-            float(item["checksum"]) for item in summaries if item["status"] == "passed"
-        ]
+        checksums = [float(item["checksum"]) for item in summaries if item["status"] == "passed"]
     except (TypeError, ValueError):
-        errors.append("passed rank result is missing a valid CUDA checksum")
+        errors.append("passed rank result is missing a valid benchmark checksum")
     else:
         if any(not math.isfinite(value) for value in checksums):
             errors.append("rank results contain a non-finite CUDA checksum")
@@ -212,6 +237,8 @@ def _write_reports(
         "stage": result["stage"],
         "commit": result["commit"],
         "world_size": world_size,
+        "device_type": result.get("device_type", "cuda"),
+        "distributed_backend": result.get("distributed_backend", "none"),
         "observed_ranks": sorted(int(item["rank"]) for item in summaries),
         "validation_errors": errors,
         "rank_results": summaries,
@@ -221,6 +248,7 @@ def _write_reports(
 
     by_rank = {int(item["rank"]): item for item in summaries}
     cases: list[tuple[str, str | None]] = []
+    device_type = str(result.get("device_type", "cuda"))
     for rank in range(world_size):
         item = by_rank.get(rank)
         failure = None
@@ -228,7 +256,7 @@ def _write_reports(
             failure = f"missing result for rank {rank}"
         elif item["status"] != "passed":
             failure = str(item.get("error") or f"rank {rank} failed")
-        cases.append((f"{NAME}_rank_{rank}_cuda_matmul", failure))
+        cases.append((f"{NAME}_rank_{rank}_{device_type}_matmul", failure))
     if world_size > 1:
         cases.append((f"{NAME}_nccl_collective", "; ".join(errors) or None))
 
@@ -244,7 +272,14 @@ def _write_reports(
         },
     )
     properties = ET.SubElement(suite, "properties")
-    for name in ("product_tests_executed", "stage", "commit", "world_size"):
+    for name in (
+        "product_tests_executed",
+        "stage",
+        "commit",
+        "world_size",
+        "device_type",
+        "distributed_backend",
+    ):
         ET.SubElement(properties, "property", {"name": name, "value": str(manifest[name])})
     for name, failure in cases:
         case = ET.SubElement(
@@ -270,11 +305,12 @@ def run_benchmark(
     stage: str | None = None,
     commit: str | None = None,
     timeout_seconds: int = 120,
+    device_type: str = "cuda",
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     environment = os.environ if environ is None else environ
     context = _rank_context(environment)
-    result = _new_result(context, stage, commit, environment)
+    result = _new_result(context, stage, commit, environment, device_type)
     summaries = [_summary(result)]
     torch = None
     distributed = False
@@ -283,13 +319,19 @@ def run_benchmark(
         trtllm, torch = _load_runtime_modules()
         result["tensorrt_llm_version"] = str(getattr(trtllm, "__version__", "unknown"))
         result["tensorrt_llm_module"] = str(getattr(trtllm, "__file__", "unknown"))
-        device = _select_cuda_device(torch, context["local_rank"])
-        distributed = _initialize_distributed(torch, context, timeout_seconds)
-        try:
-            result["cuda"] = _cuda_matmul(torch, context["local_rank"], device)
+        if device_type == "cpu":
+            if context["world_size"] != 1:
+                raise BenchmarkError("CPU mode requires WORLD_SIZE=1")
+            result["cpu"] = _cpu_matmul(torch)
             result["status"] = "passed"
-        except Exception as error:
-            result["error"] = f"{type(error).__name__}: {error}"
+        else:
+            device = _select_cuda_device(torch, context["local_rank"])
+            distributed = _initialize_distributed(torch, context, timeout_seconds)
+            try:
+                result["cuda"] = _cuda_matmul(torch, context["local_rank"], device)
+                result["status"] = "passed"
+            except Exception as error:
+                result["error"] = f"{type(error).__name__}: {error}"
         summaries = _gather_summaries(torch, result) if distributed else [_summary(result)]
     except Exception as error:
         result["status"] = "failed"
@@ -302,9 +344,9 @@ def run_benchmark(
             except Exception as error:
                 result["status"] = "failed"
                 result["error"] = f"distributed cleanup failed: {error}"
-                summaries = [
-                    item for item in summaries if int(item["rank"]) != context["rank"]
-                ] + [_summary(result)]
+                summaries = [item for item in summaries if int(item["rank"]) != context["rank"]] + [
+                    _summary(result)
+                ]
 
     errors = _validate(summaries, context["world_size"])
     result["overall_status"] = "failed" if errors else "passed"
@@ -321,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("."))
     parser.add_argument("--stage")
     parser.add_argument("--commit")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--distributed-timeout-seconds", type=int, default=120)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
@@ -329,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             stage=args.stage,
             commit=args.commit,
             timeout_seconds=args.distributed_timeout_seconds,
+            device_type=args.device,
         )
     except Exception as error:
         print(f"{NAME} failed: {error}", file=sys.stderr)

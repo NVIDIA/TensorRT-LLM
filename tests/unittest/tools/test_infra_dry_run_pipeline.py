@@ -45,9 +45,48 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             "getPytestBaseCommandLine",
         )
         self.assertIn("torch.cuda.device_count()", body)
+        self.assertIn("if [ '${deviceType}' = 'cpu' ]", body)
         self.assertIn('if [ "\\$gpu_count" -gt 1 ]', body)
         self.assertIn('torchrun --standalone --nproc-per-node="\\$gpu_count"', body)
         self.assertIn("python3 ${benchmarkArgs}", body)
+        self.assertIn('stageName.startsWith("CPU-") ? "cpu" : "cuda"', body)
+        self.assertIn("\"--device '${deviceType}'\"", body)
+
+    def test_direct_command_is_posix_shell_compatible(self):
+        body = _function_body(
+            GROOVY,
+            "getInfraDryRunDirectCommand",
+            "getPytestBaseCommandLine",
+        )
+        self.assertIn("set -eu", body)
+        self.assertNotIn("pipefail", body)
+
+    def test_docs_dry_run_bypasses_normal_doc_build_and_keeps_results(self):
+        body = _function_body(GROOVY, "runLLMDocBuild", "launchTestListCheck")
+        dry_guard = body.index("if (isInfraDryRun())")
+        benchmark = body.index("getInfraDryRunDirectCommand(", dry_guard)
+        early_return = body.index("return", benchmark)
+        sphinx = body.index("make html")
+        self.assertLess(dry_guard, benchmark)
+        self.assertLess(benchmark, early_return)
+        self.assertLess(early_return, sphinx)
+        self.assertIn('"${WORKSPACE}/${stageName}"', body[dry_guard:early_return])
+
+        doc_jobs = GROOVY[
+            GROOVY.index("docBuildConfigs = [") : GROOVY.index("// Python version and OS")
+        ]
+        self.assertIn('runLLMDocBuild(pipeline, VANILLA_CONFIG, "A10-Build_Docs")', doc_jobs)
+        self.assertIn("{}, !isInfraDryRun(), attemptTag", doc_jobs)
+
+    def test_package_sanity_uses_the_shared_direct_benchmark_path(self):
+        package_jobs = GROOVY[
+            GROOVY.index("sanityCheckJobs =") : GROOVY.index(
+                "multiGpuJobs =", GROOVY.index("sanityCheckJobs =")
+            )
+        ]
+        self.assertIn("runLLMTestlistOnPlatform(", package_jobs)
+        self.assertIn("toStageName(values[1], key)", package_jobs)
+        self.assertNotIn('"CPU-', package_jobs)
 
     def test_slurm_command_allocates_one_task_per_gpu(self):
         body = _function_body(GROOVY, "getInfraDryRunNodeArgs", "getInfraDryRunDirectCommand")
