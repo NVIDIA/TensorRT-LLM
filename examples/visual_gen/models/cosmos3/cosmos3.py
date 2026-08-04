@@ -93,7 +93,8 @@ def main():
         "--model",
         type=str,
         default="nvidia/Cosmos3-Nano",
-        help="Model path or HuggingFace Hub ID (nvidia/Cosmos3-Nano, nvidia/Cosmos3-Super)",
+        help="Model path or HuggingFace Hub ID "
+        "(nvidia/Cosmos3-Nano, nvidia/Cosmos3-Super, nvidia/Cosmos3-Edge)",
     )
     parser.add_argument(
         "--visual_gen_args",

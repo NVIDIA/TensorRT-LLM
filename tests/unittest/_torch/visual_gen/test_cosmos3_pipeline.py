@@ -53,6 +53,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     _load_reference_image,
     _normalize_condition_video_latent_indexes,
 )
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
@@ -666,6 +667,9 @@ class TestCosmos3V2V:
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = False
+        # Bypassing __init__ means the generation-default family has to be set
+        # here; forward() reads its per-mode table through it.
+        pipeline.family = QWEN3_RECIPE.name
         calls = []
         token_calls = []
 
@@ -732,6 +736,9 @@ class TestCosmos3V2V:
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = True
+        # Bypassing __init__ means the generation-default family has to be set
+        # here; forward() reads its per-mode table through it.
+        pipeline.family = QWEN3_RECIPE.name
         rebuilt = []
 
         class StopAfterTokenize(Exception):
