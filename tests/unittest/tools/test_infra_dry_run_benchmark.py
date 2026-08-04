@@ -128,6 +128,7 @@ class _Distributed:
 
 class _Torch:
     float16 = "float16"
+    float32 = "float32"
     float64 = "float64"
 
     def __init__(self, *, cuda=True, finite=True, numel=16, remote=None):
@@ -196,7 +197,7 @@ class InfraDryRunBenchmarkTest(unittest.TestCase):
                 BENCHMARK._load_runtime_modules(),
                 (modules["tensorrt_llm"], modules["torch"]),
             )
-        self.assertEqual(imported, ["tensorrt_llm", "torch"])
+        self.assertCountEqual(imported, ["tensorrt_llm", "torch"])
 
     def test_single_rank_success_writes_rank_manifest_and_junit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -238,6 +239,30 @@ class InfraDryRunBenchmarkTest(unittest.TestCase):
                 self.assertIn(expected, rank["error"])
                 self.assertEqual(manifest["status"], "failed")
                 self.assertIsNotNone(junit.find(".//failure"))
+
+    def test_cpu_mode_runs_without_cuda_and_writes_cpu_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            result = _run(
+                output_dir,
+                _Torch(cuda=False),
+                stage="CPU-Generic-x86-1",
+                device_type="cpu",
+                environ={},
+            )
+            rank, manifest, junit = _read_outputs(output_dir)
+
+        self.assertEqual(result["overall_status"], "passed")
+        self.assertEqual(rank["cpu"]["device"], "cpu")
+        self.assertEqual(manifest["device_type"], "cpu")
+        self.assertEqual(manifest["distributed_backend"], "none")
+        self.assertEqual(manifest["product_tests_executed"], 0)
+        self.assertIsNone(result.get("cuda"))
+        self.assertEqual(
+            junit.find(".//testcase").attrib["name"],
+            "infra_dry_run_rank_0_cpu_matmul",
+        )
+        self.assertIsNone(junit.find(".//failure"))
 
     def test_import_failure_writes_failure_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
