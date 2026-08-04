@@ -101,7 +101,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 pos_embd_params,
                 mla_params,
                 skip_create_weights_in_init,
-                sparse_attention_config,
+                sparse_params,
                 dtype,
                 self.compress_ratio,
                 layer_idx,

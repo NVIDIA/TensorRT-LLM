@@ -18,10 +18,9 @@ from tensorrt_llm.quantization.utils import fp8_utils
 
 from ..dsa.indexer import HAS_FAST_HADAMARD, Indexer, rotate_activation
 from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
+from .params import DeepSeekV4Params
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
-
     from ..dsa.metadata import DSAtrtllmAttentionMetadata
     from .metadata import DeepseekV4TrtllmAttentionMetadata
 
@@ -33,7 +32,7 @@ class DeepseekV4Indexer(Indexer):
         pos_embd_params: Optional[PositionalEmbeddingParams],
         mla_params: Optional[MLAParams],
         skip_create_weights_in_init: bool,
-        sparse_attention_config: "SparseAttentionConfig",
+        sparse_params: DeepSeekV4Params,
         dtype: Optional[torch.dtype],
         compress_ratio: int = 1,
         layer_idx: int = 0,
@@ -44,7 +43,7 @@ class DeepseekV4Indexer(Indexer):
             pos_embd_params,
             mla_params,
             skip_create_weights_in_init,
-            sparse_attention_config,
+            sparse_params,
             dtype,
             compress_ratio,
             layer_idx,
@@ -69,7 +68,7 @@ class DeepseekV4Indexer(Indexer):
             is_neox=False,
         )
         rms_norm_eps = 1e-6
-        index_head_dim = sparse_attention_config.index_head_dim
+        index_head_dim = sparse_params.index_head_dim
         indexer_mla_params = MLAParams(
             hidden_size=mla_params.hidden_size,
             qk_rope_head_dim=mla_params.qk_rope_head_dim,
@@ -80,7 +79,7 @@ class DeepseekV4Indexer(Indexer):
         # covers main-attention layouts (bf16 / fp8_pertensor), which the
         # indexer doesn't use, so the translation lives here at the
         # boundary instead of leaking through the user-facing config.
-        self.indexer_k_dtype = sparse_attention_config.indexer_k_dtype
+        self.indexer_k_dtype = sparse_params.indexer_k_dtype
         compressor_preset = "mxfp4" if self.indexer_k_dtype == "fp4" else "fp8_blockwise"
         self.indexer_cache_dtype = resolve_kv_cache_dtype(compressor_preset)
         self.compressor = Compressor(
