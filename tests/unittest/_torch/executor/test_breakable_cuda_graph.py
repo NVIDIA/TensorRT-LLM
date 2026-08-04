@@ -91,17 +91,16 @@ def test_eager_on_graph_during_torch_compile():
     torch.testing.assert_close(compiled_add_one(value), value + 1)
 
 
-def test_make_weak_ref_option_preserves_unsupported_values():
+def test_make_weak_ref_supports_value_types_and_rejects_objects():
     unsupported = object()
     with pytest.raises(TypeError, match="Invalid type"):
         make_weak_ref(unsupported)
 
-    captured = make_weak_ref(
-        {"nested": (unsupported, [None, "value"])},
-        preserve_unsupported=True,
-    )
-    assert captured == {"nested": (unsupported, [None, "value"])}
-    assert captured["nested"][0] is unsupported
+    value = {"nested": (None, "value", [1, 2.0, True])}
+    assert make_weak_ref(value) == value
+
+    with pytest.raises(TypeError, match="Invalid type"):
+        make_weak_ref({unsupported: "value"})
 
 
 def test_break_graph_inserts_empty_breakpoint():
@@ -222,12 +221,14 @@ def test_runner_warmup_capture_execute_and_shared_output():
 
 def test_runner_first_bucket_segments_share_one_memory_pool():
     class BreakableBody(nn.Module):
+        @staticmethod
         @eager_on_graph
-        def eager_add_one(self, value):
+        def eager_add_one(value):
             return value + 1
 
+        @staticmethod
         @eager_on_graph
-        def eager_double(self, value):
+        def eager_double(value):
             return value * 2
 
         def forward(self, value):

@@ -161,11 +161,9 @@ def eager_on_graph(inner: Callable) -> Callable:
         capture._end_current_segment()
         output = inner(*args, **kwargs)
 
-        captured_args = tuple(make_weak_ref(arg, preserve_unsupported=True) for arg in args)
-        captured_kwargs = {
-            key: make_weak_ref(value, preserve_unsupported=True) for key, value in kwargs.items()
-        }
-        captured_output = make_weak_ref(output, preserve_unsupported=True)
+        captured_args = tuple(make_weak_ref(arg) for arg in args)
+        captured_kwargs = {key: make_weak_ref(value) for key, value in kwargs.items()}
+        captured_output = make_weak_ref(output)
 
         def replay_fn() -> Any:
             new_output = inner(*captured_args, **captured_kwargs)

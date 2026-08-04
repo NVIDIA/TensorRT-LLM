@@ -159,29 +159,19 @@ def with_model_extra_attrs(get_attrs):
     return decorator
 
 
-def make_weak_ref(x, preserve_unsupported: bool = False):
+def make_weak_ref(x):
 
     if isinstance(x, torch.Tensor):
         return convert_to_torch_tensor(
             TensorWrapper(x.data_ptr(), x.dtype, x.shape,
                           x.stride())) if x.is_cuda else x
     elif isinstance(x, tuple):
-        return tuple(
-            make_weak_ref(i, preserve_unsupported=preserve_unsupported)
-            for i in x)
+        return tuple(make_weak_ref(i) for i in x)
     elif isinstance(x, list):
-        return [
-            make_weak_ref(i, preserve_unsupported=preserve_unsupported)
-            for i in x
-        ]
+        return [make_weak_ref(i) for i in x]
     elif isinstance(x, dict):
-        return {
-            k: make_weak_ref(v, preserve_unsupported=preserve_unsupported)
-            for k, v in x.items()
-        }
-    elif isinstance(x, (int, float, bool)):
-        return x
-    elif preserve_unsupported:
+        return {make_weak_ref(k): make_weak_ref(v) for k, v in x.items()}
+    elif x is None or isinstance(x, (int, float, str, bool)):
         return x
     else:
         raise TypeError(f"Invalid type {type(x)} to make weak ref")
