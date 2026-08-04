@@ -49,11 +49,14 @@ from blocks import (  # noqa: E402
     write_filtered_test_db,
 )
 from coverage_tier import (  # noqa: E402
+    DEFAULT_NO_DATA_POLICY,
+    NO_DATA_POLICIES,
     apply_coverage_tier,
     compute_coverage_stage_counts,
     open_db,
     write_coverage_test_db,
 )
+
 from rules._helpers import strip_noop_diff_lines  # noqa: E402
 from rules.agent_flow_rule import AgentFlowRule  # noqa: E402
 from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
@@ -338,6 +341,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Path to cbts_touchmap.sqlite. When set, the coverage tier (Tier 2) "
         "runs on fallbacks and may drop fully-safe single-GPU stages.",
     )
+    parser.add_argument(
+        "--no-data-policy",
+        choices=NO_DATA_POLICIES,
+        default=DEFAULT_NO_DATA_POLICY,
+        help="How to treat a changed function with no rows in the coverage DB: "
+        "'file' force-runs every test entering that file, 'importers' only the "
+        "file's <module> touch set, 'ignore' treats it as impacting nothing "
+        f"(default: {DEFAULT_NO_DATA_POLICY}).",
+    )
     args = parser.parse_args(argv)
 
     if args.list_needed_diffs:
@@ -389,7 +401,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             db = open_db(args.coverage_db)
             tier, note = apply_coverage_tier(
-                pr, selector.pairs, selector.handled, stages, yaml_index, repo_root, db
+                pr,
+                selector.pairs,
+                selector.handled,
+                stages,
+                yaml_index,
+                repo_root,
+                db,
+                no_data_policy=args.no_data_policy,
             )
         except Exception as e:  # noqa: BLE001 — CBTS must never break CI
             note = f"coverage tier errored: {e}"

@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from qualname_map import qualnames_for_lines
-from rules._helpers import iter_diff_post_line_numbers
 from touch_db import (
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
@@ -28,20 +27,33 @@ from touch_db import (
     TouchDB,
     canon,
     split_stage,
+    stage_family,
 )
+
+from rules._helpers import iter_diff_post_line_numbers
 
 
 @dataclass
 class CoverageResult:
-    """Per-stage coverage decision over a set of residual core-Python files."""
+    """Per-stage-family coverage decision over a set of residual core-Python files."""
 
     ok: bool
     reason: str
+    # keyed by stage family (shard suffix stripped); see `touch_db.stage_family`
     impacted: dict[str, set[str]] = field(default_factory=dict)
     skippable: dict[str, set[str]] = field(default_factory=dict)
     n_untrusted: int = 0
-    # functions with no DB rows (new/uninstrumented); bounded via importers
+    # functions with no DB rows (new/uninstrumented); bounded per `no_data_policy`
     no_data_funcs: list[str] = field(default_factory=list)
+
+
+# What to do with a changed function that has no rows in the DB — it was never
+# captured, so "which tests exercise it" is unknown rather than empty.
+#   file       fall back to every test that entered any function in the file
+#   importers  fall back to the file's `<module>` touch set (its importers)
+#   ignore     treat as impacting nothing
+NO_DATA_POLICIES = ("file", "importers", "ignore")
+DEFAULT_NO_DATA_POLICY = "file"
 
 
 class CoverageSelector:
@@ -54,6 +66,7 @@ class CoverageSelector:
         launch_markers: tuple[tuple[str, str], ...] = _LAUNCH_MARKERS,
         serving_path_markers: tuple[str, ...] = _SERVING_PATH_MARKERS,
         min_funcs: int = _MIN_FUNCS,
+        no_data_policy: str = DEFAULT_NO_DATA_POLICY,
     ) -> None:
         self.db = db
         self.repo_root = Path(repo_root)
@@ -61,6 +74,7 @@ class CoverageSelector:
         self._launch_markers = launch_markers
         self._serving_path_markers = serving_path_markers
         self._min_funcs = min_funcs
+        self._no_data_policy = no_data_policy
         self._untrusted: set[str] | None = None
 
     def untrusted_tests(self) -> set[str]:
@@ -73,6 +87,18 @@ class CoverageSelector:
                 self._min_funcs,
             )
         return self._untrusted
+
+    def untrusted_families(self) -> set[str]:
+        """`untrusted_tests()` re-keyed to `<stage family>/<nodeid>`.
+
+        Untrusted on any shard means untrusted for the family — the entry runs.
+        """
+        out: set[str] = set()
+        for test in self.untrusted_tests():
+            stage, nodeid = split_stage(test)
+            if stage:
+                out.add(f"{stage_family(stage)}/{nodeid}")
+        return out
 
     def _impacted_tests(
         self, residual_files: list[str], diffs: dict[str, str]
@@ -96,7 +122,20 @@ class CoverageSelector:
                 impacted |= tests
                 if not tests and qualname != "<module>":
                     no_data.append(f"{cf}::{qualname}")
+                    impacted |= self._no_data_fallback(cf)
         return impacted, no_data
+
+    def _no_data_fallback(self, cf: str) -> set[str]:
+        """Tests to force-run for a changed function the DB never captured.
+
+        No rows means the function was never observed, not that no test reaches
+        it, so the file's own test set is the tightest sound bound available.
+        """
+        if self._no_data_policy == "file":
+            return self.db.tests_touching_file(cf)
+        if self._no_data_policy == "importers":
+            return self.db.tests_touching_func(cf, "<module>")
+        return set()
 
     def _read_head(self, path: str) -> str | None:
         try:
@@ -124,16 +163,16 @@ class CoverageSelector:
         for test in impacted_tests:
             stage, nodeid = split_stage(test)
             if stage:
-                impacted.setdefault(stage, set()).add(nodeid)
+                impacted.setdefault(stage_family(stage), set()).add(nodeid)
 
-        untrusted = self.untrusted_tests()
+        untrusted = self.untrusted_families()
         skippable: dict[str, set[str]] = {}
         n_untrusted = 0
-        for stage, known_nodeids in self.db.known_by_stage().items():
-            imp = impacted.get(stage, set())
-            keep_untrusted = {n for n in known_nodeids if f"{stage}/{n}" in untrusted}
+        for family, known_nodeids in self.db.known_by_family().items():
+            imp = impacted.get(family, set())
+            keep_untrusted = {n for n in known_nodeids if f"{family}/{n}" in untrusted}
             n_untrusted += len(keep_untrusted - imp)
-            skippable[stage] = known_nodeids - imp - keep_untrusted
+            skippable[family] = known_nodeids - imp - keep_untrusted
 
         return CoverageResult(
             ok=True,

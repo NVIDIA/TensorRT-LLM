@@ -35,6 +35,9 @@ _CANON_RE = re.compile(r"(tensorrt_llm/.*)$")
 # A DB test value is `<stage>/<nodeid>`; unit tests wrap the inner entry.
 _UNITTEST_WRAP_RE = re.compile(r"::test_unittests_v2\[(?P<inner>.+)\]$")
 
+# Trailing `-<split_id>` of a pytest-split shard name.
+_SPLIT_SUFFIX_RE = re.compile(r"-\d+$")
+
 # Completeness-heuristic constants consumed by `untrusted_tests()`.
 _WORKER_SENTINEL = "tensorrt_llm/_torch/pyexecutor/py_executor.py"
 _LAUNCH_MARKERS: tuple[tuple[str, str], ...] = (
@@ -55,6 +58,18 @@ def split_stage(test: str) -> tuple[str, str]:
     """Split a DB `test` value `<stage>/<nodeid>` into `(stage, nodeid)`; `("", test)` if no `/`."""
     stage, sep, nodeid = test.partition("/")
     return (stage, nodeid) if sep else ("", test)
+
+
+def stage_family(stage: str) -> str:
+    """Collapse a pytest-split shard name to its family (`A10-PyTorch-2` -> `A10-PyTorch`).
+
+    Coverage is captured per shard, but pytest-split assigns each entry to
+    exactly one shard, so a stage's shards hold disjoint capture sets. Only the
+    family-level union answers "was this entry ever captured on this stage" —
+    and the shard an entry lands on is not stable across runs anyway, since
+    pytest-split rebalances by duration.
+    """
+    return _SPLIT_SUFFIX_RE.sub("", stage)
 
 
 def unwrap_unittest(nodeid: str) -> Optional[str]:
@@ -179,6 +194,18 @@ class TouchDB:
             stage, nodeid = split_stage(test)
             if stage:
                 out.setdefault(stage, set()).add(nodeid)
+        return out
+
+    def known_by_family(self) -> dict[str, set[str]]:
+        """`{stage family -> {bare nodeid, ...}}` — a stage's shards unioned.
+
+        Selection keys on this rather than `known_by_stage`: see `stage_family`.
+        """
+        out: dict[str, set[str]] = {}
+        for test in self.known_tests():
+            stage, nodeid = split_stage(test)
+            if stage:
+                out.setdefault(stage_family(stage), set()).add(nodeid)
         return out
 
     # -- forward lookup (debug / explain-why) --
