@@ -355,8 +355,34 @@ def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
 
 
+def _vision_requires_replication(model_config: ModelConfig) -> bool:
+    """Whether the MoonViT vision tower must run replicated (tp=1) rather than
+    tensor-parallel sharded across the attention-TP ranks.
+
+    Replication is required when either:
+
+    * attention data-parallelism is enabled (attention weights are already
+      replicated per rank), or
+    * the vision attention head count is not divisible by the attention-TP
+      degree (e.g. Kimi K3's 12 heads under TP16). Such a tower cannot be
+      TP-sharded at all, so it must be replicated instead of tripping the
+      ``num_heads % tp_size`` assertion in :class:`Attention`.
+    """
+    mapping = model_config.mapping
+    if mapping.enable_attention_dp:
+        return True
+    vision_cfg = getattr(model_config.pretrained_config, "vision_config",
+                         None) or {}
+    if not isinstance(vision_cfg, dict):
+        vision_cfg = (vision_cfg.to_dict()
+                      if hasattr(vision_cfg, "to_dict") else vars(vision_cfg))
+    num_heads = vision_cfg.get("vt_num_attention_heads",
+                               vision_cfg.get("num_attention_heads", 12))
+    return (num_heads % mapping.tp_size) != 0
+
+
 def _get_vision_tp_mapping(model_config: ModelConfig) -> Mapping:
-    if not model_config.mapping.enable_attention_dp:
+    if not _vision_requires_replication(model_config):
         return model_config.mapping
 
     return Mapping(
@@ -770,6 +796,13 @@ class KimiK25VisionModel(nn.Module):
             kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
         )
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
+        # The MoonViT tower cannot be tensor-parallel sharded when its attention
+        # head count is not divisible by the attention-TP degree (e.g. Kimi K3's
+        # 12 heads under TP16); run the whole tower replicated (tp=1) in that
+        # case so module construction and weight loading agree. Attention-DP
+        # already replicates the vision tower via its own path, so leave it be.
+        if not model_config.mapping.enable_attention_dp:
+            self.model_config.mapping = _get_vision_tp_mapping(model_config)
         pretrained_config = self.model_config.pretrained_config
         model_dtype = (
             getattr(pretrained_config, "torch_dtype", None)

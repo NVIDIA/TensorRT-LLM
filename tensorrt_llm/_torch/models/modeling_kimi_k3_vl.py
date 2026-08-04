@@ -292,6 +292,13 @@ class KimiK3VisionModel(KimiK25VisionModel):
             kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
         )
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
+        # The MoonViT tower cannot be tensor-parallel sharded when its attention
+        # head count is not divisible by the attention-TP degree (e.g. Kimi K3's
+        # 12 heads under TP16); run the whole tower replicated (tp=1) in that
+        # case so module construction and weight loading agree. Attention-DP
+        # already replicates the vision tower via its own path, so leave it be.
+        if not model_config.mapping.enable_attention_dp:
+            self.model_config.mapping = _get_vision_tp_mapping(model_config)
         pretrained_config = self.model_config.pretrained_config
         model_dtype = (
             getattr(pretrained_config, "torch_dtype", None)
