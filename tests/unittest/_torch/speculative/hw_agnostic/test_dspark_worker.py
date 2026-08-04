@@ -28,6 +28,7 @@ import torch
 
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata, DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm._torch.speculative.utils import get_spec_metadata
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="DSpark metadata/worker allocate CUDA buffers"
@@ -132,6 +133,41 @@ def test_worker_lazy_init_window_buffers():
     buf_id = id(worker._kv_windows)
     worker._lazy_init(dm, meta)
     assert id(worker._kv_windows) == buf_id
+
+
+def test_worker_graph_bucket_uses_full_seq_slot_pool():
+    """A small graph bucket must not shrink the persistent rolling-window pool."""
+    num_seq_slots = 5
+    spec_config = types.SimpleNamespace(
+        max_draft_len=5,
+        tokens_per_gen_step=6,
+        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+        target_layer_ids=[],
+    )
+    metadata = get_spec_metadata(
+        spec_config,
+        types.SimpleNamespace(hidden_size=HIDDEN, torch_dtype=torch.bfloat16, vocab_size=32),
+        max_num_requests=num_seq_slots,
+        max_num_tokens=8,
+        num_seq_slots=num_seq_slots,
+    ).create_cuda_graph_metadata(max_batch_size=2)
+    worker = _make_worker()
+    worker._lazy_init(
+        _fake_draft_model(num_stages=1, window_size=8, head_dim=4),
+        metadata,
+    )
+
+    assert metadata.max_num_requests == 2 < metadata.num_seq_slots
+    assert worker._kv_windows.shape == (6, 1, 8, 4)
+    assert worker._ctx_len.shape == (6,)
+    assert worker._batch_to_slot.shape == (num_seq_slots,)
+    assert worker._scratch_slot == num_seq_slots
+    assert list(worker._free_slots) == list(range(num_seq_slots))
+
+    live_slots = {worker._assign_slot(100 + i, reset=False) for i in range(num_seq_slots)}
+    assert live_slots == set(range(num_seq_slots))
+    assert worker._scratch_slot not in live_slots
+    assert list(worker._free_slots) == []
 
 
 def test_worker_rejects_mismatched_block_size():
