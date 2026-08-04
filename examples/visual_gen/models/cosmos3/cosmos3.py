@@ -71,31 +71,42 @@ def _load_transfer_controls(extra_params: Dict[str, Any]) -> Optional[str]:
     return first_path
 
 
-def _fit_output_to_source(params, source_path: Optional[str]) -> None:
+def _source_frame_size(source_path: str) -> tuple[int, int] | None:
+    """Read ``(height, width)`` from a video container header.
+
+    Demuxing is CPU-side FFmpeg inside PyNvVideoCodec — the decoder this repo
+    already depends on — so it costs no GPU and no extra dependency, and the
+    stream's dimensions come off the header without decoding a frame.
+    """
+    import PyNvVideoCodec as nvc
+
+    data = Path(source_path).read_bytes()
+    position = 0
+
+    def _read(buf: bytearray) -> int:
+        nonlocal position
+        chunk = data[position : position + len(buf)]
+        buf[: len(chunk)] = chunk
+        position += len(chunk)
+        return len(chunk)
+
+    demuxer = nvc.CreateDemuxer(_read)
+    height, width = int(demuxer.Height()), int(demuxer.Width())
+    return (height, width) if height > 0 and width > 0 else None
+
+
+def _fit_output_to_source(params, source_path: str | None) -> None:
     """Size the output to the bucket whose aspect ratio matches ``source_path``.
 
     Transfer output resolution comes from the request (as it does for V2V), so
-    the aspect fit happens here, where the file is still at hand. Needs OpenCV
-    to read the frame size; without it the model defaults stand.
+    the aspect fit happens here, where the file is still at hand.
     """
     if source_path is None:
         return
-    try:
-        import cv2
-    except ImportError:
-        print("OpenCV not installed: leaving the output resolution at the model default.")
+    size = _source_frame_size(source_path)
+    if size is None:
         return
-    capture = cv2.VideoCapture(str(source_path))
-    try:
-        if not capture.isOpened():
-            return
-        source_w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        source_h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    finally:
-        capture.release()
-    if source_w <= 0 or source_h <= 0:
-        return
-    params.width, params.height = find_closest_target_size(source_h, source_w, 720)
+    params.width, params.height = find_closest_target_size(*size, 720)
     print(f"Fitting output to the source aspect: {params.width}x{params.height} (WxH)")
 
 
