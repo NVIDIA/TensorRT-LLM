@@ -17,7 +17,7 @@ import enum
 import os
 import threading
 from dataclasses import replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
 import torch
@@ -1957,7 +1957,8 @@ def _(
 class Fp8BlockScalingGemmRunner(TunableRunner):
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, partial(deep_gemm_gen_tuning_buckets,
+                          x_is_declared_max=True)), ),
         tune_max_num_tokens=4096,
     )
 

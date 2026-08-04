@@ -186,3 +186,73 @@ def test_measured_cold_band_now_has_a_bucket_inside_it(m, block_m):
         f"containing M={m}: that band JIT-compiles on a live iteration "
         f"(nvbug 6550749)"
     )
+
+
+# ---------------------------------------------------------------------------
+# x_is_declared_max: honour a caller's tune_max_num_tokens instead of the floor.
+#
+# The 4096 floor exists only because fp8SwapABGemmRunner declares no
+# tune_max_num_tokens, so it receives the *current input size*. A caller that
+# does declare one gets its buckets clamped there instead: AutoTuner
+# ._find_nearest_profile looks up with min(M, tune_max_num_tokens), so a bucket
+# above the declared max can never be selected. Profiling it is pure cost, and
+# for the two cute_dsl MoE ops (declared max 512, and multi-tactic, so every
+# bucket is profiled per tactic) that was 224 of 264 buckets.
+# ---------------------------------------------------------------------------
+
+_DECLARED_MAXES = (128, 256, 512, 1024, 2048, 4096, 8192)
+
+
+@pytest.mark.parametrize("declared_max", _DECLARED_MAXES)
+def test_declared_max_is_not_raised_to_the_floor(declared_max):
+    """No bucket may exceed a declared max (it would be unreachable)."""
+    buckets = deep_gemm_gen_tuning_buckets(declared_max, x_is_declared_max=True)
+
+    over = [b for b in buckets if b > declared_max]
+    assert not over, (
+        f"buckets {over} exceed the declared max {declared_max}; the runtime "
+        f"lookup clamps M to it, so these are profiled but never selected"
+    )
+
+
+@pytest.mark.parametrize("declared_max", _DECLARED_MAXES)
+def test_declared_max_still_covers_every_reachable_m(declared_max):
+    """Thinning must not reintroduce a hole below the declared max."""
+    buckets = deep_gemm_gen_tuning_buckets(declared_max, x_is_declared_max=True)
+
+    for m in range(128, declared_max + 1):
+        band_start = ((m - 1) // 16) * 16 + 1
+        band = range(band_start, band_start + 16)
+        assert any(b in band for b in buckets), (
+            f"declared_max={declared_max}: M={m} is reachable but its band "
+            f"[{band.start}, {band.stop - 1}] holds no bucket"
+        )
+
+
+def test_declared_max_thins_the_multi_tactic_moe_case():
+    """The cute_dsl MoE ops declare 512; that must cost far less than the floor.
+
+    Pins the reduction hyukn asked for on PR #17242 so a later edit cannot
+    silently restore the floor for callers that declare a maximum.
+    """
+    honoured = deep_gemm_gen_tuning_buckets(512, x_is_declared_max=True)
+    floored = deep_gemm_gen_tuning_buckets(512)
+
+    assert len(honoured) == 40, len(honoured)
+    assert len(floored) == 264, len(floored)
+    assert max(honoured) == 512
+
+
+def test_default_is_unchanged_for_callers_without_a_declared_max():
+    """fp8SwapABGemmRunner's path must be byte-identical to the floor form.
+
+    It receives the current input size, not a maximum, so dropping the floor
+    there would warm nothing above the first call's M.
+    """
+    for x in (64, 128, 512, 2048, 4096, 8192, 9000):
+        assert deep_gemm_gen_tuning_buckets(x) == deep_gemm_gen_tuning_buckets(
+            x, x_is_declared_max=False
+        )
+
+    # A small first call still warms the full floor range.
+    assert max(deep_gemm_gen_tuning_buckets(64)) == 4096

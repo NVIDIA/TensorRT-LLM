@@ -362,13 +362,21 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
 DEEP_GEMM_BLOCK_M_QUANTUM = 16
 
 
-def deep_gemm_gen_tuning_buckets(x: int) -> Tuple[int, ...]:
+def deep_gemm_gen_tuning_buckets(x: int,
+                                 x_is_declared_max: bool = False
+                                 ) -> Tuple[int, ...]:
     """Generate the M values to autotune, so DeepGEMM JIT-compiles every config.
 
     Args:
-        x: Upper bound on M. Note this is the *current input size* rather than a
-            maximum for callers that leave ``tune_max_num_tokens`` unset; see the
-            lower-clamp comment below.
+        x: Upper bound on M.
+        x_is_declared_max: True when the caller sets ``tune_max_num_tokens``, so
+            ``x`` is that declared maximum rather than the current input size.
+            Buckets above it are then dropped instead of profiled: M is clamped
+            with ``min(M, tune_max_num_tokens)`` for the runtime lookup (see
+            ``AutoTuner._find_nearest_profile``), so a higher bucket can never be
+            a reachable cache key. Pass it via ``functools.partial`` on the spec
+            rather than repeating the numeric limit, which would desync from a
+            ``tune_max_num_tokens`` that is reassigned per call.
 
     Returns:
         Ascending M values to profile. Stride is
@@ -376,17 +384,25 @@ def deep_gemm_gen_tuning_buckets(x: int) -> Tuple[int, ...]:
         DeepGEMM config for any (N, K), and the top of the range is included.
     """
     buckets = tuple(range(8, 128, 8))
-    # Clamp x to be between 4096 and 8192.
+    # Clamp x to be at most 8192, and -- only when we are guessing -- at least
+    # 4096.
     #
-    # The lower clamp is load-bearing and must not be "tightened" to the real
-    # max_num_tokens: fp8SwapABGemmRunner leaves tune_max_num_tokens unset, so
-    # autotuner.py passes the *current input size* here rather than a maximum
-    # (see autotuner.py, `Use the current input size as the opt value`). Drop
-    # the floor and a small first call (say M=64) would warm nothing above 120
-    # and every larger M would JIT mid-iteration.
-    if x >= 128:
-        x = min(x, 8192)
+    # The lower clamp is load-bearing for callers that leave
+    # tune_max_num_tokens unset (fp8SwapABGemmRunner): autotuner.py then passes
+    # the *current input size* here rather than a maximum (see autotuner.py,
+    # `Use the current input size as the opt value`). Drop the floor there and a
+    # small first call (say M=64) would warm nothing above 120, so every larger
+    # M would JIT mid-iteration.
+    #
+    # A caller that *does* declare a maximum needs no such guess, and profiling
+    # past it is pure waste -- the runtime lookup is clamped to the declared max,
+    # so those buckets are unreachable. Honouring it keeps the two cute_dsl MoE
+    # ops (which declare 512, and unlike the DeepGEMM warmup runners are
+    # multi-tactic) at 40 buckets instead of 264.
+    if not x_is_declared_max:
         x = max(x, 4096)
+    x = min(x, 8192)
+    if x >= 128:
         # Round the top up to a whole quantum, and include it. The only multiple
         # of 16 inside a band [16k+1, 16k+16] is its *top*, so a bucket >= x is
         # required to warm the band that x itself lives in -- and a half-open
