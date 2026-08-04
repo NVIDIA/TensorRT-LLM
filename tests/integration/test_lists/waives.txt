@@ -395,6 +395,7 @@ unittest/_torch/attention/test_attention_backends.py::test_attention_backend[dee
 unittest/_torch/executor/test_pytorch_model_engine.py::PyTorchModelEngineTestCase::test_promoted_context_precedes_speculative_overlap_generation SKIP (https://nvbugs/6550803)
 unittest/_torch/misc/test_autotuner.py::test_cutedsl_nvfp4_heuristic_matches_full_sweep SKIP (https://nvbugs/6490028)
 unittest/_torch/misc/test_share_tensor.py::TestShareTensor::test_share_tensor_different_dtypes SKIP (https://nvbugs/6418021)
+unittest/_torch/modeling/test_modeling_gpt_oss.py::test_gpt_oss_trtllmgen[CUTLASS] SKIP (https://nvbugs/6556063)
 unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
 unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM" SKIP (https://nvbugs/6464169)
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
