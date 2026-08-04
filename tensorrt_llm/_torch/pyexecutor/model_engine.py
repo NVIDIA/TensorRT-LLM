@@ -2841,7 +2841,7 @@ class PyTorchModelEngine(ModelEngine):
         return default_max_seq_len
 
     def _init_max_num_tokens(self):
-        # Modified from tensorrt_llm/_common.py check_max_num_tokens
+        # Modified from tensorrt_llm/_bootstrap.py check_max_num_tokens
         if self.max_num_tokens is None:
             self.max_num_tokens = self.max_seq_len * self.batch_size
         if self.max_num_tokens > self.max_seq_len * self.batch_size:

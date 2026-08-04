@@ -1,6 +1,6 @@
 import torch
 
-from tensorrt_llm import serialization
+from tensorrt_llm.llmapi import serialization
 
 
 class TestClass:
