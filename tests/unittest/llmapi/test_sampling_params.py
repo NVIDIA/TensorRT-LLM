@@ -31,6 +31,8 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.resource_governor import ResourceGovernor
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("field", ["logprobs", "prompt_logprobs", "top_logprobs"])
 def test_check_logprobs_limit(field):

@@ -4388,8 +4388,7 @@ class BaseLlmArgs(StrictBaseModel):
         "(default), it is read from the HF config.json ('dtype', or the "
         "deprecated 'torch_dtype'); for composite/VLM configs it falls "
         "back to the nested text_config.dtype. Defaults to bfloat16 if "
-        "none is found, and is overridden to float16 on GPUs with compute "
-        "capability < 8.0 (pre-Ampere).",
+        "none is found.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32"))
 
@@ -4698,16 +4697,6 @@ class BaseLlmArgs(StrictBaseModel):
         elif not isinstance(config_dict, dict):
             raise ValueError("Configuration file root must be a mapping.")
         return cls(**config_dict)
-
-    @field_validator("dtype")
-    @classmethod
-    def validate_dtype(cls, v, info):
-        if torch.cuda.get_device_properties(0).major < 8:
-            if v == 'auto':
-                v = 'float16'
-            if v == 'bfloat16':
-                raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
-        return v
 
     @field_validator("gpus_per_node", mode='before')
     @classmethod
