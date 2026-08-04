@@ -39,10 +39,19 @@ def _vuln_doc_to_agent_item(doc: dict) -> dict:
 def _license_doc_to_agent_item(doc: dict) -> dict:
     pkg = doc.get("s_package_name", "unknown")
     ver = doc.get("s_package_version", "unknown")
+    scan_type = doc.get("s_type", "")
+    is_container = scan_type == "container_license"
+    artifact_type = "container" if is_container else "source"
+    container = doc.get("s_release_image") or None if is_container else None
+    license_ids = doc.get("s_license_ids", "")
+    action_detail = f"license: {license_ids}" if license_ids and license_ids != "N/A" else None
     return {
         "dependency_name": pkg,
         "action_type": "license_correction",
         "current_version": ver,
+        "artifact_type": artifact_type,
+        "container": container,
+        "action_detail": action_detail,
     }
 
 
@@ -60,7 +69,12 @@ def format_risks_for_agent(vuln_docs: list, license_docs: list) -> list:
         lics = doc.get("s_license_ids", "")
         if lics == "Unknown License" or lics == "":
             item = _license_doc_to_agent_item(doc)
-            key = (item["dependency_name"], item["current_version"], item["action_type"])
+            key = (
+                item["dependency_name"],
+                item["current_version"],
+                item["action_type"],
+                item.get("container"),
+            )
             if key not in seen:
                 seen.add(key)
                 items.append(item)
@@ -112,9 +126,12 @@ def extract_ticket_refs(agent_response: dict) -> dict:
     license_ticket = agent_resp_value.get("license_correction_ticket")
     if license_ticket and license_ticket.get("link"):
         link = license_ticket["link"]
+        deps = license_ticket.get("dependencies") or []
+        permissiveness = {dep["name"]: dep.get("is_permissive") for dep in deps if dep.get("name")}
         refs["license"] = {
             "ticket_url": link,
-            "dependencies": license_ticket.get("dependencies"),
+            "dependencies": deps,
+            "permissiveness": permissiveness,
             "status": "CREATED",
         }
 

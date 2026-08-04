@@ -77,22 +77,24 @@ def get_latest_license_preapproved_container_deps(scan_type: str):
     return data_source["nested_preapproved_deps"]
 
 
-def get_triaged_deps(scan_type: str, branch: str) -> dict:
-    """Return {package_name: ticket_url} for all packages that have a triage_record."""
+def get_triaged_deps(scan_type: str, branch: str, container: str = "") -> dict:
+    """Return {package_name: ticket_url} for all packages that have a triage_record.
+
+    When ``container`` is provided, only records scoped to that container image are returned.
+    """
+    filters = [
+        {"term": {"s_type": "triage_record"}},
+        {"term": {"s_scan_type": scan_type}},
+        {"term": {"s_branch": branch}},
+    ]
+    if container:
+        filters.append({"term": {"s_release_image": container}})
     try:
         resp = ES_CLIENT.search(
             index=ES_INDEX_BASE + "-*",
             body={
                 "size": 10000,
-                "query": {
-                    "bool": {
-                        "filter": [
-                            {"term": {"s_type": "triage_record"}},
-                            {"term": {"s_scan_type": scan_type}},
-                            {"term": {"s_branch": branch}},
-                        ]
-                    }
-                },
+                "query": {"bool": {"filter": filters}},
                 "_source": ["s_package_name", "s_ticket_url"],
             },
         )
@@ -118,7 +120,8 @@ def save_triage_records(
 ) -> None:
     """Persist (package_name, ticket_url) triage records so future runs can skip re-triage.
 
-    Each record dict must have 'package_name' and 'ticket_url' keys.
+    Each record dict must have 'package_name' and 'ticket_url' keys, and optionally 'container'
+    for records scoped to a specific container image.
     """
     docs = [
         {
@@ -128,6 +131,7 @@ def save_triage_records(
             "ts_created": ts_created,
             "s_package_name": rec["package_name"],
             "s_ticket_url": rec["ticket_url"],
+            **({"s_release_image": rec["container"]} if rec.get("container") else {}),
         }
         for rec in records
         if rec.get("package_name") and rec.get("ticket_url")

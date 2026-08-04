@@ -369,10 +369,15 @@ def processScanResults(ref) {
                             --scan-mode ${params.scanMode}${skipArgs}
                     """, returnStdout: true).trim()
                 }
-                echo "Scan result: ${output}"
                 def result = new JsonSlurper().parseText(output)
                 if (result.status == "unstable") {
                     echo "New risks detected: ${result.detail}"
+                    if (result.detected_licenses) {
+                        echo "Non-permissive licenses detected:"
+                        result.detected_licenses.each { entry ->
+                            echo "  [${entry.scan_type}] ${entry.dependency_name} | license: ${entry.license} | permissive: ${entry.is_permissive}"
+                        }
+                    }
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
                     }

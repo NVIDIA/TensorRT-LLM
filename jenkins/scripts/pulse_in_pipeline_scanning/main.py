@@ -68,18 +68,33 @@ SUBMIT_KWARG = {
 }
 
 
+def _license_docs_to_entries(docs: list, scan_type: str) -> list:
+    """Convert ES risk docs to output entries with dependency_name, license, is_permissive."""
+    entries = []
+    for doc in docs:
+        entries.append(
+            {
+                "dependency_name": doc.get("s_package_name", "unknown"),
+                "license": doc.get("s_license_ids") or "Unknown",
+                "is_permissive": doc.get("is_permissive", False),
+                "scan_type": scan_type,
+            }
+        )
+    return entries
+
+
 def process_result():
     RISKY_DEPENDENCIES = []
-    source_licenses = []
-    count_container_licenses = 0
+    detected_licenses = []
 
     if not args.skip_source_code:
-        source_vulns = submit_source_code_vulns(
-            os.path.join(args.report_directory, "source_code/vulns.json"),
-            **SUBMIT_KWARG,
-        )
-        if len(source_vulns) > 0:
-            RISKY_DEPENDENCIES.append(f"{len(source_vulns)} new source code vulnerability")
+        if args.scan_mode != "release":
+            source_vulns = submit_source_code_vulns(
+                os.path.join(args.report_directory, "source_code/vulns.json"),
+                **SUBMIT_KWARG,
+            )
+            if len(source_vulns) > 0:
+                RISKY_DEPENDENCIES.append(f"{len(source_vulns)} new source code vulnerability")
 
         source_licenses = submit_source_code_licenses(
             os.path.join(args.report_directory, "source_code/sbom.json"),
@@ -87,29 +102,34 @@ def process_result():
             license_check_token=LICENSE_CHECK_TOKEN,
         )
         if source_licenses is None:
-            RISKY_DEPENDENCIES.append("source code SBOM not found")
+            if args.scan_mode != "release":
+                RISKY_DEPENDENCIES.append("source code SBOM not found")
         else:
-            if len(source_licenses) > 0:
+            source_entries = _license_docs_to_entries(source_licenses, "source_code")
+            detected_licenses.extend(source_entries)
+            non_permissive = [e for e in source_entries if not e["is_permissive"]]
+            if non_permissive:
                 RISKY_DEPENDENCIES.append(
-                    f"{len(source_licenses)} new source code non-permissive license"
+                    f"{len(non_permissive)} new source code non-permissive license"
                 )
 
     if not args.skip_container:
-        amd64_container_vulns = submit_container_vulns(
-            os.path.join(args.report_directory, "release_amd64/vulns.json"),
-            os.path.join(args.report_directory, "base_amd64/vulns.json"),
-            "amd64",
-            **SUBMIT_KWARG,
-        )
-        arm64_container_vulns = submit_container_vulns(
-            os.path.join(args.report_directory, "release_arm64/vulns.json"),
-            os.path.join(args.report_directory, "base_arm64/vulns.json"),
-            "arm64",
-            **SUBMIT_KWARG,
-        )
-        count_container_vulns = len(amd64_container_vulns) + len(arm64_container_vulns)
-        if count_container_vulns > 0:
-            RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
+        if args.scan_mode != "release":
+            amd64_container_vulns = submit_container_vulns(
+                os.path.join(args.report_directory, "release_amd64/vulns.json"),
+                os.path.join(args.report_directory, "base_amd64/vulns.json"),
+                "amd64",
+                **SUBMIT_KWARG,
+            )
+            arm64_container_vulns = submit_container_vulns(
+                os.path.join(args.report_directory, "release_arm64/vulns.json"),
+                os.path.join(args.report_directory, "base_arm64/vulns.json"),
+                "arm64",
+                **SUBMIT_KWARG,
+            )
+            count_container_vulns = len(amd64_container_vulns) + len(arm64_container_vulns)
+            if count_container_vulns > 0:
+                RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
 
         amd64_container_licenses = submit_container_licenses(
             os.path.join(args.report_directory, "release_amd64/licenses.json"),
@@ -125,10 +145,14 @@ def process_result():
             **SUBMIT_KWARG,
             license_check_token=LICENSE_CHECK_TOKEN,
         )
-        count_container_licenses = len(amd64_container_licenses) + len(arm64_container_licenses)
-        if count_container_licenses > 0:
+        container_license_entries = _license_docs_to_entries(
+            amd64_container_licenses, "container_amd64"
+        ) + _license_docs_to_entries(arm64_container_licenses, "container_arm64")
+        detected_licenses.extend(container_license_entries)
+        non_permissive_container = [e for e in container_license_entries if not e["is_permissive"]]
+        if non_permissive_container:
             RISKY_DEPENDENCIES.append(
-                f"{count_container_licenses} new container non-permissive license"
+                f"{len(non_permissive_container)} new container non-permissive license"
             )
 
     if RISKY_DEPENDENCIES:
@@ -136,17 +160,12 @@ def process_result():
         status = "unstable"
         if args.scan_mode == "monitor":
             post_slack_msg(args.build_number, args.ref, detail)
-        if (
-            args.scan_mode == "release"
-            and source_licenses is not None
-            and count_container_licenses + len(source_licenses) == 0
-        ):
-            status = "success"
 
         return {
             "status": status,
             "detail": detail,
             "risks": RISKY_DEPENDENCIES,
+            "detected_licenses": detected_licenses,
             "dashboard_url": get_dashboard_url(args.build_number, args.ref),
         }
     else:

@@ -29,10 +29,15 @@ def safe(value, default=None):
     return value if value else default
 
 
-def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -> dict:
-    """Call triage agent for untriaged risk_docs; persist ticket records; return {pkg: ticket_url}."""
+def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -> tuple[dict, dict]:
+    """Call triage agent for untriaged risk_docs; persist ticket records.
+
+    Returns (new_tickets, permissiveness) where:
+    - new_tickets: {pkg: ticket_url}
+    - permissiveness: {pkg: is_permissive} from the agent (None if agent had no opinion)
+    """
     if not risk_docs:
-        return {}
+        return {}, {}
     is_vuln = "vulnerability" in scan_type
     agent_resp = call_triage_agent(
         format_risks_for_agent(
@@ -41,7 +46,7 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
         )
     )
     if not agent_resp:
-        return {}
+        return {}, {}
     ticket_refs = extract_ticket_refs(agent_resp)
     new_tickets = {}
     for item in ticket_refs.get("vulnerability", []):
@@ -49,8 +54,10 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
         if pkg and url:
             new_tickets[pkg] = url
     license_ticket = ticket_refs.get("license")
+    permissiveness = {}
     if license_ticket and license_ticket.get("ticket_url"):
         url = license_ticket["ticket_url"]
+        permissiveness = license_ticket.get("permissiveness", {})
         for pkg in license_ticket.get("dependencies") or []:
             new_tickets[pkg.get("name")] = url
     if new_tickets:
@@ -59,9 +66,17 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
             scan_type,
             branch,
             ts_created,
-            [{"package_name": k, "ticket_url": v} for k, v in new_tickets.items()],
+            [
+                {
+                    "package_name": doc["s_package_name"],
+                    "ticket_url": new_tickets[doc["s_package_name"]],
+                    "container": doc.get("s_release_image", ""),
+                }
+                for doc in risk_docs
+                if doc.get("s_package_name") in new_tickets
+            ],
         )
-    return new_tickets
+    return new_tickets, permissiveness
 
 
 def submit_source_code_vulns(
@@ -113,7 +128,7 @@ def submit_source_code_vulns(
                 risks_to_report.append(doc)
             bulk_documents.append(doc)
         if risks_to_report:
-            new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+            new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
             for doc in bulk_documents:
                 if doc["s_package_name"] in new_tickets:
                     doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
@@ -212,10 +227,19 @@ def submit_source_code_licenses(
             sbom_documents.append(doc)
 
         if risks_to_report:
-            new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+            new_tickets, permissiveness = _run_triage(
+                risks_to_report, SCAN_TYPE, build_metadata["ref"], ts
+            )
             for doc in sbom_documents:
                 if doc["s_package_name"] in new_tickets:
                     doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+            # Only drop packages the agent explicitly confirmed as permissive.
+            # Packages not sent to the agent (known non-permissive licenses) are kept as-is.
+            agent_permissive = {pkg for pkg, perm in permissiveness.items() if perm is True}
+            if agent_permissive:
+                risks_to_report = [
+                    doc for doc in risks_to_report if doc["s_package_name"] not in agent_permissive
+                ]
 
         if sbom_documents:
             _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
@@ -281,7 +305,7 @@ def submit_container_vulns(
             risks_to_report.append(doc)
         docs.append(doc)
     if risks_to_report:
-        new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+        new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
         for doc in docs:
             if doc["s_package_name"] in new_tickets:
                 doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
@@ -308,19 +332,19 @@ def submit_container_licenses(
 ) -> list:
     """Triage untriaged container license risks, save all docs to ES, return untriaged risks."""
     SCAN_TYPE = "container_license"
-    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
-    ts = int(start_datetime.timestamp() * 1000)
-
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
+    release_image = release_data.get("image_tag", "")
+    base_image = base_data.get("image_tag", "")
+    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"], container=release_image)
+    ts = int(start_datetime.timestamp() * 1000)
+
     trtllm_deps = diff_licenses(SCAN_TYPE, input_file, base_input_file)
 
     map_preapproved = get_preapproved_deps_map(SCAN_TYPE)
 
     docs = []
     risks_to_report = []
-    release_image = release_data.get("image_tag", "")
-    base_image = base_data.get("image_tag", "")
     # Build {license_id: [deps]} and call the API once for all detected licenses
     license_to_deps = {}
     for v in trtllm_deps:
@@ -368,10 +392,19 @@ def submit_container_licenses(
         docs.append(doc)
 
     if risks_to_report:
-        new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+        new_tickets, permissiveness = _run_triage(
+            risks_to_report, SCAN_TYPE, build_metadata["ref"], ts
+        )
         for doc in docs:
             if doc["s_package_name"] in new_tickets:
                 doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+        # Only drop packages the agent explicitly confirmed as permissive.
+        # Packages not sent to the agent (known non-permissive licenses) are kept as-is.
+        agent_permissive = {pkg for pkg, perm in permissiveness.items() if perm is True}
+        if agent_permissive:
+            risks_to_report = [
+                doc for doc in risks_to_report if doc["s_package_name"] not in agent_permissive
+            ]
 
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
