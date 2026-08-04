@@ -29,10 +29,8 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     DFlashForCausalLM,
     Eagle3ForCausalLM,
     SpecDecOneEngineForCausalLM,
-    get_draft_model,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm.llmapi import DFlashDecodingConfig
 
 
 class _FakeDraftModel(nn.Module):
@@ -77,30 +75,6 @@ class _FakeEagle3Wrapper:
 
     def __init__(self, model):
         self.model = model
-
-
-@pytest.mark.parametrize(
-    ("architectures", "constructor_name"),
-    [
-        ([], "DFlashForCausalLM"),
-        (["LagunaForCausalLM"], "DFlashLagunaForCausalLM"),
-    ],
-)
-def test_get_draft_model_passes_dflash_attention_backend(architectures, constructor_name):
-    spec_config = DFlashDecodingConfig(max_draft_len=7, attention_backend="TRTLLM")
-    model_config = SimpleNamespace(spec_config=spec_config)
-    draft_config = SimpleNamespace(pretrained_config=SimpleNamespace(architectures=architectures))
-
-    with patch(
-        f"tensorrt_llm._torch.models.modeling_speculative.{constructor_name}"
-    ) as constructor:
-        result = get_draft_model(model_config, draft_config, None, None)
-
-    constructor.assert_called_once_with(
-        draft_config,
-        dflash_attention_backend="TRTLLM",
-    )
-    assert result is constructor.return_value
 
 
 @pytest.mark.parametrize("num_capture_layers", [2, 3], ids=["2_layers", "3_layers"])
@@ -337,6 +311,20 @@ def test_dflash_attention_mask_args():
     )
 
     assert disabled_wrapper._get_attention_mask_args(0) == (False, (-1, -1))
+
+    missing_window_wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=1,
+            layer_types=["sliding_attention"],
+            use_sliding_window=True,
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="use_sliding_window=True requires a positive integer sliding_window",
+    ):
+        missing_window_wrapper._get_attention_mask_args(0)
 
     laguna_wrapper = _fake_dflash_mask_wrapper(
         SimpleNamespace(

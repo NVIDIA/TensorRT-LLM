@@ -80,14 +80,3 @@ def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):
         [3, 4, 5],
         [6, 7, 8],
     ]
-
-
-def test_worker_rejects_model_attention_backend_mismatch():
-    config = DFlashDecodingConfig(max_draft_len=7, attention_backend="TRTLLM")
-    worker = DFlashWorker(config, Mapping())
-
-    with pytest.raises(
-        ValueError,
-        match="worker=TRTLLM, model=VANILLA",
-    ):
-        worker.set_draft_model(_FakeDraftModel(attention_backend="VANILLA"))

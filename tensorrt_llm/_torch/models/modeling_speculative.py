@@ -32,8 +32,8 @@ try:
         flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
-from ..pyexecutor.config_utils import (get_layer_attention_window,
-                                       is_sliding_attention_layer)
+from ..pyexecutor.config_utils import (_is_sliding_attention_layer,
+                                       get_layer_attention_window)
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -1603,7 +1603,7 @@ class DFlashForCausalLM(nn.Module):
         is_sliding_layer = False
         if layer_types:
             layer_type = layer_types[layer_idx % len(layer_types)]
-            is_sliding_layer = is_sliding_attention_layer(layer_type)
+            is_sliding_layer = _is_sliding_attention_layer(layer_type)
 
         sliding_window = get_layer_attention_window(self.config, layer_idx)
         is_sliding_layer = is_sliding_layer or sliding_window is not None

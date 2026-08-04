@@ -24,7 +24,7 @@ def uses_vswa_kv_cache_layout(
                     for window in max_attention_windows))
 
 
-def is_sliding_attention_layer(layer_type: object) -> bool:
+def _is_sliding_attention_layer(layer_type: object) -> bool:
     """Return whether a config layer type denotes sliding attention."""
     layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
     return "sliding" in layer_type_name
@@ -40,7 +40,8 @@ def get_layer_attention_window(
     Otherwise, infer it from ``sliding_window`` and ``layer_types`` so legacy
     configs that omit the flag continue to work.
     """
-    if getattr(config, "use_sliding_window", None) is False:
+    use_sliding_window = getattr(config, "use_sliding_window", None)
+    if use_sliding_window is False:
         return None
 
     sliding_window = getattr(config, "sliding_window", None)
@@ -49,12 +50,16 @@ def get_layer_attention_window(
             "Attention-window derivation assumes a single sliding-window "
             f"size, got multiple: {sliding_window}")
     if sliding_window is None:
+        if use_sliding_window is True:
+            raise ValueError(
+                "use_sliding_window=True requires a positive integer "
+                "sliding_window.")
         return None
 
     layer_types = getattr(config, "layer_types", None)
     if layer_types:
         layer_type = layer_types[layer_idx % len(layer_types)]
-        if not is_sliding_attention_layer(layer_type):
+        if not _is_sliding_attention_layer(layer_type):
             return None
 
     if (not isinstance(sliding_window, int) or isinstance(sliding_window, bool)

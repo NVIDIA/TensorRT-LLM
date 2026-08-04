@@ -442,6 +442,24 @@ def _normalize_attention_windows(
     return normalized
 
 
+def draft_config_defines_attention_layout(
+    draft_pretrained_config: object, ) -> bool:
+    """Return whether the draft HF config explicitly defines its attention layout.
+
+    A ``True`` result makes the draft settings authoritative, including an
+    explicit full-attention layout. For example, a config with
+    ``use_sliding_window=False`` and ``sliding_window=4096`` returns ``True``:
+    its layers should attend to ``max_seq_len`` instead of inheriting the
+    target model's window. A config that provides none of
+    ``use_sliding_window``, ``sliding_window``, or ``layer_types`` returns
+    ``False`` so the legacy uniform-target fallback can be used.
+    """
+    return (
+        getattr(draft_pretrained_config, "use_sliding_window", None) is not None
+        or getattr(draft_pretrained_config, "sliding_window", None) is not None
+        or bool(getattr(draft_pretrained_config, "layer_types", None)))
+
+
 def _derive_draft_max_attention_window(
     kv_cache_config: KvCacheConfig,
     draft_pretrained_config: object,
@@ -452,7 +470,7 @@ def _derive_draft_max_attention_window(
         get_layer_attention_window(draft_pretrained_config, layer_idx)
         for layer_idx in range(num_draft_layers)
     ]
-    if any(window is not None for window in layer_windows):
+    if draft_config_defines_attention_layout(draft_pretrained_config):
         draft_windows = [
             max_seq_len if window is None else window
             for window in layer_windows
@@ -706,15 +724,12 @@ class KvCacheCreator:
             # For PP, draft layers are only on the last rank (see
             # get_pp_layers), so only that rank should include draft cost.
             effective_draft_config = self._get_effective_draft_config()
+            draft_kv_cache_config = self._get_one_model_draft_kv_cache_config(
+                kv_cache_config, self._max_seq_len)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
                 # Resolve draft manager class from draft config — may differ
                 # from target (e.g. hybrid target + plain transformer draft).
-                draft_kv_cache_config = kv_cache_config
-                if self._speculative_config.spec_dec_mode.is_dflash():
-                    draft_kv_cache_config = (
-                        self._get_one_model_draft_kv_cache_config(
-                            kv_cache_config, self._max_seq_len))
                 draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
                     effective_draft_config,
                     draft_kv_cache_config,
@@ -727,7 +742,7 @@ class KvCacheCreator:
                 total += self._per_manager_cache_cost(
                     self._kv_cache_manager_cls,
                     effective_draft_config,
-                    kv_cache_config,
+                    draft_kv_cache_config,
                     num_layers=self._get_num_draft_layers(),
                     is_draft=True)
         return total
@@ -1378,12 +1393,10 @@ class KvCacheCreator:
     def _get_draft_max_attention_window(
         self,
         max_seq_len: int,
-        kv_cache_config: Optional[KvCacheConfig] = None,
+        kv_cache_config: KvCacheConfig,
     ) -> Optional[List[int]]:
         """Derive the draft manager's per-layer attention windows."""
         effective_draft_config = self._get_effective_draft_config()
-        kv_cache_config = (kv_cache_config if kv_cache_config is not None else
-                           self._kv_cache_config)
         return _derive_draft_max_attention_window(
             kv_cache_config,
             effective_draft_config.pretrained_config,
@@ -1431,8 +1444,7 @@ class KvCacheCreator:
             kv_cache_config,
             max_seq_len,
             estimating_kv_cache=estimating_kv_cache)
-        if (not uses_vswa_kv_cache_layout(
-                draft_kv_config.max_attention_window)
+        if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
             # pool_ratio describes one manager's pool-group layout. The
