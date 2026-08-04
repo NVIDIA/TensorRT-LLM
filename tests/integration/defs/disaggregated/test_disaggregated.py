@@ -1816,7 +1816,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_gentp2_cute_dsl_mla_smoke(
     require the lib's kernel-compile marker in a generation-worker log:
     correct client output alone would not distinguish the CuTe DSL path from
     a silent fallback to flashinfer_trtllm_gen. The lib stays enabled by
-    default; TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
+    default; TLLM_FMHA_LIBS=-cute_dsl on the generation server is the
     documented off switch.
     """
     setup_model_symlink(llm_venv, deepseek_v3_model_root,

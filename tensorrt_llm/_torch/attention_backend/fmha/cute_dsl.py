@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 _LOG2_E = math.log2(math.e)
 
 
-class CuteDslMlaFmha(PhasedFmha):
+class CuteDslFmha(PhasedFmha):
     """Blackwell CuTe DSL FMHA library for decode-only MLA."""
 
     @classmethod
@@ -141,10 +141,10 @@ class CuteDslMlaFmha(PhasedFmha):
             BlackwellMultiHeadLatentAttentionForwardFP16,
         )
 
-        cute_in_dtype = CuteDslMlaFmha._to_cutlass_dtype(in_dtype)
+        cute_in_dtype = CuteDslFmha._to_cutlass_dtype(in_dtype)
         if cute_in_dtype is None:
             return False, f"Unsupported CuTe DSL input dtype {in_dtype}."
-        cute_out_dtype = CuteDslMlaFmha._to_cutlass_dtype(out_dtype)
+        cute_out_dtype = CuteDslFmha._to_cutlass_dtype(out_dtype)
         if cute_out_dtype is None:
             return False, f"Unsupported CuTe DSL output dtype {out_dtype}."
 

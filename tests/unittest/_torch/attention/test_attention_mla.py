@@ -615,7 +615,7 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool):
 
     # fp8 KV with (num_heads=128, seq_len_q=1) is admitted by the CuTe DSL
     # perf gate from batch_size >= 64, so a 64-request decode batch routes
-    # the generation phase through cute_dsl_mla in the default lib order.
+    # the generation phase through cute_dsl in the default lib order.
     scenario = Scenario(kv_cache_dtype=torch.float8_e4m3fn,
                         num_layers=1,
                         kv_cache_tokens_per_block=tokens_per_block)
