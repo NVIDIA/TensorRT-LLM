@@ -399,10 +399,16 @@ def deep_gemm_gen_tuning_buckets(x: int,
     # so those buckets are unreachable. Honouring it keeps the two cute_dsl MoE
     # ops (which declare 512, and unlike the DeepGEMM warmup runners are
     # multi-tactic) at 40 buckets instead of 264.
-    if not x_is_declared_max:
-        x = max(x, 4096)
-    x = min(x, 8192)
+    #
+    # Both clamps stay INSIDE the `x >= 128` guard, as on main: a caller whose
+    # current input size is below 128 keeps returning just the low buckets. See
+    # test_below_128_is_unchanged_from_main -- hoisting the floor above the guard
+    # silently turned f(64) from 15 buckets into 264, an unmeasured startup cost
+    # on a path this fix has no reason to touch.
     if x >= 128:
+        if not x_is_declared_max:
+            x = max(x, 4096)
+        x = min(x, 8192)
         # Round the top up to a whole quantum, and include it. The only multiple
         # of 16 inside a band [16k+1, 16k+16] is its *top*, so a bucket >= x is
         # required to warm the band that x itself lives in -- and a half-open

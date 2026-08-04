@@ -243,16 +243,30 @@ def test_declared_max_thins_the_multi_tactic_moe_case():
     assert max(honoured) == 512
 
 
-def test_default_is_unchanged_for_callers_without_a_declared_max():
-    """fp8SwapABGemmRunner's path must be byte-identical to the floor form.
+@pytest.mark.parametrize("x", [1, 8, 32, 64, 120, 127])
+def test_below_128_is_unchanged_from_main(x):
+    """A sub-128 current input size must return ONLY the low buckets.
 
-    It receives the current input size, not a maximum, so dropping the floor
-    there would warm nothing above the first call's M.
+    Both clamps live inside the ``x >= 128`` guard, so this path is
+    byte-identical to main. That ordering is load-bearing and easy to lose:
+    hoisting ``max(x, 4096)`` above the guard turns f(64) from 15 buckets into
+    264. Nothing in this fix needs that, and it is an unmeasured startup cost on
+    a live path -- ``fp8SwapABGemmRunner`` declares no ``tune_max_num_tokens``,
+    so the autotuner hands it the *current* M, and ``exclude_from_cache=True``
+    means the sweep re-runs on every process start.
+
+    Asserted against main's literal output, not against the function's own
+    default: comparing ``f(x)`` to ``f(x, x_is_declared_max=False)`` compares the
+    function to itself and cannot fail.
     """
-    for x in (64, 128, 512, 2048, 4096, 8192, 9000):
-        assert deep_gemm_gen_tuning_buckets(x) == deep_gemm_gen_tuning_buckets(
-            x, x_is_declared_max=False
-        )
+    assert deep_gemm_gen_tuning_buckets(x) == tuple(range(8, 128, 8))
 
-    # A small first call still warms the full floor range.
-    assert max(deep_gemm_gen_tuning_buckets(64)) == 4096
+
+def test_the_floor_still_fires_from_128_up():
+    """Above the guard the floor must still apply -- it is not dead code.
+
+    Complements the test above, so the sub-128 short-circuit cannot be mistaken
+    for the floor having been removed. A first call at M=128 warms out to 4096.
+    """
+    assert max(deep_gemm_gen_tuning_buckets(128)) >= 4096
+    assert max(deep_gemm_gen_tuning_buckets(129)) >= 4096
