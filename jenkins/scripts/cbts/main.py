@@ -38,7 +38,9 @@ from typing import Optional
 
 # Make sibling modules importable when invoked as `python3 <path>/main.py ...`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "coverage_selection"))
 
+from artifact import build_from_url  # noqa: E402
 from blocks import (  # noqa: E402
     Stage,
     YAMLIndex,
@@ -125,6 +127,10 @@ class SelectionResult:
     # set by coverage tier; Groovy re-adds multiGpuJobs under MULTI_GPU_FILE_CHANGED gate
     enable_multi_gpu: bool = False
     coverage_dropped_stages: list[str] = field(default_factory=list)
+    # Post-merge build the consulted touch DB came from. The DB is resolved as
+    # "latest post-merge tarball" at decision time, so two runs of the same
+    # commit can consult different DBs; recording it makes a decision replayable.
+    coverage_db_build: Optional[int] = None
 
     def to_json(self) -> str:
         data = {
@@ -139,6 +145,7 @@ class SelectionResult:
             "perfsanity_required": self.perfsanity_required,
             "enable_multi_gpu": self.enable_multi_gpu,
             "coverage_dropped_stages": sorted(self.coverage_dropped_stages),
+            "coverage_db_build": self.coverage_db_build,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
@@ -338,6 +345,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         "runs on fallbacks and may drop fully-safe single-GPU stages.",
     )
     parser.add_argument(
+        "--coverage-db-url",
+        default=None,
+        help="Artifactory URL the --coverage-db tarball was fetched from. Only its "
+        "post-merge build number is used, recorded in the decision as "
+        "coverage_db_build so a decision can be traced back to its DB.",
+    )
+    parser.add_argument(
         "--no-data-policy",
         choices=NO_DATA_POLICIES,
         default=DEFAULT_NO_DATA_POLICY,
@@ -391,6 +405,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     rules = build_rules(yaml_index, stages, repo_root)
     selector = Selector(stages)
     result = selector.run(pr, rules)
+
+    if args.coverage_db_url:
+        result.coverage_db_build = build_from_url(args.coverage_db_url)
 
     if args.coverage_db and result.scope is None:
         note = ""

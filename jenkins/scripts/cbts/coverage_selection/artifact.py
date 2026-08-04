@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import tarfile
@@ -89,6 +90,12 @@ def latest_build_number(jenkins_base: str = _JENKINS_BASE) -> Optional[int]:
 
 def tarball_url(build: int, artifact_base: str = ARTIFACT_BASE) -> str:
     return f"{_URM}/{artifact_base}/{build}/cbts-coverage/{TARBALL_NAME}"
+
+
+def build_from_url(url: str) -> Optional[int]:
+    """Post-merge build number encoded in a `tarball_url()`, or None if absent."""
+    m = re.search(r"/(\d+)/cbts-coverage/", url or "")
+    return int(m.group(1)) if m else None
 
 
 def latest_tarball_url(

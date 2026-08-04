@@ -842,7 +842,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
         // Download the touch DB for audit + Tier 2 coverage-based narrowing.
-        def coverageDbPath = _cbtsCoverageAudit(pipeline)
+        def coverageDb = _cbtsCoverageAudit(pipeline)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -868,8 +868,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         writeFile file: inputPath, text: inputJson
 
         def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
-        if (coverageDbPath) {
-            mainCmd += " --coverage-db ${coverageDbPath}"
+        if (coverageDb.path) {
+            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-url '${coverageDb.url}'"
         }
         def output = sh(script: mainCmd, returnStdout: true)
 
@@ -926,7 +926,7 @@ def _cbtsCoverageAudit(pipeline)
         ).trim()
         if (!url) {
             pipeline.echo("CBTS audit: no coverage DB artifact found — skipping Tier 2")
-            return ""
+            return [path: "", url: ""]
         }
         sh "cd ${LLM_ROOT} && mkdir -p ${covDir}"
         // wget the tarball (retrying) and extract the sqlite.
@@ -935,12 +935,14 @@ def _cbtsCoverageAudit(pipeline)
             "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py " +
            "--db ${covDir}/cbts_touchmap.sqlite"
-        return "${covDir}/cbts_touchmap.sqlite"
+        // url rides along so main.py can record which post-merge build the DB
+        // came from ("latest" is resolved here, once, per run).
+        return [path: "${covDir}/cbts_touchmap.sqlite", url: url]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
-        return ""
+        return [path: "", url: ""]
     }
 }
 
