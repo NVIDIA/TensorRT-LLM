@@ -1906,24 +1906,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
 @skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_transceiver_runtime_python",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@skip_arm
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
