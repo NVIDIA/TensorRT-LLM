@@ -748,7 +748,15 @@ class GvrTopKKernel:
         # fire census (pro/512k bench + 9 per-layer fixture cells) contains
         # NO K512 cell — so K512 keeps the original byte-identical kernel.
         if p4_tail_fast is None:  # [p4tt]
-            p4_tail_fast = self.p4_exact_tail and top_k >= 1024
+            # Was gated on top_k >= 1024, which left K=512 on the original
+            # full-candidate 4-level radix: every level re-zeroes 256 bins
+            # and re-walks the WHOLE candidate array, so a step whose
+            # boundary class is large costs ~5us against ~0.2us for its
+            # neighbours. The compacted path pays for the class only.
+            # Measured on the captured flash rows that trigger it
+            # (256k layer 20 step 4, K=512): 5.04us -> 2.17us, with the
+            # neighbouring steps unchanged at ~0.2us.
+            p4_tail_fast = self.p4_exact_tail
         self.p4_tail_fast = bool(p4_tail_fast) and self.p4_exact_tail  # [p4tt]
         # p4_tail_v3: compacted-class repair (block-parallel radix +
         # pure-tie pre-check) in place of the stock thread0 serial
