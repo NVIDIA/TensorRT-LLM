@@ -578,7 +578,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             # seq_lens has not been set yet; fall back to the base implementation.
             super().prepare_for_indices_conversion()
             return
-        torch.ops.trtllm.deepseek_v4_compute_token_positions(
+        torch.ops.trtllm.compute_token_positions(
             self._seq_lens_cuda[:num_requests],
             None,
             self.cu_seq_lens_cuda,
@@ -601,7 +601,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             num_tokens = self.num_tokens
             num_requests = self.num_seqs
             token_positions = self.token_positions_cuda[:num_tokens]
-            torch.ops.trtllm.deepseek_v4_compute_token_positions(
+            torch.ops.trtllm.compute_token_positions(
                 self._seq_lens_cuda[:num_requests],
                 self.cached_token_lens_cuda[:num_requests],
                 self.cu_seq_lens_cuda,
@@ -1023,7 +1023,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             # replacing ~8 ATen dispatches (pad/cumsum/arange/searchsorted/two
             # gathers/two adds) and their temporaries.
             token_positions = token_positions_buf[:num_tokens]
-            torch.ops.trtllm.deepseek_v4_compute_token_positions(
+            torch.ops.trtllm.compute_token_positions(
                 seq_lens,
                 cached_tokens,
                 cu_seq_lens_buf,

@@ -1109,7 +1109,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # several MB; it is uploaded once per prepare() and shared by every consumer
         # (sliding + one call per compression ratio + the indexer table).
         self._ensure_device_block_offsets()
-        torch.ops.trtllm.deepseek_v4_compute_compress_block_table(
+        torch.ops.trtllm.compute_shared_block_table(
             self._device_kv_cache_block_offsets_input,
             device_copy_idx[: copy_idx.size(0)],
             int(pool_id),

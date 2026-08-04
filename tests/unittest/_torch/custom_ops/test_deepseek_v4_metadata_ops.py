@@ -301,7 +301,7 @@ def test_compute_token_positions(seq_lens_spec, batch_size):
     req = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
     pos = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
 
-    torch.ops.trtllm.deepseek_v4_compute_token_positions(
+    torch.ops.trtllm.compute_token_positions(
         seq_lens, cached, cu, req, pos, num_tokens, True
     )
     torch.testing.assert_close(cu[: batch_size + 1], ref_cu, rtol=0, atol=0)
@@ -317,7 +317,7 @@ def test_compute_token_positions(seq_lens_spec, batch_size):
     # reuse mode: cu already populated, only the per-token phase runs
     req2 = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
     pos2 = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
-    torch.ops.trtllm.deepseek_v4_compute_token_positions(
+    torch.ops.trtllm.compute_token_positions(
         seq_lens, cached, cu, req2, pos2, num_tokens, False
     )
     torch.testing.assert_close(req2[:num_tokens], ref_req, rtol=0, atol=0)
@@ -325,7 +325,7 @@ def test_compute_token_positions(seq_lens_spec, batch_size):
 
     # req-only mode: token_positions omitted
     req3 = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
-    torch.ops.trtllm.deepseek_v4_compute_token_positions(
+    torch.ops.trtllm.compute_token_positions(
         seq_lens, None, cu, req3, None, num_tokens, True
     )
     torch.testing.assert_close(req3[:num_tokens], ref_req, rtol=0, atol=0)
@@ -371,7 +371,7 @@ def _ref_shared_block_table(block_offsets, pool_id, copy_idx, scale, bad_page_in
 @pytest.mark.parametrize("scale", [1, 4, 128])
 @pytest.mark.parametrize("num_pools,capacity,max_blocks", [(1, 8, 4), (3, 64, 16), (7, 130, 129)])
 @pytest.mark.parametrize("num_seqs", [1, 5, 64])
-def test_compute_compress_block_table(scale, num_pools, capacity, max_blocks, num_seqs):
+def test_compute_shared_block_table(scale, num_pools, capacity, max_blocks, num_seqs):
     device = "cuda"
     torch.manual_seed(num_seqs * 31 + max_blocks)
     if num_seqs > capacity:
@@ -391,7 +391,7 @@ def test_compute_compress_block_table(scale, num_pools, capacity, max_blocks, nu
     pool_id = num_pools - 1
 
     out = torch.full((num_seqs, max_blocks), 12345, dtype=torch.int32, device=device)
-    torch.ops.trtllm.deepseek_v4_compute_compress_block_table(
+    torch.ops.trtllm.compute_shared_block_table(
         block_offsets, copy_idx, pool_id, scale, out
     )
 
@@ -399,14 +399,14 @@ def test_compute_compress_block_table(scale, num_pools, capacity, max_blocks, nu
     torch.testing.assert_close(out, expected.to(torch.int32), rtol=0, atol=0)
 
 
-def test_compute_compress_block_table_leaves_padding_untouched():
+def test_compute_shared_block_table_leaves_padding_untouched():
     """Rows past num_seqs must not be written: padded CUDA-graph slots read them."""
     device = "cuda"
     block_offsets = torch.ones((2, 16, 2, 8), dtype=torch.int32, device=device)
     copy_idx = torch.arange(4, dtype=torch.int32, device=device)
     out = torch.full((16, 8), -7, dtype=torch.int32, device=device)
 
-    torch.ops.trtllm.deepseek_v4_compute_compress_block_table(
+    torch.ops.trtllm.compute_shared_block_table(
         block_offsets, copy_idx, 1, 4, out[:4]
     )
 
@@ -416,3 +416,101 @@ def test_compute_compress_block_table_leaves_padding_untouched():
     torch.testing.assert_close(
         out[:4], torch.full((4, 8), 4, dtype=torch.int32, device=device), rtol=0, atol=0
     )
+
+
+# The shared-memory prefix scans pick a template instantiation from a size ladder
+# (<=512, <=2048, else the compile-time bound). Batch sizes that straddle those
+# boundaries take different code paths, and the largest tier is only safe because
+# the op layer rejects anything above the bound. Both need coverage.
+
+_SCAN_TIER_BATCHES = [511, 512, 513, 2047, 2048, 2049, 4096]
+
+
+@pytest.mark.parametrize("batch_size", _SCAN_TIER_BATCHES)
+def test_token_positions_across_scan_tiers(batch_size):
+    device = "cuda"
+    torch.manual_seed(batch_size)
+    seq_lens = torch.randint(1, 5, (batch_size,), dtype=torch.int32, device=device)
+    num_tokens = int(seq_lens.sum().item())
+    cached = torch.randint(0, 1000, (batch_size,), dtype=torch.int32, device=device)
+
+    ref_cu, ref_req, ref_pos = _ref_token_positions(
+        seq_lens, cached, batch_size, num_tokens, device
+    )
+    cu = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    req = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    pos = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+
+    torch.ops.trtllm.compute_token_positions(
+        seq_lens, cached, cu, req, pos, num_tokens, True
+    )
+    torch.testing.assert_close(cu, ref_cu, rtol=0, atol=0)
+    torch.testing.assert_close(req, ref_req, rtol=0, atol=0)
+    torch.testing.assert_close(pos, ref_pos, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch_size", _SCAN_TIER_BATCHES)
+def test_per_ratio_kv_lens_across_scan_tiers(batch_size):
+    device = "cuda"
+    torch.manual_seed(batch_size + 7)
+    ratios = [1, 4, 128]
+    kv_lens = torch.randint(1, 9000, (batch_size,), dtype=torch.int32, device=device)
+    cached = (kv_lens * torch.rand(batch_size, device=device)).to(torch.int32)
+    ref = _ref_per_ratio(kv_lens, cached, ratios)
+
+    comp = {r: torch.zeros(batch_size, dtype=torch.int32, device=device) for r in ratios}
+    past = {r: torch.zeros(batch_size, dtype=torch.int32, device=device) for r in ratios}
+    new_comp = {r: torch.zeros(batch_size, dtype=torch.int32, device=device) for r in ratios}
+    cu = {r: torch.zeros(batch_size + 1, dtype=torch.int32, device=device) for r in ratios}
+
+    torch.ops.trtllm.deepseek_v4_compute_per_ratio_kv_lens(
+        kv_lens, cached, ratios,
+        [comp[r] for r in ratios], [past[r] for r in ratios],
+        [new_comp[r] for r in ratios], [cu[r] for r in ratios],
+    )
+    for r in ratios:
+        exp_c, exp_p, exp_n, exp_cu = ref[r]
+        torch.testing.assert_close(comp[r], exp_c, rtol=0, atol=0)
+        torch.testing.assert_close(past[r], exp_p, rtol=0, atol=0)
+        torch.testing.assert_close(new_comp[r], exp_n, rtol=0, atol=0)
+        torch.testing.assert_close(cu[r], exp_cu, rtol=0, atol=0)
+
+
+def test_token_positions_rejects_batch_above_scan_bound():
+    """Above the compile-time bound the op must fail loudly, not scribble."""
+    device = "cuda"
+    too_big = 4097
+    seq_lens = torch.ones(too_big, dtype=torch.int32, device=device)
+    cached = torch.zeros(too_big, dtype=torch.int32, device=device)
+    cu = torch.zeros(too_big + 1, dtype=torch.int32, device=device)
+    req = torch.zeros(too_big, dtype=torch.int32, device=device)
+    pos = torch.zeros(too_big, dtype=torch.int32, device=device)
+
+    with pytest.raises(RuntimeError):
+        torch.ops.trtllm.compute_token_positions(
+            seq_lens, cached, cu, req, pos, too_big, True
+        )
+
+    # With the scan skipped (cu_seq_lens supplied by the caller) the bound does
+    # not apply, so the same batch must go through.
+    cu_ref = torch.zeros(too_big + 1, dtype=torch.int32, device=device)
+    cu_ref[1:] = torch.cumsum(seq_lens, 0, dtype=torch.int32)
+    torch.ops.trtllm.compute_token_positions(
+        seq_lens, cached, cu_ref, req, pos, too_big, False
+    )
+    expected_req = torch.arange(too_big, dtype=torch.int32, device=device)
+    torch.testing.assert_close(req, expected_req, rtol=0, atol=0)
+
+
+def test_per_ratio_kv_lens_rejects_batch_above_scan_bound():
+    device = "cuda"
+    too_big = 4097
+    kv = torch.ones(too_big, dtype=torch.int32, device=device)
+    cached = torch.zeros(too_big, dtype=torch.int32, device=device)
+    buf = torch.zeros(too_big, dtype=torch.int32, device=device)
+    cu = torch.zeros(too_big + 1, dtype=torch.int32, device=device)
+
+    with pytest.raises(RuntimeError):
+        torch.ops.trtllm.deepseek_v4_compute_per_ratio_kv_lens(
+            kv, cached, [1], [buf], [buf], [buf], [cu]
+        )

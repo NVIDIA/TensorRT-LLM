@@ -369,66 +369,6 @@ void invokeDeepseekV4ComputeSlidingBlockTablesWithScratch(int32_t const* blockOf
 }
 
 
-// ---------------------------------------------------------------------------
-// COMPRESS block table: single (poolId, scale) for the whole batch.
-//
-// Mirrors the CPU-Python `_compute_shared_block_table`:
-//     base = host_kv_cache_block_offsets[poolId, copyIdx, 0, :]
-//     out  = where(base == BAD, BAD, base * scale)
-// Keeping it on the GPU removes a ~257KB CPU gather + torch.where (executed
-// once per compression ratio, plus once for the indexer table) and the
-// subsequent host->device staging copy from the decode critical path.
-// ---------------------------------------------------------------------------
-__global__ void computeCompressBlockTableKernel(int32_t const* __restrict__ blockOffsets,
-    int32_t const* __restrict__ copyIdx, int32_t* __restrict__ output, int32_t poolId, int32_t scale,
-    int32_t copyIdxCapacity, int32_t numTables, int32_t maxBlocksPerSeq)
-{
-    int32_t const tableId = static_cast<int32_t>(blockIdx.y);
-    if (tableId >= numTables)
-    {
-        return;
-    }
-
-    int64_t const outputOffset = static_cast<int64_t>(tableId) * maxBlocksPerSeq;
-    int32_t const mappedTableId = copyIdx[tableId];
-    bool const validTable = mappedTableId >= 0 && mappedTableId < copyIdxCapacity;
-
-    // blockOffsets layout is [numPools, copyIdxCapacity, 2, maxBlocksPerSeq];
-    // the CPU path reads index 0 of the K/V dimension.
-    int64_t const baseOffset
-        = ((static_cast<int64_t>(poolId) * copyIdxCapacity + mappedTableId) * 2) * maxBlocksPerSeq;
-
-    for (int32_t blockId = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x)
-             + static_cast<int32_t>(threadIdx.x);
-         blockId < maxBlocksPerSeq; blockId += static_cast<int32_t>(gridDim.x) * static_cast<int32_t>(blockDim.x))
-    {
-        int32_t value = kBadPageIndex;
-        if (validTable)
-        {
-            int32_t const base = blockOffsets[baseOffset + blockId];
-            value = base == kBadPageIndex ? kBadPageIndex : base * scale;
-        }
-        output[outputOffset + blockId] = value;
-    }
-}
-
-void invokeDeepseekV4ComputeCompressBlockTable(int32_t const* blockOffsets, int32_t const* copyIdx, int32_t* output,
-    int32_t poolId, int32_t scale, int32_t copyIdxCapacity, int32_t numTables, int32_t maxBlocksPerSeq,
-    cudaStream_t stream)
-{
-    if (numTables <= 0 || maxBlocksPerSeq <= 0)
-    {
-        return;
-    }
-
-    int32_t const threadsPerBlock = kVecThreadsPerBlock;
-    int32_t const blocksPerRow = std::min((maxBlocksPerSeq + threadsPerBlock - 1) / threadsPerBlock, 64);
-    dim3 const block(static_cast<uint32_t>(threadsPerBlock));
-    dim3 const grid(static_cast<uint32_t>(blocksPerRow), static_cast<uint32_t>(numTables));
-    computeCompressBlockTableKernel<<<grid, block, 0, stream>>>(
-        blockOffsets, copyIdx, output, poolId, scale, copyIdxCapacity, numTables, maxBlocksPerSeq);
-}
-
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

@@ -17,7 +17,7 @@
 #include "tensorrt_llm/kernels/deepseekV4BlockTable.h"
 #include "tensorrt_llm/kernels/deepseekV4CompressedMeta.h"
 #include "tensorrt_llm/kernels/deepseekV4Indices.h"
-#include "tensorrt_llm/kernels/deepseekV4TokenPositions.h"
+#include "tensorrt_llm/kernels/attentionMetadataKernels.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -184,7 +184,7 @@ void deepseekV4ComputeSlidingBlockTablesWithScratch(th::Tensor const& blockOffse
 }
 
 
-void deepseekV4ComputeCompressBlockTable(th::Tensor const& blockOffsets, th::Tensor const& copyIdx, int64_t poolId,
+void computeSharedBlockTable(th::Tensor const& blockOffsets, th::Tensor const& copyIdx, int64_t poolId,
     int64_t scale, th::Tensor const& output)
 {
     int const device = output.get_device();
@@ -209,7 +209,7 @@ void deepseekV4ComputeCompressBlockTable(th::Tensor const& blockOffsets, th::Ten
         = std::min(checkedInt32Size(copyIdx.size(0), "num_tables"), checkedInt32Size(output.size(0), "output_rows"));
 
     auto stream = at::cuda::getCurrentCUDAStream(device);
-    tk::invokeDeepseekV4ComputeCompressBlockTable(blockOffsets.data_ptr<int32_t>(), copyIdx.data_ptr<int32_t>(),
+    tk::invokeComputeSharedBlockTable(blockOffsets.data_ptr<int32_t>(), copyIdx.data_ptr<int32_t>(),
         output.data_ptr<int32_t>(), static_cast<int32_t>(poolId), static_cast<int32_t>(scale), copyIdxCapacity,
         numTables, maxBlocksPerSeq, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -458,7 +458,7 @@ void deepseekV4ComputeGenCompressedPositionIds(std::vector<th::Tensor> const& pa
 }
 
 
-void deepseekV4ComputeTokenPositions(th::Tensor const& seqLens,
+void computeTokenPositions(th::Tensor const& seqLens,
     std::optional<th::Tensor> const& cachedTokens, th::Tensor const& cuSeqLens,
     th::Tensor const& reqIdxPerToken, std::optional<th::Tensor> const& tokenPositions,
     int64_t numTokensIn, bool computeCuSeqLens)
@@ -498,7 +498,7 @@ void deepseekV4ComputeTokenPositions(th::Tensor const& seqLens,
     }
 
     c10::cuda::CUDAGuard const deviceGuard(cuSeqLens.device());
-    tk::invokeDeepseekV4ComputeTokenPositions(seqLens.data_ptr<int32_t>(), cachedPtr,
+    tk::invokeComputeTokenPositions(seqLens.data_ptr<int32_t>(), cachedPtr,
         cuSeqLens.data_ptr<int32_t>(), reqIdxPerToken.data_ptr<int32_t>(), positionsPtr, batchSize,
         numTokens, computeCuSeqLens, at::cuda::getCurrentCUDAStream(device));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -513,7 +513,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "deepseek_v4_compute_sliding_block_tables(Tensor block_offsets, Tensor copy_idx, Tensor pool_ids, "
         "Tensor valid_pool, Tensor scales, Tensor layer_offsets, Tensor(a!) output) -> ()");
-    m.def("deepseek_v4_compute_compress_block_table(Tensor block_offsets, Tensor copy_idx, int pool_id, int scale, "
+    m.def("compute_shared_block_table(Tensor block_offsets, Tensor copy_idx, int pool_id, int scale, "
           "Tensor! output) -> ()");
     m.def("deepseek_v4_compute_per_ratio_kv_lens(Tensor kv_lens, Tensor cached_tokens, int[] ratios, "
           "Tensor(a!)[] compressed_kv_lens, Tensor(b!)[] past_kv_lens, Tensor(c!)[] new_comp_kv_lens, "
@@ -526,7 +526,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("deepseek_v4_compute_gen_compressed_position_ids(Tensor[] past_kv_lens, "
           "Tensor[] cu_new_comp_kv, Tensor(a!)[] compressed_position_ids, int[] ratios, "
           "int[] counts, int[] offsets, int num_contexts, int batch_size) -> ()");
-    m.def("deepseek_v4_compute_token_positions(Tensor seq_lens, Tensor? cached_tokens, "
+    m.def("compute_token_positions(Tensor seq_lens, Tensor? cached_tokens, "
           "Tensor(a!) cu_seq_lens, Tensor(b!) req_idx_per_token, Tensor(c!)? token_positions, "
           "int num_tokens, bool compute_cu_seq_lens) -> ()");
     m.def("deepseek_v4_compute_indices(Tensor token_positions, int window_size, int max_compressed_indices, "
@@ -542,15 +542,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("deepseek_v4_compute_sliding_block_tables", &tensorrt_llm::torch_ext::deepseekV4ComputeSlidingBlockTables);
-    m.impl(
-        "deepseek_v4_compute_compress_block_table", &tensorrt_llm::torch_ext::deepseekV4ComputeCompressBlockTable);
+    m.impl("compute_shared_block_table", &tensorrt_llm::torch_ext::computeSharedBlockTable);
     m.impl("deepseek_v4_compute_per_ratio_kv_lens", &tensorrt_llm::torch_ext::deepseekV4ComputePerRatioKvLens);
     m.impl("deepseek_v4_compute_compressed_mask", &tensorrt_llm::torch_ext::deepseekV4ComputeCompressedMask);
     m.impl("deepseek_v4_compute_ctx_compressed_position_ids",
         &tensorrt_llm::torch_ext::deepseekV4ComputeCtxCompressedPositionIds);
     m.impl("deepseek_v4_compute_gen_compressed_position_ids",
         &tensorrt_llm::torch_ext::deepseekV4ComputeGenCompressedPositionIds);
-    m.impl("deepseek_v4_compute_token_positions", &tensorrt_llm::torch_ext::deepseekV4ComputeTokenPositions);
+    m.impl("compute_token_positions", &tensorrt_llm::torch_ext::computeTokenPositions);
     m.impl("deepseek_v4_compute_indices", &tensorrt_llm::torch_ext::deepseekV4ComputeIndices);
     m.impl("deepseek_v4_compute_sliding_block_tables_with_scratch",
         &tensorrt_llm::torch_ext::deepseekV4ComputeSlidingBlockTablesWithScratch);

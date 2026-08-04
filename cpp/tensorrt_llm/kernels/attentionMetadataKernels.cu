@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "tensorrt_llm/kernels/deepseekV4TokenPositions.h"
+#include "tensorrt_llm/kernels/attentionMetadataKernels.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -16,6 +16,10 @@ namespace kernels
 namespace
 {
 constexpr int32_t kThreadsPerBlock = 256;
+constexpr int32_t kVecThreadsPerBlock = 128;
+// Mirrors kv_cache_manager_v2::kBadPageIndex; kept local so this file does not
+// pull the batch_manager headers into device code.
+constexpr int32_t kBadPageIndex = -1;
 
 // Phase 1: padded exclusive scan of seq_lens into cu_seq_lens.
 // batchSize is the scheduler batch (a few hundred), so a single-block
@@ -96,9 +100,51 @@ __global__ void computeTokenPositionsKernel(int32_t const* __restrict__ cuSeqLen
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// One shared-page block table: gather block_offsets[poolId, copyIdx, 0, :] and
+// map it with where(base == kBadPageIndex, kBadPageIndex, base * scale).
+//
+// Keeping it on the GPU removes a host gather of a few hundred KB plus the
+// subsequent host->device staging copy from the decode critical path; callers
+// that build several tables per iteration pay that cost once per table.
+// ---------------------------------------------------------------------------
+__global__ void computeSharedBlockTableKernel(int32_t const* __restrict__ blockOffsets,
+    int32_t const* __restrict__ copyIdx, int32_t* __restrict__ output, int32_t poolId, int32_t scale,
+    int32_t copyIdxCapacity, int32_t numTables, int32_t maxBlocksPerSeq)
+{
+    int32_t const tableId = static_cast<int32_t>(blockIdx.y);
+    if (tableId >= numTables)
+    {
+        return;
+    }
+
+    int64_t const outputOffset = static_cast<int64_t>(tableId) * maxBlocksPerSeq;
+    int32_t const mappedTableId = copyIdx[tableId];
+    bool const validTable = mappedTableId >= 0 && mappedTableId < copyIdxCapacity;
+
+    // blockOffsets layout is [numPools, copyIdxCapacity, 2, maxBlocksPerSeq];
+    // the CPU path reads index 0 of the K/V dimension.
+    int64_t const baseOffset
+        = ((static_cast<int64_t>(poolId) * copyIdxCapacity + mappedTableId) * 2) * maxBlocksPerSeq;
+
+    for (int32_t blockId = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x)
+             + static_cast<int32_t>(threadIdx.x);
+         blockId < maxBlocksPerSeq;
+         blockId += static_cast<int32_t>(gridDim.x) * static_cast<int32_t>(blockDim.x))
+    {
+        int32_t value = kBadPageIndex;
+        if (validTable)
+        {
+            int32_t const base = blockOffsets[baseOffset + blockId];
+            value = base == kBadPageIndex ? kBadPageIndex : base * scale;
+        }
+        output[outputOffset + blockId] = value;
+    }
+}
 } // namespace
 
-void invokeDeepseekV4ComputeTokenPositions(int32_t const* seqLens, int32_t const* cachedTokens,
+void invokeComputeTokenPositions(int32_t const* seqLens, int32_t const* cachedTokens,
     int32_t* cuSeqLens, int32_t* reqIdxPerToken, int32_t* tokenPositions, int32_t batchSize,
     int32_t numTokens, bool computeCuSeqLens, cudaStream_t stream)
 {
@@ -132,6 +178,24 @@ void invokeDeepseekV4ComputeTokenPositions(int32_t const* seqLens, int32_t const
             cuSeqLens, cachedTokens, reqIdxPerToken, tokenPositions, batchSize, numTokens);
     }
 }
+
+void invokeComputeSharedBlockTable(int32_t const* blockOffsets, int32_t const* copyIdx, int32_t* output,
+    int32_t poolId, int32_t scale, int32_t copyIdxCapacity, int32_t numTables, int32_t maxBlocksPerSeq,
+    cudaStream_t stream)
+{
+    if (numTables <= 0 || maxBlocksPerSeq <= 0)
+    {
+        return;
+    }
+
+    int32_t const threadsPerBlock = kVecThreadsPerBlock;
+    int32_t const blocksPerRow = std::min((maxBlocksPerSeq + threadsPerBlock - 1) / threadsPerBlock, 64);
+    dim3 const block(static_cast<uint32_t>(threadsPerBlock));
+    dim3 const grid(static_cast<uint32_t>(blocksPerRow), static_cast<uint32_t>(numTables));
+    computeSharedBlockTableKernel<<<grid, block, 0, stream>>>(
+        blockOffsets, copyIdx, output, poolId, scale, copyIdxCapacity, numTables, maxBlocksPerSeq);
+}
+
 
 } // namespace kernels
 
