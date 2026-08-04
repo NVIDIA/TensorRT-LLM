@@ -36,13 +36,26 @@ from tensorrt_llm.scaffolding import (
 
 @pytest.fixture(scope="module")
 def small_model_path():
-    """Path to a small local checkpoint; tests must not download from HuggingFace."""
+    """Path to a small local checkpoint; tests must not download from HuggingFace.
+
+    Skips unless the directory really holds a loadable causal LM. Some entries in the
+    model cache carry only tokenizer files, which would make ``from_pretrained`` raise
+    instead of letting the suite skip cleanly.
+    """
     models_root = llm_models_root()
     if models_root is None:
         pytest.skip("LLM_MODELS_ROOT is not set and the default model cache is not mounted")
+
     model_dir = models_root / "gpt2"
-    if not model_dir.exists():
-        pytest.skip(f"{model_dir} is not available")
+    if not (model_dir / "config.json").is_file():
+        pytest.skip(f"{model_dir} has no config.json; not a loadable model directory")
+
+    weight_globs = ("*.safetensors", "pytorch_model*.bin", "model*.bin")
+    if not any(next(model_dir.glob(pattern), None) for pattern in weight_globs):
+        pytest.skip(
+            f"{model_dir} has no model weights; tokenizer-only directories cannot be loaded"
+        )
+
     return str(model_dir)
 
 
