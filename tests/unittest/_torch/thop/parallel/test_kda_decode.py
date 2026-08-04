@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch.nn.functional as F
-from utils.util import skip_blackwell_geforce, skip_pre_blackwell
 
 import tensorrt_llm  # noqa: F401
 
@@ -307,8 +306,6 @@ def _assert_parity(
     )
 
 
-@skip_pre_blackwell
-@skip_blackwell_geforce
 @torch.no_grad()
 @pytest.mark.parametrize("batch_size", [1, 17, 32])
 @pytest.mark.parametrize("num_heads", [2, 3, 4, 6, 12, 96])
