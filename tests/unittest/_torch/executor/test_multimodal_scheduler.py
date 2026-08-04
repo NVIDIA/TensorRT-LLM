@@ -240,13 +240,15 @@ def test_admission_rejects_requests_larger_than_output_budget():
             "multimodal_embedding_lengths": [3],
         },
     )
-    with pytest.raises(ValueError, match="raise encoder_max_num_tokens"):
+    with pytest.raises(ValueError, match="raise encoder_max_num_tokens") as exc_info:
         initialize_multimodal_encoder_request(
             request,
             max_num_tokens=1 << 30,
             max_output_bytes=2 * 4,  # fits 2 rows; the video needs 3
             bytes_per_encoder_embedding=4,
         )
+    assert "Multimodal request 1" in str(exc_info.value)
+    assert "effective encoder_max_num_tokens is 1073741824" in str(exc_info.value)
 
 
 def test_oversized_request_fails_fast_instead_of_starving():
@@ -259,8 +261,10 @@ def test_oversized_request_fails_fast_instead_of_starving():
     )
     request = _request(1, [3, 3])  # 2 rows = 8 bytes > 4-byte budget
 
-    with pytest.raises(RuntimeError, match="raise encoder_max_num_tokens"):
+    with pytest.raises(RuntimeError, match="raise encoder_max_num_tokens") as exc_info:
         scheduler.schedule_request([request], set())
+    assert "Multimodal request 1" in str(exc_info.value)
+    assert "effective encoder_max_num_tokens is 1048576" in str(exc_info.value)
 
 
 def test_scheduler_requires_bytes_per_embedding_alongside_budget():

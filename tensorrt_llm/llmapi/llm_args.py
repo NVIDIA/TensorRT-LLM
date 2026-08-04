@@ -589,17 +589,11 @@ class MultimodalConfig(StrictBaseModel):
     encoder_cache_max_bytes: NonNegativeInt = Field(
         default=134_217_728,  # 128 MiB.
         description=
-        ("Maximum bytes for the per-model multimodal encoder embedding cache. "
-         "String values such as '512MB' and '1GiB' use binary units. This is "
-         "a cross-request cache with all-or-nothing per-request reuse (every "
-         "item must hit before cached embeddings are used); 0 disables it, "
-         "and only single-modality requests are cacheable for the time being. "
-         "The item-level encoder scheduler does not use this cache; its "
-         "resident encoder outputs are bounded by an internally derived budget "
-         "(one prefill iteration's embeddings). For the time being, this is "
-         "incompatible with encoder_side_stream_max_ahead > 0. "
-         "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
-         ),
+        ("Maximum bytes for the opt-in multimodal encoder embedding cache; 0 "
+         "disables it. String values such as '512MB' and '1GiB' use binary "
+         "units. Inline encoding caches whole single-modality requests; item "
+         "scheduling caches individual items. Compatible with side-stream "
+         "prefetch; their memory limits are additive."),
         status="prototype",
     )
 
