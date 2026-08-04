@@ -2129,7 +2129,6 @@ class OpenAIServer(_VideoRoutesMixin):
                     yield pp_res
             if res is not None:
                 await self._extract_metrics(res, raw_request)
-            await self._extract_metrics(res, raw_request)
 
         try:
             if request.background:
