@@ -15,6 +15,10 @@
 
 import os
 
+from ._flashinfer_workaround import _configure_flashinfer_workspace
+
+_configure_flashinfer_workspace()
+
 # Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
 
