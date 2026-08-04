@@ -121,7 +121,7 @@ def extract_ticket_refs(agent_response: dict) -> dict:
     """
     refs = {}
 
-    print(agent_response)
+    print(agent_response, file=sys.stderr)
     agent_resp_value = json.loads(agent_response.get("value", "{}"))
     license_ticket = agent_resp_value.get("license_correction_ticket")
     if license_ticket and license_ticket.get("link"):
@@ -137,7 +137,7 @@ def extract_ticket_refs(agent_response: dict) -> dict:
 
     refs["vulnerability"] = []
     for item in agent_resp_value.get("version_bump_tickets") or []:
-        print(item)
+        print(item, file=sys.stderr)
         link = item.get("link", "")
         if not link:
             continue
