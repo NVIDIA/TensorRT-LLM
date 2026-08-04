@@ -42,6 +42,7 @@ sys.path.insert(0, str(CBTS))
 sys.path.insert(0, str(CBTS / "coverage_selection"))
 
 from qualname_map import qualnames_for_lines  # noqa: E402
+from rules._helpers import iter_diff_post_line_numbers  # noqa: E402
 from touch_db import (  # noqa: E402
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
@@ -53,8 +54,6 @@ from touch_db import (  # noqa: E402
     split_stage,
     stage_family,
 )
-
-from rules._helpers import iter_diff_post_line_numbers  # noqa: E402
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:

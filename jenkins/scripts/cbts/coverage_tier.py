@@ -34,7 +34,6 @@ from blocks import (
     _target_in_filter_subtree,
     block_matches_stage,
 )
-
 from rules.base import PRInputs, RuleResult
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "coverage_selection"))
