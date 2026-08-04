@@ -373,10 +373,21 @@ def processScanResults(ref) {
                 if (result.status == "unstable") {
                     echo "New risks detected: ${result.detail}"
                     if (result.detected_licenses) {
-                        echo "Non-permissive licenses detected:"
+                        def colWidths = [scan_type: 9, dependency_name: 15, license: 7]
                         result.detected_licenses.each { entry ->
-                            echo "  [${entry.scan_type}] ${entry.dependency_name} | license: ${entry.license} | permissive: ${entry.is_permissive}"
+                            colWidths.scan_type        = Math.max(colWidths.scan_type,        entry.scan_type.toString().length())
+                            colWidths.dependency_name  = Math.max(colWidths.dependency_name,  entry.dependency_name.toString().length())
+                            colWidths.license          = Math.max(colWidths.license,          entry.license.toString().length())
                         }
+                        def sep  = "+-${'-' * colWidths.scan_type}-+-${'-' * colWidths.dependency_name}-+-${'-' * colWidths.license}-+-${'-' * 11}-+"
+                        def rows = [sep,
+                                    "| ${'SCAN TYPE'.padRight(colWidths.scan_type)} | ${'DEPENDENCY NAME'.padRight(colWidths.dependency_name)} | ${'LICENSE'.padRight(colWidths.license)} | IS PERMISSIVE |",
+                                    sep]
+                        result.detected_licenses.each { entry ->
+                            rows << "| ${entry.scan_type.toString().padRight(colWidths.scan_type)} | ${entry.dependency_name.toString().padRight(colWidths.dependency_name)} | ${entry.license.toString().padRight(colWidths.license)} | ${entry.is_permissive.toString().padRight(13)} |"
+                        }
+                        rows << sep
+                        echo "Non-permissive licenses detected:\n${rows.join('\n')}"
                     }
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
