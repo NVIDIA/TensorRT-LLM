@@ -3697,6 +3697,15 @@ class PyExecutor:
                         LlmRequestState.GENERATION_IN_PROGRESS,
                         LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
+                # Only fill in a placeholder when the Python-side list is empty (e.g. a
+                # DISAGG_GENERATION_INIT request, which never gets a draft snapshot). Overwriting it
+                # unconditionally would clobber the real draft tokens the one-model spec sampler
+                # wrote at the end of the previous iteration - which the overlap-disabled path
+                # reads back in `_prepare_tp_inputs` - and would also suppress the
+                # `current_num_draft_tokens == 0` signal that `_handle_dynamic_draft_len` uses to
+                # request a one-hot draft-probs placeholder under rejection sampling.
+                if not request.py_draft_tokens:
+                    request.py_draft_tokens = [0] * self.max_total_draft_tokens
                 request.draft_tokens = [0] * self.max_total_draft_tokens
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(

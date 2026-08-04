@@ -4446,11 +4446,23 @@ class PyTorchModelEngine(ModelEngine):
                 previous_pos_indices.extend([previous_batch_idx] *
                                             runtime_tokens_per_gen_step)
 
+                cached_token_num = (past_seen_token_num +
+                                    runtime_tokens_per_gen_step)
+                # The first generation batch overlaps the context sampler, so there is a previous
+                # token tensor but no previous speculative target forward in the KV cache.
+                # Backends without dynamic KV lengths cannot apply the runtime acceptance-length
+                # correction in _preprocess_inputs and must start at the prompt boundary.
+                # py_decoding_iter is a proxy for "the previous forward for this request was its
+                # last context chunk": _update_requests lags _prepare_and_schedule_batch by exactly
+                # one iteration, so the sampler's first increment has not landed yet at this point
+                # and only here. This branch already assumes that same batch-to-batch continuity
+                # (previous_batch_idx indexes the immediately preceding batch's device tensors).
+                if (request.py_decoding_iter == 0
+                        and not hasattr(attn_metadata, "kv_lens_cuda")):
+                    cached_token_num = request.max_beam_num_tokens
                 num_cached_tokens_per_seq.append(
-                    past_seen_token_num + runtime_tokens_per_gen_step -
-                    request.py_num_compressed_tokens)
-                request.cached_tokens = (past_seen_token_num +
-                                         runtime_tokens_per_gen_step)
+                    cached_token_num - request.py_num_compressed_tokens)
+                request.cached_tokens = cached_token_num
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
