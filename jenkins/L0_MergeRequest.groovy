@@ -1269,7 +1269,7 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
             def podSpec = createKubernetesPodConfig("", "agent")
             trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
                 stage("Upload Single-GPU Coverage (${arch})") {
-                    def testResultLink = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}/test-results"
+                    def testResultLink = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results"
                     sh "rm -rf cov && mkdir -p cov"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl python3 py3-pip")
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
@@ -1308,7 +1308,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
         stage ("Collect Test Result") {
             sh "rm -rf **/*.xml *.tar.gz"
 
-            testResultLink = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}/test-results"
+            testResultLink = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results"
 
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
