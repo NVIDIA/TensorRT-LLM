@@ -560,6 +560,15 @@ class DeepseekV4WeightLoader:
         self.is_draft_model = is_draft_model
 
     def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+        # Opt-in WAR (TRTLLM_PINNED_WEIGHT_STAGING=1) for drivers where
+        # pageable H2D copies stall during weight loading; staging buffers
+        # are freed on scope exit. See pinned_weight_staging.py.
+        from tensorrt_llm._torch import pinned_weight_staging
+
+        with pinned_weight_staging.staging_scope():
+            return self._load_weights_impl(weights, skip_modules=skip_modules)
+
+    def _load_weights_impl(self, weights: Dict, skip_modules: List[str] = []):
         # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
         # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
         # named-parameter keys before iterating modules. The detection is by
@@ -1316,7 +1325,7 @@ class DeepseekV4Attention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
@@ -1348,7 +1357,7 @@ class DeepseekV4Attention(MLA):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            aux_stream=aux_stream,
+            aux_stream_dict=aux_stream_dict,
             num_groups=config.o_groups,
             o_lora_rank=config.o_lora_rank,
             mapping_with_cp=mapping_with_cp,
@@ -1783,7 +1792,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         self.self_attn = DeepseekV4Attention(
             model_config,
             layer_idx=attention_layer_idx,
-            aux_stream=aux_stream_dict[AuxStreamType.Attention],
+            aux_stream_dict=aux_stream_dict,
             reduce_output=not self.enable_attention_dp and self.mapping.tp_size > 1,
         )
 
@@ -2355,6 +2364,9 @@ class DeepseekV4Model(DecoderModel):
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         self.hc_mult = config.hc_mult
+        # Attention-phase and MoE-phase lanes are sequential within a layer, so the
+        # Mla* roles reuse the Moe* slots. Engram keeps its own: it precomputes
+        # across the layer rather than inside the MoE phase.
         aux_stream_list = [torch.cuda.Stream() for _ in range(5)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
@@ -2363,6 +2375,9 @@ class DeepseekV4Model(DecoderModel):
             AuxStreamType.MoeBalancer: aux_stream_list[2],
             AuxStreamType.MoeOutputMemset: aux_stream_list[3],
             AuxStreamType.EngramPrecompute: aux_stream_list[4],
+            AuxStreamType.MlaCompressor: aux_stream_list[1],
+            AuxStreamType.MlaIndexer: aux_stream_list[2],
+            AuxStreamType.MlaIndexerAux: aux_stream_list[3],
         }
 
         self.embed_tokens = Embedding(

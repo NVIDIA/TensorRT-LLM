@@ -912,6 +912,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
     )
     index_share_for_mtp_iteration: Optional[bool] = Field(
         default=None,
+        status="prototype",
         description=
         "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
         "it each step. Defaults to the model's HF config value.")
@@ -1808,6 +1809,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
     # If set, drafting will use separate KV cache in one-model speculative decoding.
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
+    # If set, the draft model attends directly over the target model KV cache.
+    _use_shared_kv_cache: bool = PrivateAttr(False)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
@@ -3561,19 +3564,83 @@ class KvCacheCompressionConfig(StrictBaseModel):
     as a resource manager in create_py_executor (_util.py), like the KV cache
     manager itself. Concrete algorithms subclass this and add their parameters.
     """
+
+    changes_physical_kv_length: ClassVar[bool] = False
+    """Whether physical and logical KV lengths can diverge."""
+
     algorithm: str = Field(
         description=
         "Name of the KV-cache compression algorithm to run; selects which "
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
 
-    @property
-    def kv_cache_compression_mode(self):
-        # The mode carries algorithm-level traits (``is_*`` predicates) the
-        # raw algorithm string does not.
-        from tensorrt_llm._torch.kv_cache_compression.interface import \
-            KvCacheCompressionMode
-        return KvCacheCompressionMode.from_string(self.algorithm)
+    def supports_block_reuse(self) -> bool:
+        return False
+
+    def supports_speculative_decoding(self) -> bool:
+        return False
+
+
+class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
+    """TriAttention KV-cache compression: periodic decode-time eviction.
+
+    Scored by offline calibration (github.com/WeianMao/triattention; supply
+    the official .pt via ``calibration_path``). Pure compression — decode
+    runs the model's standard attention over the compacted cache.
+    """
+
+    changes_physical_kv_length: ClassVar[bool] = True
+
+    algorithm: Literal["triattention"] = "triattention"
+    eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
+        default="union",
+        description=
+        "Which token set each eviction round keeps. `union` (default) takes "
+        "the union of each KV head's top-B and re-ranks it by the per-token max "
+        "score; it matches the official base setting (per-head and "
+        "per-layer-per-head pruning both off). `per_head` keeps a per-KV-head "
+        "set shared across layers (mean of per-layer max); `per_layer_perhead` "
+        "keeps a fully independent set per (layer, KV head).")
+    normalize_scores: bool = Field(
+        default=True,
+        description="Z-normalize each head's scores over the decode region "
+        "before selection (upstream default). `union` eviction requires True: "
+        "its fused score+stats+union pipeline always normalizes.")
+    budget: int = Field(
+        default=2048,
+        gt=0,
+        description="Tokens kept at each periodic eviction; prompt tokens are "
+        "always preserved on top.")
+    beta: int = Field(
+        default=128,
+        gt=0,
+        description="Eviction period in confirmed generation tokens (upstream "
+        "`divide_length`): one speculative iteration may advance the counter "
+        "by multiple accepted tokens; at most one eviction is coalesced per update."
+    )
+    model_path: str = Field(
+        min_length=1,
+        description="Checkpoint path used to derive RoPE tables when converting "
+        "the official calibration and to classify kernel-masked sliding-attention "
+        "layers.")
+    calibration_path: str = Field(
+        min_length=1,
+        description="Path to the official TriAttention calibration `.pt` "
+        "(produced by github.com/WeianMao/triattention). TRT-LLM does not "
+        "compute calibration; it converts this file to the runtime schema at "
+        "load.")
+
+    def supports_block_reuse(self) -> bool:
+        return True
+
+    def supports_speculative_decoding(self) -> bool:
+        return self.eviction_mode == "union"
+
+
+KvCacheCompressionConfigType: TypeAlias = Annotated[
+    Union[TriAttentionKvCacheCompressionConfig],
+    Field(discriminator="algorithm"),
+]
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
@@ -3849,6 +3916,20 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. "
         "Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled."
+    )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    fp8_context_mla_kv_len_cap: Optional[int] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Override, in tokens, for the max summed attended-KV length (total_kv_len) per forward step that "
+        "the fp8 context-MLA attention workspace is reserved and scheduled for. Only affects fp8 "
+        "context-MLA models (e.g. DeepSeek / Kimi with an fp8 KV cache). None (default) reserves for the "
+        "never-stall worst case min(max_batch_size, max_num_tokens) * max_seq_len. A smaller value reserves "
+        "less workspace (freeing KV cache) and defers context requests whose summed attended KV would "
+        "exceed it; it is floored at max_seq_len and capped at the worst case. Safe at any value -- the "
+        "scheduler enforces it -- trading prefill batching under heavy reuse for KV cache capacity."
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
@@ -4420,8 +4501,8 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype")
 
     # KV cache compression config (separate from sparse attention: changes which
-    # KV is stored, not the attention computation)
-    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
+    # KV is stored, not the attention computation).
+    kv_cache_compression_config: Optional[KvCacheCompressionConfigType] = Field(
         default=None,
         description="KV-cache compression config; None disables compression.",
         status="prototype")
