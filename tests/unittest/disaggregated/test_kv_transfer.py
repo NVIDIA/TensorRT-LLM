@@ -18,7 +18,7 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 # progress thread is enough here: these tests verify transfer logic, not
 # transfer-engine threading.
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
@@ -47,7 +47,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.logger import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
@@ -83,7 +83,7 @@ class KvCacheConfigV2:
     disk_prefetch_num_reqs: int = 4
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
-    block_reuse_policy: str = "all_reusable"
+    block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95

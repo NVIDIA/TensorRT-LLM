@@ -5,6 +5,7 @@ import itertools
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 import time
@@ -207,12 +208,24 @@ def launch_disaggregated_llm(
         "generation_servers": num_gen_instances
     }
 
+    internal_request_auth_key = secrets.token_hex(32)
+
     # Inject disagg_cluster into server config (for minimal_instances and is_ready check)
     disaggregated_server_config["disagg_cluster"] = disagg_cluster
+    disaggregated_server_config["internal_request_auth_key"] = (
+        internal_request_auth_key)
 
     # Inject into worker configs
-    ctx_server_config = {**ctx_server_config, "disagg_cluster": disagg_cluster}
-    gen_server_config = {**gen_server_config, "disagg_cluster": disagg_cluster}
+    ctx_server_config = {
+        **ctx_server_config,
+        "disagg_cluster": disagg_cluster,
+        "internal_request_auth_key": internal_request_auth_key,
+    }
+    gen_server_config = {
+        **gen_server_config,
+        "disagg_cluster": disagg_cluster,
+        "internal_request_auth_key": internal_request_auth_key,
+    }
 
     with open(disaggregated_serving_config_path, "w") as f:
         yaml.dump(disaggregated_server_config, f)
