@@ -18,7 +18,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
-                    Optional, Tuple, Union)
+                    Optional, Protocol, Sequence, Tuple, Union, cast)
 
 import torch
 import triton
@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy, KVCacheManagerV2, Role)
+from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
+    KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -50,9 +52,17 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
-                                                      SsmLayerConfig)
+                                                      SsmLayerConfig,
+                                                      TokenIdExt, _KVCache)
 
 GB = 1 << 30
+
+
+class _PrefixReuseDiagnostics(Protocol):
+
+    def _get_num_tokens_before_hybrid_pruning(self) -> int:
+        ...
+
 
 # Replay kernels pad the token/window dimension to at least 16 for tensor-core
 # tiles, so history sizes below 16 are no faster when not writing and do
@@ -2730,9 +2740,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
     Attention KV pages and Mamba recurrent-state pages are both owned by the
-    Python V2 cache manager.  Mamba layers are represented as V2 SSM layers,
-    while this wrapper exposes the state tensors and slot indices expected by
-    the PyTorch Mamba kernels.
+    selected V2 backend (C++ by default). Mamba layers are represented as V2
+    SSM layers, while this wrapper exposes the state tensors and slot indices
+    expected by the PyTorch Mamba kernels.
     """
 
     _supports_additional_snapshot_offsets = True
@@ -2798,6 +2808,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
         self._seed_rank_offset = _mamba_rank_offset(mapping)
         self._seed_request_counter = 0
+        self._recurrent_evicted_blocks_total = 0
+        self._recurrent_onboarded_blocks_total = 0
+        self._recurrent_dropped_blocks_total = 0
+        self._recurrent_status_logged = False
         num_cuda_graph_padding_dummy_slots = (
             _get_num_cuda_graph_padding_dummy_slots(spec_config,
                                                     max_batch_size))
@@ -2960,6 +2974,104 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.all_ssm_states = []
             self.all_conv_states = []
             self._setup_replay_buffers(spec_config)
+
+    def _create_kv_cache(
+        self,
+        request_id: int,
+        lora_task_id: Optional[int],
+        input_tokens: Optional[Sequence[TokenIdExt]],
+        *,
+        cache_salt: Optional[str] = None,
+        is_dummy: bool = False,
+        expected_prompt_length: Optional[int] = None,
+    ) -> Optional[_KVCache]:
+        kv_cache = super()._create_kv_cache(
+            request_id,
+            lora_task_id,
+            input_tokens,
+            cache_salt=cache_salt,
+            is_dummy=is_dummy,
+            expected_prompt_length=expected_prompt_length,
+        )
+        if (self.mapping.rank == 0 and kv_cache is not None
+                and input_tokens is not None and not is_dummy
+                and self.local_num_mamba_layers > 0):
+            # Prefix lookup excludes the final prompt token because it must be
+            # recomputed by prefill. Restore it for the request-length metric.
+            request_total_tokens = len(input_tokens) + 1
+            prefix_reuse_diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
+            logger.debug(
+                f"[MambaHybridCacheManagerV2] prefix reuse rank={self.mapping.rank} "
+                f"request_id={request_id} "
+                f"request_total_tokens={request_total_tokens} "
+                f"longest_attention_match_tokens="
+                f"{prefix_reuse_diagnostics._get_num_tokens_before_hybrid_pruning()} "
+                f"latest_recurrent_snapshot_tokens="
+                f"{kv_cache.num_committed_tokens}")
+        return kv_cache
+
+    def get_iteration_stats(self) -> Optional[KVCacheV2IterationStatsReport]:
+        """Log recurrent-cache movement; this is KDA state for Kimi K3."""
+        report = super().get_iteration_stats()
+        if report is None:
+            return None
+
+        pool_group_ids = sorted({
+            pool_group_id
+            for pool_group_id, _, kind in
+            self._stats_life_cycle_metadata().values() if kind == "ssm"
+        })
+        if not pool_group_ids:
+            return report
+        pool_group_reports = [
+            report.by_pool_group[pool_group_id]
+            for pool_group_id in pool_group_ids
+        ]
+
+        stats = [
+            pool_group_report.stats for pool_group_report in pool_group_reports
+        ]
+        evicted_blocks = sum(stat.iter_offload_blocks for stat in stats)
+        evicted_bytes = sum(stat.iter_offload_bytes for stat in stats)
+        onboarded_blocks = sum(stat.iter_onboard_blocks for stat in stats)
+        onboarded_bytes = sum(stat.iter_onboard_bytes for stat in stats)
+        dropped_blocks = sum(stat.iter_host_dropped_blocks for stat in stats)
+        dropped_bytes = sum(stat.iter_host_dropped_bytes for stat in stats)
+        has_movement = bool(evicted_blocks or onboarded_blocks
+                            or dropped_blocks)
+        if has_movement:
+            self._recurrent_evicted_blocks_total += evicted_blocks
+            self._recurrent_onboarded_blocks_total += onboarded_blocks
+            self._recurrent_dropped_blocks_total += dropped_blocks
+        if (self.mapping.rank == 0
+                and (has_movement or not self._recurrent_status_logged)):
+            logger.info(
+                f"[MambaHybridCacheManagerV2] recurrent cache status "
+                f"rank={self.mapping.rank} pool_group_ids={pool_group_ids} "
+                f"evicted_recurrent_blocks={evicted_blocks} "
+                f"evicted_recurrent_bytes={evicted_bytes} "
+                f"onboarded_recurrent_blocks={onboarded_blocks} "
+                f"onboarded_recurrent_bytes={onboarded_bytes} "
+                f"dropped_recurrent_blocks={dropped_blocks} "
+                f"dropped_recurrent_bytes={dropped_bytes} "
+                f"total_evicted_recurrent_blocks="
+                f"{self._recurrent_evicted_blocks_total} "
+                f"total_onboarded_recurrent_blocks="
+                f"{self._recurrent_onboarded_blocks_total} "
+                f"total_dropped_recurrent_blocks="
+                f"{self._recurrent_dropped_blocks_total} "
+                f"gpu_used_recurrent_blocks="
+                f"{sum(stat.primary_used_num_blocks for stat in stats)} "
+                f"gpu_free_recurrent_blocks="
+                f"{sum(stat.primary_free_num_blocks for stat in stats)} "
+                f"gpu_evictable_recurrent_blocks="
+                f"{sum(stat.primary_evictable_num_blocks for stat in stats)} "
+                f"host_used_recurrent_blocks="
+                f"{sum(stat.secondary_used_num_blocks for stat in stats)} "
+                f"host_free_recurrent_blocks="
+                f"{sum(stat.secondary_free_num_blocks for stat in stats)}")
+            self._recurrent_status_logged = True
+        return report
 
     @staticmethod
     def get_cache_size_per_token(model_config,

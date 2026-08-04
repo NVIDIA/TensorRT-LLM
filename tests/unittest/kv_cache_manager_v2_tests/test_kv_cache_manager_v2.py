@@ -1913,8 +1913,10 @@ class TestSSMSupport(unittest.TestCase):
         self,
         tokens_per_block: int = 32,
         gpu_quota: int = 32 << 20,
+        host_quota: int = 0,
         num_attn_layers: int = 2,
         num_ssm_layers: int = 2,
+        ssm_buffer_size: int = 8192,
         window_size: SlidingWindowSize = None,
         commit_min_snapshot: bool = True,
         enable_partial_reuse: bool = False,
@@ -1938,14 +1940,17 @@ class TestSSMSupport(unittest.TestCase):
                 SsmLayerConfig(
                     layer_id=LayerId(lid),
                     buffers=[
-                        BufferConfig(role=DataRole("ssm_state"), size=8192),
+                        BufferConfig(role=DataRole("ssm_state"), size=ssm_buffer_size),
                     ],
                 )
             )
             lid += 1
+        cache_tiers = [GpuCacheTierConfig(quota=gpu_quota)]
+        if host_quota > 0:
+            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
         return KVCacheManagerConfig(
             tokens_per_block=tokens_per_block,
-            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            cache_tiers=cache_tiers,
             layers=layers,
             enable_partial_reuse=enable_partial_reuse,
             commit_min_snapshot=commit_min_snapshot,
@@ -2064,6 +2069,44 @@ class TestSSMSupport(unittest.TestCase):
 
         reused.resume(stream)
         reused.close()
+
+    def test_ssm_offload_stats_do_not_change_attention_cache_totals(self) -> None:
+        """SSM offload is visible without changing attention cache-hit totals."""
+        ssm_buffer_size = 3 << 19
+        cfg = self._make_ssm_config(
+            gpu_quota=2 << 20,
+            host_quota=2 << 20,
+            num_attn_layers=0,
+            num_ssm_layers=1,
+            ssm_buffer_size=ssm_buffer_size,
+        )
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(32)]
+
+        seed = self.manager.create_kv_cache(id=101)
+        seed.resume(stream)
+        seed.capacity = len(prompt)
+        seed.history_length = len(prompt)
+        seed.commit(prompt, is_end=True)
+        seed.close()
+        self.manager.get_and_reset_iteration_stats()
+
+        occupant = self.manager.create_kv_cache(id=102)
+        occupant.resume(stream)
+        ssm_life_cycle_id = _introspection.ssm_life_cycle_id(self.manager)
+        assert ssm_life_cycle_id is not None
+        offload_stats = self.manager.get_and_reset_iteration_stats()[ssm_life_cycle_id]
+        self.assertEqual(offload_stats.iter_offload_blocks, 1)
+        self.assertEqual(offload_stats.iter_offload_bytes, ssm_buffer_size)
+        occupant.close()
+
+        committed_stats = self.manager.get_committed_stats()
+        self.assertEqual(committed_stats.alloc_total_blocks, 0)
+        self.assertEqual(committed_stats.alloc_new_blocks, 0)
+        self.assertEqual(committed_stats.reused_blocks, 0)
+        self.assertEqual(committed_stats.missed_blocks, 0)
 
     def test_discard_ssm_snapshot_stats_clears_dirty_state(self) -> None:
         cfg = self._make_ssm_config()
@@ -2201,7 +2244,7 @@ class TestSSMSupport(unittest.TestCase):
 
     def test_ssm_reuse_keeps_snapshots_from_multiple_commits(self) -> None:
         """Multiple commit() calls keep independently reusable SSM snapshots."""
-        cfg = self._make_ssm_reuse_config(tokens_per_block=32)
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
         self.manager = KVCacheManager(cfg)
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
@@ -2222,6 +2265,8 @@ class TestSSMSupport(unittest.TestCase):
         kv2.close()
 
         kv3 = self.manager.create_kv_cache(input_tokens=prompt[:48])
+        # Attention pages cover all 48 tokens, but the latest SSM snapshot is 32.
+        self.assertEqual(kv3._get_num_tokens_before_hybrid_pruning(), 48)
         self.assertEqual(kv3.num_committed_tokens, 32)
         kv3.resume(stream)
         kv3.close()

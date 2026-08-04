@@ -241,6 +241,7 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
+        "_num_tokens_before_hybrid_pruning",
         "_num_committed_blocks",
         "_finish_event",
         "_tokens_per_block",
@@ -275,6 +276,7 @@ class _KVCache:
     # be computed on the fly, but that would be slow due to python.
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
+    _num_tokens_before_hybrid_pruning: int
     # Sometimes we can't commit a block because all its tokens are already covered by another block in
     # the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric
     # difference, 2. if our block is a partial block, we can't write to memory of the other blocks.
@@ -329,6 +331,9 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
+        self._num_tokens_before_hybrid_pruning = (
+            reuse_match.num_tokens_before_hybrid_pruning if reuse_match is not None else 0
+        )
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
         self._tokens_per_block = manager.tokens_per_block
@@ -430,12 +435,6 @@ class _KVCache:
         else:
             self.manager.clear_stats_dirty(self.id)
 
-    def _stats_life_cycle_key(self, life_cycle: LifeCycleId) -> LifeCycleId | None:
-        life_cycle_obj = self.manager._life_cycles.get_life_cycle(life_cycle)
-        if isinstance(life_cycle_obj, AttnLifeCycle):
-            return life_cycle
-        return None
-
     def _refresh_generation_alloc_ready(self) -> None:
         expected_prompt_length = self._expected_prompt_length
         if expected_prompt_length is not None and self._history_length >= expected_prompt_length:
@@ -501,10 +500,9 @@ class _KVCache:
     def _record_direct_iteration_stats(
         self, life_cycle: LifeCycleId, iteration_stats: KVCacheIterationStatsDelta
     ) -> None:
-        life_cycle_key = self._stats_life_cycle_key(life_cycle)
-        if life_cycle_key is None or iteration_stats.empty or not self._should_record_stats():
+        if iteration_stats.empty or not self._should_record_stats():
             return
-        self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
+        self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle: iteration_stats})
 
     def _record_migrated_slots(
         self,
@@ -517,9 +515,10 @@ class _KVCache:
             return
         assert len(pages) == len(slots)
         for page in pages:
-            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
-            if life_cycle_key is None:
-                continue
+            life_cycle = page.life_cycle
+            is_attention = isinstance(
+                self.manager._life_cycles.get_life_cycle(life_cycle), AttnLifeCycle
+            )
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
             page_size = sum(self.manager._storage.slot_size(pg_idx))
             stats = KVCacheStatsDelta()
@@ -528,8 +527,11 @@ class _KVCache:
                 iteration_stats.iter_offload_blocks = 1
                 iteration_stats.iter_offload_bytes = page_size
             elif dst_level == GPU_LEVEL:
-                stats.alloc_total_blocks = 1
-                stats.alloc_new_blocks = 1
+                # Global cache-hit accounting is attention-only. SSM movement is
+                # reported by lifecycle/pool-group iteration statistics instead.
+                if is_attention:
+                    stats.alloc_total_blocks = 1
+                    stats.alloc_new_blocks = 1
                 iteration_stats.iter_alloc_total_blocks = 1
                 iteration_stats.iter_alloc_new_blocks = 1
                 if src_level > GPU_LEVEL:
@@ -539,7 +541,7 @@ class _KVCache:
                     iteration_stats.iter_intra_device_copy_blocks = 1
                     iteration_stats.iter_intra_device_copy_bytes = page_size
             if not stats.empty or not iteration_stats.empty:
-                self.manager.commit_stats(stats, {life_cycle_key: iteration_stats})
+                self.manager.commit_stats(stats, {life_cycle: iteration_stats})
 
     def _record_dropped_pages(
         self,
@@ -557,15 +559,12 @@ class _KVCache:
         if not self._should_record_stats() or not pages:
             return
         for page in pages:
-            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
-            if life_cycle_key is None:
-                continue
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
             page_size = sum(self.manager._storage.slot_size(pg_idx))
             iteration_stats = KVCacheIterationStatsDelta()
             iteration_stats.iter_host_dropped_blocks = 1
             iteration_stats.iter_host_dropped_bytes = page_size
-            self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
+            self.manager.commit_stats(KVCacheStatsDelta(), {page.life_cycle: iteration_stats})
 
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them. After
     # close, uncommitted data in blocks for (beam_index >= beam_width) will be lost.
@@ -1046,6 +1045,10 @@ class _KVCache:
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
 
+    def _get_num_tokens_before_hybrid_pruning(self) -> int:
+        """Return the pre-hybrid-pruning prefix for internal diagnostics."""
+        return self._num_tokens_before_hybrid_pruning
+
     @property
     def committed_tokens(self) -> list[TokenIdExt]:
         return list(self._committed_tokens)
@@ -1284,10 +1287,9 @@ class _KVCache:
                         self.cuda_stream,
                     )
                 if lc_idx != ssm_lc_id:
-                    life_cycle_key = self._stats_life_cycle_key(lc_idx)
-                    if life_cycle_key is not None and self._should_record_stats():
+                    if self._should_record_stats():
                         changed = self._pending_stats.record_allocation_range(
-                            life_cycle_key,
+                            lc_idx,
                             last_ordinal,
                             BlockOrdinal(last_ordinal + 1),
                             beam_width=1,

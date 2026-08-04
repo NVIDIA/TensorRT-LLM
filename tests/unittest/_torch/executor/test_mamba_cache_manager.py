@@ -193,6 +193,121 @@ def test_mamba_kv_cache_params_separate_target_and_draft_masks():
     )
 
 
+def test_kimi_kda_cache_params_preserve_qkv_and_fp32_state_geometry() -> None:
+    config = SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=4,
+        linear_attn_config={
+            "head_dim": 8,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1, 3],
+            "full_attn_layers": [2, 4],
+        },
+        dtype=torch.bfloat16,
+    )
+
+    params = extract_mamba_kv_cache_params(config)
+
+    assert params.state_size == 8
+    assert params.conv_kernel == 5
+    assert params.num_heads == 4
+    assert params.n_groups == 4
+    assert params.head_dim == 8
+    assert params.mamba_layer_mask == [True, False, True, False]
+    assert params.target_full_attention_layer_mask == [
+        False,
+        True,
+        False,
+        True,
+    ]
+    assert params.num_mamba_layers == 2
+    assert params.dtype is torch.bfloat16
+    assert params.mamba_ssm_cache_dtype is torch.float32
+
+
+def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class RecordingV2Manager(MambaHybridCacheManagerV2):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    config = SimpleNamespace(
+        architectures=["KimiLinearForCausalLM"],
+        model_type="kimi_linear",
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        num_hidden_layers=4,
+        kv_lora_rank=32,
+        qk_rope_head_dim=8,
+        linear_attn_config={
+            "head_dim": 8,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1, 3],
+            "full_attn_layers": [2, 4],
+        },
+        dtype=torch.bfloat16,
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        quant_config=None,
+        sparse_attention_config=None,
+        get_num_mamba_layers=lambda: 2,
+    )
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    assert get_kv_cache_manager_cls(model_config, kv_cache_config) is MambaHybridCacheManagerV2
+
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingV2Manager,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        kv_cache_config=kv_cache_config,
+        tokens_per_block=64,
+        max_seq_len=2048,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+    args = captured["args"]
+    kwargs = captured["kwargs"]
+    assert isinstance(args, tuple)
+    assert isinstance(kwargs, dict)
+    assert args[:9] == (
+        8,
+        5,
+        4,
+        4,
+        8,
+        2,
+        [True, False, True, False],
+        torch.bfloat16,
+        torch.float32,
+    )
+    assert kwargs["num_layers"] == 2
+    assert kwargs["layer_mask"] == [False, True, False, True]
+    assert kwargs["num_kv_heads"] == 1
+    assert kwargs["head_dim"] == 40
+    assert kwargs["conv_state_layout"] == "q_k_v"
+    assert "kda_replay_num_spec" not in kwargs
+    assert "model_type" not in kwargs
+
+
 @pytest.mark.parametrize(
     ("use_v2", "enable_block_reuse", "expected"),
     [
@@ -540,6 +655,26 @@ def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
         assert llm_args.kv_cache_config.enable_block_reuse is False
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+def test_kimi_defaults_to_v2(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+    model_defaults = KimiLinearForCausalLM.get_model_defaults(llm_args)
+    apply_model_defaults_to_llm_args(llm_args, model_defaults)
+    _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults, original_setting="auto")
+
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+    assert llm_args.kv_cache_config.enable_block_reuse is False
+    assert llm_args.kv_cache_config.tokens_per_block == 64
+    assert (
+        get_kv_cache_manager_cls(_hybrid_model_config(), llm_args.kv_cache_config)
+        is MambaHybridCacheManagerV2
+    )
 
 
 def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
@@ -1995,6 +2130,124 @@ def test_v2_hybrid_uses_upstream_min_snapshot_policy():
         assert mgr.kv_cache_manager_py_config.commit_min_snapshot
     finally:
         mgr.shutdown()
+
+
+@pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])
+def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+    expected_log_count: int,
+) -> None:
+    get_num_tokens_before_hybrid_pruning = MagicMock(return_value=96)
+    kv_cache = SimpleNamespace(
+        _get_num_tokens_before_hybrid_pruning=get_num_tokens_before_hybrid_pruning,
+        num_committed_tokens=64,
+    )
+    create_kv_cache = MagicMock(return_value=kv_cache)
+    log_debug = MagicMock()
+    monkeypatch.setattr(KVCacheManagerV2, "_create_kv_cache", create_kv_cache)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.debug", log_debug
+    )
+
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.mapping = SimpleNamespace(rank=rank)
+    mgr.local_num_mamba_layers = 1
+    result = mgr._create_kv_cache(
+        request_id=123,
+        lora_task_id=None,
+        input_tokens=list(range(127)),
+        expected_prompt_length=127,
+    )
+
+    assert result is kv_cache
+    assert log_debug.call_count == expected_log_count
+    assert get_num_tokens_before_hybrid_pruning.call_count == expected_log_count
+    if rank == 0:
+        log_debug.assert_called_once_with(
+            "[MambaHybridCacheManagerV2] prefix reuse rank=0 request_id=123 "
+            "request_total_tokens=128 "
+            "longest_attention_match_tokens=96 "
+            "latest_recurrent_snapshot_tokens=64"
+        )
+
+
+@pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])
+def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+    expected_log_count: int,
+) -> None:
+    first_stats = SimpleNamespace(
+        iter_offload_blocks=3,
+        iter_offload_bytes=300,
+        iter_onboard_blocks=1,
+        iter_onboard_bytes=100,
+        iter_host_dropped_blocks=2,
+        iter_host_dropped_bytes=200,
+        primary_used_num_blocks=11,
+        primary_free_num_blocks=5,
+        primary_evictable_num_blocks=4,
+        secondary_used_num_blocks=7,
+        secondary_free_num_blocks=9,
+    )
+    second_stats = SimpleNamespace(
+        iter_offload_blocks=2,
+        iter_offload_bytes=200,
+        iter_onboard_blocks=4,
+        iter_onboard_bytes=400,
+        iter_host_dropped_blocks=1,
+        iter_host_dropped_bytes=100,
+        primary_used_num_blocks=13,
+        primary_free_num_blocks=6,
+        primary_evictable_num_blocks=5,
+        secondary_used_num_blocks=8,
+        secondary_free_num_blocks=10,
+    )
+    report = SimpleNamespace(
+        by_pool_group={
+            6: SimpleNamespace(stats=first_stats),
+            7: SimpleNamespace(stats=second_stats),
+        },
+    )
+    monkeypatch.setattr(KVCacheManagerV2, "get_iteration_stats", MagicMock(return_value=report))
+    log_info = MagicMock()
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.info", log_info)
+
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.mapping = SimpleNamespace(rank=rank)
+    mgr._stats_life_cycle_metadata = MagicMock(
+        return_value={
+            0: (4, 4096, "attention"),
+            1: (6, None, "ssm"),
+            2: (7, None, "ssm"),
+            3: (6, None, "ssm"),
+        }
+    )
+    mgr._recurrent_evicted_blocks_total = 0
+    mgr._recurrent_onboarded_blocks_total = 0
+    mgr._recurrent_dropped_blocks_total = 0
+    mgr._recurrent_status_logged = False
+
+    assert mgr.get_iteration_stats() is report
+    assert mgr._recurrent_evicted_blocks_total == 5
+    assert mgr._recurrent_onboarded_blocks_total == 5
+    assert mgr._recurrent_dropped_blocks_total == 3
+    assert log_info.call_count == expected_log_count
+    if rank == 0:
+        log_info.assert_called_once_with(
+            "[MambaHybridCacheManagerV2] recurrent cache status "
+            "rank=0 pool_group_ids=[6, 7] "
+            "evicted_recurrent_blocks=5 evicted_recurrent_bytes=500 "
+            "onboarded_recurrent_blocks=5 onboarded_recurrent_bytes=500 "
+            "dropped_recurrent_blocks=3 dropped_recurrent_bytes=300 "
+            "total_evicted_recurrent_blocks=5 "
+            "total_onboarded_recurrent_blocks=5 "
+            "total_dropped_recurrent_blocks=3 "
+            "gpu_used_recurrent_blocks=24 gpu_free_recurrent_blocks=11 "
+            "gpu_evictable_recurrent_blocks=9 "
+            "host_used_recurrent_blocks=15 host_free_recurrent_blocks=19"
+        )
 
 
 @skip_no_cuda

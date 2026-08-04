@@ -607,13 +607,9 @@ def _load_kimi_k3_mla_kv_b_proj(
             f"{source.shape[0]} are not divisible by {head_width}"
         )
     if head_start < 0:
-        raise ValueError(
-            f"Kimi K3 MLA head_start must be non-negative, got {head_start}"
-        )
+        raise ValueError(f"Kimi K3 MLA head_start must be non-negative, got {head_start}")
     if weight.device.type == "meta":
-        raise RuntimeError(
-            "Kimi K3 MLA kv_b_proj loading requires materialized weights"
-        )
+        raise RuntimeError("Kimi K3 MLA kv_b_proj loading requires materialized weights")
 
     source_heads = source.shape[0] // head_width
     source = source.view(source_heads, head_width, kv)
@@ -680,8 +676,7 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
         nonlocal count
         child = getattr(parent, attr, None)
         if isinstance(child, (nn.Linear, TrtllmLinear)):
-            setattr(parent, attr,
-                    _Fp8BlockScaleWeightReadLinear.from_linear(child))
+            setattr(parent, attr, _Fp8BlockScaleWeightReadLinear.from_linear(child))
             # Free the original BF16 storage now (as in the MLP/KDA conversions
             # above): the loader's transient name->Parameter map would otherwise
             # keep it alive until load returns, making the FP8 copy purely
@@ -1894,8 +1889,9 @@ class KimiMLARuntime(nn.Module):
             quant_config=quant_config,
         )
 
-    def forward(self, hidden_states: torch.Tensor,
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
         out = self.mixer(hidden_states, attn_metadata)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
@@ -2132,12 +2128,9 @@ class KimiLinearModel(DecoderModel):
             "tokens); disable CUDA graphs and the overlap scheduler."
         )
 
-        block_residual = hidden_states.new_zeros(0, hidden_states.shape[0],
-                                                 hidden_states.shape[1])
+        block_residual = hidden_states.new_zeros(0, hidden_states.shape[0], hidden_states.shape[1])
         for layer in self.layers:
-            hidden_states, block_residual = layer(hidden_states,
-                                                  block_residual,
-                                                  attn_metadata)
+            hidden_states, block_residual = layer(hidden_states, block_residual, attn_metadata)
             if spec_metadata is not None:
                 # DFlash hidden-state capture. K3's attn-residual scheme
                 # already folds the residual into the running prefix sum
@@ -2202,10 +2195,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
-        # - enable_block_reuse defaults off: reuse is supported as an
-        #   explicit opt-in (routes to CppMambaHybridCacheManager with
-        #   per-block KDA state snapshots); the default stays on the
-        #   Mixed manager, which SA speculative decoding requires.
+        # - use_kv_cache_manager_v2 defaults on: Kimi K3 uses the unified
+        #   attention/KDA state pools and snapshot-aware reuse policy.
+        # - enable_block_reuse defaults off: reuse remains an explicit opt-in
+        #   because it also requires a recurrent-state snapshot policy.
         # - tokens_per_block=64: with 32, the flashinfer trtllm-gen FMHA lib
         #   rejects the MLA (576, 512) generation kernel (marked slower) and
         #   the fallback C++ path requires num_heads % 64 == 0, which K3's
@@ -2214,6 +2207,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "tokens_per_block": 64,
+                "use_kv_cache_manager_v2": True,
             }
         }
 
@@ -2299,12 +2293,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # instead, so context can project directly into the FMHA layout and
         # absorbed decode can take zero-copy K/V views.
         mla_mixers = [
-            layer.self_attn.mixer for layer in self.model.layers
+            layer.self_attn.mixer
+            for layer in self.model.layers
             if not getattr(layer, "is_kda", True)
         ]
-        mla_kv_b_mixers = {
-            id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers
-        }
+        mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
 
         params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
@@ -2456,10 +2449,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 # never reach here: their identically named g/o projections
                 # match the exact-ratio branch above.
                 if mla_tp_size > 1 and ".self_attn." in name:
-                    if (name.endswith((".q_b_proj.weight",
-                                       ".g_proj.weight"))
-                            and src.shape[1:] == param.shape[1:]
-                            and src.shape[0] < param.shape[0] * mla_tp_size):
+                    if (
+                        name.endswith((".q_b_proj.weight", ".g_proj.weight"))
+                        and src.shape[1:] == param.shape[1:]
+                        and src.shape[0] < param.shape[0] * mla_tp_size
+                    ):
                         s = param.shape[0]
                         lo = mla_tp_rank * s
                         param.data.zero_()
@@ -2510,10 +2504,12 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 # (o_proj) with zeros. KV-B is handled above. KDA layers'
                 # identically named projections match exactly and never take
                 # this path.
-                if (".self_attn." in name and name.endswith(
-                    (".q_b_proj.weight", ".g_proj.weight"))
-                        and src.shape[1:] == param.shape[1:]
-                        and src.shape[0] < param.shape[0]):
+                if (
+                    ".self_attn." in name
+                    and name.endswith((".q_b_proj.weight", ".g_proj.weight"))
+                    and src.shape[1:] == param.shape[1:]
+                    and src.shape[0] < param.shape[0]
+                ):
                     param.data.zero_()
                     param.data[: src.shape[0]].copy_(src.to(param.dtype))
                     return
@@ -2566,8 +2562,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         run_concurrently(load_param, param_jobs, num_workers=8)
 
         logger.info(
-            f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections "
-            "in grouped runtime layout")
+            f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
+        )
 
         # ---- backend expert slots: file-grouped streaming ----
         # The shared lazy ``weights`` dict keeps every shard mmapped for the
