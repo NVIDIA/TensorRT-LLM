@@ -40,7 +40,6 @@ def test_serializable_scheduler_output_round_trip():
         scheduled_requests,
         fitting_disagg_gen_init_requests,
         num_fitting_requests,
-        wait_for_disagg_gen_transfer_progress=True,
     )
 
     # Serialize and deserialize the serializable scheduler output
@@ -55,7 +54,6 @@ def test_serializable_scheduler_output_round_trip():
 
     # Verify the restored scheduler result is correct
     assert restored_num_fitting == num_fitting_requests
-    assert restored_output.wait_for_disagg_gen_transfer_progress
     assert _request_ids(restored_schedule.encoder_requests) == _request_ids(
         scheduled_requests.encoder_requests
     )
