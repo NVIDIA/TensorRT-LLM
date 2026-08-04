@@ -50,7 +50,6 @@ class RuleResult:
     # True (safe default) iff this rule's matched changes might affect perf
     # benchmarks. Set False when matched changes are pure test infra.
     perfsanity_relevant: bool = True
-    detail: dict[str, object] = field(default_factory=dict)
 
 
 class Rule(ABC):

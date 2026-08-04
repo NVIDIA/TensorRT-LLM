@@ -151,10 +151,9 @@ class SelectionResult:
 
 
 def _rule_reason(rule, r) -> dict:
-    """One rule's structured reason entry: `{source, **detail, blocks, stages}`."""
+    """One rule's structured reason entry: `{source, blocks, stages}`."""
     return {
         "source": rule.name,
-        **r.detail,
         "blocks": len(r.block_filters),
         "stages": len(r.affected_stages),
     }
