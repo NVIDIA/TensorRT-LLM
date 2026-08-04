@@ -591,6 +591,104 @@ def test_attention_mla_flashinfer(scenario: Scenario,
                           v2_kv_cache)
 
 
+@pytest.mark.parametrize("v2_kv_cache", [True, False],
+                         ids=["v2_kv_cache", "v1_kv_cache"])
+def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool):
+    """Cover the CuTe DSL MLA decode AutoTuner path.
+
+    The plain test_attention_mla runs with the autotuner off, so the op
+    always takes the ``default_tactic`` (-1 sentinel) branch. This test
+    drives the tuning path instead: a tuning-mode pass must profile the
+    tactic space (split_kv and is_persistent tactic elements), and a
+    subsequent serving-mode pass must reuse the tuned kernels without
+    triggering any runtime ``cute.compile`` (a compile outside the tuning
+    window stalls the serving loop).
+    """
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("CuTe DSL MLA decode requires SM100 or SM103")
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("nvidia-cutlass-dsl is not installed")
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVMlaDecodeBlackwellRunner
+
+    # fp8 KV with (num_heads=128, seq_len_q=1) is admitted by the CuTe DSL
+    # perf gate from batch_size >= 64, so a 64-request decode batch routes
+    # the generation phase through cute_dsl_mla in the default lib order.
+    scenario = Scenario(kv_cache_dtype=torch.float8_e4m3fn,
+                        num_layers=1,
+                        kv_cache_tokens_per_block=tokens_per_block)
+    ctx_lens = [10] * 64
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings":
+            scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+
+    def run_once():
+        # Numerics vs the reference implementation are asserted inside.
+        _run_test_for_backend("TRTLLM", scenario.num_heads,
+                              scenario.num_kv_heads, scenario.num_layers,
+                              scenario.q_lora_rank, scenario.kv_lora_rank,
+                              scenario.qk_nope_head_dim,
+                              scenario.qk_rope_head_dim, scenario.v_head_dim,
+                              rope_config, scenario.kv_cache_tokens_per_block,
+                              torch.device('cuda'), scenario.dtype,
+                              scenario.kv_cache_dtype, ctx_lens, 1, 2,
+                              v2_kv_cache)
+
+    AutoTuner.get().clear_cache()
+    CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache.clear()
+
+    with autotune():
+        run_once()
+
+    tuned_ops = {key[0] for key in AutoTuner.get().profiling_cache.cache}
+    assert any("cute_dsl_mla_decode" in str(op) for op in tuned_ops), (
+        f"tuning-mode pass did not tune any cute_dsl_mla_decode op; "
+        f"tuned ops: {tuned_ops}")
+
+    kernel_keys = list(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache)
+    assert kernel_keys, "tuning-mode pass compiled no CuTe DSL MLA kernels"
+    # Tactic layout: unique_id + (out_dtype, mma_qk, mma_pv, split_kv,
+    # is_persistent); both tactic elements chosen by the tuner must have
+    # been exercised during profiling.
+    persistent_variants = {key[-1] for key in kernel_keys}
+    assert persistent_variants == {
+        True, False
+    }, (f"expected both is_persistent tactic candidates to be profiled, "
+        f"got {persistent_variants}")
+    split_kv_variants = {key[-2] for key in kernel_keys}
+    assert split_kv_variants, "no split_kv tactic variant was profiled"
+
+    # Serving-mode pass: tuned tactics must be reused as-is -- any new
+    # kernel_cache entry means a runtime cute.compile happened post-tuning.
+    num_compiled = len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache)
+    run_once()
+    assert len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) == \
+        num_compiled, (
+        "serving-mode pass cute.compiled new kernel variants after tuning: "
+        f"{set(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) - set(kernel_keys)}"
+    )
+
+
 def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                           q_lora_rank, kv_lora_rank, qk_nope_head_dim,
                           qk_rope_head_dim, v_head_dim, rope_config,
