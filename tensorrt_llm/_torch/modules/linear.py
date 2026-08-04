@@ -1694,12 +1694,16 @@ class NVFP4LinearMethod(LinearMethodBase):
     def process_weights_after_loading_vanilla(self, module: Linear):
         input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
 
-        # For dynamic activation quantization, input_scale and alpha are computed at runtime
-        if input_scale is not None:
+        # For dynamic activation quantization, input_scale and alpha are computed at runtime.
+        # The destination checks cover weight-only subclasses (W4A16 / Marlin), which leave
+        # input_scale / inv_input_scale / alpha as None in create_weights: a checkpoint may
+        # still carry activation scales, but they are meaningless for a high-precision
+        # activation path, so drop them instead of copying into a missing Parameter.
+        if input_scale is not None and module.input_scale is not None:
             copy_weight(module.input_scale, input_scale)
             E2M1_MAX = 6.0
             module.inv_input_scale.data = module.input_scale / E2M1_MAX
-        if alpha is not None:
+        if alpha is not None and module.alpha is not None:
             copy_weight(module.alpha, alpha)
             module.scalar_alpha = alpha.item()
         if weight_scale_2 is not None:
@@ -1790,11 +1794,13 @@ class NVFP4LinearMethod(LinearMethodBase):
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
-        # Finalize input_scale, weight_scale_2, alpha
+        # Finalize input_scale, weight_scale_2, alpha. The destination checks skip
+        # scales this linear method never allocated (see the weight-only note in
+        # process_weights_after_loading_vanilla).
         input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
-        if input_scale is not None:
+        if input_scale is not None and module.input_scale is not None:
             copy_weight(module.input_scale, input_scale)
-        if alpha is not None:
+        if alpha is not None and module.alpha is not None:
             copy_weight(module.alpha, alpha)
             module.scalar_alpha = alpha.item()
         if weight_scale_2 is not None:
@@ -1876,11 +1882,13 @@ class NVFP4LinearMethod(LinearMethodBase):
         weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
-        # Finalize input_scale, weight_scale_2, alpha
+        # Finalize input_scale, weight_scale_2, alpha. The destination checks skip
+        # scales this linear method never allocated (see the weight-only note in
+        # process_weights_after_loading_vanilla).
         input_scale, weight_scale_2, alpha = self._finalize_nvfp4_scales(module)
-        if input_scale is not None:
+        if input_scale is not None and module.input_scale is not None:
             copy_weight(module.input_scale, input_scale)
-        if alpha is not None:
+        if alpha is not None and module.alpha is not None:
             copy_weight(module.alpha, alpha)
             module.scalar_alpha = alpha.item()
         if weight_scale_2 is not None:
@@ -2004,85 +2012,18 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
-        module.scaling_vector_size = 16
-        assert in_features % module.scaling_vector_size == 0, (
-            f"in_features {in_features} must be divisible by scaling_vector_size "
-            f"{module.scaling_vector_size}")
+        super().create_weights(module, in_features, out_features, bias, dtype)
 
-        module.weight = Parameter(torch.empty([out_features, in_features // 2],
-                                              dtype=fp4_utils.float4_e2m1x2),
-                                  requires_grad=False)
-
-        nrows = fp4_utils.pad_up(out_features, 128)
-        ncols = fp4_utils.pad_up(in_features // module.scaling_vector_size, 4)
-        module.weight_scale = Parameter(torch.empty(
-            [nrows * ncols], dtype=fp4_utils.float4_sf_dtype),
-                                        requires_grad=False)
-        module.weight_scale_2 = Parameter(torch.empty([1], dtype=torch.float32),
-                                          requires_grad=False)
-
+        # W4A16 consumes high-precision activations, so there is no calibrated
+        # activation scale. These must be None from create_weights onwards (not
+        # merely left uninitialized): eligibility checks such as
+        # ``is_static_nvfp4_input_eligible`` run right after create_weights,
+        # before any weights are loaded, and read ``input_scale is not None``.
+        # The parent's process_weights_after_loading_* skip scales whose
+        # destination is None, so checkpoint-provided values are dropped here.
         module.input_scale = None
         module.inv_input_scale = None
         module.alpha = None
-        module.pre_quant_scale = None
-        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
-                                     requires_grad=False)
-        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
-                                         requires_grad=False)
-
-        if bias:
-            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
-                                    requires_grad=False)
-        else:
-            module.register_parameter("bias", None)
-
-    def _process_weights_without_static_activation_scale(
-            self, module: Linear, process_fn):
-        original_input_scale = module.input_scale
-        original_inv_input_scale = module.inv_input_scale
-        original_alpha = module.alpha
-        had_scalar_alpha = hasattr(module, "scalar_alpha")
-        original_scalar_alpha = getattr(module, "scalar_alpha", None)
-
-        device = module.weight_scale_2.device
-        module.input_scale = Parameter(torch.empty([1],
-                                                   dtype=torch.float32,
-                                                   device=device),
-                                       requires_grad=False)
-        module.inv_input_scale = Parameter(torch.empty([1],
-                                                       dtype=torch.float32,
-                                                       device=device),
-                                           requires_grad=False)
-        module.alpha = Parameter(torch.empty([1],
-                                             dtype=torch.float32,
-                                             device=device),
-                                 requires_grad=False)
-        try:
-            process_fn(module)
-        finally:
-            module.input_scale = original_input_scale
-            module.inv_input_scale = original_inv_input_scale
-            module.alpha = original_alpha
-            if had_scalar_alpha:
-                module.scalar_alpha = original_scalar_alpha
-            elif hasattr(module, "scalar_alpha"):
-                delattr(module, "scalar_alpha")
-
-    def process_weights_after_loading_vanilla(self, module: Linear):
-        self._process_weights_without_static_activation_scale(
-            module,
-            super().process_weights_after_loading_vanilla)
-
-    def process_weights_after_loading_fused_qkv_linear(self, module: Linear):
-        self._process_weights_without_static_activation_scale(
-            module,
-            super().process_weights_after_loading_fused_qkv_linear)
-
-    def process_weights_after_loading_fused_gate_up_linear(
-            self, module: Linear):
-        self._process_weights_without_static_activation_scale(
-            module,
-            super().process_weights_after_loading_fused_gate_up_linear)
 
     def transform_weights(self, module: Linear) -> None:
         # Materialize the smaller linear scale view once for Triton dequantization.
@@ -2175,6 +2116,20 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
 
 class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     """W4A16 NVFP4 linear backed by Marlin."""
+
+    # ``apply`` always allocates a plain output buffer (the Marlin GEMM has no
+    # NCCL-window output path) and ``apply_linear_allreduce`` is unsupported, so
+    # this must not inherit the True from NVFP4LinearMethod: Linear.forward reads
+    # this ClassVar to take a zero-copy branch that assumes the GEMM wrote into
+    # the symmetric-memory window.
+    supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
+
+    def get_tp_alignment(self, tp_mode, quant_config=None):
+        # Same 32-element alignment as the parent NVFP4 path. The Marlin kernel
+        # itself wants K%64 and N%128, but ``transform_weights`` pads the weight
+        # and scales up to those bounds (and ``apply`` slices the N padding back
+        # off), so the sharding constraint stays unchanged.
+        return 32
 
     @staticmethod
     def is_supported(module: Linear) -> bool:

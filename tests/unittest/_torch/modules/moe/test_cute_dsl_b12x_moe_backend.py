@@ -56,17 +56,10 @@ def test_can_implement_rejects_unsupported_sm(sm_version):
 
 
 @pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
-def test_can_implement_accepts_supported_sm_with_nvfp4(sm_version):
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
+def test_can_implement_accepts_supported_sm(sm_version, quant_algo):
     with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version):
-        ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4)
-    assert ok
-    assert reason is None
-
-
-@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
-def test_can_implement_accepts_supported_sm_with_w4a16_nvfp4(sm_version):
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version):
-        ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.W4A16_NVFP4)
+        ok, reason = CuteDslB12xFusedMoE.can_implement(quant_algo)
     assert ok
     assert reason is None
 
@@ -157,22 +150,12 @@ def test_get_moe_cls_cutedsl_returns_cutlass_for_w4a16_nvfp4_on_unsupported_sm()
 
 
 @pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
-def test_get_moe_cls_cutedsl_selects_b12x_on_supported_sm(sm_version):
-    """CUTEDSL + NVFP4 + SM120/121 + flashinfer importable → CuteDslB12xFusedMoE."""
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
+def test_get_moe_cls_cutedsl_selects_b12x_on_supported_sm(sm_version, quant_algo):
+    """CUTEDSL + NVFP4/W4A16_NVFP4 + SM120/121 + flashinfer importable → CuteDslB12xFusedMoE."""
     cfg = ModelConfig()
     cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
-        cls = get_moe_cls(cfg)
-    assert cls is CuteDslB12xFusedMoE
-
-
-@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
-def test_get_moe_cls_cutedsl_selects_b12x_for_w4a16_nvfp4_on_supported_sm(sm_version):
-    """CUTEDSL + W4A16_NVFP4 + SM120/121 + flashinfer importable → CuteDslB12xFusedMoE."""
-    cfg = ModelConfig()
-    cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    cfg.quant_config = QuantConfig(quant_algo=quant_algo)
     with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
         cls = get_moe_cls(cfg)
     assert cls is CuteDslB12xFusedMoE

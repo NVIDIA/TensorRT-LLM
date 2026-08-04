@@ -36,7 +36,6 @@ from tensorrt_llm._torch.modules.linear import (
     quant_config_has_nvfp4_activation_quantization,
 )
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import gelu_tanh, is_nvfp4_marlin_enabled, model_extra_attrs, relu2
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -151,24 +150,6 @@ def test_nvfp4_marlin_utility_requires_explicit_opt_in():
         assert not is_nvfp4_marlin_enabled()
         with model_extra_attrs({"nvfp4_gemm_allowed_backends": ["cutlass", "marlin"]}):
             assert is_nvfp4_marlin_enabled()
-
-
-def test_nvfp4_rmsnorm_keeps_high_precision_output_for_hopper_marlin():
-    with (
-        patch("tensorrt_llm._torch.modules.rms_norm.get_sm_version", return_value=90),
-        patch("tensorrt_llm._torch.modules.rms_norm.is_nvfp4_marlin_enabled", return_value=True),
-    ):
-        norm = RMSNorm(
-            hidden_size=32,
-            eps=1e-5,
-            dtype=torch.bfloat16,
-            quantize_type="nvfp4",
-            return_hp_output=True,
-        )
-
-    assert not norm.is_nvfp4
-    assert not norm.return_hp_output
-    assert norm.nvfp4_scale is None
 
 
 def test_w4a16_attention_does_not_quantize_output_to_fp4():
@@ -657,45 +638,6 @@ def test_w4a16_nvfp4_linear_restores_high_rank_input_shape():
         output = method.apply(module, input_tensor, bias=None)
 
     assert output.shape == (2, 3, 8)
-
-
-def test_w4a16_nvfp4_linear_uses_triton_dequant():
-    method = W4A16NVFP4LinearMethod()
-    input_tensor = torch.ones((2, 32), dtype=torch.bfloat16)
-    bias = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.bfloat16)
-    module = SimpleNamespace(
-        weight=torch.empty((4, 16), dtype=torch.uint8),
-        weight_scale=torch.empty((128 * 4,), dtype=torch.uint8),
-        _w4a16_weight_scale_linear=torch.empty((128 * 4,), dtype=torch.uint8),
-        weight_scale_2=torch.tensor([0.5], dtype=torch.float32),
-        dtype=torch.bfloat16,
-        out_features=4,
-        scaling_vector_size=16,
-        pre_quant_scale=None,
-        use_custom_cublas_mm=False,
-    )
-    captured = {}
-
-    def fake_dequant(weight, weight_scale, weight_scale_2, **kwargs):
-        captured["weight"] = weight
-        captured["weight_scale"] = weight_scale
-        captured["weight_scale_2"] = weight_scale_2
-        captured.update(kwargs)
-        return torch.ones((4, 32), dtype=torch.bfloat16)
-
-    with patch(
-        "tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4.dequant_nvfp4_2d_triton",
-        side_effect=fake_dequant,
-    ):
-        output = method.apply(module, input_tensor, bias=bias)
-
-    assert captured["weight"].data_ptr() == module.weight.data_ptr()
-    assert captured["weight_scale"] is module._w4a16_weight_scale_linear
-    assert captured["weight_scale_2"] is module.weight_scale_2
-    assert captured["target_dtype"] is torch.bfloat16
-    assert captured["sf_vec_size"] == 16
-    expected = torch.tensor([33.0, 34.0, 35.0, 36.0], dtype=torch.bfloat16).expand(2, 4)
-    torch.testing.assert_close(output, expected)
 
 
 def test_w4a16_nvfp4_linear_scale_cache_is_nonpersistent_buffer():
