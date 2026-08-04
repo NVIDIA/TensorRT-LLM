@@ -2266,7 +2266,7 @@ class TestSSMSupport(unittest.TestCase):
 
         kv3 = self.manager.create_kv_cache(input_tokens=prompt[:48])
         # Attention pages cover all 48 tokens, but the latest SSM snapshot is 32.
-        self.assertEqual(kv3.num_tokens_before_ssm_pruning, 48)
+        self.assertEqual(kv3._get_num_tokens_before_hybrid_pruning(), 48)
         self.assertEqual(kv3.num_committed_tokens, 32)
         kv3.resume(stream)
         kv3.close()

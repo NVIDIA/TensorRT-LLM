@@ -775,7 +775,9 @@ BlockRadixTree::PrunedMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> 
         }
     }
 
-    int const numTokensBeforeSsmPruning = numMatchedTokens(matched, mTokensPerBlock);
+    // Keep the attention-page match for internal diagnostics before recurrent
+    // snapshot and SWA-window constraints are applied together below.
+    int const numTokensBeforeHybridPruning = numMatchedTokens(matched, mTokensPerBlock);
 
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
     while (!matched.empty())
@@ -846,7 +848,7 @@ BlockRadixTree::PrunedMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> 
         }
     }
 
-    return {std::move(matched), numTokensBeforeSsmPruning};
+    return {std::move(matched), numTokensBeforeHybridPruning};
 }
 
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
@@ -857,7 +859,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
-    result.numTokensBeforeSsmPruning = prunedMatch.numTokensBeforeSsmPruning;
+    result.numTokensBeforeHybridPruning = prunedMatch.numTokensBeforeHybridPruning;
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

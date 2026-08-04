@@ -2138,8 +2138,9 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
     rank: int,
     expected_log_count: int,
 ) -> None:
+    get_num_tokens_before_hybrid_pruning = MagicMock(return_value=96)
     kv_cache = SimpleNamespace(
-        num_tokens_before_ssm_pruning=96,
+        _get_num_tokens_before_hybrid_pruning=get_num_tokens_before_hybrid_pruning,
         num_committed_tokens=64,
     )
     create_kv_cache = MagicMock(return_value=kv_cache)
@@ -2161,6 +2162,7 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
 
     assert result is kv_cache
     assert log_debug.call_count == expected_log_count
+    assert get_num_tokens_before_hybrid_pruning.call_count == expected_log_count
     if rank == 0:
         log_debug.assert_called_once_with(
             "[MambaHybridCacheManagerV2] prefix reuse rank=0 request_id=123 "

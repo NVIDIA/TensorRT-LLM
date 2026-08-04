@@ -18,7 +18,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
-                    Optional, Sequence, Tuple, Union)
+                    Optional, Protocol, Sequence, Tuple, Union, cast)
 
 import torch
 import triton
@@ -56,6 +56,13 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
                                                       TokenIdExt, _KVCache)
 
 GB = 1 << 30
+
+
+class _PrefixReuseDiagnostics(Protocol):
+
+    def _get_num_tokens_before_hybrid_pruning(self) -> int:
+        ...
+
 
 # Replay kernels pad the token/window dimension to at least 16 for tensor-core
 # tiles, so history sizes below 16 are no faster when not writing and do
@@ -2992,12 +2999,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # Prefix lookup excludes the final prompt token because it must be
             # recomputed by prefill. Restore it for the request-length metric.
             request_total_tokens = len(input_tokens) + 1
+            prefix_reuse_diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
             logger.debug(
                 f"[MambaHybridCacheManagerV2] prefix reuse rank={self.mapping.rank} "
                 f"request_id={request_id} "
                 f"request_total_tokens={request_total_tokens} "
                 f"longest_attention_match_tokens="
-                f"{kv_cache.num_tokens_before_ssm_pruning} "
+                f"{prefix_reuse_diagnostics._get_num_tokens_before_hybrid_pruning()} "
                 f"latest_recurrent_snapshot_tokens="
                 f"{kv_cache.num_committed_tokens}")
         return kv_cache
@@ -3020,8 +3028,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             for pool_group_id in pool_group_ids
         ]
 
-        stats = [pool_group_report.stats
-                 for pool_group_report in pool_group_reports]
+        stats = [
+            pool_group_report.stats for pool_group_report in pool_group_reports
+        ]
         evicted_blocks = sum(stat.iter_offload_blocks for stat in stats)
         evicted_bytes = sum(stat.iter_offload_bytes for stat in stats)
         onboarded_blocks = sum(stat.iter_onboard_blocks for stat in stats)

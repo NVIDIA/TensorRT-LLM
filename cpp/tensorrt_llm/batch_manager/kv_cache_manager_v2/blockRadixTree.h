@@ -282,8 +282,9 @@ public:
         int numTokens;
         // Total query length passed to match() (== len(tokens)).
         int numLookupTokens;
-        // Attention prefix after attention-page checks and before SSM and SWA-window pruning.
-        int numTokensBeforeSsmPruning;
+        // Internal diagnostic: prefix after initial attention-page checks and
+        // before recurrent-state and SWA-window pruning.
+        int numTokensBeforeHybridPruning;
     };
 
     ReuseMatch match(
@@ -326,7 +327,7 @@ private:
     struct PrunedMatch
     {
         std::vector<MatchResult> matches;
-        int numTokensBeforeSsmPruning;
+        int numTokensBeforeHybridPruning;
     };
 
     std::vector<MatchResult> matchTokenPath(

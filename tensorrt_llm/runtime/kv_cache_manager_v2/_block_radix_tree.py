@@ -54,16 +54,17 @@ class ReuseScope(NamedTuple):
 class ReuseMatch(NamedTuple):
     """Volatile result of a KV cache prefix match.
 
-    ``num_tokens_before_ssm_pruning`` is the attention-prefix match after
-    attention-page availability checks but before SSM and SWA-window pruning.
-    For Kimi K3, which uses full attention, the attention life cycles hold MLA
-    cache pages.
+    ``num_tokens_before_hybrid_pruning`` is retained for internal diagnostics.
+    It is the prefix after attention-page availability checks but before the
+    recurrent-snapshot and SWA-window constraints are applied together. For
+    Kimi K3, which uses full attention, the attention life cycles hold MLA cache
+    pages.
     """
 
     blocks: list["Block"]
     num_tokens: int
     num_lookup_tokens: int
-    num_tokens_before_ssm_pruning: int
+    num_tokens_before_hybrid_pruning: int
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -543,7 +544,9 @@ class BlockRadixTree:
             n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
             if n < lc.num_sink_blocks:
                 matched = matched[:n]
-        num_tokens_before_ssm_pruning = self._num_matched_tokens(matched)
+        # Retain the attention-page match for internal diagnostics before the
+        # recurrent snapshot and SWA-window constraints below are applied.
+        num_tokens_before_hybrid_pruning = self._num_matched_tokens(matched)
         # Check SSM snapshot availability before SWA window constraints.
         # Truncating to the last reusable SSM snapshot can change the matched
         # length used by the SWA check.
@@ -594,7 +597,7 @@ class BlockRadixTree:
                     break
             else:
                 break
-        return matched, num_tokens_before_ssm_pruning
+        return matched, num_tokens_before_hybrid_pruning
 
     def match(
         self,
@@ -608,14 +611,14 @@ class BlockRadixTree:
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
         """
-        matched, num_tokens_before_ssm_pruning = self._prune_match(
+        matched, num_tokens_before_hybrid_pruning = self._prune_match(
             list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         )
         return ReuseMatch(
             [block for block, _ in matched],
             self._num_matched_tokens(matched),
             len(tokens),
-            num_tokens_before_ssm_pruning,
+            num_tokens_before_hybrid_pruning,
         )
 
     def _check_sanity(self) -> bool:
