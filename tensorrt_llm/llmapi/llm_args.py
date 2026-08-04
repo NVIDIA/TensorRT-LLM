@@ -2771,9 +2771,10 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         description=
         "Attention backend for DFlash pooled-context cross-attention. This is "
         "independent of the backend used to construct the drafter's standard "
-        "attention modules. Names follow the main-model convention: TRTLLM uses "
-        "Blackwell generated FMHA kernels with a private paged context cache; "
-        "VANILLA uses FlashAttention with a contiguous cache.")
+        "attention modules. TRTLLM requires FlashInfer and an NVIDIA Blackwell "
+        "GPU with SM100 or SM103, and uses generated FMHA kernels with a private "
+        "paged context cache; VANILLA uses FlashAttention with a contiguous cache."
+    )
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):

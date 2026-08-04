@@ -316,7 +316,7 @@ def _fake_dflash_mask_wrapper(config, sliding_layers_causal=False):
 def test_dflash_attention_mask_args():
     wrapper = _fake_dflash_mask_wrapper(
         SimpleNamespace(
-            num_hidden_layers=2,
+            num_hidden_layers=4,
             layer_types=["sliding_attention", "full_attention"],
             sliding_window=4096,
             use_sliding_window=True,
@@ -325,6 +325,18 @@ def test_dflash_attention_mask_args():
 
     assert wrapper._get_attention_mask_args(0) == (True, (4095, 0))
     assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
+    assert wrapper._get_attention_mask_args(2) == (True, (4095, 0))
+
+    disabled_wrapper = _fake_dflash_mask_wrapper(
+        SimpleNamespace(
+            num_hidden_layers=2,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=4096,
+            use_sliding_window=False,
+        )
+    )
+
+    assert disabled_wrapper._get_attention_mask_args(0) == (False, (-1, -1))
 
     laguna_wrapper = _fake_dflash_mask_wrapper(
         SimpleNamespace(
@@ -335,3 +347,72 @@ def test_dflash_attention_mask_args():
     )
 
     assert laguna_wrapper._get_attention_mask_args(0) == (True, (-1, -1))
+
+
+def _fake_dflash_buffer_wrapper():
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper._dflash_trtllm_gen_ops = SimpleNamespace(
+        get_workspace_size=MagicMock(side_effect=lambda **kwargs: kwargs["max_num_requests"] * 16),
+        get_multi_ctas_kv_counter_size=MagicMock(
+            side_effect=lambda _num_heads, max_batch_size, _sm_count: max_batch_size * 8
+        ),
+    )
+    wrapper._dflash_trtllm_gen_workspace = None
+    wrapper._dflash_trtllm_gen_counters = None
+    wrapper._dflash_trtllm_gen_device = None
+    wrapper._dflash_trtllm_gen_sm_count = None
+    return wrapper
+
+
+def _prepare_dflash_buffers(wrapper, max_batch_size):
+    wrapper._prepare_dflash_trtllm_gen_buffers(
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        max_batch_size=max_batch_size,
+        block_size=4,
+        num_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+    )
+
+
+def test_dflash_trtllm_gen_buffers_reuse_and_grow():
+    wrapper = _fake_dflash_buffer_wrapper()
+    device_properties = SimpleNamespace(multi_processor_count=148)
+
+    with (
+        patch("torch.cuda.get_device_properties", return_value=device_properties) as get_props,
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        _prepare_dflash_buffers(wrapper, 2)
+        workspace = wrapper._dflash_trtllm_gen_workspace
+        counters = wrapper._dflash_trtllm_gen_counters
+
+        _prepare_dflash_buffers(wrapper, 2)
+        assert wrapper._dflash_trtllm_gen_workspace is workspace
+        assert wrapper._dflash_trtllm_gen_counters is counters
+
+        _prepare_dflash_buffers(wrapper, 4)
+        assert wrapper._dflash_trtllm_gen_workspace.numel() >= 64
+        assert wrapper._dflash_trtllm_gen_counters.numel() >= 32
+        get_props.assert_called_once_with(torch.device("cpu"))
+
+
+def test_dflash_trtllm_gen_buffers_reject_capture_time_allocation():
+    wrapper = _fake_dflash_buffer_wrapper()
+    device_properties = SimpleNamespace(multi_processor_count=148)
+
+    with (
+        patch("torch.cuda.get_device_properties", return_value=device_properties),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        _prepare_dflash_buffers(wrapper, 2)
+
+    with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+        with pytest.raises(RuntimeError, match="workspace.*before CUDA graph capture"):
+            _prepare_dflash_buffers(wrapper, 4)
+
+        wrapper._dflash_trtllm_gen_counters = torch.empty(16, dtype=torch.uint8, device="meta")
+        with pytest.raises(RuntimeError, match="counter buffer.*before CUDA graph capture"):
+            _prepare_dflash_buffers(wrapper, 2)
