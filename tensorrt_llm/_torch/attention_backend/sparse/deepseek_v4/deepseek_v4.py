@@ -591,7 +591,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
         window_size = self.window_size
-        device = self.swa_local_indices_cuda.device
 
         if token_positions is None:
             # Initial prepare() path. cu_seq_lens_cuda is already populated by

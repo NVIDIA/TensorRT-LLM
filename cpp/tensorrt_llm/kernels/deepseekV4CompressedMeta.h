@@ -58,15 +58,14 @@ struct CompressedPositionIdsParams
 void invokeDeepseekV4ComputePerRatioKvLens(int32_t const* kvLens, int32_t const* cachedTokens,
     PerRatioKvLensParams const& params, int32_t numRatios, int32_t batchSize, cudaStream_t stream);
 
-void invokeDeepseekV4ComputeCompressedMask(CompressedMaskParams const& params,
-    int32_t maxTotalTokens, int32_t numRatios, int32_t batchSize, cudaStream_t stream);
+void invokeDeepseekV4ComputeCompressedMask(CompressedMaskParams const& params, int32_t maxTotalTokens,
+    int32_t numRatios, int32_t batchSize, cudaStream_t stream);
 
-void invokeDeepseekV4ComputeCtxCompressedPositionIds(CompressedPositionIdsParams const& params,
-    int32_t maxCount, int32_t numRatios, int32_t numContexts, cudaStream_t stream);
+void invokeDeepseekV4ComputeCtxCompressedPositionIds(CompressedPositionIdsParams const& params, int32_t maxCount,
+    int32_t numRatios, int32_t numContexts, cudaStream_t stream);
 
-void invokeDeepseekV4ComputeGenCompressedPositionIds(CompressedPositionIdsParams const& params,
-    int32_t maxCount, int32_t numRatios, int32_t numContexts, int32_t batchSize,
-    cudaStream_t stream);
+void invokeDeepseekV4ComputeGenCompressedPositionIds(CompressedPositionIdsParams const& params, int32_t maxCount,
+    int32_t numRatios, int32_t numContexts, int32_t batchSize, cudaStream_t stream);
 
 } // namespace kernels
 

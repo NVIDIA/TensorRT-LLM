@@ -18,7 +18,8 @@ These cover two behaviours that are easy to break and expensive to notice:
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
-    DeepseekV4CacheManager, )
+    DeepseekV4CacheManager,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 
@@ -122,20 +123,17 @@ def test_copy_index_memo_is_reset_each_step():
 def test_sliding_block_table_padding_keeps_bad_page_index():
     """Only [:_num_tables] is overwritten; the tail must stay BAD_PAGE_INDEX."""
     layers, types, capacity, max_blocks, num_tables = 2, 5, 9, 4, 3
-    src = torch.arange(layers * types * num_tables * max_blocks,
-                       dtype=torch.int32).reshape(layers, types, num_tables,
-                                                 max_blocks)
+    src = torch.arange(layers * types * num_tables * max_blocks, dtype=torch.int32).reshape(
+        layers, types, num_tables, max_blocks
+    )
 
     # Reference: the original code filled the whole tensor first.
-    reference = torch.empty((layers, types, capacity, max_blocks),
-                            dtype=torch.int32)
+    reference = torch.empty((layers, types, capacity, max_blocks), dtype=torch.int32)
     reference.fill_(BAD_PAGE_INDEX)
     reference[:, :, :num_tables, :].copy_(src)
 
     # Optimized: pre-poison everything, fill only the tail, then copy the head.
-    optimized = torch.full((layers, types, capacity, max_blocks),
-                           -999999,
-                           dtype=torch.int32)
+    optimized = torch.full((layers, types, capacity, max_blocks), -999999, dtype=torch.int32)
     if num_tables < optimized.size(2):
         optimized[:, :, num_tables:, :].fill_(BAD_PAGE_INDEX)
     optimized[:, :, :num_tables, :].copy_(src)
@@ -147,18 +145,15 @@ def test_sliding_block_table_padding_keeps_bad_page_index():
 def test_sliding_block_table_padding_when_full():
     """With num_tables == capacity there is no tail to fill."""
     layers, types, capacity, max_blocks = 1, 2, 6, 3
-    src = torch.arange(layers * types * capacity * max_blocks,
-                       dtype=torch.int32).reshape(layers, types, capacity,
-                                                  max_blocks)
+    src = torch.arange(layers * types * capacity * max_blocks, dtype=torch.int32).reshape(
+        layers, types, capacity, max_blocks
+    )
 
-    reference = torch.empty((layers, types, capacity, max_blocks),
-                            dtype=torch.int32)
+    reference = torch.empty((layers, types, capacity, max_blocks), dtype=torch.int32)
     reference.fill_(BAD_PAGE_INDEX)
     reference[:, :, :capacity, :].copy_(src)
 
-    optimized = torch.full((layers, types, capacity, max_blocks),
-                           -999999,
-                           dtype=torch.int32)
+    optimized = torch.full((layers, types, capacity, max_blocks), -999999, dtype=torch.int32)
     if capacity < optimized.size(2):  # false: guard must skip the fill
         optimized[:, :, capacity:, :].fill_(BAD_PAGE_INDEX)
     optimized[:, :, :capacity, :].copy_(src)
@@ -169,18 +164,15 @@ def test_sliding_block_table_padding_when_full():
 def test_block_offsets_padding_keeps_bad_page_index():
     """copy_batch_block_offsets writes only beam 0 of [:_num_tables]."""
     layers, capacity, beams, max_blocks, num_tables = 2, 7, 2, 3, 4
-    src = torch.arange(layers * num_tables * max_blocks,
-                       dtype=torch.int32).reshape(layers, num_tables,
-                                                  max_blocks)
+    src = torch.arange(layers * num_tables * max_blocks, dtype=torch.int32).reshape(
+        layers, num_tables, max_blocks
+    )
 
-    reference = torch.empty((layers, capacity, beams, max_blocks),
-                            dtype=torch.int32)
+    reference = torch.empty((layers, capacity, beams, max_blocks), dtype=torch.int32)
     reference.fill_(BAD_PAGE_INDEX)
     reference[:, :num_tables, 0, :].copy_(src)
 
-    optimized = torch.full((layers, capacity, beams, max_blocks),
-                           -999999,
-                           dtype=torch.int32)
+    optimized = torch.full((layers, capacity, beams, max_blocks), -999999, dtype=torch.int32)
     if num_tables < optimized.size(1):
         optimized[:, num_tables:, :, :].fill_(BAD_PAGE_INDEX)
     optimized[:, :num_tables, 1:, :].fill_(BAD_PAGE_INDEX)

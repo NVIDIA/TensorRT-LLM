@@ -1187,8 +1187,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         key = (tuple(request_ids), num_contexts, beam_width)
         if getattr(self, "_copy_idx_memo_key", None) == key:
             return self._copy_idx_memo_val
-        val = self.index_mapper.get_copy_index(request_ids, num_contexts,
-                                              beam_width)
+        val = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         self._copy_idx_memo_key = key
         self._copy_idx_memo_val = val
         return val
@@ -1357,9 +1356,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # it once per compression ratio, on the decode critical path; the device
             # op does the same arithmetic (BAD_PAGE_INDEX passthrough, otherwise
             # base * scale) and also removes the host->device staging copy.
-            self._compute_shared_block_table_device(
-                pool_id, scale, copy_idx, dst_tensor[:num_seqs]
-            )
+            self._compute_shared_block_table_device(pool_id, scale, copy_idx, dst_tensor[:num_seqs])
         else:
             staging[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
             dst_tensor[:num_seqs].copy_(staging[:num_seqs], non_blocking=True)
@@ -1392,9 +1389,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 pool_id, scale, copy_idx, device_block_table[:num_seqs]
             )
         else:
-            host_block_table[:num_seqs] = self._compute_shared_block_table(
-                pool_id, scale, copy_idx
-            )
+            host_block_table[:num_seqs] = self._compute_shared_block_table(pool_id, scale, copy_idx)
 
     @staticmethod
     def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping, **kwargs):

@@ -74,8 +74,7 @@ __global__ void computeTokenPositionsKernel(int32_t const* __restrict__ cuSeqLen
     int32_t const* __restrict__ cachedTokens, int32_t* __restrict__ reqIdxPerToken,
     int32_t* __restrict__ tokenPositions, int32_t batchSize, int32_t numTokens)
 {
-    for (int32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < numTokens;
-         t += gridDim.x * blockDim.x)
+    for (int32_t t = blockIdx.x * blockDim.x + threadIdx.x; t < numTokens; t += gridDim.x * blockDim.x)
     {
         // searchsorted(cu_seq_lens[1:], t, right=True): largest j with cu[j] <= t.
         int32_t lo = 0;
@@ -125,13 +124,11 @@ __global__ void computeSharedBlockTableKernel(int32_t const* __restrict__ blockO
 
     // blockOffsets layout is [numPools, copyIdxCapacity, 2, maxBlocksPerSeq];
     // the CPU path reads index 0 of the K/V dimension.
-    int64_t const baseOffset
-        = ((static_cast<int64_t>(poolId) * copyIdxCapacity + mappedTableId) * 2) * maxBlocksPerSeq;
+    int64_t const baseOffset = ((static_cast<int64_t>(poolId) * copyIdxCapacity + mappedTableId) * 2) * maxBlocksPerSeq;
 
-    for (int32_t blockId = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x)
-             + static_cast<int32_t>(threadIdx.x);
-         blockId < maxBlocksPerSeq;
-         blockId += static_cast<int32_t>(gridDim.x) * static_cast<int32_t>(blockDim.x))
+    for (int32_t blockId
+         = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x) + static_cast<int32_t>(threadIdx.x);
+         blockId < maxBlocksPerSeq; blockId += static_cast<int32_t>(gridDim.x) * static_cast<int32_t>(blockDim.x))
     {
         int32_t value = kBadPageIndex;
         if (validTable)
@@ -144,9 +141,9 @@ __global__ void computeSharedBlockTableKernel(int32_t const* __restrict__ blockO
 }
 } // namespace
 
-void invokeComputeTokenPositions(int32_t const* seqLens, int32_t const* cachedTokens,
-    int32_t* cuSeqLens, int32_t* reqIdxPerToken, int32_t* tokenPositions, int32_t batchSize,
-    int32_t numTokens, bool computeCuSeqLens, cudaStream_t stream)
+void invokeComputeTokenPositions(int32_t const* seqLens, int32_t const* cachedTokens, int32_t* cuSeqLens,
+    int32_t* reqIdxPerToken, int32_t* tokenPositions, int32_t batchSize, int32_t numTokens, bool computeCuSeqLens,
+    cudaStream_t stream)
 {
     if (batchSize <= 0)
     {
@@ -172,16 +169,14 @@ void invokeComputeTokenPositions(int32_t const* seqLens, int32_t const* cachedTo
     }
     if (numTokens > 0)
     {
-        int32_t const blocks
-            = std::min((numTokens + kThreadsPerBlock - 1) / kThreadsPerBlock, 2048);
+        int32_t const blocks = std::min((numTokens + kThreadsPerBlock - 1) / kThreadsPerBlock, 2048);
         computeTokenPositionsKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
             cuSeqLens, cachedTokens, reqIdxPerToken, tokenPositions, batchSize, numTokens);
     }
 }
 
-void invokeComputeSharedBlockTable(int32_t const* blockOffsets, int32_t const* copyIdx, int32_t* output,
-    int32_t poolId, int32_t scale, int32_t copyIdxCapacity, int32_t numTables, int32_t maxBlocksPerSeq,
-    cudaStream_t stream)
+void invokeComputeSharedBlockTable(int32_t const* blockOffsets, int32_t const* copyIdx, int32_t* output, int32_t poolId,
+    int32_t scale, int32_t copyIdxCapacity, int32_t numTables, int32_t maxBlocksPerSeq, cudaStream_t stream)
 {
     if (numTables <= 0 || maxBlocksPerSeq <= 0)
     {
@@ -195,7 +190,6 @@ void invokeComputeSharedBlockTable(int32_t const* blockOffsets, int32_t const* c
     computeSharedBlockTableKernel<<<grid, block, 0, stream>>>(
         blockOffsets, copyIdx, output, poolId, scale, copyIdxCapacity, numTables, maxBlocksPerSeq);
 }
-
 
 } // namespace kernels
 

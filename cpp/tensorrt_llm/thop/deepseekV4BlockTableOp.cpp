@@ -14,19 +14,19 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/attentionMetadataKernels.h"
 #include "tensorrt_llm/kernels/deepseekV4BlockTable.h"
 #include "tensorrt_llm/kernels/deepseekV4CompressedMeta.h"
 #include "tensorrt_llm/kernels/deepseekV4Indices.h"
-#include "tensorrt_llm/kernels/attentionMetadataKernels.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <algorithm>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <algorithm>
-#include <optional>
-#include <vector>
 #include <limits>
+#include <optional>
 #include <torch/extension.h>
+#include <vector>
 
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
@@ -183,9 +183,8 @@ void deepseekV4ComputeSlidingBlockTablesWithScratch(th::Tensor const& blockOffse
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-
-void computeSharedBlockTable(th::Tensor const& blockOffsets, th::Tensor const& copyIdx, int64_t poolId,
-    int64_t scale, th::Tensor const& output)
+void computeSharedBlockTable(
+    th::Tensor const& blockOffsets, th::Tensor const& copyIdx, int64_t poolId, int64_t scale, th::Tensor const& output)
 {
     int const device = output.get_device();
     checkCudaContiguousTensor(blockOffsets, "block_offsets", device);
@@ -215,11 +214,10 @@ void computeSharedBlockTable(th::Tensor const& blockOffsets, th::Tensor const& c
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-
-void deepseekV4ComputeIndices(th::Tensor const& tokenPositions, int64_t windowSize,
-    int64_t maxCompressedIndices, int64_t sparseMlaTopk, th::Tensor const& swaLocalIndices,
-    th::Tensor const& compressedLocalIndices, std::optional<th::Tensor> const& topkLensRatio1,
-    std::optional<th::Tensor> const& topkLensRatio4, std::optional<th::Tensor> const& topkLensRatio128)
+void deepseekV4ComputeIndices(th::Tensor const& tokenPositions, int64_t windowSize, int64_t maxCompressedIndices,
+    int64_t sparseMlaTopk, th::Tensor const& swaLocalIndices, th::Tensor const& compressedLocalIndices,
+    std::optional<th::Tensor> const& topkLensRatio1, std::optional<th::Tensor> const& topkLensRatio4,
+    std::optional<th::Tensor> const& topkLensRatio128)
 {
     int const device = swaLocalIndices.get_device();
     checkCudaContiguousTensor(tokenPositions, "token_positions", device);
@@ -231,8 +229,8 @@ void deepseekV4ComputeIndices(th::Tensor const& tokenPositions, int64_t windowSi
     TORCH_CHECK(tokenPositions.dim() == 1, "token_positions must be 1D [num_tokens]");
     TORCH_CHECK(swaLocalIndices.dim() == 2, "swa_local_indices must be 2D [rows, window_size]");
     TORCH_CHECK(compressedLocalIndices.dim() == 2, "compressed_local_indices must be 2D");
-    TORCH_CHECK(windowSize > 0 && windowSize <= swaLocalIndices.size(1),
-        "window_size must fit swa_local_indices columns");
+    TORCH_CHECK(
+        windowSize > 0 && windowSize <= swaLocalIndices.size(1), "window_size must fit swa_local_indices columns");
     TORCH_CHECK(maxCompressedIndices > 0 && maxCompressedIndices <= compressedLocalIndices.size(1),
         "max_compressed_indices must fit compressed_local_indices columns");
 
@@ -254,15 +252,13 @@ void deepseekV4ComputeIndices(th::Tensor const& tokenPositions, int64_t windowSi
 
     c10::cuda::CUDAGuard const deviceGuard(swaLocalIndices.device());
     auto stream = at::cuda::getCurrentCUDAStream(device);
-    tk::invokeDeepseekV4ComputeIndices(tokenPositions.data_ptr<int32_t>(),
-        swaLocalIndices.data_ptr<int32_t>(), compressedLocalIndices.data_ptr<int32_t>(),
-        ptr(topkLensRatio1), ptr(topkLensRatio4), ptr(topkLensRatio128), numTokens,
-        static_cast<int32_t>(windowSize), static_cast<int32_t>(maxCompressedIndices),
+    tk::invokeDeepseekV4ComputeIndices(tokenPositions.data_ptr<int32_t>(), swaLocalIndices.data_ptr<int32_t>(),
+        compressedLocalIndices.data_ptr<int32_t>(), ptr(topkLensRatio1), ptr(topkLensRatio4), ptr(topkLensRatio128),
+        numTokens, static_cast<int32_t>(windowSize), static_cast<int32_t>(maxCompressedIndices),
         static_cast<int32_t>(sparseMlaTopk), checkedInt32Size(swaLocalIndices.stride(0), "swa_stride"),
         checkedInt32Size(compressedLocalIndices.stride(0), "compressed_stride"), stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-
 
 namespace
 {
@@ -272,8 +268,7 @@ template <typename FillFn>
 int32_t forEachRatio(int64_t expectedCount, FillFn&& fill)
 {
     TORCH_CHECK(expectedCount > 0 && expectedCount <= tk::kMaxCompressRatios,
-        "number of compression ratios must be in [1, ", tk::kMaxCompressRatios, "], got ",
-        expectedCount);
+        "number of compression ratios must be in [1, ", tk::kMaxCompressRatios, "], got ", expectedCount);
     for (int64_t i = 0; i < expectedCount; ++i)
     {
         fill(static_cast<int32_t>(i));
@@ -281,17 +276,15 @@ int32_t forEachRatio(int64_t expectedCount, FillFn&& fill)
     return static_cast<int32_t>(expectedCount);
 }
 
-void checkPerRatioList(std::vector<th::Tensor> const& list, int64_t numRatios, char const* name,
-    int64_t minElems, int device)
+void checkPerRatioList(
+    std::vector<th::Tensor> const& list, int64_t numRatios, char const* name, int64_t minElems, int device)
 {
     TORCH_CHECK(static_cast<int64_t>(list.size()) == numRatios, name,
-        " must have one entry per compression ratio (expected ", numRatios, ", got ", list.size(),
-        ")");
+        " must have one entry per compression ratio (expected ", numRatios, ", got ", list.size(), ")");
     for (auto const& t : list)
     {
         checkCudaContiguousTensor(t, name, device);
-        TORCH_CHECK(t.numel() >= minElems, name, " must hold at least ", minElems, " elements, got ",
-            t.numel());
+        TORCH_CHECK(t.numel() >= minElems, name, " must hold at least ", minElems, " elements, got ", t.numel());
     }
 }
 } // namespace
@@ -308,8 +301,8 @@ void deepseekV4ComputePerRatioKvLens(th::Tensor const& kvLens, th::Tensor const&
     checkInt32Tensor(cachedTokens, "cached_tokens");
     int32_t const batchSize = checkedInt32Size(kvLens.size(0), "batch_size");
     TORCH_CHECK(cachedTokens.size(0) >= batchSize, "cached_tokens shorter than kv_lens");
-    TORCH_CHECK(batchSize <= tk::kMaxScanBatch, "batch_size ", batchSize,
-        " exceeds the single-block scan bound ", tk::kMaxScanBatch);
+    TORCH_CHECK(batchSize <= tk::kMaxScanBatch, "batch_size ", batchSize, " exceeds the single-block scan bound ",
+        tk::kMaxScanBatch);
 
     int64_t const numRatios = static_cast<int64_t>(ratios.size());
     checkPerRatioList(compressedKvLens, numRatios, "compressed_kv_lens", batchSize, device);
@@ -330,9 +323,8 @@ void deepseekV4ComputePerRatioKvLens(th::Tensor const& kvLens, th::Tensor const&
         });
 
     c10::cuda::CUDAGuard const deviceGuard(kvLens.device());
-    tk::invokeDeepseekV4ComputePerRatioKvLens(kvLens.data_ptr<int32_t>(),
-        cachedTokens.data_ptr<int32_t>(), params, numRatios32, batchSize,
-        at::cuda::getCurrentCUDAStream(device));
+    tk::invokeDeepseekV4ComputePerRatioKvLens(kvLens.data_ptr<int32_t>(), cachedTokens.data_ptr<int32_t>(), params,
+        numRatios32, batchSize, at::cuda::getCurrentCUDAStream(device));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -348,8 +340,8 @@ void deepseekV4ComputeCompressedMask(std::vector<th::Tensor> const& newCompKvLen
     int64_t const numRatios = static_cast<int64_t>(totalTokens.size());
     checkPerRatioList(newCompKvLens, numRatios, "new_comp_kv_lens", batchSize, device);
     checkPerRatioList(cuNewCompKv, numRatios, "cu_new_comp_kv", batchSize + 1, device);
-    TORCH_CHECK(static_cast<int64_t>(mask.size()) == numRatios,
-        "compressed_mask must have one entry per compression ratio");
+    TORCH_CHECK(
+        static_cast<int64_t>(mask.size()) == numRatios, "compressed_mask must have one entry per compression ratio");
 
     tk::CompressedMaskParams params{};
     int32_t maxTotal = 0;
@@ -360,8 +352,8 @@ void deepseekV4ComputeCompressedMask(std::vector<th::Tensor> const& newCompKvLen
             TORCH_CHECK(total >= 0, "total_compressed_tokens must be non-negative");
             checkCudaContiguousTensor(mask[i], "compressed_mask", device);
             TORCH_CHECK(mask[i].scalar_type() == th::kBool, "compressed_mask must be bool");
-            TORCH_CHECK(mask[i].numel() >= total, "compressed_mask buffer too small: need ", total,
-                ", have ", mask[i].numel());
+            TORCH_CHECK(
+                mask[i].numel() >= total, "compressed_mask buffer too small: need ", total, ", have ", mask[i].numel());
             params.newCompKvLens[i] = newCompKvLens[i].data_ptr<int32_t>();
             params.cuNewCompKv[i] = cuNewCompKv[i].data_ptr<int32_t>();
             params.mask[i] = mask[i].data_ptr<bool>();
@@ -381,19 +373,18 @@ namespace
 {
 void computeCompressedPositionIdsImpl(std::vector<th::Tensor> const& pastKvLens,
     std::vector<th::Tensor> const& cuNewCompKv, std::vector<th::Tensor> const& positionIds,
-    std::vector<int64_t> const& ratios, std::vector<int64_t> const& counts,
-    std::vector<int64_t> const& offsets, int64_t numContextsIn, int64_t batchSizeIn, bool isGen)
+    std::vector<int64_t> const& ratios, std::vector<int64_t> const& counts, std::vector<int64_t> const& offsets,
+    int64_t numContextsIn, int64_t batchSizeIn, bool isGen)
 {
     TORCH_CHECK(!positionIds.empty(), "compressed_position_ids list must not be empty");
     int const device = positionIds[0].get_device();
     int32_t const numContexts = checkedInt32Size(numContextsIn, "num_contexts");
     int32_t const batchSize = checkedInt32Size(batchSizeIn, "batch_size");
-    TORCH_CHECK(batchSize > 0 && numContexts >= 0 && numContexts <= batchSize,
-        "num_contexts must be within [0, batch_size]");
+    TORCH_CHECK(
+        batchSize > 0 && numContexts >= 0 && numContexts <= batchSize, "num_contexts must be within [0, batch_size]");
 
     int64_t const numRatios = static_cast<int64_t>(ratios.size());
-    TORCH_CHECK(static_cast<int64_t>(counts.size()) == numRatios
-            && static_cast<int64_t>(offsets.size()) == numRatios,
+    TORCH_CHECK(static_cast<int64_t>(counts.size()) == numRatios && static_cast<int64_t>(offsets.size()) == numRatios,
         "counts and offsets must have one entry per compression ratio");
     checkPerRatioList(pastKvLens, numRatios, "past_kv_lens", batchSize, device);
     checkPerRatioList(cuNewCompKv, numRatios, "cu_new_comp_kv", batchSize + 1, device);
@@ -411,8 +402,7 @@ void computeCompressedPositionIdsImpl(std::vector<th::Tensor> const& pastKvLens,
             checkCudaContiguousTensor(positionIds[i], "compressed_position_ids", device);
             checkInt32Tensor(positionIds[i], "compressed_position_ids");
             TORCH_CHECK(positionIds[i].numel() >= static_cast<int64_t>(offset) + count,
-                "compressed_position_ids buffer too small: need ", offset + count, ", have ",
-                positionIds[i].numel());
+                "compressed_position_ids buffer too small: need ", offset + count, ", have ", positionIds[i].numel());
             TORCH_CHECK(ratios[i] > 0, "compression ratio must be positive");
             params.pastKvLens[i] = pastKvLens[i].data_ptr<int32_t>();
             params.cuNewCompKv[i] = cuNewCompKv[i].data_ptr<int32_t>();
@@ -432,8 +422,7 @@ void computeCompressedPositionIdsImpl(std::vector<th::Tensor> const& pastKvLens,
     }
     else
     {
-        tk::invokeDeepseekV4ComputeCtxCompressedPositionIds(
-            params, maxCount, numRatios32, numContexts, stream);
+        tk::invokeDeepseekV4ComputeCtxCompressedPositionIds(params, maxCount, numRatios32, numContexts, stream);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -444,23 +433,21 @@ void deepseekV4ComputeCtxCompressedPositionIds(std::vector<th::Tensor> const& pa
     std::vector<int64_t> const& ratios, std::vector<int64_t> const& counts, int64_t numContexts)
 {
     std::vector<int64_t> const zeroOffsets(ratios.size(), 0);
-    computeCompressedPositionIdsImpl(pastKvLens, cuNewCompKv, positionIds, ratios, counts,
-        zeroOffsets, numContexts, /*batchSize=*/numContexts, /*isGen=*/false);
+    computeCompressedPositionIdsImpl(pastKvLens, cuNewCompKv, positionIds, ratios, counts, zeroOffsets, numContexts,
+        /*batchSize=*/numContexts, /*isGen=*/false);
 }
 
 void deepseekV4ComputeGenCompressedPositionIds(std::vector<th::Tensor> const& pastKvLens,
     std::vector<th::Tensor> const& cuNewCompKv, std::vector<th::Tensor> const& positionIds,
-    std::vector<int64_t> const& ratios, std::vector<int64_t> const& counts,
-    std::vector<int64_t> const& offsets, int64_t numContexts, int64_t batchSize)
+    std::vector<int64_t> const& ratios, std::vector<int64_t> const& counts, std::vector<int64_t> const& offsets,
+    int64_t numContexts, int64_t batchSize)
 {
-    computeCompressedPositionIdsImpl(pastKvLens, cuNewCompKv, positionIds, ratios, counts, offsets,
-        numContexts, batchSize, /*isGen=*/true);
+    computeCompressedPositionIdsImpl(
+        pastKvLens, cuNewCompKv, positionIds, ratios, counts, offsets, numContexts, batchSize, /*isGen=*/true);
 }
 
-
-void computeTokenPositions(th::Tensor const& seqLens,
-    std::optional<th::Tensor> const& cachedTokens, th::Tensor const& cuSeqLens,
-    th::Tensor const& reqIdxPerToken, std::optional<th::Tensor> const& tokenPositions,
+void computeTokenPositions(th::Tensor const& seqLens, std::optional<th::Tensor> const& cachedTokens,
+    th::Tensor const& cuSeqLens, th::Tensor const& reqIdxPerToken, std::optional<th::Tensor> const& tokenPositions,
     int64_t numTokensIn, bool computeCuSeqLens)
 {
     int const device = cuSeqLens.get_device();
@@ -475,18 +462,17 @@ void computeTokenPositions(th::Tensor const& seqLens,
     int32_t const numTokens = checkedInt32Size(numTokensIn, "num_tokens");
     TORCH_CHECK(batchSize > 0, "batch_size must be positive");
     TORCH_CHECK(numTokens >= 0, "num_tokens must be non-negative");
-    TORCH_CHECK(!computeCuSeqLens || batchSize <= tk::kMaxTokenPositionScanBatch, "batch_size ",
-        batchSize, " exceeds the single-block scan bound ", tk::kMaxTokenPositionScanBatch);
-    TORCH_CHECK(cuSeqLens.numel() >= static_cast<int64_t>(batchSize) + 1,
-        "cu_seq_lens must hold batch_size + 1 entries");
+    TORCH_CHECK(!computeCuSeqLens || batchSize <= tk::kMaxTokenPositionScanBatch, "batch_size ", batchSize,
+        " exceeds the single-block scan bound ", tk::kMaxTokenPositionScanBatch);
+    TORCH_CHECK(
+        cuSeqLens.numel() >= static_cast<int64_t>(batchSize) + 1, "cu_seq_lens must hold batch_size + 1 entries");
     TORCH_CHECK(reqIdxPerToken.numel() >= numTokens, "req_idx_per_token buffer too small");
 
     int32_t* positionsPtr = nullptr;
     int32_t const* cachedPtr = nullptr;
     if (tokenPositions.has_value())
     {
-        TORCH_CHECK(cachedTokens.has_value(),
-            "cached_tokens is required when token_positions is requested");
+        TORCH_CHECK(cachedTokens.has_value(), "cached_tokens is required when token_positions is requested");
         checkCudaContiguousTensor(*tokenPositions, "token_positions", device);
         checkCudaContiguousTensor(*cachedTokens, "cached_tokens", device);
         checkInt32Tensor(*tokenPositions, "token_positions");
@@ -498,9 +484,9 @@ void computeTokenPositions(th::Tensor const& seqLens,
     }
 
     c10::cuda::CUDAGuard const deviceGuard(cuSeqLens.device());
-    tk::invokeComputeTokenPositions(seqLens.data_ptr<int32_t>(), cachedPtr,
-        cuSeqLens.data_ptr<int32_t>(), reqIdxPerToken.data_ptr<int32_t>(), positionsPtr, batchSize,
-        numTokens, computeCuSeqLens, at::cuda::getCurrentCUDAStream(device));
+    tk::invokeComputeTokenPositions(seqLens.data_ptr<int32_t>(), cachedPtr, cuSeqLens.data_ptr<int32_t>(),
+        reqIdxPerToken.data_ptr<int32_t>(), positionsPtr, batchSize, numTokens, computeCuSeqLens,
+        at::cuda::getCurrentCUDAStream(device));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -513,25 +499,32 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "deepseek_v4_compute_sliding_block_tables(Tensor block_offsets, Tensor copy_idx, Tensor pool_ids, "
         "Tensor valid_pool, Tensor scales, Tensor layer_offsets, Tensor(a!) output) -> ()");
-    m.def("compute_shared_block_table(Tensor block_offsets, Tensor copy_idx, int pool_id, int scale, "
-          "Tensor! output) -> ()");
-    m.def("deepseek_v4_compute_per_ratio_kv_lens(Tensor kv_lens, Tensor cached_tokens, int[] ratios, "
-          "Tensor(a!)[] compressed_kv_lens, Tensor(b!)[] past_kv_lens, Tensor(c!)[] new_comp_kv_lens, "
-          "Tensor(d!)[] cu_new_comp_kv) -> ()");
-    m.def("deepseek_v4_compute_compressed_mask(Tensor[] new_comp_kv_lens, Tensor[] cu_new_comp_kv, "
-          "Tensor(a!)[] compressed_mask, int[] total_tokens, int batch_size) -> ()");
-    m.def("deepseek_v4_compute_ctx_compressed_position_ids(Tensor[] past_kv_lens, "
-          "Tensor[] cu_new_comp_kv, Tensor(a!)[] compressed_position_ids, int[] ratios, "
-          "int[] counts, int num_contexts) -> ()");
-    m.def("deepseek_v4_compute_gen_compressed_position_ids(Tensor[] past_kv_lens, "
-          "Tensor[] cu_new_comp_kv, Tensor(a!)[] compressed_position_ids, int[] ratios, "
-          "int[] counts, int[] offsets, int num_contexts, int batch_size) -> ()");
-    m.def("compute_token_positions(Tensor seq_lens, Tensor? cached_tokens, "
-          "Tensor(a!) cu_seq_lens, Tensor(b!) req_idx_per_token, Tensor(c!)? token_positions, "
-          "int num_tokens, bool compute_cu_seq_lens) -> ()");
-    m.def("deepseek_v4_compute_indices(Tensor token_positions, int window_size, int max_compressed_indices, "
-          "int sparse_mla_topk, Tensor(a!) swa_local_indices, Tensor(b!) compressed_local_indices, "
-          "Tensor(c!)? topk_lens_ratio1, Tensor(d!)? topk_lens_ratio4, Tensor(e!)? topk_lens_ratio128) -> ()");
+    m.def(
+        "compute_shared_block_table(Tensor block_offsets, Tensor copy_idx, int pool_id, int scale, "
+        "Tensor! output) -> ()");
+    m.def(
+        "deepseek_v4_compute_per_ratio_kv_lens(Tensor kv_lens, Tensor cached_tokens, int[] ratios, "
+        "Tensor(a!)[] compressed_kv_lens, Tensor(b!)[] past_kv_lens, Tensor(c!)[] new_comp_kv_lens, "
+        "Tensor(d!)[] cu_new_comp_kv) -> ()");
+    m.def(
+        "deepseek_v4_compute_compressed_mask(Tensor[] new_comp_kv_lens, Tensor[] cu_new_comp_kv, "
+        "Tensor(a!)[] compressed_mask, int[] total_tokens, int batch_size) -> ()");
+    m.def(
+        "deepseek_v4_compute_ctx_compressed_position_ids(Tensor[] past_kv_lens, "
+        "Tensor[] cu_new_comp_kv, Tensor(a!)[] compressed_position_ids, int[] ratios, "
+        "int[] counts, int num_contexts) -> ()");
+    m.def(
+        "deepseek_v4_compute_gen_compressed_position_ids(Tensor[] past_kv_lens, "
+        "Tensor[] cu_new_comp_kv, Tensor(a!)[] compressed_position_ids, int[] ratios, "
+        "int[] counts, int[] offsets, int num_contexts, int batch_size) -> ()");
+    m.def(
+        "compute_token_positions(Tensor seq_lens, Tensor? cached_tokens, "
+        "Tensor(a!) cu_seq_lens, Tensor(b!) req_idx_per_token, Tensor(c!)? token_positions, "
+        "int num_tokens, bool compute_cu_seq_lens) -> ()");
+    m.def(
+        "deepseek_v4_compute_indices(Tensor token_positions, int window_size, int max_compressed_indices, "
+        "int sparse_mla_topk, Tensor(a!) swa_local_indices, Tensor(b!) compressed_local_indices, "
+        "Tensor(c!)? topk_lens_ratio1, Tensor(d!)? topk_lens_ratio4, Tensor(e!)? topk_lens_ratio128) -> ()");
     m.def(
         "deepseek_v4_compute_sliding_block_tables_with_scratch(Tensor block_offsets, Tensor copy_idx, "
         "Tensor pool_ids, Tensor valid_pool, Tensor scales, Tensor layer_offsets, Tensor scratch_pages, "

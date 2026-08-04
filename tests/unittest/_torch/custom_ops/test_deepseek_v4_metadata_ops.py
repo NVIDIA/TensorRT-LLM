@@ -86,9 +86,9 @@ def _ref_gen_position_ids(past_kv, cu, gen_comp, offset, ratio, num_contexts, ba
 
 
 def _ref_token_positions(seq_lens, cached_tokens, batch_size, num_tokens, device):
-    cu = torch.nn.functional.pad(
-        torch.cumsum(seq_lens.to(torch.int), dim=0), (1, 0)
-    ).to(torch.int32)
+    cu = torch.nn.functional.pad(torch.cumsum(seq_lens.to(torch.int), dim=0), (1, 0)).to(
+        torch.int32
+    )
     token_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
     req_idx = torch.searchsorted(cu[1 : batch_size + 1].to(torch.int32), token_idx, right=True)
     positions = cached_tokens[req_idx].to(torch.int32) + (token_idx - cu[req_idx].to(torch.int32))
@@ -140,13 +140,18 @@ def test_compute_indices(ratios, positions_spec, window_size, max_comp, topk):
     # buffer shape (mirrors the CUDA-graph padded buffers in production).
     swa = torch.full((num_tokens + 7, window_size), 123, dtype=torch.int32, device=device)
     comp = torch.full((num_tokens + 7, max_comp), 123, dtype=torch.int32, device=device)
-    lens = {
-        r: torch.full((num_tokens + 7,), 123, dtype=torch.int32, device=device) for r in ratios
-    }
+    lens = {r: torch.full((num_tokens + 7,), 123, dtype=torch.int32, device=device) for r in ratios}
 
     torch.ops.trtllm.deepseek_v4_compute_indices(
-        tp, window_size, max_comp, topk, swa, comp,
-        lens.get(1), lens.get(4), lens.get(128),
+        tp,
+        window_size,
+        max_comp,
+        topk,
+        swa,
+        comp,
+        lens.get(1),
+        lens.get(4),
+        lens.get(128),
     )
 
     torch.testing.assert_close(swa[:num_tokens], ref_swa, rtol=0, atol=0)
@@ -168,15 +173,21 @@ def test_compute_per_ratio_kv_lens(ratios, batch_size):
     ref = _ref_per_ratio(kv_lens, cached, ratios)
 
     pad = 5
-    compressed = {r: torch.zeros(batch_size + pad, dtype=torch.int32, device=device) for r in ratios}
+    compressed = {
+        r: torch.zeros(batch_size + pad, dtype=torch.int32, device=device) for r in ratios
+    }
     past = {r: torch.zeros(batch_size + pad, dtype=torch.int32, device=device) for r in ratios}
     new_comp = {r: torch.zeros(batch_size + pad, dtype=torch.int32, device=device) for r in ratios}
     cu = {r: torch.zeros(batch_size + 1 + pad, dtype=torch.int32, device=device) for r in ratios}
 
     torch.ops.trtllm.deepseek_v4_compute_per_ratio_kv_lens(
-        kv_lens, cached, ratios,
-        [compressed[r] for r in ratios], [past[r] for r in ratios],
-        [new_comp[r] for r in ratios], [cu[r] for r in ratios],
+        kv_lens,
+        cached,
+        ratios,
+        [compressed[r] for r in ratios],
+        [past[r] for r in ratios],
+        [new_comp[r] for r in ratios],
+        [cu[r] for r in ratios],
     )
 
     for r in ratios:
@@ -197,12 +208,13 @@ def test_compute_compressed_mask(ratios, batch_size):
     ref = _ref_per_ratio(kv_lens, cached, ratios)
 
     totals = {r: int(ref[r][3][batch_size].item()) for r in ratios}
-    masks = {
-        r: torch.zeros(max(totals[r], 1) + 8, dtype=torch.bool, device=device) for r in ratios
-    }
+    masks = {r: torch.zeros(max(totals[r], 1) + 8, dtype=torch.bool, device=device) for r in ratios}
     torch.ops.trtllm.deepseek_v4_compute_compressed_mask(
-        [ref[r][2] for r in ratios], [ref[r][3] for r in ratios],
-        [masks[r] for r in ratios], [totals[r] for r in ratios], batch_size,
+        [ref[r][2] for r in ratios],
+        [ref[r][3] for r in ratios],
+        [masks[r] for r in ratios],
+        [totals[r] for r in ratios],
+        batch_size,
     )
     for r in ratios:
         if totals[r] == 0:
@@ -221,26 +233,33 @@ def test_compute_ctx_compressed_position_ids(ratios, num_contexts):
     ref = _ref_per_ratio(kv_lens, cached, ratios)
 
     counts = {r: int(ref[r][3][num_contexts].item()) for r in ratios}
-    out = {
-        r: torch.zeros(max(counts[r], 1) + 8, dtype=torch.int32, device=device) for r in ratios
-    }
+    out = {r: torch.zeros(max(counts[r], 1) + 8, dtype=torch.int32, device=device) for r in ratios}
     torch.ops.trtllm.deepseek_v4_compute_ctx_compressed_position_ids(
-        [ref[r][1] for r in ratios], [ref[r][3] for r in ratios],
-        [out[r] for r in ratios], ratios, [counts[r] for r in ratios], num_contexts,
+        [ref[r][1] for r in ratios],
+        [ref[r][3] for r in ratios],
+        [out[r] for r in ratios],
+        ratios,
+        [counts[r] for r in ratios],
+        num_contexts,
     )
     for r in ratios:
         if counts[r] == 0:
             continue
-        expected = _ref_ctx_position_ids(
-            ref[r][1], ref[r][3], counts[r], r, num_contexts, device
-        )
+        expected = _ref_ctx_position_ids(ref[r][1], ref[r][3], counts[r], r, num_contexts, device)
         torch.testing.assert_close(out[r][: counts[r]], expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("ratios", RATIO_SETS)
-@pytest.mark.parametrize("num_contexts,num_generations,gen_tokens_per_seq", [
-    (0, 8, 1), (0, 16, 4), (2, 6, 1), (5, 11, 4), (0, 1, 1),
-])
+@pytest.mark.parametrize(
+    "num_contexts,num_generations,gen_tokens_per_seq",
+    [
+        (0, 8, 1),
+        (0, 16, 4),
+        (2, 6, 1),
+        (5, 11, 4),
+        (0, 1, 1),
+    ],
+)
 def test_compute_gen_compressed_position_ids(
     ratios, num_contexts, num_generations, gen_tokens_per_seq
 ):
@@ -257,14 +276,17 @@ def test_compute_gen_compressed_position_ids(
         offsets[r] = int(ref[r][3][num_contexts].item()) if num_contexts > 0 else 0
 
     out = {
-        r: torch.zeros(offsets[r] + counts[r] + 8, dtype=torch.int32, device=device)
-        for r in ratios
+        r: torch.zeros(offsets[r] + counts[r] + 8, dtype=torch.int32, device=device) for r in ratios
     }
     torch.ops.trtllm.deepseek_v4_compute_gen_compressed_position_ids(
-        [ref[r][1] for r in ratios], [ref[r][3] for r in ratios],
-        [out[r] for r in ratios], ratios,
-        [counts[r] for r in ratios], [offsets[r] for r in ratios],
-        num_contexts, batch_size,
+        [ref[r][1] for r in ratios],
+        [ref[r][3] for r in ratios],
+        [out[r] for r in ratios],
+        ratios,
+        [counts[r] for r in ratios],
+        [offsets[r] for r in ratios],
+        num_contexts,
+        batch_size,
     )
     for r in ratios:
         if counts[r] == 0:
@@ -301,9 +323,7 @@ def test_compute_token_positions(seq_lens_spec, batch_size):
     req = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
     pos = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
 
-    torch.ops.trtllm.compute_token_positions(
-        seq_lens, cached, cu, req, pos, num_tokens, True
-    )
+    torch.ops.trtllm.compute_token_positions(seq_lens, cached, cu, req, pos, num_tokens, True)
     torch.testing.assert_close(cu[: batch_size + 1], ref_cu, rtol=0, atol=0)
     torch.testing.assert_close(req[:num_tokens], ref_req, rtol=0, atol=0)
     torch.testing.assert_close(pos[:num_tokens], ref_pos, rtol=0, atol=0)
@@ -317,17 +337,13 @@ def test_compute_token_positions(seq_lens_spec, batch_size):
     # reuse mode: cu already populated, only the per-token phase runs
     req2 = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
     pos2 = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
-    torch.ops.trtllm.compute_token_positions(
-        seq_lens, cached, cu, req2, pos2, num_tokens, False
-    )
+    torch.ops.trtllm.compute_token_positions(seq_lens, cached, cu, req2, pos2, num_tokens, False)
     torch.testing.assert_close(req2[:num_tokens], ref_req, rtol=0, atol=0)
     torch.testing.assert_close(pos2[:num_tokens], ref_pos, rtol=0, atol=0)
 
     # req-only mode: token_positions omitted
     req3 = torch.zeros(num_tokens + 4, dtype=torch.int32, device=device)
-    torch.ops.trtllm.compute_token_positions(
-        seq_lens, None, cu, req3, None, num_tokens, True
-    )
+    torch.ops.trtllm.compute_token_positions(seq_lens, None, cu, req3, None, num_tokens, True)
     torch.testing.assert_close(req3[:num_tokens], ref_req, rtol=0, atol=0)
 
 
@@ -391,9 +407,7 @@ def test_compute_shared_block_table(scale, num_pools, capacity, max_blocks, num_
     pool_id = num_pools - 1
 
     out = torch.full((num_seqs, max_blocks), 12345, dtype=torch.int32, device=device)
-    torch.ops.trtllm.compute_shared_block_table(
-        block_offsets, copy_idx, pool_id, scale, out
-    )
+    torch.ops.trtllm.compute_shared_block_table(block_offsets, copy_idx, pool_id, scale, out)
 
     expected = _ref_shared_block_table(block_offsets, pool_id, copy_idx.long(), scale)
     torch.testing.assert_close(out, expected.to(torch.int32), rtol=0, atol=0)
@@ -406,9 +420,7 @@ def test_compute_shared_block_table_leaves_padding_untouched():
     copy_idx = torch.arange(4, dtype=torch.int32, device=device)
     out = torch.full((16, 8), -7, dtype=torch.int32, device=device)
 
-    torch.ops.trtllm.compute_shared_block_table(
-        block_offsets, copy_idx, 1, 4, out[:4]
-    )
+    torch.ops.trtllm.compute_shared_block_table(block_offsets, copy_idx, 1, 4, out[:4])
 
     torch.testing.assert_close(
         out[4:], torch.full((12, 8), -7, dtype=torch.int32, device=device), rtol=0, atol=0
@@ -441,9 +453,7 @@ def test_token_positions_across_scan_tiers(batch_size):
     req = torch.zeros(num_tokens, dtype=torch.int32, device=device)
     pos = torch.zeros(num_tokens, dtype=torch.int32, device=device)
 
-    torch.ops.trtllm.compute_token_positions(
-        seq_lens, cached, cu, req, pos, num_tokens, True
-    )
+    torch.ops.trtllm.compute_token_positions(seq_lens, cached, cu, req, pos, num_tokens, True)
     torch.testing.assert_close(cu, ref_cu, rtol=0, atol=0)
     torch.testing.assert_close(req, ref_req, rtol=0, atol=0)
     torch.testing.assert_close(pos, ref_pos, rtol=0, atol=0)
@@ -464,9 +474,13 @@ def test_per_ratio_kv_lens_across_scan_tiers(batch_size):
     cu = {r: torch.zeros(batch_size + 1, dtype=torch.int32, device=device) for r in ratios}
 
     torch.ops.trtllm.deepseek_v4_compute_per_ratio_kv_lens(
-        kv_lens, cached, ratios,
-        [comp[r] for r in ratios], [past[r] for r in ratios],
-        [new_comp[r] for r in ratios], [cu[r] for r in ratios],
+        kv_lens,
+        cached,
+        ratios,
+        [comp[r] for r in ratios],
+        [past[r] for r in ratios],
+        [new_comp[r] for r in ratios],
+        [cu[r] for r in ratios],
     )
     for r in ratios:
         exp_c, exp_p, exp_n, exp_cu = ref[r]
@@ -487,17 +501,13 @@ def test_token_positions_rejects_batch_above_scan_bound():
     pos = torch.zeros(too_big, dtype=torch.int32, device=device)
 
     with pytest.raises(RuntimeError):
-        torch.ops.trtllm.compute_token_positions(
-            seq_lens, cached, cu, req, pos, too_big, True
-        )
+        torch.ops.trtllm.compute_token_positions(seq_lens, cached, cu, req, pos, too_big, True)
 
     # With the scan skipped (cu_seq_lens supplied by the caller) the bound does
     # not apply, so the same batch must go through.
     cu_ref = torch.zeros(too_big + 1, dtype=torch.int32, device=device)
     cu_ref[1:] = torch.cumsum(seq_lens, 0, dtype=torch.int32)
-    torch.ops.trtllm.compute_token_positions(
-        seq_lens, cached, cu_ref, req, pos, too_big, False
-    )
+    torch.ops.trtllm.compute_token_positions(seq_lens, cached, cu_ref, req, pos, too_big, False)
     expected_req = torch.arange(too_big, dtype=torch.int32, device=device)
     torch.testing.assert_close(req, expected_req, rtol=0, atol=0)
 

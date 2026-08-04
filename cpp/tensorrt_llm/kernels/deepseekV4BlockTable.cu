@@ -368,7 +368,6 @@ void invokeDeepseekV4ComputeSlidingBlockTablesWithScratch(int32_t const* blockOf
         numPools, copyIdxCapacity, numAttnTypes, numTables, maxBlocksPerSeq, scratchCapacity, maxScratchSlots);
 }
 
-
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

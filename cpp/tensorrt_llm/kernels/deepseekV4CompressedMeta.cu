@@ -19,8 +19,7 @@ constexpr int32_t kThreadsPerBlock = 256;
 
 // Binary search for the request owning a compact output index: the largest j
 // with cu[j] <= value, i.e. searchsorted(cu[1:], value, right=True).
-__device__ __forceinline__ int32_t upperBoundRequest(
-    int32_t const* __restrict__ cu, int32_t numEntries, int32_t value)
+__device__ __forceinline__ int32_t upperBoundRequest(int32_t const* __restrict__ cu, int32_t numEntries, int32_t value)
 {
     int32_t lo = 0;
     int32_t hi = numEntries;
@@ -125,8 +124,7 @@ __global__ void computeCompressedMaskKernel(CompressedMaskParams params, int32_t
 }
 
 // ── Context compressed position ids.
-__global__ void computeCtxCompressedPositionIdsKernel(
-    CompressedPositionIdsParams params, int32_t numContexts)
+__global__ void computeCtxCompressedPositionIdsKernel(CompressedPositionIdsParams params, int32_t numContexts)
 {
     int32_t const ratioId = static_cast<int32_t>(blockIdx.y);
     int32_t const total = params.counts[ratioId];
@@ -154,8 +152,7 @@ __global__ void computeGenCompressedPositionIdsKernel(
     int32_t const* __restrict__ cu = params.cuNewCompKv[ratioId];
     int32_t* __restrict__ out = params.positionIds[ratioId];
 
-    for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < genComp;
-         i += gridDim.x * blockDim.x)
+    for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < genComp; i += gridDim.x * blockDim.x)
     {
         int32_t const outputIdx = i + outputOffset;
         int32_t reqIdx = upperBoundRequest(cu, batchSize, outputIdx);
@@ -182,18 +179,15 @@ void invokeDeepseekV4ComputePerRatioKvLens(int32_t const* kvLens, int32_t const*
     // Templated on a shared-memory batch bound; pick the smallest that fits.
     if (batchSize <= 512)
     {
-        computePerRatioKvLensKernel<512>
-            <<<grid, block, 0, stream>>>(kvLens, cachedTokens, params, batchSize);
+        computePerRatioKvLensKernel<512><<<grid, block, 0, stream>>>(kvLens, cachedTokens, params, batchSize);
     }
     else if (batchSize <= 2048)
     {
-        computePerRatioKvLensKernel<2048>
-            <<<grid, block, 0, stream>>>(kvLens, cachedTokens, params, batchSize);
+        computePerRatioKvLensKernel<2048><<<grid, block, 0, stream>>>(kvLens, cachedTokens, params, batchSize);
     }
     else
     {
-        computePerRatioKvLensKernel<kMaxScanBatch>
-            <<<grid, block, 0, stream>>>(kvLens, cachedTokens, params, batchSize);
+        computePerRatioKvLensKernel<kMaxScanBatch><<<grid, block, 0, stream>>>(kvLens, cachedTokens, params, batchSize);
     }
 }
 
@@ -204,14 +198,13 @@ void invokeDeepseekV4ComputeCompressedMask(CompressedMaskParams const& params, i
     {
         return;
     }
-    dim3 const grid(static_cast<uint32_t>(gridX(maxTotalTokens, 1024)),
-        static_cast<uint32_t>(numRatios));
+    dim3 const grid(static_cast<uint32_t>(gridX(maxTotalTokens, 1024)), static_cast<uint32_t>(numRatios));
     dim3 const block(static_cast<uint32_t>(kThreadsPerBlock));
     computeCompressedMaskKernel<<<grid, block, 0, stream>>>(params, batchSize);
 }
 
-void invokeDeepseekV4ComputeCtxCompressedPositionIds(CompressedPositionIdsParams const& params,
-    int32_t maxCount, int32_t numRatios, int32_t numContexts, cudaStream_t stream)
+void invokeDeepseekV4ComputeCtxCompressedPositionIds(CompressedPositionIdsParams const& params, int32_t maxCount,
+    int32_t numRatios, int32_t numContexts, cudaStream_t stream)
 {
     if (numRatios <= 0 || numContexts <= 0 || maxCount <= 0)
     {
@@ -222,9 +215,8 @@ void invokeDeepseekV4ComputeCtxCompressedPositionIds(CompressedPositionIdsParams
     computeCtxCompressedPositionIdsKernel<<<grid, block, 0, stream>>>(params, numContexts);
 }
 
-void invokeDeepseekV4ComputeGenCompressedPositionIds(CompressedPositionIdsParams const& params,
-    int32_t maxCount, int32_t numRatios, int32_t numContexts, int32_t batchSize,
-    cudaStream_t stream)
+void invokeDeepseekV4ComputeGenCompressedPositionIds(CompressedPositionIdsParams const& params, int32_t maxCount,
+    int32_t numRatios, int32_t numContexts, int32_t batchSize, cudaStream_t stream)
 {
     if (numRatios <= 0 || maxCount <= 0 || batchSize <= 0)
     {

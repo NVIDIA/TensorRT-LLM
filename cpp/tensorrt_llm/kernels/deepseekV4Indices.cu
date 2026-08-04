@@ -24,9 +24,9 @@ constexpr int32_t kThreadsPerBlock = 256;
 // plus one [num_tokens] tensor per compression ratio.
 __global__ void computeDeepseekV4IndicesKernel(int32_t const* __restrict__ tokenPositions,
     int32_t* __restrict__ swaLocalIndices, int32_t* __restrict__ compressedLocalIndices,
-    int32_t* __restrict__ topkLensRatio1, int32_t* __restrict__ topkLensRatio4,
-    int32_t* __restrict__ topkLensRatio128, int32_t numTokens, int32_t windowSize,
-    int32_t maxCompressedIndices, int32_t sparseMlaTopk, int32_t swaStride, int32_t compressedStride)
+    int32_t* __restrict__ topkLensRatio1, int32_t* __restrict__ topkLensRatio4, int32_t* __restrict__ topkLensRatio128,
+    int32_t numTokens, int32_t windowSize, int32_t maxCompressedIndices, int32_t sparseMlaTopk, int32_t swaStride,
+    int32_t compressedStride)
 {
     int32_t const tokenId = static_cast<int32_t>(blockIdx.x);
     if (tokenId >= numTokens)
@@ -41,8 +41,7 @@ __global__ void computeDeepseekV4IndicesKernel(int32_t const* __restrict__ token
     //    beyond `position` are invalid.
     int32_t const swaStart = max(position - windowSize + 1, 0);
     int32_t* swaRow = swaLocalIndices + static_cast<int64_t>(tokenId) * swaStride;
-    for (int32_t col = static_cast<int32_t>(threadIdx.x); col < windowSize;
-         col += static_cast<int32_t>(blockDim.x))
+    for (int32_t col = static_cast<int32_t>(threadIdx.x); col < windowSize; col += static_cast<int32_t>(blockDim.x))
     {
         int32_t const idx = swaStart + col;
         swaRow[col] = idx > position ? kInvalidIndex : idx;
@@ -78,9 +77,9 @@ __global__ void computeDeepseekV4IndicesKernel(int32_t const* __restrict__ token
 } // namespace
 
 void invokeDeepseekV4ComputeIndices(int32_t const* tokenPositions, int32_t* swaLocalIndices,
-    int32_t* compressedLocalIndices, int32_t* topkLensRatio1, int32_t* topkLensRatio4,
-    int32_t* topkLensRatio128, int32_t numTokens, int32_t windowSize, int32_t maxCompressedIndices,
-    int32_t sparseMlaTopk, int32_t swaStride, int32_t compressedStride, cudaStream_t stream)
+    int32_t* compressedLocalIndices, int32_t* topkLensRatio1, int32_t* topkLensRatio4, int32_t* topkLensRatio128,
+    int32_t numTokens, int32_t windowSize, int32_t maxCompressedIndices, int32_t sparseMlaTopk, int32_t swaStride,
+    int32_t compressedStride, cudaStream_t stream)
 {
     if (numTokens <= 0)
     {
@@ -90,9 +89,9 @@ void invokeDeepseekV4ComputeIndices(int32_t const* tokenPositions, int32_t* swaL
     int32_t threads = widest >= kThreadsPerBlock ? kThreadsPerBlock : max(widest, 32);
     dim3 const block(static_cast<uint32_t>(threads));
     dim3 const grid(static_cast<uint32_t>(numTokens));
-    computeDeepseekV4IndicesKernel<<<grid, block, 0, stream>>>(tokenPositions, swaLocalIndices,
-        compressedLocalIndices, topkLensRatio1, topkLensRatio4, topkLensRatio128, numTokens,
-        windowSize, maxCompressedIndices, sparseMlaTopk, swaStride, compressedStride);
+    computeDeepseekV4IndicesKernel<<<grid, block, 0, stream>>>(tokenPositions, swaLocalIndices, compressedLocalIndices,
+        topkLensRatio1, topkLensRatio4, topkLensRatio128, numTokens, windowSize, maxCompressedIndices, sparseMlaTopk,
+        swaStride, compressedStride);
 }
 
 } // namespace kernels

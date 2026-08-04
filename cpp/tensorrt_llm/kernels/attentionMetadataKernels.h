@@ -48,9 +48,8 @@ void invokeComputeTokenPositions(int32_t const* seqLens, int32_t const* cachedTo
 // `blockOffsets` is laid out [numPools, copyIdxCapacity, 2, maxBlocksPerSeq].
 // Rows past `numTables` are left untouched, so padded CUDA-graph slots keep
 // whatever the caller put there.
-void invokeComputeSharedBlockTable(int32_t const* blockOffsets, int32_t const* copyIdx, int32_t* output,
-    int32_t poolId, int32_t scale, int32_t copyIdxCapacity, int32_t numTables, int32_t maxBlocksPerSeq,
-    cudaStream_t stream);
+void invokeComputeSharedBlockTable(int32_t const* blockOffsets, int32_t const* copyIdx, int32_t* output, int32_t poolId,
+    int32_t scale, int32_t copyIdxCapacity, int32_t numTables, int32_t maxBlocksPerSeq, cudaStream_t stream);
 
 } // namespace kernels
 
