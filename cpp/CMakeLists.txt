@@ -637,6 +637,25 @@ if(ENABLE_UCX)
           REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
                   "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
                   FILE_CONTENTS "${FILE_CONTENTS}")
+        # After RAPIDS.cmake populates rapids-cmake, rewrite CPM.cmake's
+        # github.com release URL to GITHUB_MIRROR before rapids_cpm_init
+        # includes download.cmake.
+        if(NOT FILE_CONTENTS MATCHES "TRT-LLM: mirror CPM.cmake")
+          string(
+            APPEND
+            FILE_CONTENTS
+            "
+# Mirror CPM.cmake download away from github.com.
+if(DEFINED rapids-cmake-dir AND EXISTS \"\${rapids-cmake-dir}/cpm/detail/download.cmake\")
+  file(READ \"\${rapids-cmake-dir}/cpm/detail/download.cmake\" _trtllm_cpm_download_cmake)
+  string(REPLACE
+    \"https://github.com/cpm-cmake/CPM.cmake/releases/download\"
+    \"$ENV{GITHUB_MIRROR}/cpm-cmake/CPM.cmake/releases/download\"
+    _trtllm_cpm_download_cmake \"\${_trtllm_cpm_download_cmake}\")
+  file(WRITE \"\${rapids-cmake-dir}/cpm/detail/download.cmake\" \"\${_trtllm_cpm_download_cmake}\")
+endif()
+")
+        endif()
         file(WRITE "${ucxx_source_dir}/fetch_rapids.cmake" "${FILE_CONTENTS}")
         message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
       endif()
