@@ -83,7 +83,9 @@ def test_mxfp8_flashinfer_call_contract(monkeypatch):
 
     expected = torch.empty((2, 3), dtype=torch.bfloat16)
     mm_mxfp8 = Mock(return_value=expected)
-    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
+    monkeypatch.setitem(
+        sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=Mock())
+    )
     quantized, activation_scale, quantize, _, _ = _mock_mxfp8_ops(monkeypatch)
 
     weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
@@ -116,7 +118,9 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
 
     flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
     mm_mxfp8 = Mock(return_value=flashinfer_output)
-    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
+    monkeypatch.setitem(
+        sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=Mock())
+    )
     _, _, _, native_gemm, native_output = _mock_mxfp8_ops(monkeypatch)
 
     module = SimpleNamespace(
