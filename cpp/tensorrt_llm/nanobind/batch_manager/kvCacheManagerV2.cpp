@@ -1406,7 +1406,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 // Contract: callers must keep the KvCache alive and must not mutate/resize it
                 // while using this view. The view is intended for read-only use, matching the
                 // practical use of Python's array.array/memoryview index buffers.
-                // TODO(yaoy): switch to nb::ndarray<nb::memview> when we have nanobind >= 2.9.0,
+                // TODO: switch to nb::ndarray<nb::memview> when we have nanobind >= 2.9.0,
                 // or nb::memoryview for nanobind >= 2.12.0.
                 return nb::ndarray<nb::numpy, int const, nb::ndim<1>>(
                     span.ptr, {static_cast<size_t>(span.len)}, nb::handle());
