@@ -21,16 +21,7 @@ from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
-from triton_kernels.matmul_ogs import (
-    FlexCtx,
-    FnSpecs,
-    FusedActivation,
-    GatherIndx,
-    PrecisionConfig,
-    RoutingData,
-    ScatterIndx,
-    matmul_ogs,
-)
+from triton_kernels.matmul import FlexCtx, FnSpecs, FusedActivation, PrecisionConfig
 from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.target_info import cuda_capability_geq
@@ -38,7 +29,12 @@ from triton_kernels.tensor import FP4, Tensor, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 from triton_kernels.tensor_details.layout import StridedLayout
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRouter
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import (
+    TritonEPRouter,
+    TritonMoERouting,
+    moe_gather_matmul,
+    moe_scatter_matmul,
+)
 
 PreparedWeights = tuple[Tensor, Tensor, Tensor, Tensor]
 TensorCacheKey = tuple[
@@ -61,31 +57,38 @@ _MXFP4_WEIGHT_CACHE: OrderedDict[WeightCacheKey, tuple[PreparedWeights, list[wea
 
 
 # copied from transformers.integrations.mxfp4::swizzle_mxfp4 with minor modification
-def _mxfp4_value_layout(mx_axis: int):
+def _mxfp4_value_layout(mx_axis: int = -2):
     # Blackwell's default value layout is only supported by the persistent TMA
     # kernel. GPT-OSS MoE can select the non-persistent kernel for small shapes,
     # where unswizzled values use the native MXFP4 dot_scaled path.
+    # Triton 3.7 returns Layout instances (relative mx_axis -1/-2).
     if cuda_capability_geq(10):
-        return StridedLayout, {}
+        return StridedLayout(-2)
     return layout.make_default_matmul_mxfp4_w_layout(mx_axis=mx_axis)
 
 
 def _swizzle_mxfp4(w, w_scale):
-    value_layout, value_layout_opts = _mxfp4_value_layout(mx_axis=1)
-    w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
-    w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
+    value_layout = _mxfp4_value_layout(mx_axis=-2)
+    w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout)
+    w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout(-2))
     return w, w_scale
 
 
-RouteFn = Callable[[torch.Tensor], tuple[RoutingData, GatherIndx, ScatterIndx]]
+RouteFn = Callable[[torch.Tensor], TritonMoERouting]
 
 
 def _mxfp4_layout_cache_key() -> tuple[object, ...]:
-    value_layout, value_layout_opts = _mxfp4_value_layout(mx_axis=1)
+    value_layout = _mxfp4_value_layout(mx_axis=-2)
+    layout_fields = tuple(
+        sorted(
+            (name, getattr(value_layout, name))
+            for name in getattr(value_layout, "__dataclass_fields__", {})
+        )
+    )
     return (
-        value_layout.__module__,
-        value_layout.__qualname__,
-        tuple(sorted(value_layout_opts.items())),
+        type(value_layout).__module__,
+        type(value_layout).__qualname__,
+        layout_fields,
     )
 
 
@@ -231,7 +234,7 @@ def _run_mxfp4_mlp_core(
 ) -> torch.Tensor:
     """
     Shared core for both triton_mxfp4_moe and triton_mxfp4_moe_ep.
-    - route_fn encapsulates the only difference: how we produce (routing_data, gather_idx, scatter_idx).
+    - route_fn encapsulates the only difference: how we produce TritonMoERouting.
     """
     leading_shape = hidden_states.shape[:-1]
     hidden_size = hidden_states.shape[-1]
@@ -240,7 +243,7 @@ def _run_mxfp4_mlp_core(
     router_logits = F.linear(x, router_weight, router_bias)
     # route (global vs EP-aware)
     with torch.cuda.device(router_logits.device):
-        routing_data, gather_idx, scatter_idx = route_fn(router_logits)
+        routing = route_fn(router_logits)
 
     (
         triton_gate_up_w,
@@ -252,11 +255,9 @@ def _run_mxfp4_mlp_core(
     )
 
     gate_pc = PrecisionConfig(
-        weight_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
+        b_mx_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
     )
-    down_pc = PrecisionConfig(
-        weight_scale=down_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
-    )
+    down_pc = PrecisionConfig(b_mx_scale=down_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData()))
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
@@ -264,26 +265,23 @@ def _run_mxfp4_mlp_core(
     )
 
     # gate_up (with SWiGLU fused)
-    inter = matmul_ogs(
+    inter = moe_gather_matmul(
         x,
         triton_gate_up_w,
         gate_up_bias.to(torch.float32),
-        routing_data,
-        gather_indx=gather_idx,
-        precision_config=gate_pc,
-        gammas=None,
+        routing,
+        gate_pc,
         fused_activation=act,
     )
 
     # down
-    y = matmul_ogs(
+    y = moe_scatter_matmul(
         inter,
         triton_down_w,
         down_bias.to(torch.float32),
-        routing_data,
-        scatter_indx=scatter_idx,
-        precision_config=down_pc,
-        gammas=routing_data.gate_scal,
+        routing,
+        down_pc,
+        gammas=routing.gate_scal,
     )
 
     y = y.reshape(*leading_shape, hidden_size)
