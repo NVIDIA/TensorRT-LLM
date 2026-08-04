@@ -176,6 +176,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             scheduler_policy = CapacitySchedulerPolicy.MAX_UTILIZATION
         self.policy = scheduler_policy
         self.peft_cache_manager = peft_cache_manager
+        # Non-droppable per-sequence state (Mamba recurrent state) yields no
+        # evictable pages, so MAX_UTILIZATION's suspend/resume cannot recover
+        # from over-admission: once every resident sequence is suspended the
+        # pool can never drain. Bound admission instead.
+        self.max_resident_sequences = kv_cache_manager.max_resident_sequences()
 
         # Chunking config.
         self.chunking_enabled = False
@@ -193,7 +198,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
             f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
             f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}, "
-            f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}"
+            f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}, "
+            f"max_resident_sequences={self.max_resident_sequences}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -309,6 +315,16 @@ class KVCacheV2Scheduler(RequestScheduler):
             if req.state_value == self._gen_to_complete_state_value:
                 budget.pre_claim_peft(req)
 
+        # Sequences already holding a non-droppable state slot. Counted over all
+        # active requests (not just the ones scheduled this iteration) because a
+        # suspended sequence keeps its slot.
+        max_resident = self.max_resident_sequences
+        num_resident = (
+            sum(1 for req in requests_list if self._is_started_request(req))
+            if max_resident is not None
+            else 0
+        )
+
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
             req = requests_list[req_it]
@@ -403,6 +419,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            # A first context chunk starts a new sequence and therefore claims a
+            # state slot for the rest of its lifetime.
+            starts_new_sequence = max_resident is not None and req.is_first_context_chunk
+            if starts_new_sequence and num_resident >= max_resident:
+                break
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
                 continue
@@ -421,6 +442,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
+                if starts_new_sequence:
+                    num_resident += 1
 
         # Deadlock detection: if generation requests exist but none were
         # scheduled and none were evicted, no forward pass will run and no

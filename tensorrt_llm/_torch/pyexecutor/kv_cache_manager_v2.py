@@ -2156,6 +2156,16 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
 
+    def max_resident_sequences(self) -> Optional[int]:
+        """Cap on concurrently resident sequences, or ``None`` if unbounded.
+
+        Attention pages are droppable, so pure-attention models let
+        suspend/resume absorb over-admission and need no cap. Managers that own
+        non-droppable per-sequence state (e.g. Mamba recurrent state) override
+        this so the scheduler stops admitting sequences the pool cannot hold.
+        """
+        return None
+
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.
 
