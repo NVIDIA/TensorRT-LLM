@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Opt-in (TransferWorkerConfig.bounce) VRAM d2d KV bounce buffering: coalesce a
-transfer's scattered per-block KV into ONE contiguous fabric-VMM WRITE (reliable
-cuda_ipc/MNNVL) through the BounceTransport interface; default per-block path is
-unchanged when no Config is given. config_from_size() is the on/off switch."""
+transfer's scattered per-block KV into ONE contiguous WRITE between IPC-shareable
+staging regions (fabric-VMM on NVLink-fabric platforms, legacy cuMemAlloc elsewhere;
+reliable cuda_ipc/MNNVL either way) through the BounceTransport interface; default
+per-block path is unchanged when no Config is given. config_from_size() is the
+on/off switch."""
 
 from .buffer import Buffer, SlotAllocator
 from .config import Config, FixedSizing, Sizing, SizingContext, config_from_size

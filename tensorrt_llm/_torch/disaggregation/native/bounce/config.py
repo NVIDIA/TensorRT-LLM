@@ -111,12 +111,20 @@ class Config:
     min_blocks: int = 96
 
 
-def config_from_size(size_mb: int, min_blocks: Optional[int] = None) -> Optional[Config]:
+def config_from_size(
+    size_mb: int,
+    min_blocks: Optional[int] = None,
+    default_min_blocks: Optional[int] = None,
+) -> Optional[Config]:
     """Build a bounce config from a per-region size in MiB, or None to leave bounce off (size <= 0).
     Size is both the capacity and the on/off switch. min_blocks is the gate below which a transfer
-    stays on the per-block path; when unset it comes from the env, else the default."""
+    stays on the per-block path; when unset it comes from the env, whose fallback is
+    default_min_blocks (for callers whose per-block path cannot use CUDA IPC at any size and should
+    bounce everything) and then the class default."""
     if size_mb is None or size_mb <= 0:
         return None
     if min_blocks is None:
-        min_blocks = _env_min_blocks(Config.min_blocks)
+        if default_min_blocks is None:
+            default_min_blocks = Config.min_blocks
+        min_blocks = _env_min_blocks(default_min_blocks)
     return Config(sizing=FixedSizing(capacity_mb=size_mb), min_blocks=min_blocks)

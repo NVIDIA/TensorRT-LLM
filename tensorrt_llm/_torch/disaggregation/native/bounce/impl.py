@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The two KV bounce transports (the real fabric-VMM one and the disabled null object) implementing
-the contract in core.py. Holds the buffers, the gather and scatter kernels, and the scatter worker,
+"""The two KV bounce transports (the real one and the disabled null object) implementing the
+contract in core.py. Holds the buffers, the gather and scatter kernels, and the scatter worker,
 and runs the side effects that drive each region's state machine. Never imports transfer.py."""
 
 import queue
@@ -50,8 +50,8 @@ _QUARANTINE_GRACE_S = 60.0  # how long an orphaned region is held out of reuse
 
 
 class VmmBounceTransport(BounceTransport):
-    """The real transport: gather the request's cache into one fabric region, issue a single coalesced
-    multi-rail write, and scatter it back on the receiver."""
+    """The real transport: gather the request's cache into one staging region, issue a single
+    coalesced multi-rail write, and scatter it back on the receiver."""
 
     enabled = True
 
@@ -466,7 +466,7 @@ class NoBounceTransport(BounceTransport):
 
 def create_bounce(agent, cfg, *, device_id: int, page_table) -> BounceTransport:
     """Build the real transport from the config, or the disabled one when bounce is off, it cannot
-    fit, or the fabric allocation races."""
+    fit, or the staging allocation races."""
     if cfg is None:
         return NoBounceTransport()
     try:

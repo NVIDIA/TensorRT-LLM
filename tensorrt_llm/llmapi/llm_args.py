@@ -4142,10 +4142,10 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "progress when active transfers block disaggregated admission.")
 
     kv_cache_bounce_size_mb: int = Field(
-        default=0,
-        ge=0,
+        default=-1,
+        ge=-1,
         description=
-        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
+        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous IPC-shareable staging buffer (fabric-VMM on NVLink-fabric platforms, a legacy device allocation elsewhere) and issues a single NIXL write. -1 (default) resolves automatically: off on fabric platforms where per-block transfers are already fast, on at the default capacity where the V2 pool cannot be shared over CUDA IPC and the per-block path would fall back to slow non-IPC transports. 0 forces the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
 
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:

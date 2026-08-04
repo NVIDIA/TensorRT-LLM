@@ -1304,8 +1304,9 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
 
 # Exercises the disaggregated KV-cache transfer path with the Python cache transceiver AND the
 # KV-cache bounce optimization (cache_transceiver_config.kv_cache_bounce_size_mb > 0): scattered
-# per-block WRITEs are gathered into one coalesced fabric-VMM buffer before a single NIXL WRITE.
-# Restricted to GB200/GB300 since the bounce arena is fabric (MNNVL) VMM memory.
+# per-block WRITEs are gathered into one coalesced staging buffer before a single NIXL WRITE.
+# Kept on GB200/GB300 to cover the fabric (MNNVL) VMM arena; on non-fabric platforms the arena
+# is a legacy device allocation instead (backend selection is covered by unit tests).
 #
 # The bounce transport coalesces a transfer only when it clears the receiver's min_blocks gate.
 # The test lowers that gate via the TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS env so the ordinary short

@@ -116,6 +116,17 @@ class TestConfigFromSize:
         assert bcfg.config_from_size(2048).min_blocks == 1  # env override
         assert bcfg.config_from_size(2048, 250).min_blocks == 250  # explicit arg beats env
 
+    def test_default_min_blocks_lowers_gate_without_touching_default(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", raising=False)
+        # default_min_blocks=1 is used where the pool cannot be shared over CUDA IPC (bounce
+        # everything); callers not passing it keep the pre-existing class default.
+        assert bcfg.config_from_size(2048).min_blocks == 96
+        assert bcfg.config_from_size(2048, default_min_blocks=1).min_blocks == 1
+        # The env override and the explicit argument still take precedence.
+        monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", "7")
+        assert bcfg.config_from_size(2048, default_min_blocks=1).min_blocks == 7
+        assert bcfg.config_from_size(2048, 250, default_min_blocks=1).min_blocks == 250
+
     def test_min_blocks_env_is_parsed_defensively(self, monkeypatch):
         # A bad value must not crash setup (falls back to the default); a non-positive value clamps to 1.
         for bad in ("", "auto", "1.5"):
@@ -124,6 +135,145 @@ class TestConfigFromSize:
         for nonpos in ("0", "-5"):
             monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", nonpos)
             assert bcfg.config_from_size(2048).min_blocks == 1
+
+
+# --------------------------------------------------------------------------- #
+# transceiver._resolve_bounce_config — the auto-enable matrix
+# (manager kind x fabric support x knob value); no GPU needed: the probe is monkeypatched.
+# Deliberately NOT importorskip: only the missing-CUDA-bindings env may skip; in a full
+# environment an ImportError from the transceiver (e.g. a circular import) must FAIL, not skip.
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="transceiver import needs CUDA bindings")
+class TestResolveBounceConfig:
+    @staticmethod
+    def _resolve(manager, size_mb):
+        from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+        cfg = SimpleNamespace(kv_cache_bounce_size_mb=size_mb)
+        return KvCacheTransceiverV2._resolve_bounce_config(manager, cfg)
+
+    @staticmethod
+    def _v2_manager():
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+        # the resolver only does an isinstance check, so an uninitialized instance suffices
+        return object.__new__(KVCacheManagerV2)
+
+    @staticmethod
+    def _patch_fabric(monkeypatch, value):
+        """Patch the fabric probe; value=None installs a tripwire asserting it is never called."""
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _cuda_virt_mem as cvm
+
+        if value is None:
+
+            def _must_not_probe():
+                raise AssertionError("the fabric probe must not run on this path")
+
+            monkeypatch.setattr(cvm, "is_fabric_handle_supported", _must_not_probe)
+        else:
+            monkeypatch.setattr(cvm, "is_fabric_handle_supported", lambda: value)
+
+    def test_v2_non_fabric_auto_enables(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", raising=False)
+        self._patch_fabric(monkeypatch, False)
+        got = self._resolve(self._v2_manager(), -1)
+        assert isinstance(got, bcfg.Config)
+        assert got.sizing.capacity_mb == bcfg.DEFAULT_CAPACITY_MB
+        assert got.min_blocks == 1  # the per-block path has no IPC at all: bounce everything
+
+    def test_v2_fabric_auto_stays_off(self, monkeypatch):
+        self._patch_fabric(monkeypatch, True)
+        assert self._resolve(self._v2_manager(), -1) is None
+
+    def test_v1_auto_stays_off_without_probing(self, monkeypatch):
+        self._patch_fabric(monkeypatch, None)  # v1 pools are not VMM; probing would be a bug
+        assert self._resolve(object(), -1) is None
+
+    def test_explicit_zero_disables_without_probing(self, monkeypatch):
+        # 0 is an explicit off switch and must be honored without any CUDA activity.
+        self._patch_fabric(monkeypatch, None)
+        assert self._resolve(self._v2_manager(), 0) is None
+
+    def test_v2_non_fabric_explicit_size_lowers_gate(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", raising=False)
+        self._patch_fabric(monkeypatch, False)
+        got = self._resolve(self._v2_manager(), 256)
+        assert got.sizing.capacity_mb == 256
+        assert got.min_blocks == 1
+
+    def test_v2_fabric_explicit_size_keeps_default_gate(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", raising=False)
+        self._patch_fabric(monkeypatch, True)
+        got = self._resolve(self._v2_manager(), 512)
+        assert got.sizing.capacity_mb == 512
+        assert got.min_blocks == bcfg.Config.min_blocks  # pre-existing behavior preserved
+
+    def test_v1_explicit_size_keeps_default_gate(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", raising=False)
+        self._patch_fabric(monkeypatch, None)  # v1 short-circuits before the probe
+        got = self._resolve(object(), 512)
+        assert got.min_blocks == bcfg.Config.min_blocks
+
+    def test_env_gate_override_still_wins(self, monkeypatch):
+        self._patch_fabric(monkeypatch, False)
+        monkeypatch.setenv("TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS", "7")
+        assert self._resolve(self._v2_manager(), 256).min_blocks == 7
+
+
+# --------------------------------------------------------------------------- #
+# Buffer backend selection — needs a GPU (real cuMemAlloc / VMM allocations)
+# --------------------------------------------------------------------------- #
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except ImportError:  # pragma: no cover - CPU-only env
+        return False
+
+
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.buffer import needs CUDA bindings")
+@pytest.mark.skipif(not _cuda_available(), reason="Buffer backend tests need a GPU")
+class TestBufferBackend:
+    @pytest.fixture(autouse=True)
+    def _cuda_ctx(self):
+        import torch
+
+        torch.ones(1, device="cuda")  # establish the CUDA context the driver API calls need
+
+    def test_legacy_backend_lifecycle(self, monkeypatch):
+        monkeypatch.setattr(bbuf, "is_fabric_handle_supported", lambda: False)
+        buf = bbuf.Buffer(1 * _MIB, 2 * _MIB, name="test_legacy")
+        assert isinstance(buf._vm, bbuf._LegacyDeviceMem)
+        assert buf.base_ptr != 0
+        assert buf.size == 2 * _MIB  # rounded up to one chunk
+        buf.close()
+        buf.close()  # idempotent
+
+    def test_fabric_branch_uses_virtmem(self, monkeypatch):
+        # The fabric branch also runs on non-fabric GPUs: the pool allocator negotiates its own
+        # handle type internally, so only the branch selection is under test here.
+        from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import VirtMem
+
+        monkeypatch.setattr(bbuf, "is_fabric_handle_supported", lambda: True)
+        buf = bbuf.Buffer(1 * _MIB, 2 * _MIB, name="test_fabric")
+        assert isinstance(buf._vm, VirtMem)
+        assert buf.base_ptr != 0
+        buf.close()
+        buf.close()  # idempotent
+
+    def test_probe_matches_pool_negotiation(self):
+        # Guard against the capability probe and the pool allocator diverging: both must reflect
+        # the same negotiated handle type on the same device.
+        import cuda.bindings.driver as drv
+
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import _cuda_virt_mem as cvm
+
+        alloc = cvm.NativePhysMemAllocator(2 * _MIB)
+        pool_is_fabric = int(alloc._prop.requestedHandleTypes) == int(
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        )
+        assert cvm.is_fabric_handle_supported() == pool_is_fabric
 
 
 # --------------------------------------------------------------------------- #

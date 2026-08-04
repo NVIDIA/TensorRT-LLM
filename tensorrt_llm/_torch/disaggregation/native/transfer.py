@@ -2391,9 +2391,9 @@ class TransferWorker:
         if receiver is not None:
             receiver.shutdown()
         # Close the bounce transport (stops its scatter thread, deregisters its own descriptors and
-        # frees the VMM buffers) once the receiver listener is stopped so no new scatter is enqueued.
-        # No-op for the non-bounced path (NoBounceTransport.close); without this the daemon thread + fabric
-        # buffers leak until process exit.
+        # frees the staging buffers) once the receiver listener is stopped so no new scatter is
+        # enqueued. No-op for the non-bounced path (NoBounceTransport.close); without this the
+        # daemon thread + staging buffers leak until process exit.
         bounce = getattr(self, "_bounce", None)
         if bounce is not None:
             try:

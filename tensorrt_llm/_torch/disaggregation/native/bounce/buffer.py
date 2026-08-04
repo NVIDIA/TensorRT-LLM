@@ -12,16 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fabric-VMM bounce buffers. A fabric region lets the write ride the fast intra-node fabric, which a
-plain device allocation cannot; it is allocated once at setup and reused."""
+"""Bounce buffers for coalescing cache data. On NVLink-fabric platforms the region is fabric-VMM so
+the write can ride the fast intra-node fabric. Elsewhere FABRIC handles do not exist, and a VMM
+region would carry no shareable handle at all: peer processes could not map it, and the staging hop
+itself would fall back to slow non-IPC transports. The region is therefore a legacy cuMemAlloc
+allocation there, which stays shareable through classic CUDA IPC. Either way it is allocated once at
+setup and reused."""
 
 import threading
 import time
 from typing import Dict, Optional, Tuple
 
+import cuda.bindings.driver as drv
+
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import RegMemoryDescs
-from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
+from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import (
+    PooledPhysMemAllocator,
+    VirtMem,
+    is_fabric_handle_supported,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import _unwrap
 
 _MIB = 1024 * 1024
 
@@ -30,8 +41,26 @@ def _div_up(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+class _LegacyDeviceMem:
+    """Minimal VirtMem stand-in backed by one legacy cuMemAlloc allocation. Legacy allocations are
+    shareable via cuIpcGetMemHandle on every platform, which VMM allocations are not once the FABRIC
+    handle type is unavailable."""
+
+    __slots__ = ("address",)
+
+    address: Optional[drv.CUdeviceptr]
+
+    def __init__(self, size: int) -> None:
+        self.address = _unwrap(drv.cuMemAlloc(size))
+
+    def destroy(self) -> None:
+        if self.address is not None:
+            _unwrap(drv.cuMemFree(self.address))
+            self.address = None
+
+
 class Buffer:
-    """One contiguous fabric region for coalescing cache data. The physical chunk size must match the
+    """One contiguous region for coalescing cache data. The physical chunk size must match the
     cache pool's chunk size, which the C++ splitter relies on."""
 
     __slots__ = ("_device_id", "_name", "_size", "_vm")
@@ -43,14 +72,20 @@ class Buffer:
                 f"phys_chunk_size={phys_chunk_size} must both be > 0"
             )
         vm_size = _div_up(capacity_bytes, phys_chunk_size) * phys_chunk_size
-        allocator = PooledPhysMemAllocator(phys_chunk_size)
-        # back the whole region up front so its address is writable and stable for life
-        self._vm = VirtMem(vm_size, allocator, init_num_phys_mem=vm_size // phys_chunk_size)
+        if is_fabric_handle_supported():
+            allocator = PooledPhysMemAllocator(phys_chunk_size)
+            # back the whole region up front so its address is writable and stable for life
+            self._vm = VirtMem(vm_size, allocator, init_num_phys_mem=vm_size // phys_chunk_size)
+            self._device_id = allocator.device_id
+            kind = "fabric"
+        else:
+            self._vm = _LegacyDeviceMem(vm_size)
+            self._device_id = int(_unwrap(drv.cuCtxGetDevice()))
+            kind = "legacy"
         self._size = vm_size
-        self._device_id = allocator.device_id
         self._name = name
         logger.info(
-            f"[kv-bounce] allocated fabric bounce buffer '{name}': "
+            f"[kv-bounce] allocated {kind} bounce buffer '{name}': "
             f"{vm_size / _MIB:.1f} MiB @ 0x{int(self._vm.address):x} "
             f"(chunk={phys_chunk_size // _MIB}MiB, dev={self._device_id})"
         )
@@ -90,7 +125,7 @@ _ALIGN = 512
 
 
 class SlotAllocator:
-    """First-fit allocator over one fabric buffer. Regions may be freed in any order, and first-fit
+    """First-fit allocator over one bounce buffer. Regions may be freed in any order, and first-fit
     reuses a hole freed out of order rather than skipping it. Reserve is thread-safe and blocking.
     The whole buffer is one registration, so a write can stripe across the network links."""
 

@@ -41,6 +41,45 @@ def _is_prop_supported(prop: drv.CUmemAllocationProp) -> bool:
         raise CuError(err)
 
 
+_negotiated_prop_cache: dict[int, drv.CUmemAllocationProp] = {}
+
+
+def _negotiate_alloc_prop(device_id: int) -> drv.CUmemAllocationProp:
+    """The allocation property used for every physical-memory chunk on the device, negotiated once
+    by probing the driver: FABRIC shareable handles with GPUDirect RDMA where granted (NVLink-fabric
+    platforms with IMEX, e.g. GB200/GB300 NVL72), degrading to no shareable handle elsewhere. Cached
+    per device so allocators and capability queries share one answer and cannot diverge. The result
+    must not be mutated."""
+    cached = _negotiated_prop_cache.get(device_id)
+    if cached is not None:
+        return cached
+    prop = drv.CUmemAllocationProp()
+    prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = device_id
+    prop.allocFlags.gpuDirectRDMACapable = 1
+    prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    if not _is_prop_supported(prop):
+        prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
+        if not _is_prop_supported(prop):
+            prop.allocFlags.gpuDirectRDMACapable = 0
+            if not _is_prop_supported(prop):
+                raise ValueError("Failed to create physical memory allocation property")
+    _negotiated_prop_cache[device_id] = prop
+    return prop
+
+
+def is_fabric_handle_supported() -> bool:
+    """Whether physical memory on the current device carries a FABRIC shareable handle (see
+    _negotiate_alloc_prop). Without one, VMM allocations have no shareable handle at all: peer
+    processes cannot map them and transports fall back to slow non-IPC paths."""
+    device_id = int(_unwrap(drv.cuCtxGetDevice()))
+    prop = _negotiate_alloc_prop(device_id)
+    return int(prop.requestedHandleTypes) == int(
+        drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    )
+
+
 # Physical memory
 class NativePhysMemAllocator:
     __slots__ = ("_device_id", "_size", "_prop", "_outstanding_handles")
@@ -53,19 +92,7 @@ class NativePhysMemAllocator:
     def __init__(self, size: int) -> None:
         self._device_id = int(_unwrap(drv.cuCtxGetDevice()))  # pyright: ignore
         self._size = size
-        prop = drv.CUmemAllocationProp()
-        prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-        prop.location.id = self._device_id
-        prop.allocFlags.gpuDirectRDMACapable = 1
-        prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        if not _is_prop_supported(prop):
-            prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
-            if not _is_prop_supported(prop):
-                prop.allocFlags.gpuDirectRDMACapable = 0
-                if not _is_prop_supported(prop):
-                    raise ValueError("Failed to create physical memory allocation property")
-        self._prop = prop
+        self._prop = _negotiate_alloc_prop(self._device_id)
         self._outstanding_handles = set()
 
     def allocate(self) -> drv.CUmemGenericAllocationHandle:

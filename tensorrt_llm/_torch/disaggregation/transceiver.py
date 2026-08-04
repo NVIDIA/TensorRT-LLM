@@ -33,8 +33,12 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
     get_unique_rid,
 )
+from tensorrt_llm._torch.disaggregation.native.bounce import Config as BounceConfig
 from tensorrt_llm._torch.disaggregation.native.bounce import (
     config_from_size as bounce_config_from_size,
+)
+from tensorrt_llm._torch.disaggregation.native.bounce.config import (
+    DEFAULT_CAPACITY_MB as BOUNCE_DEFAULT_CAPACITY_MB,
 )
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
@@ -106,8 +110,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
-                # Size 0 turns bounce off; the block-count gate is internal (tuned via env).
-                bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
+                bounce=self._resolve_bounce_config(kv_cache_manager, cache_transceiver_config),
             )
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
@@ -129,6 +132,46 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+    @staticmethod
+    def _resolve_bounce_config(
+        kv_cache_manager: KVCacheManager, cache_transceiver_config: CacheTransceiverConfig
+    ) -> Optional[BounceConfig]:
+        """Resolve the bounce config, auto-enabling it where the per-block path cannot work.
+
+        KVCacheManagerV2 pools are VMM allocations. Without a FABRIC shareable handle
+        (available only on NVLink-fabric platforms such as GB200/GB300 NVL72) peer
+        processes cannot map the pool, so direct per-block transfers cannot use CUDA
+        IPC and drop to non-IPC fallbacks around two orders of magnitude slower.
+        Bouncing through an IPC-shareable staging buffer restores the fast path, so on
+        such platforms bounce defaults on with the block gate lowered to cover every
+        transfer. Explicit sizes are respected everywhere; 0 forces bounce off.
+        """
+        size_mb = cache_transceiver_config.kv_cache_bounce_size_mb
+        if size_mb == 0:  # explicitly disabled: honor it without probing anything
+            return None
+
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm.runtime.kv_cache_manager_v2._cuda_virt_mem import (
+            is_fabric_handle_supported,
+        )
+
+        pool_lacks_ipc = (
+            isinstance(kv_cache_manager, KVCacheManagerV2) and not is_fabric_handle_supported()
+        )
+        if size_mb is None or size_mb < 0:  # auto (the default)
+            if not pool_lacks_ipc:
+                return None
+            logger.info(
+                f"[kv-bounce] auto-enabling bounce ({BOUNCE_DEFAULT_CAPACITY_MB} MiB per region): "
+                "the KV pool is VMM without fabric handles, so direct per-block transfers "
+                "cannot use CUDA IPC"
+            )
+            size_mb = BOUNCE_DEFAULT_CAPACITY_MB
+
+        # Without pool IPC every transfer benefits from bouncing, so the coalescing gate drops
+        # to a single block; the env override still wins inside config_from_size.
+        return bounce_config_from_size(size_mb, default_min_blocks=1 if pool_lacks_ipc else None)
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
