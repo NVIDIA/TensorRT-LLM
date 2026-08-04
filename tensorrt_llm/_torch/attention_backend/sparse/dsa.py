@@ -263,6 +263,26 @@ def _pick_dsl_expand(
     return factor, eff
 
 
+def build_req_idx_per_token(seq_lens: torch.Tensor,
+                            num_tokens: int) -> torch.Tensor:
+    """Map each token of the flattened batch to the request it belongs to.
+
+    Token ``t`` belongs to the first request whose cumulative token end
+    exceeds ``t``; ``right=True`` makes duplicated cumsum boundaries skip
+    zero-length rows, so the result matches ``torch.repeat_interleave(
+    arange(num_seqs), seq_lens)`` for every layout (see the unit test).
+
+    Device-side, fixed-shape counterpart of the host build in
+    ``prepare_for_indices_conversion()`` — usable between draft-loop
+    iterations and inside CUDA-graph capture, where a host round-trip is not.
+    """
+    cu_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
+    token_idx = torch.arange(num_tokens,
+                             device=seq_lens.device,
+                             dtype=torch.int32)
+    return torch.searchsorted(cu_seq_lens, token_idx, right=True)
+
+
 def _compute_slot_mappings(
     global_positions: torch.Tensor,
     block_offsets: torch.Tensor,
@@ -829,22 +849,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # boundary so a "shared" layer never reuses a stale top-k.
         self.shared_topk_indices = None
 
+        # Rebuild the token->request map from the current seq_lens: the map
+        # built in prepare() describes the target forward's layout, but the
+        # draft loop rewrites seq_lens to one token per request. Equivalent to
+        # prepare()'s repeat_interleave whenever seq_lens is unchanged.
+        # Unconditional (no kv_cache_manager guard) so subclasses such as
+        # DeepSeek-V4 can reuse the rebuilt buffer instead of recomputing it.
+        if self.num_tokens > 0:
+            self.req_idx_per_token[:self.num_tokens] = build_req_idx_per_token(
+                self.seq_lens_cuda[:self.num_seqs],
+                self.num_tokens).to(self.req_idx_per_token.dtype)
+
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[:self.num_seqs] - seq_lens
 
-            # Rebuild the token->request map from the current seq_lens: the map
-            # built in prepare() describes the target forward's layout, but the
-            # draft loop rewrites seq_lens to one token per request. Equivalent to
-            # prepare()'s repeat_interleave whenever seq_lens is unchanged.
-            cu_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
-            token_idx = torch.arange(self.num_tokens,
-                                     device=seq_lens.device,
-                                     dtype=torch.int32)
-            self.req_idx_per_token[:self.num_tokens] = torch.searchsorted(
-                cu_seq_lens, token_idx,
-                right=True).to(self.req_idx_per_token.dtype)
             req_indices = self.req_idx_per_token[:self.num_tokens].to(
                 dtype=torch.int64)
             seq_starts = torch.cumsum(
