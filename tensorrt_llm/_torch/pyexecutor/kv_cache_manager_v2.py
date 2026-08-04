@@ -1121,9 +1121,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
         # Account for max single-sequence capacity = seq_len + extra KV tokens +
         # _kv_reserve_draft_tokens (see __init__) + 1 base decode token.
-        max_seq_capacity = (
-            self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
-        )
+        max_seq_capacity = self._max_sequence_capacity()
         self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block - 1) // tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
@@ -2151,6 +2149,10 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
 
+    def _max_sequence_capacity(self) -> int:
+        """Return the largest capacity passed to the V2 cache."""
+        return self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
+
     def max_resident_sequences(self) -> Optional[int]:
         """Upper bound on sequences that can co-reside at ``max_seq_len``.
 
@@ -2166,25 +2168,23 @@ class KVCacheManagerV2(BaseResourceManager):
         Returns None when no such non-droppable pool exists, keeping the
         unbounded MAX_UTILIZATION behavior for plain attention models.
         """
-        state_pool_groups = {
-            pool_group_id
-            for pool_group_id, _, kind in self._stats_life_cycle_metadata().values()
-            if kind != "attention"
-        }
-        if not state_pool_groups:
+        life_cycle_metadata = self._stats_life_cycle_metadata()
+        if not any(kind != "attention" for _, _, kind in life_cycle_metadata.values()):
             return None
 
-        # Charging every attention pool the full max_seq_len is deliberately
-        # worst-case: a genuinely sliding-window pool needs fewer pages per
-        # sequence, so the bound errs low rather than over-admitting.
-        pages_per_seq = math.ceil(self.max_seq_len / self.tokens_per_block)
-        # A state pool holds one fixed slot per sequence; an attention pool
-        # must hold every page of each resident sequence.
+        # A physical group can host multiple lifecycle variants. V2 allocates
+        # each variant separately from the shared group, so their costs add.
+        attention_slots = math.ceil(self._max_sequence_capacity() / self.tokens_per_block)
+        slots_per_pool_group: dict[int, int] = defaultdict(int)
+        for pool_group_id, _, kind in life_cycle_metadata.values():
+            slots_per_pool_group[pool_group_id] += attention_slots if kind == "attention" else 1
+
+        storage_stats = self._get_storage_statistics(GPU_LEVEL)
         return max(
             1,
             min(
-                stat.total // (1 if pool_group_id in state_pool_groups else pages_per_seq)
-                for pool_group_id, stat in enumerate(self._get_storage_statistics(GPU_LEVEL))
+                storage_stats[pool_group_id].total // slots_per_sequence
+                for pool_group_id, slots_per_sequence in slots_per_pool_group.items()
             ),
         )
 

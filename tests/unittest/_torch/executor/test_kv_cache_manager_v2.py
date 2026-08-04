@@ -40,6 +40,69 @@ TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
 
 
+def _make_residency_manager(
+    *,
+    max_seq_len: int,
+    tokens_per_block: int,
+    num_extra_kv_tokens: int,
+    reserve_draft_tokens: int,
+    life_cycle_metadata: dict[int, tuple[int, int | None, str]],
+    pool_group_totals: list[int],
+) -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = max_seq_len
+    manager.tokens_per_block = tokens_per_block
+    manager.num_extra_kv_tokens = num_extra_kv_tokens
+    manager._kv_reserve_draft_tokens = reserve_draft_tokens
+    manager._stats_life_cycle_metadata = lambda: life_cycle_metadata
+    manager._get_storage_statistics = lambda _level: [
+        SimpleNamespace(total=total) for total in pool_group_totals
+    ]
+    return manager
+
+
+@pytest.mark.parametrize(
+    ("num_extra_kv_tokens", "reserve_draft_tokens", "expected"),
+    [(0, 0, 6), (1, 0, 4), (0, 32, 4)],
+)
+def test_max_resident_sequences_uses_full_rounded_capacity(
+    num_extra_kv_tokens: int,
+    reserve_draft_tokens: int,
+    expected: int,
+) -> None:
+    manager = _make_residency_manager(
+        max_seq_len=63,
+        tokens_per_block=32,
+        num_extra_kv_tokens=num_extra_kv_tokens,
+        reserve_draft_tokens=reserve_draft_tokens,
+        life_cycle_metadata={
+            0: (0, 63, "attention"),
+            1: (1, None, "ssm"),
+        },
+        pool_group_totals=[12, 100],
+    )
+
+    assert manager.max_resident_sequences() == expected
+
+
+def test_max_resident_sequences_sums_coalesced_life_cycles() -> None:
+    manager = _make_residency_manager(
+        max_seq_len=31,
+        tokens_per_block=16,
+        num_extra_kv_tokens=0,
+        reserve_draft_tokens=0,
+        life_cycle_metadata={
+            0: (0, 31, "attention"),
+            1: (0, None, "ssm"),
+            2: (0, 15, "attention"),
+        },
+        pool_group_totals=[51],
+    )
+
+    # Each sequence consumes 2 + 1 + 2 slots from the shared physical group.
+    assert manager.max_resident_sequences() == 10
+
+
 class _FakeKVCache:
     def __init__(self, num_committed_tokens: int) -> None:
         self.num_committed_tokens = num_committed_tokens

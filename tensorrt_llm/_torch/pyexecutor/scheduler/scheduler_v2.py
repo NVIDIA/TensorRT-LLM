@@ -214,6 +214,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._context_init_state_value = LlmRequestState.CONTEXT_INIT.value
         self._encoder_init_state_value = LlmRequestState.ENCODER_INIT.value
         self._disagg_gen_init_state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
+        self._disagg_gen_trans_in_progress_state_value = (
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value
+        )
+        self._disagg_gen_trans_complete_state_value = (
+            LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE.value
+        )
         self._gen_to_complete_state_value = LlmRequestState.GENERATION_TO_COMPLETE.value
 
         # Opt-in (default off): on the disagg generation server, schedule
@@ -290,6 +296,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
             )
 
+        residency_cap = self.max_resident_sequences
+        resident_request_ids = (
+            {req.request_id for req in requests_list if self._is_resident_request(req)}
+            if residency_cap is not None
+            else set()
+        )
+
         req_it_end = len(requests_list)
         req_it = 0
 
@@ -336,6 +349,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             # no free slots remain, so the request is skipped and retried next
             # iteration. PEFT budget is still checked and committed.
             if req_state_value == self._disagg_gen_init_state_value:
+                needs_residency = (
+                    residency_cap is not None and req.request_id not in resident_request_ids
+                )
+                if needs_residency and len(resident_request_ids) >= residency_cap:
+                    req_it += 1
+                    continue
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
@@ -347,6 +366,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req_it += 1
                     continue
                 disagg_candidates.append(req)
+                if needs_residency:
+                    resident_request_ids.add(req.request_id)
                 # Disagg requests only commit PEFT (not num_requests/num_tokens)
                 # because they don't participate in the forward pass. Counting
                 # them toward num_requests would steal batch slots from gen/ctx
@@ -408,21 +429,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Starting a new sequence is what grows the resident set, so the
         # residency cap is enforced here. Requests already started keep
         # their slot; the rest wait in the queue until one drains.
-        residency_cap = self.max_resident_sequences
-        num_started = (
-            sum(1 for r in requests_list if self._is_started_request(r))
-            if residency_cap is not None
-            else 0
-        )
-
         for req in pending_ctx:
             if budget.requests_full:
                 break
-            # Read before scheduling: _try_schedule_context advances the
-            # request past its first chunk.
-            is_new_sequence = residency_cap is not None and req.is_first_context_chunk
-            if is_new_sequence and num_started >= residency_cap:
-                break
+            needs_residency = (
+                residency_cap is not None
+                and req.state_value == self._context_init_state_value
+                and req.request_id not in resident_request_ids
+            )
+            if needs_residency and len(resident_request_ids) >= residency_cap:
+                continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
                 continue
@@ -438,8 +454,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     break
                 if action is ScheduleAction.SKIP:
                     continue
-                if is_new_sequence:
-                    num_started += 1
+                if needs_residency:
+                    resident_request_ids.add(req.request_id)
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
@@ -1006,6 +1022,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         return (
             req.is_context_init_state and not req.is_first_context_chunk
         ) or req.is_generation_in_progress_state
+
+    def _is_resident_request(self, req: LlmRequest) -> bool:
+        """Return whether a request already owns or reserves V2 residency."""
+        if self._is_started_request(req):
+            return True
+        if req.state_value in (
+            self._disagg_gen_trans_in_progress_state_value,
+            self._disagg_gen_trans_complete_state_value,
+        ):
+            return True
+        return self.kv_cache_manager.is_request_active(req.py_request_id)
 
     def _suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache in both main and draft managers.
