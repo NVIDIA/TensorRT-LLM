@@ -65,9 +65,12 @@ def format_risks_for_agent(vuln_docs: list, license_docs: list) -> list:
         if key not in seen:
             seen.add(key)
             items.append(item)
+    _UNKNOWN = {"", "unknown license", "unknown"}
     for doc in license_docs:
         lics = doc.get("s_license_ids", "")
-        if lics == "Unknown License" or lics == "":
+        if lics.lower() in _UNKNOWN or all(
+            lic.strip().lower() in _UNKNOWN for lic in lics.split(",")
+        ):
             item = _license_doc_to_agent_item(doc)
             key = (
                 item["dependency_name"],
