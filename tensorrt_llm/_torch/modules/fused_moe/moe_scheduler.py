@@ -486,12 +486,25 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 moe.dummy_allreduce()
 
             dispatch_kwargs = dict(eplb_dispatch_kwargs)
+            fuse_bf16_nvfp4_dispatch = False
             if isinstance(moe.comm, DeepEP) and isinstance(moe.backend, TRTLLMGenFusedMoE):
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
+            if isinstance(moe.comm, DeepEPLowLatency) and moe.backend.__class__ == CuteDslFusedMoE:
+                nvfp4_input_scale = getattr(moe.backend, "fc31_input_scale", None)
+                fuse_bf16_nvfp4_dispatch = (
+                    nvfp4_input_scale is not None
+                    and moe.comm.should_fuse_bf16_nvfp4_dispatch(x, nvfp4_input_scale)
+                )
+                if fuse_bf16_nvfp4_dispatch:
+                    dispatch_kwargs["fuse_bf16_nvfp4_quantization"] = True
+                    dispatch_kwargs["nvfp4_input_scale"] = nvfp4_input_scale
 
             if supports_post_quant:
                 # Quantize -> Dispatch
-                x, x_sf = moe.backend.quantize_input(x)
+                if fuse_bf16_nvfp4_dispatch:
+                    x_sf = None
+                else:
+                    x, x_sf = moe.backend.quantize_input(x)
 
                 # W4AFP8 + DeepEPLowLatency needs pre_quant_scale_1; other strategies
                 # absorb the kwarg via **kwargs so unconditional passing is safe.
