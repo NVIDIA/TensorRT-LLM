@@ -1259,6 +1259,47 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     return ""
 }
 
+// Upload sqlite-only early coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
+def uploadArchCoverage(String arch, pipeline, testFilter) {
+    if (!testFilter[(CBTS_COVERAGE)]) {
+        return
+    }
+    try {
+        timeout(time: 15, unit: 'MINUTES') {
+            def podSpec = createKubernetesPodConfig("", "agent")
+            trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
+                stage("Upload Single-GPU Coverage (${arch})") {
+                    def testResultLink = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}/test-results"
+                    sh "rm -rf cov && mkdir -p cov"
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl python3 py3-pip")
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget ${testResultLink}/", allowStepFailed: true)
+                    sh "cat index.html | grep \"tar.gz\" | cut -d \"\\\"\" -f 2 > result_file_names.txt"
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cat result_file_names.txt | xargs -n1 -I {} wget -c -nv ${testResultLink}/{}", allowStepFailed: true)
+                    sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
+                    sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
+                    def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
+                    if (fileCount > 0) {
+                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                        sh """
+                            python3 ${LLM_ROOT}/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
+                                --glob 'cov/.cbtscov.*.sqlite' \
+                                --out-sqlite cov/cbts_touchmap.sqlite
+                        """
+                        sh "cd cov && tar czf cbts_pystart_report_${arch}.tar.gz cbts_touchmap.sqlite"
+                        trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
+                        echo "CBTS early coverage (${arch}): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz"
+                    } else {
+                        echo "CBTS early coverage (${arch}): no data files found, skipping."
+                    }
+                }
+            })
+        }
+    } catch (Exception e) {
+        echo "CBTS early coverage upload (${arch}) failed (non-fatal): ${e.toString()}"
+    }
+}
+
 def collectTestResults(pipeline, testFilter, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
@@ -1616,6 +1657,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                     }
                 }
+                uploadArchCoverage("x86_64", pipeline, testFilter)
 
                 def requireMultiGpuTesting = currentBuild.description?.contains("Require x86_64 Multi-GPU Testing") ?: false
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
@@ -1745,6 +1787,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                     }
                 }
+
+                uploadArchCoverage("SBSA", pipeline, testFilter)
 
                 def requireMultiGpuTesting = currentBuild.description?.contains("Require SBSA Multi-GPU Testing") ?: false
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
