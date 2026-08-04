@@ -260,7 +260,7 @@ def _ensure_slurm_external_launch_env():
         os.environ.pop(var, None)
 
 
-def _run_wan22_multinode_slurm_rank(tmp_path):
+def _run_wan22_multinode_slurm_rank(request, tmp_path):
     rank_env = _slurm_rank_env()
     if rank_env is None:
         pytest.skip("This VisualGen multi-node case must run under SLURM rank env")
@@ -272,6 +272,15 @@ def _run_wan22_multinode_slurm_rank(tmp_path):
         pytest.skip(
             f"Requires at least {WAN22_LPIPS_MULTINODE_NODES} SLURM nodes, got {node_count}"
         )
+
+    if rank == 0:
+        # Only rank 0 encodes the generated video, and only it needs the media
+        # deps. Installing here (not parent-side) is required: each srun step
+        # gets a fresh container from the image, so the parent's apt-get never
+        # reaches the ranks. Keeping it rank-0-only also avoids 16 tasks racing
+        # the same apt lock; the other ranks simply block in
+        # dist.init_process_group meanwhile.
+        request.getfixturevalue("_visual_gen_deps")
 
     _ensure_slurm_external_launch_env()
     _disable_inductor_compile_worker_quiesce()
@@ -536,15 +545,12 @@ def test_wan22_t2v_lpips_against_golden_tp(_visual_gen_deps, tmp_path, variant_n
 
 def test_wan22_t2v_multinode_slurm_lpips_against_golden(request, tmp_path):
     if _slurm_rank_env() is not None:
-        _run_wan22_multinode_slurm_rank(tmp_path)
+        _run_wan22_multinode_slurm_rank(request, tmp_path)
         return
 
     if os.environ.get(_MULTINODE_SLURM_CHILD_ENV):
         pytest.skip("VisualGen SLURM child was not launched with SLURM rank env")
 
-    # Media deps (av / ffmpeg) are installed parent-side only: rank 0 shares
-    # node 0's venv with the parent, remote-node workers never touch media,
-    # and the bare child pytest invocation has no llm_venv harness to run
-    # the fixture (16 ranks racing pip/apt would be unsafe anyway).
-    request.getfixturevalue("_visual_gen_deps")
+    # Media deps are installed by rank 0 inside the srun step, not here: the
+    # parent only shells out to srun and never encodes a video.
     _run_wan22_multinode_slurm_parent()
