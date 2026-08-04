@@ -188,10 +188,12 @@ def maybe_pad_for_mxfp4(weight: torch.Tensor,
     col_pad_size = (col_alignment - weight.shape[-1]) % col_alignment
     if row_alignment:
         row_pad_size = (row_alignment - weight.shape[-2]) % row_alignment
-        weight = F.pad(weight, (0, col_pad_size, 0, row_pad_size))
-    else:
-        weight = F.pad(weight, (0, col_pad_size))
-    return weight
+        if col_pad_size == 0 and row_pad_size == 0:
+            return weight
+        return F.pad(weight, (0, col_pad_size, 0, row_pad_size))
+    if col_pad_size == 0:
+        return weight
+    return F.pad(weight, (0, col_pad_size))
 
 
 def _pad_tensor_to_shape(tensor: torch.Tensor, shape: tuple) -> torch.Tensor:
