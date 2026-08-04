@@ -196,6 +196,35 @@ def test_missing_trtllm_adapter_uses_native_hf_loader(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("fallback", ["missing-state", "missing-adapter"])
+def test_native_fallback_releases_previous_mx_session(monkeypatch, fallback):
+    instances = _install_fake_mx(
+        monkeypatch,
+        p2p_succeeded=False,
+        value={"disk": object()},
+    )
+    loader, weight_loader, _ = _loader(mx_server_url="mx:8001")
+    loader.load_weights("checkpoint", **_load_kwargs())
+    previous_session = instances[0]
+
+    kwargs = _load_kwargs()
+    if fallback == "missing-state":
+        kwargs["model"] = None
+    else:
+        monkeypatch.setitem(sys.modules, "modelexpress.engines.trtllm", ModuleType("empty"))
+
+    assert loader.load_weights("checkpoint", **kwargs) == weight_loader.load_weights.return_value
+    previous_session.cleanup.assert_called_once_with()
+    assert loader._mx_loader is None
+
+    loader.post_load_publish(
+        MagicMock(),
+        checkpoint_dir="checkpoint",
+        weights_preloaded=False,
+    )
+    previous_session.publish_model.assert_not_called()
+
+
 def test_trtllm_adapter_dependency_error_is_not_hidden(monkeypatch):
     def fail_import(_name):
         raise ModuleNotFoundError("No module named 'nixl'", name="nixl")
@@ -399,6 +428,24 @@ def test_cleanup_releases_mx_and_native_loader_resources(monkeypatch):
     )
     loader, weight_loader, config_loader = _loader(mx_server_url="mx:8001")
     loader.load_weights("checkpoint", **_load_kwargs())
+
+    loader.cleanup()
+
+    instances[0].cleanup.assert_called_once_with()
+    weight_loader.cleanup.assert_called_once_with()
+    config_loader.cleanup.assert_called_once_with()
+    assert loader._mx_loader is None
+
+
+def test_cleanup_continues_when_mx_cleanup_fails(monkeypatch):
+    instances = _install_fake_mx(
+        monkeypatch,
+        p2p_succeeded=False,
+        value={"disk": object()},
+    )
+    loader, weight_loader, config_loader = _loader(mx_server_url="mx:8001")
+    loader.load_weights("checkpoint", **_load_kwargs())
+    instances[0].cleanup.side_effect = RuntimeError("cleanup failed")
 
     loader.cleanup()
 

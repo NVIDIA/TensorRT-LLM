@@ -122,6 +122,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         self._post_transform_weights_preloaded = False
         self._source_identity_compatible_for_last_load = False
         self._transform_protocol_version_for_last_load = None
+        self._cleanup_mx_loader()
 
         if (
             self._mx_server_url is None
@@ -174,11 +175,6 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 "Qualified MX loading requires the current TRT-LLM "
                 "SourceIdentity format and a transform-layout ABI"
             )
-
-        previous_loader = self._mx_loader
-        self._mx_loader = None
-        if previous_loader is not None:
-            previous_loader.cleanup()
 
         mx_loader = MxModelLoader(
             model_config=model_config,
@@ -249,7 +245,19 @@ class MXCheckpointLoader(HfCheckpointLoader):
         )
 
     def cleanup(self) -> None:
-        if self._mx_loader is not None:
-            self._mx_loader.cleanup()
-            self._mx_loader = None
+        self._cleanup_mx_loader()
         super().cleanup()
+
+    def _cleanup_mx_loader(self) -> None:
+        mx_loader = self._mx_loader
+        self._mx_loader = None
+        if mx_loader is None:
+            return
+        try:
+            mx_loader.cleanup()
+        except Exception:  # noqa: BLE001 - cleanup is best effort
+            logger.warning(
+                "Failed to clean up ModelExpress loader %r",
+                mx_loader,
+                exc_info=True,
+            )
