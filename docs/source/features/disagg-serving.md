@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Disaggregated Serving
 
 - [Motivation](#Motivation)
@@ -13,7 +18,7 @@
   - [Multiple Instances](#multiple-instances)
 - [Environment Variables](#Environment-Variables)
 - [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
-  - [AWS EFA with LIBFABRIC](#AWS-EFA-with-LIBFABRIC)
+  - [AWS EFA with LIBFABRIC](#aws-efa-with-libfabric)
 
 ## Motivation
 

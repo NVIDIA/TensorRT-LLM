@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # AWS EFA and LIBFABRIC for Disaggregated Serving
 
 This guide is a deployment checklist for running TensorRT LLM disaggregated
@@ -43,6 +48,11 @@ Before launching TensorRT LLM workers, verify the EFA layer independently:
   `vpc.amazonaws.com/efa` extended resource.
 - If the NVIDIA Kubernetes device plugin is also installed, disable its MOFED
   device mounting so the EFA plugin owns `/dev/infiniband` allocation.
+- For custom AMIs, Bottlerocket, or any deployment that must explicitly align
+  EFA and GPU locality, use the EFA DRA driver with the NVIDIA DRA driver and
+  `matchAttribute` constraints, such as `resource.kubernetes.io/pcieRoot`,
+  before enabling GPU Direct RDMA. Do not run the EFA DRA driver on nodes where
+  the EFA device plugin is running.
 - Configure huge pages for workloads that use EFA. AWS EFA nodes pre-allocate
   2 MiB huge pages, which can be requested from Pods.
 
@@ -62,7 +72,9 @@ The worker image must contain the components needed by the selected transport:
   `/opt/amazon/efa`.
 - The NIXL LIBFABRIC plugin, `libplugin_LIBFABRIC.so`, available to the process.
   If it is not in the default plugin search path, set `NIXL_PLUGINS_DIR` to the
-  directory that contains it.
+  directory that contains the version-matched plugin.
+- Basic process-inspection utilities for the verification commands below, such
+  as `grep` and `ls`, or equivalent tools in minimal images.
 - GDRCopy and GPU Direct RDMA support when GPU memory should be registered
   directly instead of bouncing through CPU memory.
 
@@ -110,8 +122,11 @@ spec:
           value: efa
         - name: FI_EFA_USE_DEVICE_RDMA
           value: "1"
+        # Set only when the image stores libplugin_LIBFABRIC.so outside
+        # NIXL's default plugin search path. The directory must contain the
+        # version-matched LIBFABRIC plugin for this image.
         - name: NIXL_PLUGINS_DIR
-          value: /opt/nvidia/nvda_nixl/lib/plugins
+          value: <directory-containing-libplugin_LIBFABRIC.so>
 ```
 
 Production deployments normally add anti-affinity so context and generation
@@ -145,12 +160,12 @@ kubectl exec <worker-pod> -- ls -l /dev/infiniband
 kubectl logs <worker-pod> | grep -iE "NIXL.*backend|Backend.*instantiated|LIBFABRIC"
 ```
 
-For a loaded plugin check, inspect the worker process mappings:
+For a loaded plugin check, inspect the known worker process mappings. Replace
+`<worker-pid>` with the TensorRT LLM or Dynamo worker PID from the container
+entrypoint, supervisor, or runtime logs:
 
 ```bash
-kubectl exec <worker-pod> -- bash -lc '
-  grep libplugin_LIBFABRIC /proc/$(pgrep -f "trtllm|dynamo" | head -1)/maps
-'
+kubectl exec <worker-pod> -- grep libplugin_LIBFABRIC /proc/<worker-pid>/maps
 ```
 
 If the logs show UCX instead of LIBFABRIC, check `TRTLLM_NIXL_KVCACHE_BACKEND`,
