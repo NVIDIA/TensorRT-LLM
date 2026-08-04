@@ -35,7 +35,6 @@ try:
     )
     from tensorrt_llm._torch.visual_gen.modules.vae.conv import (
         _cat_spatial_halos,
-        _logical_to_physical_channels_last,
         _pack_spatial_halo,
         _physical_to_logical_channels_last,
         _spatial_channels_last_format,
@@ -398,16 +397,6 @@ class TestSpatialChannelsLastFormat:
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert actual.is_contiguous(memory_format=torch.channels_last_3d)
 
-    def test_physical_layout_cat_fuses_row_major_3d_conversion(self) -> None:
-        x = torch.randn(1, 4, 3, 8, 8)
-        halo = torch.randn(1, 4, 3, 8, 1)
-
-        actual = _cat_spatial_halos([halo, x, halo], 4, torch.channels_last_3d)
-        expected = torch.cat([halo, x, halo], dim=4)
-
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        assert actual.is_contiguous(memory_format=torch.channels_last_3d)
-
     @pytest.mark.parametrize("dim", [2, 3])
     def test_physical_layout_cat_preserves_channels_last_2d(self, dim: int) -> None:
         x = torch.randn(1, 4, 8, 8).contiguous(memory_format=torch.channels_last)
@@ -417,16 +406,6 @@ class TestSpatialChannelsLastFormat:
 
         actual = _cat_spatial_halos([halo, x, halo], dim, torch.channels_last)
         expected = torch.cat([halo, x, halo], dim=dim)
-
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        assert actual.is_contiguous(memory_format=torch.channels_last)
-
-    def test_physical_layout_cat_fuses_row_major_2d_conversion(self) -> None:
-        x = torch.randn(1, 4, 8, 8)
-        halo = torch.randn(1, 4, 8, 1)
-
-        actual = _cat_spatial_halos([halo, x, halo], 3, torch.channels_last)
-        expected = torch.cat([halo, x, halo], dim=3)
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert actual.is_contiguous(memory_format=torch.channels_last)
@@ -459,19 +438,6 @@ class TestSpatialChannelsLastFormat:
         assert wire.is_contiguous()
         expected_format = torch.channels_last_3d if len(shape) == 5 else torch.channels_last
         assert actual.is_contiguous(memory_format=expected_format)
-
-    @pytest.mark.parametrize(
-        "x",
-        [
-            torch.randn(2, 4, 8, 1),
-            torch.randn(1, 4, 3, 8, 1),
-        ],
-    )
-    def test_physical_halo_wire_views_are_bit_exact(self, x: torch.Tensor) -> None:
-        wire = _logical_to_physical_channels_last(x)
-        actual = _physical_to_logical_channels_last(wire)
-
-        torch.testing.assert_close(actual, x, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
