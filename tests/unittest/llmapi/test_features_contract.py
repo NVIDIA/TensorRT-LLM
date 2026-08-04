@@ -25,6 +25,9 @@ from tensorrt_llm import lora_helper
 from tensorrt_llm.llmapi import llm_args
 from tensorrt_llm.usage import usage_lib
 
+pytestmark = pytest.mark.cpu_only
+
+
 _STABILITY_DIR = Path(__file__).resolve().parents[1] / "api_stability"
 _COMMITTED_YAML = _STABILITY_DIR / "references_committed" / "llm.yaml"
 _REFERENCE_YAML = _STABILITY_DIR / "references" / "llm.yaml"

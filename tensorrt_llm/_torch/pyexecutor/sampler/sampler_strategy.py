@@ -112,6 +112,42 @@ BEAM_SEARCH_PAD_TOKEN = vanilla.BEAM_SEARCH_PAD_TOKEN
 
 
 @dataclass(kw_only=True)
+class RequestSeeds:
+    """Per-request RNG state for user-specified ``SamplingParams.seed``.
+
+    Threaded alongside ``generator`` through the strategy impls and handed to
+    the flashinfer sampling ops as their stateless ``seed``/``offset`` pair.
+    Both tensors are int64 and 1-D with one entry per group row, matching the
+    per-row shape flashinfer documents; a row whose request did not specify a
+    seed carries the sampler's global seed, so unseeded requests keep their
+    previous behavior only in distribution, not token-for-token (see
+    ``_SeedManager``).
+
+    NB: the pinned flashinfer (0.6.15) accepts these per-row tensors but reads
+    only element 0 of each, separating rows by ``blockIdx.x``. The per-row
+    values below are therefore carried end-to-end but not yet honored for
+    batched requests; see the warning on ``_SeedManager`` and the upstream fix
+    at https://github.com/flashinfer-ai/flashinfer/pull/2345.
+
+    ``offset`` advances per request per sampling step, which is what makes a
+    seeded request's stream depend on how many tokens it has drawn rather than
+    on which batch it happened to land in.
+    """
+
+    seed: torch.Tensor
+    """Per-row Philox seed (int64, device)."""
+    offset: torch.Tensor
+    """Per-row Philox offset (int64, device)."""
+
+    def index_select(self, indices: torch.Tensor) -> "RequestSeeds":
+        """Narrow to a subset of rows, mirroring ``group_logit_indices``."""
+        return RequestSeeds(
+            seed=self.seed.index_select(0, indices),
+            offset=self.offset.index_select(0, indices),
+        )
+
+
+@dataclass(kw_only=True)
 class TopPDecayMetadata(StrategyMetadata):
     """Per-group runtime top-p override for Top-P Decay (attached to the
     top-p-carrying groups -- top_p, top_k_top_p and min_p -- via the
@@ -297,6 +333,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             pass
 
@@ -351,9 +388,17 @@ class _StrategyImpls:
             cls,
             probs: torch.Tensor,
             generator: Optional[torch.Generator],
+            seeds: Optional["RequestSeeds"] = None,
         ) -> torch.Tensor:
+            # Explicit seed/offset take precedence over generator in the op
+            # layer, so passing both is safe and keeps the generator as the
+            # fallback when no request asked for a seed.
             return sampling_from_probs_op(
-                probs, generator=generator, check_nan=cls._flashinfer_check_nans(probs)
+                probs,
+                generator=generator,
+                seed=seeds.seed if seeds is not None else None,
+                offset=seeds.offset if seeds is not None else None,
+                check_nan=cls._flashinfer_check_nans(probs),
             )
 
         def _sample_greedy_with_probs(
@@ -410,6 +455,7 @@ class _StrategyImpls:
             min_p: Optional[torch.Tensor],
             temperature: torch.Tensor,
             generator: Optional[torch.Generator],
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             probs = cls._compute_probs(
                 logits,
@@ -419,7 +465,7 @@ class _StrategyImpls:
                 min_p=min_p,
                 temperature=temperature,
             )
-            new_tokens = cls._sample_from_probs(probs, generator=generator)
+            new_tokens = cls._sample_from_probs(probs, generator=generator, seeds=seeds)
             return new_tokens, probs
 
     class TopPDecayMixin:
@@ -475,6 +521,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             return self._sample_greedy_with_probs(logits, group_logit_indices=group_logit_indices)
 
@@ -503,6 +550,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             self._maybe_apply_top_p_decay(group_metadata)
             return self._sample_with_probs(
@@ -513,6 +561,7 @@ class _StrategyImpls:
                 min_p=None,
                 temperature=self._temperature,
                 generator=generator,
+                seeds=seeds,
             )
 
     class TopKWithProbs(StrategyImplWithProbs):
@@ -538,6 +587,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             return self._sample_with_probs(
                 logits,
@@ -547,6 +597,7 @@ class _StrategyImpls:
                 min_p=None,
                 temperature=self._temperature,
                 generator=generator,
+                seeds=seeds,
             )
 
     class TopPWithProbs(TopPDecayMixin, StrategyImplWithProbs):
@@ -572,6 +623,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             self._maybe_apply_top_p_decay(group_metadata)
             return self._sample_with_probs(
@@ -582,6 +634,7 @@ class _StrategyImpls:
                 min_p=None,
                 temperature=self._temperature,
                 generator=generator,
+                seeds=seeds,
             )
 
     class TemperatureOnlyWithProbs(StrategyImplWithProbs):
@@ -603,6 +656,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             return self._sample_with_probs(
                 logits,
@@ -612,6 +666,7 @@ class _StrategyImpls:
                 min_p=None,
                 temperature=self._temperature,
                 generator=generator,
+                seeds=seeds,
             )
 
     class MinPWithProbs(TopPDecayMixin, StrategyImplWithProbs):
@@ -647,6 +702,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             self._maybe_apply_top_p_decay(group_metadata)
             return self._sample_with_probs(
@@ -657,6 +713,7 @@ class _StrategyImpls:
                 min_p=self._min_p,
                 temperature=self._temperature,
                 generator=generator,
+                seeds=seeds,
             )
 
     class StrategyImplSampleOnly(StrategyImpl):
@@ -684,6 +741,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             if group_logit_indices is not None:
                 logits = logits[group_logit_indices]
@@ -714,6 +772,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             self._maybe_apply_top_p_decay(group_metadata)
             logits = self._prepare_logits_with_temperature(
@@ -724,6 +783,8 @@ class _StrategyImpls:
                 self._top_k,
                 self._top_p,
                 generator=generator,
+                seed=seeds.seed if seeds is not None else None,
+                offset=seeds.offset if seeds is not None else None,
                 check_nan=self._flashinfer_check_nans(logits),
             ), None
 
@@ -750,6 +811,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
@@ -758,6 +820,8 @@ class _StrategyImpls:
                 probs,
                 self._top_k,
                 generator=generator,
+                seed=seeds.seed if seeds is not None else None,
+                offset=seeds.offset if seeds is not None else None,
                 check_nan=self._flashinfer_check_nans(probs),
             ), None
 
@@ -784,6 +848,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             self._maybe_apply_top_p_decay(group_metadata)
             probs = self._prepare_probs_with_temperature(
@@ -793,6 +858,8 @@ class _StrategyImpls:
                 probs,
                 self._top_p,
                 generator=generator,
+                seed=seeds.seed if seeds is not None else None,
+                offset=seeds.offset if seeds is not None else None,
                 check_nan=self._flashinfer_check_nans(probs),
             ), None
 
@@ -815,6 +882,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             new_tokens, _ = self._sample_with_probs(
                 logits,
@@ -824,6 +892,7 @@ class _StrategyImpls:
                 min_p=None,
                 temperature=self._temperature,
                 generator=generator,
+                seeds=seeds,
             )
             return new_tokens, None
 
@@ -860,6 +929,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             self._maybe_apply_top_p_decay(group_metadata)
             # With min_p applied first, nothing has to run after top_k/top_p, so
@@ -878,6 +948,8 @@ class _StrategyImpls:
                 sanitize_top_k(self._top_k, probs.shape[-1]),
                 self._top_p,
                 generator=generator,
+                seed=seeds.seed if seeds is not None else None,
+                offset=seeds.offset if seeds is not None else None,
                 check_nan=self._flashinfer_check_nans(probs),
             ), None
 
@@ -909,6 +981,7 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor] = None,
             generator: Optional[torch.Generator] = None,
             group_metadata: Optional[StrategyMetadata] = None,
+            seeds: Optional["RequestSeeds"] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata)
             temperature = self._temperature.repeat_interleave(self._beam_width_in)
@@ -984,6 +1057,7 @@ class FlashInferGroupedStrategySampler:
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
+        seeds: Optional[RequestSeeds] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Sample grouped strategies.
 
@@ -1042,6 +1116,7 @@ class FlashInferGroupedStrategySampler:
             group_logit_indices=group_logit_indices,
             generator=generator,
             group_metadata=group_metadata,
+            seeds=seeds,
         )
         return next_tokens, softmax, strategy_impl.get_temperature()
 
