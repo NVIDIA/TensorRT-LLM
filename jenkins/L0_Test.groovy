@@ -675,6 +675,13 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, du
     }
 }
 
+// SLURM job IDs are digit-only. Not String.isNumber(): that is a
+// BigDecimal-style parse, so values like "1.5" pass and later feed
+// invalid IDs into scancel/sacct/scontrol.
+def isValidSlurmJobId(def slurmJobID) {
+    return slurmJobID && slurmJobID.toString() ==~ /\d+/
+}
+
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
@@ -692,7 +699,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             returnStdout: true
         ).trim()
 
-        if (!slurmJobID || !slurmJobID.isNumber()) {
+        if (!isValidSlurmJobId(slurmJobID)) {
             echo "Slurm job may not submit successfully. No job ID found."
         } else {
             Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
@@ -736,15 +743,23 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
 
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
-        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+        // A missing/non-numeric ID means the job was never submitted (or its ID
+        // never captured); running the dump anyway executes `scancel null` /
+        // `scontrol show job null`, whose "Invalid job id specified" output then
+        // shows up in failure analysis as a bogus error signature.
+        if (!isValidSlurmJobId(slurmJobID)) {
+            Utils.exec(pipeline, script: "echo No SLURM job ID captured for node ${nodeName}; skipping job cleanup dump")
+        } else {
+            Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
-        Utils.exec(
-            pipeline,
-            script: Utils.sshUserCmd(
-                remote,
-                "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
+            Utils.exec(
+                pipeline,
+                script: Utils.sshUserCmd(
+                    remote,
+                    "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
+                )
             )
-        )
+        }
 
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
@@ -884,7 +899,7 @@ def sweepOrphanedSlurmResources(pipeline) {
 // Best-effort: any SSH/sacct error returns null so callers fall back to the
 // duration heuristic rather than failing the stage.
 def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID) {
-    if (!slurmJobID || !slurmJobID.toString().isNumber()) {
+    if (!isValidSlurmJobId(slurmJobID)) {
         return null
     }
     String state = null
@@ -996,8 +1011,17 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // node once the pod is gone). Deregistered when cleanup actually runs.
                 registerSlurmResource(stageName, [clusterName: partition.clusterName, nodeName: nodeName, slurmJobId: slurmJobID, usedSbatch: false])
 
-                if (!slurmJobID || !slurmJobID.isNumber()) {
+                if (!isValidSlurmJobId(slurmJobID)) {
                     echo "Slurm job did not submit successfully. No job ID found.\nSubmission output:\n${slurmSubmitOutput}"
+                    // The job never entered the SLURM queue, so nothing ran on any
+                    // node: retryable infra by construction. Failing fast here also
+                    // keeps the node-wait loop below (up to 15h) from polling a
+                    // bogus job ID.
+                    throw new InfraFailure(
+                        "SLURM agent submission for ${stageName} produced no usable job ID " +
+                        "(none or a non-numeric value in the submission output); " +
+                        "the job never entered the queue.",
+                        null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-submit-no-jobid>")
                 }
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
                 Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
@@ -1968,13 +1992,26 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def slurmMetadata = captureSlurmWorkspaceMetadata(pipeline, remote, jobWorkspace, placementContext, stageName)
                 def slurmJobId = slurmMetadata.slurmJobId
                 if (!slurmJobId) {
+                    // `|| true` so a missing file (submission never wrote it) yields
+                    // an empty string and reaches the typed throw below, instead of a
+                    // generic "script returned exit code 1" the classifier can't act on.
                     slurmJobId = Utils.exec(
                         pipeline,
-                        script: Utils.sshUserCmd(remote, "\"cat ${jobWorkspace}/slurm_job_id.txt\""),
+                        script: Utils.sshUserCmd(remote, "\"cat ${jobWorkspace}/slurm_job_id.txt 2>/dev/null || true\""),
                         returnStdout: true,
                         numRetries: 3
                     ).trim()
                     recordSlurmPlacementContext(placementContext, slurmJobId, null, stageName)
+                }
+                if (!isValidSlurmJobId(slurmJobId)) {
+                    // The job never entered the SLURM queue (sbatch failed or the ID
+                    // was never captured), so nothing ran on any node: retryable
+                    // infra by construction, and node-avoidance has nothing to avoid.
+                    throw new InfraFailure(
+                        "SLURM job submission for ${stageName} produced no usable job ID " +
+                        "(slurm_job_id.txt missing, empty, or non-numeric in ${jobWorkspace}); " +
+                        "the job never entered the queue.",
+                        null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-submit-no-jobid>")
                 }
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
                 // Record the live SLURM job so a dispatcher-pod death can be reconciled
@@ -2637,7 +2674,7 @@ def recordSlurmPlacementContext(Map placementContext, String slurmJobID, def nod
         return
     }
 
-    if (slurmJobID) {
+    if (isValidSlurmJobId(slurmJobID)) {
         placementContext.slurmJobId = slurmJobID
     }
 
@@ -2657,6 +2694,12 @@ def captureSlurmWorkspaceMetadata(def pipeline, Map remote, String jobWorkspace,
     }
 
     metadata.slurmJobId = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_id.txt", stageName)
+    if (metadata.slurmJobId && !isValidSlurmJobId(metadata.slurmJobId)) {
+        // A garbage value (e.g. an error message that landed in the file) must
+        // not be recorded or later fed into sacct/scontrol diagnostics.
+        echo "[INFRA-RETRY] ${stageName}: ignoring non-numeric SLURM job ID '${metadata.slurmJobId}' from ${jobWorkspace}/slurm_job_id.txt"
+        metadata.slurmJobId = null
+    }
     metadata.nodeList = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_node_list.txt", stageName)
     if (placementContext != null && metadata.slurmJobId) {
         placementContext.slurmJobId = metadata.slurmJobId
@@ -2689,7 +2732,10 @@ def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterNa
             if (!nodeList && jobWorkspace) {
                 nodeList = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_node_list.txt", stageName, 3)
             }
-            if (!capturedJobID) {
+            // Digit-only revalidation: capturedJobID may come from the caller or
+            // a raw workspace-file read, and an invalid value here would produce
+            // the same "Invalid job id specified" noise in sacct/scontrol.
+            if (!isValidSlurmJobId(capturedJobID)) {
                 return
             }
 
