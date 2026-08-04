@@ -1,29 +1,16 @@
-"""Scoped pinned staging for weight-load host-to-device copies.
+"""Opt-in pinned staging for weight-load host-to-device copies.
 
-On some platform/driver configurations (observed on GB300 NVL72 with driver
-590.48.01 under specific per-node profiling configurations), pageable
-host-to-device copies issued during checkpoint materialization can degrade
-into a pathological per-work-item polling crawl inside the CUDA driver,
-stretching sub-second copies to tens of minutes. The visible symptom is a
-weight-load "hang": typically one rank per node stops making progress in the
-``Loading weights`` phase with zero errors, and eventually completes after
-36 min to 4+ hours. Staging the copies through a pinned buffer routes them
-onto the pinned-DMA path, which is unaffected.
+Some driver/platform combinations degrade pageable H2D copies during
+checkpoint loading into extreme slowdowns (observed on GB300 with driver
+590.48.01: one rank per node stalls in ``Loading weights`` for 36 min to
+4+ hours, no errors). Staging through pinned memory avoids the affected
+driver path.
 
-Usage (gated by ``TRTLLM_PINNED_WEIGHT_STAGING=1``, default off):
-
-    from tensorrt_llm._torch import pinned_weight_staging
-    with pinned_weight_staging.staging_scope():
-        ...load weights...
-
-Inside the scope, every pageable CPU->CUDA ``Tensor.to`` / ``Tensor.copy_``
-is rerouted through a per-dtype pinned staging buffer. The staged copy is
-forced synchronous and lock-protected because the buffer is reused. On scope
-exit the original tensor methods are restored and all staging buffers are
-freed (best-effort ``host_empty_cache`` so the pinned pages actually return
-to the OS), so pinned-host consumers that come up later -- e.g. the KV-cache
-host offload pool sized by ``host_cache_size`` -- see zero residual
-footprint, and steady-state serving copies are untouched.
+With ``TRTLLM_PINNED_WEIGHT_STAGING=1``, ``staging_scope()`` reroutes
+pageable CPU->CUDA ``Tensor.to``/``Tensor.copy_`` through a reusable
+per-dtype pinned buffer for the duration of the scope. On exit the original
+methods are restored and the buffers are freed, leaving no pinned-memory
+footprint behind. Default off: without the env var the scope is a no-op.
 """
 import os
 import threading
@@ -107,12 +94,7 @@ def _staged_copy(self, src, non_blocking=False):
 
 
 class staging_scope:
-    """Reroute pageable CPU->CUDA copies through pinned staging for the
-    dynamic extent of a weight load; restore and free everything on exit.
-
-    Re-entrant: nested scopes share one installation, freed at depth 0.
-    A no-op unless ``TRTLLM_PINNED_WEIGHT_STAGING=1``.
-    """
+    """Re-entrant: nested scopes share one installation, freed at depth 0."""
 
     def __enter__(self):
         global _depth, _orig_to, _orig_copy
@@ -145,8 +127,8 @@ class staging_scope:
                 freed = sum(b.numel() * b.element_size()
                             for b in _bufs.values())
                 _bufs.clear()
-                # Best-effort: push the freed pinned blocks out of torch's
-                # caching host allocator so the pages return to the OS.
+                # Return freed pinned pages to the OS, not just to torch's
+                # caching host allocator.
                 hec = (getattr(torch.cuda, "host_empty_cache", None)
                        or getattr(torch._C, "_host_emptyCache", None))
                 if hec is not None:
