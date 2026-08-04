@@ -4,7 +4,7 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.nn import functional as F
@@ -362,7 +362,19 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
 DEEP_GEMM_BLOCK_M_QUANTUM = 16
 
 
-def deep_gemm_gen_tuning_buckets(x: int):
+def deep_gemm_gen_tuning_buckets(x: int) -> Tuple[int, ...]:
+    """Generate the M values to autotune, so DeepGEMM JIT-compiles every config.
+
+    Args:
+        x: Upper bound on M. Note this is the *current input size* rather than a
+            maximum for callers that leave ``tune_max_num_tokens`` unset; see the
+            lower-clamp comment below.
+
+    Returns:
+        Ascending M values to profile. Stride is
+        ``DEEP_GEMM_BLOCK_M_QUANTUM`` above 128, which touches every distinct
+        DeepGEMM config for any (N, K), and the top of the range is included.
+    """
     buckets = tuple(range(8, 128, 8))
     # Clamp x to be between 4096 and 8192.
     #
