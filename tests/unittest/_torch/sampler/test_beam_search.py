@@ -659,16 +659,19 @@ def test_beam_search_vbws_e2e(monkeypatch: pytest.MonkeyPatch, ) -> None:
     beam_width_array = [2, 3, 4]
     input_prompts = [[1, 2, 3]]
     vocab_size = DummyConfig().vocab_size
-    # Two steps past the end of beam_width_array, so the width has to hold at
-    # its last entry (the clamp in get_beam_width_by_iter is exercised) while
-    # staying within what this path reliably completes.
+    # Decode well past the end of beam_width_array, so the width has to hold at
+    # its last entry for most of the run: that clamp is the interesting part,
+    # since getting it wrong reads past the array.
     #
-    # NB: capped deliberately. With max_tokens >= 6 this test intermittently
-    # fails to terminate, including with a constant beam_width_array (e.g.
-    # [4, 4, 4]), which suggests the cause is not width variation and may not
-    # be specific to VBWS at all. Not yet diagnosed; tracked separately rather
-    # than blocking the coverage this test does provide.
-    max_tokens = 5
+    # NB: running beyond the array used to hang here. Both getBeamWidthByIter
+    # implementations clamp the iteration index, but the C++ one used the
+    # global kMaxBeamWidthArrayLength instead of the array's own length and
+    # returned an out-of-bounds width once decoding outran the array. The C++
+    # micro-batch scheduler reads that width, so the request was never admitted
+    # into the generation batch again and decoding stalled forever. Exercising
+    # the clamp therefore requires the C++ fix in llmRequest.cpp -- against an
+    # older libtensorrt_llm.so this test hangs rather than fails.
+    max_tokens = 12
 
     checkpoint_loader = HfCheckpointLoader(
         weight_loader=DummyWeightLoader(),
