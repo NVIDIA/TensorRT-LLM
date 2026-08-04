@@ -241,15 +241,19 @@ def mamba_manager_override_forces_v1(llm_args: 'TorchLlmArgs') -> bool:
     collide with the route the override already selected.
 
     Both overrides are agg-mode-only, so this returns False once a disagg
-    transceiver backend is configured. ``llm_args`` is read via ``getattr``
-    because :meth:`get_model_defaults` is also called with ``None`` and with a
-    plain dict in-tree.
+    transceiver backend is configured. ``llm_args`` may be ``None``, a
+    ``TorchLlmArgs``, or its nested-dict serialization.
     """
     if not (use_py_mamba_cache_manager()
             or mamba_manager_preference() in ('CPP', 'MIXED')):
         return False
-    transceiver_config = getattr(llm_args, 'cache_transceiver_config', None)
-    return getattr(transceiver_config, 'backend', None) is None
+    transceiver_config = (llm_args.get('cache_transceiver_config')
+                          if isinstance(llm_args, dict) else getattr(
+                              llm_args, 'cache_transceiver_config', None))
+    backend = (transceiver_config.get('backend')
+               if isinstance(transceiver_config, dict) else getattr(
+                   transceiver_config, 'backend', None))
+    return backend is None
 
 
 class ReplayStateUpdateMetadata(NamedTuple):

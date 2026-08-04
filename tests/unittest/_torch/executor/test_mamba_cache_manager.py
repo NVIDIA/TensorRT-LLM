@@ -632,6 +632,19 @@ def test_v1_override_is_ignored_for_disagg(monkeypatch):
     assert _proposed_use_v2(disagg_args) == {True}
 
 
+def test_v1_override_detects_disagg_in_model_dump(monkeypatch):
+    """A serialized transceiver config must still identify disagg serving."""
+    monkeypatch.setenv("TRTLLM_USE_PY_MAMBA", "1")
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    disagg_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+    ).model_dump()
+
+    assert isinstance(disagg_args["cache_transceiver_config"], dict)
+    assert _proposed_use_v2(disagg_args) == {True}
+
+
 def test_unrecognized_preference_is_not_a_v1_override(monkeypatch):
     """Only 'CPP' and 'MIXED' select a V1 manager; anything else is ignored."""
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
