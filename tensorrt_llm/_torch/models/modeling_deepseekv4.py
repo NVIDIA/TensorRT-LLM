@@ -564,6 +564,7 @@ class DeepseekV4WeightLoader:
         # pageable H2D copies stall during weight loading; staging buffers
         # are freed on scope exit. See pinned_weight_staging.py.
         from tensorrt_llm._torch import pinned_weight_staging
+
         with pinned_weight_staging.staging_scope():
             return self._load_weights_impl(weights, skip_modules=skip_modules)
 
