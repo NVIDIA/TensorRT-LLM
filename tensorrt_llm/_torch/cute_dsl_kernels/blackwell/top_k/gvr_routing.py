@@ -99,10 +99,13 @@ RUNGS_ONLY_MAX_N = 49152
 # its split grid still fits one wave. The assist tiers cannot follow -
 # splitting a row costs them more than the scan it saves, with or without
 # the block-skip prefix - so the stock kernel wins outright and the
-# epilogue should emit nothing.
+# epilogue should emit nothing. Narrowed after phase 4 got its coarse
+# search and its boundary-class repair back: the tiers gained about
+# 1.5us there, which is enough to take the upper half of the band back
+# off the stock kernel (2 cells fall through now, down from 4).
 ASSIST_WEAK_MIN_N = 49152
-ASSIST_WEAK_MAX_N_SMALL_K = 196608  # k <= ASSIST_WEAK_K
-ASSIST_WEAK_MAX_N_LARGE_K = 196608
+ASSIST_WEAK_MAX_N_SMALL_K = 98304  # k <= ASSIST_WEAK_K
+ASSIST_WEAK_MAX_N_LARGE_K = 98304
 ASSIST_WEAK_K = 512
 ASSIST_WEAK_MAX_B = 8
 
