@@ -45,7 +45,7 @@ try:
     import flashinfer.gdn_kernels  # noqa: F401
 
     _KERNEL_DEPS_AVAILABLE = True
-except Exception:
+except ImportError:
     _KERNEL_DEPS_AVAILABLE = False
 
 needs_kernel_deps = pytest.mark.skipif(
@@ -62,7 +62,7 @@ def _k4_path() -> Path:
         )
         if spec is not None and spec.origin:
             return Path(spec.origin)
-    except Exception:
+    except ModuleNotFoundError:
         pass
     return (
         Path(__file__).resolve().parents[4]
