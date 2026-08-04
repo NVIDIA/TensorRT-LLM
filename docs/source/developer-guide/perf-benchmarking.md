@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 (perf-benchmarking)=
 
 # TensorRT LLM Benchmarking
@@ -282,6 +287,8 @@ trtllm-bench --model <model-or-tokenizer> prepare-dataset \
   --output-stdev 0
 
 cat > /workspace/bench/trtllm_bench_extra.yaml <<'EOF'
+# Optional: keep only when the runtime-inferred per-node value differs from
+# the actual GPUs exposed to each Pod.
 gpus_per_node: 4
 cuda_graph_config: null
 EOF
@@ -304,13 +311,15 @@ The important invariants are:
 
 - `mpirun -np` (or the equivalent rank count from the launcher) equals the
   total number of GPUs allocated to the benchmark.
-- `--tp * --pp` equals the number of ranks that participate in the LLM world.
-  For the two-node, four-GPU-per-node case, `--tp 8` is the simplest layout;
-  larger jobs can use `--tp 16`, `--tp 32`, or a TP/PP split such as
-  `--tp 8 --pp 2` if that better matches the model and network topology.
-- If each Pod exposes fewer GPUs than the total world size, pass
-  `gpus_per_node` through `--config` as shown above. `trtllm-bench` does not
-  expose `gpus_per_node` as a top-level throughput CLI flag.
+- `--tp * --pp * cp_size` equals the number of ranks that participate in the
+  LLM world; with the default `cp_size=1`, this reduces to `--tp * --pp`. For
+  the two-node, four-GPU-per-node case, `--tp 8` is the simplest layout. If a
+  TP/PP split such as `--tp 8 --pp 2` better matches the model and network
+  topology, launch 16 ranks when `cp_size=1`.
+- Treat `gpus_per_node` as a per-node override. Pass it through `--config` only
+  when the runtime-inferred value from local MPI ranks and visible GPUs differs
+  from the actual GPUs exposed to each Pod. `trtllm-bench` does not expose
+  `gpus_per_node` as a top-level throughput CLI flag.
 - Prefer local or pre-mounted model checkpoints for multi-node Kubernetes runs.
   Do not rely on every rank downloading the checkpoint independently.
 - Keep the dataset and YAML config on a shared volume or copy them to identical
