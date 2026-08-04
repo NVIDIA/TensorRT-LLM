@@ -477,9 +477,16 @@ try:
 # Workaround for a CuTe DSL parser bug: the nvidia-cutlass-dsl 4.5.0 AST
 # preprocessor cannot parse tuple except handlers anywhere in a kernel
 # module ("'Tuple' object has no attribute 'id'"), which breaks every
-# cute.compile of this file. Keep a single bare Exception until the DSL
-# pin moves past the bug.
+# cute.compile of this file. Keep a single Exception clause until the DSL
+# pin moves past the bug; the isinstance re-raise below narrows it to the
+# expected failure kinds without putting a tuple in the except clause.
 except Exception as e:
+    if not isinstance(e, (AttributeError, ImportError)):
+        # Not a known-benign "DSL not present / API surface moved" case:
+        # swallowing it would defer the blow-up to the first K4 compile
+        # (ptxas over WG0's 40-register budget without --uumn) with no
+        # trail back to this patch. Fail here, where the cause is visible.
+        raise
     _logger.warning(f"k4_persistent ptx-options patch failed: {e}")
     _patch_applied = False
 
