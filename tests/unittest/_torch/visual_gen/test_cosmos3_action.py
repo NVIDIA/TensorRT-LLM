@@ -9,7 +9,6 @@ Run:
 
 import json
 
-import numpy as np
 import PIL.Image
 import pytest
 import torch
@@ -21,11 +20,10 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     EMBODIMENT_TO_RAW_ACTION_DIM,
     VIDEO_RES_SIZE_INFO,
     action_aspect_ratio_label,
-    action_reference_image,
+    action_reference_size,
     build_action_json_prompt,
     find_closest_target_size,
     normalize_action_resolution,
-    normalize_action_video_input,
     prepare_action_latents,
     resolve_action_size,
     resolve_raw_action_dim,
@@ -76,25 +74,19 @@ class TestFindClosestTargetSize:
 
 
 class TestResolveActionSize:
-    @staticmethod
-    def _ref_image(width: int, height: int) -> PIL.Image.Image:
-        return PIL.Image.new("RGB", (width, height))
+    SOURCE_H, SOURCE_W = 480, 832
 
     def test_explicit_height_and_width_are_unchanged(self):
-        ref = self._ref_image(832, 480)
-        assert resolve_action_size(400, 600, ref, 480) == (400, 600)
+        assert resolve_action_size(400, 600, self.SOURCE_H, self.SOURCE_W, 480) == (400, 600)
 
     def test_unset_height_and_width_use_action_resolution_bucket(self):
-        ref = self._ref_image(832, 480)
-        assert resolve_action_size(None, None, ref, 480) == (480, 832)
+        assert resolve_action_size(None, None, self.SOURCE_H, self.SOURCE_W, 480) == (480, 832)
 
     def test_partial_height_fills_width_from_bucket(self):
-        ref = self._ref_image(832, 480)
-        assert resolve_action_size(400, None, ref, 480) == (400, 832)
+        assert resolve_action_size(400, None, self.SOURCE_H, self.SOURCE_W, 480) == (400, 832)
 
     def test_partial_width_fills_height_from_bucket(self):
-        ref = self._ref_image(832, 480)
-        assert resolve_action_size(None, 600, ref, 480) == (480, 600)
+        assert resolve_action_size(None, 600, self.SOURCE_H, self.SOURCE_W, 480) == (480, 600)
 
 
 class TestActionResolutionExtraParam:
@@ -222,124 +214,51 @@ class TestDomainActionPresets:
             normalize_action_resolution(1080)
 
 
-class TestActionReferenceImage:
-    def test_forward_dynamics_accepts_mp4_on_image_path(self, tmp_path, monkeypatch):
-        video_path = tmp_path / "clip.mp4"
-        video_path.write_bytes(b"fake")
-        expected = PIL.Image.new("RGB", (4, 2), "red")
+class TestActionReferenceSize:
+    """Canvas selection needs the source size, not a decoded frame."""
 
-        def _fake_read_video(path, pts_unit="sec"):
-            import torch
+    def test_policy_measures_image(self, tmp_path):
+        image_path = tmp_path / "frame.png"
+        PIL.Image.new("RGB", (640, 480), "blue").save(image_path)
+        assert action_reference_size(action_mode="policy", image=str(image_path), video=None) == (
+            480,
+            640,
+        )
 
-            tensor = torch.from_numpy(np.array(expected)).unsqueeze(0)
-            return tensor, None, {}
+    def test_policy_prefers_image_over_video(self, tmp_path):
+        image_path = tmp_path / "frame.png"
+        PIL.Image.new("RGB", (320, 240), "blue").save(image_path)
+        # Bytes would raise if consulted: the image must win.
+        assert action_reference_size(
+            action_mode="policy", image=str(image_path), video=b"not-a-video"
+        ) == (240, 320)
 
-        monkeypatch.setattr("torchvision.io.read_video", _fake_read_video)
-        ref = action_reference_image(
+    def test_accepts_pil_image_directly(self):
+        assert action_reference_size(
             action_mode="forward_dynamics",
-            image=str(video_path),
+            image=PIL.Image.new("RGB", (256, 128)),
             video=None,
-        )
-        assert ref.size == expected.size
-        assert ref.getpixel((0, 0)) == (255, 0, 0)
+        ) == (128, 256)
 
-    def test_policy_prefers_image_path_over_video(self, tmp_path):
+    def test_missing_source_raises(self):
+        with pytest.raises(ValueError, match="requires an image or video"):
+            action_reference_size(action_mode="policy", image=None, video=None)
+
+    def test_inverse_dynamics_ignores_image(self, tmp_path):
         image_path = tmp_path / "frame.png"
-        PIL.Image.new("RGB", (3, 3), "blue").save(image_path)
-        ref = action_reference_image(
-            action_mode="policy",
-            image=str(image_path),
-            video=str(tmp_path / "unused.mp4"),
-        )
-        assert ref.getpixel((0, 0)) == (0, 0, 255)
+        PIL.Image.new("RGB", (640, 480), "blue").save(image_path)
+        # inverse_dynamics conditions on the clip, so an image is not a source.
+        with pytest.raises(ValueError, match="requires an image or video"):
+            action_reference_size(action_mode="inverse_dynamics", image=str(image_path), video=None)
 
-    def test_policy_accepts_path_image(self, tmp_path):
-        image_path = tmp_path / "frame.png"
-        PIL.Image.new("RGB", (3, 3), "green").save(image_path)
-        ref = action_reference_image(
-            action_mode="policy",
-            image=image_path,
-            video=None,
-        )
-        assert ref.getpixel((0, 0)) == (0, 128, 0)
+    def test_video_bytes_probe_the_container_header(self, monkeypatch):
+        """Bytes are measured from the header, never by decoding a frame."""
+        import tensorrt_llm.media.decoding as decoding
 
-
-class TestNormalizeActionVideoInput:
-    def test_none_returns_empty_list(self):
-        assert normalize_action_video_input(None) == []
-
-    def test_empty_list_raises(self):
-        with pytest.raises(ValueError, match="at least one frame"):
-            normalize_action_video_input([])
-
-    def test_image_path_returns_singleton_list(self, tmp_path):
-        image_path = tmp_path / "frame.png"
-        PIL.Image.new("RGB", (8, 4), "red").save(image_path)
-        assert normalize_action_video_input(str(image_path)) == [str(image_path)]
-
-    def test_frame_directory_returns_sorted_paths(self, tmp_path):
-        (tmp_path / "b.png").write_bytes(b"")
-        (tmp_path / "a.png").write_bytes(b"")
-        (tmp_path / "skip.txt").write_text("x")
-        assert normalize_action_video_input(str(tmp_path)) == [
-            str(tmp_path / "a.png"),
-            str(tmp_path / "b.png"),
-        ]
-
-    def test_unsupported_file_extension_raises(self, tmp_path):
-        bad_path = tmp_path / "clip.mov"
-        bad_path.write_bytes(b"fake")
-        with pytest.raises(ValueError, match="must be a frame directory"):
-            normalize_action_video_input(str(bad_path))
-
-    def test_decode_mp4_returns_pil_frames(self, tmp_path, monkeypatch):
-        video_path = tmp_path / "clip.mp4"
-        video_path.write_bytes(b"fake")
-        expected = [
-            PIL.Image.new("RGB", (2, 2), "red"),
-            PIL.Image.new("RGB", (2, 2), "blue"),
-        ]
-
-        def _fake_read_video(path, pts_unit="sec"):
-            assert path == str(video_path)
-            assert pts_unit == "sec"
-            import torch
-
-            tensor = torch.stack(
-                [torch.from_numpy(np.array(image)) for image in expected],
-                dim=0,
-            )
-            return tensor, None, {}
-
-        monkeypatch.setattr(
-            "torchvision.io.read_video",
-            _fake_read_video,
-        )
-        frames = normalize_action_video_input(str(video_path))
-        assert len(frames) == 2
-        assert all(isinstance(frame, PIL.Image.Image) for frame in frames)
-        assert frames[0].getpixel((0, 0)) == (255, 0, 0)
-
-    def test_decode_respects_max_frames(self, tmp_path, monkeypatch):
-        video_path = tmp_path / "clip.avi"
-        video_path.write_bytes(b"fake")
-        images = [PIL.Image.new("RGB", (1, 1), color) for color in ("red", "green", "blue")]
-
-        def _fake_read_video(path, pts_unit="sec"):
-            import torch
-
-            tensor = torch.stack(
-                [torch.from_numpy(np.array(image)) for image in images],
-                dim=0,
-            )
-            return tensor, None, {}
-
-        monkeypatch.setattr("torchvision.io.read_video", _fake_read_video)
-        frames = normalize_action_video_input(
-            str(video_path),
-            max_frames=2,
-        )
-        assert len(frames) == 2
+        monkeypatch.setattr(decoding, "probe_video_dimensions", lambda data: (480, 640))
+        assert action_reference_size(
+            action_mode="inverse_dynamics", image=None, video=b"\x00mp4"
+        ) == (480, 640)
 
 
 class TestActionJsonPrompt:

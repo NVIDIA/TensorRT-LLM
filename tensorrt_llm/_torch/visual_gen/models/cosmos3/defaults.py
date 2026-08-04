@@ -20,10 +20,11 @@ Action generation
 -----------------
 ``COSMOS3_DOMAIN_PRESETS`` lists training-aligned sampling defaults per
 embodiment. When ``domain_name`` (or a uniquely mapped ``domain_id``) is set,
-the pipeline fills omitted ``action_chunk_size``, ``num_frames``,
-``action_resolution``, and ``frame_rate`` from the preset and logs a warning if
-explicit values differ. See Cosmos3 omni ``action_*.json`` inputs for reference
-configs (bridge, av, droid, libero, etc.).
+the pipeline fills omitted ``action_chunk_size``, ``action_resolution``, and
+``frame_rate`` from the preset and logs a warning if explicit values differ.
+``num_frames`` is always ``action_chunk_size + 1``, never a preset field. See
+Cosmos3 omni ``action_*.json`` inputs for reference configs (bridge, av, droid,
+libero, etc.).
 
 ``raw_action_dim`` is deliberately *not* a preset field: it is fixed by the
 embodiment, while several embodiments share one preset via
@@ -159,7 +160,6 @@ class Cosmos3DomainPreset(TypedDict, total=False):
     """
 
     action_chunk_size: int
-    num_frames: int
     action_resolution: int
     frame_rate: float
 
@@ -169,70 +169,60 @@ COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     # WidowX bridge.
     "bridge_orig_lerobot": {
         "action_chunk_size": 16,
-        "num_frames": 17,
         "action_resolution": 480,
         "frame_rate": 5.0,
     },
     # Autonomous-vehicle steering/throttle; longer action horizon.
     "av": {
         "action_chunk_size": 60,
-        "num_frames": 61,
         "action_resolution": 480,
         "frame_rate": 10.0,
     },
     # 6-DoF camera pose + shutter; matches AV-style horizon.
     "camera_pose": {
         "action_chunk_size": 60,
-        "num_frames": 61,
         "action_resolution": 480,
         "frame_rate": 30.0,
     },
     # Franka single-arm tabletop; same domain_id as robomind-franka.
     "droid_lerobot": {
         "action_chunk_size": 16,
-        "num_frames": 17,
         "action_resolution": 480,
         "frame_rate": 15.0,
     },
     # LIBERO sim single-arm; lower action resolution bucket.
     "libero": {
         "action_chunk_size": 16,
-        "num_frames": 17,
         "action_resolution": 256,
         "frame_rate": 10.0,
     },
     # MANO hand pose.
     "hand_pose": {
         "action_chunk_size": 16,
-        "num_frames": 17,
         "action_resolution": 480,
         "frame_rate": 24.0,
     },
     # AgiBot humanoid; shared domain_id with agibot_gear_gripper*.
     "agibotworld": {
         "action_chunk_size": 16,
-        "num_frames": 17,
         "action_resolution": 480,
         "frame_rate": 10.0,
     },
     # Google Robot (RT-1 / fractal) single-arm.
     "fractal": {
         "action_chunk_size": 16,
-        "num_frames": 17,
         "action_resolution": 480,
         "frame_rate": 5.0,
     },
     # 2-D planar push task.
     "pusht": {
         "action_chunk_size": 16,
-        "num_frames": 17,
         "action_resolution": 256,
         "frame_rate": 10.0,
     },
     # UMI handheld gripper setup.
     "umi": {
         "action_chunk_size": 16,
-        "num_frames": 17,
         "action_resolution": 480,
         "frame_rate": 10.0,
     },
@@ -301,7 +291,6 @@ def resolve_domain_action_config(
     action_resolution: int | None = None,
     frame_rate: float | None = None,
     action_fps: float | None = None,
-    num_frames: int | None = None,
 ) -> dict[str, Any]:
     """Merge user action params with domain presets and generic fallbacks."""
     preset_key = canonical_domain_preset_key(domain_name, domain_id)
@@ -371,9 +360,11 @@ def resolve_domain_action_config(
         frame_rate,
         fallback=COSMOS3_ACTION_PARAMS["frame_rate"],
     )
-    resolved_num_frames = _resolve_field("num_frames", num_frames)
-    if resolved_num_frames is None:
-        resolved_num_frames = int(resolved_chunk) + 1
+    # Always derived: an action clip is the chunk plus its initial frame. Both
+    # references fix this, and diffusers rejects a caller-supplied num_frames
+    # for action runs outright, so a preset must not pin it independently of
+    # an overridden action_chunk_size.
+    resolved_num_frames = int(resolved_chunk) + 1
     resolved_action_fps = (
         float(action_fps) if action_fps is not None else float(resolved_frame_rate)
     )

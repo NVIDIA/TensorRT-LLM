@@ -152,6 +152,40 @@ def resize_fit_pad_uint8(frames: torch.Tensor, target_h: int, target_w: int) -> 
 _RESIZE_MODES = {"cover": resize_center_crop_uint8, "fit": resize_fit_pad_uint8}
 
 
+def probe_video_dimensions(data: bytes) -> tuple[int, int]:
+    """Return the reference's ``(height, width)`` without decoding a frame.
+
+    The container header carries the source resolution, so a caller that must
+    choose its target size from the source aspect ratio - Cosmos3 action picks
+    the canvas whose shape is closest to the reference - can do so before
+    committing to a decode.
+    """
+    try:
+        import PyNvVideoCodec as nvc
+    except ImportError as exc:
+        raise ImportError(
+            "PyNvVideoCodec is required for video-reference decoding; "
+            "install the declared dependency (pip install PyNvVideoCodec)."
+        ) from exc
+
+    position = 0
+
+    def _read(buf: bytearray) -> int:
+        nonlocal position
+        chunk = data[position : position + len(buf)]
+        buf[: len(chunk)] = chunk
+        position += len(chunk)
+        return len(chunk)
+
+    try:
+        demuxer = nvc.CreateDemuxer(_read)
+        return int(demuxer.Height()), int(demuxer.Width())
+    except nvc.PyNvVCException as exc:
+        raise ValueError(
+            f"Video reference could not be demuxed (corrupt or not a supported container): {exc}"
+        ) from exc
+
+
 def decode_video_reference_window(
     data: bytes,
     *,

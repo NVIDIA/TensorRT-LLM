@@ -242,6 +242,8 @@ def _assert_valid_action(action: torch.Tensor, *, raw_action_dim: int, chunk_siz
     af = action.float()
     assert not torch.isnan(af).any()
     assert not torch.isinf(af).any()
+
+
 def _scheduler_use_karras_sigmas(scheduler) -> bool | None:
     value = getattr(scheduler.config, "use_karras_sigmas", None)
     return None if value is None else bool(value)
@@ -877,8 +879,9 @@ class TestCosmos3Audio:
 class TestCosmos3Action:
     ACTION_HEIGHT = 480
     ACTION_WIDTH = 832
-    ACTION_FRAMES = COSMOS3_ACTION_PARAMS["num_frames"]
     ACTION_CHUNK = COSMOS3_ACTION_PARAMS["action_chunk_size"]
+    # Derived, not configured: both references fix the clip at chunk + 1.
+    ACTION_FRAMES = ACTION_CHUNK + 1
     RAW_ACTION_DIM = 10
 
     def test_policy_smoke(self, cosmos3_pipeline):
@@ -942,8 +945,6 @@ class TestCosmos3Action:
 
     def test_inverse_dynamics_smoke(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)
-        image = _make_test_image().resize((self.ACTION_WIDTH, self.ACTION_HEIGHT))
-        video = [image.copy() for _ in range(NUM_FRAMES)]
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
@@ -954,8 +955,9 @@ class TestCosmos3Action:
             action_mode="inverse_dynamics",
             domain_name="bridge_orig_lerobot",
             raw_action_dim=self.RAW_ACTION_DIM,
-            action_chunk_size=NUM_FRAMES,
-            video=video,
+            # The clip is chunk + 1 frames, and the fixture holds NUM_FRAMES.
+            action_chunk_size=NUM_FRAMES - 1,
+            video=_V2V_FIXTURE_MP4.read_bytes(),
         )
         _assert_valid_video(
             result.video,
@@ -966,15 +968,13 @@ class TestCosmos3Action:
         _assert_valid_action(
             result.action,
             raw_action_dim=self.RAW_ACTION_DIM,
-            chunk_size=NUM_FRAMES,
+            chunk_size=NUM_FRAMES - 1,
         )
         assert result.action_mode == "inverse_dynamics"
         assert result.domain_id == 7
 
     def test_inverse_dynamics_rejects_short_video(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)
-        image = _make_test_image().resize((self.ACTION_WIDTH, self.ACTION_HEIGHT))
-        video = [image.copy() for _ in range(NUM_FRAMES - 1)]
         with pytest.raises(ValueError, match="requires at least"):
             _run_forward(
                 cosmos3_pipeline,
@@ -987,7 +987,7 @@ class TestCosmos3Action:
                 domain_name="bridge_orig_lerobot",
                 raw_action_dim=self.RAW_ACTION_DIM,
                 action_chunk_size=NUM_FRAMES,
-                video=video,
+                video=_V2V_FIXTURE_MP4.read_bytes(),
             )
 
     def test_action_and_audio_rejected(self, cosmos3_pipeline):

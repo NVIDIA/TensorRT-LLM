@@ -388,110 +388,47 @@ def pil_to_rgb(value: Any) -> PIL.Image.Image:
     )
 
 
-def decode_action_video_file(path: Path, max_frames: int | None = None) -> list[PIL.Image.Image]:
-    import torchvision.io as io
-
-    frames, _, _ = io.read_video(str(path), pts_unit="sec")
-    if frames.numel() == 0:
-        raise ValueError(f"Cosmos3 action video file contains no frames: {path}")
-    if max_frames is not None:
-        frames = frames[:max_frames]
-    return [PIL.Image.fromarray(frames[i].numpy()) for i in range(frames.shape[0])]
-
-
-def normalize_action_video_path(path: Path, max_frames: int | None = None) -> list[Any]:
-    if not path.exists():
-        raise ValueError(f"Cosmos3 action video path does not exist: {path}")
-    if path.is_dir():
-        frames = sorted(p for p in path.iterdir() if p.suffix.lower() in ACTION_IMAGE_EXTENSIONS)
-        if not frames:
-            raise ValueError(f"No image frames found in Cosmos3 action video directory: {path}")
-        frame_paths = [str(p) for p in frames]
-        if max_frames is not None:
-            frame_paths = frame_paths[:max_frames]
-        return frame_paths
-
-    suffix = path.suffix.lower()
-    if suffix in ACTION_IMAGE_EXTENSIONS:
-        return [str(path)]
-    if suffix in ACTION_VIDEO_EXTENSIONS:
-        return decode_action_video_file(path, max_frames=max_frames)
-    raise ValueError(
-        "Cosmos3 action video path must be a frame directory, an image file "
-        f"{sorted(ACTION_IMAGE_EXTENSIONS)}, or a video file "
-        f"{sorted(ACTION_VIDEO_EXTENSIONS)}; got {path}"
-    )
-
-
-def normalize_action_video_input(video: Any, max_frames: int | None = None) -> list[Any]:
-    """Normalize action video input to a frame list.
-
-    Accepts a list of PIL images / paths, a single image or video file path,
-    or a directory of frame images (sorted lexicographically).
-    """
-    if video is None:
-        return []
-    if isinstance(video, list):
-        if not video:
-            raise ValueError("Cosmos3 action video input must contain at least one frame.")
-        if max_frames is not None:
-            return video[:max_frames]
-        return video
-    if isinstance(video, (str, Path)):
-        return normalize_action_video_path(Path(video), max_frames=max_frames)
-    return [video]
-
-
 def resolve_action_size(
     height: int | None,
     width: int | None,
-    ref_image: PIL.Image.Image,
+    source_h: int,
+    source_w: int,
     action_resolution: int,
 ) -> tuple[int, int]:
-    """Fill unset action H/W from the action resolution bucket; honor explicit values."""
+    """Fill unset action H/W from the action resolution bucket; honor explicit values.
+
+    The bucket is the canvas whose shape is closest to the source's, so the
+    reference only ever needs a modest pad to reach it.
+    """
     if height is not None and width is not None:
         return height, width
-    target_w, target_h = find_closest_target_size(
-        ref_image.height, ref_image.width, action_resolution
-    )
+    target_w, target_h = find_closest_target_size(source_h, source_w, action_resolution)
     return (
         height if height is not None else target_h,
         width if width is not None else target_w,
     )
 
 
-def action_reference_image(
+def action_reference_size(
     *,
     action_mode: str,
     image: Any,
     video: Any,
-) -> PIL.Image.Image:
-    """Resolve the reference frame used for action sizing and conditioning."""
-    if action_mode == ACTION_MODE_INVERSE_DYNAMICS:
-        source = video if video is not None else image
-        frames = normalize_action_video_input(source, max_frames=1)
-        if not frames:
-            raise ValueError("Cosmos3 action_mode='inverse_dynamics' requires a video input.")
-        return pil_to_rgb(frames[0])
+) -> tuple[int, int]:
+    """Source ``(height, width)`` of the reference, for choosing the canvas.
 
-    source = image if image is not None else video
+    Video references are encoded bytes, so their size comes from the container
+    header rather than a decode; images are measured directly.
+    """
+    source = video if action_mode == ACTION_MODE_INVERSE_DYNAMICS else (image or video)
     if source is None:
         raise ValueError(f"Cosmos3 action_mode={action_mode!r} requires an image or video input.")
-    if isinstance(source, PIL.Image.Image):
-        return source.convert("RGB")
-    if isinstance(source, (str, Path)):
-        path = Path(source)
-        if path.is_file() and path.suffix.lower() in ACTION_IMAGE_EXTENSIONS:
-            return PIL.Image.open(path).convert("RGB")
-        frames = normalize_action_video_input(source, max_frames=1)
-        if not frames:
-            raise ValueError(
-                f"Cosmos3 action_mode={action_mode!r} requires an image or video input."
-            )
-        return pil_to_rgb(frames[0])
-    raise TypeError(
-        f"Cosmos3 action reference image must be PIL.Image or path, got {type(source)!r}."
-    )
+    if isinstance(source, bytes):
+        from tensorrt_llm.media.decoding import probe_video_dimensions
+
+        return probe_video_dimensions(source)
+    reference = pil_to_rgb(source)
+    return reference.height, reference.width
 
 
 def resize_and_pad_action_image(

@@ -42,7 +42,7 @@ from tensorrt_llm.media.decoding import decode_video_reference_window
 from .action import (
     ACTION_MODE_INVERSE_DYNAMICS,
     DEFAULT_ACTION_VIEW_POINT,
-    action_reference_image,
+    action_reference_size,
     action_start_frame_offset,
     build_action_json_prompt,
     build_vision_condition_mask,
@@ -827,16 +827,32 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         image = resize_and_pad_action_image(image, target_h, target_w)
         return self.video_processor.preprocess(image, height=target_h, width=target_w)
 
-    def _preprocess_action_video(
-        self, frames: List[Any], target_h: int, target_w: int
+    def _preprocess_action_first_frame(
+        self, image: Any, video: Any, target_h: int, target_w: int
     ) -> torch.Tensor:
-        if not frames:
-            raise ValueError("Cosmos3 action video input must contain at least one frame.")
-        processed = [
-            self._preprocess_action_image(pil_to_rgb(frame), target_h, target_w).squeeze(0)
-            for frame in frames
-        ]
-        return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
+        """Conditioning frame for policy / forward_dynamics as ``[1, 3, H, W]``.
+
+        Either source is accepted: an image goes through PIL, video bytes take
+        frame 0 off NVDEC. Both land on the padded canvas, so the two entry
+        points produce the same conditioning for the same picture.
+        """
+        if image is not None:
+            return self._preprocess_action_image(pil_to_rgb(image), target_h, target_w)
+        if not isinstance(video, bytes):
+            raise ValueError(
+                "Cosmos3 action conditioning requires an image or encoded MP4/AVI "
+                f"bytes, got {type(video).__name__}."
+            )
+        frames_u8 = decode_video_reference_window(
+            video,
+            first_frame=0,
+            last_frame=0,
+            target_h=target_h,
+            target_w=target_w,
+            device=self.device,
+            resize="fit",
+        )
+        return self._condition_frames_to_video_tensor(frames_u8).squeeze(2)
 
     def _encode_video_tensor(self, video_tensor: torch.Tensor) -> torch.Tensor:
         """VAE-encode a preprocessed pixel video [1, 3, T, H, W]."""
@@ -1138,19 +1154,24 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if resolved_action_fps is None:
             resolved_action_fps = frame_rate
 
-        action_ref_image = None
+        action_source_h = action_source_w = None
         if do_action:
             if isinstance(image, torch.Tensor) or isinstance(video, torch.Tensor):
                 raise ValueError(
                     "Cosmos3 action generation does not support tensor image/video inputs; "
-                    "pass a PIL image, image path, frame directory, video path, or frame list."
+                    "pass a PIL image or image path, or encoded MP4/AVI video bytes."
                 )
-            action_ref_image = action_reference_image(
+            # Header probe for video bytes, direct measure for an image: the
+            # canvas is the bucket closest to the source's shape, so the size
+            # has to be known before anything is decoded at it.
+            action_source_h, action_source_w = action_reference_size(
                 action_mode=normalized_action_mode,
                 image=image,
                 video=video,
             )
-            height, width = resolve_action_size(height, width, action_ref_image, action_resolution)
+            height, width = resolve_action_size(
+                height, width, action_source_h, action_source_w, action_resolution
+            )
 
         if self.rank == 0:
             logger.info(
@@ -1163,7 +1184,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     f"Cosmos3 action dims: action_chunk_size={action_chunk_size}, "
                     f"action_resolution={action_resolution}, "
                     f"action_fps={resolved_action_fps:.1f}, "
-                    f"input_aspect={action_ref_image.width / action_ref_image.height:.3f}"
+                    f"source={action_source_w}x{action_source_h} "
+                    f"(aspect {action_source_w / action_source_h:.3f})"
                 )
 
         if isinstance(prompt, str):
@@ -1342,7 +1364,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 # transformer's collectives so a failure cannot hang the job.
                 synchronize_media_prepare_status(prepare_error)
             else:
-                image_tensor = self._preprocess_action_image(action_ref_image, height, width)
+                image_tensor = self._preprocess_action_first_frame(image, video, height, width)
                 if image_tensor.ndim == 4:
                     video_tensor = (
                         image_tensor.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
