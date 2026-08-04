@@ -3516,34 +3516,44 @@ class PyExecutor:
                 ragged_active = bucket is not None
                 if bucket is None:
                     fallback_reason = "no_captured_shape"
-            else:
-                # No rank can replay a graph this step -- some batch holds a
-                # context request, which has always meant eager, long before
-                # this feature existed. Fitting a captured bucket is therefore
-                # pointless: there is no key to match, and the round-up would
-                # only add tokens nobody asked for. Worse, the fit sizes its
-                # padding from generation rows while `_get_padded_batch` pads
-                # the TOTAL batch, so on exactly these steps it budgeted for a
-                # row that never appeared -- 18 tokens against a key of 24,
-                # which threw and deadlocked the other ranks.
+            elif os.environ.get("TLLM_DSPARK_EAGER_RAGGED"):
+                # OFF BY DEFAULT. This path triggers a CUDA illegal memory
+                # access that is not yet located.
                 #
-                # So run ragged WITHOUT a bucket: the windows go out as the
-                # planner chose them and the token total is whatever it is.
-                # Trimming still saves real compute here; only the alignment is
-                # unnecessary. `agreed_ragged_bucket` stays cleared so the graph
-                # key keeps its uniform shape.
+                # The reasoning behind it is sound and is why the code is kept
+                # rather than reverted: these steps are eager no matter what
+                # this feature does -- can_run_cuda_graph is
+                # `num_context_requests == 0`, which predates it by a long way
+                # -- so declining ragged buys no graph replay. It only gives up
+                # the trimming, and that was measured: 46 of the first 64 steps
+                # fell back, trim_ratio 0.62 -> 0.
+                #
+                # What is NOT understood is why publishing ragged metadata on a
+                # step that then runs eager faults at all. Nine hypotheses have
+                # been falsified, most usefully: setting every window to the
+                # FULL block, which makes the step semantically identical to
+                # static verification, still faults -- so it is not about
+                # windows, raggedness, or trimming. A barrier at this point does
+                # not help while CUDA_LAUNCH_BLOCKING=1 completes a full 128-step
+                # run, which places the race inside the forward.
+                #
+                # The env var keeps the reproduction to one line.
                 runner = self.model_engine.cuda_graph_runner
                 runner.agreed_ragged_bucket = None
-                # A rank whose OWN batch is gen-only still pads locally even
-                # when the group cannot graph, and it stamps the padding dummy
-                # with this. Skipping the fit leaves the previous ragged step's
-                # value, so the dummy would join the batch carrying a window
-                # from a layout that no longer exists. There is no bucket to
-                # spend here, so the pad rows get the minimum.
                 runner.ragged_pad_verify_len = 0
                 for request, window in zip(gen_requests, ragged_lens):
                     request.py_verify_len = int(window)
                 ragged_active = True
+            else:
+                # No rank can replay a graph this step, so there is no captured
+                # shape to land on. Fitting one anyway budgets tokens for pad
+                # rows `_get_padded_batch` will not append -- it pads the TOTAL
+                # batch while this fit counts generation rows -- which is how
+                # `requests carry 18 generation tokens but the key's token axis
+                # is 24` reached two ranks, threw inside the forward, and
+                # deadlocked the other six behind it.
+                fallback_reason = "no_graph_this_step"
+                ragged_lens = None
 
         # Record what the step actually decided, reading the windows back off
         # the requests rather than off `ragged_lens`: fit_ragged_verify_lens

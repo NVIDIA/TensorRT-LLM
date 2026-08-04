@@ -4114,6 +4114,43 @@ class PyTorchModelEngine(ModelEngine):
                 f"presentation is {expected_rows} rows -- that tensor's shape "
                 f"IS what the ops read as their sequence count.")
 
+    def _pinned_host(self, key: str, values, dtype) -> torch.Tensor:
+        """A persistent pinned staging buffer holding ``values``.
+
+        Every async host-to-device copy on the ragged path used to source from
+        a freshly built ``torch.tensor(..., pin_memory=True)``. Nothing keeps
+        that temporary alive: the statement ends, Python is free to reclaim the
+        page, and ``non_blocking=True`` means the copy has only been QUEUED.
+        PyTorch does not extend the lifetime of an async H2D source -- that is
+        the caller's job -- so the DMA can read a freed page.
+
+        It survives most of the time, which is why this went unnoticed: it
+        needs the allocator to actually hand the page back before the copy
+        drains. Raising the number of ragged steps per run from 3 to 35 was
+        enough to turn it from never-seen into a run-killer, surfacing as
+        `CUDA error: an illegal memory access` on one rank and `unspecified
+        launch failure` on its peers, hundreds of frames from the copy.
+        CUDA_LAUNCH_BLOCKING=1 makes the copy synchronous and hides it
+        completely, which is how it was identified.
+
+        Buffers are keyed by name and grown monotonically, so a steady state
+        allocates nothing.
+        """
+        values = list(values)
+        cache = getattr(self, "_pinned_host_cache", None)
+        if cache is None:
+            cache = self._pinned_host_cache = {}
+        buf = cache.get(key)
+        if buf is None or buf.numel() < len(values) or buf.dtype != dtype:
+            buf = torch.empty(max(len(values), 1),
+                              dtype=dtype,
+                              pin_memory=prefer_pinned())
+            cache[key] = buf
+        view = buf[:len(values)]
+        if values:
+            view.copy_(torch.tensor(values, dtype=dtype))
+        return view
+
     def _attach_accept_caps(self, spec_metadata, generation_requests) -> None:
         """Publish ``cap-accept`` ceilings, without touching the layout.
 
@@ -4157,9 +4194,9 @@ class PyTorchModelEngine(ModelEngine):
         # verify_lens: acceptance runs inside the target's captured graph, so a
         # freshly allocated tensor here would be invisible to every replay.
         caps_view = self.accept_caps_cuda[:n]
-        caps_view.copy_(torch.tensor([1 + int(cap) for cap in caps],
-                                     dtype=torch.int32,
-                                     pin_memory=prefer_pinned()),
+        caps_view.copy_(self._pinned_host("accept_caps",
+                                          [1 + int(cap) for cap in caps],
+                                          torch.int32),
                         non_blocking=True)
         spec_metadata.accept_caps = caps_view
         spec_metadata.accept_cap_trim = self.accept_cap_trim_cuda
@@ -4193,9 +4230,8 @@ class PyTorchModelEngine(ModelEngine):
         # tensor: a captured graph baked in the address it saw at capture time,
         # so a new allocation here would be invisible to every replay.
         lens_view = self.ragged_verify_lens_cuda[:n]
-        lens_view.copy_(torch.tensor(token_lens,
-                                     dtype=torch.int32,
-                                     pin_memory=prefer_pinned()),
+        lens_view.copy_(self._pinned_host("ragged_verify_lens", token_lens,
+                                          torch.int32),
                         non_blocking=True)
         indptr_view = self.ragged_qo_indptr_cuda[:n + 1]
         indptr_view.copy_(build_qo_indptr(lens_view), non_blocking=True)
@@ -4218,14 +4254,10 @@ class PyTorchModelEngine(ModelEngine):
         verifies the same number of positions.
         """
         rows, cols = ragged_gather_index_lists(slots, counts)
-        rows_host = torch.tensor(rows,
-                                 dtype=torch.long,
-                                 pin_memory=prefer_pinned())
-        cols_host = torch.tensor(cols,
-                                 dtype=torch.long,
-                                 pin_memory=prefer_pinned())
-        return (rows_host.to('cuda', non_blocking=True),
-                cols_host.to('cuda', non_blocking=True))
+        return (self._pinned_host("gather_rows", rows,
+                                  torch.long).to('cuda', non_blocking=True),
+                self._pinned_host("gather_cols", cols,
+                                  torch.long).to('cuda', non_blocking=True))
 
     def _update_target_input_tensors(
             self,
