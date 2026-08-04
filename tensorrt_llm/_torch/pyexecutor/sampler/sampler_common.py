@@ -115,6 +115,28 @@ def _get_max_beam_width(request: LlmRequest) -> int:
     return max_beam_width
 
 
+def request_random_seed(request: LlmRequest) -> Optional[int]:
+    """The request's user-specified ``SamplingParams.seed``, if any.
+
+    Deliberately kept out of ``UtilsSamplingParams``: that struct backs the
+    sampling-strategy cache key, and a per-request seed there would make every
+    seeded request its own strategy group, defeating batched sampling. The seed
+    does not change *which* distribution is sampled, only the RNG stream, so it
+    is read separately and applied as per-row RNG state.
+
+    The C++ ``SamplingConfig.randomSeed`` is ``uint64``, so a user seed in
+    ``[2**63, 2**64)`` (e.g. from ``random.getrandbits(64)``) does not fit the
+    int64 tensors the torch sampler stores it in. Reinterpret the bit pattern as
+    signed rather than rejecting or clamping: the RNG consumes the seed as an
+    opaque bit pattern, so this keeps distinct seeds distinct, and it avoids an
+    overflow that would abort the whole sampling step rather than one request.
+    """
+    seed = _unwrap_singleton(cast(Optional[list[int]], request.sampling_config.random_seed))
+    if seed is None:
+        return None
+    return seed - (1 << 64) if seed >= (1 << 63) else seed
+
+
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
     # These sampling fields live on the C++ SamplingConfig as optional<vector<T>>

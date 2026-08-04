@@ -393,6 +393,55 @@ int Block::partialMatchThisNode(TokenIdExt const* otherTokens, size_t otherCount
     return count;
 }
 
+int Block::pageCoverage(LifeCycleId lcIdx) const
+{
+    auto const* page = getPage(lcIdx);
+    return page != nullptr ? page->numTokensInBlock : 0;
+}
+
+bool Block::holdsPage(CommittedPage const& page) const
+{
+    return getPage(page.lifeCycle) == &page;
+}
+
+bool Block::canReplacePage(LifeCycleId lcIdx, int numTokensInBlock) const
+{
+    auto const* existing = getPage(lcIdx);
+    return existing == nullptr || existing->numTokensInBlock < numTokensInBlock;
+}
+
+void Block::replacePage(LifeCycleId lcIdx, CommittedPage* page)
+{
+    TLLM_CHECK_DEBUG(canReplacePage(lcIdx, page->numTokensInBlock));
+    // Unlink first: excludeFromEviction() below may drop the eviction list's last
+    // reference and destroy the page, so the slot must already be empty.
+    auto* existing = unlinkPage(lcIdx);
+    if (existing != nullptr && existing->scheduledForEviction())
+    {
+        existing->manager->excludeFromEviction(*existing);
+        existing = nullptr; // May be dangling now, set to nullptr
+    }
+    page->block = this;
+    storage.at(lcIdx) = page;
+}
+
+void Block::adoptPagesFrom(Block& other)
+{
+    TLLM_CHECK_DEBUG(other.ordinal() == ordinal());
+    for (LifeCycleId lcIdx{0}; lcIdx < storage.size(); ++lcIdx)
+    {
+        auto* page = other.getPage(lcIdx);
+        if (page == nullptr || !canReplacePage(lcIdx, page->numTokensInBlock))
+        {
+            continue;
+        }
+        // Clear the source slot directly rather than via unlinkPage(), which would
+        // null the back-pointer replacePage() is about to overwrite.
+        other.storage.at(lcIdx) = nullptr;
+        replacePage(lcIdx, page);
+    }
+}
+
 CommittedPage* Block::unlinkPage(LifeCycleId lcIdx, CommittedPage* expectedPage)
 {
     auto& slot = storage.at(lcIdx);
@@ -494,7 +543,12 @@ SharedPtr<Block> addOrGetExistingBlock(
         }
     }
 
-    // Remove siblings whose tokens are a strict prefix of ours.
+    // A later turn may extend a partial endpoint to this longer block, replacing the
+    // partial sibling. That turn may not have a committable SWA page for this block:
+    // commitMinSnapshot releases out-of-window pages, while SWA scratch reuse uses
+    // temporary shared storage that is not preserved. Adopt the partial sibling's pages
+    // to keep the shorter endpoint reusable, retaining each page's recorded token count
+    // (see CommittedPage::numTokensInBlock).
     std::vector<BlockKey> toRemove;
     for (auto const& [k, sibling] : prevNext)
     {
@@ -504,18 +558,25 @@ SharedPtr<Block> addOrGetExistingBlock(
             toRemove.push_back(k);
         }
     }
-    for (auto const& k : toRemove)
-    {
-        auto erasedBlock = prev->detachNext(k);
-        TLLM_CHECK_DEBUG(erasedBlock);
-        TLLM_CHECK_DEBUG_WITH_INFO(erasedBlock->isOrphan(), "erased sibling must be orphan after removal");
-        (void) erasedBlock;
-    }
+    // Two covered siblings would be prefixes of each other; the insertion logic
+    // would already have replaced the shorter one.
+    TLLM_CHECK_DEBUG(toRemove.size() <= 1);
 
     // Create the new block. ordinal and tokensPerBlock are derived from prev inside the Block ctor.
     auto block = makeShared<Block>(newKey, std::move(tokens), prev, numLifeCycles);
 
+    // Keep the parent attached while covered children are replaced. Adding the replacement
+    // first prevents detachNext() from pruning an emptied RootBlock out of the tree.
     prevNext[newKey] = block;
+
+    for (auto const& k : toRemove)
+    {
+        auto erasedBlock = prev->detachNext(k);
+        TLLM_CHECK_DEBUG(erasedBlock);
+        block->adoptPagesFrom(*erasedBlock);
+        TLLM_CHECK_DEBUG_WITH_INFO(erasedBlock->isOrphan(), "erased sibling must be orphan after removal");
+    }
+
     if (isNew)
         *isNew = true;
     return block;
@@ -664,11 +725,6 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
     return tokensPerBlock * (static_cast<int>(matched.size()) - 1) + matched.back().numMatchedTokens;
 }
 
-bool hasPage(Block const& block, LifeCycleId lcId)
-{
-    return block.storage.at(lcId) != nullptr;
-}
-
 } // anonymous namespace
 
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
@@ -732,70 +788,26 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
             [this](auto const& m) { return m.numMatchedTokens == mTokensPerBlock; }));
 
     auto attnLcs = mLifeCycles.attentionLifeCycles();
-
-    // Full-attention layers require pages on every matched block.
-    std::vector<LifeCycleId> fullAttnLcList;
-    for (auto [lcId, attn] : attnLcs)
-    {
-        if (!attn->windowSize.has_value())
-        {
-            fullAttnLcList.push_back(lcId);
-        }
-    }
-    if (!fullAttnLcList.empty())
-    {
-        int n = findIndex(matched.begin(), matched.end(),
-            [&](auto const& match)
-            {
-                return std::any_of(fullAttnLcList.begin(), fullAttnLcList.end(),
-                    [&](LifeCycleId lcId) { return !hasPage(*match.block, lcId); });
-            });
-        matched.resize(static_cast<size_t>(n));
-    }
-
-    std::vector<std::pair<LifeCycleId, AttnLifeCycle const*>> swaLcs;
-    for (auto [lcId, attn] : attnLcs)
-    {
-        if (attn->windowSize.has_value())
-        {
-            swaLcs.push_back({lcId, attn});
-        }
-    }
-
-    // SWA sink blocks must all be available.
-    for (auto [lcId, attn] : swaLcs)
-    {
-        int const sinkBlocks = attn->numSinkBlocks;
-        int const limit = std::min(sinkBlocks, static_cast<int>(matched.size()));
-        int n = findIndex(matched.begin(), matched.begin() + limit,
-            [&, lcId = lcId](auto const& match) { return !hasPage(*match.block, lcId); });
-        if (n < sinkBlocks)
-        {
-            matched.resize(static_cast<size_t>(n));
-        }
-    }
-
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
+
+    // Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
+    // shorten the match to the coverage of a required page. Every retry strictly
+    // shortens the match, so the loop terminates.
     while (!matched.empty())
     {
+        // Check SSM snapshot availability first: truncating to the last reusable SSM
+        // snapshot changes the matched length that all the attention checks use.
         if (ssmLcId.has_value())
         {
-            // Truncate to the last block whose SSM snapshot is reusable at that
-            // block's matched-token count, then clamp the tail entry's matched
-            // token count to the snapshot length (mirrors _block_radix_tree.py).
             int ssmTrunc = 0;
             int ssmMatchLen = 0;
             for (int i = static_cast<int>(matched.size()) - 1; i >= 0; --i)
             {
-                CommittedPage* page = matched[static_cast<size_t>(i)].block->storage.at(*ssmLcId);
-                if (page == nullptr)
-                {
-                    continue;
-                }
-                auto* ssmPage = dynamic_cast<SsmCommittedPage*>(page);
-                TLLM_CHECK_DEBUG(ssmPage != nullptr);
-                int const snapshotLen = ssmPage->numTokensInBlock;
-                if (matched[static_cast<size_t>(i)].numMatchedTokens >= snapshotLen)
+                auto const& entry = matched[static_cast<size_t>(i)];
+                // An SSM page holds the recurrent state after exactly this many tokens,
+                // so reuse must stop there instead of anywhere inside the block.
+                int const snapshotLen = entry.block->pageCoverage(*ssmLcId);
+                if (snapshotLen > 0 && entry.numMatchedTokens >= snapshotLen)
                 {
                     ssmTrunc = i + 1;
                     ssmMatchLen = snapshotLen;
@@ -810,35 +822,49 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
             matched.back().numMatchedTokens = ssmMatchLen;
         }
 
+        // Only pages that are active at this candidate endpoint constrain attention
+        // reuse. Full attention requires every block. SWA requires sink blocks and the
+        // trailing window, but not the stale blocks between them. In particular, at an
+        // exact block boundary with windowSize=1, every historical block is stale.
         int const numTok = numMatchedTokens(matched, mTokensPerBlock);
-        bool trimmed = false;
-        for (auto [lcId, attn] : swaLcs)
+        bool shortened = false;
+        for (auto [lcId, attn] : attnLcs)
         {
-            int n = findIndex(matched.rbegin(), matched.rend(),
-                [&, lcId = lcId](auto const& match) { return hasPage(*match.block, lcId); });
-            if (n != 0)
+            auto const staleRange = attn->getStaleRange(numTok, mTokensPerBlock);
+            int const staleBeg = staleRange.beg.value();
+            int const staleEnd = staleRange.end.value();
+            int const numMatchedBlocks = static_cast<int>(matched.size());
+            for (int i = 0; i < numMatchedBlocks; ++i)
             {
-                matched.resize(matched.size() - static_cast<size_t>(n));
-                trimmed = true;
+                // Mirrors Python's chain(range(stale.beg), range(stale.end, len(matched))).
+                if (staleBeg <= i && i < staleEnd)
+                {
+                    continue;
+                }
+                int const numMatched = matched[static_cast<size_t>(i)].numMatchedTokens;
+                int const coverage = matched[static_cast<size_t>(i)].block->pageCoverage(lcId);
+                if (coverage >= numMatched)
+                {
+                    continue;
+                }
+                if (coverage > 0)
+                {
+                    matched.resize(static_cast<size_t>(i) + 1);
+                    matched.back().numMatchedTokens = coverage;
+                }
+                else
+                {
+                    matched.resize(static_cast<size_t>(i));
+                }
+                shortened = true;
                 break;
             }
-
-            auto staleRange = attn->getStaleRange(numTok, mTokensPerBlock);
-            BlockOrdinal const staleEnd = staleRange.end;
-            if (staleEnd < BlockOrdinal{static_cast<int>(matched.size())})
+            if (shortened)
             {
-                auto tailBegin = matched.begin() + static_cast<ptrdiff_t>(toSizeT(staleEnd));
-                int nMissing = findIndex(matched.rbegin(), std::make_reverse_iterator(tailBegin),
-                    [&, lcId = lcId](auto const& match) { return !hasPage(*match.block, lcId); });
-                if (BlockOrdinal{static_cast<int>(matched.size()) - nMissing} > staleEnd)
-                {
-                    matched.resize(matched.size() - static_cast<size_t>(nMissing) - 1);
-                    trimmed = true;
-                    break;
-                }
+                break;
             }
         }
-        if (!trimmed)
+        if (!shortened)
         {
             break;
         }
