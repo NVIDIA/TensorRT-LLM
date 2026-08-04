@@ -461,14 +461,12 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # Check FLASHINFER compatibility with one-engine speculative decoding
-        if llm_args.attn_backend == "FLASHINFER":
-            raise ValueError(
-                f"FLASHINFER attention backend is not supported with one-engine speculative "
-                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
-                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
-                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
-                f"backend instead by setting attn_backend='TRTLLM'.")
+    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
+            and spec_config.spec_dec_mode.use_one_engine()
+            and not spec_config._use_shared_kv_cache):
+        raise ValueError(
+            "FLASHINFER attention backend supports one-engine speculative "
+            "decoding only when the draft model shares the target KV cache.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
