@@ -79,13 +79,13 @@ csv/ctx_<i>/<uuid>_<rank>.csv       # Python transceiver per-task perf
 
 ```bash
 # Inspect what a yaml resolves to (no GPU needed):
-LLM_MODELS_ROOT=<models> python3 run_precheck.py --role gen --server-idx 0 --dry-run \
+LLM_MODELS_ROOT='<models>' python3 run_precheck.py --role gen --server-idx 0 --dry-run \
     --config ../disaggregated/<test>.yaml --work-dir /tmp/ct --llm-src <repo>
 
 # On a SLURM allocation: one srun per instance, e.g. ctx dep4 + gen dep8:
-LLM_MODELS_ROOT=<models> srun -N1 --ntasks=4 --mpi=pmix python3 run_precheck.py \
+LLM_MODELS_ROOT='<models>' srun -N1 --ntasks=4 --mpi=pmix python3 run_precheck.py \
     --role ctx --server-idx 0 --config <yaml> --work-dir <shared-dir> --llm-src <repo> &
-LLM_MODELS_ROOT=<models> srun -N2 --ntasks=8 --mpi=pmix python3 run_precheck.py --role gen --server-idx 0 \
+LLM_MODELS_ROOT='<models>' srun -N2 --ntasks=8 --mpi=pmix python3 run_precheck.py --role gen --server-idx 0 \
     --config <yaml> --work-dir <shared-dir> --llm-src <repo> &
 wait
 ```
