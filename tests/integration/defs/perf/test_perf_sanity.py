@@ -14,6 +14,7 @@
 # limitations under the License.
 """TensorRT LLM perf sanity tests."""
 
+import ast
 import copy
 import fcntl
 import glob
@@ -30,6 +31,24 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
+from test_common.perf_sanity_agreement import (
+    BENCHMARK_STATUS_FAILED,
+    BENCHMARK_STATUS_SUCCESS,
+    expected_disagg_lifecycle_roles,
+    extract_agreement_arm_log,
+    extract_log_after_offset,
+    extract_measured_context_lifecycle_log,
+    find_backend_event_loop_fatal,
+    format_agreement_arm_marker,
+    is_paired_agreement_configuration,
+    parse_context_activation_sequences,
+    read_coordination_text,
+    run_polled_command,
+    terminate_subprocess,
+    validate_completed_benchmark_output,
+    validate_context_agreement_mode,
+    write_atomic_coordination_text,
+)
 from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 
 from defs.trt_test_alternative import print_info
@@ -37,6 +56,7 @@ from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
+from .disagg_server_config import build_disagg_server_config
 from .perf_regression_utils import process_and_upload_test_results
 
 # Sanity-side path differs from test_perf for this key; preserve historical value.
@@ -106,6 +126,7 @@ DEFAULT_TIMEOUT = 10800
 # once EVERY ctx/gen worker has finished model load + autotune + warmup.
 AGG_SERVER_READY_TIMEOUT = 1800
 DISAGG_SERVER_READY_TIMEOUT = 3600
+SERVER_PROCESS_TERMINATE_TIMEOUT = 60
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -1037,6 +1058,13 @@ class DisaggConfig:
         hardware: dict,
         server_env_var: str,
         internal_request_auth_key: str | None = None,
+        client_timeout_seconds: Optional[int] = None,
+        post_benchmark_drain_seconds: float = 0.0,
+        expected_context_activations: Optional[int] = None,
+        expected_async_terminal_commits: Optional[int] = None,
+        expected_terminal_mode: Optional[int] = None,
+        expected_peer_ready_mode: Optional[int] = None,
+        server_config_extra: Optional[Dict] = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1048,6 +1076,13 @@ class DisaggConfig:
         self.hardware = hardware
         self.server_env_var = server_env_var
         self.internal_request_auth_key = internal_request_auth_key
+        self.client_timeout_seconds = client_timeout_seconds
+        self.post_benchmark_drain_seconds = post_benchmark_drain_seconds
+        self.expected_context_activations = expected_context_activations
+        self.expected_async_terminal_commits = expected_async_terminal_commits
+        self.expected_terminal_mode = expected_terminal_mode
+        self.expected_peer_ready_mode = expected_peer_ready_mode
+        self.server_config_extra = dict(server_config_extra or {})
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -1179,6 +1214,8 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    client_timeout_seconds: Optional[int] = None
+    post_benchmark_drain_seconds: float = 0.0
     internal_request_auth_key: str = ""
     client_configs: Dict[int, List["ClientConfig"]] = {}
     # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
@@ -1188,9 +1225,111 @@ class DisaggTestCmds(NamedTuple):
     # receive env via SLURM env propagation set up by submit.py.
     server_configs: List[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]] = []
 
+    def _terminate_server_process(
+        self,
+        server_proc: subprocess.Popen | None,
+        description: str,
+    ) -> Optional[RuntimeError]:
+        """Terminate a server subprocess without allowing teardown to hang."""
+        if not self._is_paired_agreement_run():
+            if server_proc is not None:
+                server_proc.terminate()
+                server_proc.wait()
+            return None
+        teardown_error = terminate_subprocess(
+            server_proc,
+            description,
+            SERVER_PROCESS_TERMINATE_TIMEOUT,
+        )
+        if teardown_error is not None:
+            print_info(f"{description} required forced teardown: {teardown_error}")
+        return teardown_error
+
+    def _paired_abort_path(self, server_idx: int) -> str:
+        return self._paired_coordination_path("paired_abort", server_idx, suffix=".txt")
+
+    def _paired_run_token(self) -> str:
+        token = os.environ.get("TRTLLM_PERF_RUN_TOKEN")
+        if token is None or re.fullmatch(r"[A-Za-z0-9_.-]+", token) is None:
+            raise RuntimeError("Paired agreement run requires a safe TRTLLM_PERF_RUN_TOKEN")
+        return token
+
+    def _paired_coordination_path(
+        self,
+        name: str,
+        server_idx: int,
+        suffix: str = "",
+    ) -> str:
+        return os.path.join(
+            self.test_output_dir,
+            f"{name}.{server_idx}.{self._paired_run_token()}{suffix}",
+        )
+
+    def _paired_context_log_offset_path(self, server_idx: int) -> str:
+        return self._paired_coordination_path(
+            "paired_context_log_offset",
+            server_idx,
+            suffix=".txt",
+        )
+
+    def _hostnames_dir(self, server_idx: int) -> str:
+        if self._is_paired_agreement_run():
+            return self._paired_coordination_path("hostnames", server_idx)
+        return os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
+
+    def _server_config_path(self, server_idx: int) -> str:
+        if self._is_paired_agreement_run():
+            return self._paired_coordination_path("server_config", server_idx, suffix=".yaml")
+        return os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
+
+    def _extract_singleton_context_lifecycle_log(
+        self,
+        server_idx: int,
+        cumulative_log_bytes: bytes,
+    ) -> Optional[str]:
+        """Scope a split stage to the CTX log bytes written by its measured service."""
+        offset_text = read_coordination_text(self._paired_context_log_offset_path(server_idx))
+        if offset_text is None:
+            return None
+        try:
+            scoped_log_bytes = extract_log_after_offset(cumulative_log_bytes, offset_text)
+        except ValueError as error:
+            raise RuntimeError(
+                f"Invalid paired CTX log offset for server_idx={server_idx}: {error}"
+            ) from error
+        ctx_config, _, _ = self.server_configs[server_idx]
+        return extract_measured_context_lifecycle_log(
+            scoped_log_bytes.decode(errors="replace"),
+            set(range(ctx_config.pp)),
+        )
+
+    def publish_paired_arm_abort(self, server_idx: int, error: Exception) -> None:
+        """Wake every paired-arm role after any one role fails."""
+        if not self._is_paired_agreement_run():
+            return
+        try:
+            write_atomic_coordination_text(
+                self._paired_abort_path(server_idx),
+                f"{type(error).__name__}: {error}",
+            )
+        except OSError as abort_error:
+            print_info(
+                f"Unable to publish paired-arm abort without masking "
+                f"{type(error).__name__}: {abort_error}"
+            )
+
+    def _fail_if_paired_arm_aborted(self, server_idx: int) -> None:
+        if not self._is_paired_agreement_run():
+            return
+        abort_text = read_coordination_text(self._paired_abort_path(server_idx))
+        if abort_text is not None:
+            raise RuntimeError(
+                f"Paired agreement arm {server_idx} aborted by another role: {abort_text}"
+            )
+
     def _generate_hostname_file(self, server_idx: int, port: int):
         """Create hostname file for coordination."""
-        hostnames_dir = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
+        hostnames_dir = self._hostnames_dir(server_idx)
         if not os.path.exists(hostnames_dir):
             os.makedirs(hostnames_dir, exist_ok=True)
         hostname_file = os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
@@ -1200,12 +1339,13 @@ class DisaggTestCmds(NamedTuple):
     def _generate_disagg_server_config(self, server_idx: int) -> str:
         """Generate disagg server config from hostname files."""
         print_info(f"Generating disagg server config for server index {server_idx}")
-        hostnames_folder = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
+        hostnames_folder = self._hostnames_dir(server_idx)
         expected_count = self.num_ctx_servers + self.num_gen_servers
         start_time = time.time()
         hostnames = []
 
         while True:
+            self._fail_if_paired_arm_aborted(server_idx)
             elapsed_time = time.time() - start_time
             print_info(
                 f"Waiting for hostnames in {hostnames_folder}, "
@@ -1240,21 +1380,20 @@ class DisaggTestCmds(NamedTuple):
         # where another process on the same node grabs the port.
         disagg_server_port = get_free_port()
 
-        server_config = {
-            "hostname": self.hostname,
-            "port": disagg_server_port,
-            "backend": "pytorch",
-            "internal_request_auth_key": self.internal_request_auth_key,
-            "context_servers": {
-                "num_instances": self.num_ctx_servers,
-                "urls": ctx_hostnames,
-            },
-            "generation_servers": {
-                "num_instances": self.num_gen_servers,
-                "urls": gen_hostnames,
-            },
-        }
-        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
+        server_config_extra = {}
+        if server_idx < len(self.server_configs):
+            server_config_extra = self.server_configs[server_idx][2].server_config_extra
+        server_config = build_disagg_server_config(
+            hostname=self.hostname,
+            port=disagg_server_port,
+            num_ctx_servers=self.num_ctx_servers,
+            num_gen_servers=self.num_gen_servers,
+            ctx_hostnames=ctx_hostnames,
+            gen_hostnames=gen_hostnames,
+            internal_request_auth_key=self.internal_request_auth_key,
+            server_config_extra=server_config_extra,
+        )
+        config_path = self._server_config_path(server_idx)
         with open(config_path, "w") as f:
             yaml.dump(server_config, f)
         print_info(f"Server config file {config_path} generated")
@@ -1262,9 +1401,10 @@ class DisaggTestCmds(NamedTuple):
 
     def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
         """Wait for and read disagg server config."""
-        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
+        config_path = self._server_config_path(server_idx)
         start_time = time.time()
         while True:
+            self._fail_if_paired_arm_aborted(server_idx)
             if os.path.exists(config_path):
                 print_info(f"Server config file found: {config_path}")
                 break
@@ -1282,6 +1422,7 @@ class DisaggTestCmds(NamedTuple):
 
     def wait_for_benchmark_ready(
         self,
+        server_idx: int,
         benchmark_status_file: str,
         server_proc: subprocess.Popen | None = None,
         server_log: str | None = None,
@@ -1296,12 +1437,31 @@ class DisaggTestCmds(NamedTuple):
         benchmark rank's bounded ready-wait failing fast on the dead endpoint
         -- instead of every rank sitting in this loop for the full timeout.
 
-        The benchmark-done check runs FIRST so a server exiting just after a
+        A paired-arm abort is checked first. Otherwise, benchmark success is
+        checked before process liveness so a server exiting just after a
         completed benchmark cannot fail an otherwise-passing test.
         """
         start_time = time.time()
+        server_log_offset = 0
+        paired_agreement_run = self._is_paired_agreement_run()
         while True:
-            if os.path.exists(benchmark_status_file):
+            self._fail_if_paired_arm_aborted(server_idx)
+            if paired_agreement_run:
+                benchmark_status = read_coordination_text(benchmark_status_file)
+                if benchmark_status == BENCHMARK_STATUS_FAILED:
+                    raise RuntimeError(f"Benchmark role failed for paired arm {server_idx}")
+                if benchmark_status == BENCHMARK_STATUS_SUCCESS:
+                    print_info(
+                        "Benchmark status file found, terminating server "
+                        f"{self.disagg_serving_type}"
+                    )
+                    break
+                if benchmark_status is not None:
+                    raise RuntimeError(
+                        f"Unexpected benchmark status {benchmark_status!r} in "
+                        f"{benchmark_status_file}"
+                    )
+            elif os.path.exists(benchmark_status_file):
                 print_info(
                     f"Benchmark status file found, terminating server {self.disagg_serving_type}"
                 )
@@ -1311,6 +1471,16 @@ class DisaggTestCmds(NamedTuple):
                 f"{self.disagg_serving_type} server",
                 [server_log] if server_log else None,
             )
+            if server_log and paired_agreement_run:
+                fatal_line, server_log_offset = find_backend_event_loop_fatal(
+                    server_log,
+                    server_log_offset,
+                )
+                if fatal_line is not None:
+                    report_error(
+                        f"{self.disagg_serving_type} backend event loop failed: {fatal_line}",
+                        [server_log],
+                    )
             elapsed_time = time.time() - start_time
             print_info(f"Waiting for benchmark status file, elapsed time: {elapsed_time}s")
             if elapsed_time > self.timeout:
@@ -1318,6 +1488,18 @@ class DisaggTestCmds(NamedTuple):
                     f"Timeout waiting for benchmark status file after {self.timeout}s"
                 )
             time.sleep(10)
+
+    def _is_paired_agreement_run(self) -> bool:
+        return is_paired_agreement_configuration(
+            (
+                (
+                    disagg_config.benchmark_mode,
+                    disagg_config.expected_terminal_mode,
+                    disagg_config.expected_peer_ready_mode,
+                )
+                for _, _, disagg_config in self.server_configs
+            )
+        )
 
     def wait_for_gen_log_sentinels(self, poll_interval: float = 2.0) -> bool:
         """Block until every gen worker signals that its log is fully written.
@@ -1355,6 +1537,234 @@ class DisaggTestCmds(NamedTuple):
             )
             time.sleep(poll_interval)
 
+    def _wait_for_paired_arm_barrier(self, server_idx: int, barrier_name: str) -> None:
+        """Wait until every disaggregated pytest role reaches one arm barrier."""
+        if not self._is_paired_agreement_run():
+            return
+        self._fail_if_paired_arm_aborted(server_idx)
+        marker_dir = self._paired_coordination_path(barrier_name, server_idx)
+        os.makedirs(marker_dir, exist_ok=True)
+        marker_name = f"{self.disagg_serving_type}.{os.getenv('SLURM_PROCID', '0')}"
+        marker_path = os.path.join(marker_dir, marker_name)
+        write_atomic_coordination_text(marker_path, "Done")
+
+        expected_roles = expected_disagg_lifecycle_roles(
+            self.num_ctx_servers,
+            self.num_gen_servers,
+        )
+        start_time = time.time()
+        while True:
+            self._fail_if_paired_arm_aborted(server_idx)
+            observed_roles = set(os.listdir(marker_dir))
+            missing_roles = expected_roles.difference(observed_roles)
+            if not missing_roles:
+                break
+            elapsed_time = time.time() - start_time
+            if elapsed_time > self.timeout:
+                raise RuntimeError(
+                    f"Timed out waiting for paired-arm {barrier_name}: "
+                    f"server_idx={server_idx}, observed={sorted(observed_roles)}, "
+                    f"missing={sorted(missing_roles)}"
+                )
+            time.sleep(1)
+
+    def wait_for_lifecycle_teardown(self, server_idx: int) -> None:
+        """Keep paired arms ordered until every role has stopped its services."""
+        self._wait_for_paired_arm_barrier(server_idx, "lifecycle_teardown")
+
+    def wait_for_evidence_verification(self, server_idx: int) -> None:
+        """Prevent a later arm from entering the cumulative log during parsing."""
+        self._wait_for_paired_arm_barrier(server_idx, "evidence_verified")
+
+    def verify_context_consensus_evidence(self, server_idx: int) -> None:
+        """Validate post-teardown rank evidence for a configured paired arm."""
+        ctx_config, _, disagg_config = self.server_configs[server_idx]
+        expected_activations = disagg_config.expected_context_activations
+        expected_terminal_commits = disagg_config.expected_async_terminal_commits
+        expected_terminal_mode = disagg_config.expected_terminal_mode
+        expected_peer_ready_mode = disagg_config.expected_peer_ready_mode
+        if (
+            expected_activations is None
+            and expected_terminal_commits is None
+            and expected_terminal_mode is None
+            and expected_peer_ready_mode is None
+        ):
+            return
+
+        log_path = os.path.join(self.test_output_dir, "ctx_server_0.log")
+        poll_timeout = min(self.timeout, 60)
+        expected_ranks = set(range(ctx_config.pp))
+        start_time = time.time()
+        pending_evidence = ["paired-arm markers"]
+        while True:
+            self._fail_if_paired_arm_aborted(server_idx)
+            log_text = None
+            if os.path.isfile(log_path):
+                if len(self.server_configs) == 1:
+                    with open(log_path, "rb") as log_file:
+                        cumulative_log_bytes = log_file.read()
+                    log_text = self._extract_singleton_context_lifecycle_log(
+                        server_idx,
+                        cumulative_log_bytes,
+                    )
+                else:
+                    with open(log_path, "r", errors="replace") as log_file:
+                        cumulative_log_text = log_file.read()
+                    try:
+                        log_text = extract_agreement_arm_log(
+                            cumulative_log_text,
+                            server_idx,
+                            expected_ctx_roles=1,
+                        )
+                    except ValueError as error:
+                        raise RuntimeError(str(error)) from error
+            if log_text is not None:
+                pending_evidence = []
+                if expected_terminal_mode is not None or expected_peer_ready_mode is not None:
+                    mode_by_rank = {}
+                    for rank_text, terminal_text, peer_ready_text in re.findall(
+                        r"PYTHON_ASYNC_CONSENSUS transition=mode_active "
+                        r"[^\n]*?rank=(\d+) terminal=(\d+) peer_ready=(\d+)",
+                        log_text,
+                    ):
+                        mode_by_rank[int(rank_text)] = (
+                            int(terminal_text),
+                            int(peer_ready_text),
+                        )
+                    if set(mode_by_rank) != expected_ranks:
+                        pending_evidence.append(f"agreement mode ranks={sorted(mode_by_rank)}")
+                    else:
+                        expected_mode = (expected_terminal_mode, expected_peer_ready_mode)
+                        observed_modes = set(mode_by_rank.values())
+                        if observed_modes != {expected_mode}:
+                            raise RuntimeError(
+                                "Agreement mode does not match the configured A/B arm: "
+                                f"observed={sorted(observed_modes)}, expected={expected_mode}"
+                            )
+
+                if expected_activations is not None:
+                    activation_by_rank = parse_context_activation_sequences(log_text)
+                    activation_counts = {count for count, _ in activation_by_rank.values()}
+                    activation_digests = {digest for _, digest in activation_by_rank.values()}
+                    if (
+                        set(activation_by_rank) != expected_ranks
+                        or activation_counts != {expected_activations}
+                        or len(activation_digests) != 1
+                    ):
+                        pending_evidence.append(
+                            "context activations="
+                            f"{sorted(activation_by_rank)} counts={sorted(activation_counts)} "
+                            f"digests={sorted(activation_digests)}"
+                        )
+
+                if expected_terminal_commits is not None:
+                    counters_by_rank = {}
+                    for rank_text, counters_text in re.findall(
+                        r"PYTHON_ASYNC_CONSENSUS transition=shutdown_summary "
+                        r"rank=(\d+) counters=(\{[^\n]*\})",
+                        log_text,
+                    ):
+                        counters_by_rank[int(rank_text)] = ast.literal_eval(counters_text)
+                    terminal_counts = {
+                        int(counters.get("terminal_commit", 0))
+                        for counters in counters_by_rank.values()
+                    }
+                    if set(counters_by_rank) != expected_ranks or terminal_counts != {
+                        expected_terminal_commits
+                    }:
+                        pending_evidence.append(
+                            "terminal commits="
+                            f"{sorted(counters_by_rank)} counts={sorted(terminal_counts)}"
+                        )
+                if not pending_evidence:
+                    break
+            elapsed_time = time.time() - start_time
+            if elapsed_time > poll_timeout:
+                raise RuntimeError(
+                    "Timed out waiting for exact paired-arm CTX evidence: "
+                    f"server_idx={server_idx}, timeout={poll_timeout}s, "
+                    f"pending={pending_evidence}"
+                )
+            time.sleep(1)
+        if self.disagg_serving_type == "BENCHMARK":
+            arm_log_path = os.path.join(
+                self.test_output_dir,
+                f"ctx_server_0.{server_idx}.log",
+            )
+            with open(arm_log_path, "w") as arm_log_file:
+                arm_log_file.write(log_text)
+
+        if expected_activations is not None and server_idx > 0:
+            baseline_log_path = os.path.join(
+                self.test_output_dir,
+                "ctx_server_0.0.log",
+            )
+            baseline_start_time = time.time()
+            while not os.path.isfile(baseline_log_path):
+                elapsed_time = time.time() - baseline_start_time
+                if elapsed_time > poll_timeout:
+                    raise RuntimeError(
+                        "Timed out waiting for the first paired-arm evidence artifact: "
+                        f"path={baseline_log_path}, timeout={poll_timeout}s"
+                    )
+                time.sleep(1)
+            with open(baseline_log_path, "r", errors="replace") as baseline_log_file:
+                baseline_log_text = baseline_log_file.read()
+            baseline_activation_by_rank = {
+                rank: digest
+                for rank, (_, digest) in parse_context_activation_sequences(
+                    baseline_log_text
+                ).items()
+            }
+            baseline_digests = set(baseline_activation_by_rank.values())
+            if baseline_digests != activation_digests:
+                raise RuntimeError(
+                    "Context activation order differs between paired A/B arms: "
+                    f"baseline={sorted(baseline_digests)}, "
+                    f"current={sorted(activation_digests)}"
+                )
+
+    def wait_for_context_agreement_mode(self, server_idx: int) -> None:
+        """Fail before client launch unless every CTX rank has the configured mode."""
+        if not self._is_paired_agreement_run():
+            return
+        ctx_config, _, disagg_config = self.server_configs[server_idx]
+        expected_mode = (
+            disagg_config.expected_terminal_mode,
+            disagg_config.expected_peer_ready_mode,
+        )
+        expected_ranks = set(range(ctx_config.pp))
+        log_path = os.path.join(self.test_output_dir, "ctx_server_0.log")
+        start_time = time.time()
+        poll_timeout = min(self.timeout, 120)
+        while True:
+            self._fail_if_paired_arm_aborted(server_idx)
+            if os.path.isfile(log_path):
+                with open(log_path, "rb") as log_file:
+                    cumulative_log_bytes = log_file.read()
+                log_text = self._extract_singleton_context_lifecycle_log(
+                    server_idx,
+                    cumulative_log_bytes,
+                )
+                if log_text is not None:
+                    try:
+                        mode_ready = validate_context_agreement_mode(
+                            log_text,
+                            expected_ranks,
+                            expected_mode,
+                        )
+                    except ValueError as error:
+                        raise RuntimeError(f"{error} before benchmark launch") from error
+                    if mode_ready:
+                        return
+            elapsed_time = time.time() - start_time
+            if elapsed_time > poll_timeout:
+                raise RuntimeError(
+                    "Timed out waiting for configured agreement mode before benchmark launch: "
+                    f"server_idx={server_idx}, timeout={poll_timeout}s"
+                )
+            time.sleep(1)
+
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
         for i in range(self.num_ctx_servers):
@@ -1373,11 +1783,16 @@ class DisaggTestCmds(NamedTuple):
         server_logs.append(os.path.join(self.test_output_dir, "disagg_server.log"))
         return server_logs
 
-    @staticmethod
-    def _wait_for_config_file(config_path: str, timeout: int = 600) -> None:
+    def _wait_for_config_file(
+        self,
+        server_idx: int,
+        config_path: str,
+        timeout: int = 600,
+    ) -> None:
         """Wait for a config file to be written by the primary (_0) worker."""
         start_time = time.time()
         while not os.path.exists(config_path):
+            self._fail_if_paired_arm_aborted(server_idx)
             elapsed = time.time() - start_time
             if elapsed > timeout:
                 raise RuntimeError(
@@ -1389,14 +1804,38 @@ class DisaggTestCmds(NamedTuple):
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run commands for a server and return outputs."""
         outputs = []
-        benchmark_status_file = os.path.join(
-            self.test_output_dir, f"benchmark_status.{server_idx}.txt"
-        )
         ctx_cmd, gen_cmd, disagg_cmd = self.server_cmds[server_idx]
         configs_for_idx = (
             self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
         )
+        paired_agreement_run = self._is_paired_agreement_run()
+        benchmark_status_file = (
+            self._paired_coordination_path("benchmark_status", server_idx, suffix=".txt")
+            if paired_agreement_run
+            else os.path.join(self.test_output_dir, f"benchmark_status.{server_idx}.txt")
+        )
+        paired_ctx_role = paired_agreement_run and self.disagg_serving_type.startswith("CTX_")
+        if paired_ctx_role:
+            if self.disagg_serving_type == "CTX_0":
+                cumulative_ctx_log = os.path.join(self.test_output_dir, "ctx_server_0.log")
+                context_log_offset = 0
+                if os.path.isfile(cumulative_ctx_log):
+                    context_log_offset = os.path.getsize(cumulative_ctx_log)
+                write_atomic_coordination_text(
+                    self._paired_context_log_offset_path(server_idx),
+                    str(context_log_offset),
+                )
+            print(
+                format_agreement_arm_marker(
+                    "START",
+                    server_idx,
+                    self.disagg_serving_type,
+                    os.getenv("SLURM_PROCID", "0"),
+                ),
+                flush=True,
+            )
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
+            server_proc = None
             port = get_free_port()
             self._generate_hostname_file(server_idx, port)
             is_ctx = "CTX" in self.disagg_serving_type
@@ -1405,7 +1844,7 @@ class DisaggTestCmds(NamedTuple):
             # Non-primary workers wait for _0 worker to write the config file
             if self.disagg_serving_type not in ("CTX_0", "GEN_0"):
                 config_idx = server_cmd.index("--config") + 1
-                self._wait_for_config_file(server_cmd[config_idx])
+                self._wait_for_config_file(server_idx, server_cmd[config_idx])
 
             server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
             try:
@@ -1428,18 +1867,38 @@ class DisaggTestCmds(NamedTuple):
                         stderr=subprocess.STDOUT,
                     )
                     self.wait_for_benchmark_ready(
+                        server_idx,
                         benchmark_status_file,
                         server_proc=server_proc,
                         server_log=server_file_path,
                     )
-            finally:
+            except BaseException as error:
                 print_info(f"Server {self.disagg_serving_type} stopped")
-                server_proc.terminate()
-                server_proc.wait()
+                teardown_error = self._terminate_server_process(
+                    server_proc,
+                    f"{self.disagg_serving_type} server",
+                )
+                if teardown_error is not None:
+                    if hasattr(error, "add_note"):
+                        error.add_note(str(teardown_error))
+                    else:
+                        print_info(str(teardown_error))
+                raise
+            else:
+                print_info(f"Server {self.disagg_serving_type} stopped")
+                teardown_error = self._terminate_server_process(
+                    server_proc,
+                    f"{self.disagg_serving_type} server",
+                )
+                if teardown_error is not None:
+                    raise teardown_error
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
+            disagg_server_proc = None
             try:
-                self._generate_disagg_server_config(server_idx)
+                server_config_path = self._generate_disagg_server_config(server_idx)
+                disagg_cmd = list(disagg_cmd)
+                disagg_cmd[disagg_cmd.index("-c") + 1] = server_config_path
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
                 disagg_server_file_path = os.path.join(
                     self.test_output_dir,
@@ -1457,21 +1916,38 @@ class DisaggTestCmds(NamedTuple):
                         stderr=subprocess.STDOUT,
                     )
                     self.wait_for_benchmark_ready(
+                        server_idx,
                         benchmark_status_file,
                         server_proc=disagg_server_proc,
                         server_log=disagg_server_file_path,
                     )
-            finally:
+            except BaseException as error:
                 print_info(f"Disagg server {self.disagg_serving_type} stopped")
-                disagg_server_proc.terminate()
-                disagg_server_proc.wait()
+                teardown_error = self._terminate_server_process(
+                    disagg_server_proc,
+                    f"{self.disagg_serving_type} server",
+                )
+                if teardown_error is not None:
+                    if hasattr(error, "add_note"):
+                        error.add_note(str(teardown_error))
+                    else:
+                        print_info(str(teardown_error))
+                raise
+            else:
+                print_info(f"Disagg server {self.disagg_serving_type} stopped")
+                teardown_error = self._terminate_server_process(
+                    disagg_server_proc,
+                    f"{self.disagg_serving_type} server",
+                )
+                if teardown_error is not None:
+                    raise teardown_error
 
         elif self.disagg_serving_type == "BENCHMARK":
             # Perf-benchmark clients whose gen-worker device step time must be
             # parsed once the gen logs are flushed. The parse is deferred out of
             # the client loop because gen_server_*.log keeps being written until
             # the gen srun exits, and the gen srun only exits after
-            # benchmark_status is written in the finally below. Parsing inside
+            # benchmark_status is written after the client/drain block below. Parsing inside
             # the loop (as before) could read a truncated / not-yet-flushed log
             # and report a wrong mean (nvbugs 6487036 / 6487040).
             pending_device_step_time: List[dict] = []
@@ -1486,7 +1962,9 @@ class DisaggTestCmds(NamedTuple):
                         self.timeout, server_ready_timeout(DISAGG_SERVER_READY_TIMEOUT, "DISAGG")
                     ),
                     check_files=self.get_server_logs(server_idx),
+                    abort_check=lambda: self._fail_if_paired_arm_aborted(server_idx),
                 )
+                self.wait_for_context_agreement_mode(server_idx)
 
                 client_configs = self.client_configs.get(server_idx, [])
 
@@ -1515,14 +1993,23 @@ class DisaggTestCmds(NamedTuple):
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
                             bench_env.update(client_config.to_env())
-                        output = subprocess.check_output(
-                            client_cmd_with_port,
-                            env=bench_env,
-                            stderr=subprocess.STDOUT,
-                        ).decode()
-
-                        with open(benchmark_file_path, "w") as benchmark_ctx:
-                            benchmark_ctx.write(output)
+                        if self.client_timeout_seconds is None:
+                            output = subprocess.check_output(
+                                client_cmd_with_port,
+                                env=bench_env,
+                                stderr=subprocess.STDOUT,
+                            ).decode()
+                            with open(benchmark_file_path, "w") as benchmark_ctx:
+                                benchmark_ctx.write(output)
+                        else:
+                            output = run_polled_command(
+                                client_cmd_with_port,
+                                env=bench_env,
+                                log_path=benchmark_file_path,
+                                timeout_seconds=self.client_timeout_seconds,
+                                abort_check=lambda: self._fail_if_paired_arm_aborted(server_idx),
+                                terminate_timeout_seconds=SERVER_PROCESS_TERMINATE_TIMEOUT,
+                            )
 
                         outputs.append(output)
                         # Defer the gen-worker device-step-time parse until the
@@ -1563,10 +2050,48 @@ class DisaggTestCmds(NamedTuple):
                         output_dir=self.test_output_dir,
                         server_idx=server_idx,
                     )
-
-            finally:
-                with open(benchmark_status_file, "w") as status_file:
-                    status_file.write("Done")
+                if self.post_benchmark_drain_seconds > 0:
+                    print_info(
+                        "Benchmark clients completed; keeping services alive for "
+                        f"{self.post_benchmark_drain_seconds:g}s so post-client "
+                        "transfer consensus can drain"
+                    )
+                    time.sleep(self.post_benchmark_drain_seconds)
+                if paired_agreement_run:
+                    for client_idx, output in enumerate(outputs):
+                        client_config = (
+                            client_configs[client_idx] if client_idx < len(client_configs) else None
+                        )
+                        if client_config is None or client_config.only_run_accuracy:
+                            continue
+                        required_metrics = dict(PERF_METRIC_LOG_QUERIES)
+                        if client_config.spec_decoding:
+                            required_metrics.update(SPEC_DECODING_PERF_METRIC_LOG_QUERIES)
+                        validate_completed_benchmark_output(
+                            output,
+                            expected_requests=(
+                                client_config.concurrency * client_config.iterations
+                            ),
+                            required_metric_patterns=required_metrics,
+                        )
+            except BaseException as error:
+                try:
+                    write_atomic_coordination_text(
+                        benchmark_status_file,
+                        BENCHMARK_STATUS_FAILED if paired_agreement_run else "Done",
+                    )
+                except OSError as status_error:
+                    status_note = f"Unable to publish benchmark failure status: {status_error}"
+                    if hasattr(error, "add_note"):
+                        error.add_note(status_note)
+                    else:
+                        print_info(status_note)
+                raise
+            else:
+                write_atomic_coordination_text(
+                    benchmark_status_file,
+                    BENCHMARK_STATUS_SUCCESS if paired_agreement_run else "Done",
+                )
 
             # benchmark_status is written, so the gen workers can now stop and
             # their srun will exit and drop gen_server_{i}.done. Wait once for
@@ -1575,7 +2100,12 @@ class DisaggTestCmds(NamedTuple):
             # flushed log is complete, so no settle polling is needed. Only
             # gen_only runs emit prev_device_step_time; other modes parse to
             # None and skip the summary line.
-            if pending_device_step_time:
+            # An agreement-validation run keeps each outer GEN srun alive
+            # through the lifecycle/evidence barriers. Its end-of-srun sentinel
+            # therefore cannot exist before this test returns. These are e2e
+            # arms and do not publish the gen-only device-step metric, so skip
+            # this single-run-only postprocessing rather than deadlocking.
+            if pending_device_step_time and not paired_agreement_run:
                 self.wait_for_gen_log_sentinels()
                 for record in pending_device_step_time:
                     device_step_time_mean = parse_gen_worker_device_step_time(
@@ -1592,6 +2122,19 @@ class DisaggTestCmds(NamedTuple):
                         idx = record["output_index"]
                         outputs[idx] = f"{outputs[idx]}\n{summary_line}\n"
 
+        if paired_ctx_role:
+            print(
+                format_agreement_arm_marker(
+                    "END",
+                    server_idx,
+                    self.disagg_serving_type,
+                    os.getenv("SLURM_PROCID", "0"),
+                ),
+                flush=True,
+            )
+        self.wait_for_lifecycle_teardown(server_idx)
+        self.verify_context_consensus_evidence(server_idx)
+        self.wait_for_evidence_verification(server_idx)
         return outputs
 
     def get_cmd_str(self, server_idx: int) -> List[str]:
@@ -1863,6 +2406,30 @@ class PerfSanityTestConfig:
         )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
+        client_timeout_seconds = benchmark.get("client_timeout_seconds")
+        if client_timeout_seconds is not None:
+            client_timeout_seconds = int(client_timeout_seconds)
+            if client_timeout_seconds <= 0:
+                raise ValueError("client_timeout_seconds must be positive")
+        post_benchmark_drain_seconds = float(
+            benchmark.get("post_benchmark_drain_seconds", 0.0) if benchmark_mode == "e2e" else 0.0
+        )
+        if post_benchmark_drain_seconds < 0:
+            raise ValueError("post_benchmark_drain_seconds must be non-negative")
+        expected_context_activations = (
+            benchmark.get("expected_context_activations") if benchmark_mode == "e2e" else None
+        )
+        if expected_context_activations is not None:
+            expected_context_activations = int(expected_context_activations)
+            if expected_context_activations < 0:
+                raise ValueError("expected_context_activations must be non-negative")
+        expected_peer_ready_mode = (
+            benchmark.get("expected_peer_ready_mode") if benchmark_mode == "e2e" else None
+        )
+        if expected_peer_ready_mode is not None:
+            expected_peer_ready_mode = int(expected_peer_ready_mode)
+            if expected_peer_ready_mode not in (0, 1):
+                raise ValueError("expected_peer_ready_mode must be 0 or 1")
         internal_request_auth_key = self._resolve_internal_request_auth_key(config)
 
         # Parse concurrency_list - can be string or list
@@ -1903,45 +2470,102 @@ class PerfSanityTestConfig:
             ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
             self.server_configs = [ctx_server_config]
         else:
-            # For e2e and gen_only modes - create ctx and gen server configs
-            ctx_server_config_data = {
-                "internal_request_auth_key": internal_request_auth_key,
-                "concurrency": concurrency_values[0],
-                "name": f"{benchmark_mode}-{config_file_base_name}",
-                "model_name": model_name,
-                "gpus_per_node": gpus_per_node,
-                "disagg_run_type": "ctx",
-                **worker_config.get("ctx", {}),
-            }
-
-            gen_server_config_data = {
-                "internal_request_auth_key": internal_request_auth_key,
-                "concurrency": concurrency_values[0],
-                "name": f"{benchmark_mode}-{config_file_base_name}",
-                "model_name": model_name,
-                "gpus_per_node": gpus_per_node,
-                "disagg_run_type": "gen",
-                **worker_config.get("gen", {}),
-            }
-
-            ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
-            gen_server_config = ServerConfig(gen_server_config_data, gen_worker_env_var)
-
-            disagg_config = DisaggConfig(
-                name=f"{benchmark_mode}-{config_file_base_name}",
-                disagg_serving_type=disagg_serving_type,
-                hostname=socket.gethostname(),
-                numa_bind=numa_bind,
-                timeout=timeout,
-                benchmark_mode=benchmark_mode,
-                model_name=model_name,
-                hardware=hardware,
-                server_env_var=server_env_var,
-                internal_request_auth_key=internal_request_auth_key,
+            agreement_arms = (
+                benchmark.get("agreement_ab_arms", [{}]) if benchmark_mode == "e2e" else [{}]
             )
+            if not isinstance(agreement_arms, list) or not agreement_arms:
+                raise ValueError("agreement_ab_arms must be a non-empty list")
+            self.server_configs = []
+            arm_names = set()
+            for arm in agreement_arms:
+                if not isinstance(arm, dict):
+                    raise ValueError("each agreement_ab_arms entry must be a mapping")
+                unexpected_keys = set(arm).difference(
+                    {
+                        "name",
+                        "ctx_worker_env_var",
+                        "expected_async_terminal_commits",
+                        "expected_terminal_mode",
+                    }
+                )
+                if unexpected_keys:
+                    raise ValueError(
+                        f"agreement_ab_arms contains unsupported keys: {sorted(unexpected_keys)}"
+                    )
+                arm_name = str(arm.get("name", "")).strip()
+                if len(agreement_arms) > 1 and not arm_name:
+                    raise ValueError("paired agreement arms require unique non-empty names")
+                if arm_name in arm_names:
+                    raise ValueError(f"duplicate agreement arm name: {arm_name}")
+                arm_names.add(arm_name)
+                expected_async_terminal_commits = arm.get("expected_async_terminal_commits")
+                if expected_async_terminal_commits is not None:
+                    expected_async_terminal_commits = int(expected_async_terminal_commits)
+                    if expected_async_terminal_commits < 0:
+                        raise ValueError("expected_async_terminal_commits must be non-negative")
+                expected_terminal_mode = arm.get("expected_terminal_mode")
+                if expected_terminal_mode is not None:
+                    expected_terminal_mode = int(expected_terminal_mode)
+                    if expected_terminal_mode not in (0, 1):
+                        raise ValueError("expected_terminal_mode must be 0 or 1")
+                if (expected_terminal_mode is None) != (expected_peer_ready_mode is None):
+                    raise ValueError(
+                        "expected_terminal_mode and expected_peer_ready_mode "
+                        "must be configured together"
+                    )
+                config_name = f"{benchmark_mode}-{config_file_base_name}"
+                if arm_name:
+                    config_name = f"{config_name}-{arm_name}"
+                arm_ctx_worker_env_var = " ".join(
+                    part
+                    for part in (
+                        ctx_worker_env_var,
+                        arm.get("ctx_worker_env_var", ""),
+                    )
+                    if part
+                )
 
-            # server_configs is a list with one element (tuple of ctx, gen, disagg config)
-            self.server_configs = [(ctx_server_config, gen_server_config, disagg_config)]
+                ctx_server_config_data = {
+                    "internal_request_auth_key": internal_request_auth_key,
+                    "concurrency": concurrency_values[0],
+                    "name": config_name,
+                    "model_name": model_name,
+                    "gpus_per_node": gpus_per_node,
+                    "disagg_run_type": "ctx",
+                    **worker_config.get("ctx", {}),
+                }
+                gen_server_config_data = {
+                    "internal_request_auth_key": internal_request_auth_key,
+                    "concurrency": concurrency_values[0],
+                    "name": config_name,
+                    "model_name": model_name,
+                    "gpus_per_node": gpus_per_node,
+                    "disagg_run_type": "gen",
+                    **worker_config.get("gen", {}),
+                }
+
+                ctx_server_config = ServerConfig(ctx_server_config_data, arm_ctx_worker_env_var)
+                gen_server_config = ServerConfig(gen_server_config_data, gen_worker_env_var)
+                disagg_config = DisaggConfig(
+                    name=config_name,
+                    disagg_serving_type=disagg_serving_type,
+                    hostname=socket.gethostname(),
+                    numa_bind=numa_bind,
+                    timeout=timeout,
+                    benchmark_mode=benchmark_mode,
+                    model_name=model_name,
+                    hardware=hardware,
+                    server_env_var=server_env_var,
+                    internal_request_auth_key=internal_request_auth_key,
+                    client_timeout_seconds=client_timeout_seconds,
+                    post_benchmark_drain_seconds=post_benchmark_drain_seconds,
+                    expected_context_activations=expected_context_activations,
+                    expected_async_terminal_commits=expected_async_terminal_commits,
+                    expected_terminal_mode=expected_terminal_mode,
+                    expected_peer_ready_mode=expected_peer_ready_mode,
+                    server_config_extra=config.get("server_config_extra", {}),
+                )
+                self.server_configs.append((ctx_server_config, gen_server_config, disagg_config))
 
         # Create client configs for each concurrency value
         # For ctx_only: OSL is set to 1 and dataset_file is empty
@@ -1949,45 +2573,46 @@ class PerfSanityTestConfig:
         dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
         use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
 
-        if benchmark_mode == "ctx_only":
-            spec_decoding = bool(ctx_server_config.spec_decoding_type)
-        else:
-            spec_decoding = bool(ctx_server_config.spec_decoding_type) or bool(
-                gen_server_config.spec_decoding_type
-            )
-
         # Accuracy lives at the top of disagg yamls; only_run_accuracy lives inside
         # benchmark: (since `benchmark` is what becomes the disagg ClientConfig).
         accuracy_data = config.get("accuracy") or None
         only_run_accuracy = bool(benchmark.get("only_run_accuracy", False))
 
-        client_configs = []
-        for concurrency in concurrency_values:
-            client_config_data = {
-                "concurrency": concurrency,
-                "iterations": 1
-                if benchmark_mode == "gen_only"
-                else benchmark.get("multi_round", 1),
-                "isl": benchmark.get("input_length", 1024),
-                "osl": osl,
-                "random_range_ratio": benchmark.get("benchmark_ratio", 0.0),
-                "backend": "openai",
-                "use_chat_template": False,
-                "streaming": benchmark.get("streaming", True),
-                "dataset_file": dataset_file,
-                "use_nv_sa_benchmark": use_nv_sa_benchmark,
-                "accuracy_config": accuracy_data,
-                "only_run_accuracy": only_run_accuracy,
-            }
-            client_config = ClientConfig(
-                client_config_data,
-                model_name,
-                env_vars=client_env_var,
-                spec_decoding=spec_decoding,
-            )
-            client_configs.append(client_config)
-
-        self.server_client_configs = {0: client_configs}
+        self.server_client_configs = {}
+        for server_idx, server_config in enumerate(self.server_configs):
+            if benchmark_mode == "ctx_only":
+                spec_decoding = bool(server_config.spec_decoding_type)
+            else:
+                ctx_server_config, gen_server_config, _ = server_config
+                spec_decoding = bool(ctx_server_config.spec_decoding_type) or bool(
+                    gen_server_config.spec_decoding_type
+                )
+            client_configs = []
+            for concurrency in concurrency_values:
+                client_config_data = {
+                    "concurrency": concurrency,
+                    "iterations": 1
+                    if benchmark_mode == "gen_only"
+                    else benchmark.get("multi_round", 1),
+                    "isl": benchmark.get("input_length", 1024),
+                    "osl": osl,
+                    "random_range_ratio": benchmark.get("benchmark_ratio", 0.0),
+                    "backend": "openai",
+                    "use_chat_template": False,
+                    "streaming": benchmark.get("streaming", True),
+                    "dataset_file": dataset_file,
+                    "use_nv_sa_benchmark": use_nv_sa_benchmark,
+                    "accuracy_config": accuracy_data,
+                    "only_run_accuracy": only_run_accuracy,
+                }
+                client_config = ClientConfig(
+                    client_config_data,
+                    model_name,
+                    env_vars=client_env_var,
+                    spec_decoding=spec_decoding,
+                )
+                client_configs.append(client_config)
+            self.server_client_configs[server_idx] = client_configs
 
     def _resolve_internal_request_auth_key(self, config: dict) -> str:
         explicit_key = config.get("internal_request_auth_key")
@@ -2128,6 +2753,8 @@ class PerfSanityTestConfig:
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
             internal_request_auth_key=disagg_config.internal_request_auth_key,
+            client_timeout_seconds=disagg_config.client_timeout_seconds,
+            post_benchmark_drain_seconds=disagg_config.post_benchmark_drain_seconds,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
         )
@@ -2179,6 +2806,8 @@ class PerfSanityTestConfig:
 
             except Exception as e:
                 outputs[server_idx] = []
+                if isinstance(commands, DisaggTestCmds):
+                    commands.publish_paired_arm_abort(server_idx, e)
                 # Aggregated mode does not set DISAGG_SERVING_TYPE, so the
                 # default "BENCHMARK" applies and report_error is always called.
                 # Disagg mode sets DISAGG_SERVING_TYPE per srun; only the

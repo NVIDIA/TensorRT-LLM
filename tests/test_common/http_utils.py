@@ -1,6 +1,7 @@
 import os
 import subprocess
 import time
+from collections.abc import Callable
 
 import requests
 
@@ -50,21 +51,27 @@ def wait_for_endpoint_ready(
     check_files: list[str] | None = None,
     server_proc: subprocess.Popen | None = None,
     check_interval: float = 30.0,
+    abort_check: Callable[[], None] | None = None,
 ):
     """Poll ``url`` until it returns 200, failing fast and loudly otherwise.
 
-    Fail-fast paths (all of which dump the tails of ``check_files`` so the
-    server-side story lands in the CI log):
+    Fail-fast paths:
+      - ``abort_check`` observes a sibling-role failure;
       - ``server_proc`` exited -> no point polling a dead server for the
         remaining timeout;
       - an error keyword appears in a ``check_files`` log (scanned every
         ``check_interval`` seconds; time-based rather than iteration-based);
       - ``timeout`` elapses without the endpoint becoming ready.
+
+    The process, log-error, and timeout paths dump ``check_files`` tails so
+    the server-side story lands in the CI log.
     """
     start = time.monotonic()
     next_file_check = start + check_interval
     missing_warned: set[str] = set()
     while time.monotonic() - start < timeout:
+        if abort_check is not None:
+            abort_check()
         # Check server_proc if provided (singular)
         fail_if_proc_died(server_proc, "Server process (before becoming ready)", check_files)
 

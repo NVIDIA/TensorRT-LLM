@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from threading import Event, Lock, Thread
 from typing import Callable, Optional
@@ -190,12 +193,15 @@ class ZMQMessenger(MessengerInterface):
             logger.debug("Stopping ZMQMessenger...")
 
             self._stop_event.set()
-            self._internal_socket.send(b"STOP")
             if self._listener_thread:
                 self._internal_socket.send(b"STOP")
                 self._listener_thread.join(timeout)
                 if self._listener_thread.is_alive():
-                    logger.warning("Listener thread did not terminate within timeout")
+                    # Closing a socket/context while its listener is still in
+                    # poll/recv is a use-after-close. Keep ownership intact and
+                    # let the caller stop memory teardown.
+                    self._closed = False
+                    raise RuntimeError("Messenger listener did not terminate within timeout")
 
             _close_socket(self._socket)
             _close_socket(self._internal_socket)

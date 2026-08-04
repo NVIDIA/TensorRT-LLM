@@ -135,6 +135,7 @@ def get_from_waiting_queue(
     enable_attention_dp: bool,
     max_num_active_requests: int,
     all_ranks_num_active_requests: Optional[List[int]] = None,
+    deferred_request_ids: Optional[set[int]] = None,
 ) -> List:
     """Get requests from the waiting queue.
 
@@ -144,6 +145,8 @@ def get_from_waiting_queue(
         enable_attention_dp: Whether to enable attention DP scheduling.
         max_num_active_requests: Maximum number of active requests per rank.
         all_ranks_num_active_requests: Number of active requests for each rank.
+        deferred_request_ids: Request IDs that must remain queued while other
+            eligible requests are considered.
 
     Returns:
         List of requests that can be processed.
@@ -162,6 +165,9 @@ def get_from_waiting_queue(
 
     while req_count < max_req_count and waiting_queue:
         req_item = waiting_queue.peek_request()
+        if deferred_request_ids and req_item.id in deferred_request_ids:
+            pending_requests.append(waiting_queue.pop_request())
+            continue
         num_children = len(req_item.child_req_ids) if req_item.child_req_ids else 0
         if (req_count + 1 + num_children) > max_req_count:
             break
