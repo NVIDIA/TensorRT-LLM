@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -70,6 +70,20 @@ class TestSamplingParamsConversion:
         assert params.temperature == 0.7
         assert params.top_k == 50
         assert params.top_p == 0.9
+
+    def test_max_tokens_omitted_defers_to_engine(self):
+        """Omitted max_tokens (None or proto3 uint32 default 0) becomes None."""
+        proto_config = pb2.SamplingConfig()
+        output_config = pb2.OutputConfig()
+
+        # Explicitly unset (None) and proto3 default (0) both defer to engine.
+        for max_tokens in (None, 0):
+            params = create_sampling_params_from_proto(
+                proto_config=proto_config,
+                output_config=output_config,
+                max_tokens=max_tokens,
+            )
+            assert params.max_tokens is None
 
     def test_beam_search_config(self):
         """Test beam search configuration."""

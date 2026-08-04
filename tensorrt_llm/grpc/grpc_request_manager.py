@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -248,7 +248,7 @@ class GrpcRequestManager:
 def create_sampling_params_from_proto(
     proto_config: pb2.SamplingConfig,
     output_config: pb2.OutputConfig,
-    max_tokens: int,
+    max_tokens: Optional[int] = None,
     stop: Optional[List[str]] = None,
     stop_token_ids: Optional[List[int]] = None,
     ignore_eos: bool = False,
@@ -264,7 +264,10 @@ def create_sampling_params_from_proto(
     Args:
         proto_config: Protobuf SamplingConfig message
         output_config: Protobuf OutputConfig message
-        max_tokens: Maximum tokens to generate
+        max_tokens: Maximum tokens to generate. A falsy value (None or 0, e.g.
+            an omitted proto3 ``uint32`` field) defers to the engine-side
+            default, which fills the remaining context
+            (``max_seq_len - prompt_len``), matching the Python ``LLM`` API.
         stop: Stop strings (tokenized by TRT-LLM's _setup())
         stop_token_ids: Stop token IDs
         ignore_eos: Whether to ignore end-of-sequence token
@@ -279,8 +282,11 @@ def create_sampling_params_from_proto(
     """
     # Build kwargs for SamplingParams
     # KEY OPTIMIZATION: detokenize=False skips Python detokenization!
+    # Treat an omitted max_tokens (None, or the proto3 default 0 for the
+    # non-optional uint32 field) as "unset" so the engine deduces the default
+    # from the remaining context, matching the Python LLM API behavior.
     kwargs = {
-        "max_tokens": max_tokens,
+        "max_tokens": max_tokens if max_tokens else None,
         "detokenize": False,
     }
 
