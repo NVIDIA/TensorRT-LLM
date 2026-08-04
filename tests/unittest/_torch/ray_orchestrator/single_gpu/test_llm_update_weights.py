@@ -41,8 +41,20 @@ def release_shared_cuda_memory():
 
 
 class RefHFModelWithIPCHandles(RefHFModel):
-    def __init__(self, model_dir: str, device_id: int = 0, **model_kwargs):
+    def __init__(
+        self,
+        model_dir: str,
+        device_id: int = 0,
+        *,
+        num_hidden_layers: Optional[int] = None,
+        layers_block_type: Optional[List[str]] = None,
+    ):
         self.device_id = device_id
+        model_kwargs = {}
+        if num_hidden_layers is not None:
+            model_kwargs["num_hidden_layers"] = num_hidden_layers
+        if layers_block_type is not None:
+            model_kwargs["layers_block_type"] = layers_block_type
         self.model = AutoModelForCausalLM.from_pretrained(
             model_dir,
             torch_dtype=torch.bfloat16,
@@ -53,9 +65,12 @@ class RefHFModelWithIPCHandles(RefHFModel):
         # ``layers_block_type`` and silently ignore the num_hidden_layers
         # override; callers must pass a truncated ``layers_block_type`` for
         # such models. Catch a silently ignored override loudly here.
-        num_hidden_layers = model_kwargs.get("num_hidden_layers")
         if num_hidden_layers is not None:
-            assert self.model.config.num_hidden_layers == num_hidden_layers
+            assert self.model.config.num_hidden_layers == num_hidden_layers, (
+                f"num_hidden_layers override silently ignored: "
+                f"HF loaded {self.model.config.num_hidden_layers}, "
+                f"expected {num_hidden_layers}"
+            )
         self.all_weights = {}
         self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
         self._replicate_weights()

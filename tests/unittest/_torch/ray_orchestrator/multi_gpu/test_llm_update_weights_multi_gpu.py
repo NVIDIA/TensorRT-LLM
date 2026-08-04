@@ -1,11 +1,7 @@
 import base64
 import gc
-import importlib.util
-import os
 import pickle
 import re
-import subprocess
-import sys
 from typing import Callable, List, Optional, Tuple
 
 import pytest
@@ -626,73 +622,27 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
     del hf_model
 
 
-@pytest.fixture
-def mamba_deps():
-    """Install mamba-ssm and causal-conv1d for the duration of the test, then
-    restore the full pip environment. Uses a pip-freeze diff so transitive
-    dependencies (e.g. quack-kernels pinning nvidia-cutlass-dsl==4.6.0.dev0,
-    which breaks tensorrt-llm's pin of 4.5.0) are also reverted."""
+@pytest.mark.part4
+@skip_pre_hopper
+def test_llm_update_weights_nemotron_h():
+    """Weight update on Nemotron-H, a hybrid model mixing mamba, MoE and
+    attention layers.
 
-    def _freeze():
-        out = subprocess.check_output(
-            [sys.executable, "-m", "pip", "freeze", "--disable-pip-version-check"],
-            text=True,
-        )
-        result = {}
-        for line in out.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or " @ " in line:
-                continue
-            if "==" in line:
-                name, ver = line.split("==", 1)
-                result[name.lower()] = ver
-        return result
-
-    pkgs = ["mamba-ssm", "causal-conv1d"]
-    mod_names = {"mamba-ssm": "mamba_ssm", "causal-conv1d": "causal_conv1d"}
-    need_install = [p for p in pkgs if importlib.util.find_spec(mod_names[p]) is None]
-
-    before = _freeze() if need_install else None
+    Requires mamba-ssm and causal-conv1d to be importable: without them HF
+    falls back to the naive Python selective_scan path, which OOMs on
+    Nemotron-H and produces unmatched logits. The Ray CI stage installs both
+    next to ray -- see jenkins/scripts/slurm_install.sh."""
     try:
-        if need_install:
-            # --no-deps: avoid pulling in optional kernel deps (quack-kernels,
-            # tilelang) that upgrade nvidia-cutlass-dsl and break tensorrt-llm.
-            # The container already provides torch/einops/etc.
-            subprocess.check_call(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--no-build-isolation",
-                    "--no-deps",
-                    *need_install,
-                ]
-            )
-            importlib.invalidate_caches()
-        yield
-    finally:
-        if before is None:
-            return
-        after = _freeze()
-        new_pkgs = [p for p in after if p not in before]
-        changed = [(p, before[p]) for p in after if p in before and after[p] != before[p]]
-        if new_pkgs:
-            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", *new_pkgs])
-        if changed:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", *[f"{p}=={v}" for p, v in changed]]
-            )
-
-
-def _nemotron_h_body():
-    """Body of test_llm_update_weights_nemotron_h. Executed in a fresh
-    ``python -m pytest`` subprocess (via test_nemotron_h_body_impl) so HF
-    transformers re-imports cleanly and the mamba-ssm / causal-conv1d fast
-    path (installed by the mamba_deps fixture) is picked up. Running this
-    in-process would let the parent pytest's already-resolved negative
-    caches force the naive Python selective_scan path, which OOMs on
-    Nemotron-H and produces unmatched logits."""
+        import causal_conv1d  # noqa: F401
+        import mamba_ssm  # noqa: F401
+    except ImportError as e:
+        # Fail loudly here rather than let the naive fallback OOM further in,
+        # which is a much harder failure to read.
+        pytest.fail(
+            f"{e.name} is not installed, so the mamba fast path is unavailable. "
+            "The Ray CI stage installs mamba-ssm and causal-conv1d alongside ray; "
+            "see jenkins/scripts/slurm_install.sh."
+        )
     model_dir = str(llm_models_root() / "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
     num_hidden_layers = 7
     # NemotronHConfig derives num_hidden_layers from ``layers_block_type``
@@ -770,78 +720,11 @@ def _nemotron_h_body():
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         # Looser threshold: Nemotron-H logits are compared against a BF16
         # reference and the mamba SSM / selective-scan path introduces small
-        # numerical differences (observed top-20 overlap ~0.89 vs the 0.9
-        # default).
-        compare_logits(llm_logits, ref_logits, threshold=0.8)
+        # numerical differences. Measured over 5 runs x 4 prompts (GB200, TP=4,
+        # BF16): mean top-20 overlap 0.891, overall range 0.867-0.928. The
+        # spread is dominated by which prompt it is, not by run-to-run noise --
+        # the weakest prompt stays in 0.867-0.875 across all 5 runs, so 0.85
+        # clears the worst observation by ~0.017 while 0.88 would already flake.
+        compare_logits(llm_logits, ref_logits, threshold=0.85)
 
     del hf_model
-
-
-# Guard so this inner test only runs inside the subprocess launched by
-# ``test_llm_update_weights_nemotron_h`` (which sets the env var and targets it
-# by node id). It carries no ``part*`` marker, so marker-filtered CI runs
-# deselect it, and the env guard skips it in an unfiltered in-process run.
-_NEMOTRON_H_BODY_ENV = "_TLLM_RUN_NEMOTRON_H_BODY"
-
-
-@pytest.mark.skipif(
-    os.environ.get(_NEMOTRON_H_BODY_ENV) != "1",
-    reason="Inner body of test_llm_update_weights_nemotron_h; only run in the "
-    "subprocess spawned by that test.",
-)
-def test_nemotron_h_body_impl():
-    _nemotron_h_body()
-
-
-@pytest.mark.part4
-@skip_pre_hopper
-def test_llm_update_weights_nemotron_h(mamba_deps):
-    """Runs the Nemotron-H body in a fresh ``python -m pytest`` subprocess so
-    HF transformers re-imports cleanly and picks up the mamba-ssm /
-    causal-conv1d fast path installed by the ``mamba_deps`` fixture (a plain
-    in-process run would keep the parent's negative import caches; see the
-    _nemotron_h_body docstring). Driving it as a subprocess — instead of a
-    hand-managed ``multiprocessing`` child — lets ``subprocess.run`` and the
-    inner pytest own the process lifecycle: a hang is bounded by ``timeout=``,
-    a crash surfaces as a non-zero return code, and the failure detail is the
-    inner pytest's own traceback."""
-    # Must stay under the outer pytest ``--timeout`` so a genuine hang (e.g. a
-    # Ray/NCCL/CUDA deadlock) is reported here with useful output instead of
-    # the whole test being hard-killed at the pytest timeout.
-    subprocess_timeout_s = 1800.0
-
-    node_id = f"{os.path.abspath(__file__)}::test_nemotron_h_body_impl"
-    cmd = [
-        sys.executable,
-        "-m",
-        "pytest",
-        node_id,
-        "--run-ray",
-        "-p",
-        "no:cacheprovider",
-        "-p",
-        "no:xdist",
-        "--tb=short",
-        "-s",
-        "-v",
-    ]
-    env = {**os.environ, _NEMOTRON_H_BODY_ENV: "1"}
-    try:
-        result = subprocess.run(
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=subprocess_timeout_s,
-        )
-    except subprocess.TimeoutExpired as e:
-        out = (e.stdout or "") + (e.stderr or "")
-        pytest.fail(
-            f"Nemotron-H subprocess did not complete within "
-            f"{subprocess_timeout_s:.0f}s (likely hung); terminated.\n{out}"
-        )
-    if result.returncode != 0:
-        pytest.fail(
-            f"Nemotron-H subprocess failed (exit code {result.returncode}).\n"
-            f"{result.stdout}\n{result.stderr}"
-        )
