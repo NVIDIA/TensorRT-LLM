@@ -71,11 +71,15 @@ def _is_executor_unittest_group_case(case: str) -> bool:
         case_args = case.split()
     if not case_args:
         return False
-    return case_args[0].replace("\\", "/").rstrip("/") == "unittest/_torch/executor"
+    normalized_case = case_args[0].replace("\\", "/").rstrip("/")
+    return len(case_args) == 1 and normalized_case == "unittest/_torch/executor"
 
 
 def _append_case_specific_pytest_options(command: list[str], case: str) -> None:
     if _is_executor_unittest_group_case(case):
+        # Temporary waiver for #16284: the leak is observed during teardown of
+        # the full executor unittest group after all inner tests pass. Keep
+        # thread-leak checking enabled for individual executor files/selectors.
         command.extend(["-o", "threadleak=False"])
 
 

@@ -18,13 +18,15 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 
-def _load_test_unittests_module():
+
+def _load_test_unittests_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     defs_module = types.ModuleType("defs")
     conftest_module = types.ModuleType("defs.conftest")
     conftest_module.tests_path = lambda: Path("tests")
-    sys.modules.setdefault("defs", defs_module)
-    sys.modules.setdefault("defs.conftest", conftest_module)
+    monkeypatch.setitem(sys.modules, "defs", defs_module)
+    monkeypatch.setitem(sys.modules, "defs.conftest", conftest_module)
 
     module_path = Path(__file__).parents[2] / "integration" / "defs" / "test_unittests.py"
     spec = importlib.util.spec_from_file_location("_test_unittests_wrapper", module_path)
@@ -34,8 +36,26 @@ def _load_test_unittests_module():
     return module
 
 
-def test_executor_unittest_group_disables_threadleak_checker():
-    module = _load_test_unittests_module()
+def test_loader_restores_stub_modules_after_context() -> None:
+    original_defs = sys.modules.pop("defs", None)
+    original_conftest = sys.modules.pop("defs.conftest", None)
+    try:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            _load_test_unittests_module(monkeypatch)
+            assert "defs" in sys.modules
+            assert "defs.conftest" in sys.modules
+
+        assert "defs" not in sys.modules
+        assert "defs.conftest" not in sys.modules
+    finally:
+        if original_defs is not None:
+            sys.modules["defs"] = original_defs
+        if original_conftest is not None:
+            sys.modules["defs.conftest"] = original_conftest
+
+
+def test_executor_unittest_group_disables_threadleak_checker(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_test_unittests_module(monkeypatch)
     command = ["-m", "pytest", "unittest/_torch/executor"]
 
     module._append_case_specific_pytest_options(command, "unittest/_torch/executor")
@@ -44,8 +64,26 @@ def test_executor_unittest_group_disables_threadleak_checker():
     assert "threadleak=False" in command
 
 
-def test_non_executor_unittest_group_keeps_threadleak_checker():
-    module = _load_test_unittests_module()
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unittest/_torch/executor/test_example.py",
+        "unittest/_torch/executor -k test_example",
+    ],
+)
+def test_executor_unittest_subsets_keep_threadleak_checker(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    module = _load_test_unittests_module(monkeypatch)
+    command = ["-m", "pytest", case]
+
+    module._append_case_specific_pytest_options(command, case)
+
+    assert "threadleak=False" not in command
+
+
+def test_non_executor_unittest_group_keeps_threadleak_checker(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_test_unittests_module(monkeypatch)
     command = ["-m", "pytest", "unittest/_torch/attention"]
 
     module._append_case_specific_pytest_options(command, "unittest/_torch/attention")
