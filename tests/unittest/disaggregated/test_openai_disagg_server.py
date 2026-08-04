@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi import Request
 from starlette.datastructures import Headers
 
-from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
+from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
 from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
@@ -94,6 +94,21 @@ async def test_http_cluster_storage_request_is_proxied_to_coordinator():
     )
     assert response.status_code == 200
     assert response.body == b'{"result":true}'
+
+
+def test_create_client_does_not_register_with_server_metrics_collector():
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._coordinator = SimpleNamespace(get_disagg_request_id=AsyncMock(return_value=1))
+    server._req_timeout_secs = 30
+    server._collect_perf_metrics = True
+    server._config = SimpleNamespace(internal_request_auth_key="key")
+    server._perf_metrics_collector = SimpleNamespace()
+
+    with patch("tensorrt_llm.serve.openai_disagg_server.OpenAIHttpClient") as mock_client:
+        client = server._create_client(SimpleNamespace(), ServerRole.GENERATION, max_retries=2)
+
+    assert client is mock_client.return_value
+    mock_client.assert_called_once()
 
 
 def test_extract_conversation_id_from_headers():
