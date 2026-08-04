@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -416,6 +419,83 @@ class TestDisaggTransferAdmissionController:
 
 
 class TestDisaggTransferIdleProgress:
+    @staticmethod
+    def _enable_gen_world_vote_bypass(executor, role="gen"):
+        if role == "gen":
+            executor.dist = Mock(rank=3, world_size=8, tp_size=8, pp_size=1, cp_size=1)
+            executor.enable_attention_dp = True
+        else:
+            executor.dist = Mock(rank=2, world_size=4, tp_size=1, pp_size=4, cp_size=1)
+            executor.enable_attention_dp = False
+        executor._gen_world_vote_bypass_enabled = True
+        executor._gen_world_vote_bypass_role_name = role
+        executor._gen_world_vote_idle_checks = 0
+        executor._gen_world_vote_wait_flag_true = 0
+        executor._gen_world_vote_wait_flag_false = 0
+        executor._gen_world_vote_calls = 0
+        executor._gen_world_vote_skipped = 0
+        executor._gen_world_vote_ctx_calls = 0
+        executor._gen_world_vote_gen_status_one_calls = 0
+        executor._gen_world_vote_ctx_status_one_calls = 0
+        executor._gen_world_vote_first_skip_logged = False
+        executor._gen_world_vote_summary_logged = False
+
+    @pytest.mark.parametrize(
+        "role,topology,attention_dp,decision",
+        [
+            (
+                "gen",
+                dict(rank=0, world_size=8, tp_size=8, pp_size=1, cp_size=1),
+                True,
+                "bypass_all_false_world_vote",
+            ),
+            (
+                "ctx",
+                dict(rank=0, world_size=4, tp_size=1, pp_size=4, cp_size=1),
+                False,
+                "control_world_vote_preserved",
+            ),
+        ],
+    )
+    def test_bypass_initializes_only_exact_topologies(
+        self, monkeypatch, role, topology, attention_dp, decision
+    ):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(**topology)
+        executor.enable_attention_dp = attention_dp
+        info = Mock()
+        monkeypatch.setenv("TRTLLM_NVBUG_6448152_BYPASS_FALSE_GEN_WORLD_VOTE", "1")
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", info)
+
+        PyExecutor._initialize_gen_world_vote_bypass_diagnostic(executor)
+
+        assert executor._gen_world_vote_bypass_enabled
+        assert executor._gen_world_vote_bypass_role_name == role
+        message = info.call_args.args[0]
+        assert "event=effective_config" in message
+        assert f"decision={decision}" in message
+        assert f"role={role}" in message
+
+    def test_bypass_rejects_unexpected_topology(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=0, world_size=2, tp_size=2, pp_size=1, cp_size=1)
+        executor.enable_attention_dp = True
+        monkeypatch.setenv("TRTLLM_NVBUG_6448152_BYPASS_FALSE_GEN_WORLD_VOTE", "1")
+
+        with pytest.raises(RuntimeError, match="exact frozen GB300 topology"):
+            PyExecutor._initialize_gen_world_vote_bypass_diagnostic(executor)
+
+    def test_bypass_stays_disabled_without_env(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(rank=0, world_size=8, tp_size=8, pp_size=1, cp_size=1)
+        executor.enable_attention_dp = True
+        monkeypatch.delenv("TRTLLM_NVBUG_6448152_BYPASS_FALSE_GEN_WORLD_VOTE", raising=False)
+
+        PyExecutor._initialize_gen_world_vote_bypass_diagnostic(executor)
+
+        assert not executor._gen_world_vote_bypass_enabled
+        assert executor._gen_world_vote_bypass_role_name == "disabled"
+
     def test_gen_transfer_status_polls_active_transfers(self):
         executor = object.__new__(PyExecutor)
         executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
@@ -469,6 +549,138 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
         executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+
+    def test_bypass_skips_false_world_vote_and_keeps_ctx_tp_vote(self):
+        executor = object.__new__(PyExecutor)
+        self._enable_gen_world_vote_bypass(executor)
+        executor.dist.tp_allreduce.return_value = 0
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=1,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+        )
+
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        assert executor._gen_world_vote_idle_checks == 1
+        assert executor._gen_world_vote_wait_flag_true == 0
+        assert executor._gen_world_vote_wait_flag_false == 1
+        assert executor._gen_world_vote_skipped == 1
+        assert executor._gen_world_vote_ctx_calls == 1
+
+    def test_bypass_preserves_warmup_world_vote_without_counting(self):
+        executor = object.__new__(PyExecutor)
+        self._enable_gen_world_vote_bypass(executor)
+        executor._is_warmup = True
+        executor.dist.allreduce.return_value = 0
+        executor.dist.tp_allreduce.return_value = 0
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=1,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+        )
+
+        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        executor.dist.tp_allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        assert executor._gen_world_vote_idle_checks == 0
+        assert executor._gen_world_vote_calls == 0
+        assert executor._gen_world_vote_skipped == 0
+
+    def test_bypass_fails_closed_on_transport_admission_wait(self):
+        executor = object.__new__(PyExecutor)
+        self._enable_gen_world_vote_bypass(executor)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        with pytest.raises(RuntimeError, match="unexpected transport-admission"):
+            PyExecutor._check_disagg_transfer_progress_when_idle(
+                executor,
+                num_fitting_reqs=0,
+                fitting_disagg_gen_init_requests=[],
+                wait_for_disagg_gen_transfer_progress=True,
+                all_gen_first=False,
+            )
+
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_allreduce.assert_not_called()
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        assert executor._gen_world_vote_wait_flag_true == 1
+        assert executor._gen_world_vote_skipped == 0
+
+    def test_bypass_keeps_ctx_world_vote_and_status_one_path(self):
+        executor = object.__new__(PyExecutor)
+        self._enable_gen_world_vote_bypass(executor, role="ctx")
+        executor.dist.allreduce.return_value = 0
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+        )
+
+        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
+        assert executor._gen_world_vote_calls == 1
+        assert executor._gen_world_vote_skipped == 0
+        assert executor._gen_world_vote_ctx_status_one_calls == 1
+
+    def test_bypass_keeps_ctx_wait_true_world_vote_and_gen_status_one_path(self):
+        executor = object.__new__(PyExecutor)
+        self._enable_gen_world_vote_bypass(executor, role="ctx")
+        executor.dist.allreduce.return_value = 1
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+        )
+
+        executor.dist.allreduce.assert_called_once_with(1, op=ReduceOp.MAX)
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        assert executor._gen_world_vote_wait_flag_true == 1
+        assert executor._gen_world_vote_calls == 1
+        assert executor._gen_world_vote_gen_status_one_calls == 1
+
+    def test_bypass_summary_is_idempotent(self, monkeypatch):
+        executor = object.__new__(PyExecutor)
+        self._enable_gen_world_vote_bypass(executor)
+        executor._gen_world_vote_idle_checks = 4
+        executor._gen_world_vote_wait_flag_false = 4
+        executor._gen_world_vote_skipped = 4
+        info = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.info", info)
+
+        PyExecutor._log_gen_world_vote_bypass_summary(executor)
+        PyExecutor._log_gen_world_vote_bypass_summary(executor)
+
+        info.assert_called_once()
+        message = info.call_args.args[0]
+        assert "event=summary" in message
+        assert "idle_checks=4" in message
+        assert "gen_world_vote_calls=0" in message
+        assert "gen_world_vote_skipped=4" in message
 
     def test_falls_back_to_context_transfer_when_not_generation_blocked(self):
         executor = object.__new__(PyExecutor)

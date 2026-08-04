@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import functools
@@ -101,6 +104,12 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+# TEST ONLY: isolate the scheduler-level generation-status world vote added by
+# PR15356. The exact diagnostic workload has no transport-admission wait vote,
+# so the treatment skips only the otherwise all-false GEN world synchronization.
+_BYPASS_FALSE_GEN_WORLD_VOTE_ENV = (
+    "TRTLLM_NVBUG_6448152_BYPASS_FALSE_GEN_WORLD_VOTE")
 
 
 class PPCommTag(IntEnum):
@@ -774,6 +783,7 @@ class PyExecutor:
                                    None)
         self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer, tokens_per_block)
+        self._initialize_gen_world_vote_bypass_diagnostic()
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
@@ -2020,6 +2030,8 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+        if getattr(self, "_gen_world_vote_bypass_enabled", False):
+            self._log_gen_world_vote_bypass_summary()
 
         for i in range(self.num_micro_batches):
             try:
@@ -2781,6 +2793,87 @@ class PyExecutor:
         except (AttributeError, TypeError, ValueError):
             return 1
 
+    def _gen_world_vote_bypass_topology(self) -> str:
+        return (
+            f"rank={self._dist_size(self.dist, 'rank')} "
+            f"world_size={self._dist_size(self.dist, 'world_size')} "
+            f"tp_size={self._dist_size(self.dist, 'tp_size')} "
+            f"pp_size={self._dist_size(self.dist, 'pp_size')} "
+            f"cp_size={self._dist_size(self.dist, 'cp_size')} "
+            f"attention_dp={int(getattr(self, 'enable_attention_dp', False))}")
+
+    def _gen_world_vote_bypass_role(self) -> Optional[str]:
+        world_size = self._dist_size(self.dist, "world_size")
+        tp_size = self._dist_size(self.dist, "tp_size")
+        pp_size = self._dist_size(self.dist, "pp_size")
+        cp_size = self._dist_size(self.dist, "cp_size")
+        attention_dp = bool(getattr(self, "enable_attention_dp", False))
+        if ((world_size, tp_size, pp_size, cp_size, attention_dp) == (8, 8, 1,
+                                                                      1, True)):
+            return "gen"
+        if ((world_size, tp_size, pp_size, cp_size,
+             attention_dp) == (4, 1, 4, 1, False)):
+            return "ctx"
+        return None
+
+    def _initialize_gen_world_vote_bypass_diagnostic(self) -> None:
+        self._gen_world_vote_bypass_enabled = (
+            os.getenv(_BYPASS_FALSE_GEN_WORLD_VOTE_ENV) == "1")
+        self._gen_world_vote_bypass_role_name = "disabled"
+        self._gen_world_vote_idle_checks = 0
+        self._gen_world_vote_wait_flag_true = 0
+        self._gen_world_vote_wait_flag_false = 0
+        self._gen_world_vote_calls = 0
+        self._gen_world_vote_skipped = 0
+        self._gen_world_vote_ctx_calls = 0
+        self._gen_world_vote_gen_status_one_calls = 0
+        self._gen_world_vote_ctx_status_one_calls = 0
+        self._gen_world_vote_first_skip_logged = False
+        self._gen_world_vote_summary_logged = False
+        if not self._gen_world_vote_bypass_enabled:
+            return
+
+        role = self._gen_world_vote_bypass_role()
+        if role is None:
+            topology = self._gen_world_vote_bypass_topology()
+            logger.error("NVBUG6448152_GEN_WORLD_VOTE event=invalid_topology "
+                         f"{topology}")
+            raise RuntimeError(
+                "TEST ONLY generation world-vote bypass requires the exact "
+                f"frozen GB300 topology; observed {topology}")
+        self._gen_world_vote_bypass_role_name = role
+        decision = ("bypass_all_false_world_vote"
+                    if role == "gen" else "control_world_vote_preserved")
+        logger.info("NVBUG6448152_GEN_WORLD_VOTE event=effective_config "
+                    f"decision={decision} fail_closed_gen=1 role={role} "
+                    f"{self._gen_world_vote_bypass_topology()}")
+
+    def _log_gen_world_vote_bypass_summary(self) -> None:
+        if (not getattr(self, "_gen_world_vote_bypass_enabled", False)
+                or getattr(self, "_gen_world_vote_summary_logged", False)):
+            return
+        self._gen_world_vote_summary_logged = True
+        logger.info(
+            "NVBUG6448152_GEN_WORLD_VOTE event=summary "
+            "treatment=gen_only_all_false_world_vote_bypass "
+            "fail_closed_gen=1 "
+            f"role={getattr(self, '_gen_world_vote_bypass_role_name', 'unknown')} "
+            f"{self._gen_world_vote_bypass_topology()} "
+            f"idle_checks={getattr(self, '_gen_world_vote_idle_checks', 0)} "
+            "wait_flag_true="
+            f"{getattr(self, '_gen_world_vote_wait_flag_true', 0)} "
+            "wait_flag_false="
+            f"{getattr(self, '_gen_world_vote_wait_flag_false', 0)} "
+            "gen_world_vote_calls="
+            f"{getattr(self, '_gen_world_vote_calls', 0)} "
+            "gen_world_vote_skipped="
+            f"{getattr(self, '_gen_world_vote_skipped', 0)} "
+            f"ctx_vote_calls={getattr(self, '_gen_world_vote_ctx_calls', 0)} "
+            "gen_status1_calls="
+            f"{getattr(self, '_gen_world_vote_gen_status_one_calls', 0)} "
+            "ctx_status1_calls="
+            f"{getattr(self, '_gen_world_vote_ctx_status_one_calls', 0)}")
+
     def _sync_disagg_gen_status_entry(self, local_need_check: bool) -> int:
         if self._dist_size(self.dist, "world_size") > 1:
             return self.dist.allreduce(int(local_need_check), op=ReduceOp.MAX)
@@ -2804,17 +2897,60 @@ class PyExecutor:
         local_need_gen_check = (local_need_check
                                 and wait_for_disagg_gen_transfer_progress)
 
-        any_need_gen_check = self._sync_disagg_gen_status_entry(
-            local_need_gen_check)
+        diagnostic_enabled = (getattr(self, "_gen_world_vote_bypass_enabled",
+                                      False)
+                              and not getattr(self, "is_warmup", False))
+        if diagnostic_enabled:
+            self._gen_world_vote_idle_checks += 1
+            if wait_for_disagg_gen_transfer_progress:
+                self._gen_world_vote_wait_flag_true += 1
+                if self._gen_world_vote_bypass_role_name == "gen":
+                    logger.error(
+                        "NVBUG6448152_GEN_WORLD_VOTE "
+                        "event=unexpected_wait_flag "
+                        "decision=abort_before_asymmetric_collective "
+                        f"role={self._gen_world_vote_bypass_role_name} "
+                        f"local_need_check={int(local_need_check)} "
+                        f"{self._gen_world_vote_bypass_topology()}")
+                    raise RuntimeError(
+                        "TEST ONLY generation world-vote bypass observed an "
+                        "unexpected transport-admission wait request")
+            else:
+                self._gen_world_vote_wait_flag_false += 1
+            if self._gen_world_vote_bypass_role_name == "gen":
+                self._gen_world_vote_skipped += 1
+                any_need_gen_check = 0
+                if not self._gen_world_vote_first_skip_logged:
+                    logger.info(
+                        "NVBUG6448152_GEN_WORLD_VOTE event=exercised "
+                        "decision=skip_all_false_world_vote wait_flag=0 "
+                        f"role={self._gen_world_vote_bypass_role_name} "
+                        f"{self._gen_world_vote_bypass_topology()}")
+                    self._gen_world_vote_first_skip_logged = True
+            else:
+                self._gen_world_vote_calls += 1
+                any_need_gen_check = self._sync_disagg_gen_status_entry(
+                    local_need_gen_check)
+        else:
+            any_need_gen_check = self._sync_disagg_gen_status_entry(
+                local_need_gen_check)
         if any_need_gen_check > 0:
             if local_need_gen_check:
                 logger.debug(
                     "Waiting for generation KV cache transfer progress to free "
                     "disagg admission budget")
+            if diagnostic_enabled:
+                self._gen_world_vote_gen_status_one_calls += 1
             self._check_disagg_gen_cache_transfer_status(1)
             return
 
-        any_need_check = self._sync_disagg_ctx_status_entry(local_need_check)
+        if diagnostic_enabled:
+            self._gen_world_vote_ctx_calls += 1
+            any_need_check = self._sync_disagg_ctx_status_entry(
+                local_need_check)
+        else:
+            any_need_check = self._sync_disagg_ctx_status_entry(
+                local_need_check)
         if any_need_check > 0:
             if local_need_check and not all_gen_first:
                 logger.warning(
@@ -2822,6 +2958,8 @@ class PyExecutor:
                 )
                 # Local conditions warrant a blocking wait for at least one
                 # in-flight transfer to complete so KV blocks can be freed.
+                if diagnostic_enabled:
+                    self._gen_world_vote_ctx_status_one_calls += 1
                 self._check_disagg_ctx_cache_transfer_status(1)
             else:
                 # Either (a) a peer rank needed the call but we didn't, or
