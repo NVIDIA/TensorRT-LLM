@@ -396,7 +396,10 @@ def test_precheck_commands_propagate_model_root(monkeypatch, model_root):
 
     assert len(commands) == 2
     for command in commands:
-        assert f"LLM_MODELS_ROOT={model_root}" in shlex.split(command)
+        tokens = shlex.split(command)
+        assignment = f"LLM_MODELS_ROOT={model_root}"
+        assert assignment in tokens
+        assert tokens.index(assignment) < tokens.index("python3")
 
 
 def _enabled_line(cfg):
