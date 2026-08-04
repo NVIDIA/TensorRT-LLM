@@ -813,6 +813,81 @@ class TestRequestValidation:
         req = self._make_request(extra_params={"stg_scale": 0.5})
         self._merge_and_validate(executor, req)  # should not raise
 
+    def test_spec_validator_runs_at_preflight(self):
+        """Per-param validators turn deterministic client errors into 400s at
+        the boundary instead of worker-side failures (Cosmos3 conditioning)."""
+        import torch
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def _validate(extras):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params=extras),
+                declared_defaults={},
+                extra_param_specs=COSMOS3_EXTRA_SPECS,
+            )
+
+        # Valid values pass.
+        _validate({"condition_video_latent_indexes": [0, 1], "condition_video_keep": "last"})
+        # ``video`` carries encoded MP4/AVI bytes: a video signature passes,
+        # empty / non-video bytes are client errors, and anything that is not
+        # bytes (e.g. a decoded tensor) fails the type check.
+        _validate({"video": b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"})
+        with pytest.raises(ValueError, match="empty"):
+            _validate({"video": b""})
+        with pytest.raises(ValueError, match="not a recognized video container"):
+            _validate({"video": b"\x89PNG\r\n\x1a\n and not a video"})
+        with pytest.raises(ValueError, match="expected type 'bytes'"):
+            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8)})
+
+        with pytest.raises(ValueError, match="non-negative"):
+            _validate({"condition_video_latent_indexes": [0, -1]})
+        with pytest.raises(ValueError, match="must not be empty"):
+            _validate({"condition_video_latent_indexes": []})
+        with pytest.raises(ValueError, match="first or last"):
+            _validate({"condition_video_keep": "middle"})
+        # No silent float truncation; None elements are a 400, not a TypeError.
+        with pytest.raises(ValueError, match="must be integers"):
+            _validate({"condition_video_latent_indexes": [1.9]})
+        with pytest.raises(ValueError, match="must be integers"):
+            _validate({"condition_video_latent_indexes": [None]})
+        _validate({"condition_video_latent_indexes": [0, 1.0]})  # integral floats OK
+        with pytest.raises(ValueError, match="output_type"):
+            _validate({"output_type": "gif"})
+        _validate({"output_type": "image"})
+
+    def test_validator_type_errors_become_client_errors(self):
+        """A validator raising TypeError (wrong-shaped value it didn't guard)
+        still folds into the 400 message list instead of escaping as a 500."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def touchy(value):
+            len(value)  # TypeError on ints
+
+        specs = {"knob": ExtraParamSchema(type="int", default=None, validator=touchy)}
+        with pytest.raises(ValueError, match="extra_params\\['knob'\\]"):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params={"knob": 3}),
+                declared_defaults={},
+                extra_param_specs=specs,
+            )
+
+    def test_spec_validators_survive_pickling(self):
+        """Specs travel worker -> coordinator in the READY handshake (pickled
+        over ZMQ); validators must be module-level functions so they serialize
+        by reference — a lambda/closure here would crash worker startup."""
+        import pickle
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        specs = pickle.loads(pickle.dumps(COSMOS3_EXTRA_SPECS))
+        with pytest.raises(ValueError, match="first or last"):
+            specs["condition_video_keep"].validator("middle")
+        with pytest.raises(ValueError, match="not a recognized video container"):
+            specs["video"].validator(b"garbage bytes")
+
     # --- unsupported universal fields ---
 
     def test_num_frames_on_image_pipeline_raises(self):
@@ -1185,7 +1260,7 @@ class TestResolveSeed:
 class TestEngineFailureTransport:
     """Validation is enforced at :meth:`VisualGen.generate_async` entry, so
     by the time a request reaches ``process_request`` only runtime
-    failures from ``pipeline.infer()`` can produce an error response.
+    failures from ``pipeline.run_inference()`` can produce an error response.
     The error message rides back on ``DiffusionResponse.error_msg``.
     """
 
@@ -1215,7 +1290,7 @@ class TestEngineFailureTransport:
         executor._merge_defaults = lambda req: DiffusionExecutor._merge_defaults(executor, req)
         executor.pipeline.request_warmup_cache_key = MagicMock(return_value=(1024, 1024, None))
         executor.pipeline._warmed_up_shapes = None
-        executor.pipeline.infer = MagicMock(side_effect=RuntimeError("oops"))
+        executor.pipeline.run_inference = MagicMock(side_effect=RuntimeError("oops"))
 
         req = DiffusionRequest(
             request_id=7,
@@ -1253,7 +1328,7 @@ class TestEngineFailureTransport:
         executor.pipeline.prepare_request = MagicMock(side_effect=prepare_request)
         executor.pipeline.request_warmup_cache_key = MagicMock(side_effect=request_warmup_cache_key)
         executor.pipeline._warmed_up_shapes = {(1024, 1024)}
-        executor.pipeline.infer = MagicMock(
+        executor.pipeline.run_inference = MagicMock(
             side_effect=lambda _req: events.append("infer") or MagicMock()
         )
         req = DiffusionRequest(
@@ -1266,4 +1341,4 @@ class TestEngineFailureTransport:
 
         assert events == ["prepare", "warmup_cache_key", "infer"]
         executor.pipeline.request_warmup_cache_key.assert_called_once_with(req)
-        executor.pipeline.infer.assert_called_once_with(req)
+        executor.pipeline.run_inference.assert_called_once_with(req)

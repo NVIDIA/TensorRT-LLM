@@ -417,8 +417,18 @@ def create_py_executor(
     ) = llm_args.get_runtime_sizes()
 
     tokens_per_block = kv_cache_config.tokens_per_block
-    if llm_args.attn_backend == "VANILLA":
+
+    # RocketKV's Vanilla path keeps its landmark (KT) cache in a single block per
+    # sequence: RocketVanillaAttention writes the whole sequence into
+    # kt_cache_block_offsets[0], and kt_tokens_per_block is derived from
+    # tokens_per_block. It does not support a paged KT cache, so force one block
+    # per sequence for it. Plain Vanilla attention supports paged KV cache and is
+    # left untouched.
+    sparse_config = llm_args.sparse_attention_config
+    if (llm_args.attn_backend == "VANILLA" and sparse_config is not None
+            and getattr(sparse_config, "algorithm", None) == "rocket"):
         tokens_per_block = max_num_tokens
+        kv_cache_config.tokens_per_block = tokens_per_block
 
     # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
     # of 32.
@@ -451,14 +461,12 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # Check FLASHINFER compatibility with one-engine speculative decoding
-        if llm_args.attn_backend == "FLASHINFER":
-            raise ValueError(
-                f"FLASHINFER attention backend is not supported with one-engine speculative "
-                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
-                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
-                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
-                f"backend instead by setting attn_backend='TRTLLM'.")
+    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
+            and spec_config.spec_dec_mode.use_one_engine()
+            and not spec_config._use_shared_kv_cache):
+        raise ValueError(
+            "FLASHINFER attention backend supports one-engine speculative "
+            "decoding only when the draft model shares the target KV cache.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
