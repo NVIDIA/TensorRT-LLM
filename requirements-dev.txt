@@ -56,3 +56,7 @@ hf-transfer==0.1.9
 line_profiler
 # workaround to prevent picking up 20260602.2.5 which pulls in NumPy 2.5.0
 numpy-typing-compat!=20260602.2.5
+# The SMG gRPC adapter is an optional runtime extra (tensorrt_llm[grpc-smg]) and
+# is intentionally not in requirements.txt. Keep it in the dev/test environment
+# so the SMG adapter tests run in CI without shipping it in the default install.
+smg-grpc-proto>=0.4.2

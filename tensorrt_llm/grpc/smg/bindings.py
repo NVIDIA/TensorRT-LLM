@@ -15,6 +15,13 @@
 
 """Generated protobuf bindings used by the SMG adapter."""
 
-from smg_grpc_proto.generated import trtllm_service_pb2, trtllm_service_pb2_grpc
+try:
+    from smg_grpc_proto.generated import trtllm_service_pb2, trtllm_service_pb2_grpc
+except ImportError as e:
+    raise ImportError(
+        "The SMG gRPC adapter requires the optional 'smg-grpc-proto' package, "
+        "which is not part of the default TensorRT-LLM installation. Install it "
+        "with: pip install tensorrt_llm[grpc-smg]"
+    ) from e
 
 __all__ = ["trtllm_service_pb2", "trtllm_service_pb2_grpc"]

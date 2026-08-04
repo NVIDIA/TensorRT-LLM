@@ -1352,7 +1352,13 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            from tensorrt_llm.grpc.smg.server import launch_smg_server
+            try:
+                from tensorrt_llm.grpc.smg.server import launch_smg_server
+            except ImportError as e:
+                raise ValueError(
+                    "gRPC serving with the SMG protocol requires the optional "
+                    "'smg-grpc-proto' package. Install it with: "
+                    "pip install tensorrt_llm[grpc-smg]") from e
 
             launch_smg_server(host,
                               port,

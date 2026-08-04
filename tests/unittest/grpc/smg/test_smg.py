@@ -19,21 +19,31 @@ import io
 import os
 import sys
 
-import grpc
 import pytest
 import torch
 from PIL import Image
 
 from tensorrt_llm import LLM
-from tensorrt_llm.grpc.smg.bindings import trtllm_service_pb2 as pb2
-from tensorrt_llm.grpc.smg.request_manager import (
+from tensorrt_llm.llmapi import KvCacheConfig
+
+# The SMG adapter depends on the optional 'smg-grpc-proto' package
+# (pip install tensorrt_llm[grpc-smg]). Skip the whole module cleanly when it is
+# absent so collection does not fail in an environment without the extra.
+pytest.importorskip(
+    "smg_grpc_proto",
+    reason="SMG gRPC adapter extra not installed (pip install tensorrt_llm[grpc-smg])",
+)
+
+import grpc  # noqa: E402
+
+from tensorrt_llm.grpc.smg.bindings import trtllm_service_pb2 as pb2  # noqa: E402
+from tensorrt_llm.grpc.smg.request_manager import (  # noqa: E402
     GrpcRequestManager,
     create_disaggregated_params_from_proto,
     create_lora_request_from_proto,
     create_sampling_params_from_proto,
 )
-from tensorrt_llm.grpc.smg.servicer import TrtllmServiceServicer
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.grpc.smg.servicer import TrtllmServiceServicer  # noqa: E402
 
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../..")
