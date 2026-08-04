@@ -15,9 +15,10 @@
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import KeysView
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Type
+from typing import Any, ClassVar, Optional, Type
 
 from tensorrt_llm import logger
 
@@ -26,6 +27,11 @@ from tensorrt_llm import logger
 class ReasoningParserResult:
     content: str = ""
     reasoning_content: str = ""
+
+
+# Enough of the rendered prompt's tail to hold a prefilled marker and any
+# trailing whitespace, without copying a prompt that may be very long.
+_PROMPT_TAIL_CHARS = 64
 
 
 def register_reasoning_parser(*keys: str, **default_kwargs):
@@ -69,11 +75,42 @@ class ReasoningParserFactory:
                           **default_kwargs)
 
     @classmethod
-    def keys(cls):
+    def resolve_prefilled_thinking(cls, reasoning_parser: str,
+                                   prompt: str) -> Optional[bool]:
+        """Whether the rendered prompt already opened or closed reasoning.
+
+        Templates that prefill the marker leave it in the prompt, so the model
+        never emits it. Returns None when neither marker is present, meaning
+        the mode could not be determined from the prompt.
+        """
+        entry = cls._parsers.get(reasoning_parser.lower())
+        if entry is None:
+            return None
+        parser_cls = entry[0]
+        if not parser_cls.resolves_thinking_from_prompt:
+            return None
+        # Only the tail matters, so avoid copying the whole prompt.
+        tail = prompt[-_PROMPT_TAIL_CHARS:].rstrip()
+        if tail.endswith(parser_cls.reasoning_end):
+            return False
+        if tail.endswith(parser_cls.reasoning_start):
+            return True
+        return None
+
+    @classmethod
+    def keys(cls) -> KeysView[str]:
         return cls._parsers.keys()
 
 
 class BaseReasoningParser(ABC):
+
+    # Opt in on parsers whose template prefills the reasoning marker into the
+    # prompt and that select their mode from `enable_thinking`. Only those can
+    # have the mode resolved from the rendered prompt, and they must define
+    # both markers below.
+    resolves_thinking_from_prompt: ClassVar[bool] = False
+    reasoning_start: ClassVar[str]
+    reasoning_end: ClassVar[str]
 
     def __init__(self,
                  *,
@@ -109,7 +146,6 @@ class IdentityReasoningParser(BaseReasoningParser):
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
-@register_reasoning_parser("laguna")
 @register_reasoning_parser("qwen3")
 # Qwen3.5 (and forced-thinking Qwen3 variants) use a chat template that
 # pre-injects `<think>\n` into the assistant prompt prefix, so the model
@@ -272,6 +308,34 @@ class DeepSeekV4ReasoningParser(BaseReasoningParser):
         return self._parser.finish()
 
 
+@register_reasoning_parser("poolside_v1", "laguna")
+class PoolsideV1ReasoningParser(DeepSeekV4ReasoningParser):
+    """Poolside Laguna models, which prefill the marker the same way.
+
+    The family's templates disagree on the `enable_thinking` default, so the
+    mode is resolved from the rendered prompt rather than from a constant.
+    `laguna` stays as an alias of `poolside_v1` for existing deployments.
+    """
+
+    resolves_thinking_from_prompt = True
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        kwargs = chat_template_kwargs or {}
+        if kwargs.get("thinking") is None and kwargs.get(
+                "enable_thinking") is None:
+            # Mode unresolved (offline LLM API, disagg generation server,
+            # add_generation_prompt=false). Keep splitting on a `<think>` the
+            # model emits itself, as these models do in multi-turn and tools.
+            self._parser = DeepSeekR1Parser(
+                reasoning_at_start=False,
+                chat_template_kwargs=chat_template_kwargs)
+
+
 @register_reasoning_parser("minimax_m3")
 class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for MiniMax-M3.
@@ -327,7 +391,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
-    "laguna": "laguna",
+    "laguna": "poolside_v1",
     "deepseek_v4": "deepseek_v4",
     "nemotron_h": "nemotron-v3",
     "nemotron_h_puzzle": "nemotron-v3",

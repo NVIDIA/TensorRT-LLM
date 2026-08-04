@@ -48,6 +48,7 @@ from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
@@ -1478,6 +1479,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            # Pre-render, so the mode may be unresolved. Safe because the
+            # boundary lookup reads the parser class attributes, not the
+            # branch `__init__` picked.
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -1528,6 +1532,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     base64.b64decode(request.prompt_token_ids_b64),
                     dtype=np.int32).tolist()
 
+            rendered_prompt = None
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
@@ -1545,6 +1550,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
+                if isinstance(prompt, str):
+                    rendered_prompt = prompt
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -1564,6 +1571,26 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
+            # Templates that prefill <think>/</think> leave the marker in the
+            # prompt, so the request kwargs alone cannot tell the parser which
+            # mode was rendered. Take it from the prompt instead.
+            if postproc_args.reasoning_parser:
+                thinking = None
+                if rendered_prompt and request.add_generation_prompt:
+                    thinking = ReasoningParserFactory.resolve_prefilled_thinking(
+                        postproc_args.reasoning_parser, rendered_prompt)
+                if thinking is None and request.disaggregated_params is not None:
+                    # Generation worker: it never rendered, so use the mode the
+                    # context worker resolved and relayed.
+                    thinking = request.disaggregated_params.resolved_thinking
+                if thinking is not None:
+                    # Both keys, because the parser ORs them: leaving a stale
+                    # `thinking` in place would override what we resolved.
+                    postproc_args.chat_template_kwargs = {
+                        **(request.chat_template_kwargs or {}),
+                        "thinking": thinking,
+                        "enable_thinking": thinking,
+                    }
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(
