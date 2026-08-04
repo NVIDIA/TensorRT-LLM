@@ -370,14 +370,18 @@ class ConversationHistoryStore:
 
         self._pop_conversation_by_conversation_id(conversation_id)
 
-    def _trim_conversation(self, conversation_id) -> None:
-        while len(self.conversations[conversation_id]
-                  ) > self.conversation_capacity:
+    def _trim_conversation(self, conversation_id: str) -> None:
+        conversation = self.conversations.get(conversation_id)
+        if conversation is None:
+            return
+
+        while len(conversation) > self.conversation_capacity:
             self._pop_conversation_by_conversation_id(conversation_id)
 
-    def _pop_conversation_by_conversation_id(self, conversation_id) -> None:
-        conversation = self.conversations[conversation_id]
-        if len(conversation) == 0:
+    def _pop_conversation_by_conversation_id(self,
+                                             conversation_id: str) -> None:
+        conversation = self.conversations.get(conversation_id)
+        if conversation is None or len(conversation) == 0:
             return
 
         is_harmony_conversation = isinstance(conversation[0], Message)
