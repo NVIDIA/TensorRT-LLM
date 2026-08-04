@@ -29,6 +29,12 @@ import torch
 import torch.distributed as dist
 from utils.util import check_accuracy
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_kimi_linear import (
+    _K3_MOE_EP_ENV,
+    _K3_MOE_TP_ENV,
+    KimiK3MoERuntime,
+)
 from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
 from tensorrt_llm._torch.modules.kimi_k3_moe import KimiK3SparseMoeBlock
 from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import (
@@ -38,6 +44,7 @@ from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import (
 )
 from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm.mapping import Mapping
 
 situ_supported = pytest.mark.skipif(
     not is_native_situ_supported(),
@@ -420,8 +427,6 @@ def test_fused_forward_without_weights_raises():
 
 
 def test_mapping_records_moe_tp_ep_user_specified():
-    from tensorrt_llm.mapping import Mapping
-
     # Auto default: -1 sentinels resolve to (moe_tp=tp, moe_ep=1) but must
     # NOT be flagged as a user request.
     auto = Mapping(world_size=8, tp_size=8)
@@ -438,13 +443,6 @@ def test_mapping_records_moe_tp_ep_user_specified():
 
 
 def test_kimi_k3_moe_split_selection(monkeypatch):
-    from tensorrt_llm._torch.models.modeling_kimi_linear import (
-        _K3_MOE_EP_ENV,
-        _K3_MOE_TP_ENV,
-        KimiK3MoERuntime,
-    )
-    from tensorrt_llm.mapping import Mapping
-
     monkeypatch.delenv(_K3_MOE_TP_ENV, raising=False)
     monkeypatch.delenv(_K3_MOE_EP_ENV, raising=False)
 
@@ -468,10 +466,6 @@ def test_kimi_k3_moe_split_selection(monkeypatch):
 
 
 def test_kimi_k3_routed_config_preserves_explicit_megamoe_backend():
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoERuntime
-    from tensorrt_llm.mapping import Mapping
-
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
         moe_backend="MEGAMOE_DEEPGEMM",
@@ -484,10 +478,6 @@ def test_kimi_k3_routed_config_preserves_explicit_megamoe_backend():
 
 
 def test_kimi_k3_routed_config_keeps_trtllm_default():
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoERuntime
-    from tensorrt_llm.mapping import Mapping
-
     model_config = ModelConfig(mapping=Mapping(world_size=1, rank=0, tp_size=1))
 
     routed_model_config = KimiK3MoERuntime._routed_moe_model_config(model_config)
@@ -569,9 +559,7 @@ def _make_routed_moe(
     """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.fused_moe import ConfigurableMoE, create_moe
-    from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     pretrained_config = PretrainedConfig()
