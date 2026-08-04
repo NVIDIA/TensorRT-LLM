@@ -1334,6 +1334,25 @@ def get_multimodal_encoder_token_lengths(
     return item_metadata.encoder_token_lengths
 
 
+def format_multimodal_encoder_output_budget_error(
+    required_bytes: int,
+    budget_bytes: int,
+    effective_encoder_max_num_tokens: int,
+    *,
+    request_id: Optional[int] = None,
+) -> str:
+    """Format guidance for a request that exceeds the MM output budget."""
+    request_label = ("Multimodal request" if request_id is None else
+                     f"Multimodal request {request_id}")
+    return (
+        f"{request_label} needs {required_bytes} bytes of resident encoder "
+        f"output but the encoder output budget is only {budget_bytes} bytes; "
+        "effective encoder_max_num_tokens is "
+        f"{effective_encoder_max_num_tokens} (it falls back to max_num_tokens "
+        "when unset); raise encoder_max_num_tokens to serve inputs of this size"
+    )
+
+
 def initialize_multimodal_encoder_request(
         request: LlmRequest,
         max_num_tokens: int,
@@ -1383,10 +1402,12 @@ def initialize_multimodal_encoder_request(
             total_bytes = (sum(embedding_lengths) * bytes_per_encoder_embedding)
             if total_bytes > max_output_bytes:
                 raise ValueError(
-                    f"Multimodal request needs {total_bytes} bytes of "
-                    "resident encoder output but the encoder output budget "
-                    f"is only {max_output_bytes} bytes; raise "
-                    "encoder_max_num_tokens to serve inputs of this size")
+                    format_multimodal_encoder_output_budget_error(
+                        total_bytes,
+                        max_output_bytes,
+                        max_num_tokens,
+                        request_id=request.py_request_id,
+                    ))
         request.py_mm_encoder_state = (
             MultimodalEncoderRequestState.from_embedding_lengths(
                 embedding_lengths))

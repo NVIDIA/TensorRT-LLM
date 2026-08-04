@@ -21,6 +21,7 @@ from tensorrt_llm.logger import logger
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
+    format_multimodal_encoder_output_budget_error,
     get_multimodal_encoder_token_lengths,
     is_multimodal_encoder_ready,
 )
@@ -624,11 +625,12 @@ class MultimodalScheduler(RequestScheduler):
                     # within the budget, so reaching this means an
                     # accounting bug rather than a user input.
                     raise RuntimeError(
-                        f"Multimodal request {request.py_request_id} needs "
-                        f"{request_bytes} bytes of resident encoder "
-                        "output but the encoder output budget is only "
-                        f"{budget} bytes; raise encoder_max_num_tokens to "
-                        "serve inputs of this size"
+                        format_multimodal_encoder_output_budget_error(
+                            request_bytes,
+                            budget,
+                            self.max_num_tokens,
+                            request_id=request.py_request_id,
+                        )
                     )
                 if resident_bytes + reserved_bytes + request_bytes > budget:
                     continue
