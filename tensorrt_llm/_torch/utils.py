@@ -323,13 +323,66 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     return tuple(num_token_buckets[::-1])
 
 
+# DeepGEMM selects (BLOCK_M, BLOCK_N, num_stages, swap_ab) as a pure function
+# of M, and every breakpoint of that function sits at M % 16 == 1. Two sites in
+# csrc/jit_kernels/heuristics/sm100.hpp are the *entire* M dependence:
+#   * :62-63  the non-swap_ab BLOCK_M pick, which steps at M = 33 and M = 65;
+#   * :230    ceil_div(expected_m, block_m) in the config score, which steps at
+#             M = k*block_m + 1 -- and every candidate block_m is a multiple of
+#             16 (swap_ab uses lcm(16, block_m_multiple_of); non-swap_ab uses
+#             {32, 64, 128}).
+# num_stages is a closed form over block_m/block_n only, and num_sms is
+# constant, so neither adds a breakpoint. Each band is therefore an aligned
+# union of [16k+1, 16k+16] cells, and every such cell contains exactly one
+# multiple of 16 -- so a stride-16 grid provably touches every band, for any
+# (N, K), not merely the shapes measured below.
+#
+# A stride of 128 leaves ~1 band in 8 unwarmed. Those bands are then JIT'd by
+# whichever live iteration first lands in one, putting ~2.2s of nvcc *inside*
+# the measured window. Sizing the stride to the 16-token quantum is what makes
+# the warmup complete; the numbers here are measured, not assumed:
+#
+#   stride  buckets  nvcc compiles  nvcc time  bands left unwarmed
+#      128       46             28        64s    7   <-- nvbug 6550749
+#       32       76             33        88s    1   (misses M=385, a band
+#                                                     exactly 16 wide)
+#       16      136             34        81s    0   COMPLETE
+#
+# (Those counts come from a standalone sweep bounded at M <= 2048; the clamp
+# below makes the production list larger -- 264 buckets -- without adding
+# compiles, since it adds no new BLOCK_M rungs.)
+#
+# Tripling the bucket count costs +4 compiles, not +200: the number of distinct
+# configs is bounded by the BLOCK_M ladder (~17 per shape), not by how densely
+# M is sampled. End to end on the nvbug 6550749 case the DeepGEMM cache goes
+# from 33 cubins to 37. The extra buckets are warm GEMM calls at ~4.3ms each,
+# they run during autotuning at startup, and they cannot change which kernel
+# steady-state inference picks -- selection is a function of M either way.
+# See tests/unittest/_torch/misc/test_deep_gemm_tuning_buckets.py.
+DEEP_GEMM_BLOCK_M_QUANTUM = 16
+
+
 def deep_gemm_gen_tuning_buckets(x: int):
     buckets = tuple(range(8, 128, 8))
     # Clamp x to be between 4096 and 8192.
+    #
+    # The lower clamp is load-bearing and must not be "tightened" to the real
+    # max_num_tokens: fp8SwapABGemmRunner leaves tune_max_num_tokens unset, so
+    # autotuner.py passes the *current input size* here rather than a maximum
+    # (see autotuner.py, `Use the current input size as the opt value`). Drop
+    # the floor and a small first call (say M=64) would warm nothing above 120
+    # and every larger M would JIT mid-iteration.
     if x >= 128:
         x = min(x, 8192)
         x = max(x, 4096)
-        buckets += tuple(range(128, x, 128))
+        # Round the top up to a whole quantum, and include it. The only multiple
+        # of 16 inside a band [16k+1, 16k+16] is its *top*, so a bucket >= x is
+        # required to warm the band that x itself lives in -- and a half-open
+        # range(128, x, 16) provides none. That left the band containing
+        # max_num_tokens cold, which is the single most likely M of all (every
+        # full batch hits it). Pre-fix the same hole was 128 wide.
+        top = -(-x // DEEP_GEMM_BLOCK_M_QUANTUM) * DEEP_GEMM_BLOCK_M_QUANTUM
+        buckets += tuple(range(128, top + 1, DEEP_GEMM_BLOCK_M_QUANTUM))
     return buckets
 
 
