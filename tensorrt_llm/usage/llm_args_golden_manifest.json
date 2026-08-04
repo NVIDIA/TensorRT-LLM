@@ -189,6 +189,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.max_num_generation_first_pre_active_requests"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",

@@ -152,6 +152,14 @@ class TestResultTail:
         # non-bounced result: only [msg_type, prefix] -> no tail.
         assert btr.decode_result_tail([b"KV_AGENT_RESULT", b"prefix"]) == (None, None, None)
 
+    def test_v2_roundtrip_uses_explicit_tail_index(self):
+        wm = self._wm([100], [16], 0xABCD)
+        msg = [b"KV_AGENT_RESULT", b"prefix", b"sender-endpoint"] + btr.encode_result_tail(wm)
+        dst, sizes, src_base = btr.decode_result_tail(msg, tail_index=3)
+        assert np.array_equal(dst, wm.dst_ptrs)
+        assert np.array_equal(sizes, wm.sizes)
+        assert src_base == 0xABCD
+
     def test_encode_tail_handles_unset_base(self):
         wm = self._wm([1, 2], [8, 8], None)
         tail = btr.encode_result_tail(wm)
@@ -185,6 +193,30 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
     r, rid, sl, last, code, size = tfr._KV_RESULT_PREFIX.unpack(msg[1])
     assert (r, rid, sl, last, size) == (3, 12345, 7, True, 8192)
     assert tfr._AGENT_RESULT_BY_CODE[code] is result
+
+
+def test_make_kv_result_msg_v2_preserves_identity_size_and_tail():
+    """The v2 prefix adds identity without dropping timing or bounce framing."""
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    tail = [b"dst", b"sizes", b"base"]
+    msg = tfr._make_kv_result_msg(
+        3,
+        12345,
+        7,
+        True,
+        tfr.AgentResult.SUCCESS,
+        transfer_size=8192,
+        tail=tail,
+        request_epoch=99,
+        sender_endpoint="tcp://sender",
+    )
+
+    assert msg[0] == tfr.MessageType.KV_AGENT_RESULT
+    assert msg[2] == b"tcp://sender"
+    assert msg[3:] == tail
+    rank, rid, epoch, slice_id, last, code, size = tfr._KV_RESULT_PREFIX_V2.unpack(msg[1])
+    assert (rank, rid, epoch, slice_id, last, size) == (3, 12345, 99, 7, True, 8192)
+    assert tfr._AGENT_RESULT_BY_CODE[code] is tfr.AgentResult.SUCCESS
 
 
 # --------------------------------------------------------------------------- #
@@ -232,6 +264,200 @@ def test_fanin_bounce_safe_gate():
     assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.NHD))) is True
 
 
+def test_receiver_derives_canonical_rank_bound_destination_plan():
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    if not hasattr(tfr.Receiver, "_build_bounce_destination_plan"):
+        pytest.skip("minimal local transfer stub does not load Receiver implementation")
+    receiver = object.__new__(tfr.Receiver)
+    local_region = SimpleNamespace(memory=SimpleNamespace(ptrs=np.array([1, 2])))
+    peer_region = SimpleNamespace(memory=SimpleNamespace(ptrs=np.array([3, 4])))
+    mapped = SimpleNamespace(
+        src=SimpleNamespace(
+            memory=SimpleNamespace(
+                ptrs=np.array([0x2050, 0x2000], dtype=np.int64),
+                bytes_per_region=0x50,
+            )
+        )
+    )
+    mapper = SimpleNamespace(map=lambda _local, _peer: mapped)
+    receiver._registrar = SimpleNamespace(
+        self_extractor=SimpleNamespace(extract=lambda *_args, **_kwargs: local_region),
+        peer_extractor=lambda *_args: SimpleNamespace(
+            extract=lambda *_extract_args, **_extract_kwargs: peer_region
+        ),
+        get_pool_mapping=lambda _peer: {(0, 0): (0, 0)},
+        get_kv_map=lambda *_args: mapper,
+    )
+    receiver_req = SimpleNamespace(block_ids_per_layer_groups=[np.array([5, 6], dtype=np.int64)])
+    peer_ri = SimpleNamespace(instance_name="ctx", instance_rank=7)
+
+    dst_ptrs, sizes = receiver._build_bounce_destination_plan(receiver_req, peer_ri)
+
+    assert dst_ptrs.tolist() == [0x2000, 0x2050]
+    assert sizes.tolist() == [0x50, 0x50]
+
+
+def _make_receiver_dispatch_harness(
+    tfr,
+    *,
+    bounce_enabled,
+    peer_ranks=(0,),
+    register_error=None,
+):
+    peer_infos = SimpleNamespace(
+        instance_name="ctx",
+        instance_rank=0,
+        sender_endpoints=["tcp://ctx-0", "tcp://ctx-1"],
+        dp_size=1,
+        layer_num_per_pp=[1],
+        page_table=None,
+    )
+    peer_overlap = SimpleNamespace(
+        ranks=list(peer_ranks),
+        duplicate_head_factor=1,
+        overlap_pp_size=1,
+    )
+
+    class _Registrar:
+        def __init__(self):
+            self.cache = {}
+            self.registered = []
+
+        def get_peer_overlap(self, _peer_infos, _dp_rank):
+            return peer_overlap
+
+        def get_peer_rank_info(self, peer_name, peer_rank):
+            return self.cache[(peer_name, peer_rank)]
+
+        def register(self, peer_name, peer_rank, peer_info):
+            self.registered.append((peer_name, peer_rank, peer_info))
+            if register_error is not None:
+                raise register_error
+            self.cache[(peer_name, peer_rank)] = peer_info
+
+    class _Bounce:
+        def __init__(self):
+            self.enabled = bounce_enabled
+            self.reserve_calls = []
+            self.bound = []
+
+        def reserve(self, request, expected_transfers, *, expected_destination_plans=None):
+            self.reserve_calls.append((request, expected_transfers, expected_destination_plans))
+            return self.enabled
+
+        def bind_writer(self, key, rank, writer_index):
+            self.bound.append((key, rank, writer_index))
+            return 0xB000
+
+        def set_completion_callback(self, _key, _callback):
+            pass
+
+        def release_idle_reservation(self, _key):
+            pass
+
+    receiver = object.__new__(tfr.Receiver)
+    registrar = _Registrar()
+    bounce = _Bounce()
+    receiver._registrar = registrar
+    receiver._bounce = bounce
+    receiver_req = SimpleNamespace(
+        unique_rid=17,
+        slice_id=0,
+        request_epoch=None,
+        bounce_dst_base=None,
+        to_bytes=lambda: b"receiver-request",
+    )
+    receiver._build_recv_req_info = lambda _task: receiver_req
+    receiver._get_sender_info = lambda _params: peer_infos
+    plan = (
+        np.array([0x1000], dtype=np.int64),
+        np.array([0x80], dtype=np.int64),
+    )
+    receiver._build_bounce_destination_plan = lambda _request, _peer_info: plan
+    session = SimpleNamespace(
+        request_epoch=3,
+        mark_transferring=lambda *_args, **_kwargs: True,
+        _make_bounce_settlement_callback=lambda _task: lambda _success: None,
+    )
+    receiver._get_session = lambda _unique_rid: session
+    receiver._sender_endpoint_capabilities = {}
+    sent = []
+    receiver._request_sender_data = lambda endpoint, request: sent.append((endpoint, request))
+    task = SimpleNamespace(
+        _params=SimpleNamespace(ctx_dp_rank=0),
+        _unique_rid=17,
+        slice_id=0,
+        _perf_timer=None,
+    )
+    return receiver, task, peer_infos, registrar, bounce, plan, sent
+
+
+def test_receiver_first_request_registers_peer_for_exact_bounce_plan():
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    receiver, task, peer_infos, registrar, bounce, plan, sent = _make_receiver_dispatch_harness(
+        tfr, bounce_enabled=True
+    )
+
+    receiver.dispatch_task(task)
+    receiver.dispatch_task(task)
+
+    assert registrar.registered == [("ctx", 0, peer_infos)]
+    assert registrar.get_peer_rank_info("ctx", 0) is peer_infos
+    assert len(bounce.reserve_calls) == 2
+    assert all(call[2][0] is plan for call in bounce.reserve_calls)
+    assert bounce.bound == [((17, 0), 0, 0), ((17, 0), 0, 0)]
+    assert sent == [
+        ("tcp://ctx-0", b"receiver-request"),
+        ("tcp://ctx-0", b"receiver-request"),
+    ]
+
+
+def test_receiver_non_bounce_dispatch_does_not_register_peer():
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    receiver, task, _peer_infos, registrar, bounce, _plan, sent = _make_receiver_dispatch_harness(
+        tfr, bounce_enabled=False
+    )
+
+    receiver.dispatch_task(task)
+
+    assert registrar.registered == []
+    assert bounce.reserve_calls == [(receiver._build_recv_req_info(task), 1, None)]
+    assert sent == [("tcp://ctx-0", b"receiver-request")]
+
+
+def test_receiver_bounce_registration_failure_falls_back_before_reservation():
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    receiver, task, peer_infos, registrar, bounce, _plan, sent = _make_receiver_dispatch_harness(
+        tfr,
+        bounce_enabled=True,
+        register_error=ValueError("incompatible peer"),
+    )
+
+    receiver.dispatch_task(task)
+
+    assert registrar.registered == [("ctx", 0, peer_infos)]
+    assert bounce.reserve_calls == []
+    assert sent == [("tcp://ctx-0", b"receiver-request")]
+
+
+def test_receiver_missing_fanin_rank_falls_back_without_partial_bounce_reservation():
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    receiver, task, peer_infos, registrar, bounce, _plan, sent = _make_receiver_dispatch_harness(
+        tfr,
+        bounce_enabled=True,
+        peer_ranks=(0, 1),
+    )
+
+    receiver.dispatch_task(task)
+
+    assert registrar.registered == [("ctx", 0, peer_infos)]
+    assert bounce.reserve_calls == []
+    assert sent == [
+        ("tcp://ctx-0", b"receiver-request"),
+        ("tcp://ctx-1", b"receiver-request"),
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # NoBounceTransport — disabled no-op fallback
 # --------------------------------------------------------------------------- #
@@ -244,6 +470,7 @@ class TestNoBounce:
         assert nb.build_request(SimpleNamespace()) is None
         assert nb.writer_base(("r", 0), 1) is None
         assert nb.is_bounced(("r", 0)) is False
+        nb.set_completion_callback(("r", 0), lambda _ok: None)
         nb.record_result(("r", 0), 1)  # no-op, must not raise
         nb.record_failure(("r", 0), 1)  # no-op, must not raise
         nb.release_idle_reservation(("r", 0))  # no-op, must not raise
@@ -301,7 +528,14 @@ class _FakeAlloc:
         return []
 
 
-def _make_transport(monkeypatch, block_bytes_per_group, capacity=1 << 30, min_blocks=1):
+def _make_transport(
+    monkeypatch,
+    block_bytes_per_group,
+    capacity=1 << 30,
+    min_blocks=1,
+    destination_pool_layouts=None,
+    valid_destination_ranges=None,
+):
     monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
     monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self: 0)
     monkeypatch.setattr(
@@ -316,6 +550,10 @@ def _make_transport(monkeypatch, block_bytes_per_group, capacity=1 << 30, min_bl
         capacity_bytes=capacity,
         phys_chunk_size=32 * _MIB,
         block_bytes_per_group=block_bytes_per_group,
+        destination_pool_layouts=destination_pool_layouts,
+        valid_destination_ranges=(
+            [(0, 1 << 62)] if valid_destination_ranges is None else valid_destination_ranges
+        ),
         min_blocks=min_blocks,
     )
 
@@ -326,6 +564,18 @@ def _recv_req(block_counts, rid=1, slice_id=0):
         unique_rid=rid,
         slice_id=slice_id,
         bounce_dst_base=None,
+    )
+
+
+def _recv_req_with_ids(block_ids_per_group, rid=1, slice_id=0):
+    return SimpleNamespace(
+        block_ids_per_layer_groups=[
+            np.asarray(block_ids, dtype=np.int64) for block_ids in block_ids_per_group
+        ],
+        unique_rid=rid,
+        slice_id=slice_id,
+        bounce_dst_base=None,
+        mamba_state_index=None,
     )
 
 
@@ -386,13 +636,15 @@ class TestFanInReserve:
         req = _recv_req([2])
         assert t.reserve(req, num_writers=2) is True
         rid_slice = (req.unique_rid, req.slice_id)
+        low_base = t.bind_writer(rid_slice, 3, 0)
+        high_base = t.bind_writer(rid_slice, 7, 1)
         # writer for the HIGHER src_base reports first; scatter must reorder by src_base.
         t.record_result(
             rid_slice,
             7,
             np.array([20], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            src_base=200,
+            np.array([100], dtype=np.int64),
+            src_base=high_base,
         )
         assert t._scatter_q.empty()  # only 1 of 2 writers terminal -> no scatter
         assert not t._recv_alloc.released  # region NOT freed while a writer is still pending
@@ -400,36 +652,29 @@ class TestFanInReserve:
             rid_slice,
             3,
             np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            src_base=100,
+            np.array([100], dtype=np.int64),
+            src_base=low_base,
         )
         ctx, descs = t._scatter_q.get_nowait()
-        # each tail carries its OWN src_base; sorted (100 before 200) so the scatter is deterministic.
-        assert [t[0] for t in descs] == [100, 200]  # per-writer src_base preserved
+        # Each tail carries its own bound source; sorting makes scatter deterministic.
+        assert [item[0] for item in descs] == [low_base, high_base]
         assert [list(t[1]) for t in descs] == [[10], [20]]  # dst_ptrs
-        assert [list(t[2]) for t in descs] == [[8], [8]]  # sizes
+        assert [list(t[2]) for t in descs] == [[100], [100]]  # sizes
 
-    def test_fanin_fallback_writer_leaves_survivor_at_its_own_base(self, monkeypatch):
-        # Regression: if one fan-in writer falls back to in-place (SUCCESS, empty tail) while a
-        # sibling bounces, the survivor must be scattered from ITS OWN src_base, not packed to 0.
+    def test_incomplete_bounced_result_is_rejected_without_releasing(self, monkeypatch):
+        # Once the receiver advertises a bounce address, a tail-less SUCCESS is malformed rather
+        # than an in-place fallback. It must not consume writer credit or free the shared region.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])
         assert t.reserve(req, num_writers=2) is True
         rid_slice = (req.unique_rid, req.slice_id)
-        t.record_result(
-            rid_slice, 7, None, None
-        )  # writer 0 fell back to in-place: SUCCESS, no tail
-        assert t._scatter_q.empty()  # only 1 of 2 writers terminal
-        t.record_result(
-            rid_slice,
-            3,
-            np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            src_base=100,
-        )  # writer 1 bounced to base+100
-        ctx, descs = t._scatter_q.get_nowait()
-        assert [t[0] for t in descs] == [100]  # only the survivor, read from base+100 (NOT 0)
-        assert [list(t[1]) for t in descs] == [[10]]
+        t.bind_writer(rid_slice, 7, 0)
+        t.bind_writer(rid_slice, 3, 1)
+        with pytest.raises(RuntimeError, match="incomplete bounced-result scatter tail"):
+            t.record_result(rid_slice, 7, None, None)
+        assert t._scatter_q.empty()
+        assert t._recv_alloc.released == []
+        assert t.is_bounced(rid_slice) is True
 
     def test_fanin_failed_then_success_releases_only_after_both(self, monkeypatch):
         # A FAILED writer must not free the shared region until every writer is terminal.
@@ -437,11 +682,17 @@ class TestFanInReserve:
         req = _recv_req([2])
         assert t.reserve(req, num_writers=2) is True
         rid_slice = (req.unique_rid, req.slice_id)
+        t.bind_writer(rid_slice, 7, 0)
+        src_base = t.bind_writer(rid_slice, 3, 1)
         t.record_failure(rid_slice, 7)  # first writer fails
         assert not t._recv_alloc.released  # region held while a sibling may still be in flight
         assert t.is_bounced(rid_slice) is True
         t.record_result(
-            rid_slice, 3, np.array([10], dtype=np.int64), np.array([8], dtype=np.int64), src_base=0
+            rid_slice,
+            3,
+            np.array([10], dtype=np.int64),
+            np.array([100], dtype=np.int64),
+            src_base=src_base,
         )
         # all terminal, >=1 FAILED -> no scatter, release (both drained), region freed.
         assert t._scatter_q.empty()
@@ -456,13 +707,14 @@ class TestFanInReserve:
         req = _recv_req([2])
         assert t.reserve(req, num_writers=1) is True
         rid_slice = (req.unique_rid, req.slice_id)
+        src_base = t.bind_writer(rid_slice, 3, 0)
         calls = []
         t.record_result(
             rid_slice,
             3,
             np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            src_base=0,
+            np.array([200], dtype=np.int64),
+            src_base=src_base,
             on_done=lambda ok: calls.append(ok),
         )
         ctx, descs = t._scatter_q.get_nowait()
@@ -473,33 +725,36 @@ class TestFanInReserve:
         assert calls == [True]
         assert t._recv_alloc.released
 
-    def test_empty_acc_fires_on_done_inline_and_releases(self, monkeypatch):
-        # Bounced SUCCESS that carried no scatter tail: nothing to copy, but the task must still
-        # complete -> on_done(True) inline + slot released, nothing queued.
+    def test_empty_tail_does_not_fire_callback_or_release(self, monkeypatch):
+        # A missing scatter plan is not proof that the advertised remote write landed correctly.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])
         assert t.reserve(req, num_writers=1) is True
         rid_slice = (req.unique_rid, req.slice_id)
+        t.bind_writer(rid_slice, 3, 0)
         calls = []
-        t.record_result(rid_slice, 3, None, None, on_done=lambda ok: calls.append(ok))
-        assert calls == [True]
+        with pytest.raises(RuntimeError, match="incomplete bounced-result scatter tail"):
+            t.record_result(rid_slice, 3, None, None, on_done=lambda ok: calls.append(ok))
+        assert calls == []
         assert t._scatter_q.empty()
-        assert t._recv_alloc.released  # slot freed
+        assert t._recv_alloc.released == []
+        assert t.is_bounced(rid_slice) is True
 
-    def test_missing_key_is_dropped(self, monkeypatch):
-        # A late/duplicate result for an already-settled (popped) rid_slice is dropped: the context's own
-        # settle already fired completion, so re-firing here would double-report.
+    def test_missing_key_is_rejected(self, monkeypatch):
+        # Session tombstones filter legitimate delayed duplicates before they reach the bounce layer;
+        # an unknown reservation here is a protocol error and cannot be silently accepted.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         calls = []
-        t.record_result(
-            ("missing", 0),
-            3,
-            np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            src_base=0,
-            on_done=lambda ok: calls.append(ok),
-        )
-        assert calls == []  # no-op, no callback
+        with pytest.raises(RuntimeError, match="unknown reservation"):
+            t.record_result(
+                ("missing", 0),
+                3,
+                np.array([10], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+                src_base=0,
+                on_done=lambda ok: calls.append(ok),
+            )
+        assert calls == []
 
     def test_duplicate_writer_is_ignored(self, monkeypatch):
         # A duplicate SUCCESS from the same peer_rank must not double-count toward all-terminal.
@@ -507,11 +762,313 @@ class TestFanInReserve:
         req = _recv_req([2])
         assert t.reserve(req, num_writers=2) is True
         rid_slice = (req.unique_rid, req.slice_id)
-        arr = (np.array([10], dtype=np.int64), np.array([8], dtype=np.int64))
-        t.record_result(rid_slice, 7, *arr, src_base=0)
-        t.record_result(rid_slice, 7, *arr, src_base=0)  # duplicate of the SAME writer
+        src_base = t.bind_writer(rid_slice, 7, 0)
+        t.bind_writer(rid_slice, 3, 1)
+        arr = (np.array([10], dtype=np.int64), np.array([100], dtype=np.int64))
+        t.record_result(rid_slice, 7, *arr, src_base=src_base)
+        t.record_result(rid_slice, 7, *arr, src_base=src_base)  # duplicate of the SAME writer
         assert t._scatter_q.empty()  # still only 1 distinct writer -> not all terminal
         assert not t._recv_alloc.released
+
+    @pytest.mark.parametrize(
+        "peer_rank,source_offset,error",
+        [
+            (9, 0, "source identity mismatch"),
+            (7, 1, "source identity mismatch"),
+        ],
+    )
+    def test_unbound_or_wrong_source_writer_is_rejected(
+        self, monkeypatch, peer_rank, source_offset, error
+    ):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = _recv_req([1])
+        assert t.reserve(req, num_writers=1)
+        rid_slice = (req.unique_rid, req.slice_id)
+        src_base = t.bind_writer(rid_slice, 7, 0)
+        with pytest.raises(RuntimeError, match=error):
+            t.record_result(
+                rid_slice,
+                peer_rank,
+                np.array([10], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+                src_base=src_base + source_offset,
+            )
+        assert t._recv_alloc.released == []
+        assert t.is_bounced(rid_slice)
+
+    @pytest.mark.parametrize(
+        "dst_ptrs,sizes,error",
+        [
+            ([0x2000], [99], "describes 99 bytes"),
+            ([0x2000, 0x2030], [60, 40], "overlap"),
+            ([0x1FF0], [100], "outside the receiver-owned KV destination plan"),
+            ([0x2000], [0], "must be positive"),
+        ],
+    )
+    def test_untrusted_scatter_plan_is_rejected(self, monkeypatch, dst_ptrs, sizes, error):
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=[100],
+            valid_destination_ranges=[(0x2000, 0x2100)],
+        )
+        req = _recv_req([1])
+        assert t.reserve(req, num_writers=1)
+        rid_slice = (req.unique_rid, req.slice_id)
+        src_base = t.bind_writer(rid_slice, 7, 0)
+        with pytest.raises(RuntimeError, match=error):
+            t.record_result(
+                rid_slice,
+                7,
+                np.array(dst_ptrs, dtype=np.int64),
+                np.array(sizes, dtype=np.int64),
+                src_base=src_base,
+            )
+        assert t._recv_alloc.released == []
+        assert t.is_bounced(rid_slice)
+
+    def test_scatter_plan_cannot_target_another_request_block(self, monkeypatch):
+        # Both blocks live in the registered pool, but this request owns only
+        # block 2. A sender-returned tail naming block 3 must fail closed.
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=[100],
+            destination_pool_layouts=[[(0x2000, 100, 8)]],
+            valid_destination_ranges=[(0x2000, 0x2320)],
+        )
+        req = _recv_req_with_ids([[2]])
+        expected_ptr = 0x2000 + 2 * 100
+        assert t.reserve(
+            req,
+            num_writers=1,
+            expected_destination_plans={
+                7: (
+                    np.array([expected_ptr], dtype=np.int64),
+                    np.array([100], dtype=np.int64),
+                )
+            },
+        )
+        rid_slice = (req.unique_rid, req.slice_id)
+        src_base = t.bind_writer(rid_slice, 7, 0)
+
+        with pytest.raises(RuntimeError, match="outside the receiver-owned KV destination plan"):
+            t.record_result(
+                rid_slice,
+                7,
+                np.array([0x2000 + 3 * 100], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+                src_base=src_base,
+            )
+
+        assert t._recv_alloc.released == []
+        assert t.is_bounced(rid_slice)
+
+    @pytest.mark.parametrize(
+        "dst_ptrs,error",
+        [
+            ([0x2000, 0x2000], "overlap or duplicate"),
+            ([0x2032, 0x2000], "not in canonical address order"),
+        ],
+    )
+    def test_exact_plan_rejects_duplicate_or_reordered_tail(self, monkeypatch, dst_ptrs, error):
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=[100],
+            destination_pool_layouts=[[(0x2000, 100, 8)]],
+        )
+        req = _recv_req_with_ids([[0]])
+        expected = {
+            7: (
+                np.array([0x2000, 0x2032], dtype=np.int64),
+                np.array([50, 50], dtype=np.int64),
+            )
+        }
+        assert t.reserve(req, expected_destination_plans=expected)
+        rid_slice = (req.unique_rid, req.slice_id)
+        src_base = t.bind_writer(rid_slice, 7, 0)
+
+        with pytest.raises(RuntimeError, match=error):
+            t.record_result(
+                rid_slice,
+                7,
+                np.array(dst_ptrs, dtype=np.int64),
+                np.array([50, 50], dtype=np.int64),
+                src_base=src_base,
+            )
+
+        assert t._scatter_q.empty()
+        assert t._recv_alloc.released == []
+        assert t.is_bounced(rid_slice)
+
+    @pytest.mark.parametrize("wrong_ptr", [0x2001, 0x2064])
+    def test_exact_plan_rejects_rank_swapped_or_in_bounds_wrong_offset(
+        self, monkeypatch, wrong_ptr
+    ):
+        # Both writer plans are valid, in-request ranges and collectively cover
+        # the slot. A writer still cannot claim its sibling's range or shift its
+        # own range within the slot: rank identity binds the exact sequence.
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=[200],
+            destination_pool_layouts=[[(0x2000, 200, 8)]],
+        )
+        req = _recv_req_with_ids([[0]])
+        expected = {
+            7: (
+                np.array([0x2000], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+            ),
+            3: (
+                np.array([0x2064], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+            ),
+        }
+        assert t.reserve(req, num_writers=2, expected_destination_plans=expected)
+        rid_slice = (req.unique_rid, req.slice_id)
+        src_base = t.bind_writer(rid_slice, 7, 0)
+        t.bind_writer(rid_slice, 3, 1)
+
+        with pytest.raises(RuntimeError, match="exact receiver-derived destination plan"):
+            t.record_result(
+                rid_slice,
+                7,
+                np.array([wrong_ptr], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+                src_base=src_base,
+            )
+
+        assert t._scatter_q.empty()
+        assert t._recv_alloc.released == []
+        assert t.is_bounced(rid_slice)
+
+    def test_exact_rank_bound_plans_accept_correct_fanin(self, monkeypatch):
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=[200],
+            destination_pool_layouts=[[(0x2000, 200, 8)]],
+        )
+        req = _recv_req_with_ids([[0]])
+        expected = {
+            7: (
+                np.array([0x2000], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+            ),
+            3: (
+                np.array([0x2064], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+            ),
+        }
+        assert t.reserve(req, num_writers=2, expected_destination_plans=expected)
+        rid_slice = (req.unique_rid, req.slice_id)
+        first_base = t.bind_writer(rid_slice, 7, 0)
+        second_base = t.bind_writer(rid_slice, 3, 1)
+
+        t.record_result(
+            rid_slice,
+            3,
+            np.array([0x2064], dtype=np.int64),
+            np.array([100], dtype=np.int64),
+            src_base=second_base,
+        )
+        t.record_result(
+            rid_slice,
+            7,
+            np.array([0x2000], dtype=np.int64),
+            np.array([100], dtype=np.int64),
+            src_base=first_base,
+        )
+
+        _ctx, descs = t._scatter_q.get_nowait()
+        assert [src for src, _dst, _sizes in descs] == [first_base, second_base]
+
+    def test_request_destination_plan_rejects_out_of_range_block_id(self, monkeypatch):
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=[100],
+            destination_pool_layouts=[[(0x2000, 100, 8)]],
+        )
+        req = _recv_req_with_ids([[8]])
+
+        assert t.reserve(req, num_writers=1) is False
+        assert req.bounce_dst_base is None
+        assert t._recv_alloc.released == [0]
+
+    def test_mamba_request_does_not_advertise_an_incomplete_bounce_plan(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = _recv_req_with_ids([[0]])
+        req.mamba_state_index = 4
+
+        assert t.reserve(req, num_writers=1) is False
+        assert req.bounce_dst_base is None
+
+    def test_build_request_releases_send_slot_when_request_creation_fails(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        monkeypatch.setattr(t, "_gather_blocking", lambda *args, **kwargs: None)
+
+        def fail_make_write(*args, **kwargs):
+            raise RuntimeError("descriptor creation failed")
+
+        monkeypatch.setattr(t, "_make_write", fail_make_write)
+        write_meta = SimpleNamespace(
+            src_ptrs=np.array([0x1000], dtype=np.int64),
+            dst_ptrs=np.array([0x2000], dtype=np.int64),
+            sizes=np.array([100], dtype=np.int64),
+        )
+        with pytest.raises(RuntimeError, match="descriptor creation failed"):
+            t.build_request(write_meta)
+        assert t._send_alloc.released == [0]
+
+    def test_build_request_canonicalizes_coupled_fragment_triplets(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        gathered = []
+        monkeypatch.setattr(
+            t,
+            "_gather_blocking",
+            lambda _addr, meta, _total: gathered.append(
+                (meta.src_ptrs.copy(), meta.dst_ptrs.copy(), meta.sizes.copy())
+            ),
+        )
+        monkeypatch.setattr(t, "_make_write", lambda *_args: "request")
+        write_meta = SimpleNamespace(
+            src_ptrs=np.array([0x3000, 0x1000, 0x2000], dtype=np.int64),
+            dst_ptrs=np.array([0x2300, 0x2100, 0x2200], dtype=np.int64),
+            sizes=np.array([30, 10, 20], dtype=np.int64),
+        )
+
+        request, _slot_id = t.build_request(write_meta)
+
+        assert request == "request"
+        assert list(write_meta.src_ptrs) == [0x1000, 0x2000, 0x3000]
+        assert list(write_meta.dst_ptrs) == [0x2100, 0x2200, 0x2300]
+        assert list(write_meta.sizes) == [10, 20, 30]
+        assert [list(values) for values in gathered[0]] == [
+            [0x1000, 0x2000, 0x3000],
+            [0x2100, 0x2200, 0x2300],
+            [10, 20, 30],
+        ]
+
+    def test_close_retains_memory_if_scatter_thread_does_not_exit(self):
+        t = object.__new__(btr.VmmBounceTransport)
+        stopped = []
+        joined = []
+        deregistered = []
+        closed = []
+        t._stop = SimpleNamespace(set=lambda: stopped.append(True))
+        t._scatter_q = queue.Queue()
+        t._scatter_thread = SimpleNamespace(
+            is_alive=lambda: True, join=lambda timeout: joined.append(timeout)
+        )
+        t._reg_descs = ["send", "recv"]
+        t._agent = SimpleNamespace(deregister_memory=lambda desc: deregistered.append(desc))
+        t._send_alloc = SimpleNamespace(close=lambda: closed.append("send"))
+        t._recv_alloc = SimpleNamespace(close=lambda: closed.append("recv"))
+
+        with pytest.raises(RuntimeError, match="did not exit"):
+            t.close()
+
+        assert stopped == [True]
+        assert joined == [btr._CLOSE_JOIN_S]
+        assert deregistered == []
+        assert closed == []
 
     def test_scatter_write_result_non_bounce_fires_on_done(self):
         # Non-bounced path completes inline (the in-place WRITE already landed the KV).
@@ -533,19 +1090,26 @@ class TestFanInReserve:
         assert t._recv_alloc.released  # slot freed
         t.release_idle_reservation(rid_slice)  # already gone -> no-op, must not raise
 
-    def test_orphan_reservation_quarantines_and_is_idempotent(self, monkeypatch):
-        # Giving up on an in-flight reservation must quarantine the region (a write may still land),
-        # not release or leak it; a second give-up is a no-op.
+    def test_orphan_reservation_waits_for_explicit_drain_proof(self, monkeypatch):
+        # A fixed quarantine timeout cannot prove a remote RMA is done. Keep
+        # the slot live until the sender ACK supplies exact drain proof.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])
         assert t.reserve(req, num_writers=1) is True
         rid_slice = (req.unique_rid, req.slice_id)
         t.orphan_reservation(rid_slice)
-        assert t._recv_alloc.quarantined == [0]  # quarantined, not released
+        assert t._recv_alloc.quarantined == []
         assert t._recv_alloc.released == []
-        assert t.is_bounced(rid_slice) is False  # settled and removed from the live map
-        t.orphan_reservation(rid_slice)  # already gone -> no-op, must not raise
-        assert t._recv_alloc.quarantined == [0]
+        assert t.is_bounced(rid_slice) is True
+
+        t._recv_alloc.reclaim_expired()
+        assert t.is_bounced(rid_slice) is True
+        assert t._recv_alloc.released == []
+
+        t.confirm_drained(rid_slice)
+        assert t.is_bounced(rid_slice) is False
+        assert t._recv_alloc.released == [0]
+        t.confirm_drained(rid_slice)  # already gone -> idempotent
 
 
 # --------------------------------------------------------------------------- #
@@ -597,7 +1161,7 @@ class TestLifecycle:
         )
 
     def _dst(self, v=10):
-        return dict(dst_ptrs=np.array([v], dtype=np.int64), sizes=np.array([8], dtype=np.int64))
+        return dict(dst_ptrs=np.array([v], dtype=np.int64), sizes=np.array([100], dtype=np.int64))
 
     def test_writer_base_layout(self):
         c = self._ctx(3, per_writer_bytes=0x64, base_addr=0x1000)
@@ -605,8 +1169,9 @@ class TestLifecycle:
 
     def test_single_writer_success_scatters_then_releases(self):
         c = self._ctx(1)
+        c.bind_writer(3, c.writer_base(0))
         assert not c.ready_to_scatter() and not c.ready_to_settle()
-        c.record_writer_result(3, succeeded=True, src_base=0, **self._dst())
+        c.record_writer_result(3, succeeded=True, src_base=c.writer_base(0), **self._dst())
         assert c.ready_to_scatter()
         c.begin_scatter()
         assert not c.ready_to_settle()  # scatter not landed yet
@@ -619,17 +1184,21 @@ class TestLifecycle:
 
     def test_fanin_holds_until_all_terminal(self):
         c = self._ctx(2)
-        c.record_writer_result(7, succeeded=True, src_base=0, **self._dst())
+        c.bind_writer(7, c.writer_base(0))
+        c.bind_writer(3, c.writer_base(1))
+        c.record_writer_result(7, succeeded=True, src_base=c.writer_base(0), **self._dst())
         assert not c.ready_to_scatter()  # 1/2 writers
         assert not c.ready_to_settle()  # drain-before-release
-        c.record_writer_result(3, succeeded=True, src_base=100, **self._dst())
+        c.record_writer_result(3, succeeded=True, src_base=c.writer_base(1), **self._dst())
         assert c.ready_to_scatter()  # all success -> scatter
 
     def test_fanin_failed_then_success_releases(self):
         c = self._ctx(2)
+        c.bind_writer(7, c.writer_base(0))
+        c.bind_writer(3, c.writer_base(1))
         c.record_writer_result(7, succeeded=False)
         assert not c.ready_to_settle()  # a sibling is still pending -> hold
-        c.record_writer_result(3, succeeded=True, src_base=0, **self._dst())
+        c.record_writer_result(3, succeeded=True, src_base=c.writer_base(1), **self._dst())
         assert not c.ready_to_scatter()  # >=1 FAILED -> skip scatter
         assert c.ready_to_settle()
         ret = c.settle()
@@ -637,39 +1206,101 @@ class TestLifecycle:
         assert ret.success is False
         assert c.state is bcore.TransferState.FAILED
 
-    def test_orphan_quarantines(self):
+    def test_orphan_waits_for_drain_proof(self):
         c = self._ctx(2)
-        c.record_writer_result(7, succeeded=True, src_base=0, **self._dst())
+        c.bind_writer(7, c.writer_base(0))
+        c.bind_writer(3, c.writer_base(1))
+        c.record_writer_result(7, succeeded=True, src_base=c.writer_base(0), **self._dst())
         c.mark_orphaned()  # the other writer is in-doubt
+        assert not c.ready_to_settle()
+        c.confirm_drained()
         assert c.ready_to_settle()
         ret = c.settle()
-        assert ret.disposition is bcore.Disposition.QUARANTINE and ret.success is False
-        assert c.state is bcore.TransferState.QUARANTINED
+        assert ret.disposition is bcore.Disposition.RELEASE and ret.success is False
+        assert c.state is bcore.TransferState.CANCELLED_DRAINED
 
-    def test_empty_tail_success_releases_without_scatter(self):
+    def test_orphan_drain_proof_fires_unconditional_settlement_callback(self):
+        calls = []
         c = self._ctx(1)
-        c.record_writer_result(3, succeeded=True)  # no dst tail
-        assert not c.ready_to_scatter()
-        assert c.ready_to_settle()
-        assert c.settle().disposition is bcore.Disposition.RELEASE
+        c.bind_writer(3, c.writer_base(0))
+        c.set_completion_callback(lambda ok: calls.append(("settled", ok)))
+        c.mark_orphaned()
+        c.confirm_drained()
 
-    def test_writers_locked_after_scatter_drops_late_writer(self):
+        settlement = c.settle()
+
+        assert settlement is not None
+        assert calls == []
+        settlement.on_done(settlement.success)
+        assert calls == [("settled", False)]
+
+    def test_success_fires_result_then_unconditional_settlement_callback(self):
+        calls = []
         c = self._ctx(1)
-        c.record_writer_result(3, succeeded=True, src_base=0, **self._dst())
+        c.bind_writer(3, c.writer_base(0))
+        c.on_done = lambda ok: calls.append(("result", ok))
+        c.set_completion_callback(lambda ok: calls.append(("settled", ok)))
+        c.record_writer_result(3, succeeded=True, src_base=c.writer_base(0), **self._dst())
+        c.begin_scatter()
+        c.finish_scatter(True)
+
+        settlement = c.settle()
+
+        assert settlement is not None
+        settlement.on_done(settlement.success)
+        assert calls == [("result", True), ("settled", True)]
+
+    def test_settlement_callback_runs_when_result_callback_raises(self):
+        calls = []
+        c = self._ctx(1)
+        c.bind_writer(3, c.writer_base(0))
+
+        def fail_result(_ok):
+            calls.append("result")
+            raise RuntimeError("boom")
+
+        c.on_done = fail_result
+        c.set_completion_callback(lambda _ok: calls.append("settled"))
+        c.record_writer_result(3, succeeded=True, src_base=c.writer_base(0), **self._dst())
+        c.begin_scatter()
+        c.finish_scatter(True)
+
+        settlement = c.settle()
+
+        assert settlement is not None
+        with pytest.raises(RuntimeError, match="boom"):
+            settlement.on_done(settlement.success)
+        assert calls == ["result", "settled"]
+
+    def test_empty_tail_success_is_rejected(self):
+        c = self._ctx(1)
+        c.bind_writer(3, c.writer_base(0))
+        with pytest.raises(RuntimeError, match="complete scatter tail"):
+            c.record_writer_result(3, succeeded=True)
+        assert not c.ready_to_settle()
+
+    def test_writers_locked_after_scatter_rejects_unbound_late_writer(self):
+        c = self._ctx(1)
+        c.bind_writer(3, c.writer_base(0))
+        c.record_writer_result(3, succeeded=True, src_base=c.writer_base(0), **self._dst())
         c.begin_scatter()  # SCATTERING -> frozen
-        c.record_writer_result(9, succeeded=False)  # a late / reordered report
-        assert 9 not in c._writer_ok  # dropped, cannot re-arm the state
+        with pytest.raises(RuntimeError, match="unexpected bounce writer"):
+            c.record_writer_result(9, succeeded=False)
+        assert 9 not in c._writer_ok
 
     def test_duplicate_writer_dedup(self):
         c = self._ctx(2)
-        c.record_writer_result(7, succeeded=True, src_base=0, **self._dst())
+        c.bind_writer(7, c.writer_base(0))
+        c.bind_writer(3, c.writer_base(1))
+        c.record_writer_result(7, succeeded=True, src_base=c.writer_base(0), **self._dst())
         c.record_writer_result(7, succeeded=False)  # same rank again -> ignored
         assert c._writer_ok[7] is True
         assert not c.ready_to_settle()  # still only 1 distinct writer of 2
 
     def test_scatter_failure_releases_as_failed(self):
         c = self._ctx(1)
-        c.record_writer_result(3, succeeded=True, src_base=0, **self._dst())
+        c.bind_writer(3, c.writer_base(0))
+        c.record_writer_result(3, succeeded=True, src_base=c.writer_base(0), **self._dst())
         c.begin_scatter()
         c.finish_scatter(False)  # scatter kernel failed
         ret = c.settle()
@@ -679,7 +1310,8 @@ class TestLifecycle:
         # once SCATTERING, all writers already reported SUCCESS -> nothing is in doubt, so a late
         # orphan (e.g. a racing cancel) must NOT downgrade a clean transfer to quarantine.
         c = self._ctx(1)
-        c.record_writer_result(3, succeeded=True, src_base=0, **self._dst())
+        c.bind_writer(3, c.writer_base(0))
+        c.record_writer_result(3, succeeded=True, src_base=c.writer_base(0), **self._dst())
         c.begin_scatter()
         c.mark_orphaned()  # no-op after SCATTERING
         c.finish_scatter(True)

@@ -29,7 +29,7 @@ class TransferState(Enum):
     SCATTERING = "scattering"  # all writers succeeded; scattering back into the cache
     COMPLETED = "completed"  # scattered cleanly, slot released
     FAILED = "failed"  # all writers done, at least one failed, slot released
-    QUARANTINED = "quarantined"  # a writer is in doubt, slot held out of reuse
+    CANCELLED_DRAINED = "cancelled_drained"  # cancellation settled only after exact drain proof
 
 
 class ScatterState(Enum):
@@ -60,22 +60,27 @@ class Settlement:
 @dataclass
 class TransferContext:
     """Lifetime state machine for one bounced receive region. The region is released only after every
-    writer reports (success or failure both mean its write has drained); a writer given up on (a
-    cancelled or timed-out transfer, whose one-sided write cannot be aborted) makes it quarantined
-    instead of reused."""
+    writer reports (success or failure both mean its write has drained), or an exact sender ACK proves
+    that every advertised write for the request incarnation has drained. Cancellation alone never
+    makes the region reusable."""
 
     rid_slice: Tuple[int, int]
     slot_id: int
     base_addr: int
     per_writer_bytes: int
     num_writers: int
+    allowed_destination_ranges: Tuple[Tuple[int, int], ...] = ()
+    expected_destination_plans: Dict[int, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
     on_done: Optional[Callable[[bool], None]] = None
+    on_settled: Optional[Callable[[bool], None]] = None
 
     # Whether each writer that reported succeeded, keyed by rank; presence means it reported.
     _writer_ok: Dict[int, bool] = field(default_factory=dict)
+    _expected_writer_bases: Dict[int, int] = field(default_factory=dict)
     # per successful writer: where it wrote, plus the fragments to scatter back
     _scatter_descs: List[tuple] = field(default_factory=list)
     _orphaned: bool = False
+    _drain_proven: bool = False
     scatter_state: ScatterState = ScatterState.IDLE
     state: TransferState = TransferState.INIT
     settled: bool = False
@@ -89,7 +94,7 @@ class TransferContext:
             TransferState.SCATTERING,
             TransferState.COMPLETED,
             TransferState.FAILED,
-            TransferState.QUARANTINED,
+            TransferState.CANCELLED_DRAINED,
         )
 
     def _all_writers_reported(self) -> bool:
@@ -99,6 +104,40 @@ class TransferContext:
         return self._all_writers_reported() and all(self._writer_ok.values())
 
     # Mutations: call only while holding the transport's reservation lock.
+    def bind_writer(self, peer_rank: int, src_base: int) -> None:
+        """Bind one immutable writer identity to its advertised bounce sub-region."""
+        if self._writers_final() or peer_rank in self._expected_writer_bases:
+            raise RuntimeError(f"bounce writer {peer_rank} was bound more than once")
+        if len(self._expected_writer_bases) >= self.num_writers:
+            raise RuntimeError("bounce writer binding exceeds the reserved fan-in")
+        if self.expected_destination_plans and peer_rank not in self.expected_destination_plans:
+            raise RuntimeError(f"bounce writer {peer_rank} has no receiver-derived scatter plan")
+        self._expected_writer_bases[peer_rank] = src_base
+
+    def set_completion_callback(self, on_settled: Callable[[bool], None]) -> None:
+        """Install the immutable reservation-lifetime callback before advertisement."""
+        if self._writers_final() or self.on_settled is not None:
+            raise RuntimeError("bounce completion callback was installed more than once")
+        self.on_settled = on_settled
+
+    def _combined_callback(self) -> Optional[Callable[[bool], None]]:
+        if self.on_done is None:
+            return self.on_settled
+        if self.on_settled is None:
+            return self.on_done
+        on_done = self.on_done
+        on_settled = self.on_settled
+
+        def complete(success: bool) -> None:
+            try:
+                on_done(success)
+            finally:
+                # Session lifetime credit must retire even if optional task/perf
+                # completion handling raises.
+                on_settled(success)
+
+        return complete
+
     def record_writer_result(
         self,
         peer_rank: int,
@@ -110,6 +149,24 @@ class TransferContext:
     ) -> None:
         """Record one writer's terminal report. Repeat or late reports are ignored, so duplicate or
         out-of-order messages are harmless."""
+        expected_src_base = self._expected_writer_bases.get(peer_rank)
+        if expected_src_base is None:
+            raise RuntimeError(f"result from unexpected bounce writer rank {peer_rank}")
+        if succeeded:
+            if src_base is None or dst_ptrs is None or sizes is None:
+                raise RuntimeError(
+                    "successful bounce writer result requires a complete scatter tail"
+                )
+            if src_base != expected_src_base:
+                raise RuntimeError(
+                    f"bounce writer {peer_rank} returned source base {src_base}, "
+                    f"expected {expected_src_base}"
+                )
+        elif src_base is not None and src_base != expected_src_base:
+            raise RuntimeError(
+                f"bounce writer {peer_rank} returned source base {src_base}, "
+                f"expected {expected_src_base}"
+            )
         # A duplicate or late report can still arrive after the writer set is final, because
         # scatter runs on another thread while the region stays live. For example a retransmitted
         # notification, or a stray failure that would flip a good transfer to failed; drop it.
@@ -125,10 +182,15 @@ class TransferContext:
 
     def mark_orphaned(self) -> None:
         """Give up on writers that never reported (cancel, timeout, shutdown): a one-sided write
-        cannot be aborted, so the region is quarantined on settle. No-op once scattering or done."""
+        cannot be aborted, so retain the region pending explicit drain proof. No-op once scattering
+        or done."""
         if self._writers_final():
             return
         self._orphaned = True
+
+    def confirm_drained(self) -> None:
+        """Record external proof that no writer can touch this region again."""
+        self._drain_proven = True
 
     def begin_scatter(self) -> None:
         self.state = TransferState.SCATTERING
@@ -154,7 +216,10 @@ class TransferContext:
         if self.settled:
             return False
         if self._orphaned:
-            return True  # in doubt: settle now and quarantine
+            # Cancellation alone says nothing about a one-sided remote write.
+            # Settle only after every writer reports terminal or the sender's
+            # drain ACK provides equivalent proof.
+            return self._drain_proven or self._all_writers_reported()
         if not self._all_writers_reported():
             return False  # a writer has not reported yet
         if self._all_writers_succeeded() and self._scatter_descs:
@@ -168,11 +233,23 @@ class TransferContext:
             return None
         self.settled = True
         if self._orphaned:
-            self.state = TransferState.QUARANTINED
-            return Settlement(self.slot_id, Disposition.QUARANTINE, False, self.on_done)
+            self.state = TransferState.CANCELLED_DRAINED
+            # Despite the historical state name, reaching here now requires
+            # exact drain proof, so the region is safe to release immediately.
+            return Settlement(
+                self.slot_id,
+                Disposition.RELEASE,
+                False,
+                self._combined_callback(),
+            )
         success = self._all_writers_succeeded() and self.scatter_state is not ScatterState.FAILED
         self.state = TransferState.COMPLETED if success else TransferState.FAILED
-        return Settlement(self.slot_id, Disposition.RELEASE, success, self.on_done)
+        return Settlement(
+            self.slot_id,
+            Disposition.RELEASE,
+            success,
+            self._combined_callback(),
+        )
 
 
 class BounceTransport(ABC):
@@ -192,12 +269,27 @@ class BounceTransport(ABC):
         """Release a send region after its write completes."""
 
     @abstractmethod
-    def reserve(self, recv_req, num_writers: int = 1, *, timeout: Optional[float] = None) -> bool:
+    def reserve(
+        self,
+        recv_req,
+        num_writers: int = 1,
+        *,
+        timeout: Optional[float] = None,
+        expected_destination_plans=None,
+    ) -> bool:
         """Reserve a region and record its address for the senders. False falls back to per-fragment."""
 
     @abstractmethod
     def writer_base(self, rid_slice, writer_index: int) -> Optional[int]:
         """Where the given fan-in writer writes in the region."""
+
+    @abstractmethod
+    def bind_writer(self, rid_slice, peer_rank: int, writer_index: int) -> Optional[int]:
+        """Bind a rank to its immutable advertised sub-region and return that base."""
+
+    @abstractmethod
+    def set_completion_callback(self, rid_slice, on_settled: Callable[[bool], None]) -> None:
+        """Install the callback that retires the reservation's lifetime credit."""
 
     @abstractmethod
     def is_bounced(self, rid_slice) -> bool:
@@ -209,7 +301,11 @@ class BounceTransport(ABC):
 
     @abstractmethod
     def orphan_reservation(self, rid_slice) -> None:
-        """Give up on an in-flight reservation (cancel/timeout/lost result); quarantine, don't leak."""
+        """Retain an in-flight reservation until explicit drain proof."""
+
+    @abstractmethod
+    def confirm_drained(self, rid_slice) -> None:
+        """Release an orphan only after all possible remote writes drained."""
 
     @abstractmethod
     def record_result(
@@ -218,7 +314,7 @@ class BounceTransport(ABC):
         """Handle a writer's success; scatter and finalize once all writers reported."""
 
     @abstractmethod
-    def record_failure(self, rid_slice, peer_rank) -> None:
+    def record_failure(self, rid_slice, peer_rank, on_done=None) -> None:
         """Handle a writer's failure; free the region once all writers reported."""
 
     @abstractmethod
