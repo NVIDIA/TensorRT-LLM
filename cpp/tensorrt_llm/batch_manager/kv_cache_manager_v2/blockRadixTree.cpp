@@ -321,17 +321,6 @@ static bool isPrefix(std::vector<TokenIdExt> const& prefix, std::vector<TokenIdE
     return true;
 }
 
-// tokensPerBlock for a child of `prev`, derived from `prev` alone.
-// Mirrors Python: prev.tokens_per_block if isinstance(prev, RootBlock) else len(prev.tokens).
-// Deliberately does not touch prev->prev, which is null whenever `prev` has been detached
-// from the tree by eviction while a live KvCache still holds it (see Block::prev in the header).
-int childTokensPerBlock(NodeBase const& prev) noexcept
-{
-    if (prev.type() == NodeBase::Type::kROOT_BLOCK)
-        return prev.tokensPerBlock();
-    return static_cast<int>(static_cast<Block const&>(prev).tokens.size());
-}
-
 } // anonymous namespace
 
 BlockKey Block::makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_t count)
@@ -347,14 +336,16 @@ Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode, LifeC
     , tokens(std::move(toks))
     , prev(prevNode)
     , storage(numLifeCycles, nullptr)
+    , mTokensPerBlock(prevNode->type() == NodeBase::Type::kROOT_BLOCK
+              ? prevNode->tokensPerBlock()
+              : static_cast<int>(static_cast<Block const*>(prevNode)->tokens.size()))
     , mOrdinal(prevNode->ordinal() + 1)
 {
 }
 
 int Block::tokensPerBlock() const noexcept
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(prev, "Block must have a prev");
-    return childTokensPerBlock(*prev);
+    return mTokensPerBlock;
 }
 
 void Block::releasePages()
@@ -539,8 +530,7 @@ SharedPtr<Block> addOrGetExistingBlock(
         return it->second;
     }
 
-    // Not prev->tokensPerBlock() — see childTokensPerBlock.
-    int const tpb = childTokensPerBlock(*prev);
+    int const tpb = prev->tokensPerBlock();
 
     // Useless check: is this block's token prefix covered by a sibling?
     // Mirrors Python's UselessBlockError — throw with the sibling block.

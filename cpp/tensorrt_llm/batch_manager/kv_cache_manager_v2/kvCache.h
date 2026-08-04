@@ -441,6 +441,7 @@ public:
     std::optional<RequestIdType> id; // opaque identifier (mirrors Python's id field)
 
 private:
+    friend class KvCacheManager;
     friend class KvCacheIntrospection;
     friend std::vector<SharedPageLock> batchedLockToGpu(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
@@ -526,6 +527,9 @@ private:
     // Release stale held uncommitted pages for SWA layers after committing stops.
     // Mirrors Python's _on_stop_committing().
     void _onStopCommitting();
+
+    // Stop publishing reuse after a cache reset or detached parent invalidates this lineage.
+    void _invalidateReuse();
 
     // Commit a single block at ordinal `ord`.
     // `isLast` mirrors Python's is_last parameter: when True (or on VIRTUAL_STOP),

@@ -151,6 +151,10 @@ void KvCacheManager::shutdown()
 void KvCacheManager::clearReusableBlocks()
 {
     TLLM_CHECK_DEBUG(mRadixTree);
+    for (KvCache* kvc : mLivingKvCaches)
+    {
+        kvc->_invalidateReuse();
+    }
     mRadixTree->clear();
 }
 

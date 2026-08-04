@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/config.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/eventManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/pendingStats.h"
@@ -195,6 +196,206 @@ TEST(KvCacheManagerV2StatsTest, DisabledStatsSuppressManagerCommit)
     manager->commitStats(KVCacheStatsDelta{4, 3, 2, 1});
     EXPECT_TRUE(manager->getCommittedStats().empty());
     EXPECT_TRUE(manager->getAndResetIterationStats().empty());
+}
+
+TEST(KvCacheManagerV2LifecycleTest, DetachedBlockRetainsTokensPerBlock)
+{
+    auto const config = makeConfig();
+    LifeCycleRegistry const lifeCycles{config};
+    BlockRadixTree tree{lifeCycles, config.tokensPerBlock};
+    RootBlock& root = tree.addOrGetExisting({});
+
+    auto block
+        = addOrGetExistingBlock(&root, lifeCycles.size(), std::vector<TokenIdExt>(config.tokensPerBlock, TokenId{1}));
+    auto detached = root.detachNext(block->key);
+    ASSERT_EQ(detached, block);
+    EXPECT_TRUE(detached->isOrphan());
+    EXPECT_TRUE(detached->isFull());
+    EXPECT_EQ(detached->tokensPerBlock(), config.tokensPerBlock);
+    EXPECT_TRUE(detached->next.empty());
+}
+
+TEST(KvCacheManagerV2LifecycleTest, ResetPreventsLiveCacheFromRepopulatingReuse)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    CachedCudaStream stream;
+    auto cache = manager->createKvCache();
+    ASSERT_TRUE(cache->resume(stream.handle()));
+    ASSERT_TRUE(cache->resize(4 * manager->tokensPerBlock()));
+
+    std::vector<TokenIdExt> const firstBlock(manager->tokensPerBlock(), TokenId{1});
+    std::vector<TokenIdExt> const secondBlock(manager->tokensPerBlock(), TokenId{2});
+    std::vector<TokenIdExt> const thirdBlock(manager->tokensPerBlock(), TokenId{3});
+    std::vector<TokenIdExt> const fourthBlock(manager->tokensPerBlock(), TokenId{4});
+    std::vector<TokenIdExt> committed = firstBlock;
+    committed.insert(committed.end(), secondBlock.begin(), secondBlock.end());
+    cache->commit(committed);
+    EXPECT_EQ(manager->probeReuse({}, committed), 2 * manager->tokensPerBlock());
+    auto const livePage = blockPageGetPage(cache->blocks()[BlockOrdinal{0}].pages[kDefaultBeamIndex][LifeCycleId{0}]);
+    auto const committedLivePage = dynamicPointerCast<CommittedPage>(livePage);
+    ASSERT_TRUE(committedLivePage);
+    ASSERT_TRUE(committedLivePage->hasValidSlot());
+
+    std::vector<TokenIdExt> const siblingTokens(manager->tokensPerBlock(), TokenId{9});
+    auto siblingCache = manager->createKvCache();
+    ASSERT_TRUE(siblingCache->resume(stream.handle()));
+    ASSERT_TRUE(siblingCache->resize(manager->tokensPerBlock()));
+    siblingCache->commit(siblingTokens);
+    WeakPtr<Block> const siblingBlock = siblingCache->blocks()[BlockOrdinal{0}].treeBlock;
+    siblingCache->close();
+    EXPECT_FALSE(siblingBlock.expired());
+    EXPECT_EQ(manager->storage().getStatistics().evictable, SlotCount{1});
+
+    manager->clearReusableBlocks();
+    EXPECT_EQ(cache->commitState(), KvCache::CommitState::VIRTUAL_STOP);
+    ASSERT_EQ(cache->blocks().size(), BlockOrdinal{4});
+    EXPECT_TRUE(cache->blocks()[BlockOrdinal{0}].treeBlock->isOrphan());
+    EXPECT_TRUE(cache->blocks()[BlockOrdinal{1}].treeBlock->isOrphan());
+    EXPECT_TRUE(cache->blocks()[BlockOrdinal{0}].treeBlock->next.empty());
+    EXPECT_TRUE(cache->blocks()[BlockOrdinal{1}].treeBlock->next.empty());
+    EXPECT_EQ(cache->blocks()[BlockOrdinal{0}].treeBlock->getPage(LifeCycleId{0}), nullptr);
+    EXPECT_EQ(committedLivePage->block, nullptr);
+    EXPECT_EQ(committedLivePage->status(), PageStatus::LOCKED);
+    EXPECT_TRUE(committedLivePage->hasValidSlot());
+    EXPECT_TRUE(siblingBlock.expired());
+    EXPECT_EQ(manager->storage().getStatistics().evictable, SlotCount{0});
+    EXPECT_TRUE(manager->radixTree().roots().empty());
+    EXPECT_EQ(manager->probeReuse({}, committed), 0);
+    EXPECT_NO_THROW(cache->commit(thirdBlock));
+    EXPECT_EQ(cache->numCommittedTokens(), 3 * manager->tokensPerBlock());
+    EXPECT_EQ(cache->historyLength(), cache->numCommittedTokens());
+    EXPECT_NO_THROW(cache->commit(fourthBlock));
+    EXPECT_EQ(cache->numCommittedTokens(), 4 * manager->tokensPerBlock());
+    EXPECT_EQ(cache->historyLength(), cache->numCommittedTokens());
+    EXPECT_EQ(cache->commitState(), KvCache::CommitState::VIRTUAL_STOP);
+    EXPECT_TRUE(manager->radixTree().roots().empty());
+
+    cache->stopCommitting();
+    EXPECT_EQ(cache->commitState(), KvCache::CommitState::USER_STOP);
+    cache->close();
+    stream.synchronize();
+    committed.insert(committed.end(), thirdBlock.begin(), thirdBlock.end());
+    committed.insert(committed.end(), fourthBlock.begin(), fourthBlock.end());
+    EXPECT_EQ(manager->probeReuse({}, committed), 0);
+}
+
+TEST(KvCacheManagerV2LifecycleTest, OrphanedParentStopsFullBlockReuseBeforeV1Event)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto eventManager
+        = std::make_shared<EventManager>(1024, 0, std::nullopt, EventManager::AttentionDpGatherFn{}, "v1_block_key");
+    auto manager = std::make_shared<KvCacheManager>(makeConfig(), eventManager);
+    CachedCudaStream stream;
+    auto cache = manager->createKvCache();
+    ASSERT_TRUE(cache->resume(stream.handle()));
+    ASSERT_TRUE(cache->resize(4 * manager->tokensPerBlock()));
+
+    std::vector<TokenIdExt> const firstBlock(manager->tokensPerBlock(), TokenId{1});
+    cache->commit(firstBlock);
+    auto const orphan = cache->blocks()[BlockOrdinal{0}].treeBlock;
+    ASSERT_TRUE(orphan);
+    manager->radixTree().clear();
+    ASSERT_TRUE(orphan->isOrphan());
+    ASSERT_TRUE(manager->radixTree().roots().empty());
+
+    EXPECT_NO_THROW(cache->commit(std::vector<TokenIdExt>(manager->tokensPerBlock(), TokenId{2})));
+    EXPECT_EQ(cache->commitState(), KvCache::CommitState::VIRTUAL_STOP);
+    EXPECT_EQ(cache->numCommittedBlocks(), 1);
+    EXPECT_TRUE(orphan->next.empty());
+    EXPECT_TRUE(manager->radixTree().roots().empty());
+    EXPECT_NO_THROW(cache->commit(std::vector<TokenIdExt>(manager->tokensPerBlock(), TokenId{3})));
+    EXPECT_NO_THROW(cache->commit(std::vector<TokenIdExt>(manager->tokensPerBlock(), TokenId{4})));
+    EXPECT_EQ(cache->numCommittedTokens(), 4 * manager->tokensPerBlock());
+    EXPECT_EQ(cache->historyLength(), cache->numCommittedTokens());
+
+    cache->stopCommitting();
+    cache->close();
+    stream.synchronize();
+    EXPECT_NO_THROW(manager->radixTree().clear());
+    EXPECT_NO_THROW(manager->shutdown());
+}
+
+TEST(KvCacheManagerV2LifecycleTest, OrphanedParentStopsPartialSnapshotBeforeV1Event)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    auto eventManager
+        = std::make_shared<EventManager>(1024, 0, std::nullopt, EventManager::AttentionDpGatherFn{}, "v1_block_key");
+    auto manager = std::make_shared<KvCacheManager>(config, eventManager);
+    CachedCudaStream stream;
+    auto cache = manager->createKvCache();
+    ASSERT_TRUE(cache->resume(stream.handle()));
+    ASSERT_TRUE(cache->resize(2 * manager->tokensPerBlock()));
+
+    cache->commit(std::vector<TokenIdExt>(manager->tokensPerBlock(), TokenId{1}));
+    auto const orphan = cache->blocks()[BlockOrdinal{0}].treeBlock;
+    ASSERT_TRUE(orphan);
+    manager->radixTree().clear();
+    ASSERT_TRUE(orphan->isOrphan());
+
+    EXPECT_NO_THROW(cache->commit({TokenId{2}}));
+    EXPECT_EQ(cache->commitState(), KvCache::CommitState::VIRTUAL_STOP);
+    EXPECT_EQ(cache->numCommittedBlocks(), 1);
+    EXPECT_TRUE(orphan->next.empty());
+    EXPECT_TRUE(manager->radixTree().roots().empty());
+
+    cache->close();
+    stream.synchronize();
+}
+
+TEST(KvCacheManagerV2LifecycleTest, OrphanedParentStopsPartialFinalCommitBeforeV1Event)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto eventManager
+        = std::make_shared<EventManager>(1024, 0, std::nullopt, EventManager::AttentionDpGatherFn{}, "v1_block_key");
+    auto manager = std::make_shared<KvCacheManager>(makeConfig(), eventManager);
+    CachedCudaStream stream;
+    auto cache = manager->createKvCache();
+    ASSERT_TRUE(cache->resume(stream.handle()));
+    ASSERT_TRUE(cache->resize(2 * manager->tokensPerBlock()));
+
+    cache->commit(std::vector<TokenIdExt>(manager->tokensPerBlock(), TokenId{1}));
+    auto const orphan = cache->blocks()[BlockOrdinal{0}].treeBlock;
+    ASSERT_TRUE(orphan);
+    manager->radixTree().clear();
+    ASSERT_TRUE(orphan->isOrphan());
+
+    cache->commit({TokenId{2}});
+    ASSERT_EQ(cache->commitState(), KvCache::CommitState::ALLOWED);
+    EXPECT_NO_THROW(cache->stopCommitting());
+    EXPECT_EQ(cache->commitState(), KvCache::CommitState::USER_STOP);
+    EXPECT_EQ(cache->numCommittedBlocks(), 1);
+    EXPECT_TRUE(orphan->next.empty());
+    EXPECT_TRUE(manager->radixTree().roots().empty());
+
+    cache->close();
+    stream.synchronize();
+}
+
+TEST(KvCacheManagerV2LifecycleTest, ResetReleasesSwaPagesHeldOnlyForCommit)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeConfig();
+    std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = 4;
+    auto manager = std::make_shared<KvCacheManager>(config);
+    CachedCudaStream stream;
+    auto cache = manager->createKvCache();
+    ASSERT_TRUE(cache->resume(stream.handle()));
+    ASSERT_TRUE(cache->resize(12, 0));
+    ASSERT_TRUE(cache->resize(12, 8));
+
+    auto const& stalePage = cache->blocks()[BlockOrdinal{0}].pages[kDefaultBeamIndex][LifeCycleId{0}];
+    ASSERT_TRUE(std::holds_alternative<SharedPtr<PageHolder>>(stalePage));
+    manager->clearReusableBlocks();
+    EXPECT_EQ(cache->commitState(), KvCache::CommitState::VIRTUAL_STOP);
+    EXPECT_TRUE(blockPageIsNull(stalePage));
+
+    EXPECT_NO_THROW(manager->clearReusableBlocks());
+    EXPECT_TRUE(cache->resize(std::nullopt, 12));
+    cache->close();
+    stream.synchronize();
 }
 
 TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrentSnapshot)

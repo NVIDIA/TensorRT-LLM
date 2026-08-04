@@ -127,7 +127,7 @@ public:
 
     void shutdown();
 
-    // Clear all reusable (committed) blocks from the radix tree.
+    // Start a new reuse epoch: clear the tree and stop live caches from republishing into it.
     void clearReusableBlocks();
 
     // ---- KvCache creation -------------------------------------------------

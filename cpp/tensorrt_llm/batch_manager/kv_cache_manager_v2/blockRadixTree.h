@@ -136,7 +136,7 @@ struct NodeBase
 
     SharedPtr<Block> detachNext(BlockKey const& key);
 
-    /// RootBlock: delegates to tree. Block: len(prev->tokens) or prev->tokensPerBlock().
+    /// RootBlock: delegates to tree. Block: returns its retained block size.
     virtual int tokensPerBlock() const noexcept = 0;
 
 protected:
@@ -274,6 +274,7 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
     void releasePages();
 
 private:
+    int const mTokensPerBlock;
     BlockOrdinal mOrdinal;
 };
 

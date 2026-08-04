@@ -875,14 +875,19 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
 
     LifeCycleId numLc = mManager->storage().numLifeCycles();
     NodeBase* prevNode = nullptr;
-    RootBlock& root = mManager->radixTree().addOrGetExisting(mReuseScope);
     if (ordinal == BlockOrdinal{0})
     {
-        prevNode = &root;
+        prevNode = &mManager->radixTree().addOrGetExisting(mReuseScope);
     }
     else
     {
-        prevNode = _getTreeBlock(BlockOrdinal{ordinal.value() - 1}).get();
+        auto const& prevBlock = _getTreeBlock(BlockOrdinal{ordinal.value() - 1});
+        if (prevBlock->isOrphan())
+        {
+            _invalidateReuse();
+            return;
+        }
+        prevNode = prevBlock.get();
     }
 
     bool isNew = false;
@@ -1518,14 +1523,27 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         throw LogicError("Cannot commit block that is not full except last block");
 
     // Prev node lookup (root or previous committed block).
-    RootBlock& root = mManager->radixTree().addOrGetExisting(mReuseScope);
     LifeCycleId numLc = mManager->storage().numLifeCycles();
 
-    NodeBase* prevNode = &root;
+    NodeBase* prevNode = nullptr;
     if (ord > 0)
     {
         TLLM_CHECK_DEBUG_WITH_INFO(mBlocks[BlockOrdinal{ord - 1}].treeBlock, "prev block must be committed");
-        prevNode = mBlocks[BlockOrdinal{ord - 1}].treeBlock.get();
+        auto const& prevBlock = mBlocks[BlockOrdinal{ord - 1}].treeBlock;
+        if (prevBlock->isOrphan())
+        {
+            _invalidateReuse();
+            if (isLast)
+            {
+                mCommitState = CommitState::USER_STOP;
+            }
+            return;
+        }
+        prevNode = prevBlock.get();
+    }
+    else
+    {
+        prevNode = &mManager->radixTree().addOrGetExisting(mReuseScope);
     }
 
     // Try to find or create a block in the radix tree.
@@ -1740,18 +1758,18 @@ void KvCache::commit(std::vector<TokenIdExt> const& tokens, bool isEnd)
 
     // Append tokens to committed list.
     mCommittedTokens.insert(mCommittedTokens.end(), tokens.begin(), tokens.end());
+
+    // Keep the history invariant even after reuse has been invalidated.
+    int const numCommitted = static_cast<int>(mCommittedTokens.size());
+    if (mHistoryLength < numCommitted)
+        setHistoryLength(numCommitted);
+
     if (mCommitState == CommitState::VIRTUAL_STOP)
     {
         if (isEnd)
             mCommitState = CommitState::USER_STOP;
         return;
     }
-
-    // Bump history_length to cover newly committed tokens (mirrors Python — done
-    // BEFORE the commit loop so stale-range computation sees the new history).
-    int const numCommitted = static_cast<int>(mCommittedTokens.size());
-    if (mHistoryLength < numCommitted)
-        setHistoryLength(numCommitted);
 
     int const numCommittedBlocksBefore = mNumCommittedBlocks;
     int const newNumFullBlocks = numCommitted / mTokensPerBlock;
@@ -1976,6 +1994,15 @@ void KvCache::_onStopCommitting()
         }
     }
     TLLM_CHECK_DEBUG(_checkSanity());
+}
+
+void KvCache::_invalidateReuse()
+{
+    if (mCommitState == CommitState::ALLOWED)
+    {
+        mCommitState = CommitState::VIRTUAL_STOP;
+        _onStopCommitting();
+    }
 }
 
 // ---------------------------------------------------------------------------
