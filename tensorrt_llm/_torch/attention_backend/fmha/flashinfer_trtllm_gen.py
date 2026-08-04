@@ -137,8 +137,13 @@ def _install_flashinfer_mla_decode_tuning_config_cache() -> None:
             "max_seq_len",
             "device",
         )
-        if tuple(inspect.signature(orig_build).parameters) != expected_params:
+        signature = inspect.signature(orig_build)
+        if tuple(signature.parameters) != expected_params:
             return  # builder was refactored; memo key may no longer be complete
+        try:
+            signature.bind(**dict.fromkeys(expected_params))
+        except TypeError:
+            return  # parameters went positional-only; the keyword call below would fail
 
         cache: dict = {}
 
@@ -194,9 +199,8 @@ def _install_flashinfer_mla_decode_tuning_config_cache() -> None:
     except (ImportError, AttributeError, TypeError, ValueError):
         # A future flashinfer refactor (moved module, changed fields) must not
         # break attention; it just loses the workaround.
-        logger.debug(
-            "Skipping flashinfer MLA decode tuning-config cache workaround.", exc_info=True
-        )
+        # tensorrt_llm's logger.debug(*msg) takes no exc_info/kwargs.
+        logger.debug("Skipping flashinfer MLA decode tuning-config cache workaround.")
 
 
 if IS_FLASHINFER_AVAILABLE:
