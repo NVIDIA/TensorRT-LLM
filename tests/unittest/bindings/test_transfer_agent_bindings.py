@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import numpy as np
 import pytest
 
 # Try to import the transfer agent binding module
@@ -162,6 +163,40 @@ def test_memory_descs():
     assert len(descs.descs) == 2
     assert descs.descs[0].addr == 0x1000
     assert descs.descs[1].addr == 0x2000
+
+
+@pytest.mark.cpu_only
+def test_memory_descs_from_readonly_arrays():
+    """Test MemoryDescs construction from read-only arrays."""
+    addrs = np.array([0x1000, 0x2000], dtype=np.int64)
+    sizes = np.array([4096, 8192], dtype=np.int64)
+    device_ids = np.array([0, 1], dtype=np.int32)
+    addrs.flags.writeable = False
+    sizes.flags.writeable = False
+    device_ids.flags.writeable = False
+
+    descs = tab.MemoryDescs.from_arrays(tab.MemoryType.VRAM, addrs, sizes, device_ids)
+
+    assert [(desc.addr, desc.len, desc.device_id) for desc in descs.descs] == [
+        (0x1000, 4096, 0),
+        (0x2000, 8192, 1),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_memory_descs_from_readonly_arrays_uniform_device():
+    """Test uniform-device MemoryDescs construction from read-only arrays."""
+    addrs = np.array([0x1000, 0x2000], dtype=np.int64)
+    sizes = np.array([4096, 8192], dtype=np.int64)
+    addrs.flags.writeable = False
+    sizes.flags.writeable = False
+
+    descs = tab.MemoryDescs.from_arrays_uniform_device(tab.MemoryType.VRAM, addrs, sizes, 2)
+
+    assert [(desc.addr, desc.len, desc.device_id) for desc in descs.descs] == [
+        (0x1000, 4096, 2),
+        (0x2000, 8192, 2),
+    ]
 
 
 @pytest.mark.cpu_only
