@@ -26,6 +26,30 @@ Replace `x.y.z` with the desired version. Browse the available tags for [`devel`
 
 {{container_tag_admonition}}
 
+## Binary Compatibility
+
+Use TensorRT LLM Python packages, Python bindings, and native libraries from the
+same TensorRT LLM release. The Python bindings are compiled against the C++
+runtime library layout for a specific build, so replacing only selected shared
+libraries from a newer image or wheel is unsupported and can fail with Python
+signature errors or native crashes.
+
+When moving to a newer release, update the full TensorRT LLM environment
+together. For example, use a single `release:x.y.z` image, install one matching
+TensorRT LLM wheel, or rebuild and install the wheel from the same source tree.
+Do not mix files such as these across different release tags:
+
+- `bindings.cpython-*.so`
+- `libtensorrt_llm.so`
+- `libtensorrt_llm_nixl_wrapper.so`
+- `libth_common.so`
+
+This is especially important when adopting a new transport or runtime feature
+by copying libraries into an older base image. If the base image was built with
+an older TensorRT LLM release, rebuild the image with the newer release or
+replace the complete installed TensorRT LLM package instead of copying only the
+feature-specific `.so` files.
+
 ## Building Images Locally
 
 All local image builds require the TensorRT LLM source tree and approximately 63 GB of free disk space. Clone the repository first if you have not already:
