@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm import _flashinfer_workaround as workaround
+import tensorrt_llm as workaround
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi import mpi_session
 

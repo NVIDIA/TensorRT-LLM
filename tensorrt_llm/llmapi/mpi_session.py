@@ -17,8 +17,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
 
-from tensorrt_llm._flashinfer_workaround import \
-    _FLASHINFER_WORKSPACE_ISOLATION_ENV
+from tensorrt_llm import _FLASHINFER_WORKSPACE_ISOLATION_ENV
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -439,9 +438,7 @@ class MpiPoolSession(MpiSession):
             if key.startswith("TRTLLM") or key.startswith("TLLM")
         }
         if self.n_workers > 1:
-            # FlashInfer 0.6.15 generates JIT sources before taking its build
-            # lock. A private workspace prevents spawned workers from racing
-            # while writing those sources.
+            # Isolate FlashInfer JIT sources across workers.
             env.setdefault(_FLASHINFER_WORKSPACE_ISOLATION_ENV, "1")
         env.update(self._env_overrides)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
