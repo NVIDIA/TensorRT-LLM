@@ -493,9 +493,12 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
         link_dir = None
 
     try:
+        # Pre-import torch so libth_common.so can resolve c10 symbols (e.g.
+        # c10::ValueError) when bindings loads it. CLI args after -c land
+        # in sys.argv[1:] for argparse.
         build_run(
-            f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O . "
-            f"-p \"{nanobind_stubgen_patterns}\" -q",
+            f"\"{venv_python}\" -c 'import torch; from nanobind.stubgen import main; main()' "
+            f"-m bindings -r -O . -p \"{nanobind_stubgen_patterns}\" -q",
             env=env_stub_gen)
         # Pre-import torch so deep_gemm_cpp_tllm's FP4 scalar-type registration
         # succeeds; CLI args after `-c ...` land in sys.argv[1:] for argparse.
@@ -513,9 +516,9 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
                 env=env_stub_gen)
         if transfer_agent_binding:
             # Generate stubs for tensorrt_llm_transfer_agent_binding
-
             build_run(
-                f"\"{venv_python}\" -m nanobind.stubgen -m tensorrt_llm_transfer_agent_binding -O .",
+                f"\"{venv_python}\" -c 'import torch; from nanobind.stubgen import main; main()' "
+                "-m tensorrt_llm_transfer_agent_binding -O .",
                 env=env_stub_gen)
 
     finally:
