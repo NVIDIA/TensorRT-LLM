@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# 1-GPU GLM-Image adapter. The initial VisualGen enablement delegates the
+# GLM-Image AR+DiT stack to upstream Diffusers, so TRTLLM dynamic
+# quantization, torch.compile, CUDA graphs, and custom attention backends
+# are intentionally disabled until a native transformer port lands.
+attention_config:
+  backend: VANILLA
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+torch_compile_config:
+  enable: false
+  enable_autotune: false
+cuda_graph_config:
+  enable: false
+compilation_config:
+  skip_warmup: true
