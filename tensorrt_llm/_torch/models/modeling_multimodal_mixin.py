@@ -1609,7 +1609,9 @@ def _dispatch_cross_iter_prefetch(
                         cache_misses.append(param)
                     elif partition.is_full_hit:
                         param.multimodal_data["multimodal_embedding"] = (
-                            model.assemble_full_embedding(partition.hits, len(partition.keys))
+                            MultimodalEncoderRequestState.assemble_full_embedding(
+                                partition.hits, len(partition.keys)
+                            )
                         )
                     else:
                         partial_hits.append((param, partition))
