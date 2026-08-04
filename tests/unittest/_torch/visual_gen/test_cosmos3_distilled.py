@@ -633,9 +633,10 @@ class TestDistilledConditioningAnchor:
 
         latents = torch.arange(48, dtype=torch.float32).reshape(1, 4, 3, 2, 2)
         untouched = latents[:, :, 1:].clone()
-        returned = post_step_fn(latents)
+        returned, extra = post_step_fn(latents, None)
 
         assert returned is latents, "must write in place, not copy"
+        assert extra is None, "extra-stream latents pass through untouched"
         assert torch.all(latents[:, :, 0:1] == self.CLEAN)
         assert torch.equal(latents[:, :, 1:], untouched)
 
@@ -767,7 +768,7 @@ class TestForwardConditioningWiring:
         post_step_fn = captured["post_step_fn"]
         assert post_step_fn is not None
         latents = torch.zeros(1, 4, self.T_LAT, self.H_LAT, self.W_LAT)
-        post_step_fn(latents)
+        post_step_fn(latents, None)
         assert torch.all(latents[:, :, 0:1] == self.CLEAN)
         assert torch.all(latents[:, :, 1:] == 0.0)
 

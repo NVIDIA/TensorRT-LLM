@@ -1054,8 +1054,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 )
             if do_action:
                 raise ValueError("Cosmos3 action generation does not support output_type='image'.")
-            if enable_audio:
-                raise ValueError("Cosmos3 audio generation does not support output_type='image'.")
             num_frames = 1
             # T2I force-disables audio instead of rejecting it, so an image
             # request never trips the audio-weight presence check below.
