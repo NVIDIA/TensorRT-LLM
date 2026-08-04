@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -35,9 +35,14 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(mixtureOfExpertsTest
                              PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
-  remove_compile_definition(mixtureOfExpertsInternalTest
-                            USING_OSS_CUTLASS_MOE_GEMM)
+  # The internal-path variant includes headers (quantization.h) that only ship
+  # with the internal cutlass kernels sources; the prebuilt tarball provides the
+  # library and a reduced header set only.
+  if(INTERNAL_CUTLASS_KERNELS_PATH)
+    add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
+    remove_compile_definition(mixtureOfExpertsInternalTest
+                              USING_OSS_CUTLASS_MOE_GEMM)
+  endif()
 endif()
 
 add_gtest(ropeTest ropeTest.cu)

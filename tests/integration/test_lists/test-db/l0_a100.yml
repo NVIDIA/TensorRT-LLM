@@ -52,12 +52,11 @@ l0_a100:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: tensorrt
+      backend: pytorch
   tests:
   - unittest/llmapi/test_llm.py -m "part0"
   - unittest/llmapi/test_llm.py -m "not part0" TIMEOUT (90)
   - unittest/llmapi/test_executor.py
-  - accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
 - condition:
     ranges:
       system_gpu_count:

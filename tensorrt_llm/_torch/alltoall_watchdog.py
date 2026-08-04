@@ -53,6 +53,15 @@ _WORKSPACE_WATCHDOG_STATE_KEY = "alltoall_watchdog_shared_state"
 _WORKSPACE_WATCHDOG_STATE_INIT_LOCK = threading.Lock()
 
 
+def reject_rank_mask_cuda_graph_capture(rank_mask_enabled: bool) -> None:
+    """Reject graph capture until membership-scoped recapture is available."""
+    if rank_mask_enabled and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "rank-mask mode does not support CUDA graphs until generation-scoped "
+            "invalidation and recapture are implemented"
+        )
+
+
 def _normalize_completion_flag(value: int) -> int:
     return int(value) & _COMPLETION_FLAG_MASK
 

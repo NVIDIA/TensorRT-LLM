@@ -143,15 +143,24 @@ def test_qwen35_dense_vl_resolves_mamba_ssm_cache_dtype(
     config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
     model_config = ModelConfig(pretrained_config=config)
 
+    # "auto" keeps the SSM cache in the model weights dtype for performance:
+    # the checkpoint's mamba_ssm_dtype=float32 expresses SSM compute intent,
+    # and honoring it for cache allocation disables the FlashInfer bf16-state
+    # GDN decode kernel and doubles state memory traffic.
     validate_and_set_mamba_ssm_cache_dtype(model_config, "auto")
-    assert model_config.quant_config.mamba_ssm_cache_dtype is torch.float32
+    assert model_config.quant_config.mamba_ssm_cache_dtype is torch.bfloat16
 
     mamba_params = extract_mamba_kv_cache_params(
         config.text_config,
         quant_config=model_config.quant_config,
     )
     assert mamba_params.dtype is torch.bfloat16
-    assert mamba_params.mamba_ssm_cache_dtype is torch.float32
+    assert mamba_params.mamba_ssm_cache_dtype is torch.bfloat16
+
+    # Explicit opt-in honors the checkpoint's fp32 SSM state intent.
+    opt_in_config = ModelConfig(pretrained_config=config)
+    validate_and_set_mamba_ssm_cache_dtype(opt_in_config, "float32")
+    assert opt_in_config.quant_config.mamba_ssm_cache_dtype is torch.float32
 
 
 def test_qwen35_dense_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
@@ -163,6 +172,31 @@ def test_qwen35_dense_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
         AutoCheckpointMapper.get("HF", "Qwen3_5ForConditionalGeneration"),
         Qwen3_5MoeHfWeightMapper,
     )
+
+
+def test_qwen35_dense_vl_disable_mm_encoder_skips_vision_tower(
+    tmp_path: Path,
+) -> None:
+    """disable_mm_encoder must not instantiate the vision encoder (nvbug
+    6405760: the tower's GPU memory shrank the KV cache pool for text-only
+    serving of VLM checkpoints)."""
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
+    model_config = ModelConfig(pretrained_config=config, disable_mm_encoder=True)
+    with torch.device("cuda"):
+        model = Qwen3_5VLModel(model_config)
+
+    assert model.mm_encoder is None
+    assert not any("mm_encoder" in name for name, _ in model.named_parameters())
+
+
+def test_qwen35_dense_vl_default_keeps_vision_tower(tmp_path: Path) -> None:
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
+    model_config = ModelConfig(pretrained_config=config)
+    with torch.device("cuda"):
+        model = Qwen3_5VLModel(model_config)
+
+    assert model.mm_encoder is not None
+    assert any("mm_encoder" in name for name, _ in model.named_parameters())
 
 
 def test_qwen35_dense_vl_placeholder_metadata_registered() -> None:

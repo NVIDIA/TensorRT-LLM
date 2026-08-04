@@ -34,7 +34,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferOp,
     TransferRequest,
 )
-from tensorrt_llm.runtime.generation import CUASSERT
+from tensorrt_llm._utils import CUASSERT
 
 from .buffer import SlotAllocator
 from .config import SizingContext, fit_within_free
@@ -146,22 +146,21 @@ class VmmBounceTransport(BounceTransport):
     def _new_stream(self):
         return CUASSERT(cudart.cudaStreamCreate())[0]
 
-    def _launch_gather(self, src_addr: int, write_meta, total: int):
-        """Launch the gather of the scattered fragments into the send region and return an event to
-        wait on."""
+    def _gather_blocking(self, src_addr: int, write_meta, total: int) -> None:
+        """Gather the scattered fragments into the send region and block until done. The whole gather
+        runs under the stream lock so a second sender thread can't overwrite the shared staging buffer
+        mid-copy and corrupt this region; only the fast gather serializes, the writes stay parallel."""
         plan = Plan(write_meta.src_ptrs, write_meta.dst_ptrs, write_meta.sizes, total)
         with self._send_stream_lock:
             gather_contiguous(
                 src_addr, plan.src_ptrs, plan.sizes, plan.offsets, stream=self._send_stream
             )
             event = CUASSERT(cudart.cudaEventCreate())[0]
-            CUASSERT(cudart.cudaEventRecord(event, self._send_stream))
-        return event
-
-    def _wait_gather(self, event) -> None:
-        if event is not None:
-            CUASSERT(cudart.cudaEventSynchronize(event))
-            CUASSERT(cudart.cudaEventDestroy(event))
+            try:
+                CUASSERT(cudart.cudaEventRecord(event, self._send_stream))
+                CUASSERT(cudart.cudaEventSynchronize(event))
+            finally:
+                CUASSERT(cudart.cudaEventDestroy(event))
 
     def _make_write(self, src_addr: int, write_meta, total: int):
         # one coalesced descriptor spanning the whole region
@@ -189,20 +188,20 @@ class VmmBounceTransport(BounceTransport):
             )
             return None
         slot_id, src_addr = res
-        return slot_id, src_addr, total, self._launch_gather(src_addr, write_meta, total)
+        try:
+            self._gather_blocking(src_addr, write_meta, total)
+        except Exception:
+            self._send_alloc.release(slot_id)  # free the slot if the gather raises
+            raise
+        return slot_id, src_addr, total
 
     def build_request(self, write_meta):
-        """Gather into a send slot and build the coalesced write, or None on backpressure. Frees the
-        slot if the gather raises."""
+        """Gather into a send slot and build the coalesced write, or None on backpressure. The gather
+        blocks (and frees the slot on failure) inside _reserve_and_gather."""
         gathered = self._reserve_and_gather(write_meta, timeout=_RESERVE_TIMEOUT_S)
         if gathered is None:  # backpressure: fall back
             return None
-        slot_id, src_addr, total, event = gathered
-        try:
-            self._wait_gather(event)
-        except Exception:
-            self._send_alloc.release(slot_id)
-            raise
+        slot_id, src_addr, total = gathered
         return self._make_write(src_addr, write_meta, total), slot_id
 
     def release_send(self, slot_id) -> None:
@@ -239,6 +238,21 @@ class VmmBounceTransport(BounceTransport):
                 f"({total % num_writers}B remainder); head-mismatch explosion NOT mitigated",
                 warn_key="kv-bounce-uneven-fanin",
             )
+        if num_writers > 1:
+            # Fan-in gives each writer an equal share of the region, which only matches where it
+            # writes when all writers send the same bytes. Equal layer count guarantees that only
+            # when the per-block sizes match, so require that here, else fall back.
+            present_slot_bytes = {
+                self._block_bytes_per_group[g]
+                for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups)
+                if int(block_ids.size) > 0
+            }
+            if len(present_slot_bytes) > 1:
+                return self._skip_bounce(
+                    f"fan-in across {num_writers} senders with non-uniform layer-group slot bytes "
+                    f"{sorted(present_slot_bytes)}; the equal split would overrun a sub-region",
+                    warn_key="kv-bounce-heterogeneous-fanin",
+                )
         if total > self._recv_alloc.capacity:  # too big to ever fit, unlike transient backpressure
             return self._skip_bounce(
                 f"transfer {total // _MIB}MiB exceeds the {self._recv_alloc.capacity // _MIB}MiB bounce "
@@ -261,6 +275,14 @@ class VmmBounceTransport(BounceTransport):
                 num_writers=num_writers,
             )
             self._reserved_map[ctx.rid_slice] = ctx  # inactive until the first writer reports
+        # Positive marker: all fall-back guards above passed, so this transfer provably takes the
+        # coalesced-bounce WRITE path. Logged once (per process) so an e2e test can assert that
+        # bounce actually engaged instead of silently falling back to the per-fragment path.
+        logger.info_once(
+            f"[kv-bounce] coalesced {nblocks} blocks / {total // _MIB}MiB into one region "
+            f"across {num_writers} writer(s)",
+            key="kv-bounce-coalesced",
+        )
         return True
 
     def writer_base(self, rid_slice: RidSlice, writer_index: int) -> Optional[int]:
@@ -280,6 +302,12 @@ class VmmBounceTransport(BounceTransport):
             ctx = self._reserved_map.pop(rid_slice, None)
         if ctx is not None:
             self._recv_alloc.release(ctx.slot_id)
+
+    def orphan_reservation(self, rid_slice: RidSlice) -> None:
+        """Give up on a reservation whose write may still be in flight (cancel/timeout/lost result).
+        The write can't be aborted, so quarantine the region (reclaimed later) rather than releasing
+        or leaking it. Idempotent; a no-op once the transfer has settled."""
+        self._apply(rid_slice, lambda ctx: ctx.mark_orphaned())
 
     def _apply(self, rid_slice: RidSlice, mutate: Callable[[TransferContext], None]) -> None:
         """Mutate the state under the lock, then do what it asks (scatter or settle) with the lock
@@ -419,6 +447,9 @@ class NoBounceTransport(BounceTransport):
         return False
 
     def release_idle_reservation(self, rid_slice) -> None:
+        pass
+
+    def orphan_reservation(self, rid_slice) -> None:
         pass
 
     def record_result(

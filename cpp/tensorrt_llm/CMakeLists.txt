@@ -144,8 +144,6 @@ add_subdirectory(common)
 add_subdirectory(kernels)
 add_subdirectory(layers)
 add_subdirectory(runtime)
-add_subdirectory(testing)
-add_subdirectory(executor_worker)
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
@@ -176,7 +174,6 @@ set(TRTLLM_LINK_LIBS
     ${CUBLASLT_LIB}
     ${CURAND_LIB}
     ${CMAKE_DL_LIBS}
-    ${TRT_LIB}
     common_src
     kernels_src
     flash_mla_src
@@ -199,7 +196,6 @@ set(TRTLLM_LINK_LIBS
     cute_dsl_src
     layers_src
     runtime_src
-    testing_src
     compressorKernels_src
     mhcKernels_src
     userbuffers_src
@@ -310,5 +306,3 @@ endif()
 if(BUILD_FLASH_MLA)
   add_subdirectory(flash_mla)
 endif()
-
-add_subdirectory(plugins)

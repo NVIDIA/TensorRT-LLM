@@ -30,6 +30,7 @@ try:
         HaloExchangeConv,
         HaloExchangeConv2dStride2,
     )
+    from tensorrt_llm._torch.visual_gen.modules.vae.conv import _spatial_channels_last_format
 
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
@@ -206,6 +207,36 @@ class TestHaloExchangeConv:
 class TestHaloExchangeConv2dStride2:
     def test_conv2d_stride2_2gpu(self):
         _run(2, _logic_halo_conv2d_stride2)
+
+
+@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
+class TestSpatialChannelsLastFormat:
+    """CPU unit tests for the halo channels-last layout helper.
+
+    ``_spatial_channels_last_format`` is what lets the halo ``cat`` preserve
+    channels-last (so downstream convs skip a full-tensor re-conversion). It runs
+    on CPU tensors, so no GPU/distributed setup is needed here.
+    """
+
+    def test_channels_last_3d_detected(self):
+        x = torch.randn(1, 4, 3, 8, 8).contiguous(memory_format=torch.channels_last_3d)
+        assert _spatial_channels_last_format(x) is torch.channels_last_3d
+
+    def test_channels_last_2d_detected(self):
+        x = torch.randn(2, 4, 8, 8).contiguous(memory_format=torch.channels_last)
+        assert _spatial_channels_last_format(x) is torch.channels_last
+
+    def test_row_major_returns_none(self):
+        assert _spatial_channels_last_format(torch.randn(1, 4, 3, 8, 8)) is None
+        assert _spatial_channels_last_format(torch.randn(2, 4, 8, 8)) is None
+
+    def test_cat_preserves_channels_last_when_halos_match(self):
+        # The core invariant: cat of same-format channels-last slices stays
+        # channels-last (a mixed-format cat would fall back to row-major).
+        x = torch.randn(1, 4, 3, 8, 8).contiguous(memory_format=torch.channels_last_3d)
+        halo = torch.zeros(1, 4, 3, 1, 8).contiguous(memory_format=torch.channels_last_3d)
+        out = torch.cat([halo, x, halo], dim=3)
+        assert out.is_contiguous(memory_format=torch.channels_last_3d)
 
 
 if __name__ == "__main__":

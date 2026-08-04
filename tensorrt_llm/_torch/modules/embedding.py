@@ -58,9 +58,19 @@ class LMHead(Linear):
         else:
             self.padding_size = 0
 
+        # Linear re-shards only the dim selected by tensor_parallel_mode, so
+        # only that dim may be passed as local*tp (to carry the ceil-div
+        # padding); the other dim must be the true full size — Linear keeps it
+        # as-is, and quant_method.create_weights sizes the (packed) quantized
+        # weight and scales from it.
+        in_features_full = (local_in_features * tp_size if tensor_parallel_mode
+                            == TensorParallelMode.ROW else embedding_dim)
+        out_features_full = (local_out_features *
+                             tp_size if tensor_parallel_mode
+                             == TensorParallelMode.COLUMN else num_embeddings)
         super().__init__(
-            local_in_features * tp_size,
-            local_out_features * tp_size,
+            in_features_full,
+            out_features_full,
             bias=False,
             dtype=dtype,
             mapping=mapping,

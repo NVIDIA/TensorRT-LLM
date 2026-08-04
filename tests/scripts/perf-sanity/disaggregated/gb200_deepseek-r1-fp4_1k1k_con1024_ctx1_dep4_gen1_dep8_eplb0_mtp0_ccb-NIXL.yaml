@@ -66,6 +66,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
+      transceiver_runtime: PYTHON
     stream_interval: 100
     num_postprocess_workers: 4
   ctx:
@@ -90,3 +91,4 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
+      transceiver_runtime: PYTHON

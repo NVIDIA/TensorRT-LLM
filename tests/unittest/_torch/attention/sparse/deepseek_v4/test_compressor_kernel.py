@@ -1223,8 +1223,10 @@ def test_prefill_varlen(seq_lens_list, compress_ratio, head_dim, overlap):
 
         if valid_outputs:
             out_kernel_valid = torch.cat(valid_outputs, dim=0)
+            # The CUDA and PyTorch reductions can round to adjacent BF16 values near a tie.
+            output_rtol = max(2e-3, torch.finfo(out_kernel_valid.dtype).eps)
             assert torch.allclose(
-                out_py.to(out_kernel_valid.dtype), out_kernel_valid, rtol=2e-3, atol=5e-3
+                out_py.to(out_kernel_valid.dtype), out_kernel_valid, rtol=output_rtol, atol=5e-3
             ), (
                 f"Output mismatch: max diff = {(out_py.to(out_kernel_valid.dtype) - out_kernel_valid).abs().max():.6f}"
             )

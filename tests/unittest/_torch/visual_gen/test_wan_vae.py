@@ -5,7 +5,6 @@
 
 import os
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -98,31 +97,21 @@ def test_load_wan_vae_defaults_to_native(monkeypatch):
     assert isinstance(wan_vae, WanVAE)
 
 
-def test_use_native_wan_vae_selects_native_unless_parallel(monkeypatch):
-    single_gpu_mapping = MagicMock(world_size=1, parallel_vae_size=1)
-    multi_gpu_mapping = MagicMock(world_size=2, parallel_vae_size=1)
-    parallel_vae_mapping = MagicMock(world_size=2, parallel_vae_size=2)
-
+def test_use_native_wan_vae_default(monkeypatch):
+    """Native VAE is the default when the diffusers-fallback env is unset."""
     monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)
-    # Selection depends only on parallel_vae_size, not world_size.
-    assert _use_native_wan_vae(single_gpu_mapping)
-    assert _use_native_wan_vae(multi_gpu_mapping)
-    assert not _use_native_wan_vae(parallel_vae_mapping)
+    assert _use_native_wan_vae()
 
 
 @pytest.mark.parametrize("fallback_value", ["1", "2", "-1"])
 def test_use_diffuser_vae_env_forces_diffusers(monkeypatch, fallback_value):
-    single_gpu_mapping = MagicMock(world_size=1, parallel_vae_size=1)
-
     monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, fallback_value)
-    assert not _use_native_wan_vae(single_gpu_mapping)
+    assert not _use_native_wan_vae()
 
 
 def test_use_diffuser_vae_env_zero_keeps_native(monkeypatch):
-    single_gpu_mapping = MagicMock(world_size=1, parallel_vae_size=1)
-
     monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, "0")
-    assert _use_native_wan_vae(single_gpu_mapping)
+    assert _use_native_wan_vae()
 
 
 @pytest.mark.parametrize(

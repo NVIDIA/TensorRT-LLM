@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import json
 import pickle
 import tempfile
@@ -415,6 +418,55 @@ def test_llm_request():
     logits = torch.tensor([-5, -6 - 7], dtype=torch.float)
     llm_request.draft_logits = logits
     assert torch.equal(llm_request.draft_logits, logits)
+
+
+def test_generation_only_llm_request_adopts_draft_tokens() -> None:
+    request_id = 42
+    first_gen_tokens = [100]
+    draft_tokens = [101, 102, 103]
+    llm_request_type = _tb.internal.batch_manager.LlmRequestType
+    context_phase_params = _tb.executor.ContextPhaseParams(
+        first_gen_tokens,
+        request_id,
+        None,
+        draft_tokens,
+        None,
+        None,
+    )
+
+    llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=context_phase_params,
+    )
+
+    assert llm_request.is_generation_only_request
+    assert llm_request.has_draft_tokens()
+    assert llm_request.num_draft_tokens == len(draft_tokens)
+    assert llm_request.draft_tokens == draft_tokens
+    assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+    late_llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+
+    assert late_llm_request.draft_tokens is None
+    assert late_llm_request.num_draft_tokens == 0
+
+    late_llm_request.context_phase_params = context_phase_params
+
+    assert late_llm_request.has_draft_tokens()
+    assert late_llm_request.num_draft_tokens == len(draft_tokens)
+    assert late_llm_request.draft_tokens == draft_tokens
 
 
 def test_llm_request_kv_cache_transfer_metric_bindings():

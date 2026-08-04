@@ -31,7 +31,7 @@ embodiment, while several embodiments share one preset via
 ``action.EMBODIMENT_TO_RAW_ACTION_DIM`` instead.
 """
 
-from typing import Any, TypedDict
+from typing import Any, Dict, Iterable, TypedDict
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     COSMOS3_ACTION_RESOLUTIONS,
@@ -41,6 +41,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     resolve_raw_action_dim,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+from tensorrt_llm.inputs.media_io import sniff_media_kind
 
 # ---------------------------------------------------------------------------
 # Constant tables
@@ -56,22 +57,72 @@ COSMOS3_720P_PARAMS = {
     "frame_rate": 24.0,
 }
 
-# Fields merged by the executor for every request. Modality-specific values
-# (height/width/num_frames/steps/guidance) are declared with ``None`` so the
-# executor accepts explicit overrides; ``forward()`` resolves unset fields from
-# T2V/T2I/action context.
-COSMOS3_PIPELINE_DEFAULTS = {
-    "height": None,
-    "width": None,
-    "num_frames": None,
-    "num_inference_steps": None,
-    "guidance_scale": None,
-    "max_sequence_length": COSMOS3_720P_PARAMS["max_sequence_length"],
-    "frame_rate": COSMOS3_720P_PARAMS["frame_rate"],
-}
+COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES = (0, 1)
+COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
 
-# Text-to-image (``output_type="image"``) defaults. Applied when the request
-# field is ``None``.
+
+# ---------------------------------------------------------------------------
+# Conditioning-value normalizers / validators. Declared as the ``validator``
+# of the matching extra-param specs below, so invalid values 400 at preflight;
+# the pipeline reuses them at run time to normalize the same inputs.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_condition_video_latent_indexes(
+    indexes: Iterable[int] | None,
+) -> tuple[int, ...]:
+    if indexes is None:
+        return COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES
+    values = []
+    for index in indexes:
+        # Strict: reject non-integers instead of silently truncating (1.9 -> 1)
+        # or TypeError-ing on None. Integral floats (JSON emitters) coerce.
+        if isinstance(index, bool) or not isinstance(index, (int, float)):
+            raise ValueError(
+                f"Cosmos3 condition_video_latent_indexes must be integers, got {index!r}."
+            )
+        if isinstance(index, float):
+            if not index.is_integer():
+                raise ValueError(
+                    f"Cosmos3 condition_video_latent_indexes must be integers, got {index!r}."
+                )
+            index = int(index)
+        values.append(index)
+    normalized = tuple(values)
+
+    if not normalized:
+        raise ValueError("Cosmos3 condition_video_latent_indexes must not be empty.")
+    if any(index < 0 for index in normalized):
+        raise ValueError(
+            f"Cosmos3 condition_video_latent_indexes must be non-negative, got {normalized}."
+        )
+    return normalized
+
+
+def _normalize_condition_video_keep(keep: str | None) -> str:
+    normalized = str(keep or COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
+    if normalized not in {"first", "last"}:
+        raise ValueError("Cosmos3 condition_video_keep must be either first or last.")
+    return normalized
+
+
+def _validate_output_type(output_type: str) -> None:
+    if output_type not in ("video", "image"):
+        raise ValueError(f"Cosmos3 output_type must be 'video' or 'image', got {output_type!r}.")
+
+
+def _validate_video_reference(video) -> None:
+    """Preflight for the ``video`` extra param: encoded MP4/AVI bytes."""
+    if not video:
+        raise ValueError("Cosmos3 video reference bytes are empty.")
+    if sniff_media_kind(video) != "video":
+        raise ValueError(
+            "Cosmos3 video reference bytes are not a recognized video "
+            "container (supported: MP4/AVI)."
+        )
+
+
+# Text-to-image (``output_type="image"``) defaults; resolved in ``infer()``.
 COSMOS3_T2I_PARAMS = {
     "height": 1024,
     "width": 1024,
@@ -81,12 +132,21 @@ COSMOS3_T2I_PARAMS = {
     "guidance_interval": (400.0, 1000.0),
 }
 
+# Fields merged by the executor into every request. Mode-dependent values
+# remain None until infer() selects the request mode; key membership also
+# declares these fields supported during request validation.
+COSMOS3_PIPELINE_DEFAULTS = {
+    **COSMOS3_720P_PARAMS,
+    "height": None,
+    "width": None,
+    "num_inference_steps": None,
+    "guidance_scale": None,
+}
+
 COSMOS3_ACTION_PARAMS = {
     "action_chunk_size": 16,
-    "num_frames": 17,
     "num_inference_steps": 30,
     "guidance_scale": 1.0,
-    "flow_shift": 5.0,
     "frame_rate": 24.0,
 }
 
@@ -340,7 +400,7 @@ def resolve_domain_action_config(
     }
 
 
-COSMOS3_EXTRA_SPECS: dict[str, ExtraParamSchema] = {
+COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "use_duration_template": ExtraParamSchema(
         type="bool",
         default=True,
@@ -353,8 +413,12 @@ COSMOS3_EXTRA_SPECS: dict[str, ExtraParamSchema] = {
     ),
     "use_system_prompt": ExtraParamSchema(
         type="bool",
-        default=False,
-        description="Whether to use the system prompt.",
+        default=None,
+        description=(
+            "Whether to prepend the system prompt. Unset means the model "
+            "decides: V2V uses it, other modes take the checkpoint's "
+            "declared default."
+        ),
     ),
     "use_guardrails": ExtraParamSchema(
         type="bool",
@@ -367,9 +431,44 @@ COSMOS3_EXTRA_SPECS: dict[str, ExtraParamSchema] = {
         description="Whether to enable audio generation.",
     ),
     "output_type": ExtraParamSchema(
-        type="Literal['video', 'image']",
+        type="str",
         default="video",
         description="Output modality: 'video' (T2V/I2V) or 'image' (text-to-image).",
+        validator=_validate_output_type,
+    ),
+    "condition_video_latent_indexes": ExtraParamSchema(
+        type="list",
+        default=list(COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES),
+        description=(
+            "Latent frame indexes OF THE OUTPUT video to pin to the encoded "
+            "reference (not source-frame selection). Each latent frame spans 4 "
+            "pixel frames, so the worker consumes the first (or last, per "
+            "condition_video_keep) max(indexes)*4+1 reference frames."
+        ),
+        validator=_normalize_condition_video_latent_indexes,
+    ),
+    "condition_video_keep": ExtraParamSchema(
+        type="str",
+        default=COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
+        description="Which side of the input video to use for conditioning: first or last.",
+        validator=_normalize_condition_video_keep,
+    ),
+    "flow_shift": ExtraParamSchema(
+        type="float",
+        default=None,
+        description="Optional scheduler flow shift override. Uses the Cosmos3 mode default when omitted.",
+    ),
+    "video": ExtraParamSchema(
+        type="bytes",
+        default=None,
+        description=(
+            "V2V reference: encoded MP4/AVI bytes (e.g. "
+            "Path(video).read_bytes()). Each worker rank demuxes them from "
+            "memory and NVDEC-decodes only the conditioning window per "
+            "condition_video_latent_indexes / condition_video_keep, resized "
+            "to the output resolution, then VAE-encodes it."
+        ),
+        validator=_validate_video_reference,
     ),
     "action_mode": ExtraParamSchema(
         type="Literal['policy', 'forward_dynamics', 'inverse_dynamics']",
@@ -434,14 +533,6 @@ COSMOS3_EXTRA_SPECS: dict[str, ExtraParamSchema] = {
         default=None,
         description=(
             "Action-token temporal rate for mRoPE (Hz). Defaults to frame_rate when omitted."
-        ),
-    ),
-    "video": ExtraParamSchema(
-        type="path_or_list",
-        default=None,
-        description=(
-            "Video for inverse_dynamics: .mp4/.avi file, frame directory, "
-            "image path, or list of PIL images / frame paths."
         ),
     ),
 }

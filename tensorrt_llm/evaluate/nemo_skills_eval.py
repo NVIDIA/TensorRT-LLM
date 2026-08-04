@@ -46,7 +46,7 @@ import logging
 import os
 import re
 import tempfile
-from typing import Any, Iterable, List, Optional, Union
+from typing import Any, Iterable, List, Optional
 
 import click
 
@@ -749,9 +749,8 @@ class NemoSkillsEvaluator(Evaluator):
     @classmethod
     def command_harness(cls, ctx, **kwargs) -> None:
         from .. import LLM as PyTorchLLM
-        from .._tensorrt_engine import LLM
 
-        llm: Union[LLM, PyTorchLLM] = ctx.obj
+        llm: PyTorchLLM = ctx.obj
         evaluator = cls(
             dataset_path=kwargs.pop("dataset_path", None),
             split=kwargs.pop("split", None),

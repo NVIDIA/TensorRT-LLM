@@ -229,6 +229,16 @@ Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` functio
 
 **Important**: Pre-merge and post-merge tests must be in separate stages.
 
+### Pre-merge vs Post-merge Perf-Regression Gating
+
+By default, `test_perf_sanity.py` fails CI on perf regression for pre-merge stages and only warns for post-merge stages. This is auto-detected from the Jenkins job URL (`PostMerge` substring), not the stage name.
+
+**`FUNCTIONAL-ONLY` stage-name flag**: A pre-merge stage whose name contains `FUNCTIONAL-ONLY` (e.g. `GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4`) still runs the full perf harness — benchmarks execute, metrics are uploaded to OpenSearch, dashboards update — but perf regressions **do not fail CI**. Only functional failures (build errors, crashes, empty output) fail the stage.
+
+Use this for pre-merge stages whose goal is to catch functional regressions on paths that only had post-merge coverage before. It preserves the data-continuity benefit of running in pre-merge (baselines still update from PR data points) without the flakiness cost of gating on the noisier disagg perf numbers.
+
+Detection is by substring match on `os.environ["stageName"]` inside `test_perf_sanity.py`; no changes to `perf_regression_utils.py`.
+
 ### GPU Hours Calculation
 
 - Each CI stage runtime is approximately **1 hour**

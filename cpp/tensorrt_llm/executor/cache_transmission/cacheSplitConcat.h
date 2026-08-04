@@ -27,7 +27,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
-#include <NvInferRuntimeBase.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -78,7 +78,7 @@ void concatKVCacheDispatch(runtime::ITensor::SharedPtr* inputBlocks, int inputBl
     runtime::ITensor::SharedPtr* outputBlocks, int outputBlockNum, int selfRank,
     kv_cache::CacheState const& selfCacheState, runtime::BufferManager const& bufferManager);
 
-nvinfer1::Dims makeShapeFromCacheState(kv_cache::CacheState const& cacheState);
+tensorrt_llm::Dims makeShapeFromCacheState(kv_cache::CacheState const& cacheState);
 
 void splitKVCacheDispatch(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> const& kVCacheBlocksPerWindow,
     std::vector<runtime::ITensor::SharedPtr>& ouputSplitBlocks, kv_cache::CacheState const& peerCacheState,
@@ -147,7 +147,7 @@ void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& i
 void splitUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
     std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks,
     kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
-    size_t ssmBytes, size_t blockSizeBytes, nvinfer1::DataType ssmDataType,
+    size_t ssmBytes, size_t blockSizeBytes, tensorrt_llm::DataType ssmDataType,
     runtime::BufferManager const& bufferManager);
 
 /**
@@ -156,7 +156,7 @@ void splitUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
 void splitUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
     std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks,
     kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
-    size_t ssmBytes, size_t blockSizeBytes, nvinfer1::DataType convDataType,
+    size_t ssmBytes, size_t blockSizeBytes, tensorrt_llm::DataType convDataType,
     runtime::BufferManager const& bufferManager);
 
 /**
@@ -165,7 +165,7 @@ void splitUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
 void concatUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
     std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     kv_cache::CacheState const& srcCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes,
-    size_t blockSizeBytes, nvinfer1::DataType ssmDataType, runtime::BufferManager const& bufferManager);
+    size_t blockSizeBytes, tensorrt_llm::DataType ssmDataType, runtime::BufferManager const& bufferManager);
 
 /**
  * @brief Concat conv state from per-source buffers into unified pool blocks (section-aware).
@@ -173,6 +173,6 @@ void concatUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
 void concatUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
     std::vector<SizeType32> const& realBlockIndices, std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
     kv_cache::CacheState const& srcCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx, size_t ssmBytes,
-    size_t blockSizeBytes, nvinfer1::DataType convDataType, runtime::BufferManager const& bufferManager);
+    size_t blockSizeBytes, tensorrt_llm::DataType convDataType, runtime::BufferManager const& bufferManager);
 
 } // namespace tensorrt_llm::executor::rnn_cache

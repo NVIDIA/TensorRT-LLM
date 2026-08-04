@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -261,28 +261,35 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
         .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &kvc::NixlTransferAgent::shutdown, nb::call_guard<nb::gil_scoped_release>())
-        .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::NixlTransferAgent::deregisterMemory, nb::arg("descs"))
+        .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("deregister_memory", &kvc::NixlTransferAgent::deregisterMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent",
             nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::NixlTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
+            nb::arg("name"), nb::arg("agent_desc"), nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent_by_connection",
             nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
                 &kvc::NixlTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::NixlTransferAgent::getLocalAgentDesc)
-        .def("get_local_connection_info", &kvc::NixlTransferAgent::getLocalConnectionInfo)
-        .def("invalidate_remote_agent", &kvc::NixlTransferAgent::invalidateRemoteAgent, nb::arg("name"))
+            nb::arg("name"), nb::arg("connection_info"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_agent_desc", &kvc::NixlTransferAgent::getLocalAgentDesc,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_connection_info", &kvc::NixlTransferAgent::getLocalConnectionInfo,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("invalidate_remote_agent", &kvc::NixlTransferAgent::invalidateRemoteAgent, nb::arg("name"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "submit_transfer_requests",
             [](kvc::NixlTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
             nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>(),
             nb::keep_alive<0, 1>())
-        .def(
-            "notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages)
-        .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"));
+        .def("notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"),
+            nb::arg("sync_message"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
+            nb::call_guard<nb::gil_scoped_release>());
 #endif
 
     // NOTE: MooncakeTransferAgent/MooncakeTransferStatus class bindings are intentionally

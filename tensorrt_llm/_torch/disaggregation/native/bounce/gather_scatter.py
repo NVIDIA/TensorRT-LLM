@@ -26,8 +26,7 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.runtime.generation import CUASSERT
+from tensorrt_llm._utils import CUASSERT, prefer_pinned
 
 try:
     import torch

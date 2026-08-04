@@ -6,9 +6,9 @@ import threading
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -235,12 +235,13 @@ class DiffusionRequest:
     (a :class:`~tensorrt_llm.visual_gen.params.VisualGenParams` instance).
     When ``params`` is ``None`` (the default), the executor creates a
     ``VisualGenParams()`` and fills it with pipeline-specific defaults
-    before calling ``pipeline.infer()``.
+    before calling ``pipeline.run_inference()``.
     """
 
     request_id: int
     prompt: List[str]
     params: Optional["VisualGenParams"] = None
+    prepared_inputs: Dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -253,16 +254,22 @@ class DiffusionResponse:
             model-specific fields populated. Set to ``None`` on the error
             path; on the READY signal it carries a ``dict`` instead.
         error_msg: Error message if generation failed.
-        generation: Wall-clock time the executor measured around the
-            engine's inference call (host ``time.perf_counter()``), in
-            seconds. Default ``0.0`` so the dataclass round-trips through
-            pickling across worker/client; the error path leaves it at
-            ``0.0``.
+        error_type: Failure class when ``error_msg`` is set: ``"client"``
+            (unusable request content → 400 / ``ValueError``), ``"capacity"``
+            (valid request does not fit the deployment → 503 /
+            ``MemoryError``), or ``None`` for unclassified runtime failures
+            (500 / ``RuntimeError``).
+        generation: Wall-clock time the executor measured around request
+            preparation and the engine's inference call (host
+            ``time.perf_counter()``), in seconds. Default ``0.0`` so the
+            dataclass round-trips through pickling across worker/client; the
+            error path leaves it at ``0.0``.
     """
 
     request_id: int
     output: Optional[PipelineOutput] = None
     error_msg: Optional[str] = None
+    error_type: Optional[str] = None
     generation: float = 0.0
 
 
@@ -277,12 +284,14 @@ class DiffusionExecutor:
         visual_gen_args: "VisualGenArgs",
         req_hmac_key: Optional[bytes] = None,
         resp_hmac_key: Optional[bytes] = None,
+        in_client_process: bool = False,
     ):
         self.request_queue_addr = request_queue_addr
         self.response_queue_addr = response_queue_addr
         self.device_id = device_id
         self.visual_gen_args = visual_gen_args
         self.resp_hmac_key = resp_hmac_key
+        self.in_client_process = in_client_process
 
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
@@ -402,6 +411,12 @@ class DiffusionExecutor:
         # Universal field defaults
         for field_name, default_value in self.pipeline.default_generation_params.items():
             if hasattr(params, field_name) and getattr(params, field_name) is None:
+                if (
+                    params.image is not None
+                    and getattr(self.pipeline, "derive_output_size_from_reference", False) is True
+                    and field_name in ("height", "width")
+                ):
+                    continue
                 setattr(params, field_name, default_value)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
@@ -417,28 +432,30 @@ class DiffusionExecutor:
         """Process a single request."""
         try:
             self._merge_defaults(req)
-            cache_key = self.pipeline.warmup_cache_key(
-                req.params.height, req.params.width, num_frames=req.params.num_frames
-            )
-            if self.pipeline._warmed_up_shapes and cache_key not in self.pipeline._warmed_up_shapes:
+            # Include request preparation in executor-side generation latency.
+            # Model-specific preparation runs before the warmup lookup so it
+            # can resolve shape-dependent request fields such as output size.
+            generation_start = time.perf_counter()
+            self.pipeline.prepare_request(req)
+            cache_key = self.pipeline.request_warmup_cache_key(req)
+            cache_key_is_resolved = all(value is not None for value in cache_key)
+            if (
+                cache_key_is_resolved
+                and self.pipeline._warmed_up_shapes
+                and cache_key not in self.pipeline._warmed_up_shapes
+            ):
                 logger.warning(
                     f"Requested shape {cache_key} was not warmed up. "
                     f"First request with this shape will be slower due to "
                     f"torch.compile recompilation or CUDA graph capture. "
                     f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
                 )
-            # Host wall-clock around pipeline.infer(). The pipeline already
-            # syncs at the end (decode_latents path), so this captures the
-            # full executor-side envelope including any pre/post-pipeline work
-            # that the per-phase CUDA-event timings on PipelineOutput do not.
-            generation_start = time.perf_counter()
-            output = self.pipeline.infer(req)
+            output = self.pipeline.run_inference(req)
             generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
-                # External launch co-locates this worker with the coordinator in one
-                # process; to_handle(local=True) hands the tensor over in-process
-                # instead of cross-process CUDA IPC (invalid same-process).
-                output.to_handle(local=_detect_external_launch() is not None)
+                # CUDA IPC handles are invalid within the producing process, so
+                # a same-process client takes the media via in-process handoff.
+                output.to_handle(local=self.in_client_process)
                 self.response_queue.put(
                     DiffusionResponse(
                         request_id=req.request_id,
@@ -451,7 +468,11 @@ class DiffusionExecutor:
             logger.error(traceback.format_exc())
             if self.rank == 0:
                 self.response_queue.put(
-                    DiffusionResponse(request_id=req.request_id, error_msg=str(e))
+                    DiffusionResponse(
+                        request_id=req.request_id,
+                        error_msg=str(e),
+                        error_type=self.pipeline.classify_request_failure(e),
+                    )
                 )
 
 
@@ -467,8 +488,14 @@ def run_diffusion_worker(
     req_hmac_key: Optional[bytes] = None,
     resp_hmac_key: Optional[bytes] = None,
     local_rank: Optional[int] = None,
+    in_client_process: bool = False,
 ):
-    """Entry point for worker process."""
+    """Entry point for worker process.
+
+    ``in_client_process``: True only when this worker runs inside the client
+    process. Declared by the launch site — never derive it from the
+    environment here, the env writes below make every worker look external.
+    """
     try:
         # Set log level before any other work so loading logs are visible
         logger.set_level(log_level)
@@ -530,6 +557,7 @@ def run_diffusion_worker(
             visual_gen_args=visual_gen_args,
             req_hmac_key=req_hmac_key,
             resp_hmac_key=resp_hmac_key,
+            in_client_process=in_client_process,
         )
         executor.serve_forever()
         if executor.pipeline is not None:
@@ -690,6 +718,7 @@ class DiffusionRemoteClient:
                     "resp_hmac_key": self.resp_hmac_key,
                     "log_level": logger.level,
                     "local_rank": local_rank,
+                    "in_client_process": True,
                 },
                 daemon=True,
             )

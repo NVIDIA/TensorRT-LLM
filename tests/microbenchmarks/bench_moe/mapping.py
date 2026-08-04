@@ -129,7 +129,7 @@ def _create_routing_method(
             topk_group=topk_group,
             routed_scaling_factor=1.0,
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
-            is_fused=False,
+            is_fused=True,
         )
 
     if routing_method_cls is MiniMaxM2MoeRoutingMethod:
