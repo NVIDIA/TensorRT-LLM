@@ -238,8 +238,6 @@ class CuteDslMlaFmha(PhasedFmha):
             (16, 8): 16,
             (128, 1): 64,
             (128, 2): 32,
-            (128, 4): 32,
-            (128, 8): 16,
         }
         min_batch = _PERF_MIN_BATCH_FP8.get((num_heads, seq_len_q))
         if min_batch is None:
