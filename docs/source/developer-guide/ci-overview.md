@@ -49,7 +49,7 @@ Unit tests live under `tests/unittest/` and run during the merge-request pipelin
 
 The array elements are: GPU type, YAML file (without extension), shard index, and total number of shards. Only tests with `stage: post_merge` from that YAML file are selected when a `Post-Merge` stage runs.
 
-Stage names are unbracketed, with `Post-Merge` embedded directly in the name. Copy the name exactly as it appears in the Groovy map for both `--stages` below and `--stage-list`: a name without a `*` wildcard is matched exactly, so a stale spelling such as `A100X-Triton-[Post-Merge]-1` silently selects nothing.
+Stage names are unbracketed, with `Post-Merge` embedded directly in the name. Copy the name exactly as it appears in the Groovy map. Jenkins `stage_list` matches names without a `*` wildcard exactly, so a stale spelling such as `A100X-Triton-[Post-Merge]-1` silently selects nothing. The mapping script's `--stages` option is stricter: it reports unknown names and near-match suggestions on stderr.
 
 ## Finding the stage for a test
 

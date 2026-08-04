@@ -159,6 +159,33 @@ def test_unknown_stage_reports_a_diagnostic(stage_query):
     assert f'unknown stage: {bogus}' in proc.stderr.decode()
 
 
+def test_known_stage_without_tests_is_reported(tmp_path):
+    """A known stage that runs no tests stays visible alongside other stages."""
+    # No live stage is currently empty, so build a minimal repo whose
+    # ``empty`` stage maps to a YAML holding only post_merge tests.
+    (tmp_path / 'jenkins').mkdir()
+    (tmp_path / 'jenkins' / 'L0_Test.groovy').write_text(
+        '"Filled-PyTorch-1": ["x", "l0_filled", 1, 1],\n'
+        '"Empty-PyTorch-1": ["x", "l0_empty", 1, 1],\n')
+    db_dir = tmp_path / 'tests' / 'integration' / 'test_lists' / 'test-db'
+    db_dir.mkdir(parents=True)
+    for name, stage in (('l0_filled', 'pre_merge'), ('l0_empty', 'post_merge')):
+        (db_dir / f'{name}.yml').write_text(
+            f'version: 0.0.1\n{name}:\n- condition:\n    terms:\n'
+            f'      stage: {stage}\n      backend: pytorch\n'
+            f'  tests:\n  - unittest/{name}.py\n')
+
+    script = os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py')
+    proc = subprocess.run([
+        sys.executable, script, '--repo-root',
+        str(tmp_path), '--stages', 'Empty-PyTorch-1', 'Filled-PyTorch-1'
+    ],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    assert proc.stdout.decode().split() == ['unittest/l0_filled.py']
+    assert 'no tests mapped to: Empty-PyTorch-1' in proc.stderr.decode()
+
+
 @pytest.mark.skip(reason="https://nvbugs/5547275")
 @pytest.mark.parametrize("direction",
                          ["test_to_stage", "stage_to_test", "roundtrip"])
