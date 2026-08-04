@@ -649,6 +649,7 @@ _QWEN3_5_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     placeholders_separator="",
     content_format=ContentFormat.STRING,
+    interleave_placeholders=True,
 )
 
 
