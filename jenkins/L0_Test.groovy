@@ -4905,11 +4905,16 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
         while (true) {
             launchAttempt++
             Map attemptPlacementContext = [runnerStarted: false]
+            // Declared above the try so the catch can reference it when reconciling
+            // a dispatcher-pod death: Groovy block-scopes a try-local `def`, so a
+            // declaration inside the try is not visible in the catch (it would
+            // resolve as an undefined property and throw MissingPropertyException).
+            def attemptPodSpec = null
             try {
                 if (launchAttempt > 1 && !avoidedKubernetesHostNodes.isEmpty()) {
                     echo "[INFRA-RETRY] ${stageName}: relaunching pod (attempt ${launchAttempt}), avoiding prior host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
                 }
-                def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+                attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
                 if (slurmDispatcher) {
                     // Record the dispatcher pod spec so the off-pod finalizer/sweep can
                     // launch a fresh cleanup pod if this pod dies mid-run.
