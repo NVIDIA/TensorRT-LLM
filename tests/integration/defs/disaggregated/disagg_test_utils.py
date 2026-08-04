@@ -17,7 +17,6 @@
 
 import asyncio
 import os
-import secrets
 import shutil
 import subprocess
 import tempfile
@@ -85,15 +84,7 @@ def periodic_check(timeout=300, interval=3):
 
 
 def _run_worker(
-    model_name,
-    worker_config,
-    role,
-    port,
-    work_dir,
-    device=-1,
-    save_log=False,
-    env=None,
-    worker_index=0,
+    model_name, worker_config, role, port, work_dir, device=-1, save_log=False, env=None
 ):
     """Run a worker process (context or generation).
 
@@ -106,13 +97,11 @@ def _run_worker(
         device: CUDA device ID (-1 for default)
         save_log: Whether to save logs to file
         env: Environment variables for the subprocess
-        worker_index: Index used for log/config filenames (avoids collisions when
-            multiple workers share port=0)
 
     Returns:
         ProcessWrapper: Wrapped subprocess
     """
-    worker_config_path = os.path.join(work_dir, f"{role}_{worker_index}_config.yaml")
+    worker_config_path = os.path.join(work_dir, f"{role}_{port}_config.yaml")
     with open(worker_config_path, "w+") as f:
         yaml.dump(worker_config, f)
         f.flush()
@@ -141,12 +130,13 @@ def _run_worker(
         stdout = None
         stderr = None
         if save_log:
-            log_path = os.path.join(work_dir, f"worker_{role}_{worker_index}.log")
+            log_path = os.path.join(work_dir, f"worker_{role}_{port}.log")
             log_file = open(log_path, "w+")
             stdout = log_file
             stderr = log_file
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
+        print(f"Running {role} on port {port}")
         return ProcessWrapper(
             subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr),
             log_file=log_file,
@@ -156,56 +146,26 @@ def _run_worker(
 
 
 def run_ctx_worker(
-    model_name,
-    ctx_worker_config,
-    work_dir,
-    port=0,
-    device=0,
-    env=None,
-    save_log=False,
-    worker_index=0,
+    model_name, ctx_worker_config, work_dir, port=0, device=0, env=None, save_log=False
 ):
     """Launch a context worker with service discovery.
 
     Use port=0 to let the worker choose a free port.
     """
     return _run_worker(
-        model_name,
-        ctx_worker_config,
-        "ctx",
-        port,
-        work_dir,
-        device,
-        save_log=save_log,
-        env=env,
-        worker_index=worker_index,
+        model_name, ctx_worker_config, "ctx", port, work_dir, device, save_log=save_log, env=env
     )
 
 
 def run_gen_worker(
-    model_name,
-    gen_worker_config,
-    work_dir,
-    port=0,
-    device=1,
-    env=None,
-    save_log=False,
-    worker_index=0,
+    model_name, gen_worker_config, work_dir, port=0, device=1, env=None, save_log=False
 ):
     """Launch a generation worker with service discovery.
 
     Use port=0 to let the worker choose a free port.
     """
     return _run_worker(
-        model_name,
-        gen_worker_config,
-        "gen",
-        port,
-        work_dir,
-        device,
-        save_log=save_log,
-        env=env,
-        worker_index=worker_index,
+        model_name, gen_worker_config, "gen", port, work_dir, device, save_log=save_log, env=env
     )
 
 
@@ -478,13 +438,7 @@ def disagg_cluster_config(service_discovery):
 
 
 @pytest.fixture
-def internal_request_auth_key():
-    """Create one internal auth key shared by proxy and workers."""
-    return secrets.token_hex(32)
-
-
-@pytest.fixture
-def disagg_server_config(disagg_cluster_config, router, disagg_port, internal_request_auth_key):
+def disagg_server_config(disagg_cluster_config, router, disagg_port):
     """Create disaggregated server configuration."""
     return {
         "hostname": "localhost",
@@ -492,16 +446,14 @@ def disagg_server_config(disagg_cluster_config, router, disagg_port, internal_re
         "disagg_cluster": disagg_cluster_config,
         "context_servers": {"router": {"type": router}},
         "generation_servers": {"router": {"type": router}},
-        "internal_request_auth_key": internal_request_auth_key,
     }
 
 
 @pytest.fixture
-def worker_config(disagg_cluster_config, internal_request_auth_key):
+def worker_config(disagg_cluster_config):
     """Create worker configuration."""
     return {
         "disagg_cluster": disagg_cluster_config,
-        "internal_request_auth_key": internal_request_auth_key,
         "disable_overlap_scheduler": True,
         "cache_transceiver_config": {"backend": "DEFAULT"},
         "kv_cache_config": {

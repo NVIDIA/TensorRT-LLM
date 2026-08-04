@@ -251,7 +251,6 @@ def test_env_functions_replaces_defaults():
             os.unlink(output_path)
 
 
-@pytest.mark.skip(reason="https://nvbugs/6337226")
 def test_iteration_aware_profiling():
     """Test iteration-aware profiling using TLLM_PROFILE_START_STOP.
 

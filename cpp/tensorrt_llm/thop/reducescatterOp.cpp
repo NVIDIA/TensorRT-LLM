@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 
+#include <NvInferRuntime.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 #if ENABLE_MULTI_DEVICE

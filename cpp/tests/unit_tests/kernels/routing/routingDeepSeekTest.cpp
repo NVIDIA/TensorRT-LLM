@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tests/unit_tests/kernels/routing/routingTest.h"
 
 namespace tk = tensorrt_llm::kernels;
@@ -157,8 +156,8 @@ protected:
     {
         RoutingKernelTest<T>::allocateBuffers(param);
         int64_t scoresSize = param.numTokens * param.numExperts;
-        this->mPtrScoresHost = mBufferManager->pinned(ITensor::makeShape({scoresSize}), tensorrt_llm::DataType::kFLOAT);
-        this->mPtrScoresDevice = mBufferManager->gpu(ITensor::makeShape({scoresSize}), tensorrt_llm::DataType::kFLOAT);
+        this->mPtrScoresHost = mBufferManager->pinned(ITensor::makeShape({scoresSize}), nvinfer1::DataType::kFLOAT);
+        this->mPtrScoresDevice = mBufferManager->gpu(ITensor::makeShape({scoresSize}), nvinfer1::DataType::kFLOAT);
 
         this->mPtrRoutingBiasHost
             = mBufferManager->pinned(ITensor::makeShape({param.numExperts}), TRTDataType<T>::value);
@@ -431,9 +430,9 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelWithFloat32Bias)
     // the GPU kernel (using fp32 bias) and the host reference (using T-typed bias)
     // observe numerically equivalent inputs.
     auto float32BiasHost
-        = this->mBufferManager->pinned(ITensor::makeShape({param.numExperts}), tensorrt_llm::DataType::kFLOAT);
+        = this->mBufferManager->pinned(ITensor::makeShape({param.numExperts}), nvinfer1::DataType::kFLOAT);
     auto float32BiasDevice
-        = this->mBufferManager->gpu(ITensor::makeShape({param.numExperts}), tensorrt_llm::DataType::kFLOAT);
+        = this->mBufferManager->gpu(ITensor::makeShape({param.numExperts}), nvinfer1::DataType::kFLOAT);
     auto fp32BiasPtr = bufferCast<float>(*float32BiasHost);
     auto tBiasPtr = bufferCast<TypeParam>(*this->mPtrRoutingBiasHost);
     for (int i = 0; i < param.numExperts; i++)

@@ -117,8 +117,8 @@ Format: `path/to/test_file.py::test_function_name[param_id]`
 Example from `l0_a30.yml`:
 
 ```yaml
-- accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype
-- unittest/_torch/modeling -k "modeling_llama"
+- accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_medusa_fp8_prequantized
+- examples/test_multimodal.py::test_llm_multimodal_general[Qwen2-VL-7B-Instruct-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:4]
 ```
 
 ### Example: Adding an Accuracy Test

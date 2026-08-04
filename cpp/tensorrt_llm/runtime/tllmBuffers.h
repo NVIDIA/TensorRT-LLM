@@ -27,7 +27,7 @@
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
@@ -550,7 +550,7 @@ public:
     //!
     //! \brief Construct an empty buffer.
     //!
-    explicit GenericBuffer(tensorrt_llm::DataType type, TAllocator allocator = {}) // NOLINT(*-pro-type-member-init)
+    explicit GenericBuffer(nvinfer1::DataType type, TAllocator allocator = {}) // NOLINT(*-pro-type-member-init)
         : GenericBuffer{0, type, std::move(allocator)}
     {
     }
@@ -559,7 +559,7 @@ public:
     //! \brief Construct a buffer with the specified allocation size in number of elements.
     //!
     explicit GenericBuffer( // NOLINT(*-pro-type-member-init)
-        std::size_t size, tensorrt_llm::DataType type, TAllocator allocator = {})
+        std::size_t size, nvinfer1::DataType type, TAllocator allocator = {})
         : GenericBuffer{size, size, type, std::move(allocator)}
     {
     }
@@ -636,7 +636,7 @@ public:
     //!
     //! \brief Returns the type of the buffer.
     //!
-    [[nodiscard]] tensorrt_llm::DataType getDataType() const override
+    [[nodiscard]] nvinfer1::DataType getDataType() const override
     {
         return mType;
     }
@@ -687,8 +687,7 @@ public:
     }
 
 protected:
-    explicit GenericBuffer(
-        std::size_t size, std::size_t capacity, tensorrt_llm::DataType type, TAllocator allocator = {})
+    explicit GenericBuffer(std::size_t size, std::size_t capacity, nvinfer1::DataType type, TAllocator allocator = {})
         : TAllocator{std::move(allocator)}
         , mSize{size}
         , mCapacity{capacity}
@@ -701,14 +700,14 @@ protected:
 
 private:
     std::size_t mSize{0}, mCapacity{0};
-    tensorrt_llm::DataType mType;
+    nvinfer1::DataType mType;
     void* mBuffer;
 };
 
 class MulticastBuffer : virtual public IBuffer
 {
 public:
-    explicit MulticastBuffer(tensorrt_llm::DataType type, std::set<int> const& ranks)
+    explicit MulticastBuffer(nvinfer1::DataType type, std::set<int> const& ranks)
         : mSize(0)
         , mCapacity(0)
         , mType(type)
@@ -717,7 +716,7 @@ public:
         TLLM_CHECK(ranks.size() > 1);
     }
 
-    explicit MulticastBuffer(size_t size, tensorrt_llm::DataType type, std::set<int> const& ranks)
+    explicit MulticastBuffer(size_t size, nvinfer1::DataType type, std::set<int> const& ranks)
         : mSize(0)
         , mCapacity(0)
         , mType(type)
@@ -818,7 +817,7 @@ public:
         return mCapacity;
     }
 
-    [[nodiscard]] tensorrt_llm::DataType getDataType() const override
+    [[nodiscard]] nvinfer1::DataType getDataType() const override
     {
         return mType;
     }
@@ -854,7 +853,7 @@ public:
 private:
     std::size_t mSize = 0;
     std::size_t mCapacity = 0;
-    tensorrt_llm::DataType mType;
+    nvinfer1::DataType mType;
     std::set<int> mRanks;
     IpcNvlsHandle* mHandle;
 };
@@ -883,7 +882,7 @@ public:
     //!
     //! \brief Construct an empty tensor.
     //!
-    explicit GenericTensor(tensorrt_llm::DataType type, TAllocator allocator = {})
+    explicit GenericTensor(nvinfer1::DataType type, TAllocator allocator = {})
         : Base{type, std::move(allocator)}
     {
         mDims.nbDims = 0;
@@ -892,14 +891,14 @@ public:
     //!
     //! \brief Construct a tensor with the specified allocation dimensions.
     //!
-    explicit GenericTensor(tensorrt_llm::Dims const& dims, tensorrt_llm::DataType type, TAllocator allocator = {})
+    explicit GenericTensor(nvinfer1::Dims const& dims, nvinfer1::DataType type, TAllocator allocator = {})
         : Base{nonNegative(volume(dims)), type, std::move(allocator)}
         , mDims{dims}
     {
     }
 
     explicit GenericTensor(
-        tensorrt_llm::Dims const& dims, std::size_t capacity, tensorrt_llm::DataType type, TAllocator allocator = {})
+        nvinfer1::Dims const& dims, std::size_t capacity, nvinfer1::DataType type, TAllocator allocator = {})
         : Base{nonNegative(volume(dims)), capacity, type, std::move(allocator)}
         , mDims{dims}
     {
@@ -924,12 +923,12 @@ public:
         return *this;
     }
 
-    [[nodiscard]] tensorrt_llm::Dims const& getShape() const override
+    [[nodiscard]] nvinfer1::Dims const& getShape() const override
     {
         return mDims;
     }
 
-    void reshape(tensorrt_llm::Dims const& dims) override
+    void reshape(nvinfer1::Dims const& dims) override
     {
         Base::resize(nonNegative(volume(dims)));
         mDims = dims;
@@ -947,7 +946,7 @@ public:
     }
 
 private:
-    tensorrt_llm::Dims mDims{};
+    nvinfer1::Dims mDims{};
 };
 
 // Forward declaration
@@ -972,9 +971,9 @@ public:
     /////////////////////
     // ITensor methods
     /////////////////////
-    [[nodiscard]] tensorrt_llm::Dims const& getShape() const override;
+    [[nodiscard]] nvinfer1::Dims const& getShape() const override;
 
-    void reshape(tensorrt_llm::Dims const& dims) override;
+    void reshape(nvinfer1::Dims const& dims) override;
 
     /////////////////////
     // IBuffer methods
@@ -984,7 +983,7 @@ public:
 
     [[nodiscard]] std::size_t getCapacity() const override;
 
-    [[nodiscard]] tensorrt_llm::DataType getDataType() const override;
+    [[nodiscard]] nvinfer1::DataType getDataType() const override;
 
     [[nodiscard]] MemoryType getMemoryType() const override;
 
@@ -1017,7 +1016,7 @@ private:
 
     std::weak_ptr<MulticastTensor> mTensor;
     ViewType mViewType;
-    tensorrt_llm::Dims mDims{};
+    nvinfer1::Dims mDims{};
 };
 
 class MulticastTensor : virtual public ITensor,
@@ -1027,13 +1026,13 @@ class MulticastTensor : virtual public ITensor,
 public:
     using Base = MulticastBuffer;
 
-    explicit MulticastTensor(tensorrt_llm::DataType type, std::set<int> const& ranks)
+    explicit MulticastTensor(nvinfer1::DataType type, std::set<int> const& ranks)
         : Base(type, ranks)
     {
         mDims.nbDims = 0;
     }
 
-    explicit MulticastTensor(tensorrt_llm::Dims const& dims, tensorrt_llm::DataType type, std::set<int> const& ranks)
+    explicit MulticastTensor(nvinfer1::Dims const& dims, nvinfer1::DataType type, std::set<int> const& ranks)
         : Base(nonNegative(volume(dims)), type, ranks)
         , mDims(dims)
     {
@@ -1069,12 +1068,12 @@ public:
     /////////////////////
     // ITensor methods
     /////////////////////
-    [[nodiscard]] tensorrt_llm::Dims const& getShape() const override
+    [[nodiscard]] nvinfer1::Dims const& getShape() const override
     {
         return mDims;
     }
 
-    void reshape(tensorrt_llm::Dims const& dims) override
+    void reshape(nvinfer1::Dims const& dims) override
     {
         Base::resize(nonNegative(volume(dims)));
         mDims = dims;
@@ -1092,7 +1091,7 @@ public:
     }
 
 private:
-    tensorrt_llm::Dims mDims{};
+    nvinfer1::Dims mDims{};
 };
 
 using DeviceTensor = GenericTensor<CudaAllocatorAsync>;

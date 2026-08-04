@@ -1,5 +1,6 @@
 import pytest
-from apps.chat import LLM, AutoTokenizer, LlmConsole, SamplingParams
+from apps.chat import (LLM, AutoTokenizer, BuildConfig, LlmConsole,
+                       SamplingParams)
 
 from ..test_llm import llama_model_path
 
@@ -8,7 +9,10 @@ from ..test_llm import llama_model_path
 def interactive_console():
     model_dir = llama_model_path
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    llm = LLM(model_dir, max_batch_size=8, max_seq_len=512)
+    build_config = BuildConfig()
+    build_config.max_batch_size = 8
+    build_config.max_seq_len = 512
+    llm = LLM(model_dir, build_config=build_config)
 
     sampling_params = SamplingParams()
 

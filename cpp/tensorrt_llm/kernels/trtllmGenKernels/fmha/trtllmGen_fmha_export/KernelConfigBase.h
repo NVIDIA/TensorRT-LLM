@@ -118,9 +118,7 @@ enum class AttentionMaskType {
   // Sliding window causal mask or chunked attention causal mask.
   SlidingOrChunkedCausal,
   // Custom mask.
-  Custom,
-  // Sliding window mask combined with custom packed mask.
-  SlidingWindowCustom
+  Custom
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -135,19 +133,9 @@ enum class AttentionMaskType {
 ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
-ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
+ATTENTION_MASK_TYPE_FUNCTION(Custom)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
-
-__host__ __device__ inline bool isCustomMask(AttentionMaskType maskType) {
-  return maskType == AttentionMaskType::Custom ||
-         maskType == AttentionMaskType::SlidingWindowCustom;
-}
-
-__host__ __device__ inline bool usesSlidingWindowMask(AttentionMaskType maskType) {
-  return maskType == AttentionMaskType::SlidingOrChunkedCausal ||
-         maskType == AttentionMaskType::SlidingWindowCustom;
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -399,8 +387,6 @@ template <> inline std::string toString(AttentionMaskType e) {
     return "SlidingOrChunkedCausal";
   case AttentionMaskType::Custom:
     return "Custom";
-  case AttentionMaskType::SlidingWindowCustom:
-    return "SlidingWindowCustom";
   default:
     TLLM_LOG_ERROR("Unsupported enum.");
     return "";
@@ -502,6 +488,8 @@ template <> inline std::string toString(MmaOrder e) {
   X(tg::Dtype, mDtypeOut, tg::Dtype::E4m3, uint32_t)                                               \
   /* Whether to use dynamic numTokensPerPage. */                                                   \
   X(bool, mDynamicNumTokensPerPage, false, bool)                                                   \
+  /* Whether to use fp16 softmax. */                                                               \
+  X(bool, mEnablesFp16Softmax, false, bool)                                                        \
   /* Do we enable max value inflation? */                                                          \
   X(bool, mEnablesInflateMax, false, bool)                                                         \
   /* Whether 2 instances of the softmax task could be merged ? */                                  \
@@ -523,12 +511,8 @@ template <> inline std::string toString(MmaOrder e) {
   /* Store tensor to gmem directly in the end of the correction task. */                           \
   /* True: vectorized store. False: TMA store using dedicated warp. */                             \
   X(bool, mFuseEpilogueIntoCorr, true, bool)                                                       \
-  /* Fuse DSv4 inverse RoPE + 1x128 E4M3 quantization into the correction epilogue. */             \
-  X(bool, mFusesDsv4InvRopeFp8Quant, false, bool)                                                  \
   /* Whether to transform K/V in the correction task. */                                           \
   X(bool, mFuseTransformKvIntoCorr, true, bool)                                                    \
-  /* Whether to allocate separate transformed-K/V resources with independent pipelines. */         \
-  X(bool, mSeparateTransformedKv, false, bool)                                                     \
   /* Whether to group the headsQ into one CTA. */                                                  \
   X(bool, mGroupsHeadsQ, false, bool)                                                              \
   /* Whether to group both tokensQ and headsQ into one CTA. */                                     \
@@ -657,10 +641,11 @@ template <> inline std::string toString(MmaOrder e) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#define KERNEL_CONFIG_BASE_FIELDS(X) KERNEL_CONFIG_BASE_FIELDS_BASE(X)
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA(X)
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
+#define KERNEL_CONFIG_BASE_FIELDS(X)                                                               \
+  KERNEL_CONFIG_BASE_FIELDS_BASE(X)                                                                \
+  KERNEL_CONFIG_BASE_FIELDS_EXTRA(X)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -727,3 +712,4 @@ template <> struct hash<fmha::KernelConfigBase> {
 
 #undef KERNEL_CONFIG_BASE_FIELDS
 #undef KERNEL_CONFIG_BASE_FIELDS_BASE
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA

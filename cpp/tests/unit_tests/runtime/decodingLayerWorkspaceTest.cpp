@@ -16,7 +16,6 @@
 
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/common/workspace.h"
 #include <gtest/gtest.h>
 #include <random>
@@ -122,9 +121,8 @@ auto const tensorDataTypesTuples = testing::Combine(tensorDataTypes, tensorDataT
 auto const tensorShapeTuples = testing::Combine(tensorDimensions, tensorDimensions, tensorDimensions);
 auto const mirrorInWorkspaceParams = testing::Combine(tensorDataTypesTuples, tensorShapeTuples, randomSeeds);
 
-using MirrorInWorkspaceParamType
-    = std::tuple<std::tuple<tensorrt_llm::DataType, tensorrt_llm::DataType, tensorrt_llm::DataType>,
-        std::tuple<std::int32_t, std::int32_t, std::int32_t>, std::uint64_t>;
+using MirrorInWorkspaceParamType = std::tuple<std::tuple<nvinfer1::DataType, nvinfer1::DataType, nvinfer1::DataType>,
+    std::tuple<std::int32_t, std::int32_t, std::int32_t>, std::uint64_t>;
 
 class MirrorInWorkspaceTest : public testing::TestWithParam<MirrorInWorkspaceParamType>
 {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -97,8 +97,7 @@ class MaxUtilizationScheduler : public BaseCapacityScheduler
 public:
     MaxUtilizationScheduler(SizeType32 maxNumRequests, bool twoStepsLookAhead,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE,
-        bool enablePrefixAwareScheduling = true);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager& kvCacheManager,
@@ -109,8 +108,6 @@ private:
     SizeType32 mMaxNumRequests;
     /// @brief Boolean that indicates if two step lookahead is enabled
     bool mTwoStepsLookAhead;
-    /// @brief Whether to use KV prefix-reuse estimates in scheduling decisions.
-    bool mEnablePrefixAwareScheduling;
 };
 
 /// @brief Schedule requests using the GUARANTEED_NO_EVICT policy
@@ -123,8 +120,7 @@ class GuaranteedNoEvictScheduler : public BaseCapacityScheduler
 public:
     GuaranteedNoEvictScheduler(SizeType32 maxNumRequests,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE,
-        bool enablePrefixAwareScheduling = true);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
@@ -140,8 +136,6 @@ protected:
 
 private:
     SizeType32 mMaxNumRequests;
-    /// @brief Whether to use KV prefix-reuse estimates in scheduling decisions.
-    bool mEnablePrefixAwareScheduling;
 };
 
 /// @brief Schedule requests using the STATIC_BATCH policy
@@ -150,8 +144,7 @@ class StaticBatchScheduler : public GuaranteedNoEvictScheduler
 public:
     StaticBatchScheduler(SizeType32 maxNumRequests,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE,
-        bool enablePrefixAwareScheduling = true);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
         kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
@@ -167,8 +160,7 @@ public:
     explicit CapacityScheduler(SizeType32 maxNumRequests, executor::CapacitySchedulerPolicy capacitySchedulerPolicy,
         bool hasKvCacheManager, bool twoStepsLookAhead = false,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
-        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE,
-        bool enablePrefixAwareScheduling = true);
+        LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
     /**
      * @brief Schedules requests following the selected policy.

@@ -44,9 +44,7 @@ from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
-from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
 
 # HF FLUX.2 uses Flux2FeedForward with linear_in/linear_out attribute names.
 # We use GatedMLP which uses gate_up_proj/down_proj. Remap at load time.
@@ -250,12 +248,6 @@ class Flux2TransformerBlock(nn.Module):
 
         # FFN for image stream (shared GatedMLP from _torch/modules)
         # HF key remapping (linear_in.* → gate_up_proj.*, linear_out.* → down_proj.*) in load_weights()
-        use_cute_dsl_swiglu = (
-            torch.cuda.is_available()
-            and is_sm_100f()
-            and config is not None
-            and config.get_quant_config().quant_algo == QuantAlgo.NVFP4
-        )
         self.ff = GatedMLP(
             hidden_size=dim,
             intermediate_size=int(dim * mlp_ratio),
@@ -264,7 +256,6 @@ class Flux2TransformerBlock(nn.Module):
             config=config,
             layer_idx=layer_idx,
             reduce_output=(tp_size != 1),
-            use_cute_dsl_blockscaling_mm=use_cute_dsl_swiglu,
         )
         # FFN for text stream
         self.ff_context = GatedMLP(
@@ -275,7 +266,6 @@ class Flux2TransformerBlock(nn.Module):
             config=config,
             layer_idx=layer_idx,
             reduce_output=(tp_size != 1),
-            use_cute_dsl_blockscaling_mm=use_cute_dsl_swiglu,
         )
 
     def forward(

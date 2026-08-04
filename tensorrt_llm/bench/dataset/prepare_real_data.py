@@ -70,12 +70,11 @@ class DatasetConfig(BaseModel):
     def get_prompt(self, req):
         """Get the prompt sentence from the given request."""
         if self.prompt_key:
-            if self.prompt_key not in req:
-                raise ValueError(
-                    f"Dataset {self.name} does not have key '{self.prompt_key}'. "
-                    "Please set --prompt-key to one of the available keys: "
-                    f"{req.keys()}"
-                )
+            assert self.prompt_key in req, (
+                f"Dataset {self.name} does not have key '{self.prompt_key}'. "
+                "Please set --prompt-key to one of the available keys: "
+                f"{req.keys()}"
+            )
             return req[self.prompt_key]
         elif self.prompt:
             return self.prompt
@@ -84,23 +83,21 @@ class DatasetConfig(BaseModel):
 
     def get_input(self, req):
         """Get the input sentence from the given request."""
-        if self.input_key not in req:
-            raise ValueError(
-                f"Dataset {self.name} does not have key '{self.input_key}'. "
-                "Please set --input-key to one of the available keys: "
-                f"{req.keys()}"
-            )
+        assert self.input_key in req, (
+            f"Dataset {self.name} does not have key '{self.input_key}'. "
+            "Please set --input-key to one of the available keys: "
+            f"{req.keys()}"
+        )
         return req[self.input_key]
 
     def get_images(self, req):
         """Get the images from the given request."""
         image_keys = [self.image_key] + [f"{self.image_key}_{i}" for i in range(1, 8)]
-        if not any(key in req for key in image_keys):
-            raise ValueError(
-                f"Dataset {self.name} does not have key '{self.image_key}'. "
-                "Please set --dataset-image-key to one of the available keys: "
-                f"{req.keys()}"
-            )
+        assert any(key in req for key in image_keys), (
+            f"Dataset {self.name} does not have key '{self.image_key}'. "
+            "Please set --dataset-image-key to one of the available keys: "
+            f"{req.keys()}"
+        )
         images = []
         for key in image_keys:
             if key in req and req[key] is not None:
@@ -117,12 +114,11 @@ class DatasetConfig(BaseModel):
                 "you wish to set output length to the length of the golden "
                 "output, set --output-key."
             )
-        if self.output_key not in req:
-            raise ValueError(
-                f"Dataset {self.name} does not have key '{self.output_key}'. "
-                "Please set --output-key to one of the available keys: "
-                f"{req.keys()}"
-            )
+        assert self.output_key in req, (
+            f"Dataset {self.name} does not have key '{self.output_key}'. "
+            "Please set --output-key to one of the available keys: "
+            f"{req.keys()}"
+        )
         return req[self.output_key]
 
 
@@ -244,11 +240,7 @@ def real_dataset(root_args, **kwargs):
         if any(key in req for key in ["image", "image_1", "video"]):
             # multimodal input
             if "video" in req and req["video"] is not None:
-                # Video inputs are not supported yet; warn and fall through to
-                # image handling. Raising here would reject datasets that carry
-                # a video column alongside images, which previously worked (the
-                # original `assert "Not supported yet"` never fired).
-                logging.warning("Video modality is not supported yet; ignoring 'video' field.")
+                assert "Not supported yet"
             assert kwargs["output_len_dist"] is not None, (
                 "Output length distribution must be set for multimodal requests."
             )

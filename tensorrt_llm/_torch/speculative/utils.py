@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 from bisect import bisect_left
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
@@ -20,7 +17,6 @@ from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
-from .dspark import DSparkSpecMetadata, DSparkWorker
 from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
                      Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
@@ -28,57 +24,12 @@ from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
 from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .model_drafter import ModelDrafter
 from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata, MTPWorker
-from .mtp_dynamic_tree import (MTPEagleDynamicTreeResourceManager,
-                               MTPEagleDynamicTreeWorker)
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
 from .suffix_automaton import SuffixAutomatonManager
-
-_GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
-    "Gemma4ForCausalLM",
-    "Gemma4ForConditionalGeneration",
-)
-
-
-def _is_effective_dynamic_tree(spec_config) -> bool:
-    # At dynamic_tree_max_topK == 1 the tree collapses to a linear chain; route
-    # to the linear Eagle3 one-model path to avoid divergence in tree bookkeeping.
-    return (getattr(spec_config, 'use_dynamic_tree', False)
-            and getattr(spec_config, 'dynamic_tree_max_topK', 0) > 1)
-
-
-def _get_draft_vocab_size(spec_config, target_vocab_size: int) -> int:
-    """Draft-model vocab size, used to decide whether rejection sampling needs
-    the d2t-expanded ``full_draft_probs`` buffer (only when it differs from the
-    target vocab).
-
-    Reads the draft model's ``config.json`` from ``spec_config.speculative_model``.
-    Eagle3 configs store the target vocab in ``vocab_size`` and the reduced head
-    width in ``draft_vocab_size``, so ``draft_vocab_size`` is read first, falling
-    back to ``vocab_size`` (or a nested ``text_config.vocab_size``). Returns
-    ``target_vocab_size`` (shared vocab, no buffer needed) when there is no
-    separate draft model or the config cannot be read.
-    """
-    draft_dir = getattr(spec_config, "speculative_model", None)
-    if not draft_dir:
-        return target_vocab_size
-    try:
-        import json
-        import os
-        cfg_path = os.path.join(str(draft_dir), "config.json")
-        if not os.path.isfile(cfg_path):
-            return target_vocab_size
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        vs = cfg.get("draft_vocab_size") or cfg.get("vocab_size")
-        if vs is None:
-            vs = (cfg.get("text_config") or {}).get("vocab_size")
-        return int(vs) if vs else target_vocab_size
-    except (OSError, ValueError, TypeError, AttributeError):
-        return target_vocab_size
 
 
 def get_spec_metadata(spec_config,
@@ -87,18 +38,10 @@ def get_spec_metadata(spec_config,
                       max_num_tokens,
                       spec_resource_manager=None,
                       is_draft_model=False,
-                      max_seq_len=262144,
-                      num_seq_slots=None):
+                      max_seq_len=262144):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
-    # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool;
-    # DeepSeek-V4 overlap can exceed max_num_requests.
-    num_seq_slots = (num_seq_slots
-                     if num_seq_slots is not None else max_num_requests)
     vocab_size = getattr(model_config, "vocab_size", 0)
-    # Draft-model vocab size, used to gate the d2t-expanded full_draft_probs
-    # buffer allocation (see SpecMetadata.prepare_rejection_sampling_buffers).
-    draft_vocab_size = _get_draft_vocab_size(spec_config, vocab_size)
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         # MTP Eagle one-model reuses Eagle3 one-model metadata for the
         # unified worker/sampler/slot_ids plumbing, but skips per-layer
@@ -116,12 +59,8 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             use_rejection_sampling=use_rejection_sampling,
-            advanced_sampling_mode=spec_config.advanced_sampling_mode,
             vocab_size=vocab_size,
-            num_seq_slots=num_seq_slots,
-            draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
-            use_dynamic_tree=getattr(spec_config, 'use_dynamic_tree', False),
         )
     if spec_config.spec_dec_mode.is_mtp_vanilla():
         return MTPSpecMetadata(
@@ -131,9 +70,6 @@ def get_spec_metadata(spec_config,
             mtp_num_modules=spec_config.max_draft_len,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
-            use_rejection_sampling=use_rejection_sampling,
-            vocab_size=vocab_size,
-            draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(
@@ -151,7 +87,6 @@ def get_spec_metadata(spec_config,
             is_mtp_eagle=True,
         )
     if spec_config.spec_dec_mode.is_eagle3():
-        effective_dynamic_tree = _is_effective_dynamic_tree(spec_config)
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -167,8 +102,8 @@ def get_spec_metadata(spec_config,
             is_mtp_eagle=False,
             eagle_choices=spec_config.eagle_choices,
             is_spec_dec_tree=spec_config.eagle_choices is not None
-            or effective_dynamic_tree,
-            is_spec_dec_dynamic_tree=effective_dynamic_tree,
+            or spec_config.use_dynamic_tree,
+            is_spec_dec_dynamic_tree=spec_config.use_dynamic_tree,
         )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
@@ -182,9 +117,8 @@ def get_spec_metadata(spec_config,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
-            draft_vocab_size=draft_vocab_size,
             spec_resource_manager=spec_resource_manager,
-            use_dynamic_tree=_is_effective_dynamic_tree(spec_config),
+            use_dynamic_tree=spec_config.use_dynamic_tree,
             eagle_choices=spec_config.eagle_choices,
         )
     if spec_config.spec_dec_mode.is_pard():
@@ -194,9 +128,6 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             spec_resource_manager=spec_resource_manager,
-            use_rejection_sampling=use_rejection_sampling,
-            vocab_size=vocab_size,
-            draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_dflash():
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
@@ -209,24 +140,6 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
-            use_rejection_sampling=use_rejection_sampling,
-            vocab_size=vocab_size,
-            draft_vocab_size=draft_vocab_size,
-        )
-    if spec_config.spec_dec_mode.is_dspark():
-        target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
-        return DSparkSpecMetadata(
-            max_draft_len=spec_config.max_draft_len,
-            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
-            spec_dec_mode=spec_config.spec_dec_mode,
-            max_num_requests=max_num_requests,
-            layers_to_capture=target_layer_ids,
-            hidden_size=model_config.hidden_size,
-            max_num_tokens=max_num_tokens,
-            dtype=model_config.torch_dtype,
-            use_rejection_sampling=use_rejection_sampling,
-            vocab_size=vocab_size,
-            draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSpecMetadata(
@@ -235,9 +148,6 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             max_num_tokens=max_num_tokens,
-            use_rejection_sampling=use_rejection_sampling,
-            vocab_size=vocab_size,
-            draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(
@@ -273,16 +183,6 @@ def get_spec_metadata(spec_config,
     return None
 
 
-def get_mtp_hidden_size(model_config) -> int:
-    pretrained_config = getattr(model_config, "pretrained_config", model_config)
-    hidden_size = getattr(pretrained_config, "hidden_size", None)
-    if hidden_size is None:
-        hidden_size = getattr(model_config, "hidden_size")
-    if getattr(pretrained_config, "model_type", None) == "deepseek_v4":
-        return hidden_size * getattr(pretrained_config, "hc_mult", 1)
-    return hidden_size
-
-
 def get_spec_resource_manager(model_engine, draft_model_engine=None):
     spec_config = model_engine.spec_config
     if spec_config is None:
@@ -298,15 +198,6 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         if sa_cfg is not None:
             sa_manager = SuffixAutomatonManager(sa_cfg, max_num_requests,
                                                 max_seq_len)
-        # Dynamic tree combines SpecTreeManager with MTP hidden-state slots.
-        if getattr(spec_config, 'use_dynamic_tree', False):
-            return MTPEagleDynamicTreeResourceManager(
-                spec_config,
-                model_config.torch_dtype,
-                model_config.hidden_size,
-                max_num_requests,
-                sa_manager=sa_manager,
-            )
         if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
             # Unified resource manager: the unified worker reads
             # ``relaxed_delta_pool`` from ``Eagle3ResourceManager`` (mirrors the
@@ -314,7 +205,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             return Eagle3ResourceManager(
                 spec_config,
                 model_config.torch_dtype,
-                get_mtp_hidden_size(model_config),
+                model_config.hidden_size,
                 max_num_requests,
                 max_seq_len,
                 max_num_tokens,
@@ -331,12 +222,12 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
-            get_mtp_hidden_size(model_config),
+            model_config.hidden_size,
             max_num_requests,
             sa_manager=sa_manager,
         )
-    if spec_dec_mode.is_eagle3_one_model() and _is_effective_dynamic_tree(
-            spec_config):
+    if spec_dec_mode.is_eagle3_one_model() and getattr(
+            spec_config, 'use_dynamic_tree', False):
         return Eagle3OneModelDynamicTreeResourceManager(spec_config,
                                                         max_num_requests)
     if spec_dec_mode.is_eagle3_one_model():
@@ -395,10 +286,7 @@ def get_spec_decoder(
         # MTP Eagle one-model now uses the same sampler as Eagle3 one-model.
         return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
     if spec_config.spec_dec_mode.is_mtp_vanilla():
-        nextn = spec_config.max_draft_len
-        if getattr(spec_config, "use_dynamic_tree", False):
-            nextn = spec_config.max_total_draft_tokens
-        return MTPSampler(sampler_args, nextn=nextn)
+        return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
     if spec_config.spec_dec_mode.is_eagle3(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
@@ -448,8 +336,6 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
-    if getattr(spec_config, "_use_shared_kv_cache", False):
-        return 0
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         return 1
     if spec_config.spec_dec_mode.is_mtp_vanilla():
@@ -483,22 +369,12 @@ def get_spec_worker(spec_config,
                     use_separate_draft_kv_cache: bool = False):
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_vanilla():
-        return MTPWorker(spec_config,
-                         model_config,
-                         use_separate_draft_kv_cache,
-                         mapping=mapping)
+        return MTPWorker(spec_config, model_config, use_separate_draft_kv_cache)
     if spec_dec_mode.is_mtp_eagle_one_model():
-        if getattr(spec_config, 'use_dynamic_tree', False):
-            return MTPEagleDynamicTreeWorker(spec_config,
-                                             model_config,
-                                             use_separate_draft_kv_cache,
-                                             mapping=mapping)
-        return MTPEagleWorker(spec_config,
-                              model_config,
-                              use_separate_draft_kv_cache,
-                              mapping=mapping)
+        return MTPEagleWorker(spec_config, model_config,
+                              use_separate_draft_kv_cache)
     if spec_dec_mode.is_eagle3_one_model():
-        if _is_effective_dynamic_tree(spec_config):
+        if getattr(spec_config, 'use_dynamic_tree', False):
             return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
                                                    use_separate_draft_kv_cache)
         return Eagle3OneModelWorker(
@@ -509,8 +385,6 @@ def get_spec_worker(spec_config,
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
-    if spec_dec_mode.is_dspark():
-        return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)
     if spec_dec_mode.is_draft_target_one_model():
@@ -525,8 +399,6 @@ def get_num_extra_kv_tokens(spec_config):
     KV cache tokens are required.
     """
     if spec_config is None:
-        return 0
-    if getattr(spec_config, "_use_shared_kv_cache", False):
         return 0
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
@@ -552,11 +424,6 @@ def update_spec_config_from_model_config(spec_config, model_config):
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
     if not isinstance(spec_config, MTPDecodingConfig):
         return
-    architectures = getattr(model_config, "architectures", None) or ()
-    if (architectures
-            and architectures[0] in _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES):
-        spec_config._use_shared_kv_cache = (
-            spec_config.spec_dec_mode.is_mtp_eagle_one_model())
     # Read the MTP layer count from the model's pretrained config. This
     # determines the actual MTP layer count in the checkpoint and drives the
     # spec_dec_mode decision (EAGLE vs vanilla MTP). Different checkpoints expose
@@ -589,8 +456,7 @@ def update_spec_config_from_model_config(spec_config, model_config):
             f"using max_draft_len={effective_draft_len} draft tokens.")
         spec_config.max_draft_len = effective_draft_len
 
-    if not spec_config.use_dynamic_tree:
-        spec_config.max_total_draft_tokens = spec_config.max_draft_len
+    spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
 
 def update_spec_config_from_loaded_model(spec_config, model) -> None:

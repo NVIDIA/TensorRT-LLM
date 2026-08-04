@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tests/unit_tests/kernels/sampling/samplingTest.h"
 #include <random>
@@ -58,8 +57,7 @@ TEST_F(SamplingUtilsKernelTest, CurandInitialize)
         sync_check_cuda_error(this->mStream->get());
 
         // Generate random numbers using initialized curand states.MemoryType
-        auto randValsDevice
-            = this->mBufferManager->gpu(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+        auto randValsDevice = this->mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
         generateRandomNumber<<<1, batchSize, 0, this->mStream->get()>>>(
             bufferCast<int32_t>(*randValsDevice), batchSlotsPtr, curandStates, batchSize);
         auto randValsHost = this->mBufferManager->copyFrom(*randValsDevice, MemoryType::kCPU);
@@ -99,7 +97,7 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     curandState_t* curandStates;
     cudaMalloc(&curandStates, sizeof(curandState_t) * 2 * batchSize);
 
-    auto randomSeedsHost = mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT64);
+    auto randomSeedsHost = mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT64);
     auto randomSeedsHostPtr = bufferCast<int64_t>(*randomSeedsHost);
     size_t const periodSize = 3;
     for (size_t i = 0; i < batchSize; ++i)
@@ -108,7 +106,7 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     }
     auto randomSeedsDevice = mBufferManager->copyFrom(*randomSeedsHost, MemoryType::kGPU);
 
-    auto batchSlots = mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+    auto batchSlots = mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
     auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
@@ -122,7 +120,7 @@ TEST_F(SamplingUtilsKernelTest, CurandBatchInitialize)
     sync_check_cuda_error(mStream->get());
 
     // Generate random numbers using initialized curand states.
-    auto randValsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+    auto randValsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
     generateRandomNumber<<<1, batchSize, 0, this->mStream->get()>>>(
         bufferCast<SizeType32>(*randValsDevice), batchSlotsPtr, curandStates, batchSize);
     auto const randValsHost = mBufferManager->copyFrom(*randValsDevice, MemoryType::kCPU);
@@ -168,26 +166,25 @@ public:
             ITensor::makeShape({batchSize, maxBeamWidth, vocabSizePadded}), dataType);
         ITensor::SharedPtr logitsHostPtrs = this->mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), ptrType);
         auto refLogitsHost = this->mBufferManager->pinnedPool(
-            ITensor::makeShape({batchSize, maxBeamWidth, vocabSizePadded}), tensorrt_llm::DataType::kFLOAT);
+            ITensor::makeShape({batchSize, maxBeamWidth, vocabSizePadded}), nvinfer1::DataType::kFLOAT);
         auto refEntropyHost = this->mBufferManager->pinnedPool(
-            ITensor::makeShape({maxBatchSize, maxBeamWidth}), tensorrt_llm::DataType::kFLOAT);
-        auto entropyDevice = this->mBufferManager->gpu(
-            ITensor::makeShape({maxBatchSize, maxBeamWidth}), tensorrt_llm::DataType::kFLOAT);
+            ITensor::makeShape({maxBatchSize, maxBeamWidth}), nvinfer1::DataType::kFLOAT);
+        auto entropyDevice
+            = this->mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxBeamWidth}), nvinfer1::DataType::kFLOAT);
 
         auto biasHost = this->mBufferManager->pinnedPool(ITensor::makeShape({vocabSize}), dataType);
         auto temperatureHost
-            = this->mBufferManager->pinnedPool(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
+            = this->mBufferManager->pinnedPool(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
 
         auto endIdsHost
-            = this->mBufferManager->pinnedPool(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
+            = this->mBufferManager->pinnedPool(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
         auto beamWidthsHost
-            = this->mBufferManager->pinnedPool(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
+            = this->mBufferManager->pinnedPool(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
 
         ITensor::SharedPtr finishedHost = this->mBufferManager->pinnedPool(
             ITensor::makeShape({maxBeamWidth, maxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
-        auto batchSlots
-            = this->mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+        auto batchSlots = this->mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*batchSlots);
         auto beamWidthsHostPtr = bufferCast<SizeType32>(*beamWidthsHost);

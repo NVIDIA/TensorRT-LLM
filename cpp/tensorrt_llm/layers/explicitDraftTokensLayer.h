@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/layers/baseLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -84,7 +83,7 @@ private:
 
     TensorPtr mTemperature;
 
-    std::optional<tensorrt_llm::DataType> mDecoderDtype{std::nullopt};
+    std::optional<nvinfer1::DataType> mDecoderDtype{std::nullopt};
 };
 
 } // namespace tensorrt_llm::layers

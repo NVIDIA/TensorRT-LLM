@@ -9,9 +9,6 @@ from tensorrt_llm._torch.peft.lora.validation import (
     check_moe_lora_supported,
     has_moe_lora_targets,
 )
-from tensorrt_llm.quantization.mode import QuantMode
-
-pytestmark = pytest.mark.cpu_only
 
 
 class _FakeLoraConfig:
@@ -21,17 +18,17 @@ class _FakeLoraConfig:
         self.lora_target_modules = lora_target_modules
 
 
+class _FakeQuantMode:
+    def __init__(self, any_quant: bool):
+        self._any = any_quant
+
+    def has_any_quant(self, exclude_kv_cache: bool = False):
+        return self._any
+
+
 class _FakeQuantConfig:
-    """Minimal stand-in for `QuantConfig` carrying a real `QuantMode`."""
-
-    def __init__(self, quant_mode: QuantMode):
-        self.quant_mode = quant_mode
-
-
-_NO_QUANT = QuantMode(0)
-_FP8_QDQ = QuantMode.from_description(use_fp8_qdq=True)
-_FP8_BLOCK_SCALE = QuantMode.from_description(use_fp8_block_scales=True)
-_NVFP4 = QuantMode.from_description(use_nvfp4=True)
+    def __init__(self, any_quant: bool):
+        self.quant_mode = _FakeQuantMode(any_quant)
 
 
 def test_has_moe_lora_targets_none():
@@ -58,7 +55,7 @@ def test_check_no_lora_is_noop():
     check_moe_lora_supported(
         moe_backend_name="WIDEEP",
         lora_config=None,
-        quant_config=_FakeQuantConfig(_FP8_BLOCK_SCALE),
+        quant_config=_FakeQuantConfig(True),
     )
 
 
@@ -68,7 +65,7 @@ def test_check_no_moe_lora_is_noop():
     check_moe_lora_supported(
         moe_backend_name="TRTLLM",
         lora_config=cfg,
-        quant_config=_FakeQuantConfig(_FP8_BLOCK_SCALE),
+        quant_config=_FakeQuantConfig(True),
     )
 
 
@@ -88,30 +85,8 @@ def test_check_moe_lora_cutlass_unquantized_quant_mode_ok():
     check_moe_lora_supported(
         moe_backend_name="cutlass",  # case-insensitive
         lora_config=cfg,
-        quant_config=_FakeQuantConfig(_NO_QUANT),
+        quant_config=_FakeQuantConfig(False),
     )
-
-
-def test_check_moe_lora_cutlass_fp8_qdq_ok():
-    # Per-tensor FP8 (qdq) base weights are supported on Cutlass.
-    cfg = _FakeLoraConfig(["moe_h_to_4h", "moe_4h_to_h", "moe_gate"])
-    check_moe_lora_supported(
-        moe_backend_name="CUTLASS",
-        lora_config=cfg,
-        quant_config=_FakeQuantConfig(_FP8_QDQ),
-    )
-
-
-def test_check_moe_lora_rejects_fp8_block_scale():
-    # Only per-tensor FP8 (qdq) is supported; FP8 block-scale has no LoRA path
-    # and must be rejected.
-    cfg = _FakeLoraConfig(["moe_h_to_4h", "moe_4h_to_h", "moe_gate"])
-    with pytest.raises(ValueError, match="FP8 block-scale"):
-        check_moe_lora_supported(
-            moe_backend_name="CUTLASS",
-            lora_config=cfg,
-            quant_config=_FakeQuantConfig(_FP8_BLOCK_SCALE),
-        )
 
 
 @pytest.mark.parametrize(
@@ -137,15 +112,13 @@ def test_check_moe_lora_rejects_non_cutlass_backend(backend):
         )
 
 
-def test_check_moe_lora_rejects_nvfp4_base():
-    # FP4 (and other non per-tensor-FP8 quant) has no LoRA path and must be
-    # rejected.
+def test_check_moe_lora_rejects_quantized_base():
     cfg = _FakeLoraConfig(["moe_gate", "moe_4h_to_h"])
-    with pytest.raises(ValueError, match="per-tensor FP8"):
+    with pytest.raises(ValueError, match="unquantized fp16/bf16 base weights"):
         check_moe_lora_supported(
             moe_backend_name="CUTLASS",
             lora_config=cfg,
-            quant_config=_FakeQuantConfig(_NVFP4),
+            quant_config=_FakeQuantConfig(True),
         )
 
 

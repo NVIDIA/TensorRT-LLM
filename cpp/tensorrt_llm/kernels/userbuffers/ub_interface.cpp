@@ -16,7 +16,6 @@
 #include "ub_interface.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 
@@ -81,13 +80,13 @@ namespace kernels::ub
 {
 
 void allreduce2_userbuff_inplace_launcher(int const handler, size_t const offset, size_t const elements,
-    tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
+    nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     allreduce2_userbuff_inplace_impl(handler, offset, elements, dataType, comm, stream);
 }
 
 int allgather2_userbuff_residual_launcher(int const handler, size_t const offset, size_t const elements,
-    int const hidden_size, void* residual, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream,
+    int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream,
     bool force_enable)
 {
     return allgather2_userbuff_residual_impl(
@@ -96,7 +95,7 @@ int allgather2_userbuff_residual_launcher(int const handler, size_t const offset
 
 int allreduce2_userbuff_rmsnorm_launcher(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
-    void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
+    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     return allreduce2_userbuff_rmsnorm_impl(handler, offset, out_handler, out_offset, elements, hidden_size, beta,
         gamma, eps, residual_in, residual_out, dataType, comm, stream);
@@ -104,7 +103,7 @@ int allreduce2_userbuff_rmsnorm_launcher(int const handler, size_t const offset,
 
 int allreduce2_userbuff_inplace_rmsnorm_quant_launcher(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
-    float* scalefactor, void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm,
+    float* scalefactor, void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm,
     cudaStream_t stream)
 {
     return allreduce2_userbuff_inplace_rmsnorm_quant_impl(handler, offset, out_handler, out_offset, elements,
@@ -114,7 +113,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_launcher(int const handler, size_t
 int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, size_t const offset,
     int const out_handler, size_t const out_offset, int const scale_handler, size_t const scale_offset,
     size_t const elements, int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor,
-    void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
+    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     return allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(handler, offset, out_handler, out_offset, scale_handler,
         scale_offset, elements, hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, dataType, comm,
@@ -166,12 +165,12 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::ub
 {
 void allreduce2_userbuff_inplace_launcher(int const handler, size_t const offset, size_t const elements,
-    tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
+    nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
 {
 }
 
 int allgather2_userbuff_residual_launcher(int const handler, size_t const offset, size_t const elements,
-    int const hidden_size, void* residual, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream,
+    int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream,
     bool force_enable)
 {
     return 0;
@@ -179,7 +178,7 @@ int allgather2_userbuff_residual_launcher(int const handler, size_t const offset
 
 int allreduce2_userbuff_inplace_rmsnorm_quant_launcher(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
-    float* scalefactor, void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm,
+    float* scalefactor, void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm,
     cudaStream_t stream)
 {
     return 0;
@@ -188,7 +187,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_launcher(int const handler, size_t
 int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, size_t const offset,
     int const out_handler, size_t const out_offset, int const scale_handler, size_t const scale_offset,
     size_t const elements, int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor,
-    void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
+    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     return 0;
 }

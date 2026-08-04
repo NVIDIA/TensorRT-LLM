@@ -133,7 +133,7 @@ class DeepSeekV32Parser(BaseToolParser):
         try:
             # Extract content between function_calls tags
             function_calls_match = re.search(
-                re.escape(self.bot_token) + r"(.*?)" + re.escape(self.eot_token),
+                r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>",
                 text,
                 re.DOTALL,
             )

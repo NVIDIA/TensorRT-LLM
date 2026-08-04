@@ -74,13 +74,6 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
     size_t bufferIdx = computeBufferIdx(localIdx, targetInfo);
     size_t size = outputBuffers[bufferIdx]->getSizeInBytes();
 
-    // Skip Helix CP ranks that own no blocks for this sequence (num_total_blocks < cp_size).
-    // The matching gen rank skips its receive, so no 0-byte transfer is posted on either side.
-    if (size == 0)
-    {
-        return;
-    }
-
     if (bufferIdx < bufferCoverTargetNum)
     {
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
@@ -183,7 +176,7 @@ void sendAllBuffers(TransferSession& session, int deviceId,
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, std::optional<LlmRequest const*> llmRequest,
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP, SizeType32 ppSize)
 {
     auto poolNum = cacheManager->getBlockManager().getNumPools(
@@ -197,10 +190,9 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, std::option
         || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
     {
         // disable reuse path, and vwsa don't support reuse.
-        TLLM_CHECK_WITH_INFO(llmRequest.has_value(), "LlmRequest required for non-reuse-tree transfer path");
         bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
 
-        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, (*llmRequest)->mRequestId);
+        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
 
         auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
 
@@ -236,20 +228,16 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, std::option
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
 
-    // No request on the reuse-tree path: fall through to the plain lastBlockKey lookup.
-    if (llmRequest.has_value())
+    auto multimodalHashes = llmRequest.getMultimodalHashes();
+    bool isMultimodal = multimodalHashes.has_value() && *multimodalHashes && !(*multimodalHashes)->empty();
+    if (isMultimodal)
     {
-        auto multimodalHashes = (*llmRequest)->getMultimodalHashes();
-        bool isMultimodal = multimodalHashes.has_value() && *multimodalHashes && !(*multimodalHashes)->empty();
-        if (isMultimodal)
-        {
-            auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
-            auto const usableSize = static_cast<SizeType32>(lastBlockKey.uniqueTokens.size());
-            auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
-                lastBlockKey.uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/true);
-            auto blockKeys = buildBlockKeys(blockedUniqueTokens, **llmRequest);
-            return BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
-        }
+        auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+        auto const usableSize = static_cast<SizeType32>(lastBlockKey.uniqueTokens.size());
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+            lastBlockKey.uniqueTokens, usableSize, tokensPerBlock, /*allowPartial=*/true);
+        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+        return BlockRange::fromReuseTree(*cacheManager, blockKeys, indexFromEnd);
     }
 
     return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
@@ -368,15 +356,11 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_format);
     session.setTime(TransferSession::kTimeFormatter);
-    auto llmRequest = session.getLlmRequest();
-    if (llmRequest.has_value())
-    {
-        TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", (*llmRequest)->mRequestId);
-        TLLM_CHECK_WITH_INFO(
-            (*llmRequest)->mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
-    }
+    auto const& llmRequest = session.getLlmRequest();
+    TLLM_LOG_DEBUG(
+        mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
 
+    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
@@ -394,6 +378,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     size_t targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
+        TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
         return;
     }
 
@@ -421,15 +406,13 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
     SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
 
-    TLLM_LOG_DEBUG("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%s",
-        allWindowSizes.size(), numKvPools, numPools,
-        llmRequest.has_value() ? std::to_string((*llmRequest)->mRequestId).c_str() : "<request-free>");
+    TLLM_LOG_DEBUG("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
+        allWindowSizes.size(), numKvPools, numPools, llmRequest.mRequestId);
 
     bool layerWise = common::getEnvDisaggLayerwise() && numKvPools == 1;
     if (layerWise)
     {
-        TLLM_CHECK_WITH_INFO(llmRequest.has_value(), "LlmRequest required for layer-wise transfer");
-        auto& progress = (*llmRequest)->getContextProgress();
+        auto& progress = llmRequest.getContextProgress();
         SizeType32 const numLayers = blockManager.getNumLayers();
         runtime::ITensor::Shape offset = runtime::ITensor::makeShape({0, 0});
         for (SizeType32 layerIdx = 0; layerIdx < numLayers; layerIdx++)
@@ -525,11 +508,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                     }
                 }
             }
-            if (llmRequest.has_value())
-            {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
-                    (*llmRequest)->mRequestId);
-            }
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
+                llmRequest.mRequestId);
 
             return;
         }
@@ -542,9 +522,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
-        auto const* sendCancelFlag
-            = common::getEnvDisaggEnableInflightCancel() ? &session.getDataContext().getTransferTerminate() : nullptr;
-        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend(sendCancelFlag);
+        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
         BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
@@ -624,44 +602,23 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
         }
 
-        if (sendCancelFlag != nullptr && sendCancelFlag->load(std::memory_order_relaxed))
-        {
-            TLLM_THROW("KV cache transfer cancelled before NIXL submission");
-        }
-
-        try
-        {
-            sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer,
-                bufferManager, targetInfo, pickUpConnections);
-        }
-        catch (...)
-        {
-            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
-            {
-                sendHolder.poison();
-            }
-            throw;
-        }
+        sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
+            targetInfo, pickUpConnections);
 
         session.setTime(TransferSession::kTimeTransmissions);
 
         sendHolder.release();
         session.setTime(TransferSession::kTimePostprocess);
     }
-    if (llmRequest.has_value())
-    {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ",
-            (*llmRequest)->mRequestId);
-    }
+    TLLM_LOG_DEBUG(
+        mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
 }
 
 void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_unformat);
     session.setTime(TransferSession::kTimeFormatter);
-    auto llmRequestOpt = session.getLlmRequest();
-    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for receiving KV cache");
-    auto const& llmRequest = **llmRequestOpt;
+    auto const& llmRequest = session.getLlmRequest();
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId, ctxReqId);
@@ -729,13 +686,6 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         "outputBuffersPerWindow size: %ld,blockNum: %d , kvWindowSizes: %ld", outputBuffersPerWindow.size(), blockNum,
         kvWindowSizes.size());
     TLLM_CHECK(!outputBuffersPerWindow.empty());
-
-    // An "empty" Helix CP rank owns no KV blocks for this sequence (num_total_blocks < cp_size).
-    // There is nothing to receive; the sender (context, CP=1) skips the matching 0-byte transfer.
-    if (blockNum == 0)
-    {
-        return;
-    }
     if (outputBuffersPerWindow.size() > 1)
     {
         // We only support limited case for VSWA.
@@ -747,7 +697,12 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     {
         NVTX3_SCOPED_RANGE(formatInputRecvBuffer);
 
-        auto const dataType = mCacheTransBufferManager->getDataType();
+        // TODO(disagg-multi-dtype): pool 0's dtype is treated as canonical for the wire
+        // transport here.  Pools with differing dtypes are rejected up-front in
+        // CacheTransBufferManager's constructor (see cacheTransBuffer.cpp).  When
+        // per-pool dtype dispatch lands, this single dataType variable must be replaced
+        // with a per-pool lookup keyed by the source pool of each block.
+        auto dataType = mCacheManager->getPrimaryPool(0)->getDataType();
         bool layerWise = common::getEnvDisaggLayerwise() && numKvPools == 1;
         if (layerWise)
         {
@@ -906,16 +861,12 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 if (preAssignedKvId.has_value())
                 {
                     cacheBufferId = static_cast<int>(*preAssignedKvId);
-                    if (!session.hasReservedRecvBuffer(*mCacheTransBufferManager))
-                    {
-                        recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
-                    }
                 }
                 else
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
-                    recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 }
+                recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
@@ -1049,7 +1000,6 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     recvSplitCaches, outputBuffersPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
 
                 bufferManager.getStream().synchronize();
-                (void) session.releaseReservedRecvBuffer(*mCacheTransBufferManager);
                 recvHolder.release();
             }
             session.setTime(TransferSession::kTimePostprocess);

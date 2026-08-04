@@ -3,12 +3,8 @@ import os
 import sys
 import unittest
 
-import pytest
-
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
-
-pytestmark = pytest.mark.cpu_only
 
 # A global list to simulate a leak
 LEAKY_HOLD = []

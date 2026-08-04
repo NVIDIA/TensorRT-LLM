@@ -15,51 +15,24 @@
 
 from __future__ import annotations
 
-import sys
 import time
 from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
-
-# avoid importing the whole tensorrt_llm module, which takes time during debugging.
-from importlib.util import find_spec
-from pathlib import Path
 from threading import Condition
 from typing import Any, Callable
 
-from ._utils import temporary_sys_path
-
-if "tensorrt_llm" in sys.modules:
-    from tensorrt_llm.logger import logger
-    from tensorrt_llm.runtime.kv_cache_hash import (
-        KV_CACHE_HASH_ALGO_AUTO,
-        KV_CACHE_HASH_ALGO_DEFAULT,
-        KV_CACHE_HASH_ALGO_V1,
-        KV_CACHE_HASH_ALGO_V2,
-        KV_CACHE_HASH_ALGO_V2_SHA256_64,
-        NonTextTokenHashError,
-        hash_v1_block_key,
-        truncate_sha256_hash_to_int64,
-    )
-else:
-    # fast path for dev, avoids importing the whole tensorrt_llm module
-    import logging
-
-    logger = logging.getLogger("tensorrt_llm")
-
-    spec = find_spec("kv_cache_manager_v2")
-    assert spec is not None and spec.origin is not None
-    with temporary_sys_path(str(Path(spec.origin).parent.parent)):
-        from kv_cache_hash import (  # noqa
-            KV_CACHE_HASH_ALGO_AUTO,
-            KV_CACHE_HASH_ALGO_DEFAULT,
-            KV_CACHE_HASH_ALGO_V1,
-            KV_CACHE_HASH_ALGO_V2,
-            KV_CACHE_HASH_ALGO_V2_SHA256_64,
-            NonTextTokenHashError,
-            hash_v1_block_key,
-            truncate_sha256_hash_to_int64,
-        )
+from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.kv_cache_hash import (
+    KV_CACHE_HASH_ALGO_AUTO,
+    KV_CACHE_HASH_ALGO_DEFAULT,
+    KV_CACHE_HASH_ALGO_V1,
+    KV_CACHE_HASH_ALGO_V2,
+    KV_CACHE_HASH_ALGO_V2_SHA256_64,
+    NonTextTokenHashError,
+    hash_v1_block_key,
+    truncate_sha256_hash_to_int64,
+)
 
 from ._common import GPU_LEVEL, PRIORITY_DEFAULT, CacheLevel, Priority, TokenIdExt
 
@@ -335,7 +308,7 @@ class KVCacheEventManager:
 
     def _add_event(
         self,
-        data: (KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData),
+        data: KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData,
         layer_group_id: LayerGroupId = None,
     ) -> None:
         if self._max_kv_event_entries <= 0:
@@ -416,7 +389,7 @@ class KVCacheEventManager:
 
     def _add_event_unlocked(
         self,
-        data: (KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData),
+        data: KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData,
         layer_group_id: LayerGroupId = None,
     ) -> KVCacheEvent:
         if not isinstance(data, KVCacheRemovedData):
@@ -536,11 +509,13 @@ class KVCacheEventManager:
         cache_level: CacheLevel = GPU_LEVEL
         priority: Priority = PRIORITY_DEFAULT
         found_page = False
-        for life_cycle_id in range(len(block.storage)):
+        for life_cycle_id, page_ref in enumerate(block.storage):
             if life_cycle_ids is not None and life_cycle_id not in life_cycle_ids:
                 continue
-            page = block.get_page(life_cycle_id)
-            if page is None or page.num_tokens_in_block < len(block.tokens):
+            if page_ref is None:
+                continue
+            page = page_ref()
+            if page is None:
                 continue
             cache_level = page.cache_level
             priority = page.priority
@@ -560,12 +535,11 @@ class KVCacheEventManager:
 
     @staticmethod
     def _life_cycle_ids_from_radix_block(block: Any) -> set[int]:
-        life_cycle_ids = set[int]()
-        for life_cycle_id in range(len(block.storage)):
-            page = block.get_page(life_cycle_id)
-            if page is not None and page.num_tokens_in_block >= len(block.tokens):
-                life_cycle_ids.add(life_cycle_id)
-        return life_cycle_ids
+        return {
+            life_cycle_id
+            for life_cycle_id, page_ref in enumerate(block.storage)
+            if page_ref is not None and page_ref() is not None
+        }
 
     def _parent_hash_from_radix_block(self, block: Any) -> EventBlockHash | None:
         parent = block.prev
@@ -576,7 +550,7 @@ class KVCacheEventManager:
     def _hash_from_radix_block(self, block: Any) -> EventBlockHash:
         if self._hash_algo == KV_CACHE_HASH_ALGO_V1:
             return self._v1_hash_from_radix_block(block)
-        return self._normalize_block_hash(getattr(block, "event_key", block.key))
+        return self._normalize_block_hash(block.key)
 
     def _v1_hash_from_radix_block(self, block: Any) -> int:
         key = bytes(block.key)

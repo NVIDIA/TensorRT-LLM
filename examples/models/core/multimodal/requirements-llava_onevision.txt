@@ -1,0 +1,4 @@
+git+https://github.com/LLaVA-VL/LLaVA-NeXT.git
+transformers>=4.56.0
+einops
+av

@@ -19,7 +19,6 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaMemPool.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -231,7 +230,7 @@ TEST_F(TllmBuffersTest, DeviceBuffer)
     {
         CudaAllocatorAsync allocator{mStream, mMemPool};
         {
-            DeviceBuffer buffer{size, tensorrt_llm::DataType::kFLOAT, allocator};
+            DeviceBuffer buffer{size, nvinfer1::DataType::kFLOAT, allocator};
             testBuffer(buffer, sizeof(float));
         }
         streamPtr->synchronize();
@@ -243,7 +242,7 @@ TEST_F(TllmBuffersTest, DeviceBuffer)
     {
         CudaAllocator allocator{};
         {
-            StaticDeviceBuffer buffer{size, tensorrt_llm::DataType::kFLOAT, allocator};
+            StaticDeviceBuffer buffer{size, nvinfer1::DataType::kFLOAT, allocator};
             testBuffer(buffer, sizeof(float));
         }
         streamPtr->synchronize();
@@ -264,10 +263,10 @@ TEST_F(TllmBuffersTest, DeviceTensor)
         GTEST_SKIP() << noPoolSkipReason;
     }
     auto streamPtr = std::make_shared<CudaStream>();
-    tensorrt_llm::Dims constexpr dims{3, 16, 8, 4};
+    nvinfer1::Dims constexpr dims{3, 16, 8, 4};
     CudaAllocatorAsync allocator{streamPtr, mMemPool};
     {
-        DeviceTensor tensor{dims, tensorrt_llm::DataType::kFLOAT, allocator};
+        DeviceTensor tensor{dims, nvinfer1::DataType::kFLOAT, allocator};
         EXPECT_EQ(tensor.getSize(), ITensor::volume(dims));
         testBuffer(tensor, sizeof(float));
         EXPECT_EQ(tensor.getSize(), ITensor::volume(tensor.getShape()));
@@ -282,7 +281,7 @@ TEST_F(TllmBuffersTest, BufferSlice)
 {
     auto constexpr size = 1024;
     HostAllocator allocator{};
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     auto buffer = std::make_shared<HostBuffer>(size, dataType, allocator);
     auto offset = size / 8;
     auto slice = IBuffer::slice(buffer, offset);
@@ -320,7 +319,7 @@ TEST_F(TllmBuffersTest, BufferOutput)
     CudaAllocatorAsync allocator{streamPtr, mMemPool};
     for (std::size_t size : {0, 16})
     {
-        DeviceBuffer buffer{size, tensorrt_llm::DataType::kFLOAT, allocator};
+        DeviceBuffer buffer{size, nvinfer1::DataType::kFLOAT, allocator};
         TLLM_CUDA_CHECK(cudaMemsetAsync(buffer.data(), 0, buffer.getSizeInBytes(), streamPtr->get()));
         streamPtr->synchronize();
         std::stringstream ss;
@@ -344,11 +343,11 @@ TEST_F(TllmBuffersTest, TensorOutput)
     }
 
     auto streamPtr = std::make_shared<CudaStream>();
-    tensorrt_llm::Dims constexpr dims{3, 16, 8, 4};
+    nvinfer1::Dims constexpr dims{3, 16, 8, 4};
     CudaAllocatorAsync allocator{streamPtr, mMemPool};
-    for (auto dataType : {tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kHALF, tensorrt_llm::DataType::kBOOL,
-             tensorrt_llm::DataType::kINT8, tensorrt_llm::DataType::kINT32, tensorrt_llm::DataType::kINT64,
-             tensorrt_llm::DataType::kUINT8})
+    for (auto dataType :
+        {nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF, nvinfer1::DataType::kBOOL, nvinfer1::DataType::kINT8,
+            nvinfer1::DataType::kINT32, nvinfer1::DataType::kINT64, nvinfer1::DataType::kUINT8})
     {
         DeviceTensor tensor{dims, dataType, allocator};
         TLLM_CUDA_CHECK(cudaMemsetAsync(tensor.data(), 0, tensor.getSizeInBytes(), streamPtr->get()));
@@ -484,8 +483,8 @@ TEST_F(TllmBuffersTest, PinnedPoolAllocator)
     EXPECT_EQ(segments.size(), 0);
 
     {
-        auto a = BufferManager::pinnedPool(ITensor::makeShape({512, 4, 4}), tensorrt_llm::DataType::kFLOAT);
-        auto b = BufferManager::pinnedPool(ITensor::makeShape({512, 10}), tensorrt_llm::DataType::kHALF);
+        auto a = BufferManager::pinnedPool(ITensor::makeShape({512, 4, 4}), nvinfer1::DataType::kFLOAT);
+        auto b = BufferManager::pinnedPool(ITensor::makeShape({512, 10}), nvinfer1::DataType::kHALF);
         pool.logSegments();
         auto it = std::begin(segments);
         EXPECT_NE(it->tag, nullptr);
@@ -513,7 +512,7 @@ TEST_F(TllmBuffersTest, PinnedPoolAllocator)
     std::size_t secondChunkSize;
     {
         // Test creating a new chunk
-        auto c = BufferManager::pinnedPool(ITensor::makeShape({initChunkSize + 1}), tensorrt_llm::DataType::kUINT8);
+        auto c = BufferManager::pinnedPool(ITensor::makeShape({initChunkSize + 1}), nvinfer1::DataType::kUINT8);
         pool.logSegments();
         auto it = std::begin(segments);
         EXPECT_EQ(it->tag, nullptr);

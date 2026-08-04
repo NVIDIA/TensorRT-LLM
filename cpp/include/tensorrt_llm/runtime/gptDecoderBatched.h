@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -49,7 +48,7 @@ public:
     explicit GptDecoderBatched(CudaStreamPtr stream);
 
     void setup(executor::DecodingMode const& mode, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
-        tensorrt_llm::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig) override;
+        nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig) override;
 
     void disableLookahead(RequestVector const& genRequests, TensorPtr const& batchSlots) override;
 

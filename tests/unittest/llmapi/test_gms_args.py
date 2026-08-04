@@ -14,9 +14,6 @@ import pytest
 
 from tensorrt_llm.llmapi.llm_args import LoadFormat, TorchLlmArgs
 
-pytestmark = pytest.mark.cpu_only
-
-
 _LOGGER_PATH = "tensorrt_llm.llmapi.llm_args.logger"
 _DUMMY_MODEL = "/tmp/test-gms-args-nonexistent"
 

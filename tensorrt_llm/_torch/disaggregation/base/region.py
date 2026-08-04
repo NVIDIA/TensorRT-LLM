@@ -39,6 +39,15 @@ class MemRegionGroup(NamedTuple):
     bytes_per_region: int
 
 
+class DataRole(IntFlag):
+    """Logical role(s) a memory region plays. Supports combinations."""
+
+    KEY = auto()
+    VALUE = auto()
+    BLOCK_QUANT = auto()
+    INDEXER = auto()
+
+
 class DataLayout(IntFlag):
     """Possible orders for storing data in memory."""
 
@@ -62,6 +71,7 @@ class KVRegionSpec(RegionSpec):
     Specifies a region within the Key/Value cache, with optional axes.
     """
 
+    role: DataRole = DataRole.KEY | DataRole.VALUE
     heads: Optional[IndexRange] = None
     tokens: Optional[IndexRange] = None
 

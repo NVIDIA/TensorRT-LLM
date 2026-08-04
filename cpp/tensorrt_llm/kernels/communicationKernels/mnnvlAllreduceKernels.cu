@@ -33,7 +33,6 @@
 #include "tensorrt_llm/common/lamportUtils.cuh"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -857,9 +856,9 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     };
 #undef LAUNCH_ALLREDUCE_KERNEL
 #undef DISPATCH_ALLREDUCE_PATTERN
-    bool launched = (params.dType == tensorrt_llm::DataType::kBF16 && dispatchImpl((__nv_bfloat16*) nullptr))
-        || (params.dType == tensorrt_llm::DataType::kFLOAT && dispatchImpl((float*) nullptr))
-        || (params.dType == tensorrt_llm::DataType::kHALF && dispatchImpl((__nv_half*) nullptr));
+    bool launched = (params.dType == nvinfer1::DataType::kBF16 && dispatchImpl((__nv_bfloat16*) nullptr))
+        || (params.dType == nvinfer1::DataType::kFLOAT && dispatchImpl((float*) nullptr))
+        || (params.dType == nvinfer1::DataType::kHALF && dispatchImpl((__nv_half*) nullptr));
     if (!launched)
     {
         TLLM_CHECK_WITH_INFO(false, "Failed to dispatch MNNVL AllReduceOneShot kernel.");
@@ -1247,9 +1246,9 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
 
 #undef LAUNCH_ALLREDUCE_KERNEL
 
-    bool launched = (params.dType == tensorrt_llm::DataType::kFLOAT && dispatchAR((float*) nullptr))
-        || (params.dType == tensorrt_llm::DataType::kBF16 && dispatchAR((__nv_bfloat16*) nullptr))
-        || (params.dType == tensorrt_llm::DataType::kHALF && dispatchAR((__nv_half*) nullptr));
+    bool launched = (params.dType == nvinfer1::DataType::kFLOAT && dispatchAR((float*) nullptr))
+        || (params.dType == nvinfer1::DataType::kBF16 && dispatchAR((__nv_bfloat16*) nullptr))
+        || (params.dType == nvinfer1::DataType::kHALF && dispatchAR((__nv_half*) nullptr));
     if (!launched)
     {
         TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Failed to dispatch twoshotAllreduce kernel.");
@@ -1389,9 +1388,9 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             return true;
         };
 
-        launched = (params.dType == tensorrt_llm::DataType::kFLOAT && dispatchRN((float*) nullptr))
-            || (params.dType == tensorrt_llm::DataType::kBF16 && dispatchRN((__nv_bfloat16*) nullptr))
-            || (params.dType == tensorrt_llm::DataType::kHALF && dispatchRN((__nv_half*) nullptr));
+        launched = (params.dType == nvinfer1::DataType::kFLOAT && dispatchRN((float*) nullptr))
+            || (params.dType == nvinfer1::DataType::kBF16 && dispatchRN((__nv_bfloat16*) nullptr))
+            || (params.dType == nvinfer1::DataType::kHALF && dispatchRN((__nv_half*) nullptr));
         if (!launched)
         {
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Failed to dispatch rmsnorm lamport kernel.");

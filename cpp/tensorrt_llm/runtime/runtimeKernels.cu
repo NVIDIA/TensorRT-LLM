@@ -21,7 +21,7 @@
 #include "tensorrt_llm/kernels/speculativeDecoding/kvCacheUpdateKernels.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntimeBase.h>
 #include <cuda_runtime.h>
 
 using namespace tensorrt_llm::runtime;
@@ -333,13 +333,13 @@ void invokeFillBatch(IBuffer& buffer, IBuffer const& slotIndices, std::size_t sl
 {
     switch (buffer.getDataType())
     {
-    case tensorrt_llm::DataType::kINT32:
+    case nvinfer1::DataType::kINT32:
         invokeFillBatch<std::int32_t>(buffer, slotIndices, slotStride, values, stream);
         break;
-    case tensorrt_llm::DataType::kINT8:
+    case nvinfer1::DataType::kINT8:
         invokeFillBatch<std::int8_t>(buffer, slotIndices, slotStride, values, stream);
         break;
-    case tensorrt_llm::DataType::kFLOAT: invokeFillBatch<float>(buffer, slotIndices, slotStride, values, stream); break;
+    case nvinfer1::DataType::kFLOAT: invokeFillBatch<float>(buffer, slotIndices, slotStride, values, stream); break;
     default: TLLM_THROW("data type not supported");
     }
 }
@@ -349,15 +349,13 @@ void invokeGatherBatch(IBuffer& buffer, IBuffer const& values, IBuffer const& sl
 {
     switch (buffer.getDataType())
     {
-    case tensorrt_llm::DataType::kINT32:
+    case nvinfer1::DataType::kINT32:
         invokeGatherBatch<std::int32_t>(buffer, values, slotIndices, slotStride, stream);
         break;
-    case tensorrt_llm::DataType::kINT8:
+    case nvinfer1::DataType::kINT8:
         invokeGatherBatch<std::int8_t>(buffer, values, slotIndices, slotStride, stream);
         break;
-    case tensorrt_llm::DataType::kFLOAT:
-        invokeGatherBatch<float>(buffer, values, slotIndices, slotStride, stream);
-        break;
+    case nvinfer1::DataType::kFLOAT: invokeGatherBatch<float>(buffer, values, slotIndices, slotStride, stream); break;
     default: TLLM_THROW("data type not supported");
     }
 }
@@ -410,12 +408,12 @@ void scatterTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, 
 {
     switch (input.getDataType())
     {
-    case tensorrt_llm::DataType::kINT32: invokeScatterTensor<SizeType32>(output, input, beamWidth, stream); break;
-    case tensorrt_llm::DataType::kFLOAT: invokeScatterTensor<float>(output, input, beamWidth, stream); break;
-    case tensorrt_llm::DataType::kHALF: invokeScatterTensor<half>(output, input, beamWidth, stream); break;
-    case tensorrt_llm::DataType::kINT8: invokeScatterTensor<int8_t>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kINT32: invokeScatterTensor<SizeType32>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kFLOAT: invokeScatterTensor<float>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kHALF: invokeScatterTensor<half>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kINT8: invokeScatterTensor<int8_t>(output, input, beamWidth, stream); break;
 #ifdef ENABLE_FP8
-    case tensorrt_llm::DataType::kFP8: invokeScatterTensor<__nv_fp8_e4m3>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kFP8: invokeScatterTensor<__nv_fp8_e4m3>(output, input, beamWidth, stream); break;
 #endif // ENABLE_FP8
     default: TLLM_THROW("data type not supported");
     }
@@ -425,15 +423,15 @@ void tileTensor(ITensor& output, ITensor const& input, SizeType32 beamWidth, Cud
 {
     switch (input.getDataType())
     {
-    case tensorrt_llm::DataType::kINT32: invokeTileTensor<SizeType32>(output, input, beamWidth, stream); break;
-    case tensorrt_llm::DataType::kFLOAT: invokeTileTensor<float>(output, input, beamWidth, stream); break;
-    case tensorrt_llm::DataType::kHALF: invokeTileTensor<half>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kINT32: invokeTileTensor<SizeType32>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kFLOAT: invokeTileTensor<float>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kHALF: invokeTileTensor<half>(output, input, beamWidth, stream); break;
 #ifdef ENABLE_BF16
-    case tensorrt_llm::DataType::kBF16: invokeTileTensor<__nv_bfloat16>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kBF16: invokeTileTensor<__nv_bfloat16>(output, input, beamWidth, stream); break;
 #endif // ENABLE_BF16
-    case tensorrt_llm::DataType::kINT8: invokeTileTensor<int8_t>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kINT8: invokeTileTensor<int8_t>(output, input, beamWidth, stream); break;
 #ifdef ENABLE_FP8
-    case tensorrt_llm::DataType::kFP8: invokeTileTensor<__nv_fp8_e4m3>(output, input, beamWidth, stream); break;
+    case nvinfer1::DataType::kFP8: invokeTileTensor<__nv_fp8_e4m3>(output, input, beamWidth, stream); break;
 #endif // ENABLE_FP8
     default: TLLM_THROW("data type not supported");
     }
@@ -446,22 +444,22 @@ void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output,
 {
     switch (output.getDataType())
     {
-    case tensorrt_llm::DataType::kFLOAT:
+    case nvinfer1::DataType::kFLOAT:
         invokeMergeLogitsFragments<float>(bufferManager, output, fragmentsVector, cachePointerDevice, cachePointerHost,
             firstBatchSlotIdx, microBatchSize, beamWidth, stream, stepOffset);
         break;
-    case tensorrt_llm::DataType::kHALF:
+    case nvinfer1::DataType::kHALF:
         invokeMergeLogitsFragments<half>(bufferManager, output, fragmentsVector, cachePointerDevice, cachePointerHost,
             firstBatchSlotIdx, microBatchSize, beamWidth, stream, stepOffset);
         break;
 #ifdef ENABLE_BF16
-    case tensorrt_llm::DataType::kBF16:
+    case nvinfer1::DataType::kBF16:
         invokeMergeLogitsFragments<__nv_bfloat16>(bufferManager, output, fragmentsVector, cachePointerDevice,
             cachePointerHost, firstBatchSlotIdx, microBatchSize, beamWidth, stream, stepOffset);
         break;
 #endif // ENABLE_BF16
 #ifdef ENABLE_FP8
-    case tensorrt_llm::DataType::kFP8:
+    case nvinfer1::DataType::kFP8:
         invokeMergeLogitsFragments<__nv_fp8_e4m3>(bufferManager, output, fragmentsVector, cachePointerDevice,
             cachePointerHost, firstBatchSlotIdx, microBatchSize, beamWidth, stream, stepOffset);
         break;

@@ -17,13 +17,14 @@
 
 import json
 import math
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, List, Optional, Union
 
 import click
 import numpy as np
 import pandas as pd
 
 from .. import LLM as PyTorchLLM
+from .._tensorrt_engine import LLM
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -311,7 +312,7 @@ class MMLU(Evaluator):
                 system_prompt: Optional[str], max_input_length: int,
                 max_output_length: int, check_accuracy: bool,
                 accuracy_threshold: float, output_dir: Optional[str]) -> None:
-        llm: PyTorchLLM = ctx.obj
+        llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
             truncate_prompt_tokens=max_input_length)

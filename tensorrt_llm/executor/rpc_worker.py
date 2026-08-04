@@ -1,7 +1,7 @@
 from pathlib import Path
 from queue import Queue
 from threading import Event
-from typing import Optional
+from typing import Optional, Union
 
 import nvtx
 
@@ -10,6 +10,7 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from .._utils import mpi_rank
 from ..bindings import executor as tllm
+from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
 from ..logger import set_level
@@ -47,7 +48,7 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Path,
+        engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
         is_llm_executor: Optional[bool] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
@@ -110,7 +111,7 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
     @staticmethod
     def main_task(
-        engine: Path,
+        engine: Union[Path, Engine],
         rpc_addr: str,
         *,
         executor_config: Optional[tllm.ExecutorConfig] = None,

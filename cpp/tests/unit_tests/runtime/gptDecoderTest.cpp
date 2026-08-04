@@ -17,7 +17,6 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
@@ -69,7 +68,7 @@ bool forwardAndSync(std::unique_ptr<IGptDecoder> const& decoder, DecodingOutput&
     }
 }
 
-void testDecoder(tensorrt_llm::DataType const dtype, SamplingConfig const& samplingConfig)
+void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingConfig)
 {
     SizeType32 constexpr tensorParallelism{1};
     SizeType32 constexpr pipelineParallelism{1};
@@ -141,21 +140,21 @@ void testDecoder(tensorrt_llm::DataType const dtype, SamplingConfig const& sampl
     if (beamWidth > 1)
     {
         auto srcCacheIndirection = std::shared_ptr(
-            manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), tensorrt_llm::DataType::kINT32));
+            manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32));
         manager.setZero(*srcCacheIndirection);
         inputs.cacheIndirection = srcCacheIndirection;
     }
 
     // set up outputs
     auto outputIds = std::shared_ptr(
-        manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), tensorrt_llm::DataType::kINT32));
+        manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32));
     manager.setZero(*outputIds);
     auto gatheredOutputIds = std::shared_ptr(
-        manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), tensorrt_llm::DataType::kINT32));
+        manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32));
     manager.setZero(*gatheredOutputIds);
     DecodingOutput outputs{outputIds, gatheredOutputIds};
     auto newTokens
-        = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize, beamWidth}), tensorrt_llm::DataType::kINT32));
+        = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kINT32));
     manager.setZero(*newTokens);
     outputs.newTokens = newTokens;
 
@@ -166,7 +165,7 @@ void testDecoder(tensorrt_llm::DataType const dtype, SamplingConfig const& sampl
         TRTDataType<tensorrt_llm::kernels::FinishedState::UnderlyingType>::value);
     inputs.finishReasons = ITensor::view(outputs.finishReasons);
     manager.setZero(*outputs.finishReasons);
-    outputs.finishedSum = BufferManager::pinnedPool(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+    outputs.finishedSum = BufferManager::pinnedPool(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
     auto finishedSumHost = bufferCast<std::int32_t>(*outputs.finishedSum);
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
@@ -176,17 +175,17 @@ void testDecoder(tensorrt_llm::DataType const dtype, SamplingConfig const& sampl
     if (beamWidth > 1)
     {
         auto tgtCacheIndirection = std::shared_ptr(
-            manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), tensorrt_llm::DataType::kINT32));
+            manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32));
         manager.setZero(*tgtCacheIndirection);
         outputs.cacheIndirection = tgtCacheIndirection;
 
         auto cumLogProbs
-            = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize, beamWidth}), tensorrt_llm::DataType::kFLOAT));
+            = std::shared_ptr(manager.gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kFLOAT));
         manager.setZero(*cumLogProbs);
         outputs.cumLogProbs = cumLogProbs;
 
         auto parentIds = std::shared_ptr(
-            manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), tensorrt_llm::DataType::kINT32));
+            manager.gpu(ITensor::makeShape({batchSize, beamWidth, maxSeqLength}), nvinfer1::DataType::kINT32));
         manager.setZero(*parentIds);
         outputs.parentIds = parentIds;
     }
@@ -246,13 +245,13 @@ void testDecoder(tensorrt_llm::DataType const dtype, SamplingConfig const& sampl
 
 } // namespace
 
-class ParamTest : public ::testing::TestWithParam<std::tuple<tensorrt_llm::DataType, SizeType32>>
+class ParamTest : public ::testing::TestWithParam<std::tuple<nvinfer1::DataType, SizeType32>>
 {
 };
 
 TEST_P(ParamTest, Test)
 {
-    tensorrt_llm::DataType const dtype{std::get<0>(GetParam())};
+    nvinfer1::DataType const dtype{std::get<0>(GetParam())};
     SizeType32 const beamWidth{std::get<1>(GetParam())};
     SamplingConfig const samplingConfig{beamWidth};
 
@@ -260,11 +259,10 @@ TEST_P(ParamTest, Test)
 }
 
 INSTANTIATE_TEST_SUITE_P(DecoderTest, ParamTest,
-    testing::Combine(
-        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kHALF), testing::Values(1, 3)),
+    testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF), testing::Values(1, 3)),
     [](testing::TestParamInfo<ParamTest::ParamType> const& info)
     {
-        std::string name{std::get<0>(info.param) == tensorrt_llm::DataType::kFLOAT ? "Float" : "Half"};
+        std::string name{std::get<0>(info.param) == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};
         auto const beamWidth = std::get<1>(info.param);
         name.append(beamWidth == 1 ? "Sampling" : "BeamWidth" + std::to_string(beamWidth));
         return name;

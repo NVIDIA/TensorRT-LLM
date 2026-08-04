@@ -16,16 +16,17 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Type, Union
 
+import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.llmapi.llm_args import (
+    BuildConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
     TorchLlmArgs,
     _ParallelConfig,
 )
-from tensorrt_llm.llmapi.utils import get_device_count
 
 from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
@@ -74,6 +75,13 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     model_config = _get_config_dict()
 
+    build_config: Optional[BuildConfig] = Field(
+        default_factory=BuildConfig,
+        description="!!! DO NOT USE !!! Internal only; needed for BaseLlmArgs compatibility.",
+        exclude_from_json=True,
+        frozen=True,
+        repr=False,
+    )
     backend: Literal["_autodeploy"] = Field(
         default="_autodeploy",
         description="The backend to use for this LLM instance.",
@@ -81,7 +89,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     gpus_per_node: int = Field(
-        default=get_device_count(),
+        default=torch.cuda.device_count(),
         description="The number of GPUs per node.",
         frozen=True,
     )
@@ -92,6 +100,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         if value is not None and value > 1:
             raise ValueError("AutoDeploy does not support beam search (max_beam_width > 1).")
         return value
+
+    @field_validator("build_config", mode="before")
+    @classmethod
+    def ensure_no_build_config(cls, value: Any, info: ValidationInfo) -> Any:
+        msg = "build_config is not in use by AutoDeploy's LlmArgs"
+        return _check_for_default_value_only(cls, value, info, msg)
 
     @field_validator(
         "tensor_parallel_size",
@@ -483,15 +497,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             `self.max_seq_len` so that all downstream consumers see the same value.
         """
 
-        # Resolve enable_attention_dp from the same source `init_dist_config`
-        # uses so the factory sees the same value the runtime will see.
-        # TODO remove it once this is fixed: https://github.com/NVIDIA/TensorRT-LLM/issues/13134
-        ash = self.transforms.get("apply_sharding_hints", {})
-        sharding_config = (
-            ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
-        )
-        enable_attention_dp = sharding_config.get("enable_attention_dp", False)
-
         # TODO (lucaslie): consider supporting Path objects in the model factory
         factory = ModelFactoryRegistry.get(self.model_factory)(
             model=str(self.model),
@@ -502,7 +507,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             max_seq_len=self.max_seq_len,
             # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
             sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
-            enable_attention_dp=enable_attention_dp,
             speculative_config=self.speculative_config,
             speculative_model_kwargs=self.speculative_model_kwargs or None,
         )

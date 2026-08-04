@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -230,9 +230,8 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 
 // Assigns chunk sizes to context requests under the kFORCE_CHUNK policy.
 //
-// Requests with expected snapshot points advance to their next absolute snapshot position.
-// Otherwise, every request consumes its full remaining context.
-// Capacity and context-length truncation are rounded down to a chunk-unit boundary.
+// Every request is assigned exactly min(contextRemainingLength, chunkUnitSize) tokens.
+// Requests whose chunk would push the running total past ctxTokensCapacity are zeroed.
 //
 // This policy is designed for linear attention state caching, so reusable KV-cache tokens are NOT
 // calculated because it's not supported yet.
@@ -249,36 +248,16 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
     SizeType32 totalTokens{0};
     for (auto& llmReq : contextsToBeChunked)
     {
-        SizeType32 chunkSize = llmReq->getContextRemainingLength();
-        auto const& expectedSnapshotPoints = llmReq->getExpectedSnapshotPoints();
-        if (!expectedSnapshotPoints.empty())
-        {
-            auto const currentPosition = llmReq->getContextCurrentPosition();
-            std::optional<SizeType32> nextSnapshotPoint;
-            for (auto const point : expectedSnapshotPoints)
-            {
-                if (point > currentPosition && (!nextSnapshotPoint || point < nextSnapshotPoint.value()))
-                {
-                    nextSnapshotPoint = point;
-                }
-            }
-            chunkSize = nextSnapshotPoint
-                ? std::max<SizeType32>(0, std::min(nextSnapshotPoint.value(), llmReq->getPromptLen()) - currentPosition)
-                : llmReq->getContextRemainingLength();
-        }
-
-        if (maxContextLength && chunkSize > maxContextLength.value())
-        {
-            chunkSize = maxContextLength.value() / chunkUnitSize * chunkUnitSize;
-        }
+        SizeType32 const chunkSize = std::min(llmReq->getContextRemainingLength(), chunkUnitSize);
         if (ctxTokensCapacity && totalTokens + chunkSize > ctxTokensCapacity.value())
         {
-            auto const remainingCapacity = std::max<SizeType32>(0, ctxTokensCapacity.value() - totalTokens);
-            chunkSize = std::min(chunkSize, remainingCapacity) / chunkUnitSize * chunkUnitSize;
+            llmReq->setContextChunkSize(0);
         }
-
-        llmReq->setContextChunkSize(chunkSize);
-        totalTokens += llmReq->getContextChunkSize();
+        else
+        {
+            llmReq->setContextChunkSize(chunkSize);
+            totalTokens += llmReq->getContextChunkSize();
+        }
     }
 }
 
@@ -288,9 +267,8 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 //   kEQUAL_PROGRESS        — all requests advance together one chunkUnitSize at a time.
 //   kFIRST_COME_FIRST_SERVED — requests are served greedily in order until the budget
 //                              is exhausted.
-//   kFORCE_CHUNK           — requests advance to the next expected snapshot point, or consume
-//                              the remaining context when none are configured; budget is charged
-//                              at face value (no reuse discount).
+//   kFORCE_CHUNK           — every request gets exactly min(remaining, chunkUnitSize)
+//                              tokens; budget is charged at face value (no reuse discount).
 //
 // EQUAL_PROGRESS and FIRST_COME_FIRST_SERVED are compute-aware: tokens covered by the
 // reusable KV-cache prefix are not charged against ctxTokensCapacity.
@@ -458,7 +436,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         allContextRequestsFit = false;
     }
 
-    // FORCE_CHUNK must always run boundary selection even when all contexts fit.
+    // For FORCE_CHUNK policy, always re-chunk regardless of whether all contexts fit.
     if (mCtxChunkConfig && mCtxChunkConfig.value().chunkingPolicy == ContextChunkingPolicy::kFORCE_CHUNK)
     {
         allContextRequestsFit = false;

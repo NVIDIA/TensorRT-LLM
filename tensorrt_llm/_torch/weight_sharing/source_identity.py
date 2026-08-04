@@ -14,19 +14,17 @@
 # limitations under the License.
 """Backend-agnostic source identity for weight-sharing receivers.
 
-A :class:`SourceIdentity` is a serializable fingerprint of an immutable
-checkpoint artifact and the configuration choices that affect how its weights
-are laid out in memory. It exists so that a *receiver* of pre-laid-out weights
-(e.g. MX peer-to-peer transfer, or a GMS read-only materialize) can verify that
-both the producer ("source") and the consumer built identities and agree on the
-artifact and every layout-affecting choice before consuming shared weights.
+A :class:`SourceIdentity` is a serializable fingerprint of configuration choices
+that affect how a model's weights are laid out in memory. It exists so that a
+*receiver* of pre-laid-out weights (e.g. MX peer-to-peer transfer, or a GMS
+read-only materialize) can verify that both the producer ("source") and the
+consumer built identities and agree on every layout-affecting choice before the
+receiver consumes shared weights.
 
 The identity is intentionally decoupled from any specific weight-sharing
 technology (neither MX nor GMS appears here). Both consume it identically:
 
-    local = SourceIdentity.from_model_config(
-        model_config, checkpoint_dir="/path/to/checkpoint"
-    )
+    local = SourceIdentity.from_model_config(model_config)
     decision = check_weight_sharing_compatibility(local, source_identity, policy)
     if decision.should_share:
         ...  # pull / materialize shared weights
@@ -42,16 +40,14 @@ Layered design
 --------------
 The fingerprint is split so comparison can be selective:
 
-* **global fingerprint** -- immutable checkpoint artifact, transform-layout
-  ABI, rank-invariant model identity, quantization, backend selection, fusion
-  flags, and parallel *sizes* (TP/PP/EP/CP).
+* **global fingerprint** -- rank-invariant model identity, quantization,
+  backend selection, fusion flags, and parallel *sizes* (TP/PP/EP/CP).
 * **shard fingerprint** -- this rank's TP/PP/EP/CP *rank* slice plus the
   realized local parameter/buffer `(shape, dtype)` layout. Receiver rank `N`
   must align with the source rank that produced shard `N`.
 
 A caller that wants *enforced* sharing across otherwise-divergent runs can skip
-the global comparison (`compare_global=False`) and trust the source. Identity
-format and transform-layout ABI compatibility remain mandatory.
+the global comparison (`compare_global=False`) and trust the source.
 
 Adding fields
 -------------
@@ -71,7 +67,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from tensorrt_llm._torch.weight_sharing.artifact_identity import ArtifactIdentity
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -83,7 +78,7 @@ if TYPE_CHECKING:
 # Bump when the fingerprint projection changes in a way that makes previously
 # stored identities incomparable. Two identities with different format versions
 # never match.
-SOURCE_IDENTITY_FORMAT_VERSION = 3
+SOURCE_IDENTITY_FORMAT_VERSION = 1
 
 _PRETRAINED_METADATA_FIELDS = frozenset(
     {
@@ -199,10 +194,10 @@ class IdentityCheckPolicy(Enum):
     * `WARN_FALLBACK` (default): log a warning and fall back to non-shared
       loading. Never raises.
     * `STRICT`: raise :class:`SourceIdentityMismatchError` on mismatch.
-    * `ENFORCE`: share despite concrete artifact/config/shard differences (the
+    * `ENFORCE`: always share regardless of concrete-identity mismatch (the
       caller explicitly trusts the source, e.g. enforced cross-run sharing).
-      Identity format and transform-layout ABI must still match, and both
-      identities must be present.
+      Still requires both local and source identities to be present. Logs at
+      debug.
     """
 
     WARN_FALLBACK = "warn_fallback"
@@ -229,7 +224,6 @@ class SourceIdentity:
 
     format_version: int
     # --- global parts (must match across all ranks) ---
-    artifact_identity: ArtifactIdentity
     model_fingerprint: str
     quant_fingerprint: str
     backend_fingerprint: str
@@ -243,17 +237,6 @@ class SourceIdentity:
     pp_size: int = 1
     ep_size: int = -1
     dtype: Optional[str] = None
-    # Layout semantics are safety-critical and always compared, including
-    # under ENFORCE. `None` denotes a source that does not use a qualified
-    # post-transform layout contract. Keep this last to preserve existing
-    # positional construction of the discovery fields above.
-    transform_abi_id: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        if self.transform_abi_id is not None and (
-            not isinstance(self.transform_abi_id, str) or not self.transform_abi_id
-        ):
-            raise ValueError("SourceIdentity transform_abi_id must be a non-empty string")
 
     # ---- construction --------------------------------------------------
 
@@ -263,10 +246,7 @@ class SourceIdentity:
         model_config: "ModelConfig",
         model: Optional["nn.Module"] = None,
         *,
-        checkpoint_dir: Optional[str] = None,
-        artifact_identity: Optional[ArtifactIdentity] = None,
         model_name: Optional[str] = None,
-        transform_abi_id: Optional[str] = None,
     ) -> "SourceIdentity":
         """Build an identity from a torch-backend :class:`ModelConfig`.
 
@@ -278,33 +258,14 @@ class SourceIdentity:
                 Producer and consumer must build the identity at the same
                 lifecycle point (model construction, before weight load). When
                 `None`, the shard fingerprint contains no tensor-layout data.
-            checkpoint_dir: Checkpoint file or directory used to derive the
-                nested artifact identity. Required unless `artifact_identity`
-                is supplied explicitly.
-            artifact_identity: Precomputed immutable checkpoint identity,
-                primarily for callers that resolve provenance outside this
-                method. Mutually exclusive with `checkpoint_dir`.
             model_name: Human-readable model identity used by discovery layers
                 (e.g. the MX server's source catalog). Does not affect the
                 compatibility fingerprints.
-            transform_abi_id: Stable identifier for the post-transform tensor
-                layout and receiver-finalization contract. `None` when the
-                source does not use a qualified post-transform layout.
 
         Returns:
             A fully populated :class:`SourceIdentity` for
             `model_config.mapping.rank`.
-
-        Raises:
-            ValueError: If neither or both artifact identity inputs are given.
         """
-        if checkpoint_dir is None and artifact_identity is None:
-            raise ValueError("Exactly one of checkpoint_dir or artifact_identity must be provided")
-        if checkpoint_dir is not None and artifact_identity is not None:
-            raise ValueError("Exactly one of checkpoint_dir or artifact_identity must be provided")
-        if artifact_identity is None:
-            artifact_identity = ArtifactIdentity.from_checkpoint(checkpoint_dir)
-
         mapping = model_config.mapping
         rank = getattr(mapping, "rank", 0)
 
@@ -314,14 +275,12 @@ class SourceIdentity:
 
         return cls(
             format_version=SOURCE_IDENTITY_FORMAT_VERSION,
-            artifact_identity=artifact_identity,
             model_fingerprint=cls._build_model_fingerprint(model_config),
             quant_fingerprint=cls._build_quant_fingerprint(model_config),
             backend_fingerprint=cls._build_backend_fingerprint(model_config),
             parallel_fingerprint=cls._build_parallel_fingerprint(mapping),
             rank=rank,
             shard_fingerprint=cls._build_shard_fingerprint(mapping, model),
-            transform_abi_id=transform_abi_id,
             model_name=model_name,
             tp_size=getattr(mapping, "tp_size", 1),
             pp_size=getattr(mapping, "pp_size", 1),
@@ -459,8 +418,6 @@ class SourceIdentity:
         return _canonical_hash(
             {
                 "format_version": self.format_version,
-                "artifact": self.artifact_identity.to_dict(),
-                "transform_abi_id": self.transform_abi_id,
                 "model": self.model_fingerprint,
                 "quant": self.quant_fingerprint,
                 "backend": self.backend_fingerprint,
@@ -489,14 +446,7 @@ class SourceIdentity:
         if self.format_version != other.format_version:
             mismatched.append("format_version")
 
-        # A transform ABI mismatch changes the meaning of transferred tensors,
-        # so no identity policy may bypass it.
-        if self.transform_abi_id != other.transform_abi_id:
-            mismatched.append("transform_abi_id")
-
         if compare_global:
-            if self.artifact_identity != other.artifact_identity:
-                mismatched.append("artifact_identity")
             for name in (
                 "model_fingerprint",
                 "quant_fingerprint",
@@ -523,14 +473,12 @@ class SourceIdentity:
         """
         return {
             "format_version": self.format_version,
-            "artifact_identity": self.artifact_identity.to_dict(),
             "model_fingerprint": self.model_fingerprint,
             "quant_fingerprint": self.quant_fingerprint,
             "backend_fingerprint": self.backend_fingerprint,
             "parallel_fingerprint": self.parallel_fingerprint,
             "rank": self.rank,
             "shard_fingerprint": self.shard_fingerprint,
-            "transform_abi_id": self.transform_abi_id,
             "model_name": self.model_name,
             "tp_size": self.tp_size,
             "pp_size": self.pp_size,
@@ -548,20 +496,14 @@ class SourceIdentity:
         Returns:
             The reconstructed :class:`SourceIdentity`.
         """
-        format_version = data["format_version"]
-        if format_version != SOURCE_IDENTITY_FORMAT_VERSION:
-            raise ValueError(f"Unsupported SourceIdentity format version: {format_version}")
-
         return cls(
-            format_version=format_version,
-            artifact_identity=ArtifactIdentity.from_dict(data["artifact_identity"]),
+            format_version=data["format_version"],
             model_fingerprint=data["model_fingerprint"],
             quant_fingerprint=data["quant_fingerprint"],
             backend_fingerprint=data["backend_fingerprint"],
             parallel_fingerprint=data["parallel_fingerprint"],
             rank=data["rank"],
             shard_fingerprint=data["shard_fingerprint"],
-            transform_abi_id=data["transform_abi_id"],
             model_name=data.get("model_name"),
             tp_size=data.get("tp_size", 1),
             pp_size=data.get("pp_size", 1),
@@ -606,8 +548,7 @@ def check_weight_sharing_compatibility(
         result = IdentityMatchResult(matched=False, mismatched_fields=missing_fields)
         message = (
             "SourceIdentity unavailable for fields "
-            f"{missing_fields}; receiver cannot verify the source checkpoint "
-            "artifact and weight layout."
+            f"{missing_fields}; receiver cannot verify source weight layout."
         )
         if policy is IdentityCheckPolicy.STRICT:
             raise SourceIdentityMismatchError(message)
@@ -621,15 +562,10 @@ def check_weight_sharing_compatibility(
     if policy is IdentityCheckPolicy.ENFORCE:
         result = local.matches(source, compare_global=False, compare_shard=False)
         if not result.matched:
-            logger.warning(
-                "SourceIdentity ENFORCE cannot bypass identity format or "
-                f"transform-layout ABI mismatch in {result.mismatched_fields}."
+            logger.debug(
+                f"SourceIdentity ENFORCE: sharing despite mismatch in {result.mismatched_fields}."
             )
-        return IdentityCheckDecision(
-            should_share=result.matched,
-            match_result=result,
-            policy=policy,
-        )
+        return IdentityCheckDecision(should_share=True, match_result=result, policy=policy)
 
     result = local.matches(source, compare_global=compare_global, compare_shard=compare_shard)
     if result.matched:
@@ -638,7 +574,7 @@ def check_weight_sharing_compatibility(
     message = (
         "SourceIdentity mismatch on fields "
         f"{result.mismatched_fields}; receiver and source disagree on "
-        "the checkpoint artifact or weight layout."
+        "weight layout."
     )
     if policy is IdentityCheckPolicy.STRICT:
         raise SourceIdentityMismatchError(message)

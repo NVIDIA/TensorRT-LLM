@@ -4,7 +4,7 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import torch
 from torch.nn import functional as F
@@ -25,10 +25,6 @@ aux_stream_name_list = [
     'MoeBalancer',
     'MoeOutputMemset',
     'MoeFc2Alpha',
-    'EngramPrecompute',
-    'MlaIndexer',
-    'MlaIndexerAux',
-    'MlaCompressor',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -39,11 +35,6 @@ EventType = Enum(
     ['Main', *aux_stream_name_list],
     start=0,
 )
-
-
-def is_gdn_replay_enabled() -> bool:
-    """Return whether GDN replay was explicitly enabled."""
-    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "0") == "1"
 
 
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
@@ -113,20 +104,13 @@ def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
 
 
-def is_nvfp4_marlin_supported_sm(sm_version: int | None = None) -> bool:
-    """Return True on Ada Lovelace (SM89, e.g. L40S) and Hopper (SM90-99)."""
-    if sm_version is None:
-        sm_version = get_sm_version()
-    return 89 <= sm_version < 100
-
-
 def is_nvfp4_marlin_enabled() -> bool:
-    is_supported_sm = is_nvfp4_marlin_supported_sm()
+    is_hopper = get_sm_version() == 90
     has_marlin_kernel = hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
     attrs = get_model_extra_attrs()
     is_marlin_specified = attrs is not None and "marlin" in attrs.get(
         'nvfp4_gemm_allowed_backends', [])
-    return is_supported_sm and has_marlin_kernel and is_marlin_specified
+    return is_hopper and has_marlin_kernel and is_marlin_specified
 
 
 @contextlib.contextmanager
@@ -175,13 +159,6 @@ class Fp4QuantizedTensor:
     fp4_tensor: torch.Tensor
     scaling_factor: torch.Tensor
     is_sf_swizzled: bool = True
-    # Optional un-quantized (BF16/FP16) hidden-state view of the same logical
-    # activation. When the FP4 tensor is produced by a fused
-    # (add+)RMSNorm+NVFP4-quant that also returns the un-quantized
-    # (post-RMSNorm) value, this carries that tensor so downstream consumers
-    # needing the un-quantized form (e.g. DSv3.2's DSA indexer at
-    # sparse/dsa.py:pre_indexer_proj) can use it without dequantizing FP4.
-    unquantized_hidden_states: Optional[torch.Tensor] = None
 
     @property
     def shape(self):

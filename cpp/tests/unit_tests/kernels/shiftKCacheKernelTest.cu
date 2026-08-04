@@ -2,7 +2,6 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
@@ -198,37 +197,37 @@ public:
         std::vector<int32_t> const& tokenSeqIdxs)
     {
         // allocate buffer
-        mSeqLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
-        mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+        mSeqLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+        mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
-        mInputLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
-        mInputLengthsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
+        mInputLengthsHost = mBufferManager->pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+        mInputLengthsDevice = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
-        mKScaleQuantOrigDevice = mBufferManager->gpu(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
+        mKScaleQuantOrigDevice = mBufferManager->gpu(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
 
         mTokenReadIdxsHost = mBufferManager->pinned(
-            ITensor::makeShape({static_cast<int>(tokenReadIdxs.size())}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenReadIdxs.size())}), nvinfer1::DataType::kINT32);
         mTokenReadIdxsDevice = mBufferManager->gpu(
-            ITensor::makeShape({static_cast<int>(tokenReadIdxs.size())}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenReadIdxs.size())}), nvinfer1::DataType::kINT32);
 
         mTokenWriteIdxsHost = mBufferManager->pinned(
-            ITensor::makeShape({static_cast<int>(tokenWriteIdxs.size())}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenWriteIdxs.size())}), nvinfer1::DataType::kINT32);
         mTokenWriteIdxsDevice = mBufferManager->gpu(
-            ITensor::makeShape({static_cast<int>(tokenWriteIdxs.size())}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenWriteIdxs.size())}), nvinfer1::DataType::kINT32);
 
         mTokenPosIdxsHost = mBufferManager->pinned(
-            ITensor::makeShape({static_cast<int>(tokenPosIdxs.size())}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenPosIdxs.size())}), nvinfer1::DataType::kINT32);
         mTokenPosIdxsDevice = mBufferManager->gpu(
-            ITensor::makeShape({static_cast<int>(tokenPosIdxs.size())}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenPosIdxs.size())}), nvinfer1::DataType::kINT32);
 
         mTokenSeqIdxsHost = mBufferManager->pinned(
-            ITensor::makeShape({static_cast<int>(tokenSeqIdxs.size())}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenSeqIdxs.size())}), nvinfer1::DataType::kINT32);
         mTokenSeqIdxsDevice = mBufferManager->gpu(
-            ITensor::makeShape({static_cast<int>(tokenSeqIdxs.size())}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({static_cast<int>(tokenSeqIdxs.size())}), nvinfer1::DataType::kINT32);
 
-        // tensorrt_llm::DataType dataType = tensorrt_llm::DataType::kHALF
-        // tensorrt_llm::DataType::kHALF
-        // tensorrt_llm::DataType::kBF16
+        // nvinfer1::DataType dataType = nvinfer1::DataType::kHALF
+        // nvinfer1::DataType::kHALF
+        // nvinfer1::DataType::kBF16
         int32_t batchBeam = batchSize * beamWidth;
         if (pagedKvCache)
         {

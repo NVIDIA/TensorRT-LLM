@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,6 @@
 
 #pragma once
 
-#include "kv_cache_manager_v2/common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -35,7 +34,13 @@ using ITensor = tensorrt_llm::runtime::ITensor;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
-// DiskAddress and MemAddress are defined in kv_cache_manager_v2/common.h (included above).
+struct DiskAddress
+{
+    int fd;
+    ssize_t pos;
+};
+
+using MemAddress = std::uintptr_t;
 
 // Please make sure to align with the definition in tensorrt_llm/runtime/kv_cache_manager_v2/_common.py
 constexpr tk::KVCacheIndex::UnderlyingType BAD_PAGE_INDEX = -1;
@@ -71,10 +76,6 @@ public:
 
     at::Tensor getCopyIndex(
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext, SizeType32 beamWidth);
-
-    //! Gathers each request's beam-0 K block offsets into a host snapshot.
-    void gatherKBlockOffsets(at::Tensor const& source, at::Tensor destination,
-        std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numBlocks);
 
     /// Number of sequences currently tracked (i.e. active IndexMapper slots).
     [[nodiscard]] SizeType32 size() const noexcept

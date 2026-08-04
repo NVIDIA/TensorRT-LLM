@@ -1,0 +1,25 @@
+{
+    "parameters": {
+        "gpu_device_ids": {
+            "string_value": "1"
+        },
+        "max_beam_width": {
+            "string_value": "8"
+        },
+        "batch_scheduler_policy": {
+            "string_value": "guaranteed_no_evict"
+        },
+        "executor_worker_path": {
+            "string_value": "/opt/tritonserver/backends/tensorrtllm/trtllmExecutorWorker"
+        },
+        "normalize_log_probs": {
+            "string_value": "true"
+        },
+        "gpt_model_type": {
+            "string_value": "inflight_fused_batching"
+        }
+    },
+    "model_transaction_policy": {
+        "decoupled": false
+    }
+}

@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #pragma once
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -121,25 +120,25 @@ namespace kernels::ub
 {
 using namespace ::tensorrt_llm::runtime::ub;
 void allreduce2_userbuff_inplace_impl(int const handler, size_t const offset, size_t const elements,
-    tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream = 0);
+    nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream = 0);
 // for TP-parallelism, only single node is implemented
 
 int allgather2_userbuff_residual_impl(int const handler, size_t const offset, size_t const elements,
-    int const hidden_size, void* residual, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream,
+    int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream,
     bool force_enable);
 
 int allreduce2_userbuff_rmsnorm_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
-    void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream);
+    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream);
 
 int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
-    float* scalefactor, void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm,
+    float* scalefactor, void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm,
     cudaStream_t stream);
 int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, int const scale_handler, size_t const scale_offset, size_t const elements,
     int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor, void* residual_in,
-    void* residual_out, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream);
+    void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream);
 } // namespace kernels::ub
 
 TRTLLM_NAMESPACE_END

@@ -203,9 +203,7 @@ def test_allreduce_fusion(device_count, ModuleCls, strategy, rmsnorm_op):
     max_retries = 5
     last_exc: Exception | None = None
     for _ in range(max_retries):
-        # wait_shutdown: block shutdown until the workers exited, so a test
-        # handed a live pool right after this one cannot race the GPU release.
-        mpi_pool = MpiPoolSession(n_workers=n_workers, wait_shutdown=True)
+        mpi_pool = MpiPoolSession(n_workers=n_workers)
         try:
             mpi_pool.submit_sync(
                 _test_allreduce_fusion,

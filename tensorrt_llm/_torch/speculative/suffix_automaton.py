@@ -87,17 +87,6 @@ class SuffixAutomatonManager(BaseResourceManager):
     and are CUDA graph compatible.
 
     Used as the resource manager for both NGram and MTP+SA speculative decoding.
-
-    Rejection sampling is not supported for NGram or SA drafting. Both are
-    retrieval-based drafters: they propose draft tokens by matching against
-    previously seen context (n-gram lookup / suffix-automaton traversal) instead
-    of sampling from a model head, so they emit only token ids with no per-token
-    proposal distribution ``q(x)`` over the vocabulary. Rejection sampling's
-    acceptance test needs ``q`` to form the ratio ``min(1, p(x)/q(x))`` and the
-    residual ``(p - q)+`` correction on rejection; without ``q`` the target
-    distribution cannot be preserved. The gate lives in
-    ``TorchLlmArgs.validate_speculative_config`` (NGram falls outside the
-    supported-mode whitelist; SA is rejected via ``rs_sa_active``).
     """
 
     def __init__(

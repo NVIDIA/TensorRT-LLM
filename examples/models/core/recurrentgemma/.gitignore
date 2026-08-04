@@ -1,0 +1,10 @@
+__pycache__/
+.vscode/
+recurrentgemma*/
+data/
+dataset/
+trt_ckpt/
+trt_engine/
+model.cache
+*.safetensors
+*.json

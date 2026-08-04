@@ -22,8 +22,9 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
+#include "tensorrt_llm/runtime/tllmLogger.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntimeBase.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -654,29 +655,29 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
     // outputs
     mOutputIds = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxSeqLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mSeqLengths = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mAcceptedLengths = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mNextDraftLengths = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mPrevDraftLengths = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mAcceptedLengthCumSum = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize() + 1}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize() + 1}), nvinfer1::DataType::kINT32);
 
     mOutputNextDraftTokens = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingDraftTokens()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mOutputPositionIdsBase = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mRandomDataSample = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), dataType);
 
@@ -688,21 +689,21 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
     mPackedMasks = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingTokens(),
             static_cast<SizeType32>(divUp(mSamplingParams.getMaxDecodingTokens(), 32))}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mNextPosIds = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingTokens()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mOutputUnpackedNextDraftTokens = BufferManager::pinnedPool(
         ITensor::makeShape(
             {mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mOutputUnpackedNextDraftIndices = BufferManager::pinnedPool(
         ITensor::makeShape(
             {mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mOutputDraftProbs = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxNumPaths(),
@@ -712,68 +713,68 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
     mOutputTemperatures = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), dataType);
 
     mOutputGenerationLengths = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mOutputGenerationLengthsHost = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
-    mMaxGenLengthHost = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+    mMaxGenLengthHost = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     // inputs
-    mBatchSlots = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getBatchSize()}), tensorrt_llm::DataType::kINT32);
+    mBatchSlots
+        = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getBatchSize()}), nvinfer1::DataType::kINT32);
 
     mTokensPerStep = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mPathsOffsets = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize() * mSamplingParams.getMaxDraftPathLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mMasks = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingTokens(),
             mSamplingParams.getMaxDecodingTokens()}),
-        tensorrt_llm::DataType::kBOOL);
+        nvinfer1::DataType::kBOOL);
 
     mInputNextDraftTokens = BufferManager::pinnedPool(
         ITensor::makeShape(
             {mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mLastDraftTokens = BufferManager::pinnedPool(
         ITensor::makeShape(
             {mSamplingParams.getBatchSize(), mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mPackedPosIds = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingTokens()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mBestPathLengths = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mBestPathIndices = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mSpecDecodingGenerationLengths = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mNextFlatTokens = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize() * mSamplingParams.getMaxDecodingTokens()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mInputPositionIdsBase = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
     mNextDraftIndices = BufferManager::pinnedPool(
         ITensor::makeShape(
             {mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mLastDraftIndices = BufferManager::pinnedPool(
         ITensor::makeShape(
             {mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
 
     mNextDraftProbs = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxNumPaths(),
@@ -781,20 +782,20 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
         dataType);
 
     mEndIds = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kINT32);
 
-    mMaxGenLengthDevice = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
+    mMaxGenLengthDevice = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     // Packed inputs
-    mMaxGenerationLength = BufferManager::pinnedPool(ITensor::makeShape({1}), tensorrt_llm::DataType::kINT32);
-    mCumSumGenerationLengths = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getBatchSize()}), tensorrt_llm::DataType::kINT32);
+    mMaxGenerationLength = BufferManager::pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    mCumSumGenerationLengths
+        = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getBatchSize()}), nvinfer1::DataType::kINT32);
 
     // Packed outputs
-    mPackedPositionIdsBase = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getBatchSize()}), tensorrt_llm::DataType::kINT32);
-    mPackedGenerationLengths = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getBatchSize()}), tensorrt_llm::DataType::kINT32);
+    mPackedPositionIdsBase
+        = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getBatchSize()}), nvinfer1::DataType::kINT32);
+    mPackedGenerationLengths
+        = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getBatchSize()}), nvinfer1::DataType::kINT32);
     mPackedRandomDataSample = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getBatchSize()}), dataType);
     mPackedRandomDataVerification = BufferManager::pinnedPool(
         ITensor::makeShape(
@@ -803,21 +804,21 @@ void ExplicitDraftTokensLayerTest<T>::allocateBuffers()
     mPackedNextDraftTokens = BufferManager::pinnedPool(
         ITensor::makeShape(
             {mSamplingParams.getBatchSize(), mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
     mPackedNextDraftIndices = BufferManager::pinnedPool(
         ITensor::makeShape(
             {mSamplingParams.getBatchSize(), mSamplingParams.getMaxNumPaths(), mSamplingParams.getMaxPathLen()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
     mPackedPackedMasks = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getBatchSize(), mSamplingParams.getMaxDecodingTokens(),
             static_cast<SizeType32>(divUp(mSamplingParams.getMaxDecodingTokens(), 32))}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
     mPackedPositionOffsets = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getBatchSize(), mSamplingParams.getMaxDecodingTokens()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
     mPackedPackedPosIds = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getBatchSize(), mSamplingParams.getMaxDecodingTokens()}),
-        tensorrt_llm::DataType::kINT32);
+        nvinfer1::DataType::kINT32);
     mPackedDraftProbs = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getBatchSize(), mSamplingParams.getMaxNumPaths(),
             mSamplingParams.getMaxDraftPathLen(), mSamplingParams.getVocabSize()}),
@@ -1563,6 +1564,7 @@ protected:
 
     void SetUp() override
     {
+        mLogger = std::make_shared<TllmLogger>();
         mStream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
         mBufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(mStream);
     }
@@ -1574,12 +1576,12 @@ protected:
     {
         SizeType32* batchSlotsPtr{nullptr};
 
-        auto curandState = mBufferManager->gpu(ITensor::makeShape({batchSize, 48}), tensorrt_llm::DataType::kUINT8);
+        auto curandState = mBufferManager->gpu(ITensor::makeShape({batchSize, 48}), nvinfer1::DataType::kUINT8);
         auto* curandStatePtr = reinterpret_cast<curandState_t*>(bufferCast<uint8_t>(*curandState));
 
         if (batchInit)
         {
-            auto randomSeeds = mBufferManager->gpu(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT64);
+            auto randomSeeds = mBufferManager->gpu(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT64);
             trk::invokeFill(*randomSeeds, static_cast<int64_t>(randomSeed), *mStream);
             auto* randomSeedsPtr = bufferCast<uint64_t>(*randomSeeds);
             tk::invokeCurandBatchInitialize(curandStatePtr, batchSlotsPtr, batchSize, randomSeedsPtr, mStream->get());
@@ -1623,6 +1625,7 @@ protected:
     }
 
 private:
+    std::shared_ptr<nvinfer1::ILogger> mLogger;
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
 };

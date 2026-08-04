@@ -1,0 +1,183 @@
+# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#  * Neither the name of NVIDIA CORPORATION nor the names of its
+#    contributors may be used to endorse or promote products derived
+#    from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+# OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+name: "multimodal_encoders"
+backend: "python"
+max_batch_size: ${triton_max_batch_size}
+
+dynamic_batching {
+    preferred_batch_size: [ ${triton_max_batch_size} ]
+    max_queue_delay_microseconds: ${max_queue_delay_microseconds}
+    default_queue_policy: { max_queue_size: ${max_queue_size} }
+}
+
+input [
+    {
+        name: "IMAGE"
+        data_type: TYPE_FP16
+        dims: [ -1, -1, -1, -1 ]
+        optional: true
+    },
+    {
+        name: "pixel_values"
+        data_type: TYPE_FP16
+        dims: [ -1, -1, -1, -1 ]
+        optional: true
+    },
+    # input tensors for mllama
+    {
+        name: "aspect_ratio_ids"
+        data_type: TYPE_INT64
+        dims: [ -1 ]
+        optional: true
+    },
+    {
+        name: "aspect_ratio_mask"
+        data_type: TYPE_INT64
+        dims: [ -1, -1 ]
+        optional: true
+    },
+    {
+        name: "cross_attention_mask"
+        data_type: TYPE_INT64
+        dims: [ -1, -1, -1 ]
+        optional: true
+    },
+    {
+        name: "max_tokens"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+        optional: true
+    },
+    # Required for llava_onevision and pixtral
+    {
+        name: "image_sizes"
+        data_type: TYPE_INT64
+        dims: [ -1, 2 ]
+        optional: true
+    },
+    # Required for llava_onevision
+    {
+        name: "is_video_input"
+        data_type: TYPE_BOOL
+        dims: [ 1 ]
+        optional: true
+    },
+    # Required for Qwen2-VL
+    {
+        name: "attention_mask"
+        data_type: TYPE_INT64
+
+        dims: [ -1 ]
+        optional: true
+    },
+    {
+        name: "image_grid_thw"
+        data_type: TYPE_INT64
+        dims: [ 3 ]
+        optional: true
+    },
+    {
+        name: "vision_input_id"
+        data_type: TYPE_INT32
+        dims: [ -1 ]
+        optional: true
+    }
+]
+
+# The supported datatype in trtion's python backend is written
+# https://github.com/triton-inference-server/python_backend/blob/bfabfdbf4aa1e3db36aaf9e640b1ce5e0a720f48/src/pb_stub_utils.cc#L124
+# NOTE
+# TYPE_BF16, TYPE_FP8 is not supported
+output [
+    {
+        name: "OUT_PROMPT_EMBEDDING_TABLE"
+        data_type: ${prompt_embedding_table_data_type}
+        dims: [ -1, -1 ]
+    },
+    {
+        name: "OUT_PROMPT_VOCAB_SIZE"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+    },
+    # Output for visual encoders of type mllama
+    {
+        name: "ENCODER_INPUT_FEATURES"
+        data_type: ${encoder_input_features_data_type}
+        dims: [ -1, -1 ]
+    },
+    {
+        name: "ENCODER_OUTPUT_LENGTHS"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+        reshape: { shape: [ ] }
+    },
+    {
+        name: "CROSS_ATTENTION_MASK"
+        data_type: TYPE_BOOL
+        dims: [ -1, -1 ]
+    },
+    # skip_cross_attn_blocks shape `[bs]`, only used in mllama
+    {
+        name: "SKIP_CROSS_ATTN_BLOCKS"
+        data_type: TYPE_BOOL
+        dims: [ 1 ]
+    },
+    # Mrope param, only used in Qwen2-VL
+    {
+        name: "MROPE_ROTARY_COS_SIN"
+        data_type: TYPE_FP32
+        dims: [ -1 ]
+    },
+    {
+        name: "MROPE_POSITION_DELTAS"
+        data_type: TYPE_INT64
+        dims: [ 1 ]
+    }
+]
+
+# USER can add another modal's model as parameters and also as inputs here.
+
+parameters {
+  key: "multimodal_model_path"
+  value: {
+    string_value: "${multimodal_model_path}"
+  }
+}
+# HF model path, needed for llava_onevision and mllama model
+parameters {
+  key: "hf_model_path"
+  value: {
+    string_value: "${hf_model_path}"
+  }
+}
+
+instance_group [
+    {
+        count: 1
+        kind: KIND_CPU
+    }
+]

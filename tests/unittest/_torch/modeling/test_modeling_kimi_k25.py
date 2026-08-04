@@ -605,12 +605,6 @@ class TestKimiK25AutoModelRegistration(unittest.TestCase):
         self.assertIsNotNone(cls, "KimiK25ForConditionalGeneration not in MODEL_CLASS_MAPPING")
         self.assertIs(cls, KimiK25ForConditionalGeneration)
 
-    def test_prefers_python_transceiver(self):
-        """Kimi-K2.5 defaults to the Python KV-cache transceiver in disagg."""
-        self.assertEqual(
-            KimiK25ForConditionalGeneration.get_preferred_transceiver_runtime(), "PYTHON"
-        )
-
 
 # ---------------------------------------------------------------------------
 # E2E Smoke Test — requires GPU + model checkpoint

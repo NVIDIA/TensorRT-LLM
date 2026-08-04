@@ -15,7 +15,6 @@
  */
 
 #include "tests/unit_tests/layers/baseSamplingLayerTest.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 
 namespace tensorrt_llm::tests::layers::sampling
 {
@@ -68,26 +67,26 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
             BaseSamplingLayerTest::mMaxOutputLen * params.beamWidth, mVocabSize);
     }
 
-    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), tensorrt_llm::DataType::kINT32);
-    mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), tensorrt_llm::DataType::kINT32);
+    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kINT32);
+    mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kINT32);
     mFinishedDevice = params.isExternalDraftTokensLayerTest
         ? mBufferManager->gpu(ITensor::makeShape({mMaxTokensPerEngineStep, maxBatchSize()}),
             TRTDataType<tk::FinishedState::UnderlyingType>::value)
         : mBufferManager->gpu(
             ITensor::makeShape({maxBatchSize()}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
-    mOutputIdsDevice = mBufferManager->gpu(
-        ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
-    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), tensorrt_llm::DataType::kINT32);
+    mOutputIdsDevice
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kINT32);
     mIdsPtrHost = mBufferManager->pinned(ITensor::makeShape({maxBatchSize()}), ptrType);
 
-    mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), tensorrt_llm::DataType::kFLOAT);
+    mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kFLOAT);
     mOutputLogProbsDevice
-        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), mMaxSeqLen}), tensorrt_llm::DataType::kFLOAT);
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), mMaxSeqLen}), nvinfer1::DataType::kFLOAT);
 
     mBatchSlots
-        = mBufferManager->pinned(ITensor::makeShape({mBatchSize + mBatchSizeBadPad}), tensorrt_llm::DataType::kINT32);
-    mCurandStatesDevice = mBufferManager->gpu(
-        ITensor::makeShape({maxBatchSize(), sizeof(curandState_t)}), tensorrt_llm::DataType::kINT8);
+        = mBufferManager->pinned(ITensor::makeShape({mBatchSize + mBatchSizeBadPad}), nvinfer1::DataType::kINT32);
+    mCurandStatesDevice
+        = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
 
     auto const workspaceSize = mSamplingLayer->getWorkspaceSize();
 
@@ -153,11 +152,11 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
         setupParams = samplingSetupParams;
 
         mSrcCacheIndirection = mBufferManager->gpu(
-            ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
         mTgtCacheIndirection = mBufferManager->gpu(
-            ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
         mParentIds = mBufferManager->gpu(
-            ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({maxBatchSize(), mBeamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
 
         auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
         auto constexpr nvSizeType = TRTDataType<SizeType32>::value;

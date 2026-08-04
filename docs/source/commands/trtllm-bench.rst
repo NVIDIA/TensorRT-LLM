@@ -20,10 +20,10 @@ Syntax
 Dataset preparation
 ------------------
 
-prepare-dataset
-^^^^^^^^^^^^^^^
+prepare_dataset.py
+^^^^^^^^^^^^^^^^^^
 
-trtllm-bench ships a ``prepare-dataset`` subcommand which generates benchmark datasets in the required format. It supports:
+trtllm-bench is designed to work with the `prepare_dataset.py <https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/prepare_dataset.py>`_ script, which generates benchmark datasets in the required format. The prepare_dataset script supports:
 
 **Dataset Types:**
 
@@ -38,17 +38,17 @@ trtllm-bench ships a ``prepare-dataset`` subcommand which generates benchmark da
 - Support for LoRA adapters and task IDs
 - Output in JSON format compatible with trtllm-bench
 
-.. note::
-   The tokenizer is taken from the model passed to ``trtllm-bench --model``. Use ``--output`` to write the dataset to a file, or ``--stdout`` to stream it with a JSON dataset entry on each line.
+.. important::
+   The ``--stdout`` flag is **required** when using prepare_dataset.py with trtllm-bench to ensure proper data streaming format.
 
 **Usage:**
 
-prepare-dataset
+prepare_dataset
 """""""""""""""
 
 .. code-block:: bash
 
-    trtllm-bench --model <model> prepare-dataset [OPTIONS]
+    python prepare_dataset.py [OPTIONS]
 
 **Options**
 
@@ -60,10 +60,12 @@ prepare-dataset
 
    * - Option
      - Description
+   * - ``--tokenizer``
+     - Tokenizer directory or HuggingFace model name (required)
    * - ``--output``
      - Output JSON filename (default: preprocessed_dataset.json)
    * - ``--stdout``
-     - Print output to stdout with a JSON dataset entry on each line instead of writing a file
+     - Print output to stdout with JSON dataset entry on each line (**required for trtllm-bench**)
    * - ``--random-seed``
      - Random seed for token generation (default: 420)
    * - ``--task-id``
@@ -75,14 +77,14 @@ prepare-dataset
    * - ``--log-level``
      - Logging level: info or debug (default: info)
 
-real-dataset
-""""""""""""
+dataset
+"""""""
 
 Process real datasets from various sources.
 
 .. code-block:: bash
 
-    trtllm-bench --model <model> prepare-dataset real-dataset [OPTIONS]
+    python prepare_dataset.py dataset [OPTIONS]
 
 **Options**
 
@@ -106,14 +108,14 @@ Process real datasets from various sources.
      - Input format: json, jsonl, csv, or txt (default: auto-detect)
 
 
-token-norm-dist
+token_norm_dist
 """""""""""""""
 
 Generate synthetic datasets with normal token distribution.
 
 .. code-block:: bash
 
-    trtllm-bench --model <model> prepare-dataset token-norm-dist [OPTIONS]
+    python prepare_dataset.py token_norm_dist [OPTIONS]
 
 **Options**
 
@@ -137,14 +139,14 @@ Generate synthetic datasets with normal token distribution.
      - Normal distribution standard deviation for output tokens (required)
 
 
-token-unif-dist
+token_unif_dist
 """""""""""""""
 
 Generate synthetic datasets with uniform token distribution
 
 .. code-block:: bash
 
-    trtllm-bench --model <model> prepare-dataset token-unif-dist [OPTIONS]
+    python prepare_dataset.py token_unif_dist [OPTIONS]
 
 **Options**
 

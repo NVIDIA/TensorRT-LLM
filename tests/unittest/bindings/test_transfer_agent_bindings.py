@@ -585,11 +585,8 @@ class TestNixlFunctionalTransfer:
         status = agent_a.submit_transfer_requests(request)
 
         # With timeout_ms=0, wait checks status once and returns immediately.
-        # Either IN_PROGRESS (transfer still running) or SUCCESS (transfer
-        # already completed by the progress thread on a fast loopback path)
-        # is a valid non-blocking observation; FAILURE would indicate a bug.
         result = status.wait(timeout_ms=0)
-        assert result in (tab.TransferState.IN_PROGRESS, tab.TransferState.SUCCESS)
+        assert result == tab.TransferState.IN_PROGRESS
 
         # Wait for the transfer to actually finish before cleanup
         final_result = status.wait(timeout_ms=5000)
@@ -802,9 +799,8 @@ class TestMooncakeFunctionalTransfer:
         )
         status = agent_a.submit_transfer_requests(request)
 
-        # Zero-timeout poll must not block; a fast device may already be done, so accept either.
         result = status.wait(timeout_ms=0)
-        assert result in (tab.TransferState.IN_PROGRESS, tab.TransferState.SUCCESS)
+        assert result == tab.TransferState.IN_PROGRESS
 
         final_result = status.wait(timeout_ms=5000)
         assert final_result == tab.TransferState.SUCCESS

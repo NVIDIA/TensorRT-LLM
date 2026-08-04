@@ -1475,19 +1475,10 @@ __device__ inline void addAttentionSinks(
 {
     for (uint32_t i = 0; i < globalRowSum.size; i++)
     {
-        uint32_t const rowOffset = warp_size * i + laneId();
-        if constexpr (SPEC_DEC)
+        uint32_t srcOffset = warp_size * i + laneId();
+        if (srcOffset < headGrpSize)
         {
-            // Spec-dec rows flatten [query token, head], so repeat the sink indices for every token.
-            if (rowOffset < warpTile.y)
-            {
-                uint32_t const srcOffset = rowOffset % headGrpSize;
-                globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
-            }
-        }
-        else if (rowOffset < headGrpSize)
-        {
-            globalRowSum[i] += expf(attentionSinks[rowOffset] - globalRowMax[i]);
+            globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
         }
     }
 }
@@ -1707,7 +1698,7 @@ CUBIN_EXPORT __global__
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
 #if SLIDING_WINDOW && SPEC_DEC && !IS_SPEC_DEC_TREE
-    uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1;
+    uint32_t const tok0SeqLen = cacheSeqLen - actualQSeqLen + 1 + idxHeadTokenInGrp; // ctaTokOffset;
     int32_t const tok0WinBeg = int32_t(tok0SeqLen) - int32_t(slidingWinSize);
     uint32_t const nbTotalSkipTokens = mha::max(0, tok0WinBeg);
     bool const rtIsReallySliding = (cacheSeqLen + actualQSeqLen > slidingWinSize);

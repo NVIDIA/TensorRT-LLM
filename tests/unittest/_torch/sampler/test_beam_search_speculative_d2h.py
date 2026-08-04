@@ -31,7 +31,6 @@ real model weights.
 
 import gc
 import pathlib as _pl
-from contextlib import nullcontext
 from copy import deepcopy
 from typing import Any, Iterable
 
@@ -172,6 +171,9 @@ def _run_with_env(
         monkeypatch.setattr(
             TorchSampler, "_predict_beam_search_is_likely_finishing", predictor_override
         )
+    if sampler_method_patches:
+        for name, replacement in sampler_method_patches.items():
+            monkeypatch.setattr(TorchSampler, name, replacement)
 
     gc.collect(2)
     llm = _build_llm(
@@ -182,15 +184,9 @@ def _run_with_env(
     )
     try:
         with llm:
-            sampling_params = _make_sampling_params(fixed_params, stop_token_ids)
-            if sampler_method_patches:
-                # Warmup before installing the hooks.
-                _generate(llm, input_prompts, sampling_params)
-            with monkeypatch.context() if sampler_method_patches else nullcontext() as p:
-                for name, replacement in (sampler_method_patches or {}).items():
-                    p.setattr(TorchSampler, name, replacement)
-                # Run with the hooks installed.
-                return _generate(llm, input_prompts, sampling_params)
+            return _generate(
+                llm, input_prompts, _make_sampling_params(fixed_params, stop_token_ids)
+            )
     finally:
         del llm
         gc.collect(2)

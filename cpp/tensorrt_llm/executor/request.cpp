@@ -79,11 +79,6 @@ VecTokens Request::getInputTokenIds() const
     return mImpl->getInputTokenIds();
 }
 
-SizeType32 Request::getNumInputTokens() const
-{
-    return mImpl->getNumInputTokens();
-}
-
 SizeType32 Request::getMaxTokens() const
 {
     return mImpl->getMaxNewTokens();

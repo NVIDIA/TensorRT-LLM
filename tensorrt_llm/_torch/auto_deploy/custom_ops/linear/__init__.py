@@ -27,6 +27,4 @@ __all__ = [
     "torch_router",
     "swiglu",
     "silu_mul",
-    "dsv3_fused_a_gemm",
-    "dsv3_router_gemm",
 ]

@@ -531,7 +531,6 @@ def run(
     permuted_m: int = None,
     use_cupti: bool = False,
     raster_along_m: bool = False,
-    swiglu_limit: float = float("inf"),
     **kwargs,
 ):
     """Run contiguous grouped GEMM with gather operation and SwiGLU fusion for FC1 layer.
@@ -649,7 +648,6 @@ def run(
         True,
         topk=1,
         raster_along_m=raster_along_m,
-        swiglu_limit=swiglu_limit,
     )
 
     # Compute max active clusters on current device
@@ -733,11 +731,6 @@ def run(
             gate_result = gemm_result[
                 0, :, n_block + interleave_granularity : n_block + 2 * interleave_granularity
             ]
-
-            # SwiGLU clamp
-            if swiglu_limit != float("inf"):
-                gate_result = gate_result.clamp(max=swiglu_limit)
-                up_result = up_result.clamp(min=-swiglu_limit, max=swiglu_limit)
 
             # SwiGLU: up * silu(gate) where silu(x) = x * sigmoid(x)
             silu_gate = gate_result * torch.sigmoid(gate_result)
@@ -1201,12 +1194,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--raster_along_m", action="store_true", default=False, help="Raster along M dimension"
     )
-    parser.add_argument(
-        "--swiglu_limit",
-        type=float,
-        default=float("inf"),
-        help="Swiglu clamp factor, +inf (default) disables clamp",
-    )
 
     args = parser.parse_args()
 
@@ -1262,7 +1249,6 @@ if __name__ == "__main__":
         args.permuted_m,
         args.use_cupti,
         args.raster_along_m,
-        args.swiglu_limit,
     )
     print(f"Execution time: {exec_time:.2f} us")
     print("PASS")

@@ -6,7 +6,6 @@ These tests are CPU-only and exercise the synthetic-adapter generator that the
 end-to-end multi-LoRA tests will use.
 """
 
-import pytest
 import torch
 
 from tensorrt_llm._torch.peft.lora.moe_layout import (
@@ -14,8 +13,6 @@ from tensorrt_llm._torch.peft.lora.moe_layout import (
     make_per_expert_lora,
     reference_moe_lora_delta,
 )
-
-pytestmark = pytest.mark.cpu_only
 
 
 def test_module_list_complete():

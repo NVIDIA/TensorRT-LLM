@@ -122,7 +122,7 @@ __global__ void gatherTree(gatherTreeParam param)
         {
             int const levelBeamIx = batch * param.beamWidth * param.maxSeqLen + beam * param.maxSeqLen + level;
             int const levelParentIx = batch * param.beamWidth * param.maxSeqLen + parent * param.maxSeqLen + level;
-            if (parent < 0 || parent >= param.beamWidth)
+            if (parent < 0 || parent > param.beamWidth)
             {
                 param.outputIds[levelBeamIx] = param.endTokens[batch];
                 parent = -1;
@@ -702,11 +702,10 @@ __global__ void transposeLogProbs(float* outputLogProbs, float* outputLogProbsTi
     }
 
     auto const batchSlot = batchSlots[batchIdx];
-    auto const batchBeamIdx = batchSlot * beamWidth + beamIdx;
-    if (pos < sequenceLengths[batchBeamIdx])
+    if (pos < sequenceLengths[batchSlot])
     {
-        auto const outputIndex = batchSlot * beamWidth * maxSeqLen + beamIdx * maxSeqLen + pos;
-        outputLogProbs[outputIndex]
+        auto const batchBeamIdx = batchSlot * beamWidth * maxSeqLen + beamIdx * maxSeqLen + pos;
+        outputLogProbs[batchBeamIdx]
             = outputLogProbsTiled[pos * maxBatchSize * beamWidth + batchSlot * beamWidth + beamIdx];
     }
 }

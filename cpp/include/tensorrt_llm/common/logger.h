@@ -50,6 +50,8 @@ constexpr std::string_view formatModule(std::string_view module)
         return "deepgemm";
     else if (module == "executor")
         return "executor";
+    else if (module == "executor_worker")
+        return "exec_wkr";
     else if (module == "flash_mla")
         return "flashmla";
     else if (module == "kernels")
@@ -58,6 +60,8 @@ constexpr std::string_view formatModule(std::string_view module)
         return "layers";
     else if (module == "nanobind")
         return "nanobind";
+    else if (module == "plugins")
+        return "plugins";
     else if (module == "runtime")
         return "runtime";
     else if (module == "testing")

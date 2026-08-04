@@ -25,7 +25,6 @@ import torch
 from ..utils import _sync
 from .cupti import _build_cuda_graph_kernel_stats_cupti
 from .eager import _l2_flush_buffer
-from .nsys import _NsysProfiler, measured_range
 
 
 def _time_moe_forward_cuda_graph(
@@ -38,17 +37,10 @@ def _time_moe_forward_cuda_graph(
     iters: int,
     cupti_ctx: Optional[Any] = None,
     flush_l2: bool = True,
-    nsys: bool = False,
 ) -> Tuple[List[float], Dict[str, Any]]:
-    """Time ``moe.forward`` inside an unrolled CUDA graph with EXTERNAL events.
-
-    When ``nsys=True`` the measured region is captured for an external
-    ``nsys -c cudaProfilerApi`` run (see ``timing/nsys.py``); this requires
-    ``cupti_ctx=None`` since CUPTI conflicts with nsys.
-    """
+    """Time ``moe.forward`` inside an unrolled CUDA graph with EXTERNAL events."""
     device = x.device if x.numel() > 0 else torch.device("cuda")
     l2_buffer = _l2_flush_buffer(device) if flush_l2 else None
-    profiler = _NsysProfiler(nsys)
 
     if cupti_ctx is not None:
         _cupti = cupti_ctx.module
@@ -111,15 +103,8 @@ def _time_moe_forward_cuda_graph(
         _cupti_kernels.clear()
         _cupti_events.clear()
 
-    # Start the nsys capture AFTER warmup replays so only the measured replay is
-    # captured (cudaProfilerStart/Stop are host-side, bracketing the replay). The
-    # NVTX range wraps the host-side replay() (host NVTX is not recorded into the
-    # graph, so it must sit here); it marks the whole unrolled replay window.
-    profiler.start()
-    with measured_range(nsys):
-        big_graph.replay()
+    big_graph.replay()
     _sync()
-    profiler.stop()
 
     if _cupti_available:
         _cupti.activity_flush_all(0)

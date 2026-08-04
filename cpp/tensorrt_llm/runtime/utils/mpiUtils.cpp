@@ -597,16 +597,9 @@ MpiComm::~MpiComm() noexcept
 #if ENABLE_MULTI_DEVICE
     if (mFreeComm && mComm)
     {
-        // Calling MPI_Comm_free after MPI has been finalized is undefined behavior.
-        // We need this check to prevent heap corruption during program exit when
-        // static MpiComm objects are created.
-        int finalized = 0;
-        if (MPI_Finalized(&finalized) == MPI_SUCCESS && !finalized)
+        if (MPI_Comm_free(&mComm) != MPI_SUCCESS)
         {
-            if (MPI_Comm_free(&mComm) != MPI_SUCCESS)
-            {
-                TLLM_LOG_ERROR("MPI_Comm_free failed");
-            }
+            TLLM_LOG_ERROR("MPI_Comm_free failed");
         }
     }
 #endif // ENABLE_MULTI_DEVICE

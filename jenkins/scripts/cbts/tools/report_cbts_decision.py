@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 # limitations under the License.
 """Post a CBTS decision to OpenSearch (CI-health monitoring).
 
---status <pre_merge|post_merge|fallback|deferred|disabled> [--reason <text>]
+--status <pre_merge|post_merge|fallback|deferred> [--reason <text>]
 [--decision <main.py output>] [--pr-number <n>] [--repo-root <dir>].
 Context + creds come from env. Exits 0 on failure (never blocks CI).
 """
@@ -116,7 +116,7 @@ def build_document(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Post a CBTS decision to OpenSearch.")
     parser.add_argument(
-        "--status", required=True, help="pre_merge / post_merge / fallback / deferred / disabled."
+        "--status", required=True, help="pre_merge / post_merge / fallback / deferred."
     )
     parser.add_argument("--reason", default="", help="Reason text (deferred only).")
     parser.add_argument("--decision", default=None, help="Path to cbts/main.py decision JSON.")

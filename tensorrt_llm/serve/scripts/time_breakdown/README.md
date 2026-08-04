@@ -376,33 +376,49 @@ The tool expects a JSON file containing an array of request performance metrics 
 
 ## Usage
 
-### Server-side JSONL workflow
+### Integration with Benchmark Serving
 
-Configure the server-side writer:
-
+Step 1: Set in `extra-llm-api-config.yaml`:
 ```yaml
-perf_metrics_output_dir: <OUTPUT_DIR>
+return_perf_metrics: True
+perf_metrics_max_requests: <INTEGER>
 ```
+If running disaggregated serving, add configs for all servers (disagg, context and generation server).
 
-Run the workload, then copy the generated `perf_metrics-*.jsonl` file from the server. For disaggregated serving, use the disagg server file; it contains the combined disagg, context, and generation phases.
+Step 2: Add `--save-request-time-breakdown` when running `benchmark_serving.py`:
+```bash
+python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model ${model_name} \
+        --dataset-name random \
+        --ignore-eos \
+        --num-prompts 1000 \
+        --random-input-len 1024 \
+        --random-output-len 2048 \
+        --random-ids \
+        --max-concurrency 64 \
+        --save-result \
+        --result-dir <RESULT_DIR> \
+        --percentile-metrics "ttft,tpot,itl,e2e" \
+        --save-request-time-breakdown 
+```
 
 ### As a CLI Tool
 
 ```bash
 # Basic usage
-python time_breakdown.py perf_metrics-disagg.jsonl
+python time_breakdown.py perf_metrics.json
 
 # Specify output file
-python time_breakdown.py perf_metrics-disagg.jsonl -o my_time_diagram.html
+python time_breakdown.py perf_metrics.json -o my_time_diagram.html
 
 # Limit max requests and sort by E2E latency
-python time_breakdown.py perf_metrics-disagg.jsonl --max-requests 100 --sort-by e2e
+python time_breakdown.py perf_metrics.json --max-requests 100 --sort-by e2e
 
 # Show statistics only
-python time_breakdown.py perf_metrics-disagg.jsonl --stats-only
+python time_breakdown.py perf_metrics.json --stats-only
 
 # Create diagram and show statistics
-python time_breakdown.py perf_metrics-disagg.jsonl --show-stats
+python time_breakdown.py perf_metrics.json --show-stats
 ```
 
 ### CLI Options

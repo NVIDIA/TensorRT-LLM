@@ -15,7 +15,6 @@
  */
 
 #include "medusaDecodeLayerTest.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/medusaModule.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -139,36 +138,35 @@ void MedusaDecodingLayerTest<T>::allocateBuffers()
     mFinishedDevice = mBufferManager->gpu(
         ITensor::makeShape({mMaxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
-    mOutputIdsDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
+    mOutputIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
 
-    mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), tensorrt_llm::DataType::kINT32);
+    mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
 
-    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+    mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
     mPathsDevice = mBufferManager->gpu(
-        ITensor::makeShape({mMaxBatchSize, mMaxDecodingTokens, mMaxDraftPathLen + 1}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({mMaxBatchSize, mMaxDecodingTokens, mMaxDraftPathLen + 1}), nvinfer1::DataType::kINT32);
 
-    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+    mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
-    mAcceptedLengths = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+    mAcceptedLengths = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
-    mTreeIdsDevice = mBufferManager->gpu(
-        ITensor::makeShape({mMaxBatchSize, mMaxDecodingTokens - 1}), tensorrt_llm::DataType::kINT32);
+    mTreeIdsDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxDecodingTokens - 1}), nvinfer1::DataType::kINT32);
 
     mMedusaLogitsDevice = mBufferManager->gpu(
         ITensor::makeShape({mMaxDraftPathLen, mMaxBatchSize, mMaxDecodingTokens, mVocabSizePadded}), dataType);
 
-    mNextDraftTokensDevice = mBufferManager->gpu(
-        ITensor::makeShape({mMaxBatchSize, mMaxDecodingTokens - 1}), tensorrt_llm::DataType::kINT32);
+    mNextDraftTokensDevice
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mMaxDecodingTokens - 1}), nvinfer1::DataType::kINT32);
 
-    mTokensPerStepDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+    mTokensPerStepDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
 
     mAcceptedLengthCumSumDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize + 1}), tensorrt_llm::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize + 1}), nvinfer1::DataType::kINT32);
 
     mPackedPathsDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize * mMaxDraftPathLen}), tensorrt_llm::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize * mMaxDraftPathLen}), nvinfer1::DataType::kINT32);
 
     for (int32_t bi = 0; bi < mBatchSize; ++bi)
     {
@@ -217,7 +215,7 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
     for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {
         auto const draftIdsHost = ITensor::wrap(reinterpret_cast<TokenIdType*>(params.draftIds[bi].data()),
-            tensorrt_llm::DataType::kINT32, ITensor::makeShape({1, mMaxDecodingTokens - 1}));
+            nvinfer1::DataType::kINT32, ITensor::makeShape({1, mMaxDecodingTokens - 1}));
         auto draftIdsDeviceSlice = ITensor::slice(mNextDraftTokensDevice, batchSlotsPtr[bi], 1);
         mBufferManager->copy(*draftIdsHost, *draftIdsDeviceSlice);
     }
@@ -226,7 +224,7 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
     {
         auto& path = params.paths[bi];
         auto const numPaths = static_cast<SizeType32>(params.paths[bi].size() / (mMaxDraftPathLen + 1));
-        auto const pathsHost = ITensor::wrap(reinterpret_cast<SizeType32*>(path.data()), tensorrt_llm::DataType::kINT32,
+        auto const pathsHost = ITensor::wrap(reinterpret_cast<SizeType32*>(path.data()), nvinfer1::DataType::kINT32,
             ITensor::makeShape({1, numPaths, mMaxDraftPathLen + 1}));
         TensorPtr pathsDeviceSlice = ITensor::slice(mPathsDevice, batchSlotsPtr[bi], 1);
         pathsDeviceSlice->squeeze(0);

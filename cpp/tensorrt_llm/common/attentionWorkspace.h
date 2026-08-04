@@ -142,12 +142,6 @@ struct AttentionGenerationWorkspaceSizes
     size_t partialSum{};
     size_t partialMax{};
     size_t shiftKCache{};
-    // Cascade-attention prefix-side partials (fp32), populated only when the
-    // owning AttentionOp's generation path can dispatch the cascade fast-path.
-    // See cascade::getCascadeWorkspaceSizes for the field layout.
-    size_t cascadeOut{};
-    size_t cascadeMax{};
-    size_t cascadeSum{};
 };
 
 struct AttentionGenerationWorkspaceLayout
@@ -157,9 +151,6 @@ struct AttentionGenerationWorkspaceLayout
     WorkspaceSlice partialSum{};
     WorkspaceSlice partialMax{};
     WorkspaceSlice shiftKCache{};
-    WorkspaceSlice cascadeOut{};
-    WorkspaceSlice cascadeMax{};
-    WorkspaceSlice cascadeSum{};
     size_t totalSize{};
 };
 
@@ -172,9 +163,6 @@ struct AttentionGenerationWorkspaceViews
     float* partialSum{};
     float* partialMax{};
     T* shiftKCache{};
-    float* cascadeOut{};
-    float* cascadeMax{};
-    float* cascadeSum{};
 };
 
 struct AttentionFlashMlaWorkspaceSizes
@@ -314,9 +302,6 @@ public:
         layout.partialSum = nextSlice(offset, sizes.partialSum, alignment);
         layout.partialMax = nextSlice(offset, sizes.partialMax, alignment);
         layout.shiftKCache = nextSlice(offset, sizes.shiftKCache, alignment);
-        layout.cascadeOut = nextSlice(offset, sizes.cascadeOut, alignment);
-        layout.cascadeMax = nextSlice(offset, sizes.cascadeMax, alignment);
-        layout.cascadeSum = nextSlice(offset, sizes.cascadeSum, alignment);
         layout.totalSize = offset;
         return layout;
     }
@@ -338,9 +323,6 @@ public:
         views.partialSum = ptr<float>(workspace, layout.partialSum);
         views.partialMax = ptr<float>(workspace, layout.partialMax);
         views.shiftKCache = ptr<T>(workspace, layout.shiftKCache);
-        views.cascadeOut = ptr<float>(workspace, layout.cascadeOut);
-        views.cascadeMax = ptr<float>(workspace, layout.cascadeMax);
-        views.cascadeSum = ptr<float>(workspace, layout.cascadeSum);
         return views;
     }
 

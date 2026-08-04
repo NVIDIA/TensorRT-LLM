@@ -23,7 +23,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -85,7 +85,7 @@ TEST_F(RuntimeKernelTest, FillBufferInt8)
 {
     for (auto size : {123LLU, 1025LLU, 1LLU << 32})
     {
-        auto buffer = mManager->gpu(size, tensorrt_llm::DataType::kINT8);
+        auto buffer = mManager->gpu(size, nvinfer1::DataType::kINT8);
         testFill<std::int8_t>(*buffer, *mManager, *mStream);
     }
 }
@@ -94,7 +94,7 @@ TEST_F(RuntimeKernelTest, FillTensorInt8)
 {
     for (auto size : {123, 1025, std::numeric_limits<int32_t>::max()})
     {
-        auto tensor = mManager->gpu(tr::ITensor::makeShape({size, 2}), tensorrt_llm::DataType::kINT8);
+        auto tensor = mManager->gpu(tr::ITensor::makeShape({size, 2}), nvinfer1::DataType::kINT8);
         testFill<std::int8_t>(*tensor, *mManager, *mStream);
     }
 }
@@ -111,7 +111,7 @@ TEST_F(RuntimeKernelTest, ScatterHalf)
     auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, inputLength});
 
     auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
-    auto outputTensor = mManager->gpu(outputShape, tensorrt_llm::DataType::kHALF);
+    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kHALF);
     mManager->setZero(*outputTensor);
 
     tr::kernels::scatterTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
@@ -174,7 +174,7 @@ TEST_F(RuntimeKernelTest, TileInt32)
     auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, inputLength});
 
     auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
-    auto outputTensor = mManager->gpu(outputShape, tensorrt_llm::DataType::kINT32);
+    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT32);
 
     tr::kernels::tileTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
 
@@ -194,7 +194,7 @@ TEST_F(RuntimeKernelTest, TileHalf)
     auto const outputShape = tr::ITensor::makeShape({batchSize * beamWidth, inputLength});
 
     auto inputTensor = mManager->copyFrom(input, inputShape, tr::MemoryType::kGPU);
-    auto outputTensor = mManager->gpu(outputShape, tensorrt_llm::DataType::kHALF);
+    auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kHALF);
 
     tr::kernels::tileTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
 
@@ -228,11 +228,11 @@ TEST_F(RuntimeKernelTest, TileInt8Large)
 
     // Scope the allocated tensors to ensure they are de-allocated before the test ends.
     {
-        auto inputTensor = mManager->gpu(inputShape, tensorrt_llm::DataType::kINT8);
+        auto inputTensor = mManager->gpu(inputShape, nvinfer1::DataType::kINT8);
         tr::kernels::invokeFill(*inputTensor, value, *mStream);
         mStream->synchronize();
 
-        auto outputTensor = mManager->gpu(outputShape, tensorrt_llm::DataType::kINT8);
+        auto outputTensor = mManager->gpu(outputShape, nvinfer1::DataType::kINT8);
         tr::kernels::tileTensor(*outputTensor, *inputTensor, beamWidth, *mStream);
         mStream->synchronize();
 
@@ -257,11 +257,11 @@ void testCopyBatch(tr::SizeType64 stride, tr::BufferManager& manager, tr::CudaSt
 
     auto const bufferShape = tr::ITensor::makeShape({rows, stride});
     auto const indicesShape = tr::ITensor::makeShape({numIndices});
-    auto srcBufferHost = tr::BufferManager::cpu(bufferShape, tensorrt_llm::DataType::kINT32);
-    auto dstBufferDevice = manager.gpu(bufferShape, tensorrt_llm::DataType::kINT32);
-    auto srcOffsets = tr::BufferManager::pinned(indicesShape, tensorrt_llm::DataType::kINT64);
-    auto dstOffsets = tr::BufferManager::pinned(indicesShape, tensorrt_llm::DataType::kINT64);
-    auto sizes = tr::BufferManager::pinned(indicesShape, tensorrt_llm::DataType::kINT64);
+    auto srcBufferHost = tr::BufferManager::cpu(bufferShape, nvinfer1::DataType::kINT32);
+    auto dstBufferDevice = manager.gpu(bufferShape, nvinfer1::DataType::kINT32);
+    auto srcOffsets = tr::BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT64);
+    auto dstOffsets = tr::BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT64);
+    auto sizes = tr::BufferManager::pinned(indicesShape, nvinfer1::DataType::kINT64);
     tr::kernels::invokeFill(*dstBufferDevice, 0, stream);
 
     auto* srcBufferHostPtr = tr::bufferCast<std::int32_t>(*srcBufferHost);

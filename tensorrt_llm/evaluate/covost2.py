@@ -22,13 +22,14 @@ Gemma4's HF blog reports CoVoST scores for the E2B/E4B checkpoints, so this
 task is added here for apples-to-apples comparison.
 """
 
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 import click
 import datasets
 import numpy as np
 
 from .. import LLM as PyTorchLLM
+from .._tensorrt_engine import LLM
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -349,7 +350,7 @@ class CoVoST2(Evaluator):
         output_dir: Optional[str],
         dump_samples_path: Optional[str],
     ) -> None:
-        llm: PyTorchLLM = ctx.obj
+        llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
             truncate_prompt_tokens=max_input_length,

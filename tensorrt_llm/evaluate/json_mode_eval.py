@@ -14,7 +14,7 @@
 # limitations under the License.
 import json
 import os
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Union
 
 import click
 import datasets
@@ -22,6 +22,7 @@ import jsonschema
 import numpy as np
 
 from .. import LLM as PyTorchLLM
+from .._tensorrt_engine import LLM
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import GuidedDecodingParams, SamplingParams
@@ -131,7 +132,7 @@ class JsonModeEval(Evaluator):
                 random_seed: int, system_prompt: Optional[str],
                 max_input_length: int, max_output_length: int,
                 output_dir: Optional[str]) -> None:
-        llm: PyTorchLLM = ctx.obj
+        llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
             truncate_prompt_tokens=max_input_length)

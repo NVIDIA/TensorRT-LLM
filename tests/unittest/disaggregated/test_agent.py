@@ -6,10 +6,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-# Force a deterministic UCX/NIXL config regardless of what the cluster/CI
-# injects; see test_kv_transfer.py for the full rationale.
-os.environ["UCX_TLS"] = "^ib,gdr_copy"
-os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (

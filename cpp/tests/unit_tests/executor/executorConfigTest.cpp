@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,17 +27,6 @@ using ::testing::Invoke;
 using namespace tensorrt_llm::executor;
 using namespace tensorrt_llm::common;
 
-TEST(CacheTransceiverConfigTest, validatesKvTransferPollInterval)
-{
-    auto makeConfig = [](std::optional<int> pollIntervalMs)
-    { return CacheTransceiverConfig(std::nullopt, std::nullopt, std::nullopt, std::nullopt, pollIntervalMs); };
-
-    EXPECT_EQ(makeConfig(std::nullopt).getKvTransferPollIntervalMs(), std::nullopt);
-    EXPECT_EQ(makeConfig(1).getKvTransferPollIntervalMs(), 1);
-    EXPECT_THROW(makeConfig(0), TllmException);
-    EXPECT_THROW(makeConfig(-1), TllmException);
-}
-
 TEST(ExecutorConfigTest, ctorValidInputs)
 {
     SchedulerConfig schedulerConfig;
@@ -47,12 +36,6 @@ TEST(ExecutorConfigTest, ctorValidInputs)
     }
     {
         auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 0);
-    }
-    {
-        auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true,
-            ExecutorConfig::kUnlimitedStatsMaxIterations, ExecutorConfig::kUnlimitedStatsMaxIterations);
-        EXPECT_EQ(executorConfig.getIterStatsMaxIterations(), ExecutorConfig::kUnlimitedStatsMaxIterations);
-        EXPECT_EQ(executorConfig.getRequestStatsMaxIterations(), ExecutorConfig::kUnlimitedStatsMaxIterations);
     }
     {
         auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 1000);
@@ -104,24 +87,9 @@ TEST(ExecutorConfigTest, ctorInvalidInputs)
         FAIL() << "Expected TllmException";
     }
 
-    // iter stats below the unlimited sentinel
+    // iter stats negative
     ParallelConfig parallelConfigValid;
-    testInvalid(1, schedulerConfig, kvCacheConfig, true, true, -2, BatchingType::kINFLIGHT, parallelConfigValid);
-
-    // request stats below the unlimited sentinel
-    try
-    {
-        auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 1000, -2);
-        FAIL() << "Expected TllmException";
-    }
-    catch (TllmException& e)
-    {
-        EXPECT_THAT(e.what(), testing::HasSubstr("Assertion failed"));
-    }
-    catch (std::exception const& e)
-    {
-        FAIL() << "Expected TllmException";
-    }
+    testInvalid(1, schedulerConfig, kvCacheConfig, true, true, -1, BatchingType::kINFLIGHT, parallelConfigValid);
 }
 
 TEST(ExecutorConfigTest, extendedRuntimePerfKnobConfigTest)

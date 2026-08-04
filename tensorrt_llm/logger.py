@@ -17,6 +17,8 @@ import os
 import sys
 from typing import Dict, Optional
 
+import tensorrt as trt
+
 try:
     from polygraphy.logger import G_LOGGER
 except ImportError:
@@ -73,6 +75,7 @@ _MODULE_ABBREVIATIONS = {
     "flash_mla": "flashmla",
     "quantization": "quantize",
     "scaffolding": "scaffold",
+    "_tensorrt_engine": "trt_engn",
     "visual_gen": "vis_gen",
     "__pycache__": "pycache",
     "tokenizer": "tokenizr",
@@ -183,6 +186,7 @@ class Logger(metaclass=Singleton):
             min_severity = self.DEFAULT_LEVEL
 
         self._min_severity = min_severity
+        self._trt_logger = trt.Logger(severity_map[min_severity][0])
         self._logger = logging.getLogger(self.PREFIX)
         self._logger.propagate = False
         handler = logging.StreamHandler(stream=sys.stdout)
@@ -200,7 +204,7 @@ class Logger(metaclass=Singleton):
         # Set the underlying Python logger to the minimum of all configured
         # levels so that per-module overrides more verbose than the global
         # level are not silently dropped by Python's logging framework.
-        global_py_level = severity_map[min_severity][0]
+        global_py_level = severity_map[min_severity][1]
         if self._module_levels:
             # Map our numeric levels to Python logging levels.
             _numeric_to_py = {
@@ -220,7 +224,7 @@ class Logger(metaclass=Singleton):
 
         self._polygraphy_logger = G_LOGGER
         if self._polygraphy_logger is not None:
-            self._polygraphy_logger.module_severity = severity_map[min_severity][1]
+            self._polygraphy_logger.module_severity = severity_map[min_severity][2]
 
         # For log_once
         self._appeared_keys = set()
@@ -263,6 +267,10 @@ class Logger(metaclass=Singleton):
             return self._logger.debug
         else:
             raise AttributeError(f"No such severity: {severity}")
+
+    @property
+    def trt_logger(self) -> trt.ILogger:
+        return self._trt_logger
 
     def log(self, severity, *msg):
         module = _get_caller_module()
@@ -330,21 +338,20 @@ class Logger(metaclass=Singleton):
             )
             return
         self._min_severity = min_severity
-        self._logger.setLevel(severity_map[min_severity][0])
+        self._trt_logger.min_severity = severity_map[min_severity][0]
+        self._logger.setLevel(severity_map[min_severity][1])
         if self._polygraphy_logger is not None:
-            self._polygraphy_logger.module_severity = severity_map[min_severity][1]
+            self._polygraphy_logger.module_severity = severity_map[min_severity][2]
 
 
 severity_map = {
-    # [0] Python logging level; [1] polygraphy level (appended below when
-    # polygraphy is installed).
-    "internal_error": [logging.CRITICAL],
-    "error": [logging.ERROR],
-    "warning": [logging.WARNING],
-    "info": [logging.INFO],
-    "verbose": [logging.DEBUG],
-    "debug": [logging.DEBUG],
-    "trace": [logging.DEBUG],
+    "internal_error": [trt.Logger.INTERNAL_ERROR, logging.CRITICAL],
+    "error": [trt.Logger.ERROR, logging.ERROR],
+    "warning": [trt.Logger.WARNING, logging.WARNING],
+    "info": [trt.Logger.INFO, logging.INFO],
+    "verbose": [trt.Logger.VERBOSE, logging.DEBUG],
+    "debug": [trt.Logger.VERBOSE, logging.DEBUG],
+    "trace": [trt.Logger.VERBOSE, logging.DEBUG],
 }
 
 if G_LOGGER is not None:

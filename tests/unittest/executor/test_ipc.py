@@ -7,8 +7,6 @@ import zmq
 
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 
-pytestmark = pytest.mark.cpu_only
-
 
 class TestIpcBasics:
     """Test basic synchronous IPC operations."""

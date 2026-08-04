@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tensorrt_llm._utils import mpi_allgather
 
-from .mapping import _resolve_mapping_layout
 from .routing import _per_rank_tokens
 from .specs import ConfigSpec, ModelSpec, RunResult, WorkloadSpec
 from .utils import _compute_stats
@@ -408,14 +407,12 @@ def _make_skipped_run_result(
     r = RunResult(model=model, workload=workload, config=config)
     r.status = "skipped"
     r.skip_reason = reason
-    _, _, _enable_dp = _resolve_mapping_layout(config, world_size)
-    r.per_rank_num_tokens = _per_rank_tokens(workload, world_size, enable_dp=bool(_enable_dp))
+    r.per_rank_num_tokens = _per_rank_tokens(workload, world_size)
     r.status_per_rank = {f"rank{i}": "skipped" for i in range(world_size)}
     r.instrumentation = {
         "level": ",".join(sorted(analysis)) if analysis else "summary",
         "cuda_graph": bool(config.cuda_graph),
         "cupti_available": False,
-        "nsys_capture": False,
         "phase_timing_available": False,
         "kernel_breakdown_available": False,
     }

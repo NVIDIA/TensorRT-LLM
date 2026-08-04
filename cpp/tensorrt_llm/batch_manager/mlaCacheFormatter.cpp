@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -124,13 +124,9 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_format);
     session.setTime(TransferSession::kTimeFormatter);
-    auto llmRequest = session.getLlmRequest();
-    if (llmRequest.has_value())
-    {
-        TLLM_LOG_DEBUG(
-            mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", (*llmRequest)->mRequestId);
-        TLLM_CHECK_WITH_INFO((*llmRequest)->mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
-    }
+    auto const& llmRequest = session.getLlmRequest();
+    TLLM_LOG_DEBUG(
+        mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
@@ -138,6 +134,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto const& lastBlockKey = session.getLastBlockKey();
     auto const& connections = session.getConnections();
     auto& bufferManager = session.getBufferManager();
+    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     TLLM_CHECK(!connections.empty());
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
@@ -148,6 +145,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
+        TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
         return;
     }
 
@@ -221,11 +219,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                 }
             }
 
-            if (llmRequest.has_value())
-            {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
-                    (*llmRequest)->mRequestId);
-            }
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
+                llmRequest.mRequestId);
 
             return;
         }
@@ -258,9 +253,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        auto const* sendCancelFlag
-            = common::getEnvDisaggEnableInflightCancel() ? &session.getDataContext().getTransferTerminate() : nullptr;
-        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(sendCancelFlag);
+        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
         BufferIndexHolder sendHolder(
             *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false);
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
@@ -311,13 +304,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             auto cpDomainIdx = processIdx / connectionsPerCPDomain;
             auto ppDomainIdx = (processIdx % connectionsPerCPDomain) % pPDomainSize;
             auto cacheIdx = cpDomainIdx * pPDomainSize + ppDomainIdx;
-            // Helix: skip CP ranks that own no blocks for this sequence (num_total_blocks < cp_size).
-            // The matching gen rank skips its receive, so no 0-byte transfer is posted on either side.
-            auto const& splitCache = outputSplitCaches.at(cacheIdx);
-            if (splitCache == nullptr || splitCache->getSizeInBytes() == 0)
-            {
-                return;
-            }
             if (cacheIdx < bufferCoverTargetNum)
             {
                 size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
@@ -353,84 +339,63 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             session.appendMeasure(startTime, endTime, outputSplitCaches.at(cacheIdx)->getSizeInBytes());
         };
 
-        if (sendCancelFlag != nullptr && sendCancelFlag->load(std::memory_order_relaxed))
+        if (pickUpConnections.size() > 1)
         {
-            TLLM_THROW("MLA cache transfer cancelled before NIXL submission");
-        }
-
-        try
-        {
-            if (pickUpConnections.size() > 1)
+            if (!common::getEnvEnableReceiveKVCacheParallel())
             {
-                if (!common::getEnvEnableReceiveKVCacheParallel())
+                TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
+                for (size_t i = 0; i < pickUpConnections.size(); i++)
                 {
-                    TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
-                    for (size_t i = 0; i < pickUpConnections.size(); i++)
-                    {
-                        sendBufferFun(deviceId, pickUpConnections[i]);
-                    }
-                }
-                else
-                {
-                    // concurrency num
-                    auto concurrencyNum
-                        = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize * cPDomainSize);
-
-                    auto remainSendNum = pickUpConnections.size();
-
-                    while (remainSendNum > 0)
-                    {
-                        auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
-                        std::vector<std::future<void>> futures;
-                        futures.reserve(sendConcurrencyNum);
-                        for (size_t i = 0; i < sendConcurrencyNum; i++)
-                        {
-                            size_t idx = i + (pickUpConnections.size() - remainSendNum);
-                            size_t connIdx = pickUpConnections[idx];
-                            TLLM_CHECK(idx < pickUpConnections.size());
-                            TLLM_CHECK(connIdx < session.getConnections().size());
-                            futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, connIdx));
-                        }
-                        for (auto& future : futures)
-                        {
-                            future.get();
-                        }
-                        remainSendNum -= sendConcurrencyNum;
-                    }
+                    sendBufferFun(deviceId, pickUpConnections[i]);
                 }
             }
             else
             {
-                sendBufferFun(deviceId, pickUpConnections[0]);
+                // concurrency num
+                auto concurrencyNum
+                    = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), pPDomainSize * cPDomainSize);
+
+                auto remainSendNum = pickUpConnections.size();
+
+                while (remainSendNum > 0)
+                {
+                    auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
+                    std::vector<std::future<void>> futures;
+                    futures.reserve(sendConcurrencyNum);
+                    for (size_t i = 0; i < sendConcurrencyNum; i++)
+                    {
+                        size_t idx = i + (pickUpConnections.size() - remainSendNum);
+                        size_t connIdx = pickUpConnections[idx];
+                        TLLM_CHECK(idx < pickUpConnections.size());
+                        TLLM_CHECK(connIdx < session.getConnections().size());
+                        futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, connIdx));
+                    }
+                    for (auto& future : futures)
+                    {
+                        future.get();
+                    }
+                    remainSendNum -= sendConcurrencyNum;
+                }
             }
         }
-        catch (...)
+        else
         {
-            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
-            {
-                sendHolder.poison();
-            }
-            throw;
+            sendBufferFun(deviceId, pickUpConnections[0]);
         }
         sendHolder.release();
     }
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);
 
-    if (llmRequest.has_value())
-    {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
-            (*llmRequest)->mRequestId);
-    }
+    TLLM_LOG_DEBUG(
+        mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.", llmRequest.mRequestId);
 }
 
 void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_unformat);
     session.setTime(TransferSession::kTimeFormatter);
-    auto llmRequestOpt = session.getLlmRequest();
-    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for receiving KV cache");
-    auto const& llmRequest = **llmRequestOpt;
+    auto const& llmRequest = session.getLlmRequest();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -493,13 +458,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             }
         }
 
-        // Helix: an "empty" CP rank owns no KV blocks for this sequence (num_total_blocks < cp_size).
-        // There is nothing to receive; the sender (context, CP=1) skips the matching 0-byte transfer.
-        if (blockNum == 0)
-        {
-            continue;
-        }
-
         int deviceId = bufferManager.getStream().getDevice();
 
         std::optional<int> cacheBufferId = std::nullopt;
@@ -535,18 +493,13 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             if (preAssignedId.has_value())
             {
                 cacheBufferId = static_cast<int>(*preAssignedId);
-                if (!session.hasReservedRecvBuffer(*mCacheTransBufferManagers[transferIndexerKCache]))
-                {
-                    recvHolder = BufferIndexHolder(
-                        *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
-                }
             }
             else
             {
                 cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecv();
-                recvHolder = BufferIndexHolder(
-                    *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
             }
+            recvHolder
+                = BufferIndexHolder(*mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
 
             auto targetNum = pickUpConnections.size();
 
@@ -694,7 +647,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             bufferManager.getStream().synchronize();
         }
 
-        (void) session.releaseReservedRecvBuffer(*mCacheTransBufferManagers[transferIndexerKCache]);
         recvHolder.release();
     }
     session.setTime(TransferSession::kTimePostprocess);

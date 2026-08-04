@@ -1,0 +1,4 @@
+-c ../../../constraints.txt
+tensorrt_llm>=0.0.0.dev0
+transformers==4.56.0
+accelerate==0.25.0

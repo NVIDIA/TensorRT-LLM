@@ -36,7 +36,6 @@ from .args import (
     SparseAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
-    VideoSparseAttentionConfig,
     VisualGenArgs,
 )
 from .output import VisualGenMetrics, VisualGenOutput
@@ -61,7 +60,6 @@ __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
-    "VideoSparseAttentionConfig",
     "CacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",

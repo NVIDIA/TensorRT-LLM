@@ -1,0 +1,268 @@
+# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#  * Neither the name of NVIDIA CORPORATION nor the names of its
+#    contributors may be used to endorse or promote products derived
+#    from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+# OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+name: "preprocessing"
+backend: "python"
+max_batch_size: ${triton_max_batch_size}
+
+dynamic_batching {
+    preferred_batch_size: [ ${triton_max_batch_size} ]
+    max_queue_delay_microseconds: ${max_queue_delay_microseconds}
+    default_queue_policy: { max_queue_size: ${max_queue_size} }
+}
+
+input [
+    {
+        name: "QUERY"
+        data_type: TYPE_STRING
+        dims: [ 1 ]
+    },
+    {
+        name: "DECODER_QUERY"
+        data_type: TYPE_STRING
+        dims: [ 1 ]
+        optional: true
+    },
+    {
+        name: "IMAGE_BYTES"
+        data_type: TYPE_UINT8
+        dims: [ -1, -1, -1, -1 ]
+        optional: true
+    },
+    {
+        name: "IMAGE_URL"
+        data_type: TYPE_STRING
+        dims: [ -1 ]
+        optional: true
+    },
+    # Required for pixtral
+    {
+        name: "IMAGE_SIZES"
+        data_type: TYPE_INT64
+        dims: [ -1, 2 ]
+        optional: true
+    },
+    {
+        name: "VIDEO_BYTES"
+        data_type: TYPE_UINT8
+        dims: [ -1, -1, -1, -1 ]
+        optional: true
+    },
+    {
+        name: "REQUEST_OUTPUT_LEN"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+    },
+    {
+        name: "BAD_WORDS_DICT"
+        data_type: TYPE_STRING
+        dims: [ -1 ]
+        optional: true
+    },
+    {
+        name: "STOP_WORDS_DICT"
+        data_type: TYPE_STRING
+        dims: [ -1 ]
+        optional: true
+    },
+    {
+        name: "EMBEDDING_BIAS_WORDS"
+        data_type: TYPE_STRING
+        dims: [ -1 ]
+        optional: true
+    },
+    {
+        name: "EMBEDDING_BIAS_WEIGHTS"
+        data_type: TYPE_FP32
+        dims: [ -1 ]
+        optional: true
+    },
+    {
+        name: "END_ID"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+        optional: true
+    },
+    {
+        name: "PAD_ID"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+        optional: true
+    },
+    {
+        name: "PROMPT_TABLE_EXTRA_ID"
+        data_type: TYPE_UINT64
+        dims: [ 1 ]
+        optional: true
+    }
+]
+output [
+    {
+        name: "INPUT_ID"
+        data_type: TYPE_INT32
+        dims: [ -1 ]
+    },
+    {
+        name: "REQUEST_INPUT_LEN"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+    },
+    {
+        name: "DECODER_INPUT_ID"
+        data_type: TYPE_INT32
+        dims: [ -1 ]
+    },
+    {
+        name: "REQUEST_DECODER_INPUT_LEN"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+    },
+    {
+        name: "BAD_WORDS_IDS"
+        data_type: TYPE_INT32
+        dims: [ 2, -1 ]
+    },
+    {
+        name: "STOP_WORDS_IDS"
+        data_type: TYPE_INT32
+        dims: [ 2, -1 ]
+    },
+    {
+        name: "EMBEDDING_BIAS"
+        data_type: TYPE_FP32
+        dims: [ -1 ]
+    },
+    {
+        name: "REQUEST_OUTPUT_LEN"
+        data_type: TYPE_INT32
+        dims: [ -1 ]
+    },
+    {
+        name: "OUT_END_ID"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+    },
+    {
+        name: "OUT_PAD_ID"
+        data_type: TYPE_INT32
+        dims: [ 1 ]
+    },
+    {
+        name: "OUT_PROMPT_TABLE_EXTRA_IDS"
+        data_type: TYPE_UINT64
+        dims: [ -1 ]
+    },
+    {
+        name: "PIXEL_VALUES"
+        data_type: TYPE_FP16
+        dims: [ -1, -1, -1, -1 ]
+    },
+    {
+        name: "ASPECT_RATIO_IDS"
+        data_type: TYPE_INT64
+        dims: [ -1 ]
+    },
+    {
+        name: "ASPECT_RATIO_MASK"
+        data_type: TYPE_INT64
+        dims: [ -1, -1 ]
+    },
+    {
+        name: "CROSS_ATTENTION_MASK"
+        data_type: TYPE_INT64
+        dims: [ -1, -1, -1 ]
+    },
+    # Required for image postprocessing in the llava_onevision and pixtral models
+    {
+        name: "IMAGE_SIZES"
+        data_type: TYPE_INT64
+        dims: [ -1, 2 ]
+    },
+    # Indicates if the input is video in the llava_onevision model
+    {
+        name: "IS_VIDEO_INPUT"
+        data_type: TYPE_BOOL
+        dims: [ 1 ]
+    },
+    # Required for Qwen2-VL vision encoder
+    {
+        name: "ATTENTION_MASK"
+        data_type: TYPE_INT64
+        dims: [ -1 ]
+    },
+    {
+        name: "IMAGE_GRID_THW"
+        data_type: TYPE_INT64
+        dims: [ 3 ]
+    },
+    {
+        name: "VISION_INPUT_ID"
+        data_type: TYPE_INT32
+        dims: [ -1 ]
+    }
+]
+
+parameters {
+  key: "tokenizer_dir"
+  value: {
+    string_value: "${tokenizer_dir}"
+  }
+}
+
+parameters {
+  key: "add_special_tokens"
+  value: {
+    string_value: "${add_special_tokens}"
+  }
+}
+
+parameters {
+  key: "multimodal_model_path"
+  value: {
+    string_value: "${multimodal_model_path}"
+  }
+}
+
+parameters: {
+  key: "gpt_model_path"
+  value: {
+    string_value: "${engine_dir}"
+  }
+}
+
+parameters: {
+  key: "max_num_images"
+  value: {
+    string_value: "${max_num_images}"
+  }
+}
+
+instance_group [
+    {
+        count: ${preprocessing_instance_count}
+        kind: KIND_CPU
+    }
+]

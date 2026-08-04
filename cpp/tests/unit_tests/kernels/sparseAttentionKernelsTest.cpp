@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -41,29 +40,28 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
     constexpr int total_sparse_tokens = 14;
 
     // Create input buffers
-    auto kv_page_offsets = mBufferManager->gpu(
-        ITensor::makeShape({batch_size, 2, max_num_pages_per_seq}), tensorrt_llm::DataType::kINT32);
-    auto seq_lengths = mBufferManager->gpu(ITensor::makeShape({batch_size}), tensorrt_llm::DataType::kINT32);
+    auto kv_page_offsets
+        = mBufferManager->gpu(ITensor::makeShape({batch_size, 2, max_num_pages_per_seq}), nvinfer1::DataType::kINT32);
+    auto seq_lengths = mBufferManager->gpu(ITensor::makeShape({batch_size}), nvinfer1::DataType::kINT32);
     // Shape: [num_head_kv, total_sparse_tokens] - flattened across all batches
     auto sparse_indices
-        = mBufferManager->gpu(ITensor::makeShape({num_head_kv, total_sparse_tokens}), tensorrt_llm::DataType::kINT32);
-    auto sparse_indices_offsets
-        = mBufferManager->gpu(ITensor::makeShape({batch_size + 1}), tensorrt_llm::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({num_head_kv, total_sparse_tokens}), nvinfer1::DataType::kINT32);
+    auto sparse_indices_offsets = mBufferManager->gpu(ITensor::makeShape({batch_size + 1}), nvinfer1::DataType::kINT32);
 
     // Create output buffers
     auto output_kv_page_offsets = mBufferManager->gpu(
-        ITensor::makeShape({num_head_kv, batch_size, 2, max_num_pages_per_seq}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({num_head_kv, batch_size, 2, max_num_pages_per_seq}), nvinfer1::DataType::kINT32);
     auto output_seq_lengths
-        = mBufferManager->gpu(ITensor::makeShape({num_head_kv, batch_size}), tensorrt_llm::DataType::kINT32);
+        = mBufferManager->gpu(ITensor::makeShape({num_head_kv, batch_size}), nvinfer1::DataType::kINT32);
 
     // Create pinned host buffers for data initialization
     auto kv_page_offsets_host = mBufferManager->pinned(
-        ITensor::makeShape({batch_size, 2, max_num_pages_per_seq}), tensorrt_llm::DataType::kINT32);
-    auto seq_lengths_host = mBufferManager->pinned(ITensor::makeShape({batch_size}), tensorrt_llm::DataType::kINT32);
-    auto sparse_indices_host = mBufferManager->pinned(
-        ITensor::makeShape({num_head_kv, total_sparse_tokens}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({batch_size, 2, max_num_pages_per_seq}), nvinfer1::DataType::kINT32);
+    auto seq_lengths_host = mBufferManager->pinned(ITensor::makeShape({batch_size}), nvinfer1::DataType::kINT32);
+    auto sparse_indices_host
+        = mBufferManager->pinned(ITensor::makeShape({num_head_kv, total_sparse_tokens}), nvinfer1::DataType::kINT32);
     auto sparse_indices_offsets_host
-        = mBufferManager->pinned(ITensor::makeShape({batch_size + 1}), tensorrt_llm::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({batch_size + 1}), nvinfer1::DataType::kINT32);
 
     // Initialize test data
     auto kv_page_offsets_ptr = bufferCast<int32_t>(*kv_page_offsets_host);
@@ -145,9 +143,9 @@ TEST_F(sparseAttentionKernelsTest, GatherKvPageOffsetsKernelTest)
 
     // Copy results back to host for verification
     auto output_kv_page_offsets_host = mBufferManager->pinned(
-        ITensor::makeShape({num_head_kv, batch_size, 2, max_num_pages_per_seq}), tensorrt_llm::DataType::kINT32);
+        ITensor::makeShape({num_head_kv, batch_size, 2, max_num_pages_per_seq}), nvinfer1::DataType::kINT32);
     auto output_seq_lengths_host
-        = mBufferManager->pinned(ITensor::makeShape({num_head_kv, batch_size}), tensorrt_llm::DataType::kINT32);
+        = mBufferManager->pinned(ITensor::makeShape({num_head_kv, batch_size}), nvinfer1::DataType::kINT32);
 
     mBufferManager->copy(*output_kv_page_offsets, *output_kv_page_offsets_host);
     mBufferManager->copy(*output_seq_lengths, *output_seq_lengths_host);

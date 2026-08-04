@@ -1,0 +1,4 @@
+__pycache__/
+gptj_model/
+*.log
+*.json

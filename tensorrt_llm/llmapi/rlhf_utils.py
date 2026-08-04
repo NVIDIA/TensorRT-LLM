@@ -1,10 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 import base64
 import gc
-from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Optional
 
 import torch
 
@@ -13,43 +9,6 @@ from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.logger import logger
-
-
-@contextmanager
-def _preserve_cuda_graph_refit_caches(model: torch.nn.Module) -> Iterator[None]:
-    """Keep refit-derived tensor addresses stable across post-load hooks.
-
-    Qwen3.5 eager fusion caches ``weight + 1`` for Gemma RMSNorm in the plain
-    tensor attribute ``_fused_norm_weight``. Its post-load hook recomputes that
-    cache by assigning a new tensor, but a CUDA Graph captured before refit
-    continues to reference the original allocation. Preserve that allocation
-    during refit and copy the refreshed value into it after post-load hooks run.
-    """
-    cached_tensors = []
-    for module in model.modules():
-        cached = getattr(module, "_fused_norm_weight", None)
-        if isinstance(cached, torch.Tensor):
-            cached_tensors.append((module, cached))
-
-    yield
-
-    for module, original in cached_tensors:
-        refreshed = getattr(module, "_fused_norm_weight", None)
-        if refreshed is original:
-            continue
-        if not isinstance(refreshed, torch.Tensor):
-            raise RuntimeError("Refit removed the CUDA-Graph-visible _fused_norm_weight cache")
-        if (
-            refreshed.shape != original.shape
-            or refreshed.dtype != original.dtype
-            or refreshed.device != original.device
-        ):
-            raise RuntimeError(
-                "Refit changed the shape, dtype, or device of the CUDA-Graph-visible "
-                "_fused_norm_weight cache"
-            )
-        original.copy_(refreshed)
-        module._fused_norm_weight = original
 
 
 class WorkerExtension:
@@ -74,22 +33,6 @@ class WorkerExtension:
         >>> llm._collective_rpc("update_weights", args=(ipc_handles,))
     """
 
-    def finalize_weight_update(self) -> None:
-        """Finalize a refit and refresh post-load state safely for CUDA Graph replay."""
-        model_engine = self.engine.model_engine
-        model = model_engine.model
-        with _preserve_cuda_graph_refit_caches(model):
-            model_engine.model_loader.finalize_update_weights()
-            for module in model.modules():
-                if hasattr(module, "process_weights_after_loading") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.process_weights_after_loading()
-                if hasattr(module, "post_load_weights") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.post_load_weights()
-
     @control_action_decorator
     def update_weights(self, ipc_handles: Optional[dict] = None):
         """Update model weights from IPC (Inter-Process Communication) handles.
@@ -109,7 +52,6 @@ class WorkerExtension:
         """
         try:
             if not hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
-                self.engine.model_engine.model_loader.begin_update_weights()
                 for module in self.engine.model_engine.model.modules():
                     if hasattr(module, "pre_reload_weights") and not getattr(
                         module, "_weights_removed", False
@@ -185,7 +127,15 @@ class WorkerExtension:
                 torch.cuda.ipc_collect()
             else:
                 logger.info("Finalize update weights")
-                self.finalize_weight_update()
+                for module in self.engine.model_engine.model.modules():
+                    if hasattr(module, "process_weights_after_loading") and not getattr(
+                        module, "_weights_removed", False
+                    ):
+                        module.process_weights_after_loading()
+                    if hasattr(module, "post_load_weights") and not getattr(
+                        module, "_weights_removed", False
+                    ):
+                        module.post_load_weights()
                 moe_load_balancer = getattr(self.engine.model_engine, "moe_load_balancer", None)
                 if isinstance(moe_load_balancer, MoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
@@ -202,9 +152,6 @@ class WorkerExtension:
                 torch.cuda.empty_cache()
 
         except Exception as e:
-            self.engine.model_engine.model_loader.abort_update_weights()
-            if hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
-                delattr(self.engine.model_engine.model, "first_pre_reload_weights")
             logger.error("Encountered an error in update_weights")
             raise e
 

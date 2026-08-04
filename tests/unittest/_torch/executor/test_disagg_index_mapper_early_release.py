@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,6 @@ iterations of requests accumulate in-flight.
 from unittest.mock import MagicMock
 
 import pytest
-import torch
 
 from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
@@ -196,63 +195,6 @@ class TestIndexMapperSlotReuse:
         # Now the 3rd request can be added
         index_mapper.add_new_sequence(3)
         assert _has_sequence(index_mapper, 3)
-
-    def test_gather_k_block_offsets_uses_request_order_and_beam_zero(self):
-        from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
-            IndexMapper,
-        )
-
-        index_mapper = IndexMapper(max_batch_size=3, max_beam_width=2)
-        index_mapper.add_new_sequence(11)
-        index_mapper.add_new_sequence(22)
-        index_mapper.remove_sequence(22)
-        index_mapper.add_new_sequence(33)
-
-        source = torch.arange(2 * 6 * 2 * 5, dtype=torch.int32).reshape(2, 6, 2, 5)
-        destination = torch.full((2, 3, 2, 3), -1, dtype=torch.int32)
-        index_mapper.gather_k_block_offsets(source, destination, [33, 11], 3)
-
-        torch.testing.assert_close(destination[:, 0, 0], source[:, 2, 0, :3])
-        torch.testing.assert_close(destination[:, 1, 0], source[:, 0, 0, :3])
-        assert torch.count_nonzero(destination[:, :, 1] != -1) == 0
-        assert torch.count_nonzero(destination[:, 2, 0] != -1) == 0
-
-    def test_gather_k_block_offsets_rejects_unknown_request(self):
-        from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
-            IndexMapper,
-        )
-
-        index_mapper = IndexMapper(max_batch_size=1, max_beam_width=1)
-        index_mapper.add_new_sequence(11)
-        source = torch.zeros((1, 1, 2, 4), dtype=torch.int32)
-        destination = torch.full((1, 2, 2, 3), -1, dtype=torch.int32)
-
-        with pytest.raises(Exception, match="Request ID not found"):
-            index_mapper.gather_k_block_offsets(source, destination, [11, 12], 3)
-        assert torch.count_nonzero(destination != -1) == 0
-
-    def test_gather_k_block_offsets_matches_beam_zero_index_select(self):
-        from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
-            IndexMapper,
-        )
-
-        index_mapper = IndexMapper(max_batch_size=4, max_beam_width=3)
-        for request_id in (101, 202, 303):
-            index_mapper.add_new_sequence(request_id)
-        index_mapper.remove_sequence(202)
-        index_mapper.add_new_sequence(404)
-
-        request_ids = [404, 101, 404, 303]
-        source = torch.arange(3 * 12 * 2 * 7, dtype=torch.int32).reshape(3, 12, 2, 7)
-        destination = torch.full((3, 5, 2, 5), -1, dtype=torch.int32)
-        copy_index = index_mapper.get_copy_index(request_ids, 0, 1).to(torch.long)
-        expected = torch.index_select(source, 1, copy_index)[:, :, 0, :5]
-
-        index_mapper.gather_k_block_offsets(source, destination, request_ids, 5)
-
-        torch.testing.assert_close(destination[:, :4, 0], expected)
-        assert torch.count_nonzero(destination[:, :, 1] != -1) == 0
-        assert torch.count_nonzero(destination[:, 4, 0] != -1) == 0
 
 
 class TestFreeResourcesDoubleReleaseSafety:

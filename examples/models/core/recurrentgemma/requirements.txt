@@ -1,0 +1,12 @@
+-c ../../../constraints.txt
+tensorrt_llm>=0.0.0.dev0
+git+https://github.com/google-deepmind/recurrentgemma.git@8a32e365
+flax>=0.8.2
+jax~=0.4.23
+orbax-checkpoint==0.5.7
+transformers>=4.56.0
+datasets==3.1.0
+evaluate
+rouge_score
+sentencepiece
+jaxtyping<=0.2.34

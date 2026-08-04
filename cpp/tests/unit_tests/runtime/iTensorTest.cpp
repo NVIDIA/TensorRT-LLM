@@ -17,7 +17,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -26,7 +25,7 @@ using namespace tensorrt_llm::runtime;
 TEST(ITensorTest, SqueezeTensor)
 {
     auto dims = ITensor::makeShape({16, 1, 4});
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     ITensor::SharedPtr tensor{BufferManager::cpu(dims, dataType)};
 
     auto squeezeDim = 0;
@@ -103,7 +102,7 @@ TEST(ITensorTest, UnsqueezeTensor)
     auto oldShape = ITensor::makeShape({2, 3, 4, 5});
 
     {
-        auto tensor = BufferManager::cpu(oldShape, tensorrt_llm::DataType::kINT32);
+        auto tensor = BufferManager::cpu(oldShape, nvinfer1::DataType::kINT32);
         tensor->unsqueeze(0);
         auto shape = tensor->getShape();
 
@@ -115,7 +114,7 @@ TEST(ITensorTest, UnsqueezeTensor)
         EXPECT_EQ(shape.d[4], 5);
     }
     {
-        auto tensor = BufferManager::cpu(oldShape, tensorrt_llm::DataType::kINT32);
+        auto tensor = BufferManager::cpu(oldShape, nvinfer1::DataType::kINT32);
         tensor->unsqueeze(1);
         auto shape = tensor->getShape();
 
@@ -128,7 +127,7 @@ TEST(ITensorTest, UnsqueezeTensor)
     }
 
     {
-        auto tensor = BufferManager::cpu(oldShape, tensorrt_llm::DataType::kINT32);
+        auto tensor = BufferManager::cpu(oldShape, nvinfer1::DataType::kINT32);
         tensor->unsqueeze(4);
         auto shape = tensor->getShape();
 
@@ -145,7 +144,7 @@ TEST(ITensorTest, UnsqueezeTensor)
     {
         try
         {
-            auto tensor = BufferManager::cpu(oldShape, tensorrt_llm::DataType::kINT32);
+            auto tensor = BufferManager::cpu(oldShape, nvinfer1::DataType::kINT32);
             tensor->unsqueeze(invalidDim);
             FAIL() << "Expected failure";
         }
@@ -163,7 +162,7 @@ TEST(ITensorTest, UnsqueezeTensor)
 TEST(ITensorTest, TensorView)
 {
     auto const dims = ITensor::makeShape({16, 1, 4});
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     ITensor::SharedPtr tensor = BufferManager::cpu(dims, dataType);
 
     auto const viewDims = ITensor::makeShape({16, 1, 2});
@@ -181,7 +180,7 @@ TEST(ITensorTest, TensorView)
 TEST(ITensorTest, TensorSlice)
 {
     auto dims = ITensor::makeShape({16, 8, 4});
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     ITensor::SharedPtr tensor{BufferManager::cpu(dims, dataType)};
     auto offset = dims.d[0] / 4;
     auto slice = ITensor::slice(tensor, offset);
@@ -222,7 +221,7 @@ TEST(ITensorTest, TensorSlice)
 TEST(ITensorTest, TensorDimsSliceAtManual)
 {
     auto shape = ITensor::makeShape({5, 5, 5, 5, 5});
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     ITensor::SharedPtr tensor(BufferManager::cpu(shape, dataType));
     auto offsetDims = ITensor::makeShape({4, 3, 3});
     auto sizeDim = 2;
@@ -283,7 +282,7 @@ TEST(ITensorTest, TensorDimsSliceAtManual)
 
 TEST(ITensorTest, TensorDimsSliceAtExtrame)
 {
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     {
         auto shape = ITensor::makeShape({5, 5, 5, 5, 5});
         ITensor::SharedPtr tensor(BufferManager::cpu(shape, dataType));
@@ -541,7 +540,7 @@ TEST(ShapeRange, test)
 TEST(ITensorTest, TensorDimsSliceAt)
 {
     auto shape = ITensor::makeShape({5, 5, 5, 5});
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     ITensor::SharedPtr tensor(BufferManager::cpu(shape, dataType));
 
     auto verify = [&shape, &tensor, &dataType](ITensor::Shape const& index)
@@ -658,7 +657,7 @@ TEST(ITensorTest, TensorDimsSliceAt)
 TEST(BufferRangeTest, ConstType)
 {
     auto shape = ITensor::makeShape({5, 5, 5, 5, 5});
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     ITensor::SharedPtr tensor(BufferManager::cpu(shape, dataType));
     ITensor::SharedConstPtr tensorConst = tensor;
 
@@ -695,7 +694,7 @@ TEST(BufferRangeTest, ConstType)
 TEST(ITensorTest, GetDimension)
 {
     auto shape = ITensor::makeShape({10, 11, 12});
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     ITensor::SharedPtr tensor(BufferManager::cpu(shape, dataType));
 
     auto firstDimensionFromStart = tensor->getDimension<0>();

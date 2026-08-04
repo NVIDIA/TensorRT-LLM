@@ -26,9 +26,7 @@ using ::testing::_;
 using ::testing::Invoke;
 
 using namespace tensorrt_llm::executor;
-// Not a namespace-wide import: common also exports DataType/Dims, which would
-// make the unqualified DataType (= executor::DataType) below ambiguous.
-using tensorrt_llm::common::TllmException;
+using namespace tensorrt_llm::common;
 
 TEST(RequestTest, validInputs)
 {

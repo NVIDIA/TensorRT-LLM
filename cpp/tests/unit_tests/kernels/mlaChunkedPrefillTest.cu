@@ -8,7 +8,6 @@
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/mlaChunkedPrefill.cuh"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include <cstring>
@@ -430,18 +429,18 @@ protected:
         using tensorrt_llm::runtime::ITensor;
         using tensorrt_llm::runtime::bufferCast;
 
-        auto dtype = tensorrt_llm::DataType::kHALF;
+        auto dtype = nvinfer1::DataType::kHALF;
         if constexpr (std::is_same_v<DataType, float>)
         {
-            dtype = tensorrt_llm::DataType::kFLOAT;
+            dtype = nvinfer1::DataType::kFLOAT;
         }
         else if constexpr (std::is_same_v<DataType, half>)
         {
-            dtype = tensorrt_llm::DataType::kHALF;
+            dtype = nvinfer1::DataType::kHALF;
         }
         else if constexpr (std::is_same_v<DataType, __nv_bfloat16>)
         {
-            dtype = tensorrt_llm::DataType::kBF16;
+            dtype = nvinfer1::DataType::kBF16;
         }
         else
         {
@@ -450,11 +449,11 @@ protected:
         auto cacheType = dtype;
         if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
         {
-            cacheType = tensorrt_llm::DataType::kFP8;
+            cacheType = nvinfer1::DataType::kFP8;
             this->h_kv_scale_quant_orig
-                = tensorrt_llm::runtime::BufferManager::pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
-            this->d_kv_scale_quant_orig = tensorrt_llm::runtime::BufferManager::gpuSync(
-                ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
+                = tensorrt_llm::runtime::BufferManager::pinned(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
+            this->d_kv_scale_quant_orig
+                = tensorrt_llm::runtime::BufferManager::gpuSync(ITensor::makeShape({1}), nvinfer1::DataType::kFLOAT);
             auto* kv_scale_quant_orig_ptr = bufferCast<float>(*(this->h_kv_scale_quant_orig));
             float kv_scale_orig_quant = 2.0F;
             kv_scale_quant_orig_ptr[0] = 1.0 / kv_scale_orig_quant;
@@ -464,13 +463,13 @@ protected:
 
         // cu lens
         this->h_cu_kv_seq_lens = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mBatchSize + 1}), tensorrt_llm::DataType::kINT64);
+            ITensor::makeShape({this->mBatchSize + 1}), nvinfer1::DataType::kINT64);
         this->h_cu_q_seq_lens = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mBatchSize + 1}), tensorrt_llm::DataType::kINT64);
+            ITensor::makeShape({this->mBatchSize + 1}), nvinfer1::DataType::kINT64);
         this->d_cu_kv_seq_lens = tensorrt_llm::runtime::BufferManager::gpuSync(
-            this->h_cu_kv_seq_lens->getShape(), tensorrt_llm::DataType::kINT64);
+            this->h_cu_kv_seq_lens->getShape(), nvinfer1::DataType::kINT64);
         this->d_cu_q_seq_lens = tensorrt_llm::runtime::BufferManager::gpuSync(
-            this->h_cu_q_seq_lens->getShape(), tensorrt_llm::DataType::kINT64);
+            this->h_cu_q_seq_lens->getShape(), nvinfer1::DataType::kINT64);
         {
             this->mMaxSeqLen = 0;
             this->mMaxQSeqLen = 0;
@@ -513,14 +512,14 @@ protected:
         int const total_cached_kv_len = this->mTotalKVLen - this->mTotalQLen;
         int const chunked_loop_num = (total_cached_kv_len + total_chunk_size - 1) / total_chunk_size;
         this->h_cu_chunk_lens = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({chunked_loop_num + 1, this->mBatchSize + 1}), tensorrt_llm::DataType::kINT64);
+            ITensor::makeShape({chunked_loop_num + 1, this->mBatchSize + 1}), nvinfer1::DataType::kINT64);
         this->h_chunked_ld_global_offset = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({chunked_loop_num + 1, this->mBatchSize}), tensorrt_llm::DataType::kINT64);
+            ITensor::makeShape({chunked_loop_num + 1, this->mBatchSize}), nvinfer1::DataType::kINT64);
         this->memsetZeroHost(this->h_chunked_ld_global_offset);
         this->d_cu_chunk_lens = tensorrt_llm::runtime::BufferManager::gpuSync(
-            this->h_cu_chunk_lens->getShape(), tensorrt_llm::DataType::kINT64);
+            this->h_cu_chunk_lens->getShape(), nvinfer1::DataType::kINT64);
         this->d_chunked_ld_global_offset = tensorrt_llm::runtime::BufferManager::gpuSync(
-            this->h_chunked_ld_global_offset->getShape(), tensorrt_llm::DataType::kINT64);
+            this->h_chunked_ld_global_offset->getShape(), nvinfer1::DataType::kINT64);
 
         // kv cache
         this->mMaxBlockPerSeq = (this->mMaxSeqLen + this->mTokensPerBlock - 1) / this->mTokensPerBlock;
@@ -540,13 +539,13 @@ protected:
                 this->mLoraSize + this->mRopeSize}),
             cacheType);
         this->h_compressed_offset_tensor = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({this->mBatchSize, 2, this->mMaxBlockPerSeq + 1}), tensorrt_llm::DataType::kINT32);
+            ITensor::makeShape({this->mBatchSize, 2, this->mMaxBlockPerSeq + 1}), nvinfer1::DataType::kINT32);
         this->d_kv_cache_tensor
             = tensorrt_llm::runtime::BufferManager::gpuSync(this->h_kv_cache_tensor->getShape(), dtype);
         this->d_compressed_kv_cache_tensor
             = tensorrt_llm::runtime::BufferManager::gpuSync(this->h_compressed_kv_cache_tensor->getShape(), cacheType);
         this->d_compressed_offset_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(
-            this->h_compressed_offset_tensor->getShape(), tensorrt_llm::DataType::kINT32);
+            this->h_compressed_offset_tensor->getShape(), nvinfer1::DataType::kINT32);
 
         {
             auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->h_compressed_kv_cache_tensor));
@@ -602,15 +601,15 @@ protected:
         this->m_h_output_tensor = tensorrt_llm::runtime::BufferManager::pinned(
             ITensor::makeShape({this->mTotalQLen, this->mNumHeads, this->mNopeSize}), dtype);
         this->m_h_softmax_sum_tensor = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({2, this->mTotalQLen, this->mNumHeads}), tensorrt_llm::DataType::kFLOAT);
+            ITensor::makeShape({2, this->mTotalQLen, this->mNumHeads}), nvinfer1::DataType::kFLOAT);
         this->m_h_softmax_sum_accum_tensor = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({2, this->mTotalQLen, this->mNumHeads}), tensorrt_llm::DataType::kFLOAT);
+            ITensor::makeShape({2, this->mTotalQLen, this->mNumHeads}), nvinfer1::DataType::kFLOAT);
         this->m_h_output_tensor_ref = tensorrt_llm::runtime::BufferManager::pinned(
             ITensor::makeShape({this->mTotalQLen, this->mNumHeads, this->mNopeSize}), dtype);
         this->m_h_output_tensor_accum = tensorrt_llm::runtime::BufferManager::pinned(
             ITensor::makeShape({this->mTotalQLen, this->mNumHeads, this->mNopeSize}), dtype);
         this->m_h_merge_op = tensorrt_llm::runtime::BufferManager::pinned(
-            ITensor::makeShape({chunked_loop_num + 1, this->mBatchSize}), tensorrt_llm::DataType::kINT64);
+            ITensor::makeShape({chunked_loop_num + 1, this->mBatchSize}), nvinfer1::DataType::kINT64);
         this->m_d_q_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(this->m_h_q_tensor->getShape(), dtype);
         this->m_d_kv_full_tensor
             = tensorrt_llm::runtime::BufferManager::gpuSync(this->m_h_kv_full_tensor->getShape(), dtype);
@@ -619,13 +618,13 @@ protected:
         this->m_d_output_tensor
             = tensorrt_llm::runtime::BufferManager::gpuSync(this->m_h_output_tensor->getShape(), dtype);
         this->m_d_softmax_sum_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(
-            this->m_h_softmax_sum_tensor->getShape(), tensorrt_llm::DataType::kFLOAT);
+            this->m_h_softmax_sum_tensor->getShape(), nvinfer1::DataType::kFLOAT);
         this->m_d_softmax_sum_accum_tensor = tensorrt_llm::runtime::BufferManager::gpuSync(
-            this->m_h_softmax_sum_accum_tensor->getShape(), tensorrt_llm::DataType::kFLOAT);
+            this->m_h_softmax_sum_accum_tensor->getShape(), nvinfer1::DataType::kFLOAT);
         this->m_d_output_tensor_accum
             = tensorrt_llm::runtime::BufferManager::gpuSync(this->m_h_output_tensor_accum->getShape(), dtype);
-        this->m_d_merge_op = tensorrt_llm::runtime::BufferManager::gpuSync(
-            this->m_h_merge_op->getShape(), tensorrt_llm::DataType::kINT64);
+        this->m_d_merge_op
+            = tensorrt_llm::runtime::BufferManager::gpuSync(this->m_h_merge_op->getShape(), nvinfer1::DataType::kINT64);
 
         {
             auto* q_ptr = bufferCast<DataType>(*(this->m_h_q_tensor));

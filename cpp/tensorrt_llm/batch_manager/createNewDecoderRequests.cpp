@@ -33,7 +33,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntimeBase.h>
 
 using namespace tensorrt_llm::runtime;
 
@@ -69,8 +69,10 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
     SizeType32 batchIdx{0};
     for (auto const& llmReq : contextRequests)
     {
+        auto const disaggFirstGenTokenSize
+            = llmReq->getContextPhaseParams() ? llmReq->getContextPhaseParams().value().getFirstGenTokens().size() : 0;
         auto const currentSequenceLen
-            = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens() + llmReq->getNumContextPhaseGenerationTokens();
+            = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens() + disaggFirstGenTokenSize;
         // Get position of the current sequence in the decoder
         auto const seqSlot = llmReq->mSeqSlot.value();
         batchSlotsRange[batchIdx] = seqSlot;
@@ -91,7 +93,7 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
 
 /// @brief Retrieve the embedding bias from the request. This potentially makes a copy of the tensor
 /// to the appropriate type if the input tensor does not match it.
-[[nodiscard]] TensorPtr getEmbeddingBias(tensorrt_llm::DataType logitsType, TensorPtr const& tensor)
+[[nodiscard]] TensorPtr getEmbeddingBias(nvinfer1::DataType logitsType, TensorPtr const& tensor)
 {
     // Check that embedding bias type is same as logits type. If so, we can return the tensor right away
     if (tensor->getDataType() == logitsType)
@@ -100,7 +102,7 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
     }
 
     // Support FP32 input for FP16 embedding bias (in the case of FP8 models)
-    if (tensor->getDataType() == tensorrt_llm::DataType::kFLOAT && logitsType == tensorrt_llm::DataType::kHALF)
+    if (tensor->getDataType() == nvinfer1::DataType::kFLOAT && logitsType == nvinfer1::DataType::kHALF)
     {
         // Do a deep copy of the tensor to the expected type
         TLLM_LOG_WARNING(
@@ -131,10 +133,10 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
 std::tuple<TensorPtr, std::vector<runtime::SamplingConfig>, std::vector<runtime::ITensor::SharedConstPtr>,
     std::vector<executor::LookaheadDecodingConfig>>
 CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-    executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-    tensorrt_llm::DataType logitsType, DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
-    CudaStream const& runtimeStream, CudaStream const& decoderStream, SizeType32 maxSequenceLength,
-    SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers) const
+    executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, nvinfer1::DataType logitsType,
+    DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream,
+    CudaStream const& decoderStream, SizeType32 maxSequenceLength, SizeType32 beamWidth,
+    OptionalRef<MedusaBuffers const> medusaBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(CreateNewDecoderRequests);
@@ -233,7 +235,7 @@ void initializeBeamSearch(DecodingInput& dJointInput, DecodingOutput& dJointOutp
 }
 
 void initializeEmbeddingBias(DecodingInput& dJointInput, SizeType32 batchSlot,
-    std::optional<TensorPtr> const& embeddingBias, tensorrt_llm::DataType logitsType,
+    std::optional<TensorPtr> const& embeddingBias, nvinfer1::DataType logitsType,
     runtime::ModelConfig const& modelConfig, BufferManager const& manager)
 {
     TensorPtr const embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
@@ -629,7 +631,7 @@ void newRequestSpeculativeDecoding(DecodingInput& jointDecodingInput, DecodingOu
 std::tuple<std::vector<runtime::ITensor::SharedConstPtr>, std::vector<executor::LookaheadDecodingConfig>>
 CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
     executor::DecodingConfig const& decodingConfig, runtime::decoder::DecoderState& decoderState,
-    tensorrt_llm::DataType logitsType, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+    nvinfer1::DataType logitsType, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
     runtime::CudaStream const& runtimeStream, runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
     OptionalRef<MedusaBuffers const> medusaBuffers) const
 {

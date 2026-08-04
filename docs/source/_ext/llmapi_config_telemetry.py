@@ -41,9 +41,6 @@ unless a field carries an explicit allowlist (`TelemetryField.categorical(...)`)
 and any field may opt out with `telemetry=False`. Every captured field is listed
 below; the runtime can capture nothing absent from this list.
 
-If the manifest check fails, run `python3 scripts/generate_llm_args_golden_manifest.py`, then commit
-`tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
-
 ## LLM API Configuration Fields
 
 A field can still be absent from a specific payload when its parent config is
@@ -76,16 +73,19 @@ def _table(rows: list[dict]) -> str:
 def generate_telemetry_reference(repo_root: Path | str, output_path: Path | str) -> None:
     repo_root = Path(repo_root)
     golden = json.loads((repo_root / _GOLDEN_REL).read_text())
-    rows = golden.get("TorchLlmArgs", [])
-    content = [
-        _REFERENCE_PREAMBLE,
-        "### `TorchLlmArgs`",
-        "",
-        f"{len(rows)} captured fields.",
-        "",
-        _table(rows),
-        "",
-    ]
+    content = [_REFERENCE_PREAMBLE]
+    for args_class in ("TorchLlmArgs", "TrtLlmArgs"):
+        rows = golden.get(args_class, [])
+        content.extend(
+            [
+                f"### `{args_class}`",
+                "",
+                f"{len(rows)} captured fields.",
+                "",
+                _table(rows),
+                "",
+            ]
+        )
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(content))

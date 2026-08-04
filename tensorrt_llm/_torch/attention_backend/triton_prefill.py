@@ -33,9 +33,7 @@ import torch
 import triton
 import triton.language as tl
 
-# Guard on a visible GPU so `import tensorrt_llm` stays GPU-free under
-# CUDA_VISIBLE_DEVICES="" (pure client); (0, 0) is a safe sentinel there.
-CUDA_CAPABILITY = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 
 def _get_block_sizes(Lq: int, Lv: int):

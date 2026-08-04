@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,62 +20,15 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 
-#include <chrono>
-#include <exception>
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager
 {
 
-namespace
-{
-
-char const* bufferKindName(BufferKind kind)
-{
-    switch (kind)
-    {
-    case BufferKind::kKV: return "kv";
-    case BufferKind::kKV_INDEXER: return "kv_indexer";
-    case BufferKind::kRNN: return "rnn";
-    }
-    return "unknown";
-}
-
-} // namespace
-
 void BufferIndexHolder::release() noexcept
 {
-    if (mMgr == nullptr)
-    {
-        return;
-    }
-    if (mHeld)
-    {
-        try
-        {
-            if (mIsRecv)
-            {
-                mMgr->freeBufferIndexForRecv(mIndex);
-            }
-            else
-            {
-                mMgr->freeBufferIndexForSend(mIndex);
-            }
-        }
-        catch (...)
-        {
-            // noexcept: swallow so the destructor can never throw.
-        }
-    }
-    mHeld = false;
-    mMgr = nullptr;
-}
-
-void BufferIndexHolder::poison() noexcept
-{
-    if (mMgr == nullptr)
+    if (!mHeld || mMgr == nullptr)
     {
         return;
     }
@@ -83,23 +36,22 @@ void BufferIndexHolder::poison() noexcept
     {
         if (mIsRecv)
         {
-            mMgr->poisonBufferIndexForRecv(mIndex);
+            mMgr->freeBufferIndexForRecv(mIndex);
         }
         else
         {
-            mMgr->poisonBufferIndexForSend(mIndex);
+            mMgr->freeBufferIndexForSend(mIndex);
         }
     }
     catch (...)
     {
-        // noexcept: poison is a fail-closed best effort from exception paths.
+        // noexcept: swallow so the destructor can never throw.
     }
     mHeld = false;
-    mMgr = nullptr;
 }
 
 BaseTransBufferManager::BaseTransBufferManager(
-    size_t transferBufferSize, tensorrt_llm::DataType dataType, std::optional<size_t> maxNumTokens)
+    size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)
     : mDataType{dataType}
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
     , mMaxNumTokens{maxNumTokens}
@@ -109,7 +61,7 @@ BaseTransBufferManager::BaseTransBufferManager(
     mRecvBufferCount = common::getEnvRequestKVCacheConcurrent() ? common::getEnvKVCacheRecvBufferCount() : 1;
     mSendBufferCount = common::getEnvKVCacheSendMaxConcurrenceNum();
     mUseFabricMemory = !(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer())
-        && kv_cache_manager::FabricMemory::supportFabricMemory();
+        && kv_cache_manager::FabricMemory::supportFbaricMemory();
     if (mUseFabricMemory)
     {
         mTransferBufferSize = kv_cache_manager::FabricMemory::getAlignedSize(mTransferBufferSize);
@@ -126,11 +78,9 @@ BaseTransBufferManager::BaseTransBufferManager(
     allocateBuffer();
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndexForSend(
-    std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs)
+std::optional<int> BaseTransBufferManager::assignBufferIndexForSend()
 {
-    return assignBufferIndex(
-        mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer, perRequestCancel, waitSliceMs);
+    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer);
 }
 
 void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
@@ -138,26 +88,14 @@ void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
     freeBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseDynamicBuffer);
 }
 
-void BaseTransBufferManager::poisonBufferIndexForSend(std::optional<int> bufferId) noexcept
+std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv()
 {
-    poisonBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseDynamicBuffer, "send");
-}
-
-std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv(
-    std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs)
-{
-    return assignBufferIndex(
-        mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer, perRequestCancel, waitSliceMs);
+    return assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer);
 }
 
 void BaseTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId)
 {
     freeBufferIndex(mConcurrenceRecvResource, bufferId, mRecvBufferCount, mOnlyUseDynamicBuffer);
-}
-
-void BaseTransBufferManager::poisonBufferIndexForRecv(std::optional<int> bufferId) noexcept
-{
-    poisonBufferIndex(mConcurrenceRecvResource, bufferId, mRecvBufferCount, mOnlyUseDynamicBuffer, "recv");
 }
 
 std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> BaseTransBufferManager::getOrAllocateSendBuffers(
@@ -311,51 +249,16 @@ void BaseTransBufferManager::allocateBuffer()
     }
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount,
-    bool onlyUseDynamicBuffer, std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs)
+std::optional<int> BaseTransBufferManager::assignBufferIndex(
+    ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer)
 {
-    auto const isCancelled = [perRequestCancel]()
-    { return perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed); };
-    if (isCancelled())
-    {
-        TLLM_THROW("Cache transfer buffer acquisition cancelled");
-    }
     if (onlyUseDynamicBuffer)
     {
-        TLLM_CHECK_WITH_INFO(!resource.mPoisoned.load(std::memory_order_relaxed),
-            "Cannot assign dynamic cache transfer buffer kind=%s because the transfer buffer pool is poisoned",
-            bufferKindName(getBufferKind()));
         return std::nullopt;
     }
     std::unique_lock lk(resource.mBuffersMutex);
-    auto const predicate = [&resource, bufferCount]()
-    {
-        return resource.mPoisoned.load(std::memory_order_relaxed)
-            || static_cast<size_t>(resource.mConcurrence) < bufferCount;
-    };
-    if (perRequestCancel == nullptr)
-    {
-        resource.mBuffersCV.wait(lk, predicate);
-    }
-    else
-    {
-        auto const slice = std::chrono::milliseconds{waitSliceMs};
-        while (!predicate())
-        {
-            resource.mBuffersCV.wait_for(lk, slice);
-            if (isCancelled())
-            {
-                TLLM_THROW("Cache transfer buffer acquisition cancelled");
-            }
-        }
-    }
-    if (isCancelled())
-    {
-        TLLM_THROW("Cache transfer buffer acquisition cancelled");
-    }
-    TLLM_CHECK_WITH_INFO(!resource.mPoisoned.load(std::memory_order_relaxed),
-        "Cannot assign cache transfer buffer kind=%s because the transfer buffer pool is poisoned",
-        bufferKindName(getBufferKind()));
+    resource.mBuffersCV.wait(
+        lk, [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; });
     int bufferId = -1;
     for (size_t i = 0; i < bufferCount; i++)
     {
@@ -385,59 +288,11 @@ void BaseTransBufferManager::freeBufferIndex(
         TLLM_CHECK(static_cast<size_t>(bufferId.value()) < bufferCount);
         {
             std::scoped_lock lk(resource.mBuffersMutex);
-            if (resource.mBufferIndexFlag[bufferId.value()] == 2)
-            {
-                TLLM_LOG_ERROR("Refusing to free poisoned cache transfer buffer kind=%s index=%d",
-                    bufferKindName(getBufferKind()), bufferId.value());
-                return;
-            }
             resource.mBufferIndexFlag[bufferId.value()] = 0;
         }
         resource.mConcurrence--;
         resource.mBuffersCV.notify_one();
     }
-}
-
-void BaseTransBufferManager::poisonBufferIndex(ConcurrenceResource& resource, std::optional<int> bufferId,
-    size_t bufferCount, bool onlyUseDynamicBuffer, char const* direction) noexcept
-{
-    resource.mPoisoned.store(true, std::memory_order_relaxed);
-
-    if (onlyUseDynamicBuffer)
-    {
-        TLLM_LOG_ERROR("Poisoned dynamic %s cache transfer buffer kind=%s; process restart is required", direction,
-            bufferKindName(getBufferKind()));
-        resource.mBuffersCV.notify_all();
-        return;
-    }
-
-    try
-    {
-        if (bufferId.has_value())
-        {
-            TLLM_CHECK(static_cast<size_t>(bufferId.value()) < bufferCount);
-            {
-                std::scoped_lock lk(resource.mBuffersMutex);
-                if (resource.mBufferIndexFlag[bufferId.value()] == 1)
-                {
-                    resource.mBufferIndexFlag[bufferId.value()] = 2;
-                }
-            }
-        }
-        TLLM_LOG_ERROR("Poisoned %s cache transfer buffer kind=%s index=%d; process restart is required", direction,
-            bufferKindName(getBufferKind()), bufferId.value_or(-1));
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_ERROR("Exception while poisoning %s cache transfer buffer kind=%s index=%d: %s", direction,
-            bufferKindName(getBufferKind()), bufferId.value_or(-1), e.what());
-    }
-    catch (...)
-    {
-        TLLM_LOG_ERROR("Unknown exception while poisoning %s cache transfer buffer kind=%s index=%d", direction,
-            bufferKindName(getBufferKind()), bufferId.value_or(-1));
-    }
-    resource.mBuffersCV.notify_all();
 }
 
 size_t BaseTransBufferManager::getRecvBufferCount()

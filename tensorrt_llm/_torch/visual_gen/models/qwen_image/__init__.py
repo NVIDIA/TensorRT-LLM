@@ -9,7 +9,6 @@ integration.
 """
 
 from .pipeline_qwen_image import QwenImagePipeline
-from .pipeline_qwen_image_edit import QwenImageEditPlusPipeline
 from .transformer_qwen_image import (
     AdaLayerNormContinuous,
     QwenEmbedRope,
@@ -26,7 +25,6 @@ from .transformer_qwen_image import (
 __all__ = [
     "AdaLayerNormContinuous",
     "QwenEmbedRope",
-    "QwenImageEditPlusPipeline",
     "QwenImagePipeline",
     "QwenImageTransformer2DModel",
     "QwenImageTransformerBlock",

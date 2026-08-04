@@ -23,7 +23,7 @@
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 
-#include "tensorrt_llm/common/tllmDataType.h"
+#include <NvInferRuntime.h>
 #include <array>
 
 namespace tensorrt_llm::runtime
@@ -101,7 +101,7 @@ public:
     };
 
     explicit ModelConfig(SizeType32 vocabSize, SizeType32 nbLayers, SizeType32 nbAttentionLayers,
-        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, tensorrt_llm::DataType dtype)
+        SizeType32 nbRnnLayers, SizeType32 nbHeads, SizeType32 hiddenSize, nvinfer1::DataType dtype)
         : mVocabSize(vocabSize)
         , mNbLayers(nbLayers)
         , mNbAttentionLayers(nbAttentionLayers)
@@ -137,7 +137,7 @@ public:
         , mUsePositionEmbedding(false)
         , mUseTokenTypeEmbedding(false)
         , mSpeculativeDecodingMode(SpeculativeDecodingMode::None())
-        , mLogitsDtype(tensorrt_llm::DataType::kFLOAT)
+        , mLogitsDtype(nvinfer1::DataType::kFLOAT)
         , mUseShapeInference(true)
         , mManageWeightsType(ManageWeightsType::kDisabled)
         , mSkipCrossAttnBlocks(false)
@@ -331,7 +331,7 @@ public:
         mSizePerHead = sizePerHead;
     }
 
-    [[nodiscard]] tensorrt_llm::DataType constexpr getDataType() const noexcept
+    [[nodiscard]] nvinfer1::DataType constexpr getDataType() const noexcept
     {
         return mDataType;
     }
@@ -735,20 +735,20 @@ public:
         resetSpeculativeDecodingModule();
     }
 
-    [[nodiscard]] tensorrt_llm::DataType getKvDataType() const
+    [[nodiscard]] nvinfer1::DataType getKvDataType() const
     {
         if (getQuantMode().hasFp8KvCache())
         {
-            return tensorrt_llm::DataType::kFP8;
+            return nvinfer1::DataType::kFP8;
         }
         if (getQuantMode().hasInt8KvCache())
         {
-            return tensorrt_llm::DataType::kINT8;
+            return nvinfer1::DataType::kINT8;
         }
         else if (getQuantMode().hasFp4KvCache())
         {
 #ifdef ENABLE_FP4
-            return tensorrt_llm::DataType::kFP4;
+            return nvinfer1::DataType::kFP4;
 #else
             throw std::runtime_error("Model has FP4 KV cache, but TRT-LLM was not compiled with FP4 enabled.");
 #endif
@@ -800,22 +800,22 @@ public:
         return mSpeculativeDecodingMode;
     }
 
-    void setLogitsDtype(tensorrt_llm::DataType inputDtype) noexcept
+    void setLogitsDtype(nvinfer1::DataType inputDtype) noexcept
     {
         mLogitsDtype = inputDtype;
     }
 
-    [[nodiscard]] tensorrt_llm::DataType constexpr getLogitsDtype() const noexcept
+    [[nodiscard]] nvinfer1::DataType constexpr getLogitsDtype() const noexcept
     {
         return mLogitsDtype;
     }
 
-    void setGemmAllReduceDtype(tensorrt_llm::DataType inputDtype) noexcept
+    void setGemmAllReduceDtype(nvinfer1::DataType inputDtype) noexcept
     {
         mGemmAllReduceDtype = inputDtype;
     }
 
-    [[nodiscard]] tensorrt_llm::DataType constexpr getGemmAllReduceDtype() const noexcept
+    [[nodiscard]] nvinfer1::DataType constexpr getGemmAllReduceDtype() const noexcept
     {
         return mGemmAllReduceDtype;
     }
@@ -945,10 +945,10 @@ private:
     SizeType32 mNbHeads;
     SizeType32 mHiddenSize;
     SizeType32 mSizePerHead;
-    tensorrt_llm::DataType mDataType;
+    nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
     bool mUseGemmAllReducePlugin;
-    tensorrt_llm::DataType mGemmAllReduceDtype;
+    nvinfer1::DataType mGemmAllReduceDtype;
     bool mUseMambaConv1dPlugin;
     bool mInputPacked;
     bool mPagedState;
@@ -998,7 +998,7 @@ private:
     SpeculativeDecodingMode mSpeculativeDecodingMode;
 
     // Logits datatype
-    tensorrt_llm::DataType mLogitsDtype;
+    nvinfer1::DataType mLogitsDtype;
     bool mUseShapeInference;
     ManageWeightsType mManageWeightsType;
     std::string mModelName;

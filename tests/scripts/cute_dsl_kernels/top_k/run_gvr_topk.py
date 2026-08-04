@@ -62,8 +62,6 @@ def _compile(
     return_output_values: bool,
     cluster_size: int = 1,
     seqlen_sorted: bool = False,
-    p4_warp_redundant: bool = True,
-    p2_warp_redundant: bool = True,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -138,8 +136,6 @@ def _compile(
         return_output_values=return_output_values,
         cluster_size=cluster_size,
         seqlen_sorted=seqlen_sorted,
-        p4_warp_redundant=p4_warp_redundant,
-        p2_warp_redundant=p2_warp_redundant,
     )
     return cute.compile(
         kernel,
@@ -176,8 +172,6 @@ def gvr_topk_decode(
     cluster_size: int = 1,
     seqlen_sorted: bool = False,
     order_row: Optional[torch.Tensor] = None,
-    p4_warp_redundant: bool = True,
-    p2_warp_redundant: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -203,17 +197,6 @@ def gvr_topk_decode(
                    given CTA processes, so longer rows land in earlier
                    waves. Use together with :func:`gvr_topk_sort_prepare`.
                    Compatible with ``cluster_size > 1``.
-        p4_warp_redundant: Default True. Phase 4 redundant-warp cadence:
-                   every warp replays the k-th bin search reduce and the
-                   snap-loop decision from the staged SMEM partials
-                   (bit-identical across warps), removing the publish
-                   barriers and keeping threshold/convergence state in
-                   registers. False restores the leader-thread cadence.
-        p2_warp_redundant: Default True. Phase 2 redundant-warp secant
-                   cadence (cluster_size == 1 only): one barrier per
-                   round; every warp reduces the staged warp counts and
-                   replays the classify + secant update in registers.
-                   False restores the leader cadence.
         order_row: Required iff ``seqlen_sorted=True``. Request-level —
                    ``int32[batch_size = num_rows // next_n]`` on the same
                    device as ``logits``; ``order_row[i]`` is the original
@@ -310,8 +293,6 @@ def gvr_topk_decode(
         return_output_values,
         cluster_size,
         seqlen_sorted,
-        p4_warp_redundant,
-        p2_warp_redundant,
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
@@ -762,68 +743,6 @@ def test_gvr_topk_decode(
         f"num_threads_per_block={num_threads_per_block} "
         f"enable_warp_parallel_reduce={enable_warp_parallel_reduce} "
         f"cluster_size={cluster_size}: {msg}"
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
-@pytest.mark.parametrize(
-    "dtype,top_k",
-    [
-        (torch.bfloat16, 1024),
-        (torch.float32, 2048),
-    ],
-)
-@pytest.mark.parametrize("cluster_size", [1, 4])
-@pytest.mark.parametrize(
-    "p4_warp_redundant,p2_warp_redundant",
-    [
-        # Leader-path coverage: the redundant-warp knobs default ON, so
-        # the main sweep above exercises the redundant cadences; these
-        # combinations keep the knob-off (pre-redundant leader) paths and
-        # the two mixed configurations compiling and exact.
-        (False, False),
-        (False, True),
-        (True, False),
-    ],
-)
-def test_gvr_topk_decode_leader_paths(
-    dtype: torch.dtype,
-    top_k: int,
-    cluster_size: int,
-    p4_warp_redundant: bool,
-    p2_warp_redundant: bool,
-) -> None:
-    N = 65536
-    batch_size = 32
-    seed = 42
-    logits, pre_idx, seq_lens = _make_inputs(
-        batch_size,
-        N,
-        top_k,
-        dtype,
-        seed,
-        next_n=1,
-        compress_ratio=1,
-    )
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    _, out_idxs = gvr_topk_decode(
-        logits,
-        pre_idx,
-        seq_lens,
-        top_k,
-        next_n=1,
-        num_sms=num_sms,
-        return_output_values=False,
-        cluster_size=cluster_size,
-        p4_warp_redundant=p4_warp_redundant,
-        p2_warp_redundant=p2_warp_redundant,
-    )
-    torch.cuda.synchronize()
-    ok, msg = _tie_aware_correct(out_idxs, logits, seq_lens, top_k, 1)
-    assert ok, (
-        f"dtype={dtype} K={top_k} cluster_size={cluster_size} "
-        f"p4_warp_redundant={p4_warp_redundant} "
-        f"p2_warp_redundant={p2_warp_redundant}: {msg}"
     )
 
 

@@ -20,24 +20,21 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include <algorithm>
 #include <chrono>
 #include <future>
 #include <map>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <unordered_map>
-#include <variant>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -82,11 +79,6 @@ void TransferSession::send(size_t idx, void const* data, size_t size)
     }
     catch (std::exception const& e)
     {
-        // Request-free (llmRequest-agnostic) transfer: there is no valid ID to attach.
-        if (mRequest == nullptr)
-        {
-            TLLM_THROW("%s", e.what());
-        }
         throw common::RequestSpecificException(
             __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
@@ -100,23 +92,15 @@ void TransferSession::recv(size_t idx, void* data, size_t size)
     }
     catch (std::exception const& e)
     {
-        // Request-free (llmRequest-agnostic) transfer: there is no valid ID to attach.
-        if (mRequest == nullptr)
-        {
-            TLLM_THROW("%s", e.what());
-        }
         throw common::RequestSpecificException(
             __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
     }
 }
 
-std::optional<LlmRequest const*> TransferSession::getLlmRequest() const
+LlmRequest const& TransferSession::getLlmRequest() const
 {
-    if (mRequest == nullptr)
-    {
-        return std::nullopt;
-    }
-    return mRequest;
+    TLLM_CHECK(mRequest != nullptr);
+    return *mRequest;
 }
 
 void TransferSession::setLlmRequest(LlmRequest const& llmRequest)
@@ -140,53 +124,9 @@ void TransferSession::appendMeasure(LlmRequest::TimePoint start, LlmRequest::Tim
     }
 }
 
-void TransferSession::setReservedRecvBuffers(std::vector<BufferIndexHolder> holders)
-{
-    TLLM_CHECK(mReservedRecvBuffers.empty());
-    mReservedRecvBuffers = std::move(holders);
-}
-
-bool TransferSession::hasReservedRecvBuffer(BaseTransBufferManager const& manager) const noexcept
-{
-    return std::any_of(mReservedRecvBuffers.begin(), mReservedRecvBuffers.end(),
-        [&manager](BufferIndexHolder const& holder) { return holder.isBoundTo(manager); });
-}
-
-bool TransferSession::releaseReservedRecvBuffer(BaseTransBufferManager const& manager) noexcept
-{
-    auto const holderIt = std::find_if(mReservedRecvBuffers.begin(), mReservedRecvBuffers.end(),
-        [&manager](BufferIndexHolder const& holder) { return holder.isBoundTo(manager); });
-    if (holderIt == mReservedRecvBuffers.end())
-    {
-        return false;
-    }
-    holderIt->release();
-    mReservedRecvBuffers.erase(holderIt);
-    return true;
-}
-
-void TransferSession::releaseReservedRecvBuffers() noexcept
-{
-    for (auto& holder : mReservedRecvBuffers)
-    {
-        holder.release();
-    }
-    mReservedRecvBuffers.clear();
-}
-
-void TransferSession::poisonReservedRecvBuffers() noexcept
-{
-    for (auto& holder : mReservedRecvBuffers)
-    {
-        holder.poison();
-    }
-    mReservedRecvBuffers.clear();
-}
-
 void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) const
 {
-    // Request-free transfers are excluded: the exported row is keyed by the LlmRequest.
-    if (!mTimes || mTimes->measures.empty() || mRequest == nullptr)
+    if (!mTimes || mTimes->measures.empty())
     {
         return;
     }
@@ -244,7 +184,7 @@ int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
     return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
 }
 
-std::filesystem::path getTransferOutputPath(char const* tag, std::string const& instanceId = "")
+std::filesystem::path getTransferOutputPath(char const* tag)
 {
     namespace fs = std::filesystem;
     auto outputPath = common::getEnvKVCacheTimeOutputPath();
@@ -253,9 +193,7 @@ std::filesystem::path getTransferOutputPath(char const* tag, std::string const& 
         auto rank = mpi::MpiComm::world().getRank();
         auto path = fs::path(outputPath);
         fs::create_directories(path);
-        std::string prefix
-            = instanceId.empty() ? "rank_" + std::to_string(rank) : instanceId + "_" + std::to_string(rank);
-        return path / (prefix + "_" + tag + ".csv");
+        return path / ("rank_" + std::to_string(rank) + "_" + tag + ".csv");
     }
     return {};
 }
@@ -292,7 +230,7 @@ RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTran
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
     return mRequestId == rhs.mRequestId && mIndexFromEnd == rhs.mIndexFromEnd && mLastBlockKey == rhs.mLastBlockKey
-        && mIsArbitraryTransfer == rhs.mIsArbitraryTransfer && mTransState == rhs.mTransState;
+        && mTransState == rhs.mTransState;
 }
 
 LlmRequest::RequestIdType RequestInfo::getRequestId() const noexcept
@@ -311,7 +249,6 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
     su::serialize(requestInfo.mRequestId, os);
     su::serialize(requestInfo.mIndexFromEnd, os);
     su::serialize(requestInfo.mLastBlockKey, os);
-    su::serialize(requestInfo.mIsArbitraryTransfer, os);
     su::serialize(requestInfo.mTransState, os);
 }
 
@@ -321,11 +258,8 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
     auto requestId = su::deserialize<decltype(mRequestId)>(is);
     auto indexFromEnd = su::deserialize<decltype(mIndexFromEnd)>(is);
     auto lastBlockKey = su::deserialize<decltype(mLastBlockKey)>(is);
-    auto isArbitraryTransfer = su::deserialize<decltype(mIsArbitraryTransfer)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    auto requestInfo = RequestInfo{requestId, std::move(transState), indexFromEnd, lastBlockKey};
-    requestInfo.setIsArbitraryTransfer(isArbitraryTransfer);
-    return requestInfo;
+    return RequestInfo{requestId, std::move(transState), indexFromEnd, lastBlockKey};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -335,7 +269,6 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     totalSize += su::serializedSize(requestInfo.mRequestId);
     totalSize += su::serializedSize(requestInfo.mIndexFromEnd);
     totalSize += su::serializedSize(requestInfo.mLastBlockKey);
-    totalSize += su::serializedSize(requestInfo.mIsArbitraryTransfer);
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
 }
@@ -345,17 +278,16 @@ class CacheSender::Impl
 public:
     using RequestIdType = LlmRequest::RequestIdType;
 
-    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
-        std::string instanceId = "")
+    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
         : mManager{manager}
         , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
         , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
-        , mInstanceId{std::move(instanceId)}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
+        mCurrentRequest = std::nullopt;
         mResponseFuture = std::async(std::launch::async, &Impl::response, this);
         int asyncSendThreadNum = common::getEnvKVCacheSendMaxConcurrenceNum();
         for (int i = 0; i < asyncSendThreadNum; i++)
@@ -371,34 +303,16 @@ public:
         std::promise<void> promise;
         auto future = promise.get_future();
         llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
-        if (common::getEnvDisaggEnableInflightCancel())
         {
-            (void) getOrCreateInFlightCancelFlag(llmRequest->mRequestId);
-        }
-        {
-            std::scoped_lock lock(mSenderMutex);
-            TLLM_CHECK_WITH_INFO(
-                !mTerminate, "Cannot enqueue request %zu after CacheSender termination", llmRequest->mRequestId);
-            auto const result
-                = mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
-            TLLM_CHECK_WITH_INFO(
-                result.second, "Request %zu is already queued for KV cache transfer", llmRequest->mRequestId);
+            {
+                std::scoped_lock lkResp(mSenderMutex);
+                mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
+            }
+            std::unique_lock lkCond(mCondMutex);
+            mAnyReady = true;
         }
         mSenderCv.notify_all();
         return future;
-    }
-
-    std::shared_ptr<std::atomic<bool>> getOrCreateInFlightCancelFlag(RequestIdType requestId)
-    {
-        std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-        auto it = mInFlightCancelFlags.find(requestId);
-        if (it != mInFlightCancelFlags.end())
-        {
-            return it->second;
-        }
-        auto flag = std::make_shared<std::atomic<bool>>(false);
-        mInFlightCancelFlags.emplace(requestId, flag);
-        return flag;
     }
 
     [[nodiscard]] executor::kv_cache::CommState const& getCommState() const
@@ -421,62 +335,21 @@ public:
 
     void release(LlmRequest::RequestIdType requestId)
     {
+        std::unique_lock<std::mutex> lk(mMtxForMap);
+        auto it = mRequestToSession.find(requestId);
+        TLLM_CHECK(it != mRequestToSession.end());
+        if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
-            std::unique_lock<std::mutex> lk(mMtxForMap);
-            auto it = mRequestToSession.find(requestId);
-            TLLM_CHECK(it != mRequestToSession.end());
-            if (!common::getEnvKVCacheTimeOutputPath().empty())
+            if (!mMeasuresFile.is_open())
             {
-                if (!mMeasuresFile.is_open())
-                {
-                    auto outputPath = getTransferOutputPath("send", mInstanceId);
-                    mMeasuresFile.open(outputPath);
-                    TLLM_CHECK_WITH_INFO(mMeasuresFile.is_open(), "Failed to open transfer output file: %s",
-                        outputPath.string().c_str());
-                }
-                it->second.exportMeasure(mMeasuresFile, true);
+                auto outputPath = getTransferOutputPath("send");
+                mMeasuresFile.open(outputPath);
+                TLLM_CHECK_WITH_INFO(
+                    mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
             }
-            mRequestToSession.erase(it);
+            it->second.exportMeasure(mMeasuresFile, true);
         }
-        if (common::getEnvDisaggEnableInflightCancel())
-        {
-            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-            mInFlightCancelFlags.erase(requestId);
-        }
-    }
-
-    void discardTransferState(LlmRequest::RequestIdType requestId) noexcept
-    {
-        try
-        {
-            std::unique_lock<std::mutex> lk(mMtxForMap);
-            mRequestToSession.erase(requestId);
-        }
-        catch (std::exception const& e)
-        {
-            TLLM_LOG_WARNING("Failed to discard sender session for request %ld: %s", requestId, e.what());
-        }
-        catch (...)
-        {
-            TLLM_LOG_WARNING("Failed to discard sender session for request %ld: unknown exception", requestId);
-        }
-        if (!common::getEnvDisaggEnableInflightCancel())
-        {
-            return;
-        }
-        try
-        {
-            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-            mInFlightCancelFlags.erase(requestId);
-        }
-        catch (std::exception const& e)
-        {
-            TLLM_LOG_WARNING("Failed to discard in-flight cancel flag for request %ld: %s", requestId, e.what());
-        }
-        catch (...)
-        {
-            TLLM_LOG_WARNING("Failed to discard in-flight cancel flag for request %ld: unknown exception", requestId);
-        }
+        mRequestToSession.erase(it);
     }
 
     [[nodiscard]] std::optional<RequestInfo> recvRequestInfo()
@@ -491,6 +364,7 @@ public:
             : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG, mTerminate}, &id, sizeof(id));
         if (connection == nullptr)
         {
+            TLLM_LOG_WARNING("recvRequestInfo connection is nullptr, maybe the server is terminating");
             return std::nullopt;
         }
 
@@ -518,25 +392,15 @@ public:
 
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
-        std::shared_ptr<std::atomic<bool>> cancelFlag;
-        if (common::getEnvDisaggEnableInflightCancel())
-        {
-            cancelFlag = getOrCreateInFlightCancelFlag(requestId);
-        }
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
             auto it = mRequestToSession.find(requestId);
             if (it == mRequestToSession.end())
             {
-                auto session = cancelFlag != nullptr
-                    ? TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                        DataContext{tagFromRequestId(requestId), *cancelFlag}, allCounterparts, mSelfState,
-                        info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                        !common::getEnvKVCacheTimeOutputPath().empty())
-                    : TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                        DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
-                        info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                        !common::getEnvKVCacheTimeOutputPath().empty());
+                auto session = TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
+                    DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
+                    info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
+                    !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
@@ -555,60 +419,25 @@ public:
             session = std::addressof(it->second);
         }
         session->setLlmRequest(llmRequest);
-        TLLM_LOG_DEBUG("KV cache transfer request %zu phase=transfer-submit begin.", llmRequest.mRequestId);
         mCacheTransferLayer.format(*session);
-        TLLM_LOG_DEBUG("KV cache transfer request %zu phase=transfer-complete end.", llmRequest.mRequestId);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
     {
-        bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
         bool isCancelled = false;
-        bool isCurrentRequest = false;
+        std::scoped_lock lkResp(mSenderMutex);
+        auto it = mReadyResponses.find(llmRequest.mRequestId);
+        // If the request is not the current request and already in the ready queue, we can cancel it.
+        if (it != mReadyResponses.end()
+            && (!mCurrentRequest.has_value() || getCurrentRequestId() != llmRequest.mRequestId))
         {
-            std::scoped_lock lock(mSenderMutex);
-            auto it = mReadyResponses.find(llmRequest.mRequestId);
-            if (it != mReadyResponses.end())
-            {
-                isCurrentRequest = mCurrentRequest.has_value() && mCurrentRequest.value() == llmRequest.mRequestId;
-                // The legacy path cannot interrupt a ready/active transfer, so
-                // preserve its false return until the opt-in is enabled.
-                if (!isCurrentRequest || inflightCancelEnabled)
-                {
-                    mCancelledRequests.insert(llmRequest.mRequestId);
-                    isCancelled = true;
-                    if (inflightCancelEnabled && !isCurrentRequest)
-                    {
-                        // Keep only the request ID as a tombstone so a late peer
-                        // receives ready=false without retaining the request.
-                        failResponse(it->second,
-                            std::make_exception_ptr(
-                                TLLM_REQUEST_EXCEPTION(llmRequest.mRequestId, common::RequestErrorCode::kNETWORK_ERROR,
-                                    "Context KV cache request cancelled before a peer was ready for request %zu",
-                                    llmRequest.mRequestId)));
-                        mReadyResponses.erase(it);
-                    }
-                }
-            }
-        }
-        if (inflightCancelEnabled && (!isCancelled || isCurrentRequest))
-        {
-            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-            auto flagIt = mInFlightCancelFlags.find(llmRequest.mRequestId);
-            if (flagIt != mInFlightCancelFlags.end())
-            {
-                flagIt->second->store(true, std::memory_order_relaxed);
-                isCancelled = true;
-            }
-        }
-        if (!isCancelled)
-        {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            mCancelledRequests.insert(llmRequest.mRequestId);
+            isCancelled = true;
         }
         else
         {
-            mSenderCv.notify_all();
+            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
         }
         return isCancelled;
     }
@@ -630,7 +459,8 @@ public:
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
-                agentConnection->sendReadySignal(session->getDataContext(), isReady);
+                agentConnection->sendReadySignal(
+                    executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, isReady);
             }
             else
             {
@@ -648,23 +478,10 @@ public:
 private:
     struct Response
     {
-        // An LlmRequest (co-owned until the promise resolves) for normal transfers, or
-        // just the request id for llmRequest-agnostic reuse-tree transfers.
-        std::variant<std::shared_ptr<LlmRequest>, RequestIdType> mRequestOrId;
+        // shared_ptr so this struct co-owns the request until the promise resolves;
+        // protects worker-side dereferences and the promise itself from premature destruction.
+        std::shared_ptr<LlmRequest> mRequest;
         std::promise<void> mPromise;
-        std::vector<kv_cache_manager::KVCacheBlock::IdType> mPinnedBlockIds;
-
-        [[nodiscard]] LlmRequest* getRequest() const
-        {
-            auto const* request = std::get_if<std::shared_ptr<LlmRequest>>(&mRequestOrId);
-            return request != nullptr ? request->get() : nullptr;
-        }
-
-        [[nodiscard]] RequestIdType getRequestId() const
-        {
-            auto const* request = getRequest();
-            return request != nullptr ? request->mRequestId : std::get<RequestIdType>(mRequestOrId);
-        }
     };
 
     struct AsyncSendResource
@@ -697,28 +514,13 @@ private:
                 resp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
-            // Read before std::move(resp): argument evaluations are indeterminately sequenced.
-            auto const requestId = resp.getRequestId();
-            sendAndRemoveResponse(requestId, std::move(resp));
+            // Sequence the read before the move: argument initializations
+            // are indeterminately sequenced, so inlining resp.mRequest->...
+            // alongside std::move(resp) is UB once mRequest is a shared_ptr.
+            TLLM_CHECK(resp.mRequest != nullptr);
+            auto const reqId = resp.mRequest->mRequestId;
+            sendAndRemoveResponse(reqId, std::move(resp));
         }
-    }
-
-    //! Must not throw: called from noexcept send/failure paths.
-    void releasePinnedBlocks(Response& response) noexcept
-    {
-        if (response.mPinnedBlockIds.empty())
-        {
-            return;
-        }
-        try
-        {
-            mCacheTransferLayer.getCacheManager()->unpinBlocksById(response.mPinnedBlockIds);
-        }
-        catch (std::exception const& err)
-        {
-            TLLM_LOG_ERROR("Failed to unpin reuse-tree blocks: %s", err.what());
-        }
-        response.mPinnedBlockIds.clear();
     }
 
     void sendAndRemoveResponse(RequestIdType id, Response resp) noexcept
@@ -726,369 +528,220 @@ private:
         try
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            if (auto* llmRequest = resp.getRequest(); llmRequest != nullptr)
-            {
-                sendSync(*llmRequest);
-            }
-            else
-            {
-                // Reuse tree path — no LlmRequest
-                sendSyncFromReuseTree(id);
-            }
+            sendSync(*resp.mRequest);
             release(id);
             resp.mPromise.set_value();
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
-            discardTransferState(id);
             auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
-            failResponse(resp, std::make_exception_ptr(new_exception));
+            resp.mPromise.set_exception(std::make_exception_ptr(new_exception));
         }
         catch (std::exception const& e)
         {
-            auto const exception = std::current_exception();
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s request id: %ld", e.what(), id);
-            discardTransferState(id);
-            failResponse(resp, exception);
+            resp.mPromise.set_exception(std::current_exception());
         }
-        catch (...)
-        {
-            auto const exception = std::current_exception();
-            TLLM_LOG_ERROR("Unknown exception in sendAndRemoveResponse for request id: %ld", id);
-            discardTransferState(id);
-            failResponse(resp, exception);
-        }
-        releasePinnedBlocks(resp);
     }
 
     void asyncSendAndRemoveResponse(RequestIdType id, Response resp) noexcept
     {
-        try
-        {
-            std::unique_lock lock(mAsyncSendResource.mMtxForQueue);
-            mAsyncSendResource.mSendQueue.emplace_back(std::move(resp));
-            mAsyncSendResource.mCVforQueue.notify_one();
-        }
-        catch (std::exception const& err)
-        {
-            TLLM_LOG_ERROR("Failed to queue asynchronous KV cache send for request %zu: %s", id, err.what());
-            discardTransferState(id);
-            failResponse(resp, std::current_exception());
-        }
-        catch (...)
-        {
-            TLLM_LOG_ERROR("Unknown error while queueing asynchronous KV cache send for request %zu", id);
-            discardTransferState(id);
-            failResponse(resp, std::current_exception());
-        }
+        std::unique_lock lk(mAsyncSendResource.mMtxForQueue);
+        mAsyncSendResource.mSendQueue.emplace_back(std::move(resp));
+        mAsyncSendResource.mCVforQueue.notify_one();
     }
 
-    void sendResponse(RequestIdType reqId)
+    void sendResponse(std::map<RequestIdType, CacheSender::Impl::Response>::iterator it)
     {
-        bool isReady = true;
-        bool allCounterpartsReady = false;
-        std::optional<Response> cancelledResponse;
+        auto reqId = mCurrentRequest.value();
+        auto count = --mRemainSendCount[reqId];
+        TLLM_CHECK(count >= 0);
+        if (count == 0)
         {
-            std::scoped_lock lock(mSenderMutex);
-            TLLM_CHECK(mCurrentRequest.has_value() && mCurrentRequest.value() == reqId);
-            auto responseIt = mReadyResponses.find(reqId);
-            bool const isCancelled = mCancelledRequests.find(reqId) != mCancelledRequests.end();
-            TLLM_CHECK(responseIt != mReadyResponses.end() || isCancelled);
-            auto countIt = mRemainSendCount.find(reqId);
-            TLLM_CHECK(countIt != mRemainSendCount.end());
-            auto const count = --countIt->second;
-            TLLM_CHECK(count >= 0);
-            if (isCancelled && responseIt != mReadyResponses.end())
-            {
-                cancelledResponse.emplace(std::move(responseIt->second));
-                mReadyResponses.erase(responseIt);
-            }
-            if (count > 0)
-            {
-                mCurrentRequest = std::nullopt;
-            }
-            else
-            {
-                mRemainSendCount.erase(countIt);
-                isReady = !isCancelled;
-                allCounterpartsReady = true;
-            }
-        }
+            mRemainSendCount.erase(reqId);
 
-        if (cancelledResponse.has_value())
-        {
-            failResponse(*cancelledResponse,
-                std::make_exception_ptr(TLLM_REQUEST_EXCEPTION(reqId, common::RequestErrorCode::kNETWORK_ERROR,
-                    "KV cache transfer for request %zu was cancelled", reqId)));
-        }
-        if (!allCounterpartsReady)
-        {
-            return;
-        }
+            // Check if the request is cancelled
+            bool isReady = true;
+            {
+                std::scoped_lock lk(mSenderMutex);
+                if (mCancelledRequests.find(reqId) != mCancelledRequests.end())
+                {
+                    isReady = false;
+                }
+            }
+            sendReadySignal(reqId, isReady);
 
-        // Keep mCurrentRequest set while notifying the peer so cancellation cannot change the decision after it has
-        // been made. The network operation must not run under mSenderMutex.
-        sendReadySignal(reqId, isReady);
-
-        Response response;
-        {
-            std::scoped_lock lock(mSenderMutex);
-            auto it = mReadyResponses.find(reqId);
             if (isReady)
             {
-                TLLM_CHECK(it != mReadyResponses.end());
-                response = std::move(it->second);
-                mReadyResponses.erase(it);
-            }
-            mCancelledRequests.erase(reqId);
-            mCurrentRequest = std::nullopt;
-        }
-
-        if (isReady)
-        {
-            if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
-            {
-                // Our NIXL implementation only supports recv and send in the same thread. Using ZMQ for the control
-                // path may avoid this limitation.
-                sendAndRemoveResponse(reqId, std::move(response));
+                if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
+                {
+                    // our nixl impl seems only support recv and send in the same thread
+                    //  if we use zmq as control path, we may avoid this issue
+                    sendAndRemoveResponse(it->first, std::move(it->second));
+                }
+                else
+                {
+                    // if we send data in another thread, multiple rank may send data for different requests at the same
+                    // time with gen DP case.
+                    asyncSendAndRemoveResponse(it->first, std::move(it->second));
+                }
+                removeResponse(it);
             }
             else
             {
-                // If we send data in another thread, multiple ranks may send data for different requests at the same
-                // time with generation attention DP.
-                asyncSendAndRemoveResponse(reqId, std::move(response));
+                // TODO: if the generation does not require the kv cache, the request will
+                // not be removed from mCancelledRequests. This should be handled by timeout.
+                auto const cancelledReqId = mCurrentRequest.value();
+                Response cancelledResponse;
+                {
+                    std::scoped_lock lkResp(mSenderMutex);
+                    auto it = mReadyResponses.find(cancelledReqId);
+                    TLLM_CHECK(it != mReadyResponses.end());
+                    // Move out before erasing so the promise survives the
+                    // map cleanup and can be resolved (vs. destroyed unfulfilled,
+                    // which would surface as std::future_error: Broken promise).
+                    cancelledResponse = std::move(it->second);
+                    mReadyResponses.erase(it);
+                    mCancelledRequests.erase(cancelledReqId);
+                    mRemainSendCount.erase(cancelledReqId);
+                }
+                cancelledResponse.mPromise.set_exception(std::make_exception_ptr(
+                    TLLM_REQUEST_EXCEPTION(cancelledReqId, common::RequestErrorCode::kNETWORK_ERROR,
+                        "KV cache transfer for request %zu was cancelled", cancelledReqId)));
+                mCurrentRequest = std::nullopt;
+
+                if (mReadyResponses.empty())
+                {
+                    std::unique_lock lk(mCondMutex);
+                    mAnyReady = false;
+                }
             }
         }
-        else
-        {
-            discardTransferState(reqId);
-        }
-    }
-
-    void sendSyncFromReuseTree(RequestIdType requestId)
-    {
-        TransferSession* session = nullptr;
-        {
-            std::unique_lock<std::mutex> lk(mMtxForMap);
-            auto it = mRequestToSession.find(requestId);
-            TLLM_CHECK(it != mRequestToSession.end());
-            session = std::addressof(it->second);
-        }
-        // READY was already sent by response(); the receiver consumes exactly one per transfer.
-        mCacheTransferLayer.format(*session);
-    }
-
-    // Pin the requested chain in the reuse tree; an empty result means no full match.
-    // The caller must unpin once the transfer settles.
-    std::vector<kv_cache_manager::KVCacheBlock::IdType> pinReuseTreeBlocks(RequestIdType requestId)
-    {
-        std::unique_lock<std::mutex> lk(mMtxForMap);
-        auto it = mRequestToSession.find(requestId);
-        auto const& lastBlockKey = it->second.getLastBlockKey();
-        auto* cacheManager = mCacheTransferLayer.getCacheManager();
-        auto windowSize = cacheManager->getBlockManager().getWindowSizesMetadata().begin()->first;
-        std::vector<kv_cache_manager::KVCacheBlock::IdType> pinnedIds;
-        auto lastBlock = cacheManager->findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize, pinnedIds);
-        if (lastBlock == nullptr)
-        {
-            return {};
-        }
-        return pinnedIds;
+        mCurrentRequest = std::nullopt;
     }
 
     void response() noexcept
     {
-        std::exception_ptr responseException;
         try
         {
             tensorrt_llm::common::setThreadName("dataTransResp");
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            while (true)
+            while (!mTerminate || !mAnyReady)
             {
+                if (!mAnyReady)
+                {
+                    std::unique_lock lk(mCondMutex);
+                    mSenderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                }
                 if (mTerminate)
                 {
                     break;
                 }
-
-                // Arbitrary transfers arrive without a pre-registered response; do not gate on
-                // mReadyResponses.
-                auto requestInfo = recvRequestInfo();
-                if (!requestInfo.has_value() || mTerminate || !mManager->isRunning())
+                if (!mReadyResponses.empty())
                 {
-                    break;
-                }
-                auto const reqId = requestInfo->getRequestId();
-
-                if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
-                {
-                    mRemainSendCount[reqId] = getCounterpartsCount(reqId);
-                }
-
-                if (requestInfo->isArbitraryTransfer())
-                {
-                    // No LlmRequest will ever be registered; serve from the reuse tree off-thread.
+                    auto requestInfo = recvRequestInfo();
+                    if (!requestInfo.has_value() || mTerminate || !mManager->isRunning())
                     {
-                        std::scoped_lock lock(mSenderMutex);
+                        return;
+                    }
+                    auto reqId = requestInfo->getRequestId();
+
+                    {
+                        std::scoped_lock lk(mSenderMutex);
                         mCurrentRequest = reqId;
                     }
-                    auto countIt = mRemainSendCount.find(reqId);
-                    auto const count = --countIt->second;
-                    TLLM_CHECK(count >= 0);
-                    if (count == 0)
+
+                    if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
                     {
-                        mRemainSendCount.erase(countIt);
-                        auto pinnedIds = pinReuseTreeBlocks(reqId);
-                        if (pinnedIds.empty())
-                        {
-                            TLLM_LOG_ERROR(
-                                "Requested blocks do not exist in the source's reuse tree (request id: %lu). Notifying "
-                                "receiver.",
-                                reqId);
-                            sendReadySignal(reqId, false);
-                            discardTransferState(reqId);
-                        }
-                        else
-                        {
-                            sendReadySignal(reqId, true);
-                            std::promise<void> promise;
-                            // Id-only response: the reuse-tree path has no LlmRequest.
-                            Response resp{reqId, std::move(promise), std::move(pinnedIds)};
-                            if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
-                            {
-                                sendAndRemoveResponse(reqId, std::move(resp));
-                            }
-                            else
-                            {
-                                asyncSendAndRemoveResponse(reqId, std::move(resp));
-                            }
-                        }
+                        mRemainSendCount[reqId] = getCounterpartsCount(reqId);
                     }
-                    {
-                        std::scoped_lock lock(mSenderMutex);
-                        mCurrentRequest = std::nullopt;
-                    }
+                }
+                auto it = getCurrentResponse();
+                if (it != mReadyResponses.end())
+                {
+                    sendResponse(it);
                 }
                 else
                 {
-                    // The RequestInfo may race ahead of sendAsync; wait for the specific response.
+                    auto it = getCurrentResponse();
+                    while (it == mReadyResponses.end())
                     {
-                        std::unique_lock lock(mSenderMutex);
-                        mCurrentRequest = reqId;
-                        mSenderCv.wait(lock,
-                            [this, reqId]()
-                            {
-                                return mTerminate || mReadyResponses.find(reqId) != mReadyResponses.end()
-                                    || mCancelledRequests.find(reqId) != mCancelledRequests.end();
-                            });
+                        std::unique_lock lk(mCondMutex);
+                        mSenderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
                         if (mTerminate)
                         {
-                            mCurrentRequest = std::nullopt;
                             break;
                         }
+                        it = getCurrentResponse();
                     }
-                    sendResponse(reqId);
+                    if (mTerminate || it == mReadyResponses.end())
+                    {
+                        break;
+                    }
+                    sendResponse(it);
                 }
             }
         }
         catch (std::exception const& err)
         {
             TLLM_LOG_ERROR("Exception in CacheSender response: %s", err.what());
-            responseException = std::current_exception();
+            for (auto& it : mReadyResponses)
+            {
+                it.second.mPromise.set_exception(std::current_exception());
+            }
         }
-        catch (...)
-        {
-            TLLM_LOG_ERROR("Unknown exception in CacheSender response");
-            responseException = std::current_exception();
-        }
-
-        if (!responseException)
-        {
-            responseException
-                = std::make_exception_ptr(std::runtime_error("CacheSender terminated before response completed"));
-        }
-        {
-            std::scoped_lock lock(mSenderMutex);
-            mTerminate = true;
-        }
-        mSenderCv.notify_all();
-        failPendingResponses(responseException);
     }
 
     void terminate()
     {
         {
-            std::scoped_lock lock(mSenderMutex);
+            std::unique_lock lk(mCondMutex);
             mTerminate = true;
         }
-        if (common::getEnvDisaggEnableInflightCancel())
-        {
-            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-            for (auto& [id, flag] : mInFlightCancelFlags)
-            {
-                flag->store(true, std::memory_order_relaxed);
-            }
-        }
-        // Wake the sender loop and make in-flight agent transfers observe termination through
-        // their per-request cancellation flags.
+        // We don't have to wait for the future. If another thread is sending data, it won't pay attention
+        // to the terminate flag.
         mSenderCv.notify_all();
-        if (mResponseFuture.valid())
-        {
-            mResponseFuture.get();
-        }
-
-        std::deque<Response> pendingAsyncResponses;
-        {
-            std::scoped_lock lock(mAsyncSendResource.mMtxForQueue);
-            mAsyncSendResource.mTerminate = true;
-            pendingAsyncResponses.swap(mAsyncSendResource.mSendQueue);
-        }
+        mAsyncSendResource.mTerminate = true;
         mAsyncSendResource.mCVforQueue.notify_all();
         for (auto& future : mAsyncSendFutures)
         {
             future.get();
         }
-        auto const exception
-            = std::make_exception_ptr(std::runtime_error("CacheSender terminated before asynchronous send completed"));
-        for (auto& response : pendingAsyncResponses)
+        if (mResponseFuture.valid())
         {
-            failResponse(response, exception);
+            mResponseFuture.get();
         }
     }
 
-    void failResponse(Response& response, std::exception_ptr const& exception) noexcept
+    void removeResponse(std::map<RequestIdType, Response>::iterator it)
     {
-        try
         {
-            response.mPromise.set_exception(exception);
+            std::scoped_lock lkResp(mSenderMutex);
+            mReadyResponses.erase(it);
         }
-        catch (std::future_error const& err)
+        if (mReadyResponses.empty())
         {
-            TLLM_LOG_ERROR("Failed to set CacheSender response exception: %s", err.what());
+            std::unique_lock lkCond(mCondMutex);
+            mAnyReady = false;
         }
-        releasePinnedBlocks(response);
     }
 
-    void failPendingResponses(std::exception_ptr const& exception) noexcept
+    [[nodiscard]] RequestIdType getCurrentRequestId() const
     {
-        std::map<RequestIdType, Response> pendingResponses;
-        {
-            std::scoped_lock lock(mSenderMutex);
-            pendingResponses.swap(mReadyResponses);
-            mCurrentRequest = std::nullopt;
-            mCancelledRequests.clear();
-            mRemainSendCount.clear();
-        }
-        for (auto& entry : pendingResponses)
-        {
-            failResponse(entry.second, exception);
-        }
+        return mCurrentRequest.value();
+    }
+
+    [[nodiscard]] std::map<RequestIdType, Response>::iterator getCurrentResponse()
+    {
+        std::scoped_lock lk(mSenderMutex);
+        return mReadyResponses.find(getCurrentRequestId());
     }
 
 public:
     void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
-        std::vector<SizeType32> rnnLayerNumPerPP, tensorrt_llm::DataType convStateDataType,
-        tensorrt_llm::DataType ssmStateDataType)
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType)
     {
         mCacheTransferLayer.setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
         mSelfState.setCacheState(mCacheTransferLayer.getCacheState());
@@ -1098,9 +751,9 @@ private:
     std::optional<RequestIdType> mCurrentRequest;
     std::set<LlmRequest::RequestIdType> mCancelledRequests;
     std::map<RequestIdType, Response> mReadyResponses;
-    std::mutex mSenderMutex;
-    std::atomic<bool> mTerminate{false};
-    std::condition_variable mSenderCv;
+    std::mutex mSenderMutex, mCondMutex;
+    std::atomic<bool> mAnyReady{false}, mTerminate{false};
+    std::condition_variable mSenderCv, mResponderCv;
     std::future<void> mResponseFuture;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
     AsyncSendResource mAsyncSendResource;
@@ -1114,21 +767,16 @@ private:
     std::mutex mMtxForMap;
     runtime::BufferManager mBufferManager;
     std::ofstream mMeasuresFile;
-    std::mutex mInFlightCancelMutex;
-    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<std::atomic<bool>>> mInFlightCancelFlags;
-    std::string mInstanceId;
 };
 
 class CacheReceiver::Impl
 {
 public:
-    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
-        std::string instanceId = "")
+    Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
         : mManager{manager}
         , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
         , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
-        , mInstanceId{std::move(instanceId)}
     {
         TLLM_CHECK(mManager);
         TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
@@ -1166,16 +814,9 @@ public:
                 mRequestFutures.emplace_back(std::move(requestFuture));
             }
             auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
-            std::shared_ptr<std::atomic<bool>> cancelFlag;
-            if (common::getEnvDisaggEnableInflightCancel())
-            {
-                cancelFlag = std::make_shared<std::atomic<bool>>(false);
-                std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-                mInFlightCancelFlags[llmRequest->mRequestId] = cancelFlag;
-            }
             {
                 std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
-                asyncResource->mRequestsQueue.emplace_back(llmRequest, std::move(promise), cancelFlag);
+                asyncResource->mRequestsQueue.emplace_back(llmRequest, std::move(promise));
             }
             asyncResource->mCVforQueue.notify_all();
             return future;
@@ -1188,34 +829,22 @@ public:
 
     void receiveSync(TransferSession& session)
     {
-        try
+        mCacheTransferLayer.unformat(session);
+        if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
-            mCacheTransferLayer.unformat(session);
-            if (!common::getEnvKVCacheTimeOutputPath().empty())
+            std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
+            if (!mMeasuresFile.is_open())
             {
-                std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
-                if (!mMeasuresFile.is_open())
-                {
-                    auto outputPath = getTransferOutputPath("recv", mInstanceId);
-                    mMeasuresFile.open(outputPath);
-                    TLLM_CHECK_WITH_INFO(mMeasuresFile.is_open(), "Failed to open transfer output file: %s",
-                        outputPath.string().c_str());
-                }
-                session.exportMeasure(mMeasuresFile, false);
+                auto outputPath = getTransferOutputPath("recv");
+                mMeasuresFile.open(outputPath);
+                TLLM_CHECK_WITH_INFO(
+                    mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
             }
-            session.releaseReservedRecvBuffers();
-        }
-        catch (...)
-        {
-            if (common::getEnvDisaggEnableInflightCancel())
-            {
-                session.poisonReservedRecvBuffers();
-            }
-            throw;
+            session.exportMeasure(mMeasuresFile, false);
         }
     }
 
-    TransferSession sendRequestInfo(LlmRequest const& llmRequest, std::atomic<bool> const* perRequestCancel = nullptr)
+    TransferSession sendRequestInfo(LlmRequest const& llmRequest)
     {
         uint64_t requestId = llmRequest.getContextPhaseParams().value().getReqId();
         auto const& contextState = llmRequest.getDataTransceiverState();
@@ -1228,58 +857,35 @@ public:
         if (!mCacheTransferLayer.getCacheManager()->getBlockManager().isVariableWindow())
         {
             auto* cacheManager = mCacheTransferLayer.getCacheManager();
+            auto beam = 0;
             auto const srcPpSize = destCacheState.getParallelConfig().mPipelineParallelism;
             auto requestedBlockRange = getBlockRangeForReceiving(cacheManager, llmRequest,
                 destCacheState.getEnableBlockReuse(), destCacheState.getEnablePartialReuse(),
                 /*recvSideHasCP=*/false, srcPpSize);
 
+            auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
+            auto lastBlockKey
+                = BlockKey(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
+            auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+            SizeType32 startTokenIdx = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
+            SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
+            auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
+            lastBlockKey.extraKeys = std::move(extraKeys);
+            // Compute indexFromEnd from the number of requested blocks
             int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
-            // An empty Helix CP rank owns zero KV blocks for this sequence (fewer blocks than
-            // cp_size). It still sends a RequestInfo so the context's per-request counterpart count
-            // is satisfied, but requests zero blocks: the default RequestInfo (indexFromEnd=0, empty
-            // lastBlockKey) is used and the context transmits nothing to it.
-            if (requestedBlockSize > 0)
-            {
-                auto const beam = 0;
-                auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
-                auto lastBlockKey = BlockKey(
-                    llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
-                auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
-                SizeType32 startTokenIdx
-                    = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
-                SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
-                auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
-                lastBlockKey.extraKeys = std::move(extraKeys);
-                int32_t indexFromEnd = requestedBlockSize - 1;
+            TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
+            int32_t indexFromEnd = requestedBlockSize - 1;
 
-                requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
-            }
+            requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
         }
-        // The state's provenance marks llmRequest-agnostic transfers: only
-        // getSerializedDataTransceiverState sets it; context responses leave it unset.
-        requestInfo.setIsArbitraryTransfer(contextState.isArbitraryTransferState());
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
-        std::vector<BufferIndexHolder> recvHolders;
         std::vector<std::optional<size_t>> cacheBufferIds;
         if (agentConnectionManager)
         {
-            auto const* bufferCancel = common::getEnvDisaggEnableInflightCancel() ? perRequestCancel : nullptr;
-            auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
-            recvHolders.reserve(managers.size());
-            cacheBufferIds.reserve(managers.size());
-            for (auto& cacheTransBufferManager : managers)
+            for (auto& cacheTransBufferManager : agentConnectionManager->getCacheTransBufferManagers())
             {
-                auto rawIdx = cacheTransBufferManager->assignBufferIndexForRecv(bufferCancel);
-                recvHolders.emplace_back(*cacheTransBufferManager, rawIdx, /*isRecv=*/true);
-                if (rawIdx.has_value())
-                {
-                    cacheBufferIds.push_back(static_cast<size_t>(rawIdx.value()));
-                }
-                else
-                {
-                    cacheBufferIds.push_back(std::nullopt);
-                }
+                cacheBufferIds.push_back(cacheTransBufferManager->assignBufferIndexForRecv());
             }
             TLLM_CHECK(!cacheBufferIds.empty());
         }
@@ -1308,102 +914,70 @@ public:
             allConnections.emplace_back(connection);
         }
 
-        if (common::getEnvDisaggEnableInflightCancel() && perRequestCancel != nullptr
-            && perRequestCancel->load(std::memory_order_relaxed))
+        for (size_t ci = 0; ci < allCounterparts.size(); ci++)
         {
-            TLLM_THROW("KV cache receive request cancelled before publishing receive buffers");
-        }
+            auto rank = allCounterparts[ci];
+            auto const* connection = connections.at(rank);
 
-        try
-        {
-            for (size_t ci = 0; ci < allCounterparts.size(); ci++)
+            bool isKvCounterpart
+                = std::find(kvCounterParts.begin(), kvCounterParts.end(), rank) != kvCounterParts.end();
+            bool isRnnCounterpart
+                = hasRnn && std::find(rnnCounterParts.begin(), rnnCounterParts.end(), rank) != rnnCounterParts.end();
+
+            if (agentConnectionManager)
             {
-                auto rank = allCounterparts[ci];
-                auto const* connection = connections.at(rank);
-
-                bool isKvCounterpart
-                    = std::find(kvCounterParts.begin(), kvCounterParts.end(), rank) != kvCounterParts.end();
-                bool isRnnCounterpart = hasRnn
-                    && std::find(rnnCounterParts.begin(), rnnCounterParts.end(), rank) != rnnCounterParts.end();
-
-                if (agentConnectionManager)
+                auto idsForRank = cacheBufferIds;
+                auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
+                for (size_t i = 0; i < idsForRank.size(); i++)
                 {
-                    auto idsForRank = cacheBufferIds;
-                    auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
-                    for (size_t i = 0; i < idsForRank.size(); i++)
+                    auto kind = managers[i]->getBufferKind();
+                    bool include = (kind != BufferKind::kRNN) ? isKvCounterpart : isRnnCounterpart;
+                    if (!include)
                     {
-                        auto kind = managers[i]->getBufferKind();
-                        bool include = (kind != BufferKind::kRNN) ? isKvCounterpart : isRnnCounterpart;
-                        if (!include)
-                        {
-                            idsForRank[i] = std::nullopt;
-                        }
+                        idsForRank[i] = std::nullopt;
                     }
-
-                    int validConnectionIdx = 0;
-                    if (isKvCounterpart)
-                    {
-                        auto kvCpIdx
-                            = std::find(kvCounterParts.begin(), kvCounterParts.end(), rank) - kvCounterParts.begin();
-                        auto [pickUpIdx, localRankIdx] = mCacheTransferLayer.getKvFormatter()->pickRecvConnections(
-                            allCounterparts.size(), mSelfState.getCacheState().value(),
-                            mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterparts);
-                        validConnectionIdx
-                            = std::find(localRankIdx.begin(), localRankIdx.end(), kvCpIdx) - localRankIdx.begin();
-                    }
-                    else if (isRnnCounterpart)
-                    {
-                        auto rnnTargetInfo = executor::kv_cache::targetIRanksForRnn(destCacheState,
-                            mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx());
-                        auto rnnCpIdx
-                            = std::find(rnnCounterParts.begin(), rnnCounterParts.end(), rank) - rnnCounterParts.begin();
-                        auto [pickUpIdx, localRankIdx]
-                            = cache_formatter_utils::pickRecvConnections(rnnCounterParts.size(),
-                                mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx(),
-                                destCacheState, rnnCounterParts, rnnTargetInfo);
-                        validConnectionIdx
-                            = std::find(localRankIdx.begin(), localRankIdx.end(), rnnCpIdx) - localRankIdx.begin();
-                    }
-
-                    auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
-                    TLLM_CHECK(agentConnection != nullptr);
-
-                    const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                        ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx, perRequestCancel);
                 }
-                else
+
+                int validConnectionIdx = 0;
+                if (isKvCounterpart)
                 {
-                    sendRequestInfo(connection, requestInfo);
+                    auto kvCpIdx
+                        = std::find(kvCounterParts.begin(), kvCounterParts.end(), rank) - kvCounterParts.begin();
+                    auto [pickUpIdx, localRankIdx] = mCacheTransferLayer.getKvFormatter()->pickRecvConnections(
+                        allCounterparts.size(), mSelfState.getCacheState().value(),
+                        mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterparts);
+                    validConnectionIdx
+                        = std::find(localRankIdx.begin(), localRankIdx.end(), kvCpIdx) - localRankIdx.begin();
                 }
+                else if (isRnnCounterpart)
+                {
+                    auto rnnTargetInfo = executor::kv_cache::targetIRanksForRnn(destCacheState,
+                        mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx());
+                    auto rnnCpIdx
+                        = std::find(rnnCounterParts.begin(), rnnCounterParts.end(), rank) - rnnCounterParts.begin();
+                    auto [pickUpIdx, localRankIdx] = cache_formatter_utils::pickRecvConnections(rnnCounterParts.size(),
+                        mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx(),
+                        destCacheState, rnnCounterParts, rnnTargetInfo);
+                    validConnectionIdx
+                        = std::find(localRankIdx.begin(), localRankIdx.end(), rnnCpIdx) - localRankIdx.begin();
+                }
+
+                auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
+                TLLM_CHECK(agentConnection != nullptr);
+
+                const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
+                    ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx);
             }
-
-            auto const& resource = getReceiveCacheResource(llmRequest);
-            TransferSession session = perRequestCancel != nullptr
-                ? TransferSession(std::move(allConnections),
-                    DataContext{tagFromRequestId(requestId), *perRequestCancel}, std::move(allCounterparts), mSelfState,
-                    contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(),
-                    requestInfo.getLastBlockKey(), &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty())
-                : TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
-                    std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
-                    requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
-                    !common::getEnvKVCacheTimeOutputPath().empty());
-            if (!recvHolders.empty())
+            else
             {
-                session.setReservedRecvBuffers(std::move(recvHolders));
+                sendRequestInfo(connection, requestInfo);
             }
-            return session;
         }
-        catch (...)
-        {
-            if (common::getEnvDisaggEnableInflightCancel())
-            {
-                for (auto& holder : recvHolders)
-                {
-                    holder.poison();
-                }
-            }
-            throw;
-        }
+        auto const& resource = getReceiveCacheResource(llmRequest);
+        return TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
+            std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
+            requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
+            !common::getEnvKVCacheTimeOutputPath().empty());
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -1442,27 +1016,11 @@ public:
         std::string processInfo = kDefaultProcessInfo;
         if (common::getEnvRequestKVCacheConcurrent())
         {
-            auto const& commState = llmRequest.getDataTransceiverState().getCommState();
-            if (!commState.has_value())
-            {
-                TLLM_LOG_WARNING("Cannot cancel request %zu: the request has no data-transceiver communication state",
-                    llmRequest.mRequestId);
-                return false;
-            }
-            processInfo = commState->toString();
-        }
-
-        auto const resourceIt = mInstanceToAsyncResource.find(processInfo);
-        if (resourceIt == mInstanceToAsyncResource.end())
-        {
-            TLLM_LOG_WARNING("Cannot cancel request %zu: receive worker %s is not registered", llmRequest.mRequestId,
-                processInfo.c_str());
-            return false;
+            processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
         }
 
         bool isCancelled = false;
-        auto& asyncResource = resourceIt->second;
-        std::optional<LlmRequest::RequestIdType> queuedCancelledReqId;
+        auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
         {
             std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
             auto it = std::find_if(asyncResource->mRequestsQueue.begin(), asyncResource->mRequestsQueue.end(),
@@ -1489,116 +1047,45 @@ public:
                 }
                 asyncResource->mRequestsQueue.erase(it);
                 isCancelled = true;
-                queuedCancelledReqId = llmRequest.mRequestId;
             }
-        }
-        if (common::getEnvDisaggEnableInflightCancel() && queuedCancelledReqId.has_value())
-        {
-            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-            mInFlightCancelFlags.erase(*queuedCancelledReqId);
-        }
-        if (!isCancelled && common::getEnvDisaggEnableInflightCancel())
-        {
-            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-            auto flagIt = mInFlightCancelFlags.find(llmRequest.mRequestId);
-            if (flagIt != mInFlightCancelFlags.end())
+            else
             {
-                flagIt->second->store(true, std::memory_order_relaxed);
-                isCancelled = true;
+                TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
             }
-        }
-        if (!isCancelled)
-        {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
         }
         return isCancelled;
     }
 
-    enum class ReadySignalResult
+    bool receiveReadySignal(TransferSession& session)
     {
-        kReady,
-        kNotReady,
-        kMixed,
-        kCancelled,
-    };
-
-    ReadySignalResult receiveReadySignalDetailed(TransferSession& session, std::atomic<bool> const& perRequestCancel)
-    {
+        bool isReadyFinal = true;
         bool isReady = false;
-        bool anyReady = false;
-        bool anyNotReady = false;
         auto const& connections = session.getConnections();
+
         for (size_t i = 0; i < connections.size(); i++)
         {
-            if (perRequestCancel.load(std::memory_order_relaxed))
-            {
-                return ReadySignalResult::kCancelled;
-            }
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
-                auto ready = agentConnection->recvReadySignalWithStatus(
-                    executor::kv_cache::DataContext{session.getDataContext().getTag(), perRequestCancel});
-                if (!ready.has_value())
-                {
-                    return ReadySignalResult::kCancelled;
-                }
-                isReady = ready.value();
+                isReady = agentConnection->recvReadySignal(
+                    executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG, mTerminate});
             }
             else
             {
                 connections.at(i)->recv(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
-                if (perRequestCancel.load(std::memory_order_relaxed))
-                {
-                    return ReadySignalResult::kCancelled;
-                }
             }
-            anyReady |= isReady;
-            anyNotReady |= !isReady;
+            isReadyFinal &= isReady;
         }
 
-        if (anyReady && anyNotReady)
-        {
-            return ReadySignalResult::kMixed;
-        }
-        return anyReady ? ReadySignalResult::kReady : ReadySignalResult::kNotReady;
-    }
-
-    bool receiveReadySignal(TransferSession& session)
-    {
-        auto const result = receiveReadySignalDetailed(session, mTerminate);
-        if (result == ReadySignalResult::kNotReady)
-        {
-            session.releaseReservedRecvBuffers();
-        }
-        else if (result == ReadySignalResult::kMixed)
-        {
-            if (common::getEnvDisaggEnableInflightCancel())
-            {
-                session.poisonReservedRecvBuffers();
-            }
-            else
-            {
-                session.releaseReservedRecvBuffers();
-            }
-        }
-        return result == ReadySignalResult::kReady;
+        return isReadyFinal;
     }
 
     ~Impl()
     {
         mTerminate.store(true);
-        if (common::getEnvDisaggEnableInflightCancel())
-        {
-            std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-            for (auto& [id, flag] : mInFlightCancelFlags)
-            {
-                flag->store(true, std::memory_order_relaxed);
-            }
-        }
         for (auto&& [processInfo, asyncResource] : mInstanceToAsyncResource)
         {
             asyncResource->mTerminate = true;
@@ -1611,105 +1098,29 @@ public:
     }
 
 private:
-    void requestSync(LlmRequest& llmRequest, std::atomic<bool> const& perRequestCancel)
-    {
-        auto const requestId = llmRequest.mRequestId;
-        auto const contextRequestId = llmRequest.getContextPhaseParams().value().getReqId();
-        char const* phase = "request-info";
-        TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu started.", requestId, contextRequestId);
-        if (llmRequest.getKvCacheTransferStart() == LlmRequest::TimePoint{})
-        {
-            llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
-        }
-
-        std::optional<TransferSession> session;
-        try
-        {
-            if (perRequestCancel.load(std::memory_order_relaxed) || mTerminate.load(std::memory_order_relaxed))
-            {
-                TLLM_THROW("KV cache receive request %zu cancelled before request-info", requestId);
-            }
-            TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
-                contextRequestId, phase);
-            auto const* cancelFlag = common::getEnvDisaggEnableInflightCancel() ? &perRequestCancel : nullptr;
-            session.emplace(sendRequestInfo(llmRequest, cancelFlag));
-            session->setTime(TransferSession::kTimeRequestInfo);
-            TLLM_LOG_DEBUG(
-                "KV cache receive request %zu, context request %zu phase=%s end.", requestId, contextRequestId, phase);
-
-            phase = "ready-signal";
-            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
-                contextRequestId, phase);
-            auto readyResult = receiveReadySignalDetailed(*session, perRequestCancel);
-            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s end: result=%d.", requestId,
-                contextRequestId, phase, static_cast<int>(readyResult));
-            if (readyResult == ReadySignalResult::kCancelled)
-            {
-                if (common::getEnvDisaggEnableInflightCancel())
-                {
-                    session->poisonReservedRecvBuffers();
-                }
-                TLLM_THROW("KV cache receive request %zu cancelled while waiting for the ready signal", requestId);
-            }
-            if (readyResult == ReadySignalResult::kNotReady)
-            {
-                session->releaseReservedRecvBuffers();
-                TLLM_THROW("KV cache receive request %zu was rejected by the context peer", requestId);
-            }
-            if (readyResult == ReadySignalResult::kMixed)
-            {
-                if (common::getEnvDisaggEnableInflightCancel())
-                {
-                    session->poisonReservedRecvBuffers();
-                }
-                else
-                {
-                    session->releaseReservedRecvBuffers();
-                }
-                TLLM_THROW("KV cache receive request %zu received inconsistent ready signals from its context peers",
-                    requestId);
-            }
-
-            phase = "transfer-completion-notification";
-            TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
-                contextRequestId, phase);
-            receiveSync(*session);
-            TLLM_LOG_DEBUG(
-                "KV cache receive request %zu, context request %zu phase=%s end.", requestId, contextRequestId, phase);
-            llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
-        }
-        catch (std::exception const& err)
-        {
-            if (common::getEnvDisaggEnableInflightCancel() && session.has_value())
-            {
-                session->poisonReservedRecvBuffers();
-            }
-            llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
-            TLLM_LOG_ERROR("KV cache receive request %zu, context request %zu failed in phase=%s: %s", requestId,
-                contextRequestId, phase, err.what());
-            throw;
-        }
-        catch (...)
-        {
-            if (common::getEnvDisaggEnableInflightCancel() && session.has_value())
-            {
-                session->poisonReservedRecvBuffers();
-            }
-            llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
-            TLLM_LOG_ERROR(
-                "KV cache receive request %zu, context request %zu failed in phase=%s with an unknown "
-                "exception",
-                requestId, contextRequestId, phase);
-            throw;
-        }
-
-        TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu completed.", requestId, contextRequestId);
-    }
-
     void requestSync(LlmRequest& llmRequest)
     {
-        requestSync(llmRequest, mTerminate);
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
+            llmRequest.getContextPhaseParams().value().getReqId());
+        llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
+        TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+        auto session = sendRequestInfo(llmRequest);
+        session.setTime(TransferSession::kTimeRequestInfo);
+        bool isReady = receiveReadySignal(session);
+        if (!isReady)
+        {
+            // Reuse the error state for the cancelled request.
+            llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+            llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+            return;
+        }
+        receiveSync(session);
+        llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
+            llmRequest.getContextPhaseParams().value().getReqId());
     }
 
     struct RequestAndPromise
@@ -1718,20 +1129,16 @@ private:
         // protects worker-side dereferences and the promise itself from premature destruction.
         std::shared_ptr<LlmRequest> mRequest;
         std::unique_ptr<std::promise<void>> mPromise;
-        std::shared_ptr<std::atomic<bool>> mCancelFlag;
 
         RequestAndPromise()
             : mRequest(nullptr)
             , mPromise(nullptr)
-            , mCancelFlag(nullptr)
         {
         }
 
-        RequestAndPromise(std::shared_ptr<LlmRequest> request, std::unique_ptr<std::promise<void>>&& promise,
-            std::shared_ptr<std::atomic<bool>> cancelFlag)
+        RequestAndPromise(std::shared_ptr<LlmRequest> request, std::unique_ptr<std::promise<void>>&& promise)
             : mRequest(std::move(request))
             , mPromise(std::move(promise))
-            , mCancelFlag(std::move(cancelFlag))
         {
         }
 
@@ -1740,7 +1147,6 @@ private:
         RequestAndPromise(RequestAndPromise&& other) noexcept
             : mRequest(std::move(other.mRequest))
             , mPromise(std::move(other.mPromise))
-            , mCancelFlag(std::move(other.mCancelFlag))
         {
         }
 
@@ -1756,7 +1162,6 @@ private:
 
                 mRequest = std::move(other.mRequest);
                 mPromise = std::move(other.mPromise);
-                mCancelFlag = std::move(other.mCancelFlag);
             }
             return *this;
         }
@@ -1800,9 +1205,7 @@ private:
                 try
                 {
                     TLLM_CHECK_WITH_INFO(requestAndPromise.mRequest != nullptr, "requestAndPromise.mRequest is null");
-                    auto const& cancelFlag
-                        = requestAndPromise.mCancelFlag != nullptr ? *requestAndPromise.mCancelFlag : mTerminate;
-                    requestSync(*requestAndPromise.mRequest, cancelFlag);
+                    requestSync(*requestAndPromise.mRequest);
                     requestAndPromise.mPromise->set_value();
                 }
                 catch (tensorrt_llm::common::RequestSpecificException const& err)
@@ -1821,27 +1224,14 @@ private:
                         requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
                     requestAndPromise.mPromise->set_exception(std::current_exception());
                 }
-                catch (...)
-                {
-                    TLLM_LOG_ERROR("Unknown exception in CacheReceiver request() loop");
-                    if (requestAndPromise.mPromise)
-                    {
-                        requestAndPromise.mPromise->set_exception(std::current_exception());
-                    }
-                }
-                if (common::getEnvDisaggEnableInflightCancel() && requestAndPromise.mRequest != nullptr)
-                {
-                    std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
-                    mInFlightCancelFlags.erase(requestAndPromise.mRequest->mRequestId);
-                }
             }
         }
     }
 
 public:
     void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
-        std::vector<SizeType32> rnnLayerNumPerPP, tensorrt_llm::DataType convStateDataType,
-        tensorrt_llm::DataType ssmStateDataType)
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType)
     {
         mCacheTransferLayer.setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
         mSelfState.setCacheState(mCacheTransferLayer.getCacheState());
@@ -1861,9 +1251,6 @@ private:
     std::ofstream mMeasuresFile;
     std::mutex mMeasuresFileMutex;
     std::atomic<bool> mTerminate{false};
-    std::mutex mInFlightCancelMutex;
-    std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<std::atomic<bool>>> mInFlightCancelFlags;
-    std::string mInstanceId;
 };
 
 void CacheSender::ImplDeleter::operator()(Impl* ptr)
@@ -1876,10 +1263,9 @@ void CacheReceiver::ImplDeleter::operator()(Impl* ptr)
     delete ptr;
 }
 
-CacheSender::CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex,
-    CacheTransferLayer cacheLayer, std::string instanceId)
-    : mImpl{
-        std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer), std::move(instanceId)))}
+CacheSender::CacheSender(
+    executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
+    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer)))}
 {
 }
 
@@ -1923,16 +1309,14 @@ void CacheSender::sendReadySignal(LlmRequest::RequestIdType requestId, bool isRe
 }
 
 void CacheSender::setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
-    std::vector<SizeType32> rnnLayerNumPerPP, tensorrt_llm::DataType convStateDataType,
-    tensorrt_llm::DataType ssmStateDataType)
+    std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
 {
     mImpl->setRnnConfig(std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType);
 }
 
-CacheReceiver::CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex,
-    CacheTransferLayer cacheLayer, std::string instanceId)
-    : mImpl{
-        std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer), std::move(instanceId)))}
+CacheReceiver::CacheReceiver(
+    executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
+    : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer)))}
 {
 }
 
@@ -1964,8 +1348,7 @@ bool CacheReceiver::receiveReadySignal(TransferSession& session)
 }
 
 void CacheReceiver::setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
-    std::vector<SizeType32> rnnLayerNumPerPP, tensorrt_llm::DataType convStateDataType,
-    tensorrt_llm::DataType ssmStateDataType)
+    std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
 {
     mImpl->setRnnConfig(std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType);
 }

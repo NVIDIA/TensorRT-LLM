@@ -18,7 +18,6 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/decoderState.h"
@@ -71,21 +70,21 @@ DecoderOutputBuffers::DecoderOutputBuffers(SizeType32 maxNumSequences, SizeType3
     auto constexpr TRTTokenIdType = runtime::TRTDataType<runtime::TokenIdType>::value;
 
     sequenceLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxNumSequences, maxBeamWidth}), tensorrt_llm::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxNumSequences, maxBeamWidth}), nvinfer1::DataType::kINT32);
 
-    finishedSumHost = BufferManager::pinned(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+    finishedSumHost = BufferManager::pinned(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
 
     newOutputTokensHost
         = BufferManager::pinned(ITensor::makeShape({maxTokensPerStep, maxNumSequences, maxBeamWidth}), TRTTokenIdType);
 
     cumLogProbsHost
-        = BufferManager::pinned(ITensor::makeShape({maxNumSequences, maxBeamWidth}), tensorrt_llm::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxNumSequences, maxBeamWidth}), nvinfer1::DataType::kFLOAT);
 
     logProbsHost = BufferManager::pinned(
-        ITensor::makeShape({maxNumSequences, maxBeamWidth, maxSeqLen}), tensorrt_llm::DataType::kFLOAT);
+        ITensor::makeShape({maxNumSequences, maxBeamWidth, maxSeqLen}), nvinfer1::DataType::kFLOAT);
 
     finishReasonsHost
-        = BufferManager::pinned(ITensor::makeShape({maxNumSequences, maxBeamWidth}), tensorrt_llm::DataType::kUINT8);
+        = BufferManager::pinned(ITensor::makeShape({maxNumSequences, maxBeamWidth}), nvinfer1::DataType::kUINT8);
 }
 
 void DecoderOutputBuffers::enableLookaheadDecoding(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep)
@@ -116,9 +115,9 @@ void DecoderOutputBuffers::setupSpeculativeDecoding(
         if (speculativeDecodingMode.variableDraftLength())
         {
             nextDraftTokensLengthsHost
-                = BufferManager::pinned(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+                = BufferManager::pinned(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
             prevDraftTokensLengthsHost
-                = BufferManager::pinned(ITensor::makeShape({maxNumSequences}), tensorrt_llm::DataType::kINT32);
+                = BufferManager::pinned(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
         }
     }
 }
@@ -308,18 +307,17 @@ DecoderSlotAsyncSend::~DecoderSlotAsyncSend()
 
 SlotDecoderBuffers::SlotDecoderBuffers(SizeType32 maxBeamWidth, SizeType32 maxSeqLen, BufferManager const& manager)
 {
-    outputIds = manager.gpu(ITensor::makeShape({maxBeamWidth, maxSeqLen}), tensorrt_llm::DataType::kINT32);
-    outputIdsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBeamWidth, maxSeqLen}), tensorrt_llm::DataType::kINT32);
+    outputIds = manager.gpu(ITensor::makeShape({maxBeamWidth, maxSeqLen}), nvinfer1::DataType::kINT32);
+    outputIdsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth, maxSeqLen}), nvinfer1::DataType::kINT32);
 
-    sequenceLengths = manager.gpu(ITensor::makeShape({maxBeamWidth}), tensorrt_llm::DataType::kINT32);
-    sequenceLengthsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth}), tensorrt_llm::DataType::kINT32);
+    sequenceLengths = manager.gpu(ITensor::makeShape({maxBeamWidth}), nvinfer1::DataType::kINT32);
+    sequenceLengthsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth}), nvinfer1::DataType::kINT32);
 
-    cumLogProbs = manager.gpu(ITensor::makeShape({maxBeamWidth}), tensorrt_llm::DataType::kFLOAT);
-    cumLogProbsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth}), tensorrt_llm::DataType::kFLOAT);
+    cumLogProbs = manager.gpu(ITensor::makeShape({maxBeamWidth}), nvinfer1::DataType::kFLOAT);
+    cumLogProbsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth}), nvinfer1::DataType::kFLOAT);
 
-    logProbs = manager.gpu(ITensor::makeShape({maxBeamWidth, maxSeqLen}), tensorrt_llm::DataType::kFLOAT);
-    logProbsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth, maxSeqLen}), tensorrt_llm::DataType::kFLOAT);
+    logProbs = manager.gpu(ITensor::makeShape({maxBeamWidth, maxSeqLen}), nvinfer1::DataType::kFLOAT);
+    logProbsHost = BufferManager::pinned(ITensor::makeShape({maxBeamWidth, maxSeqLen}), nvinfer1::DataType::kFLOAT);
 }
 
 } // namespace tensorrt_llm::batch_manager

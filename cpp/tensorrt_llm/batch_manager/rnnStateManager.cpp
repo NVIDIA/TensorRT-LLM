@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/utils/runtimeUtils.h"
 
@@ -81,7 +80,7 @@ RnnStateManager::RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runti
         {localNbLayers, mMaxNumSequences * mBeamSlotsPerSequence, convKernel - 1, rnnConvDimSize});
 
     mDtype = dataType;
-    mSsmCacheDtype = tensorrt_llm::DataType::kFLOAT;
+    mSsmCacheDtype = nvinfer1::DataType::kFLOAT;
 
     // Store RNN model config for CacheTransceiver
     mDState = stateSize;
@@ -118,7 +117,7 @@ RnnStateManager::RnnStateManager(SizeType32 maxNumSequences, tensorrt_llm::runti
 
 RnnStateManager::RnnStateManager(SizeType32 dState, SizeType32 dConv, SizeType32 numHeads, SizeType32 nGroups,
     SizeType32 headDim, SizeType32 maxBatchSize, WorldConfig const& worldConfig, int64_t stream,
-    tensorrt_llm::DataType dtype, tensorrt_llm::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers,
+    nvinfer1::DataType dtype, nvinfer1::DataType ssmCacheDtype, std::vector<SizeType32> const& ppLayers,
     SizeType32 numLayers)
     : mMaxNumSequences(maxBatchSize)
     , mMaxBeamWidth{1}
@@ -298,12 +297,12 @@ RnnStateManager::TensorPtr RnnStateManager::getSsmStates() const
     return pagedRnnStates;
 }
 
-tensorrt_llm::DataType RnnStateManager::getConvStateDataType() const noexcept
+nvinfer1::DataType RnnStateManager::getConvStateDataType() const noexcept
 {
     return mDtype;
 }
 
-tensorrt_llm::DataType RnnStateManager::getSsmStateDataType() const noexcept
+nvinfer1::DataType RnnStateManager::getSsmStateDataType() const noexcept
 {
     return mSsmCacheDtype;
 }

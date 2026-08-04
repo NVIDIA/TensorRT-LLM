@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
+#include "tensorrt_llm/runtime/tllmLogger.h"
 #include <chrono>
 #include <cmath>
 #include <memory> //@todo check the usage of this

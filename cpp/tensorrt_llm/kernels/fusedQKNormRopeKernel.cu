@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -174,17 +174,6 @@ __global__ void fusedQKNormRopeKernel(
     // pos_id is selected per rotary half-dim (interleaved mRoPE); for plain RoPE
     // selectMRopePosId always returns position_ids[tokenIdx].
 
-    // Hoist log2(base) and the loop-invariant constants out of the per-thread
-    // per-elem loop. powf(base, -2*hd/rd) == exp2f(-2*hd/rd * log2(base)); base
-    // and rotary_dim are kernel-uniform, so one MUFU.LG2 per warp instead of
-    // one per (thread, iter). Uses the fast __log2f intrinsic (a few ULPs of
-    // error, absorbed by bf16 downcast at store time).
-    float const neg2_log2base_over_rd = -2.0f * __log2f(base) / static_cast<float>(rotary_dim);
-    // rotary_dim is even by contract; when it's also a power of 2 (always in
-    // practice — 64/128/256) '% rotary_dim' becomes '& (rotary_dim - 1)'.
-    // The bool is warp-uniform → predicated select, no branch divergence.
-    int const rd_mask = rotary_dim - 1;
-    bool const rd_is_pow2 = ((rotary_dim & rd_mask) == 0);
     // TODO: cos sin calculation could be halved.
     if constexpr (interleave)
     {
@@ -202,7 +191,7 @@ __global__ void fusedQKNormRopeKernel(
 
             int dim_idx = laneId * numElemsPerThread + i;
             int half_dim = dim_idx / 2;
-            float freq = exp2f(static_cast<float>(half_dim) * neg2_log2base_over_rd);
+            float freq = powf(base, -2.0f * half_dim / static_cast<float>(rotary_dim));
 
             if (factor != 1.0f)
             {
@@ -243,9 +232,9 @@ __global__ void fusedQKNormRopeKernel(
             }
 
             int dim_idx = laneId * numElemsPerThread + i;
-            dim_idx = rd_is_pow2 ? ((dim_idx * 2) & rd_mask) : ((dim_idx * 2) % rotary_dim);
+            dim_idx = (dim_idx * 2) % rotary_dim;
             int half_dim = dim_idx / 2;
-            float freq = exp2f(static_cast<float>(half_dim) * neg2_log2base_over_rd);
+            float freq = powf(base, -2.0f * half_dim / static_cast<float>(rotary_dim));
 
             if (factor != 1.0f)
             {

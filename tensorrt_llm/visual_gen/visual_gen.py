@@ -19,7 +19,7 @@ import secrets
 import sys
 import weakref
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
 from tensorrt_llm._torch.visual_gen.executor import (
@@ -51,7 +51,7 @@ class VisualGenResult:
     A single instance backs both single-prompt and batch-prompt requests:
 
     - Single prompt: ``await handle`` resolves to a :class:`VisualGenOutput`.
-      Underlying-request failure raises.
+      Underlying-request failure raises :class:`RuntimeError`.
     - Batch prompt: ``await handle`` resolves to ``List[VisualGenOutput]``.
       Per-item or whole-batch failure never raises; failed items carry
       ``error != None`` (Option B semantics).
@@ -90,8 +90,8 @@ class VisualGenResult:
     async def aresult(self, timeout: Optional[float] = None):
         """Wait for the underlying request and return the resolved value.
 
-        For single-prompt requests, returns a :class:`VisualGenOutput`.
-        Underlying-request failure raises.
+        For single-prompt requests, returns a :class:`VisualGenOutput`. Raises
+        :class:`RuntimeError` on underlying-request failure.
 
         For batch-prompt requests, returns ``List[VisualGenOutput]``. Never
         raises; failed items carry ``error != None``.
@@ -156,30 +156,20 @@ class VisualGenResult:
     # ----- internals -----
 
     def _build_resolved(self, response: "DiffusionResponse"):
-        # Failure class travels on the result object, not on the public
-        # ``VisualGenOutput`` — no new public field for an error taxonomy.
-        self._error_type = getattr(response, "error_type", None)
         if self._batch_size is None:
             return to_visual_gen_output(response)
         return split_visual_gen_output(response, self._batch_size)
 
     def _resolved_value(self):
-        # For single prompts, surface engine-side failure as a built-in
-        # exception carrying the detail in its message: ``ValueError`` for
-        # client errors (unusable reference content, conditioning bounds) —
-        # uniform with the synchronous parameter validation at
-        # ``generate_async`` entry — ``MemoryError`` for capacity, and
-        # ``RuntimeError`` for anything unclassified. For batches, return the
+        # For single prompts, surface engine-side failure as
+        # ``RuntimeError``. Request-parameter validation is enforced
+        # synchronously at :meth:`VisualGen.generate_async` entry, so
+        # anything reaching this point is by definition a runtime
+        # failure from ``pipeline.infer()``. For batches, return the
         # list as-is so callers iterate per-item ``error``.
         if self._batch_size is None and isinstance(self._resolved, VisualGenOutput):
             if self._resolved.error is not None:
-                message = f"Generation failed: {self._resolved.error}"
-                error_type = getattr(self, "_error_type", None)
-                if error_type == "client":
-                    raise ValueError(message)
-                if error_type == "capacity":
-                    raise MemoryError(message)
-                raise RuntimeError(message)
+                raise RuntimeError(f"Generation failed: {self._resolved.error}")
         return self._resolved
 
 
@@ -293,16 +283,11 @@ class VisualGen:
 
     @property
     def default_params(self) -> "VisualGenParams":
-        """Returns a ``VisualGenParams`` with the loaded pipeline's defaults.
+        """Returns a ``VisualGenParams`` with all defaults resolved for the loaded pipeline.
 
         Universal fields (height, width, etc.) are filled from the
-        pipeline's defaults.  Pipelines with mode-dependent defaults
-        (e.g. Cosmos3, where text-to-image and video requests use
-        different resolutions) leave such fields as ``None``; they are
-        resolved per request from the output mode, so ``None`` here
-        means "the mode's default", not "unset".  All declared
-        ``extra_params`` keys are included with their defaults
-        (``None`` for params without one).
+        pipeline's defaults.  All declared ``extra_params`` keys are
+        included with their defaults (``None`` for params without one).
 
         Use this to inspect what the model will use, then modify and
         pass to ``generate()``::
@@ -342,6 +327,9 @@ class VisualGen:
             prompts, ``List[VisualGenOutput]`` of the same length.
 
         Raises:
+            RuntimeError: Single-prompt path on underlying-request failure.
+                The batch path never raises on per-item or whole-batch
+                failure; failed items carry ``error != None``.
             NotImplementedError: ``params`` is a list (per-item parameters
                 are not yet supported).
         """
@@ -453,25 +441,3 @@ class VisualGen:
         logger.info("VisualGen: Shutting down")
         self.executor.shutdown()
         self.executor = None
-
-    @set_api_status("prototype")
-    async def get_stats_async(self, timeout: Optional[float] = None) -> AsyncIterator[Dict]:
-        """Yield buffered visual-gen iteration-stats snapshots.
-
-        Mirrors the LLM ``get_stats_async`` API so the ``/metrics`` HTTP
-        handler in :mod:`tensorrt_llm.serve.openai_server` can iterate over
-        VisualGen stats with the same code path it uses for the LLM stats
-        queue.  Each yielded dict has the visual-gen ``/metrics`` shape:
-        ``iter``, ``timestamp``, ``numQueuedRequests``, ``numActiveRequests``,
-        ``currentStepsProcessed``, ``currentRequestId``,
-        ``currentRequestStepIdx``.
-
-        ``timeout`` is accepted for API compatibility with the LLM variant
-        but is not used: snapshots are produced synchronously on lifecycle
-        events into an in-process deque so draining is non-blocking.
-        """
-        del timeout  # accepted for LLM-API compatibility; see docstring.
-        if self.executor is None:
-            return
-        for snapshot in self.executor.get_iteration_stats():
-            yield snapshot

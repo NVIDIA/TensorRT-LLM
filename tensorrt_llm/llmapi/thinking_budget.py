@@ -33,19 +33,6 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
         self.thinking_token_budget = budget
         self.reasoning_start_token_ids = list(reasoning_start_token_ids)
         self.reasoning_end_token_ids = list(reasoning_end_token_ids)
-        # Progress through the reasoning end sequence, keyed by (req_id, beam_idx):
-        # 0 = not closing, 1..len-1 = mid-sequence, >= len = fully emitted. A
-        # missing key defaults to 0; the key is popped when the block closes.
-        #
-        # We keep this instead of re-deriving from `token_ids` because the overlap
-        # scheduler runs the processor one step behind the sampled tokens: a stale
-        # view would not show the just-forced end sequence, so re-derivation would
-        # force it again and leak a duplicate end tag (e.g. `</think>`).
-        #
-        # Keys are reclaimed only when a block is seen to close, so entries for
-        # blocks that never close persist for the processor's lifetime -- bounded
-        # per request, but a slow drip if one SamplingParams is shared across many.
-        self._end_progress: dict = {}
 
     def __call__(
         self,
@@ -55,40 +42,27 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
         stream_ptr: Optional[int],
         client_id: Optional[int],
     ) -> None:
-        del client_id
+        del req_id, client_id
         if stream_ptr is None:
-            self._apply(req_id, token_ids, logits)
+            self._apply(token_ids, logits)
             return
         with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
-            self._apply(req_id, token_ids, logits)
+            self._apply(token_ids, logits)
 
-    def _apply(self, req_id: int, token_ids: List[List[int]], logits: torch.Tensor) -> None:
+    def _apply(self, token_ids: List[List[int]], logits: torch.Tensor) -> None:
         for beam_idx, beam_token_ids in enumerate(token_ids):
-            forced_token = self._forced_token((req_id, beam_idx), beam_token_ids)
+            forced_token = self._forced_token(beam_token_ids)
             if forced_token is not None:
                 self._force_token(logits, beam_idx, len(token_ids), forced_token)
 
-    def _forced_token(self, key, token_ids: List[int]) -> Optional[int]:
+    def _forced_token(self, token_ids: List[int]) -> Optional[int]:
         start_idx = _find_last_sequence_index(token_ids, self.reasoning_start_token_ids)
         if start_idx == -1:
             return None
 
         end_idx = _find_last_sequence_index(token_ids, self.reasoning_end_token_ids)
         if end_idx > start_idx:
-            # Reasoning block closed; reset so a later block is budgeted again.
-            self._end_progress.pop(key, None)
             return None
-
-        # Block still open. If we have already begun forcing the end sequence,
-        # trust recorded progress (see _end_progress) over the lagging token view.
-        progress = self._end_progress.get(key, 0)
-        if progress >= len(self.reasoning_end_token_ids):
-            # Whole end sequence already forced; stop so we don't leak a second tag.
-            return None
-        if progress > 0:
-            # Mid end-sequence: emit the next token and advance (don't restart at 0).
-            self._end_progress[key] = progress + 1
-            return self.reasoning_end_token_ids[progress]
 
         reasoning_start = start_idx + len(self.reasoning_start_token_ids)
         reasoning_token_count = len(token_ids) - reasoning_start
@@ -97,11 +71,9 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
             partial_end_len > 0
             and reasoning_token_count - partial_end_len >= self.thinking_token_budget
         ):
-            self._end_progress[key] = partial_end_len + 1
             return self.reasoning_end_token_ids[partial_end_len]
 
         if reasoning_token_count >= self.thinking_token_budget:
-            self._end_progress[key] = 1
             return self.reasoning_end_token_ids[0]
         return None
 

@@ -1111,13 +1111,9 @@ class HCXVisionForCausalLM(PreTrainedModel):
             mm_embeds = find_input_mm_embeds(
                 mm_embeds, multimodal_params[:num_context_requests])
 
-        input_ids, input_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens,
-            input_ids,
-            mm_embeds,
-            mm_token_indices=kwargs.get("mm_token_indices"),
-            text_token_indices=kwargs.get("text_token_indices"),
-        )
+        input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
+                                                    input_ids, mm_embeds,
+                                                    **kwargs)
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,

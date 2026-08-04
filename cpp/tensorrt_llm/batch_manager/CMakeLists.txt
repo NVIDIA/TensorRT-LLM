@@ -33,20 +33,34 @@ set(SRCS
     contextTransferCoordinator.cpp
     dataTransceiver.cpp
     decoderBuffers.cpp
+    encoderBuffers.cpp
+    guidedDecoder.cpp
+    handleContextLogits.cpp
+    handleGenerationLogits.cpp
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
     kvCacheManagerV2Utils.cpp
     kvCacheManagerV2Utils.cu
     llmRequest.cpp
+    logitsPostProcessor.cpp
+    loraBuffers.cpp
+    makeDecodingBatchInputOutput.cpp
     medusaBuffers.cpp
     microBatchScheduler.cpp
     pauseRequests.cpp
     peftCacheManager.cpp
+    promptTuningBuffers.cpp
+    rnnStateBuffers.cpp
     rnnStateManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
+    runtimeBuffers.cpp
     sequenceSlotManager.cpp
+    transformerBuffers.cpp
+    trtEncoderModel.cpp
+    trtGptModelInflightBatching.cpp
+    updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
     utils/logitsThread.cpp
@@ -76,18 +90,12 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
-# Include kv_cache_manager_v2 C++ sources.
-include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_manager_v2/CMakeLists.txt)
-list(APPEND SRCS ${KV_CACHE_MANAGER_V2_SRCS})
-
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC ${xgrammar_source_dir}/3rdparty/picojson
          ${xgrammar_source_dir}/3rdparty/dlpack/include
-         ${xgrammar_source_dir}/include
-         ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
-         ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+         ${xgrammar_source_dir}/include)
 
 set_target_properties(
   ${BATCH_MANAGER_STATIC_TARGET}

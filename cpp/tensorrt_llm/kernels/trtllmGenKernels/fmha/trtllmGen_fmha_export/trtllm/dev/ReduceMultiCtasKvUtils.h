@@ -22,8 +22,6 @@
 #include "CutlassUtils.h"
 #include <float.h>
 #include "Fp4Utils.h"
-#include "Fp8Utils.h"
-#include <type_traits>
 
 namespace trtllm {
 namespace dev {
@@ -32,6 +30,15 @@ namespace dev {
 
 template <typename Dtype, int32_t NumElts>
 inline __device__ void convertAndStoreToGmem(char* gmemPtr, float (&input)[NumElts]) {
+  static_assert(sizeof(Dtype) == 0, "Not implemented.");
+}
+
+template <typename Dtype, int32_t NumElts>
+inline __device__ void convertAndStoreToGmem(char* gmemPtr,
+                                             char* oSfPtr,
+                                             float (&input)[NumElts],
+                                             float sfScale,
+                                             bool isValidRow) {
   static_assert(sizeof(Dtype) == 0, "Not implemented.");
 }
 
@@ -65,63 +72,19 @@ inline __device__ void convertAndStoreToGmem<cutlass::float_e4m3_t, 8>(char* gme
   *reinterpret_cast<uint2*>(gmemPtr) = output;
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Block scaled output store helpers.
-template <typename DtypeOut, typename DtypeIn, int32_t NumElts>
-inline __device__ std::enable_if_t<std::is_same_v<DtypeOut, cutlass::float_e2m1_t>>
-convertAndStoreToGmem(char* gmemPtr,
-                      char* gmemSfPtr,
-                      DtypeIn (&input)[NumElts],
-                      float sfScale,
-                      bool isValidRow) {
-  constexpr int NumThreadsPerVec = 16 / NumElts;
-  static_assert(NumThreadsPerVec == 1 || NumThreadsPerVec == 2 || NumThreadsPerVec == 4 ||
-                  NumThreadsPerVec == 8,
-                "NumElts Not supported.");
-  static_assert(std::is_same_v<DtypeIn, cutlass::half_t> || std::is_same_v<DtypeIn, float>,
-                "DtypeIn not supported.");
+template <>
+inline __device__ void convertAndStoreToGmem<cutlass::float_e2m1_t, 8>(char* gmemPtr,
+                                                                       char* gmemSfPtr,
+                                                                       float (&input)[8],
+                                                                       float sfScale,
+                                                                       bool isValidRow) {
   cutlass::float_e4m3_t sfOut;
-  using OutVec = cutlass::Array<cutlass::float_e2m1_t, NumElts>;
-  OutVec valOut;
-  if constexpr (std::is_same_v<DtypeIn, cutlass::half_t>) {
-    convertFp16ToE2m1<NumElts>(valOut, sfOut, input, sfScale);
-  } else {
-    convertFloatToE2m1<NumElts>(valOut, sfOut, input, sfScale);
-  }
+  uint32_t valOut;
+  convertFloatToE2m1<8>(valOut, sfOut, input, sfScale);
   if (isValidRow) {
-    *reinterpret_cast<OutVec*>(gmemPtr) = valOut;
-    if (threadIdx.x % NumThreadsPerVec == 0) { // store scale for every 16 elements (4 columns)
+    *reinterpret_cast<uint32_t*>(gmemPtr) = valOut;
+    if (threadIdx.x % 2 == 0) {
       *reinterpret_cast<cutlass::float_e4m3_t*>(gmemSfPtr) = sfOut;
-    }
-  }
-}
-
-template <typename DtypeOut, typename DtypeIn, int32_t NumElts>
-inline __device__ std::enable_if_t<std::is_same_v<DtypeOut, cutlass::float_e4m3_t>>
-convertAndStoreToGmem(char* gmemPtr,
-                      char* gmemSfPtr,
-                      DtypeIn (&input)[NumElts],
-                      float sfScale,
-                      bool isValidRow) {
-  constexpr int NumThreadsPerVec = 32 / NumElts;
-  static_assert(NumThreadsPerVec == 1 || NumThreadsPerVec == 2 || NumThreadsPerVec == 4 ||
-                  NumThreadsPerVec == 8,
-                "NumElts Not supported.");
-  static_assert(std::is_same_v<DtypeIn, cutlass::half_t> || std::is_same_v<DtypeIn, float>,
-                "DtypeIn not supported.");
-  cutlass::float_ue8m0_t sfOut;
-  using OutVec = cutlass::Array<cutlass::float_e4m3_t, NumElts>;
-  OutVec valOut;
-  if constexpr (std::is_same_v<DtypeIn, cutlass::half_t>) {
-    convertFp16ToMxE4m3<NumElts>(valOut, sfOut, input, sfScale);
-  } else {
-    convertFloatToMxE4m3<NumElts>(valOut, sfOut, input, sfScale);
-  }
-  if (isValidRow) {
-    *reinterpret_cast<OutVec*>(gmemPtr) = valOut;
-    if (threadIdx.x % NumThreadsPerVec == 0) { // store scale for every 32 elements (4 columns)
-      *reinterpret_cast<cutlass::float_ue8m0_t*>(gmemSfPtr) = sfOut;
     }
   }
 }

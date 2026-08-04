@@ -1,17 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from __future__ import annotations
 
 import asyncio
@@ -26,7 +12,8 @@ from transformers import PreTrainedTokenizer
 from zmq import PUSH
 from zmq.asyncio import Context
 
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import SamplingParams
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
@@ -44,11 +31,8 @@ class LlmManager:
                  streaming: bool,
                  concurrency: int = -1,
                  modality: Optional[str] = None,
-                 tokenizer: Optional[PreTrainedTokenizer] = None,
-                 duration: Optional[int] = None) -> None:
+                 tokenizer: Optional[PreTrainedTokenizer] = None) -> None:
         self.llm = llm
-        self.duration = duration
-        self.start_time: Optional[float] = None
         self._inbox: asyncio.Queue[Tuple[InferenceRequest,
                                          SamplingParams]] = asyncio.Queue()
         self._outbox = outbox
@@ -61,20 +45,10 @@ class LlmManager:
         self._iteration_log_task: Optional[asyncio.Task] = None
         self._concurrency_semaphore = asyncio.Semaphore(
             concurrency) if concurrency > 0 else None
-        if duration is not None and self._concurrency_semaphore is None:
-            logger.warning(
-                "--duration requires a concurrency limit to take effect; "
-                "without one, all requests are submitted to the engine "
-                "immediately and the full dataset will run.")
         self.streaming = streaming
         self.request_seen = asyncio.Event()
         self.modality = modality
         self.tokenizer = tokenizer
-
-    def _duration_exceeded(self) -> bool:
-        """Return whether the duration limit has elapsed since the first request."""
-        return (self.duration is not None and self.start_time is not None
-                and time.perf_counter() - self.start_time >= self.duration)
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
@@ -89,18 +63,11 @@ class LlmManager:
     async def _process_single_request(self, request: InferenceRequest,
                                       sampling_params: SamplingParams,
                                       post_proc_params: PostprocParams):
-        """Process a single inference request."""
         self.request_seen.set()
-        if self.start_time is None:
-            self.start_time = time.perf_counter()
         sampling_params = copy.copy(sampling_params)
         sampling_params.max_tokens = request.output_tokens
 
         async with semaphore_guard(self._concurrency_semaphore):
-            # The worker dispatches the whole inbox eagerly, so the duration
-            # limit must be enforced here, after a concurrency slot is acquired.
-            if self._duration_exceeded():
-                return
             request_start_timestamp = time.perf_counter_ns()
             time_on_first_token = None
             logger.debug(f"request.lora_request: {request.lora_request}")
@@ -146,8 +113,6 @@ class LlmManager:
         slot so that the conversation history stays consistent.
         """
         self.request_seen.set()
-        if self.start_time is None:
-            self.start_time = time.perf_counter()
         sampling_params = copy.copy(sampling_params)
         sampling_params.max_tokens = request.output_tokens
         tokenizer = self.tokenizer
@@ -158,19 +123,11 @@ class LlmManager:
         all_output_tokens: List[int] = []
 
         async with semaphore_guard(self._concurrency_semaphore):
-            # Enforce the duration limit at execution time (see
-            # _process_single_request).
-            if self._duration_exceeded():
-                return
             request_start_timestamp = time.perf_counter_ns()
             time_on_first_token = None
             last_response = None
 
-            truncated = False
             for turn_id, question in enumerate(request.turns):
-                if turn_id > 0 and self._duration_exceeded():
-                    truncated = True
-                    break
                 messages.append({"role": "user", "content": question})
 
                 input_ids = await loop.run_in_executor(
@@ -202,13 +159,6 @@ class LlmManager:
                 })
 
                 last_response = response
-
-        if truncated:
-            # A conversation cut short by the deadline is not a completed
-            # request: recording it would mix partial and full conversations in
-            # the same statistics. Requests skipped before their first turn are
-            # dropped for the same reason.
-            return
 
         response_end_timestamp = time.perf_counter_ns()
 
@@ -248,28 +198,9 @@ class LlmManager:
             self._task_errors.append(error)
 
     async def worker(self) -> None:
-        """Worker task that pulls requests from inbox and processes them."""
-        # Only a duration-triggered exit lets in-flight requests finish; a stop
-        # signal or a failure cancels them, as the pre-duration code always did.
-        drain_in_flight = False
         try:
             while not self._stop.is_set():
                 self._raise_for_failed_tasks()
-
-                # Dispatch below never awaits, so this cannot fire until the
-                # inbox is fully dispatched; enforcement happens in the request
-                # coroutines (see _process_single_request). This exits the idle
-                # loop, and the drain keeps `busy` able to reach False.
-                if self._duration_exceeded():
-                    logger.info("Duration reached. Stopping pulling requests.")
-                    while not self._inbox.empty():
-                        try:
-                            self._inbox.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
-                    drain_in_flight = True
-                    break
-
                 try:
                     request, sampling_params, post_proc_params = self._inbox.get_nowait(
                     )
@@ -282,36 +213,16 @@ class LlmManager:
                                          post_proc_params=post_proc_params))
                 task.add_done_callback(self._task_done_callback)
                 self._tasks.add(task)
+            logger.debug("Worker task finishing...")
         except asyncio.CancelledError:
             logger.info("Worker task cancelled.")
         finally:
-            logger.debug("Worker task finishing...")
-            # Snapshot: the done callback removes tasks from the set as they
-            # finish, and asyncio.wait must not race with that.
-            pending = set(self._tasks)
-            if not drain_in_flight:
-                logger.debug("Worker task cancelling remaining requests...")
-                for task in pending:
-                    task.cancel()
-            elif pending:
-                logger.debug(
-                    "Duration reached. Waiting for in-flight requests to complete..."
-                )
-                # Draining preserves the statistics of requests still running at
-                # the deadline, but a failure ends the run regardless, so stop
-                # draining as soon as one occurs. Without this a slow or hung
-                # sibling would hold the error back until it finished.
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_EXCEPTION)
-                if any(not task.cancelled() and task.exception() is not None
-                       for task in done):
-                    logger.debug(
-                        "Request failed during drain. Cancelling the rest...")
-                    for task in pending:
-                        task.cancel()
+            logger.debug("Worker task cancelling remaining requests...")
+            for task in self._tasks:
+                task.cancel()
             logger.debug("Waiting for requests...")
-            if pending:
-                await asyncio.wait(pending)
+            if self._tasks:
+                await asyncio.wait(self._tasks)
             self._raise_for_failed_tasks()
 
     # This asynchronous function acts as a worker that logs iteration statistics.
@@ -430,25 +341,7 @@ async def async_benchmark(
     iteration_log_addr: str = None,
     modality: Optional[str] = None,
     tokenizer: Optional[PreTrainedTokenizer] = None,
-    duration: Optional[int] = None,
 ) -> StatsKeeper:
-    """Run an asynchronous benchmark.
-
-    Args:
-        llm: The LLM instance to use.
-        sampling_params: Sampling parameters for generation.
-        post_proc_params: Post-processing parameters.
-        requests: List of inference requests.
-        streaming: Whether to use streaming mode.
-        concurrency: Maximum concurrency limit.
-        iteration_log_addr: Address for iteration logging.
-        modality: Modality of requests.
-        tokenizer: Tokenizer for multi-turn requests.
-        duration: Maximum run time in seconds.
-
-    Returns:
-        StatsKeeper containing benchmark statistics.
-    """
     outbox = asyncio.Queue()
     statistics = StatsKeeper()
     submit_finished = asyncio.Event()
@@ -459,8 +352,7 @@ async def async_benchmark(
                          streaming,
                          concurrency=concurrency,
                          modality=modality,
-                         tokenizer=tokenizer,
-                         duration=duration)
+                         tokenizer=tokenizer)
     enqueue_task: Optional[asyncio.Task] = None
     try:
         backend.run(iteration_addr=iteration_log_addr)
@@ -485,12 +377,7 @@ async def async_benchmark(
                 except asyncio.TimeoutError:
                     logger.debug("No items in queue. Continuing.")
 
-            if duration is None:
-                assert finished_requests == len(requests), "Benchmark failed"
-            elif finished_requests < len(requests):
-                logger.info(
-                    f"Duration limit reached. Processed {finished_requests}/{len(requests)} requests."
-                )
+            assert finished_requests == len(requests), "Benchmark failed"
 
         statistics.set_energy(monitor.total_energy)
         logger.info("Benchmark complete.")

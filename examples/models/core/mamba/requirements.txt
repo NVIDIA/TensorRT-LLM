@@ -1,0 +1,7 @@
+-c ../../../constraints.txt
+tensorrt_llm>=0.0.0.dev0
+transformers>=4.56.0
+datasets==3.1.0
+evaluate
+rouge_score
+sentencepiece

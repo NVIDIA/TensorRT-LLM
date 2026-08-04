@@ -101,6 +101,7 @@ Module names longer than 8 characters are abbreviated to fit the fixed-width tag
 | `deep_ep` | `deep_ep ` |
 | `deep_gemm` | `deepgemm` |
 | `executor` | `executor` |
+| `executor_worker` | `exec_wkr` |
 | `flash_mla` | `flashmla` |
 | `kernels` | `kernels ` |
 | `layers` | `layers  ` |

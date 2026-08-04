@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """
 ConfigurableMoE: Composition-based Configurable MoE Module
 
@@ -72,6 +73,7 @@ class ConfigurableMoE(MoE):
     # authoritative check -- if the chosen inner backend doesn't opt in, its
     # ``MoE.__init__`` will still raise.
     _supports_non_divisible_ep: bool = True
+
     """
     Configurable MoE layer using composition pattern with automatic configuration
 
@@ -275,8 +277,9 @@ class ConfigurableMoE(MoE):
         """Build the MoE backend, mirror EPLB attrs, then create weights.
 
         Why this dance:
-        - ``init_load_balancer=False``: the backend would otherwise
-          re-register itself with the load balancer; ConfigurableMoE owns it.
+        - ``init_load_balancer=False`` / ``without_comm=True``: the backend
+          would otherwise re-register itself with the load balancer and
+          initialize its own communication; ConfigurableMoE owns both.
         - ``layer_idx=None``: the wrapper passes the real ``layer_idx`` to
           ``MoE.__init__`` to drive load-balancer setup. The backend
           receives ``None`` so its own EPLB hooks no-op until we sync the
@@ -323,6 +326,7 @@ class ConfigurableMoE(MoE):
                 swiglu_limit=kwargs.get("swiglu_limit"),
                 swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
+                without_comm=True,
                 activation_type=self.activation_type,
             )
 
@@ -425,12 +429,7 @@ class ConfigurableMoE(MoE):
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
         else:
-            # non-DP: no cross-rank dispatch. The scheduler fills all_rank_num_tokens
-            # from [x.shape[0]] before calling here, so it must be a single-element list.
-            assert len(all_rank_num_tokens) == 1, (
-                f"non-DP path expects a single-element list, got {len(all_rank_num_tokens)}"
-            )
-            num_rows = all_rank_num_tokens[0]
+            num_rows = sum(all_rank_num_tokens)
         return (num_rows + self.moe_max_num_tokens - 1) // self.moe_max_num_tokens
 
     def split_chunk(self, split_token_num: int, split_num_chunks: int) -> List[int]:
@@ -655,33 +654,17 @@ class ConfigurableMoE(MoE):
         assert hasattr(self.backend, "load_weights"), (
             f"Backend {self.backend.__class__.__name__} must implement load_weights()"
         )
-        result = self.backend.load_weights(weights, allow_partial_loading)
-        if weights:
-            self._weights_transformed = False
-        return result
+        return self.backend.load_weights(weights, allow_partial_loading)
 
-    def transform_weights(self) -> None:
+    def post_load_weights(self):
         """
-        Transform weights - delegated to backend
+        Post load weights processing - delegated to backend
 
         """
-        if getattr(self, "_weights_transformed", False):
-            return
-        assert hasattr(self.backend, "transform_weights"), (
-            f"Backend {self.backend.__class__.__name__} must implement transform_weights()"
+        assert hasattr(self.backend, "post_load_weights"), (
+            f"Backend {self.backend.__class__.__name__} must implement post_load_weights()"
         )
-        self.backend.transform_weights()
-        self._weights_transformed = True
-
-    def cache_derived_state(self) -> None:
-        """
-        Cache derived state - delegated to backend
-
-        """
-        assert hasattr(self.backend, "cache_derived_state"), (
-            f"Backend {self.backend.__class__.__name__} must implement cache_derived_state()"
-        )
-        self.backend.cache_derived_state()
+        return self.backend.post_load_weights()
 
     def process_weights_after_loading(self):
         """

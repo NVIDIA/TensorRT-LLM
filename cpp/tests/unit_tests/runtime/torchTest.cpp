@@ -17,7 +17,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
@@ -53,7 +52,7 @@ protected:
 
 namespace
 {
-template <tensorrt_llm::DataType DType>
+template <nvinfer1::DataType DType>
 void checkFilled(IBuffer& buffer, int fillValue)
 {
     if (DType == buffer.getDataType())
@@ -80,13 +79,13 @@ TEST_F(TorchTest, Aten)
     }
 
     auto constexpr fillValue = 1;
-    auto tensorHostBase = manager.allocate(MemoryType::kPINNED, shapeTllm, tensorrt_llm::DataType::kINT64);
+    auto tensorHostBase = manager.allocate(MemoryType::kPINNED, shapeTllm, nvinfer1::DataType::kINT64);
 
     for (auto memoryType : {MemoryType::kCPU, MemoryType::kGPU, MemoryType::kPINNED})
     {
-        for (auto dtype : {tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kHALF, tensorrt_llm::DataType::kINT8,
-                 tensorrt_llm::DataType::kUINT8, tensorrt_llm::DataType::kINT32, tensorrt_llm::DataType::kINT64,
-                 tensorrt_llm::DataType::kBF16, tensorrt_llm::DataType::kFP8, tensorrt_llm::DataType::kBOOL})
+        for (auto dtype : {nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF, nvinfer1::DataType::kINT8,
+                 nvinfer1::DataType::kUINT8, nvinfer1::DataType::kINT32, nvinfer1::DataType::kINT64,
+                 nvinfer1::DataType::kBF16, nvinfer1::DataType::kFP8, nvinfer1::DataType::kBOOL})
         {
             ITensor::SharedPtr tensorTllm{manager.allocate(memoryType, shapeTllm, dtype)};
 
@@ -99,20 +98,20 @@ TEST_F(TorchTest, Aten)
             EXPECT_THAT(tensorAten.sizes(), ::testing::ElementsAreArray(shapeAten));
             EXPECT_EQ(tensorAten.data_ptr(), tensorTllm->data());
 
-            if (dtype != tensorrt_llm::DataType::kFP8)
+            if (dtype != nvinfer1::DataType::kFP8)
             {
                 tensorAten.fill_(c10::Scalar(fillValue));
                 auto tensorHost = ITensor::wrap(tensorHostBase->data(), dtype, shapeTllm);
                 manager.copy(*tensorTllm, *tensorHost);
                 mStream->synchronize();
-                checkFilled<tensorrt_llm::DataType::kFLOAT>(*tensorHost, fillValue);
-                checkFilled<tensorrt_llm::DataType::kHALF>(*tensorHost, fillValue);
-                checkFilled<tensorrt_llm::DataType::kINT8>(*tensorHost, fillValue);
-                checkFilled<tensorrt_llm::DataType::kUINT8>(*tensorHost, fillValue);
-                checkFilled<tensorrt_llm::DataType::kINT32>(*tensorHost, fillValue);
-                checkFilled<tensorrt_llm::DataType::kINT64>(*tensorHost, fillValue);
-                checkFilled<tensorrt_llm::DataType::kBF16>(*tensorHost, fillValue);
-                checkFilled<tensorrt_llm::DataType::kBOOL>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kFLOAT>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kHALF>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kINT8>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kUINT8>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kINT32>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kINT64>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kBF16>(*tensorHost, fillValue);
+                checkFilled<nvinfer1::DataType::kBOOL>(*tensorHost, fillValue);
             }
 
             // Conversion back to TRT-LLM tensor

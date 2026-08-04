@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include <gtest/gtest.h>
 
@@ -121,7 +120,7 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = true;
-        auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+        auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
         BlocksPerWindow const blocksPerWindow

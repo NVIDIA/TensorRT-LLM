@@ -2,10 +2,6 @@
 
 # Troubleshooting
 
-```{caution}
-The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
-```
-
 This document describes some of the frequently asked questions and their solutions in TensorRT-LLM, including problems of installation, model-building, model-execution, and input / output size.
 
 ## Installation Errors

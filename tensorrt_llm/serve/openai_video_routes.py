@@ -124,15 +124,6 @@ class _VideoRoutesMixin:
             except ValueError as exc:
                 logger.error(f"Video request error: {exc}")
                 return self.create_error_response(str(exc), status_code=HTTPStatus.BAD_REQUEST)
-            except MemoryError as exc:
-                # Valid request that does not fit this deployment (decode /
-                # allocation capacity) — a server condition, not client error.
-                logger.error(f"Video request capacity error: {exc}")
-                return self.create_error_response(
-                    str(exc),
-                    err_type="ServiceUnavailableError",
-                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                )
 
             if output.video is None:
                 return self.create_error_response(

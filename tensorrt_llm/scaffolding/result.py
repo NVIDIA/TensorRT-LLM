@@ -1,6 +1,5 @@
 import asyncio
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Union
 
 
@@ -8,15 +7,12 @@ from typing import Any, List, Mapping, Optional, Union
 class ScaffoldingOutput:
     text: str
     token_ids: List[int]
-    metadata: Optional[dict] = field(default=None)
 
 
 class ScaffoldingResult:
 
     def __init__(self):
         super().__init__()
-        self._id = str(uuid.uuid4())
-        self.metadata: dict = {}
         self.aqueue = asyncio.Queue()
         #self.cur_output: GenerationResult = None
         self.outputs = []
@@ -24,11 +20,6 @@ class ScaffoldingResult:
         self.outputs.append(ScaffoldingOutput("", []))
         self._done = False
         self.task_collections = None
-
-    @property
-    def id(self) -> str:
-        """Unique identifier for this result, auto-generated at creation."""
-        return self._id
 
     def set_output(self, output: Union[ScaffoldingOutput, Any]):
         if isinstance(output, ScaffoldingOutput):

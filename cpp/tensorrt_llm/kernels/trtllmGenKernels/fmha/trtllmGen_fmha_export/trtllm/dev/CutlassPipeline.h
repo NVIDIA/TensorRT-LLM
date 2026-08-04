@@ -527,10 +527,14 @@ public:
   }
 
   // Signal completion of stage and move to the next stage
-  inline __device__ void arrive() { mPipeline.arrive(); }
+  inline __device__ void arrive() {
+    mPipeline.arrive();
+  }
 
   // Wait on a stage to be unlocked
-  inline __device__ void wait() { mPipeline.wait(); }
+  inline __device__ void wait() {
+    mPipeline.wait();
+  }
 
 private:
   Params mParams;
@@ -1019,7 +1023,9 @@ public:
   }
 
   // Get pipeline
-  [[nodiscard]] inline __device__ Pipeline& get_pipeline() { return mPipeline; }
+  [[nodiscard]] inline __device__ Pipeline& get_pipeline() {
+    return mPipeline;
+  }
 
 private:
   // The pipeline.
@@ -1270,7 +1276,9 @@ public:
   }
 
   // Get pipeline
-  [[nodiscard]] inline __device__ Pipeline& get_pipeline() { return mPipeline; }
+  [[nodiscard]] inline __device__ Pipeline& get_pipeline() {
+    return mPipeline;
+  }
 
 private:
   // The pipeline.

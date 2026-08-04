@@ -23,8 +23,6 @@ from pydantic import ValidationError
 
 from tensorrt_llm.serve.chat_utils import parse_chat_message_content, parse_chat_messages_coroutines
 
-pytestmark = pytest.mark.cpu_only
-
 
 class SingleUseIterator:
     """Mimics Pydantic v2 ValidatorIterator: yields items once, then empty."""
@@ -153,7 +151,7 @@ class TestParseChatMessagesCoroutines:
             {"role": "assistant", "content": None, "tool_calls": [TOOL_CALL]},
             {"role": "tool", "content": "72F", "tool_call_id": "call_1"},
         ]
-        conv, _, _, _ = parse_chat_messages_coroutines(messages, self._mock_config(), None)
+        conv, _, _ = parse_chat_messages_coroutines(messages, self._mock_config(), None)
         assert len(conv) == 3
         assert conv[1]["tool_calls"][0]["function"]["arguments"] == PARSED_ARGS
 
@@ -162,7 +160,7 @@ class TestParseChatMessagesCoroutines:
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": None, "tool_calls": SingleUseIterator([TOOL_CALL])},
         ]
-        conv, _, _, _ = parse_chat_messages_coroutines(messages, self._mock_config(), None)
+        conv, _, _ = parse_chat_messages_coroutines(messages, self._mock_config(), None)
         assert conv[1]["tool_calls"][0]["function"]["arguments"] == PARSED_ARGS
 
     def test_extra_fields_raw_dict(self):
@@ -171,7 +169,7 @@ class TestParseChatMessagesCoroutines:
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": None, "tool_calls": [tc]},
         ]
-        conv, _, _, _ = parse_chat_messages_coroutines(messages, self._mock_config(), None)
+        conv, _, _ = parse_chat_messages_coroutines(messages, self._mock_config(), None)
         assert conv[1]["tool_calls"][0]["name"] == "get_weather"
 
 

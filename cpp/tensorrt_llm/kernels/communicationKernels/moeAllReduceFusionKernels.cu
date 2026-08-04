@@ -16,7 +16,6 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
@@ -443,11 +442,11 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
 #define MOE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                \
     return moereduction_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT>(params);
 #define MOE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                       \
-    if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kHALF)                                      \
+    if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kHALF)                                          \
     {                                                                                                                  \
         MOE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                                \
     }                                                                                                                  \
-    else if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kBF16)                                 \
+    else if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kBF16)                                     \
     {                                                                                                                  \
         MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }
@@ -557,20 +556,11 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
         }
 
         // * MoE finalize
-        // Accumulate the top-k weighted expert sum and the shared-expert add in
-        // fp32 (local `facc`), rounding to DType (bf16/fp16) only once when packing
-        // into `accumulator` for the 128-bit Lamport all-reduce store below.
-        // Accumulating directly in DType here rounds after every one of the top_k
-        // terms; across the many routed MoE layers this rounding bias is large
-        // enough to visibly degrade the routed output, and with attention-DP
-        // disabled + MTP speculative decoding it drifts the target hidden states
-        // enough to lower the acceptance length. The non-deferred in-kernel
-        // finalize (do_finalize=true) already accumulates in fp32; match it here.
-        float facc[kElemsPerAccess];
+        ACC_TYPE accumulator;
 #pragma unroll
         for (int i = 0; i < kElemsPerAccess; ++i)
         {
-            facc[i] = 0.f;
+            accumulator.unpacked[i] = static_cast<DType>(0);
         }
 
         for (int k = 0; k < top_k; k++)
@@ -592,15 +582,17 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
             permuted_data.packed
                 = reinterpret_cast<float4 const*>(params.allreduce_in)[thread_offset_across_token / kElemsPerAccess];
 
-            // * acc += scale(data)  (fp32 accumulation)
+            // * acc += scale(data)
 #pragma unroll
             for (int i = 0; i < kElemsPerAccess; ++i)
             {
-                facc[i] += static_cast<float>(permuted_data.unpacked[i]) * block_scale;
+                // assume computation is done in ScaleType
+                accumulator.unpacked[i]
+                    += static_cast<DType>((static_cast<float>(permuted_data.unpacked[i]) * block_scale));
             }
         }
 
-        // * Add shared expert output  (fp32 accumulation)
+        // * Add shared expert output
         if (params.shared_expert_output)
         {
             // * Load shared expert output
@@ -611,16 +603,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
 #pragma unroll
             for (int i = 0; i < kElemsPerAccess; ++i)
             {
-                facc[i] += static_cast<float>(shared_expert_output.unpacked[i]);
+                accumulator.unpacked[i] += shared_expert_output.unpacked[i];
             }
-        }
-
-        // Round the fp32 accumulator to DType once, packed for the Lamport AR store.
-        ACC_TYPE accumulator;
-#pragma unroll
-        for (int i = 0; i < kElemsPerAccess; ++i)
-        {
-            accumulator.unpacked[i] = static_cast<DType>(facc[i]);
         }
 
         // * AR Store
@@ -743,13 +727,13 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
 #define MOE_FINALIZE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                       \
     return moefinalize_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT>(params);
 #define MOE_FINALIZE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                              \
-    if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kHALF                                       \
-        && params.scale_dtype == tensorrt_llm::DataType::kHALF)                                                        \
+    if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kHALF                                           \
+        && params.scale_dtype == nvinfer1::DataType::kHALF)                                                            \
     {                                                                                                                  \
         MOE_FINALIZE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }                                                                                                                  \
-    else if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kBF16                                  \
-        && params.scale_dtype == tensorrt_llm::DataType::kBF16)                                                        \
+    else if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kBF16                                      \
+        && params.scale_dtype == nvinfer1::DataType::kBF16)                                                            \
     {                                                                                                                  \
         MOE_FINALIZE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                              \
     }

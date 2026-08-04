@@ -18,7 +18,6 @@
 #error "Define TOP_LEVEL_DIR"
 #endif
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -72,7 +71,7 @@ TEST_F(UtilsTest, LoadNpy)
 TEST_F(UtilsTest, LoadStoreNpy)
 {
     auto dims = ITensor::makeShape({2, 3, 4});
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     ITensor::SharedPtr tensor{BufferManager::cpu(dims, dataType)};
     auto tensorRange = BufferRange<float>(*tensor);
     std::iota(tensorRange.begin(), tensorRange.end(), 0);
@@ -97,7 +96,7 @@ TEST_F(UtilsTest, LoadStoreNpy)
 TEST_F(UtilsTest, LoadStoreNpyGPU)
 {
     auto dims = ITensor::makeShape({2, 3, 4});
-    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
+    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
     ITensor::SharedPtr tensor{BufferManager::cpu(dims, dataType)};
     auto tensorRange = BufferRange<float>(*tensor);
     std::iota(tensorRange.begin(), tensorRange.end(), 0);

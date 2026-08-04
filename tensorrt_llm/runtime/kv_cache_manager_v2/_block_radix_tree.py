@@ -13,25 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from itertools import chain
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Sequence, TypeVar, cast
+import hashlib
+from array import array
+from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
-from ._cache_key import (  # noqa: F401
-    BlockKey,
-    Hasher,
-    TokenBlock,
-    gen_multimodal_cache_key_tokens,
-    reuse_scope_to_bytes,
-    sequence_to_blockchain_keys,
-)
-from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenIdExt
+from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
-from ._utils import TypedIndexList, filled_list, map_optional, typed_range, unwrap_rawref
+from ._utils import TypedIndexList, chunked, div_up, filled_list, find_index, unwrap_rawref
 
 if TYPE_CHECKING:
     from ._event_manager import KVCacheEventManager
     from ._page import CommittedPage
+
+BlockKey = bytes
 
 
 class ReuseScope(NamedTuple):
@@ -40,8 +35,21 @@ class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
 
+    def _mask(self) -> bytes:
+        return sum((value is not None) << i for i, value in enumerate(self)).to_bytes(
+            div_up(len(self), 8), "little", signed=False
+        )
+
     def to_bytes(self) -> bytes:
-        return reuse_scope_to_bytes(self)
+        ret = self._mask()
+        for value in self:
+            if type(value) is int:
+                ret += value.to_bytes(8, "little", signed=False)
+            else:
+                assert value is None, (
+                    "Did you forget to update to_bytes() when adding new non-int fields to ReuseScope?"
+                )
+        return ret
 
 
 class ReuseMatch(NamedTuple):
@@ -49,7 +57,74 @@ class ReuseMatch(NamedTuple):
 
     blocks: list["Block"]
     num_tokens: int
-    num_lookup_tokens: int
+
+
+# id_offset is usually vocab_size
+def gen_multimodal_cache_key_tokens(
+    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
+) -> list[TokenIdExt]:
+    """Create synthetic tokens used only when building multimodal KV-cache keys.
+
+    Item-local token 0 carries the content digest; later offsets use deterministic IDs above the vocab.
+    """
+    assert num_tokens > 0
+    assert token_offset >= 0
+    return [
+        multi_modal_data_digest if token_offset + i == 0 else TokenId(id_offset + token_offset + i)
+        for i in range(num_tokens)
+    ]
+
+
+class Hasher:
+    __slots__ = "_hasher"
+    _hasher: "hashlib._Hash"
+
+    def __init__(self, data: int | bytes | None | Sequence[int | bytes] = None) -> None:
+        self._hasher = hashlib.sha256()
+        if data is not None:
+            self.update(data)
+
+    # This function is perf-critical. Expect compromised code quality.
+    def update(self, data: int | bytes | Sequence[int | bytes]) -> "Hasher":
+        if type(data) is int:
+            assert NDEBUG or (data >= 0 and data < (1 << 64))
+            self._hasher.update(data.to_bytes(8, "little"))
+        elif type(data) is bytes:
+            self._hasher.update(data)
+        else:
+            # Hash the whole token block in one C call instead of one per token.
+            # array("Q", data).tobytes() packs each int as 8 native-endian bytes;
+            # all NVIDIA GPU host platforms (x86_64, aarch64/Grace) are little-endian
+            # so this is byte-identical to the per-token to_bytes(8, "little") loop.
+            # Falls back to that loop for multimodal blocks (which contain bytes items).
+            try:
+                self._hasher.update(array("Q", data).tobytes())  # type: ignore
+            except (TypeError, OverflowError):
+                for item in data:  # type: ignore
+                    assert (
+                        NDEBUG
+                        or (type(item) is int and (0 <= item < (1 << 64)))
+                        or type(item) is bytes
+                    )
+                    self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
+        return self
+
+    @property
+    def digest(self) -> bytes:
+        return self._hasher.digest()
+
+
+TokenBlock = list[TokenIdExt]
+
+
+def sequence_to_blockchain_keys(
+    tokens_per_block: int, reuse_scope: ReuseScope, tokens: Sequence[TokenIdExt]
+) -> Iterator[tuple[TokenBlock, BlockKey]]:
+    digest = Hasher(reuse_scope.to_bytes()).digest
+    yield [], digest
+    for token_block in chunked(tokens, tokens_per_block):
+        digest = Hasher(digest).update(token_block).digest
+        yield token_block, digest
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -72,50 +147,40 @@ def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
     return tree
 
 
-def detach_next(parent: "Block | RootBlock", key: BlockKey) -> "Block | None":
-    child = parent.next.pop(key, None)
-    if child is None:
-        return None
-
-    child._prev = rawref.NULL
-    if isinstance(parent, RootBlock) and not parent.next:
-        tree = parent._prev()
-        if tree is not None and parent.key in tree.next:
-            detached_root = tree.next.pop(parent.key)
-            parent._prev = rawref.NULL
-            assert detached_root is parent
-    return child
-
-
-def remove_subtree(root: "Block") -> None:
+def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"]]:
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
-    # Each block's pages are reclaimed eagerly via _release_pages() while the
-    # StorageManager is still alive, rather than deferring to ~Block()/__del__().
-    # An external reference (e.g. a caller holding a matched Block) can keep a Block
-    # alive past StorageManager teardown, after which page.manager would be dangling.
+    ret: list[rawref.ref["CommittedPage"]] = []
     removed_block_hashes: list[BlockKey] = []
     tree = try_get_tree(root)
     event_manager = tree.event_manager if tree is not None else None
-    block: Block = root
+    block: "RootBlock | Block" = root
     while True:
         if block.next:
             block = next(iter(block.next.values()))
         else:
-            block._release_pages()
-            removed_block_hashes.append(block.key)
+            if isinstance(block, Block):
+                removed_block_hashes.append(block.key)
+                ret.extend(p for p in block.storage if p is not None)
+                block.storage = filled_list(None, block.num_life_cycles)
+            assert isinstance(block, RootBlock) or all(page is None for page in block.storage), (
+                "Storage is not cleared, yet"
+            )
             if block._prev() is None:
                 assert block is root
                 break
-            prev_block: Block | RootBlock = block.prev
-            detached = detach_next(prev_block, block.key)
-            assert detached is block
+            prev_block: Block | RootBlock | BlockRadixTree = block.prev
+            # Because Block.__del__() may remove RootBlock from BlockRadixTree, we need to check here.
+            # It may not be in prev_block.next when block is RootBlock.
+            if block.key in prev_block.next:
+                prev_block.next.pop(block.key)
             if block is root:
                 break
-            assert isinstance(prev_block, Block)
+            assert not isinstance(prev_block, BlockRadixTree)
             block = prev_block
     if event_manager is not None:
         event_manager.add_removed_event(removed_block_hashes)
+    return ret
 
 
 def traverse_post_order(root: "Block") -> Iterator["Block"]:
@@ -269,108 +334,30 @@ class Block:
             for b in prev.next.values():
                 if b.tokens[: len(tokens)] == tokens:
                     raise UselessBlockError(b)
-        # A later turn may extend a partial endpoint to this longer block, replacing the
-        # partial sibling. That turn may not have a committable SWA page for this block:
-        # commit_min_snapshot releases out-of-window pages, while SWA scratch reuse uses
-        # temporary shared storage that is not preserved. Adopt the partial sibling's
-        # pages to keep the shorter endpoint reusable, retaining each page's recorded token
-        # count (see CommittedPage.num_tokens_in_block).
+        # If there are sibling blocks fully covered by this block, remove them.
         to_remove = []
         for k, b in prev.next.items():
             if len(b.tokens) < len(tokens) and tokens[: len(b.tokens)] == b.tokens:
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
                 to_remove.append(k)
-        # Two covered siblings would be prefixes of each other; the insertion logic
-        # would already have replaced the shorter one.
-        assert NDEBUG or len(to_remove) <= 1
         event_manager = get_tree(prev).event_manager if to_remove else None
-        # Keep RootBlock attached while covered children are replaced.  Adding
-        # the replacement first prevents detach_next() from pruning an
-        # otherwise-empty root before this block becomes its new child.
-        prev.next[self.key] = self
         for k in to_remove:
-            b = detach_next(prev, k)
-            assert isinstance(b, Block)
-            self._adopt_pages_from(b)
+            b = prev.next.pop(k)
             if event_manager is not None:
                 event_manager.add_removed_event(b.key)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
+        prev.next[self.key] = self
 
-    def page_coverage(self, lc_idx: LifeCycleId) -> int:
-        """Return the page's recorded token count, or zero if the slot is empty.
-
-        For attention this is prefix coverage; for SSM it is an exact checkpoint position.
-        """
-        page = self.get_page(lc_idx)
-        return page.num_tokens_in_block if page is not None else 0
-
-    def holds_page(self, page: "CommittedPage") -> bool:
-        return self.get_page(page.life_cycle) is page
-
-    def can_replace_page(self, lc_idx: LifeCycleId, num_tokens_in_block: int) -> bool:
-        """Whether a page recording `num_tokens_in_block` may take over slot `lc_idx`.
-
-        A slot keeps only the page with the largest recorded token count. For attention,
-        greater coverage strictly dominates lesser coverage. For SSM, this deliberately
-        keeps only the latest checkpoint -- two conversation turns rarely end inside the
-        same block, and if they do, a reuse miss is acceptable.
-
-        Pure; use replace_page() to install.
-        """
-        existing = self.get_page(lc_idx)
-        return existing is None or existing.num_tokens_in_block < num_tokens_in_block
-
-    def replace_page(self, lc_idx: LifeCycleId, page: "CommittedPage") -> None:
-        """Install `page` in slot `lc_idx`, detaching whatever it supersedes.
-
-        The superseded page may outlive this call while a request still holds it, so
-        unlink_page() must clear its back-pointer: _release_pages() walks `storage`, so
-        nothing would clear it later and it would dangle once this block dies.
-        """
-        assert NDEBUG or self.can_replace_page(lc_idx, page.num_tokens_in_block)
-        existing = self.unlink_page(lc_idx)
-        if existing is not None and existing.scheduled_for_eviction:
-            existing.manager.exclude_from_eviction(existing)
-        page.block = rawref.ref(self)
-        self.storage[lc_idx] = rawref.ref(page)
-
-    def _adopt_pages_from(self, other: "Block") -> None:
-        """Move `other`'s pages into self without changing their recorded token counts."""
-        assert other.ordinal == self.ordinal
-        for lc_idx in typed_range(self.num_life_cycles):
-            page = other.get_page(lc_idx)
-            if page is None or not self.can_replace_page(lc_idx, page.num_tokens_in_block):
-                continue
-            # Clear the source slot directly rather than via unlink_page(), which would
-            # null the back-pointer replace_page() is about to overwrite.
-            other.storage[lc_idx] = None
-            self.replace_page(lc_idx, page)
-
-    def _release_pages(self) -> None:
-        """Reclaim every page held by this block.
-
-        Nulls each page's back-pointer and, for pages still scheduled for eviction,
-        removes them from the eviction controller (releasing their storage slots).
-        Idempotent: afterwards ``storage`` holds no pages, so it is safe to call again
-        from ``__del__``.
-
-        This must run during radix-tree teardown (``remove_subtree``/``clear``) rather
-        than being deferred to ``__del__``, so that page reclamation does not depend on
-        this ``Block`` object's destruction timing. An external reference can keep the
-        ``Block`` alive past ``StorageManager`` teardown, after which ``page.manager``
-        would be a dangling reference.
-        """
-        for lc_idx in typed_range(self.num_life_cycles):
-            page = self.get_page(lc_idx)
-            if page is not None:
-                self.unlink_page(lc_idx)
+    def __del__(self) -> None:
+        for ref in self.storage:
+            if ref is not None and ref() is not None:
+                page = unwrap_rawref(ref)
                 if page.status == PageStatus.DROPPABLE:
                     if page.scheduled_for_eviction:
                         page.manager.exclude_from_eviction(page)
-
-    def __del__(self) -> None:
-        self._release_pages()
+        if self._prev() is not None and isinstance(self.prev, RootBlock) and not self.prev.next:
+            self.prev.prev.next.pop(self.prev.key)
         self.__rawref__.invalidate()
 
     def _partial_match_this_node(self, tokens: TokenBlock) -> int:
@@ -390,62 +377,37 @@ class Block:
     def prev(self) -> "Block | RootBlock":
         return unwrap_rawref(self._prev)
 
-    def get_page(self, lc_idx: LifeCycleId) -> "CommittedPage | None":
-        """Return the page in slot `lc_idx`, or None when the slot is empty.
-
-        A non-empty slot always resolves: CommittedPage.__del__ unlinks the page from its
-        block before invalidating its rawref, so `storage` never retains a dangling ref.
-        """
-        return map_optional(self.storage[lc_idx], lambda f: f())
-
-    def unlink_page(
-        self, lc_idx: LifeCycleId, expected_page: "CommittedPage | None" = None
-    ) -> "CommittedPage | None":
-        """Detach slot `lc_idx`, returning the page that was there, or None.
-
-        The sole place a block-page link is severed.
-        """
-        # Called from CommittedPage.__del__, which invalidates the page's rawref only
-        # afterwards, so the dying page is still reachable here.
-        page = self.get_page(lc_idx)
-        if page is None:
-            return None
-        # Only unlink when the slot still holds the expected page. During rebase
-        # another block with the same key may have replaced the stored page, and
-        # unlinking then would clobber the newer page's back-pointer.
-        if expected_page is not None and page is not expected_page:
-            return None
-        page.block = rawref.NULL
+    def unset_page(self, lc_idx: LifeCycleId, lc: LifeCycle) -> None:
+        if self.storage[lc_idx] is None:
+            return
+        ordinal = self.ordinal
         self.storage[lc_idx] = None
-        return page
-
-    @staticmethod
-    def clear_stale_blocks_after_page_unlink(
-        start: "Block", lc_idx: LifeCycleId, lc: LifeCycle
-    ) -> None:
-        assert start.get_page(lc_idx) is None
-        ordinal = start.ordinal
-        tree = try_get_tree(start)
+        tree = try_get_tree(self)
         event_manager = tree.event_manager if tree is not None else None
         if type(lc) is AttnLifeCycle and (lc.window_size is None or ordinal < lc.num_sink_blocks):
-            remove_subtree(start)
+            pages = remove_subtree(self)
+            for r in pages:
+                if r() is not None:
+                    page = unwrap_rawref(r)
+                    assert page.status == PageStatus.DROPPABLE
+                    if page.scheduled_for_eviction:
+                        page.manager.exclude_from_eviction(page)
         elif event_manager is not None:
-            event_manager.add_removed_life_cycle_event(start.key, int(lc_idx))
+            event_manager.add_removed_life_cycle_event(self.key, int(lc_idx))
         # It's possible to implement more sophisticated logic to remove useless blocks for SWA, e.g.
         # check if consecutive available blocks is sufficient for window_size. (TRTLLM-8802)
         # But for simplicity, we leave it for now.
-        curr = start
+        curr = self
         while (
-            (isinstance(curr, Block) and curr.get_page(lc_idx) is None)
+            (isinstance(curr, Block) and curr.storage[lc_idx] is None)
             and not curr.next
             and curr._prev() is not None
         ):
-            prev = curr.prev
-            detached = detach_next(prev, curr.key)
-            assert detached is curr
-            if event_manager is not None:
-                event_manager.add_removed_event(curr.key)
-            curr = prev
+            if curr.key in curr.prev.next:
+                curr.prev.next.pop(curr.key)
+                if event_manager is not None:
+                    event_manager.add_removed_event(curr.key)
+            curr = curr.prev
 
     @property
     def tokens_per_block(self) -> int:
@@ -459,9 +421,7 @@ class Block:
 
     @property
     def is_orphan(self) -> bool:
-        prev = self._prev()
-        assert prev is None or (self.key in prev.next and prev.next[self.key] is self)
-        return prev is None
+        return self.key not in self.prev.next or self.prev.next[self.key] is not self
 
 
 class BlockRadixTree:
@@ -515,21 +475,28 @@ class BlockRadixTree:
     def num_life_cycles(self) -> LifeCycleId:
         return self.life_cycles.size
 
-    def clear(self) -> None:
+    def clear(self) -> list[rawref.ref["CommittedPage"]]:
         # taking O(1) space
         # remove leaf blocks one by one, in post-order
-        # ~Block() / __del__() handles page cleanup.
-        # detach_next() auto-prunes empty RootBlocks from the tree.
+        ret: list[rawref.ref["CommittedPage"]] = []
         while self.next:
-            root = next(iter(self.next.values()))
-            while root.next:
-                remove_subtree(next(iter(root.next.values())))
+            block = next(iter(self.next.values()))
+            ret.extend(remove_subtree(block))
         assert not self.next
+        return ret
 
     def _num_matched_tokens(self, matched: list[tuple[Block, int]]) -> int:
         if not matched:
             return 0
         return self._tokens_per_block * (len(matched) - 1) + matched[-1][1]
+
+    @staticmethod
+    def _has_pages(block: Block, lc_list: Iterable[LifeCycleId]) -> bool:
+        return all(block.storage[lc] is not None for lc in lc_list)
+
+    @staticmethod
+    def _has_page(block: Block, lc: LifeCycleId) -> bool:
+        return block.storage[lc] is not None
 
     # yields tuples of (block, num_matched_tokens). num_matched_tokens should be equal to
     # tokens_per_block except the last one.
@@ -565,54 +532,71 @@ class BlockRadixTree:
         assert all(b[1] == tokens_per_block for b in matched[:-1])
 
         life_cycles = self._life_cycles
-        attn_life_cycles = list(life_cycles.attention_life_cycles())
-        ssm_lc_id = life_cycles.ssm_life_cycle_id
 
-        # Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
-        # shorten the match to the coverage of a required page. Every retry strictly
-        # shortens the match, so the loop terminates.
+        # check for full attention layers
+        attn_life_cycles = list(life_cycles.attention_life_cycles())
+        if any(lc.window_size is None for _, lc in attn_life_cycles):
+            lc_list = [lc_idx for lc_idx, lc in attn_life_cycles if lc.window_size is None]
+
+            def check_no_pages(b: tuple[Block, int]) -> bool:
+                return not BlockRadixTree._has_pages(b[0], lc_list)
+
+            n = find_index(matched, check_no_pages)
+            matched = matched[:n]
+
+        swa_life_cycles = tuple(
+            (lc_idx, lc) for lc_idx, lc in attn_life_cycles if lc.window_size is not None
+        )
+        # check for SWA sink
+        for lc_idx, lc in swa_life_cycles:
+
+            def check_no_page_lc(b: tuple[Block, int]) -> bool:
+                return not BlockRadixTree._has_page(b[0], lc_idx)
+
+            n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
+            if n < lc.num_sink_blocks:
+                matched = matched[:n]
+        # Check SWA window and SSM snapshot constraints together,
+        # since SSM truncation can invalidate SWA invariants.
+        # SSM is checked first (intervals are large, so it prunes more).
+        ssm_lc_id = life_cycles.ssm_life_cycle_id
         while matched:
-            # Check SSM snapshot availability first: truncating to the last reusable SSM
-            # snapshot changes the matched length that all the attention checks use.
+            # SSM truncation: truncate to the last block with an SSM snapshot
             if ssm_lc_id is not None:
                 ssm_trunc = 0
-                ssm_match_len = 0
                 for i in reversed(range(len(matched))):
-                    # An SSM page holds the recurrent state after exactly this many tokens,
-                    # so reuse must stop there instead of anywhere inside the block.
-                    snapshot_len = matched[i][0].page_coverage(ssm_lc_id)
-                    if snapshot_len > 0 and matched[i][1] >= snapshot_len:
+                    if matched[i][0].storage[ssm_lc_id] is not None:
+                        assert NDEBUG or matched[i][1] == self._tokens_per_block, (
+                            "SSM reuse snapshot must only be selected from a fully matched block"
+                        )
                         ssm_trunc = i + 1
-                        ssm_match_len = snapshot_len
                         break
                 matched = matched[:ssm_trunc]
                 if not matched:
                     break
-                matched[-1] = (matched[-1][0], ssm_match_len)
-
-            # Only pages that are active at this candidate endpoint constrain attention
-            # reuse. Full attention requires every block. SWA requires sink blocks and the
-            # trailing window, but not the stale blocks between them. In particular, at an
-            # exact block boundary with window_size=1, every historical block is stale.
+            # SWA window check
             num_tokens = self._num_matched_tokens(matched)
-            shortened = False
-            for lc_idx, lc in attn_life_cycles:
-                stale = lc.get_stale_range(num_tokens, tokens_per_block)
-                for i in chain(range(stale.beg), range(stale.end, len(matched))):
-                    block, num_matched = matched[i]
-                    coverage = block.page_coverage(lc_idx)
-                    if coverage >= num_matched:
-                        continue
-                    if coverage > 0:
-                        matched = matched[: i + 1]
-                        matched[-1] = (block, coverage)
-                    else:
-                        matched = matched[:i]
-                    shortened = True
+            for lc_idx, lc in swa_life_cycles:
+                if lc.window_size is None:
+                    continue
+
+                def check_has_page_lc(b: tuple[Block, int]) -> bool:
+                    return BlockRadixTree._has_page(b[0], lc_idx)
+
+                n = find_index(reversed(matched), check_has_page_lc)
+                if n != 0:
+                    matched = matched[:-n]
                     break
-                if shortened:
+                _, stale_end = lc.get_stale_range(num_tokens, tokens_per_block)
+
+                def has_no_page(b: tuple[Block, int]) -> bool:
+                    return not BlockRadixTree._has_page(b[0], lc_idx)
+
+                n = find_index(reversed(matched[stale_end:]), has_no_page)
+                if len(matched) - n > stale_end:
+                    matched = matched[: len(matched) - n - 1]
                     break
-            if not shortened:
+            else:
                 break
         return matched
 
@@ -631,11 +615,7 @@ class BlockRadixTree:
         matched = self._prune_match(
             list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         )
-        return ReuseMatch(
-            [block for block, _ in matched],
-            self._num_matched_tokens(matched),
-            len(tokens),
-        )
+        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
 
     def _check_sanity(self) -> bool:
         raise NotImplementedError(

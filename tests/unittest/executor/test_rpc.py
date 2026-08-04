@@ -9,8 +9,6 @@ from tensorrt_llm.executor.rpc import (RPCCancelled, RPCClient, RPCError,
                                        RPCServer, RPCStreamingError, RPCTimeout)
 from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 
-pytestmark = pytest.mark.cpu_only
-
 
 class RpcServerWrapper(RPCServer):
     """ A helper class to wrap the RPCServer and manage its lifecycle. """

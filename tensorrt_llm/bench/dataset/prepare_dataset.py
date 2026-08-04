@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 
 import click
 from pydantic import BaseModel, model_validator
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import AutoTokenizer
 
 from tensorrt_llm.bench.dataset.prepare_real_data import real_dataset
 from tensorrt_llm.bench.dataset.prepare_synthetic_data import token_norm_dist, token_unif_dist
@@ -25,7 +25,7 @@ from tensorrt_llm.bench.dataset.prepare_synthetic_data import token_norm_dist, t
 
 class RootArgs(BaseModel):
     tokenizer: str
-    output: Optional[str]
+    output: str
     random_seed: int
     task_id: int
     trust_remote_code: bool = False
@@ -35,18 +35,9 @@ class RootArgs(BaseModel):
     @model_validator(mode="after")
     def validate_tokenizer(self):
         try:
-            # PreTrainedTokenizerFast loads directly from tokenizer.json without
-            # invoking AutoConfig, avoiding model-config parsing bugs (e.g.
-            # NemotronHConfig._pattern_to_list KeyError for hybrid models).
-            # Fall back to AutoTokenizer for models that lack a fast tokenizer.
-            try:
-                tokenizer = PreTrainedTokenizerFast.from_pretrained(
-                    self.tokenizer, padding_side="left"
-                )
-            except (OSError, ValueError):
-                tokenizer = AutoTokenizer.from_pretrained(
-                    self.tokenizer, padding_side="left", trust_remote_code=self.trust_remote_code
-                )
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.tokenizer, padding_side="left", trust_remote_code=self.trust_remote_code
+            )
         except EnvironmentError as e:
             raise ValueError(
                 "Cannot find a tokenizer from the given string because of "
@@ -62,12 +53,6 @@ class RootArgs(BaseModel):
 @click.group(name="prepare-dataset")
 @click.option(
     "--output", type=str, help="Output json filename.", default="preprocessed_dataset.json"
-)
-@click.option(
-    "--stdout",
-    is_flag=True,
-    default=False,
-    help="Print the dataset to stdout with a JSON entry on each line instead of writing a file.",
 )
 @click.option(
     "--random-seed", required=False, type=int, help="random seed for token_ids", default=420
@@ -89,15 +74,12 @@ class RootArgs(BaseModel):
 def prepare_dataset(ctx, **kwargs):
     """Prepare dataset for benchmarking with trtllm-bench."""
     model = ctx.obj.model or ctx.obj.checkpoint_path
-    # --stdout is encoded as a null output path (mutually exclusive with a file).
-    output = None if kwargs["stdout"] else kwargs["output"]
-    if output is not None:
-        output_path = Path(output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path = Path(kwargs["output"])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     ctx.obj = RootArgs(
         tokenizer=model,
-        output=output,
+        output=kwargs["output"],
         random_seed=kwargs["random_seed"],
         task_id=kwargs["task_id"],
         rand_task_id=kwargs["rand_task_id"],

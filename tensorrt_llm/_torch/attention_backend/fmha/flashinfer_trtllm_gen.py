@@ -67,21 +67,26 @@ if TYPE_CHECKING:
     )
 
 
-_MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
+def _clear_multi_ctas_kv_counter_workspace(
+    fmha_workspace: torch.Tensor,
+    num_heads: int,
+    max_num_requests: int,
+    multi_processor_count: Optional[int],
+) -> None:
+    counter_size = _get_multi_ctas_kv_counter_size(
+        num_heads,
+        max_num_requests,
+        multi_processor_count,
+    )
+    fmha_workspace.narrow(0, 0, counter_size).zero_()
 
 
 def _get_multi_ctas_kv_counter_size(
     num_heads: int,
     max_num_requests: int,
-    multi_processor_count: int,
+    multi_processor_count: Optional[int],
 ) -> int:
-    num_counters = max(num_heads * max_num_requests, multi_processor_count)
-    aligned_num_counters = (
-        (num_counters + _MULTI_CTAS_KV_COUNTER_ALIGNMENT - 1)
-        // _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-        * _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-    )
-    return aligned_num_counters * torch.int32.itemsize
+    return max(num_heads * max_num_requests, multi_processor_count or 0)
 
 
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
@@ -94,7 +99,6 @@ def _trtllm_gen_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_pool: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    multi_ctas_kv_counter_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
@@ -134,7 +138,6 @@ def _trtllm_gen_batch_decode_with_kv_cache(
         kv_pool,
         kv_pool,
         workspace_buffer,
-        multi_ctas_kv_counter_buffer,
         block_tables,
         seq_lens,
         decode_max_q_len,
@@ -166,7 +169,6 @@ def _trtllm_gen_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_pool: torch.Tensor,
     workspace_buffer: torch.Tensor,
-    multi_ctas_kv_counter_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_q_len: int,
@@ -197,7 +199,6 @@ def _trtllm_gen_batch_context_with_kv_cache(
         kv_pool,
         kv_pool,
         workspace_buffer,
-        multi_ctas_kv_counter_buffer,
         block_tables,
         seq_lens,
         max_q_len,
@@ -401,13 +402,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     MAX_HEADS_RATIO_GENERATION = 32
     MIN_TOKENS_PER_BLOCK = 8
     SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
-    # FlashInfer narrows key_cache.size(0) to int before constructing its TMA descriptor.
-    MAX_NUM_PAGES_IN_MEM_POOL = (1 << 31) - 1
     SUPPORTED_MLA_GENERATION_HEAD_DIMS = {
         (320, 256),
         (576, 512),
     }
-    SLOWER_MLA_GENERATION_KERNELS = {
+    MISSING_MLA_GENERATION_KERNELS = {
         (576, 512, 32),
     }
 
@@ -419,19 +418,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
-        self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
-
-    def _get_total_num_blocks(self, meta: "TrtllmAttentionMetadata") -> int:
-        kv_cache_manager = meta.kv_cache_manager
-        if kv_cache_manager is not None:
-            get_page_index_upper_bound = getattr(
-                getattr(kv_cache_manager, "impl", None), "get_page_index_upper_bound", None
-            )
-            # KVCacheManagerV2 exposes this implementation-only API and reports an
-            # already-flattened page-index bound, unlike the legacy logical block count.
-            if get_page_index_upper_bound is not None:
-                return int(kv_cache_manager.blocks_in_primary_pool)
-        return super()._get_total_num_blocks(meta)
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -544,7 +530,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if missing_params:
             return (
                 False,
-                "[Generation][MLA] missing required MLA parameter(s): "
+                "[Generation][MLA] Missing required MLA parameter(s): "
                 f"{', '.join(missing_params)}.",
             )
 
@@ -555,7 +541,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if head_size != head_dim_qk:
             return (
                 False,
-                f"[Generation][MLA] head_size ({head_size}) that does not match "
+                f"[Generation][MLA] head_size ({head_size}) must match "
                 f"kv_lora_rank + qk_rope_head_dim ({head_dim_qk}).",
             )
 
@@ -563,14 +549,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             supported = sorted(cls.SUPPORTED_MLA_GENERATION_HEAD_DIMS)
             return (
                 False,
-                f"[Generation][MLA] head dimensions "
+                f"[Generation][MLA] Unsupported head dimensions: "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
             )
 
-        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
+        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.MISSING_MLA_GENERATION_KERNELS:
             return (
                 False,
-                f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
+                f"[Generation][MLA] Missing TRTLLM-GEN decode kernel for "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
                 f"tokens_per_block={tokens_per_block}.",
             )
@@ -594,7 +580,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             forward_args,
         )
         if not supported:
-            logger.debug(f"FlashInfer trtllm-gen fmha library does not support {reason}")
+            logger.debug(f"FlashInfer TRTLLM-Gen FMHA does not support request: {reason}")
         return supported
 
     def _is_supported_with_reason(
@@ -608,18 +594,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     ) -> Tuple[bool, str]:
         is_mla_enable = attn.is_mla_enable
         sparse_params = attn.sparse_params
-        has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
+        has_skip_softmax = getattr(sparse_params, "algorithm", None) == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
-        if fwd.enable_dsv4_epilogue_fusion:
-            return False, "trtllm-gen does not support DSv4 epilogue fusion."
         if (
             fwd.sage_attn_num_elts_per_blk_q > 0
             or fwd.sage_attn_num_elts_per_blk_k > 0
             or fwd.sage_attn_num_elts_per_blk_v > 0
         ):
-            return False, "sage attention."
+            return False, "trtllm-gen does not support sage attention."
         if meta.helix_position_offsets is not None:
-            return False, "helix parallelism."
+            return False, "trtllm-gen does not support helix parallelism."
         sparse_kv_indices = fwd.sparse_prediction.sparse_kv_indices
         sparse_attn_indices = fwd.sparse_prediction.sparse_attn_indices
         if (
@@ -628,29 +612,24 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             or meta.num_sparse_topk > 0
             or has_sparse_attention
         ):
-            return False, "sparse attention."
+            return False, "trtllm-gen does not support sparse attention."
         if has_skip_softmax:
-            return False, "skip-softmax attention."
+            return False, "trtllm-gen does not support skip-softmax attention."
         if fwd.relative_attention_bias is not None:
-            return False, "relative attention bias."
+            return False, "Relative attention bias is not supported by trtllm-gen backend."
         if meta.use_spec_decoding and meta.is_spec_dec_tree:
-            return False, "spec-dec tree/custom masks."
+            return (
+                False,
+                "FlashInfer trtllm-gen does not support spec-dec tree/custom masks.",
+            )
         if is_mla_enable and fwd.attention_input_type != AttentionInputType.generation_only:
-            return False, "MLA with non-generation-only attention."
+            return False, "trtllm-gen MLA supports generation-only attention."
 
         if meta.kv_cache_block_offsets is None:
-            return False, "non-paged KV cache; paged KV cache is required."
-
-        num_pages_in_mem_pool = self._get_total_num_blocks(meta)
-        if num_pages_in_mem_pool > self.MAX_NUM_PAGES_IN_MEM_POOL:
-            return False, (
-                f"more than {self.MAX_NUM_PAGES_IN_MEM_POOL} flattened KV-cache "
-                f"pages, but this pool requires {num_pages_in_mem_pool}."
-            )
-
+            return False, "trtllm-gen requires paged KV cache."
         output = fwd.output
         if output is None:
-            return False, "a missing output tensor; output is required."
+            return False, "trtllm-gen requires output."
 
         tokens_per_block = meta.tokens_per_block
         if tokens_per_block is None:
@@ -663,20 +642,32 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         o_dtype = output.dtype
 
         if q_dtype not in self.SUPPORTED_INPUT_DTYPES:
-            return False, f"input dtype {q_dtype}. Supported: FP16, BF16, FP8 (E4M3)."
+            return False, (
+                f"Input dtype {q_dtype} not supported. Supported: FP16, BF16, FP8 (E4M3)."
+            )
 
         kv_cache_dtype = self._get_kv_cache_dtype(meta)
         if kv_cache_dtype is None:
             kv_cache_dtype = torch_dtype_to_binding(q_dtype)
         if meta.is_cross:
             if kv_cache_dtype == DataType.NVFP4:
-                return False, "cross attention with NVFP4 KV cache."
+                return (
+                    False,
+                    "Cross attention with NVFP4 KV cache is not supported by trtllm-gen backend.",
+                )
             if is_mla_enable:
-                return False, "cross attention with MLA."
+                return False, "Cross attention with MLA is not supported by trtllm-gen backend."
             if meta.is_spec_decoding_enabled or meta.use_spec_decoding:
-                return False, "cross attention with speculative decoding."
+                return (
+                    False,
+                    "Cross attention with speculative decoding is not supported by "
+                    "trtllm-gen backend.",
+                )
             if fwd.update_kv_cache and fwd.cross_kv is None:
-                return False, "cross attention with a missing cross_kv when update_kv_cache=True."
+                return (
+                    False,
+                    "trtllm-gen cross attention requires cross_kv when update_kv_cache=True.",
+                )
 
         is_fp8_out = output.dtype == torch.float8_e4m3fn
         is_fp4_out = output.dtype == torch.uint8
@@ -689,53 +680,62 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             q_dtype = torch.float8_e4m3fn
 
         if kv_cache_dtype not in self.SUPPORTED_KV_CACHE_DTYPES:
-            return False, f"KV cache dtype {kv_cache_dtype}. Supported: FP16, BF16, FP8, NVFP4."
+            return False, (
+                f"KV cache dtype {kv_cache_dtype} not supported. Supported: FP16, BF16, FP8, NVFP4."
+            )
         if o_dtype not in self.SUPPORTED_OUT_DTYPES:
-            return False, f"output dtype {o_dtype}. Supported: FP16, BF16, FP8."
+            return False, f"Output dtype {o_dtype} not supported. Supported: FP16, BF16, FP8."
 
         has_alibi = attn.position_embedding_type in (4, 5)
         check_context_phase = has_context_phase and not is_mla_enable
         if check_context_phase:
             if attn.head_dim in self.UNSUPPORTED_HEAD_SIZES_CONTEXT:
-                return False, f"[Context] head size {attn.head_dim}."
+                return False, f"[Context] Head size {attn.head_dim} is not supported."
             try:
                 if AttentionMaskType(fwd.mask_type) == AttentionMaskType.custom_mask:
-                    return False, "[Context] custom mask."
+                    return False, "[Context] Custom mask is not supported."
             except ValueError:
-                return False, f"[Context] invalid mask_type: {fwd.mask_type}."
+                return False, f"[Context] Invalid mask_type: {fwd.mask_type}."
             if has_alibi:
-                return False, "[Context] ALiBi."
+                return False, "[Context] ALiBi is not supported."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_CONTEXT:
                 return False, (
-                    f"[Context] dtype combination: Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
+                    f"[Context] Unsupported dtype combination: "
+                    f"Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
                 )
 
         if has_generation_phase:
             if meta.beam_width != 1 and not meta.is_cross:
-                return False, (
-                    f"[Generation] beam search (beam_width={meta.beam_width}); must be 1."
+                return (
+                    False,
+                    f"[Generation] Beam search (beam_width={meta.beam_width}) "
+                    "is not supported. Must be 1.",
                 )
             sink_token_length = 0
             if sink_token_length != 0:
-                return False, (
-                    f"[Generation] StreamingLLM (sink_token_length={sink_token_length})."
+                return (
+                    False,
+                    f"[Generation] StreamingLLM "
+                    f"(sink_token_length={sink_token_length}) is not supported.",
                 )
             if tokens_per_block < self.MIN_TOKENS_PER_BLOCK:
-                return False, (
-                    f"[Generation] tokens_per_block ({tokens_per_block}); "
-                    f"must be >= {self.MIN_TOKENS_PER_BLOCK}."
+                return (
+                    False,
+                    f"[Generation] tokens_per_block ({tokens_per_block}) "
+                    f"must be >= {self.MIN_TOKENS_PER_BLOCK}.",
                 )
             heads_ratio = attn.num_heads // attn.num_kv_heads
             if not is_mla_enable and heads_ratio > self.MAX_HEADS_RATIO_GENERATION:
-                return False, (
-                    f"[Generation] heads ratio ({heads_ratio}) exceeding maximum "
-                    f"({self.MAX_HEADS_RATIO_GENERATION})."
+                return (
+                    False,
+                    f"[Generation] heads ratio ({heads_ratio}) exceeds maximum "
+                    f"({self.MAX_HEADS_RATIO_GENERATION}).",
                 )
             if has_alibi:
-                return False, "[Generation] ALiBi."
+                return False, "[Generation] ALiBi is not supported."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_GENERATION:
                 return False, (
-                    f"[Generation] dtype combination: "
+                    f"[Generation] Unsupported dtype combination: "
                     f"Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
                 )
             if is_mla_enable:
@@ -749,12 +749,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                     return False, reason
 
         if tokens_per_block <= 0:
-            return False, f"non-positive tokens_per_block ({tokens_per_block})."
+            return False, "tokens_per_block must be positive."
         if tokens_per_block & (tokens_per_block - 1) != 0:
-            return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
+            return False, f"tokens_per_block ({tokens_per_block}) must be power of 2."
         if tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK:
             supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK)
-            return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
+            return (
+                False,
+                f"tokens_per_block ({tokens_per_block}) is not supported "
+                f"by trtllm-gen kernels. Supported: {supported}.",
+            )
 
         return True, ""
 
@@ -802,28 +806,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if self._multi_processor_count is None:
             self._multi_processor_count = self._get_multi_processor_count(q.device)
 
-        required_counter_size = _get_multi_ctas_kv_counter_size(
-            attn.num_heads,
-            metadata.max_num_requests,
-            self._multi_processor_count,
-        )
-        counter_buffer = self._multi_ctas_kv_counter_buffer
-        if (
-            counter_buffer is None
-            or counter_buffer.device != q.device
-            or counter_buffer.numel() * counter_buffer.element_size() < required_counter_size
-        ):
-            if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "The trtllm-gen multi-CTA KV counter buffer must be allocated "
-                    "before CUDA graph capture."
-                )
-            self._multi_ctas_kv_counter_buffer = torch.zeros(
-                required_counter_size,
-                dtype=torch.uint8,
-                device=q.device,
-            )
-
         num_tokens = q.size(0)
         attention_input_type = forward_args.attention_input_type
         is_gen_only = attention_input_type == AttentionInputType.generation_only
@@ -856,12 +838,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 )
             required_workspace_numel = math.ceil(required_workspace_size / workspace.element_size())
             workspace.resize_((required_workspace_numel,))
-
-    def _get_multi_ctas_kv_counter_buffer(self) -> torch.Tensor:
-        counter_buffer = self._multi_ctas_kv_counter_buffer
-        if counter_buffer is None:
-            raise RuntimeError("The trtllm-gen multi-CTA KV counter buffer is not initialized.")
-        return counter_buffer
 
     @staticmethod
     def _compute_window_left(
@@ -989,7 +965,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             q_processed,  # query
             kv_pool,  # kv_pool
             fmha_workspace,  # workspace_buffer
-            self._get_multi_ctas_kv_counter_buffer(),  # multi_ctas_kv_counter_buffer
             block_tables,  # block_tables
             params.sequence_lengths,  # seq_lens
             max_q_len,  # max_q_len
@@ -1089,7 +1064,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fwd.out_scale,  # attention_output_orig_quant
             attn.rotary_inv_freq,  # rotary_inv_freq
             attn.rotary_cos_sin,  # rotary_cos_sin
-            fwd.mrope_position_deltas,  # mrope_position_deltas
             attn.local_layer_idx,  # layer_idx
             params.seq_offset,  # seq_offset
             attn.num_heads,  # num_heads
@@ -1121,6 +1095,22 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.is_cross,  # is_cross
         )
 
+        # FIXME: Flashinfer trtllm-gen API doesn't support a separate
+        # multi CTAs counter buffer. We have to clear a small buffer
+        # before trtllm_gen_batch_decode_with_kv_cache.
+        #
+        # We must also avoid clearing the workspace only when it is
+        # resized. The warmup phase may have already cached the workspace
+        # pointer; if the capture phase skips the zeroing step, the
+        # CUDA graph will not include the counter initialization. We
+        # have already verified—specifically in the context of the GPTOSS-20B
+        # test graph replay scenario—that this skipping logic is unsafe.
+        #
+        # https://github.com/flashinfer-ai/flashinfer/issues/3433
+        _clear_multi_ctas_kv_counter_workspace(
+            fmha_workspace, attn.num_heads, meta.max_num_requests, self._multi_processor_count
+        )
+
         q_len_per_req = None if is_multi_token_gen else params.input_seq_length
         decode_max_q_len = max_q_len if is_multi_token_gen else None
         decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
@@ -1144,7 +1134,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             q_processed,  # query
             kv_pool,  # kv_pool
             fmha_workspace,  # workspace_buffer
-            self._get_multi_ctas_kv_counter_buffer(),  # multi_ctas_kv_counter_buffer
             block_tables,  # block_tables
             params.sequence_lengths,  # seq_lens
             max_kv_len,  # max_seq_len
@@ -1179,7 +1168,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         batch_beam = params.num_requests * meta.beam_width
         if params.attention_input is None:
             raise RuntimeError("MLA generation requires attention_input.")
-        kv_cache, block_tables, _kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
+        kv_cache, block_tables = thop.build_trtllm_gen_kv_cache_metadata(
             meta.host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
             meta.host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
             meta.kv_cache_block_offsets,  # kv_cache_block_offsets
@@ -1209,44 +1198,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         mla_head_dim_qk = kv_lora_rank + qk_rope_head_dim
         q_len_per_req = params.num_tokens // batch_beam if batch_beam > 0 else 1
 
-        if QuantMode(attn.quant_mode).has_fp8_kv_cache():
-            quant_q_buffer = fwd.quant_q_buffer
-            bmm1_scale_buffer = fwd.mla_bmm1_scale
-            bmm2_scale_buffer = fwd.mla_bmm2_scale
-            if quant_q_buffer is None or bmm1_scale_buffer is None or bmm2_scale_buffer is None:
-                raise RuntimeError(
-                    "FP8 MLA generation requires quant_q_buffer, "
-                    "mla_bmm1_scale, and mla_bmm2_scale."
-                )
+        query = params.qkv_input.view(batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk)
 
-            expected_q_elements = params.num_tokens * attn.num_heads * mla_head_dim_qk
-            if quant_q_buffer.numel() < expected_q_elements:
-                raise RuntimeError(
-                    f"FP8 MLA quant_q_buffer has {quant_q_buffer.numel()} elements; "
-                    f"expected at least {expected_q_elements}."
-                )
-            if bmm1_scale_buffer.dtype != torch.float32 or bmm1_scale_buffer.numel() < 1:
-                raise RuntimeError("FP8 MLA bmm1 scale must contain a float32 value.")
-            if bmm2_scale_buffer.dtype != torch.float32 or bmm2_scale_buffer.numel() < 1:
-                raise RuntimeError("FP8 MLA bmm2 scale must contain a float32 value.")
-
-            query = (
-                quant_q_buffer.view(torch.uint8)
-                .flatten()[:expected_q_elements]
-                .view(torch.float8_e4m3fn)
-                .view(batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk)
-            )
-            # FlashInfer converts tensor BMM1 scales to log2 internally. The
-            # producer stores the regular scale at index 0 and log2 at index 1.
-            bmm1_scale = bmm1_scale_buffer.flatten()[:1]
-            bmm2_scale = bmm2_scale_buffer.flatten()[:1]
-        else:
-            query = params.qkv_input.view(
-                batch_beam, q_len_per_req, attn.num_heads, mla_head_dim_qk
-            )
-            bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
-            bmm2_scale = 1.0
+        bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
         workspace_buffer = params.workspace.view(-1, 4)
+        _clear_multi_ctas_kv_counter_workspace(
+            workspace_buffer, attn.num_heads, meta.max_num_requests, self._multi_processor_count
+        )
 
         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
             query,  # query
@@ -1261,12 +1219,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             0,  # sparse_mla_top_k
             params.context_buf.view(batch_beam, q_len_per_req, attn.num_heads, kv_lora_rank),  # out
             bmm1_scale,  # bmm1_scale
-            bmm2_scale,  # bmm2_scale
+            1.0,  # bmm2_scale
             fwd.attention_sinks,  # sinks
             None,  # skip_softmax_threshold_scale_factor
             self._enable_pdl,  # enable_pdl
             "trtllm-gen",  # backend
             True,  # is_var_seq
             self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )

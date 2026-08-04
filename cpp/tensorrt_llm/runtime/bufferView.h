@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <string>
@@ -71,7 +70,7 @@ public:
         return mBuffer->getCapacity() - mOffset;
     }
 
-    [[nodiscard]] tensorrt_llm::DataType getDataType() const override
+    [[nodiscard]] nvinfer1::DataType getDataType() const override
     {
         return mBuffer->getDataType();
     }

@@ -27,6 +27,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
+#include "tensorrt_llm/runtime/tllmLogger.h"
 
 namespace tensorrt_llm::tests::kernels::sampling
 {

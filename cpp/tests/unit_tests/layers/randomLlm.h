@@ -18,7 +18,6 @@
 #include <gtest/gtest.h>
 #include <list>
 
-#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -78,7 +77,7 @@ public:
         : RandomTokenLogits(
             []()
             {
-                auto vocab = BufferManager::cpu(ITensor::makeShape({128}), tensorrt_llm::DataType::kINT32);
+                auto vocab = BufferManager::cpu(ITensor::makeShape({128}), nvinfer1::DataType::kINT32);
                 auto vocabRange = BufferRange<TokenIdType>(*vocab);
                 TokenIdType token{0};
                 std::for_each(vocabRange.begin(), vocabRange.end(), [&token](auto& v) { v = token++; });

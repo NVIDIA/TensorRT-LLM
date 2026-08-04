@@ -138,10 +138,11 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
             # with allreduce_strategy populated from YAML.
             strategy = shared_config.dist_config.allreduce_strategy
         elif hasattr(gm, "_sharding_transform_container"):
-            # Heuristic-pipeline fallback: entered only by external invocations
-            # that construct InferenceOptimizer without a dist_config kwarg
-            # (e.g. tests/unittest/auto_deploy/multigpu/transformations/library/
-            # test_allreduce_residual_rmsnorm_fusion.py).
+            # Legacy fallback: entered only by external invocations that construct
+            # InferenceOptimizer without a dist_config kwarg (e.g.
+            # tests/unittest/auto_deploy/multigpu/transformations/library/
+            # test_allreduce_residual_rmsnorm_fusion.py). Will be removed together
+            # with the legacy sharding pipeline (sharding.py).
             strategy = gm._sharding_transform_container.config.allreduce_strategy.name
         else:
             ad_logger.warning("No dist config found, skipping allreduce-residual-rmsnorm fusion")
