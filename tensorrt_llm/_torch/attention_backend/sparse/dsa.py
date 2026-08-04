@@ -2104,7 +2104,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # the fault seen on the eager-ragged path.
         #
         # Costs a device-to-host read, so it is opt-in.
-        if os.environ.get("TLLM_DSPARK_ASSERT_ROWS"):
+        if (os.environ.get("TLLM_DSPARK_ASSERT_ROWS")
+                and not torch.cuda.is_current_stream_capturing()):
+            # The .max() below is a device-to-host read, and this function runs
+            # inside the CUDA-graph capture body (on_update_kv_lens). Reading
+            # during capture raises cudaErrorStreamCaptureInvalidated and takes
+            # the whole engine down before any real step runs -- which is what
+            # the first attempt at this check did. Capture is also not where
+            # the interesting case lives: the eager path is.
             worst = int(self.attn_row_req_idx_cuda[:rows].max())
             assert worst < self.num_seqs, (
                 f"token-major row map is stale: {rows} rows index up to "
