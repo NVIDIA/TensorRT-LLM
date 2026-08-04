@@ -15,10 +15,13 @@
 
 import re
 from types import SimpleNamespace
-from typing import Dict, List, Literal
+from typing import TYPE_CHECKING, Dict, List, Literal
 
 import torch
 from transformers import PretrainedConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
@@ -32,6 +35,7 @@ from ...inputs import (
     support_multimodal_disaggregated,
 )
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
+from ..utils import is_nvfp4_marlin_supported_sm
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from .modeling_qwen3_next import Qwen3NextForCausalLM
@@ -52,6 +56,35 @@ _MTP_TOP_TO_TRTLLM = {
     "pre_fc_norm_embedding": "pre_fc_norm_embedding",
     "pre_fc_norm_hidden": "pre_fc_norm_hidden",
 }
+
+
+def _get_qwen35_moe_model_defaults(llm_args: "TorchLlmArgs") -> dict:
+    """Return Ada/Hopper defaults for globally NVFP4-quantized Qwen3.5 MoE.
+
+    MIXED_PRECISION checkpoints are excluded because this hook cannot inspect
+    their per-layer expert algorithms, some of which Marlin cannot consume.
+    Dense Qwen3.5 checkpoints are outside this MoE-specific default.
+    """
+    defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+    quant_config = getattr(llm_args, "quant_config", None)
+    if getattr(
+        quant_config, "quant_algo", None
+    ) == QuantAlgo.NVFP4 and is_nvfp4_marlin_supported_sm(get_sm_version()):
+        # The CUTLASS W4A4 NVFP4 kernels require Blackwell. Marlin consumes
+        # the same checkpoint weights with BF16 activations on Ada/Hopper.
+        # Marlin does not support EPLB, but an explicit user backend remains
+        # authoritative when model defaults are applied.
+        defaults.update(
+            {
+                "moe_config": {
+                    "backend": "MARLIN",
+                },
+                "nvfp4_gemm_config": {
+                    "allowed_backends": ["marlin"],
+                },
+            }
+        )
+    return defaults
 
 
 def _translate_mtp_pattern(name, n_hidden_layers):
@@ -614,6 +647,10 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
     class that serves the vanilla Qwen3NextForCausalLM architecture.
     """
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return _get_qwen35_moe_model_defaults(llm_args)
+
     def __init__(self, model_config):
         keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
         _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=keep_lm_head_quant)
@@ -744,6 +781,10 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
 )
 class Qwen3_5MoeVLModel(_Qwen3_5VLModel):
     """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return _get_qwen35_moe_model_defaults(llm_args)
 
 
 # TODO(TRTLLM-13417): Add tests for disaggregated support.

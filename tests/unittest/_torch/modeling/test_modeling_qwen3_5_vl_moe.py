@@ -5,6 +5,7 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List, Optional
 
 import torch
@@ -15,7 +16,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_pre_hopper
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models import Qwen3_5MoeVLModel
+from tensorrt_llm._torch.models import Qwen3_5MoeForCausalLM, Qwen3_5MoeVLModel
 from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_ssm_cache_dtype
 from tensorrt_llm.inputs import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.quantization import QuantAlgo
 
 
 def _write_qwen35_moe_vl_config(tmp_path: Path) -> Path:
@@ -154,6 +156,63 @@ def test_qwen35_moe_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
         AutoCheckpointMapper.get("HF", "Qwen3_5MoeForConditionalGeneration"),
         Qwen3_5MoeHfWeightMapper,
     )
+
+
+def test_qwen35_moe_model_defaults_select_marlin_on_hopper(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: 90,
+    )
+
+    expected = {
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+            "use_kv_cache_manager_v2": True,
+        },
+        "moe_config": {
+            "backend": "MARLIN",
+        },
+        "nvfp4_gemm_config": {
+            "allowed_backends": ["marlin"],
+        },
+    }
+    llm_args = SimpleNamespace(quant_config=SimpleNamespace(quant_algo=QuantAlgo.NVFP4))
+    assert Qwen3_5MoeForCausalLM.get_model_defaults(llm_args) == expected
+    assert Qwen3_5MoeVLModel.get_model_defaults(llm_args) == expected
+
+
+def test_qwen35_moe_model_defaults_keep_non_nvfp4_backends(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: 90,
+    )
+
+    expected = {
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+            "use_kv_cache_manager_v2": True,
+        }
+    }
+    llm_args = SimpleNamespace(quant_config=SimpleNamespace(quant_algo=QuantAlgo.FP8))
+    assert Qwen3_5MoeForCausalLM.get_model_defaults(llm_args) == expected
+    assert Qwen3_5MoeVLModel.get_model_defaults(llm_args) == expected
+
+
+def test_qwen35_moe_model_defaults_keep_blackwell_backends(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: 100,
+    )
+
+    expected = {
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+            "use_kv_cache_manager_v2": True,
+        }
+    }
+    llm_args = SimpleNamespace(quant_config=SimpleNamespace(quant_algo=QuantAlgo.NVFP4))
+    assert Qwen3_5MoeForCausalLM.get_model_defaults(llm_args) == expected
+    assert Qwen3_5MoeVLModel.get_model_defaults(llm_args) == expected
 
 
 def test_qwen35_moe_vl_placeholder_metadata_registered() -> None:
