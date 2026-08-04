@@ -64,6 +64,7 @@ def _make_creator(
     model_max_seq_len=1,
     max_cuda_graph_batch_size=1,
     layer_types=None,
+    sliding_window=None,
     max_attention_window=None,
 ):
     """Build a minimal KvCacheCreator (bypasses __init__) wired up for
@@ -79,10 +80,11 @@ def _make_creator(
 
     c._llm_args = Mock(disable_overlap_scheduler=True)
 
-    pretrained = Mock()
-    # spec=False so attribute access doesn't accept arbitrary fields; set only
-    # the ones the production path reads.
-    pretrained.layer_types = layer_types
+    pretrained = SimpleNamespace(
+        layer_types=layer_types,
+        num_hidden_layers=(len(layer_types) if isinstance(layer_types, (list, tuple)) else None),
+        sliding_window=sliding_window,
+    )
 
     model_config = Mock()
     model_config.pretrained_config = pretrained
@@ -232,7 +234,7 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
 # blocks.  A single long-context request then overflows the full-attention
 # pool and the scheduler livelocks on suspend/retry.  The fix scales
 # num_cache_blocks by the number of distinct attention-window sizes inferred
-# either from ``layer_types`` on the pretrained config (preferred) or from
+# effective per-layer sliding windows on the pretrained config (preferred) or
 # an explicit ``max_attention_window`` list on kv_cache_config (fallback).
 
 
@@ -279,6 +281,7 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         model_max_seq_len=max_seq_len,
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
+        sliding_window=max_seq_len // 2,
     )
     uniform = _make_creator(
         tpb,
@@ -344,6 +347,7 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         model_max_seq_len=max_seq_len,
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
+        sliding_window=max_seq_len // 2,
     )
 
     total_tokens = c._get_token_num_for_estimation()

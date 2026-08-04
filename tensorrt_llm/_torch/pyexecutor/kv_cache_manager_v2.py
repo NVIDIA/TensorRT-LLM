@@ -82,6 +82,7 @@ from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -939,7 +940,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"unique values={set(self.head_dim_per_layer)}"
                 )
 
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
 
         max_util_for_resume = kv_cache_config.max_util_for_resume
         quota = sys.maxsize

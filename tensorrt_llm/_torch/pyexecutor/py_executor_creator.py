@@ -40,7 +40,8 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear, is_minimax_m3
+from .config_utils import (is_hybrid_linear, is_minimax_m3,
+                           uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -844,8 +845,7 @@ def create_py_executor(
             )
 
         max_attention_window = kv_cache_config.max_attention_window
-        if max_attention_window is not None and len(
-                set(max_attention_window)) > 1:
+        if uses_vswa_kv_cache_layout(max_attention_window):
             raise NotImplementedError(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )

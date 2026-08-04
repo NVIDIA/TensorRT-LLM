@@ -48,8 +48,9 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
-                           is_gemma4_hybrid, is_hybrid_linear, is_kimi_linear,
-                           is_mla, is_nemotron_hybrid, is_qwen3_hybrid,
+                           get_layer_attention_window, is_gemma4_hybrid,
+                           is_hybrid_linear, is_kimi_linear, is_mla,
+                           is_nemotron_hybrid, is_qwen3_hybrid,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -426,22 +427,14 @@ def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
     return reserve, int(reserve / w_bytes_per_token)
 
 
-def is_vswa_enabled(kv_cache_config):
-    max_attention_window = kv_cache_config.max_attention_window
-    return max_attention_window is not None and len(
-        set(max_attention_window)) > 1
-
-
-def _is_sliding_attention_layer(layer_type: object) -> bool:
-    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
-    return "sliding" in layer_type_name
-
-
 def _normalize_attention_windows(
-    max_attention_window: List[int],
+    max_attention_window: List[Optional[int]],
     max_seq_len: int,
 ) -> Optional[List[int]]:
-    normalized = [min(max_seq_len, window) for window in max_attention_window]
+    normalized = [
+        max_seq_len if window is None else min(max_seq_len, window)
+        for window in max_attention_window
+    ]
     if all(window == max_seq_len for window in normalized):
         return None
     if len(set(normalized)) == 1:
@@ -455,33 +448,16 @@ def _derive_draft_max_attention_window(
     max_seq_len: int,
     num_draft_layers: int,
 ) -> Optional[List[int]]:
-    sliding_window = getattr(draft_pretrained_config, "sliding_window", None)
-    layer_types = getattr(draft_pretrained_config, "layer_types", None)
-    # HF configs today expose a single scalar `sliding_window`; `layer_types`
-    # only marks sliding vs full. A draft with *multiple distinct* sliding window
-    # sizes cannot be represented here — fail loudly instead of silently
-    # collapsing every sliding layer to one size. Extension point: map each
-    # sliding layer_type to its own window size.
-    if isinstance(sliding_window, (list, tuple)):
-        raise NotImplementedError(
-            "Draft KV window derivation assumes a single sliding-window size, "
-            f"got multiple: {sliding_window}")
-    if sliding_window is not None and layer_types:
-        layer_type_pattern = list(layer_types)
-        if layer_type_pattern:
-            draft_windows = []
-            for layer_idx in range(num_draft_layers):
-                layer_type = layer_type_pattern[layer_idx %
-                                                len(layer_type_pattern)]
-                draft_windows.append(
-                    int(sliding_window)
-                    if _is_sliding_attention_layer(layer_type) else max_seq_len)
-            return _normalize_attention_windows(draft_windows, max_seq_len)
-
-    use_sliding_window = getattr(draft_pretrained_config, "use_sliding_window",
-                                 None)
-    if sliding_window is not None and use_sliding_window is True:
-        return _normalize_attention_windows([int(sliding_window)], max_seq_len)
+    layer_windows = [
+        get_layer_attention_window(draft_pretrained_config, layer_idx)
+        for layer_idx in range(num_draft_layers)
+    ]
+    if any(window is not None for window in layer_windows):
+        draft_windows = [
+            max_seq_len if window is None else window
+            for window in layer_windows
+        ]
+        return _normalize_attention_windows(draft_windows, max_seq_len)
 
     if not uses_vswa_kv_cache_layout(kv_cache_config.max_attention_window):
         max_attention_window = kv_cache_config.max_attention_window
@@ -734,13 +710,18 @@ class KvCacheCreator:
                 # External drafter: layers start from 0, normal PP distribution
                 # Resolve draft manager class from draft config — may differ
                 # from target (e.g. hybrid target + plain transformer draft).
+                draft_kv_cache_config = kv_cache_config
+                if self._speculative_config.spec_dec_mode.is_dflash():
+                    draft_kv_cache_config = (
+                        self._get_one_model_draft_kv_cache_config(
+                            kv_cache_config, self._max_seq_len))
                 draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
                     effective_draft_config,
-                    kv_cache_config,
+                    draft_kv_cache_config,
                     is_disagg=self._is_disagg)
                 total += self._per_manager_cache_cost(
                     draft_kv_cache_manager_cls, effective_draft_config,
-                    kv_cache_config)
+                    draft_kv_cache_config)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 total += self._per_manager_cache_cost(
@@ -969,15 +950,28 @@ class KvCacheCreator:
         num_pool_groups = 1
         if self._is_kv_cache_manager_v2:
             model_cfg = self._model_engine.model.model_config.pretrained_config
-            layer_types = getattr(model_cfg, "layer_types", None)
-            if isinstance(layer_types, (list, tuple)):
-                distinct = len(set(layer_types))
-                if distinct > 1:
-                    num_pool_groups = distinct
-            elif (self._kv_cache_config.max_attention_window is not None
-                  and len(set(self._kv_cache_config.max_attention_window)) > 1):
-                num_pool_groups = len(
-                    set(self._kv_cache_config.max_attention_window))
+            num_layers = getattr(model_cfg, "num_hidden_layers", None)
+            attention_windows = None
+            if isinstance(num_layers, int) and num_layers > 0:
+                inferred_windows = [
+                    get_layer_attention_window(model_cfg, layer_idx)
+                    for layer_idx in range(num_layers)
+                ]
+                if any(window is not None for window in inferred_windows):
+                    attention_windows = [
+                        self._model_engine.max_seq_len
+                        if window is None else window
+                        for window in inferred_windows
+                    ]
+            if attention_windows is None:
+                attention_windows = self._kv_cache_config.max_attention_window
+            if attention_windows is not None:
+                attention_windows = _normalize_attention_windows(
+                    attention_windows,
+                    self._model_engine.max_seq_len,
+                )
+            if uses_vswa_kv_cache_layout(attention_windows):
+                num_pool_groups = len(set(attention_windows))
         num_cache_blocks *= num_pool_groups
 
         # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
@@ -1397,6 +1391,23 @@ class KvCacheCreator:
             self._get_num_draft_layers(),
         )
 
+    def _get_one_model_draft_kv_cache_config(
+        self,
+        kv_cache_config: KvCacheConfig,
+        max_seq_len: int,
+        *,
+        estimating_kv_cache: bool = False,
+    ) -> KvCacheConfig:
+        """Return a clone with the draft manager's attention-window layout."""
+        # Estimation uses a small max_tokens-sized temporary draft cache before
+        # the measured GPU budget is available to split. Applying VSWA there
+        # would size every window pool from the unsplit free-memory budget.
+        max_attention_window = (None if estimating_kv_cache else
+                                self._get_draft_max_attention_window(
+                                    max_seq_len, kv_cache_config))
+        return kv_cache_config.model_copy(
+            update={"max_attention_window": max_attention_window})
+
     def _create_one_model_draft_kv_cache_manager(
         self,
         max_seq_len: int,
@@ -1414,19 +1425,12 @@ class KvCacheCreator:
         # otherwise fall back to target model config for MTP).
         effective_draft_config = self._get_effective_draft_config()
 
-        draft_kv_config = (kv_cache_config_override if kv_cache_config_override
-                           is not None else self._kv_cache_config).model_copy()
-        # Estimation uses a small max_tokens-sized temporary draft cache before
-        # the measured GPU budget is available to split. Applying VSWA here
-        # would instead size every window pool from the unsplit free-memory
-        # budget. Install the real draft layout only for the final managers,
-        # after build_managers has partitioned max_gpu_total_bytes.
-        if estimating_kv_cache:
-            draft_kv_config.max_attention_window = None
-        else:
-            draft_kv_config.max_attention_window = (
-                self._get_draft_max_attention_window(max_seq_len,
-                                                     draft_kv_config))
+        kv_cache_config = (kv_cache_config_override if kv_cache_config_override
+                           is not None else self._kv_cache_config)
+        draft_kv_config = self._get_one_model_draft_kv_cache_config(
+            kv_cache_config,
+            max_seq_len,
+            estimating_kv_cache=estimating_kv_cache)
         if (not uses_vswa_kv_cache_layout(
                 draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None

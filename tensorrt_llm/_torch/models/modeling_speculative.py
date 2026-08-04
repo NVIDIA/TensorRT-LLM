@@ -32,6 +32,8 @@ try:
         flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from ..pyexecutor.config_utils import (get_layer_attention_window,
+                                       is_sliding_attention_layer)
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -1003,6 +1005,8 @@ class DFlashForCausalLM(nn.Module):
                 f"{self.dflash_attention_backend!r}.")
         self._dflash_trtllm_gen_workspace = None
         self._dflash_trtllm_gen_counters = None
+        self._dflash_trtllm_gen_device = None
+        self._dflash_trtllm_gen_sm_count = None
         logger.info(
             f"DFlash draft model initialized with mask_token_id: {self.mask_token_id}, "
             f"target_layer_ids: {self.target_layer_ids}, block_size: {self.block_size}, "
@@ -1596,35 +1600,22 @@ class DFlashForCausalLM(nn.Module):
     def _get_attention_mask_args(self, layer_idx):
         """Return FlashAttention causal and local-window arguments for a layer."""
         layer_types = getattr(self.config, 'layer_types', None)
-        if layer_types is None:
-            return False, (-1, -1)
-        if len(layer_types) != self.config.num_hidden_layers:
-            raise ValueError(
-                f"DFlash layer_types length {len(layer_types)} does not match "
-                f"num_hidden_layers {self.config.num_hidden_layers}.")
+        is_sliding_layer = False
+        if layer_types:
+            layer_type = layer_types[layer_idx % len(layer_types)]
+            is_sliding_layer = is_sliding_attention_layer(layer_type)
 
-        layer_type = layer_types[layer_idx]
-        if layer_type == 'full_attention':
+        sliding_window = get_layer_attention_window(self.config, layer_idx)
+        is_sliding_layer = is_sliding_layer or sliding_window is not None
+        if not is_sliding_layer:
             return False, (-1, -1)
-        if layer_type != 'sliding_attention':
-            raise ValueError(
-                f"Unsupported DFlash layer_type {layer_type!r} at layer "
-                f"{layer_idx}.")
 
-        use_sliding_window = bool(
-            getattr(self.config, 'use_sliding_window', False))
-        causal = self._sliding_layers_causal or use_sliding_window
-        if not use_sliding_window:
+        causal = self._sliding_layers_causal or sliding_window is not None
+        if sliding_window is None:
             # Laguna uses causal draft blocks but deliberately retains all
             # context K/V. Generic legacy drafters also preserve their prior
             # non-windowed behavior.
             return causal, (-1, -1)
-
-        sliding_window = getattr(self.config, 'sliding_window', None)
-        if not isinstance(sliding_window, int) or sliding_window <= 0:
-            raise ValueError(
-                "DFlash use_sliding_window requires a positive integer "
-                "sliding_window.")
         # FlashAttention's bounds are inclusive: W tokens are current + W-1 left.
         return causal, (sliding_window - 1, 0)
 
@@ -1650,15 +1641,43 @@ class DFlashForCausalLM(nn.Module):
             rotary_embedding_dim=0,
             fp8_context_fmha=False,
         )
-        if self._dflash_trtllm_gen_workspace is None:
+        device = torch.device(device)
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if self._dflash_trtllm_gen_device != device:
+            if is_capturing:
+                raise RuntimeError(
+                    "DFlash TRTLLM-Gen buffers must be prepared on the current "
+                    "device before CUDA graph capture.")
+            self._dflash_trtllm_gen_device = device
+            self._dflash_trtllm_gen_sm_count = (
+                torch.cuda.get_device_properties(device).multi_processor_count)
+
+        workspace = self._dflash_trtllm_gen_workspace
+        workspace_needs_allocation = (
+            workspace is None or workspace.device != device
+            or workspace.numel() * workspace.element_size() < workspace_bytes)
+        if workspace_needs_allocation:
+            if is_capturing:
+                raise RuntimeError(
+                    "The DFlash TRTLLM-Gen workspace must be allocated at the "
+                    "required size before CUDA graph capture.")
             self._dflash_trtllm_gen_workspace = torch.empty(workspace_bytes,
                                                             dtype=torch.uint8,
                                                             device=device)
-        sm_count = torch.cuda.get_device_properties(
-            device).multi_processor_count
+
+        sm_count = self._dflash_trtllm_gen_sm_count
         counter_bytes = trtllm_gen_ops.get_multi_ctas_kv_counter_size(
             num_heads, max_batch_size, sm_count)
-        if self._dflash_trtllm_gen_counters is None:
+        counters = self._dflash_trtllm_gen_counters
+        counters_need_allocation = (counters is None
+                                    or counters.device != device
+                                    or counters.numel() *
+                                    counters.element_size() < counter_bytes)
+        if counters_need_allocation:
+            if is_capturing:
+                raise RuntimeError(
+                    "The DFlash TRTLLM-Gen counter buffer must be allocated at "
+                    "the required size before CUDA graph capture.")
             self._dflash_trtllm_gen_counters = torch.zeros(counter_bytes,
                                                            dtype=torch.uint8,
                                                            device=device)
@@ -1926,7 +1945,7 @@ class DFlashForCausalLM(nn.Module):
                         torch.zeros(1,
                                     dtype=torch.int32,
                                     device=hidden_states.device),
-                        seq_lens_after.cumsum(0),
+                        seq_lens_after.cumsum(0, dtype=torch.int32),
                     ))
                     trtllm_gen_ops.batch_context_with_kv_cache(
                         query=q_flat,

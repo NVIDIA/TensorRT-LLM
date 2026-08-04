@@ -21,6 +21,7 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -70,6 +71,59 @@ def _make_creator(
 
 
 class TestSplitGpuBudgetForDraft:
+    def test_dflash_draft_cost_uses_derived_kv_config(self, mocker):
+        class DraftModelConfig:
+            quant_config = None
+            pretrained_config = SimpleNamespace(
+                num_hidden_layers=1,
+                hidden_size=32,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                sliding_window=512,
+                layer_types=["sliding_attention"],
+            )
+
+            def get_num_attention_layers(self):
+                return 1
+
+        creator = object.__new__(KvCacheCreator)
+        target_kv_config = KvCacheConfig(max_attention_window=[16384])
+        mode = Mock()
+        mode.is_external_drafter.return_value = True
+        mode.is_dflash.return_value = True
+
+        target_model_config = SimpleNamespace(is_encoder_decoder=False)
+        draft_model_config = DraftModelConfig()
+        target_manager_cls = Mock()
+        target_manager_cls.get_cache_size_per_token.return_value = 10
+
+        creator._kv_cache_config = target_kv_config
+        creator._tokens_per_block = 64
+        creator._max_seq_len = 16384
+        creator._max_batch_size = 1
+        creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
+        creator._mapping.pp_layers.return_value = [0]
+        creator._speculative_config = SimpleNamespace(spec_dec_mode=mode)
+        creator._model_engine = SimpleNamespace(
+            model=SimpleNamespace(model_config=target_model_config)
+        )
+        creator._draft_model_engine = None
+        creator._draft_config = draft_model_config
+        creator._kv_cache_manager_cls = target_manager_cls
+        creator._is_disagg = False
+        creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
+        get_manager_cls = mocker.patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            return_value=KVCacheManagerV2,
+        )
+
+        # The draft layer stores 64 bytes/token in a fixed 512-token window.
+        # Leaking the target's 16K window would instead count it as 64 bytes/token.
+        assert creator._get_kv_size_per_token() == CacheCost(slope=10, intercept=512 * 64)
+        draft_kv_config = get_manager_cls.call_args.args[1]
+        assert draft_kv_config.max_attention_window == [512]
+        assert target_kv_config.max_attention_window == [16384]
+
     def test_v1_mixed_draft_build_uses_original_max_seq_len(self, mocker):
         c = _make_creator(max_gpu_total_bytes=10 * GB)
         original_max_seq_len = 16384
@@ -84,6 +138,7 @@ class TestSplitGpuBudgetForDraft:
         c._max_beam_width = 1
         c._execution_stream = None
         c._enable_kv_cache_stats = Mock(return_value=False)
+        c._fp8_ctx_mla_kv_len_cap = None
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
         c._speculative_config = Mock()
         c._speculative_config.spec_dec_mode.is_external_drafter.return_value = True
