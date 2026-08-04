@@ -68,7 +68,16 @@ def _make_creator(
 
 
 class TestSplitGpuBudgetForDraft:
-    def test_dflash_draft_cost_uses_derived_kv_config(self, mocker):
+    @pytest.mark.parametrize(
+        "is_external_drafter",
+        [True, False],
+        ids=["external_dflash", "eagle3_mtp"],
+    )
+    def test_one_model_draft_cost_uses_derived_kv_config(
+        self,
+        mocker,
+        is_external_drafter,
+    ) -> None:
         class DraftModelConfig:
             quant_config = None
             pretrained_config = SimpleNamespace(
@@ -86,13 +95,19 @@ class TestSplitGpuBudgetForDraft:
         creator = object.__new__(KvCacheCreator)
         target_kv_config = KvCacheConfig(max_attention_window=[16384])
         mode = Mock()
-        mode.is_external_drafter.return_value = True
-        mode.is_dflash.return_value = True
+        mode.is_external_drafter.return_value = is_external_drafter
 
         target_model_config = SimpleNamespace(is_encoder_decoder=False)
         draft_model_config = DraftModelConfig()
-        target_manager_cls = Mock()
-        target_manager_cls.get_cache_size_per_token.return_value = 10
+        draft_kv_configs = []
+
+        class DraftCostKVCacheManager(KVCacheManagerV2):
+            @staticmethod
+            def get_cache_size_per_token(model_config, *args, **kwargs):
+                if model_config is target_model_config:
+                    return 10
+                draft_kv_configs.append(kwargs["kv_cache_config"])
+                return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
 
         creator._kv_cache_config = target_kv_config
         creator._tokens_per_block = 64
@@ -100,26 +115,35 @@ class TestSplitGpuBudgetForDraft:
         creator._max_batch_size = 1
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [0]
+        creator._mapping.is_last_pp_rank.return_value = True
         creator._speculative_config = SimpleNamespace(spec_dec_mode=mode)
         creator._model_engine = SimpleNamespace(
             model=SimpleNamespace(model_config=target_model_config)
         )
         creator._draft_model_engine = None
         creator._draft_config = draft_model_config
-        creator._kv_cache_manager_cls = target_manager_cls
+        creator._kv_cache_manager_cls = DraftCostKVCacheManager
         creator._is_disagg = False
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
+        creator._get_effective_draft_config = Mock(return_value=draft_model_config)
+        creator._get_num_draft_layers = Mock(return_value=1)
         get_manager_cls = mocker.patch(
             "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
-            return_value=KVCacheManagerV2,
+            return_value=DraftCostKVCacheManager,
         )
 
         # The draft layer stores 64 bytes/token in a fixed 512-token window.
         # Leaking the target's 16K window would instead count it as 64 bytes/token.
         assert creator._get_kv_size_per_token() == CacheCost(slope=10, intercept=512 * 64)
-        draft_kv_config = get_manager_cls.call_args.args[1]
+        assert len(draft_kv_configs) == 1
+        draft_kv_config = draft_kv_configs[0]
         assert draft_kv_config.max_attention_window == [512]
         assert target_kv_config.max_attention_window == [16384]
+        if is_external_drafter:
+            assert get_manager_cls.call_args.args[1] is draft_kv_config
+        else:
+            get_manager_cls.assert_not_called()
+        mode.is_dflash.assert_not_called()
 
     def test_v1_mixed_draft_build_uses_original_max_seq_len(self, mocker):
         c = _make_creator(max_gpu_total_bytes=10 * GB)

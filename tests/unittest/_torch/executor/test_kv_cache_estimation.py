@@ -268,6 +268,9 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
     tpb = 32
     max_seq_len = 12288
     layer_types = ["sliding_attention"] * 28 + ["full_attention"] * 7
+    # Mixed sliding/full attention must include the model's actual window size;
+    # Gemma4-E2B uses a 512-token sliding window.
+    sliding_window = 512
     assert len(set(layer_types)) == 2
 
     hybrid = _make_creator(
@@ -278,7 +281,7 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         model_max_seq_len=max_seq_len,
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
-        sliding_window=max_seq_len // 2,
+        sliding_window=sliding_window,
     )
     uniform = _make_creator(
         tpb,
@@ -335,6 +338,9 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
     tpb = 32
     max_seq_len = 12288
     layer_types = ["sliding_attention"] * 28 + ["full_attention"] * 7
+    # Mixed sliding/full attention must include the model's actual window size;
+    # Gemma4-E2B uses a 512-token sliding window.
+    sliding_window = 512
 
     c = _make_creator(
         tpb,
@@ -344,7 +350,7 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         model_max_seq_len=max_seq_len,
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
-        sliding_window=max_seq_len // 2,
+        sliding_window=sliding_window,
     )
 
     total_tokens = c._get_token_num_for_estimation()

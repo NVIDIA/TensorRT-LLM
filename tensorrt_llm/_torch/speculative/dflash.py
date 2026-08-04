@@ -220,7 +220,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_last_page_len = None
         self._ctx_page_size = 32
         self._ctx_pages_per_slot = 0
-        self._attention_backend = spec_config.attention_backend
+        self._dflash_attention_backend = spec_config.attention_backend
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
@@ -258,13 +258,16 @@ class DFlashWorker(SpecWorkerBase):
         return self.max_draft_len + 1
 
     def _validate_draft_attention_backend(self, draft_model) -> None:
-        model_backend = getattr(draft_model, "dflash_attention_backend", None)
-        if model_backend is None:
+        draft_model_dflash_attention_backend = getattr(
+            draft_model, "dflash_attention_backend", None
+        )
+        if draft_model_dflash_attention_backend is None:
             raise ValueError("DFlash draft model is missing dflash_attention_backend.")
-        if model_backend != self._attention_backend:
+        if draft_model_dflash_attention_backend != self._dflash_attention_backend:
             raise ValueError(
                 "DFlash worker and draft model attention backends must match; "
-                f"worker={self._attention_backend}, model={model_backend}."
+                f"worker={self._dflash_attention_backend}, "
+                f"model={draft_model_dflash_attention_backend}."
             )
 
     def set_draft_model(self, draft_model) -> None:
@@ -320,7 +323,7 @@ class DFlashWorker(SpecWorkerBase):
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
         capacity = self._max_ctx + self._resolved_block_size
-        if self._attention_backend == "TRTLLM":
+        if self._dflash_attention_backend == "TRTLLM":
             page_size = self._ctx_page_size
             has_context_attention = any(
                 not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
@@ -355,7 +358,7 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_kv_last_page_len = torch.full(
                 (num_slots,), page_size, dtype=torch.int32, device="cuda"
             )
-        else:
+        else:  # VANILLA DFlash backend (FlashAttention)
             kv_shape = (num_slots, L, capacity, nkv, hd)
             self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
             self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
@@ -364,7 +367,7 @@ class DFlashWorker(SpecWorkerBase):
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
             f"max_ctx={self._max_ctx}, dtype={dtype}, "
-            f"attention_backend={self._attention_backend}"
+            f"dflash_attention_backend={self._dflash_attention_backend}"
         )
 
     def _store_context_kv_paged(
@@ -376,6 +379,9 @@ class DFlashWorker(SpecWorkerBase):
     ) -> None:
         trtllm_gen_ops = get_dflash_trtllm_gen_ops()
 
+        # Convert at most once and reuse for every layer. Calling ``.to()`` in
+        # the op call would allocate converted tensors once per layer when the
+        # inputs are not already int32.
         slots_i32 = slots.to(torch.int32)
         positions_i32 = positions.to(torch.int32)
         for layer_idx in range(k.size(1)):
@@ -501,7 +507,7 @@ class DFlashWorker(SpecWorkerBase):
             if actual > 0:
                 cache_dtype = (
                     self._ctx_kv_buf.dtype
-                    if self._attention_backend == "TRTLLM"
+                    if self._dflash_attention_backend == "TRTLLM"
                     else self._ctx_k_buf.dtype
                 )
                 chunk_proj_cast = chunk_proj[:actual].to(cache_dtype)
@@ -512,14 +518,14 @@ class DFlashWorker(SpecWorkerBase):
                     chunk_proj_cast, chunk_pos[:actual]
                 )
                 # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
-                if self._attention_backend == "TRTLLM":
+                if self._dflash_attention_backend == "TRTLLM":
                     self._store_context_kv_paged(
                         chunk_k,
                         chunk_v,
                         torch.full((actual,), slot, dtype=torch.long, device="cuda"),
                         torch.arange(cur, end, dtype=torch.long, device="cuda"),
                     )
-                else:
+                else:  # VANILLA DFlash backend (FlashAttention)
                     self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
                     self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
@@ -952,7 +958,7 @@ class DFlashWorker(SpecWorkerBase):
                 # dflash_forward reads these directly via cache_batch_idx.
                 cache_dtype = (
                     self._ctx_kv_buf.dtype
-                    if self._attention_backend == "TRTLLM"
+                    if self._dflash_attention_backend == "TRTLLM"
                     else self._ctx_k_buf.dtype
                 )
                 k_new, v_new = draft_model.precompute_context_kv(
@@ -963,9 +969,9 @@ class DFlashWorker(SpecWorkerBase):
                 v_new.mul_(mask_bc)
                 slot_long = slot_flat.long()
                 col_long = col_flat.long()
-                if self._attention_backend == "TRTLLM":
+                if self._dflash_attention_backend == "TRTLLM":
                     self._store_context_kv_paged(k_new, v_new, slot_long, col_long)
-                else:
+                else:  # VANILLA DFlash backend (FlashAttention)
                     self._ctx_k_buf[slot_long, :, col_long] = k_new
                     self._ctx_v_buf[slot_long, :, col_long] = v_new
 
