@@ -47,7 +47,6 @@ from .action import (
     build_action_json_prompt,
     build_vision_condition_mask,
     normalize_action_mode,
-    normalize_action_video_input,
     pil_to_rgb,
     prepare_action_latents,
     resize_and_pad_action_image,
@@ -228,7 +227,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
             if self.action_gen:
                 # Action uses its own scheduler for the same reason as audio.
-                self.action_scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
+                self.action_scheduler = type(self.scheduler).from_config(self.scheduler.config)
 
         # Re-check the env var in case it was changed after initialization like in unit tests.
         guardrails_disabled = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
@@ -342,8 +341,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         def resolved(value, field_name):
             return value if value is not None else mode_params[field_name]
 
-        height = resolved(req.params.height, "height")
-        width = resolved(req.params.width, "width")
+        # Action sizes its canvas from the resolution bucket and the reference
+        # frame's aspect (resolve_action_size), so leaving height/width unset
+        # here is what lets forward() do that; filling them from the video
+        # table would pin every action request to 720p.
+        is_action = extra_params.get("action_mode") is not None
+        height = req.params.height if is_action else resolved(req.params.height, "height")
+        width = req.params.width if is_action else resolved(req.params.width, "width")
         num_inference_steps = resolved(req.params.num_inference_steps, "num_inference_steps")
         guidance_scale = resolved(req.params.guidance_scale, "guidance_scale")
         video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
@@ -352,11 +356,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
             image=req.params.image,
-            height=req.params.height,
-            width=req.params.width,
+            height=height,
+            width=width,
             num_frames=req.params.num_frames,
-            num_inference_steps=req.params.num_inference_steps,
-            guidance_scale=req.params.guidance_scale,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             frame_rate=req.params.frame_rate,
@@ -1299,21 +1303,44 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
             if normalized_action_mode == ACTION_MODE_INVERSE_DYNAMICS:
-                inverse_video = video if video is not None else image
-                video = normalize_action_video_input(inverse_video, max_frames=num_frames)
-                if len(video) < num_frames:
+                if not isinstance(video, bytes):
                     raise ValueError(
-                        "Cosmos3 inverse_dynamics requires at least "
-                        f"{num_frames} frames, got {len(video)}."
+                        "Cosmos3 inverse_dynamics requires encoded MP4/AVI bytes "
+                        f"(the 'video' extra-param contract), got {type(video).__name__}."
                     )
-                video_tensor = self._preprocess_action_video(video, height, width)
-                latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
-                    video_tensor,
-                    normalized_action_mode,
-                    num_frames,
-                    generator,
-                )
-                image_latent = None
+                prepare_error: Optional[Exception] = None
+                try:
+                    # "fit" rather than the V2V default: an action reference is
+                    # padded to the canvas, never cropped to it, because the
+                    # gripper and target sit at the frame edge.
+                    frames_u8 = decode_video_reference_window(
+                        video,
+                        first_frame=0,
+                        last_frame=num_frames - 1,
+                        target_h=height,
+                        target_w=width,
+                        device=self.device,
+                        resize="fit",
+                    )
+                    if frames_u8.shape[0] < num_frames:
+                        raise ValueError(
+                            "Cosmos3 inverse_dynamics requires at least "
+                            f"{num_frames} frames, got {frames_u8.shape[0]}."
+                        )
+                    video_tensor = self._condition_frames_to_video_tensor(frames_u8)
+                    del frames_u8
+                    latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
+                        video_tensor,
+                        normalized_action_mode,
+                        num_frames,
+                        generator,
+                    )
+                    del video_tensor
+                except Exception as exc:
+                    prepare_error = exc
+                # Every rank decodes independently; converge before the
+                # transformer's collectives so a failure cannot hang the job.
+                synchronize_media_prepare_status(prepare_error)
             else:
                 image_tensor = self._preprocess_action_image(action_ref_image, height, width)
                 if image_tensor.ndim == 4:
