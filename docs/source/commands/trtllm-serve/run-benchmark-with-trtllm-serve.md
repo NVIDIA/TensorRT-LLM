@@ -149,6 +149,24 @@ P99 E2EL (ms):                           1643.44
 ==================================================
 ```
 
+### Output Token Length and EOS
+
+The requested output length in synthetic benchmarks is a maximum generation
+budget, not a guarantee that every request will generate exactly that many
+tokens. A request can finish earlier if the model emits an EOS token, reaches a
+stop condition, or if the benchmark client/server applies stop-token handling.
+In that case, metrics such as `Output Sequence Length (tokens)` or `Total
+generated tokens` report the actual generated length, so the average and minimum
+can be lower than the configured output length.
+
+When benchmarking a fixed output sequence length, make sure EOS handling matches
+the methodology you want to measure. The `benchmark_serving.py` example above
+passes `--ignore-eos`, which forwards `ignore_eos` in OpenAI-compatible requests
+and avoids early EOS termination for backends that support it. If you use an
+external client such as AIPerf or GenAI-Perf, use the equivalent ignore-EOS
+setting when available; otherwise interpret output-length metrics as actual
+generated tokens rather than the requested token budget.
+
 ### Key Metrics
 
 #### Time to First Token (TTFT)
