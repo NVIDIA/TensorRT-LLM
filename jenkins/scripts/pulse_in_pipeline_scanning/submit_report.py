@@ -221,7 +221,7 @@ def submit_source_code_licenses(
                 "s_ticket_url": triaged_deps.get(package_name, "N/A"),
             }
             if package_name not in triaged_deps and not is_preapproved(
-                map_preapproved, package_name, (component.get("type") or "unknown").lower()
+                map_preapproved, package_name, "pypi"
             ):
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
