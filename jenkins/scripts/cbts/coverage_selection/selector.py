@@ -23,6 +23,7 @@ from touch_db import (
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
     _SERVING_PATH_MARKERS,
+    _UNTRUSTED_STAGE_MARKERS,
     _WORKER_SENTINEL,
     TouchDB,
     canon,
@@ -66,6 +67,7 @@ class CoverageSelector:
         launch_markers: tuple[tuple[str, str], ...] = _LAUNCH_MARKERS,
         serving_path_markers: tuple[str, ...] = _SERVING_PATH_MARKERS,
         min_funcs: int = _MIN_FUNCS,
+        untrusted_stage_markers: tuple[str, ...] = _UNTRUSTED_STAGE_MARKERS,
         no_data_policy: str = DEFAULT_NO_DATA_POLICY,
     ) -> None:
         self.db = db
@@ -74,6 +76,7 @@ class CoverageSelector:
         self._launch_markers = launch_markers
         self._serving_path_markers = serving_path_markers
         self._min_funcs = min_funcs
+        self._untrusted_stage_markers = untrusted_stage_markers
         self._no_data_policy = no_data_policy
         self._untrusted: set[str] | None = None
 
@@ -85,6 +88,7 @@ class CoverageSelector:
                 self._launch_markers,
                 self._serving_path_markers,
                 self._min_funcs,
+                self._untrusted_stage_markers,
             )
         return self._untrusted
 
