@@ -115,7 +115,7 @@ class WanCausalConvHalo(HaloExchangeConv):
 
         spatial_padding = list(self.module.padding[1:])
         spatial_padding[spatial_axis] = 0
-        return tuple(spatial_padding)
+        return (spatial_padding[0], spatial_padding[1])
 
     def forward(
         self,
