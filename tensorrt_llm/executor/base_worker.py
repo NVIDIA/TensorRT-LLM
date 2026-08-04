@@ -53,6 +53,7 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
 
 if TYPE_CHECKING:
+    from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
     from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [
@@ -971,6 +972,16 @@ class BaseWorker(GenerationExecutor):
             logger.warning("Engine or kv cache transceiver is not initialized")
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
+
+    def get_cache_transceiver(self) -> Optional["KvCacheTransceiver"]:
+        if self.engine is None:
+            return None
+        return self.engine.kv_cache_transceiver
+
+    def get_data_transceiver_state(self) -> bytes:
+        if self.engine is None or self.engine.kv_cache_transceiver is None:
+            return b""
+        return self.engine.kv_cache_transceiver.get_data_transceiver_state()
 
     @staticmethod
     def _stats_serializer(stats) -> str:

@@ -15,9 +15,10 @@
 """PyTorch-native sampling kernels.
 
 Pure tensor functions that operate on logits and probabilities with no
-dependency on the sampling_utils interface or other backend implementation modules.
+dependency on the sampler_strategy interface or other backend implementation modules.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional, cast
 
@@ -50,32 +51,60 @@ class BeamSearchMetadata(StrategyMetadata):
     beam_idx_arange: torch.Tensor
 
 
+def min_p_renorm_probs(
+    probs: torch.Tensor,
+    min_p: torch.Tensor | float,
+) -> torch.Tensor:
+    """Keep tokens with prob >= ``min_p`` times the per-row max, then renormalize.
+
+    ``min_p`` is a scalar or a per-request tensor.
+    """
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    if isinstance(min_p, torch.Tensor):
+        min_p = min_p.reshape(-1, 1)
+    thresholds = min_p * max_probs
+    probs = probs.masked_fill(probs < thresholds, 0.0)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    return probs
+
+
 def top_k_top_p_sampling_batch(
     logits: torch.Tensor,
     *,
     temperature: float,
     top_k: Optional[int] = None,
     top_p: float = 1.0,
+    min_p: float = 0.0,
     generator: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Temperature + optional top-k / top-p filtering + multinomial sampling.
+    """Temperature + optional min-p / top-k / top-p filtering + multinomial sampling.
 
     ``top_k=None`` (or ``vocab_size``) disables top-k filtering; ``top_p=1``
-    disables top-p filtering. With both disabled this is plain temperature
-    sampling.
+    disables top-p filtering; ``min_p=0`` disables min-p filtering. With all
+    disabled this is plain temperature sampling.
     """
     logits_dim = logits.dim()
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
     assert temperature > 0, "non-greedy sampling requires valid temperature"
     logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
-    if top_k is None:
+    # 0 / non-positive means "keep all" (the min_p disabled-top_k sentinel),
+    # matching sanitize_top_k on the flashinfer path.
+    if top_k is None or top_k <= 0:
         top_k = vocab_size
 
     assert top_k > 1, "non-greedy sampling requires valid top_k"
     need_top_k = top_k < vocab_size
     assert top_p > 0, "non-greedy sampling requires valid top_p"
     need_top_p = top_p < 1
+    assert 0 <= min_p < 1, "non-greedy sampling requires valid min_p"
+    need_min_p = min_p > 0
+
+    if need_min_p:
+        # Thresholding logits at max_logit + log(min_p) keeps the tokens with
+        # prob >= min_p * max_prob; the softmax below renormalizes.
+        min_values = logits.max(dim=-1, keepdim=True).values + math.log(min_p)
+        logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
 
     if need_top_k:
         values, _ = torch.topk(logits, top_k, dim=-1)
@@ -290,49 +319,7 @@ def sample_rejected(
 GREEDY_TEMPERATURE_THRESHOLD = 1e-4
 
 
-def safely_apply_temperature_inplace(
-    logits_inout: torch.Tensor, temp: torch.Tensor
-) -> torch.Tensor:
-    """Divide logits by per-row temperature in place, guarding the greedy sentinel.
-
-    Greedy requests carry a temperature of 0 / <= ``GREEDY_TEMPERATURE_THRESHOLD``.
-    Dividing by it would blow logits up to inf/nan and corrupt downstream sampling
-    (argmax / softmax / multinomial). Those rows are clamped to a temperature of 1.0
-    so the division is numerically safe; callers are expected to overwrite the greedy
-    rows with their argmax result afterwards (e.g. via ``torch.where(is_greedy, ...)``),
-    so the value used for the clamped rows here does not affect the final output.
-
-    ``logits_inout`` is modified in place (``div_``) and also returned for
-    convenience; ``temp`` is left untouched.
-    """
-    safe_temp = torch.where(temp <= GREEDY_TEMPERATURE_THRESHOLD, torch.ones_like(temp), temp)
-    return logits_inout.div_(safe_temp.unsqueeze(dim=1))
-
-
 class Fusions:
-    @staticmethod
-    @torch.compile(dynamic=None, fullgraph=True)
-    def _gather_scatter_impl(
-        dst_cuda: torch.Tensor,
-        dst_index_cuda: torch.Tensor,
-        src_cuda: torch.Tensor,
-        src_index_cuda: torch.Tensor,
-    ) -> None:
-        dst_cuda[dst_index_cuda] = src_cuda[src_index_cuda]
-
-    @staticmethod
-    def gather_scatter(
-        dst_cuda: torch.Tensor,
-        dst_index_cuda: torch.Tensor,
-        src_cuda: torch.Tensor,
-        src_index_cuda: torch.Tensor,
-    ) -> None:
-        torch._dynamo.mark_dynamic(dst_cuda, 0)
-        torch._dynamo.mark_dynamic(dst_index_cuda, 0)
-        torch._dynamo.mark_dynamic(src_cuda, 0)
-        torch._dynamo.mark_dynamic(src_index_cuda, 0)
-        Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
-
     @staticmethod
     @torch.compile(dynamic=None, fullgraph=True)
     def _determine_sampled_rank_impl(
@@ -361,15 +348,299 @@ class Fusions:
         ),
     )
     def _gather_log_softmax_impl(
-        inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.nn.functional.log_softmax(
+        inputs_cuda: torch.Tensor,
+        indices_cuda: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
+        #     materializing the index select and output the results directly into the destination tensor.
+        out[...] = torch.nn.functional.log_softmax(
             inputs_cuda[indices_cuda],
             dim=-1,
         )
 
     @staticmethod
-    def gather_log_softmax(inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor) -> torch.Tensor:
+    def gather_log_softmax_with_output(
+        inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor, out: torch.Tensor
+    ) -> None:
         torch._dynamo.mark_dynamic(inputs_cuda, 0)
         torch._dynamo.mark_dynamic(indices_cuda, 0)
-        return Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)
+        torch._dynamo.mark_dynamic(out, 0)
+        Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda, out)
+
+    # --- Top-P Decay ops ---------------------------------------------------
+    # Host-launch-bound per-step ops (a few dozen elements per row), fused with
+    # Inductor to keep the launch count low. mode="max-autotune-no-cudagraphs":
+    # cudagraphs is unsafe here (the update mutates persistent per-slot state
+    # in place and the gather's output is consumed outside the compiled region;
+    # cudagraph static output buffers get overwritten by subsequent replays).
+    # mark_dynamic on the batch-varying dims avoids recompilation as the batch
+    # composition changes. Compilation is lazy: the first decay-active request
+    # pays it (roughly a second); non-decay workloads never trigger it. See
+    # top_p_decay.TopPDecayStore for the feature-level semantics.
+
+    @staticmethod
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def _top_p_decay_update_impl(
+        runtime_top_p: torch.Tensor,
+        initial_top_p: torch.Tensor,
+        top_p_decay: torch.Tensor,
+        top_p_min: torch.Tensor,
+        reset_ids: torch.Tensor,
+        is_decay_slot: torch.Tensor,
+        step_tokens: torch.Tensor,
+        sampled_slots: torch.Tensor,
+    ) -> None:
+        active = is_decay_slot[sampled_slots]
+        current = runtime_top_p[sampled_slots]
+        updated = torch.where(
+            step_tokens[sampled_slots] == reset_ids[sampled_slots],
+            initial_top_p[sampled_slots],
+            torch.maximum(current * top_p_decay[sampled_slots], top_p_min[sampled_slots]),
+        )
+        runtime_top_p[sampled_slots] = torch.where(active, updated, current)
+
+    @staticmethod
+    def top_p_decay_update(
+        *,
+        runtime_top_p: torch.Tensor,
+        initial_top_p: torch.Tensor,
+        top_p_decay: torch.Tensor,
+        top_p_min: torch.Tensor,
+        reset_ids: torch.Tensor,
+        is_decay_slot: torch.Tensor,
+        step_tokens: torch.Tensor,
+        sampled_slots: torch.Tensor,
+    ) -> None:
+        """Fused in-place update of ``runtime_top_p`` for the sampled decay slots.
+
+        Applies the Top-P Decay recurrence (see ``top_p_decay.TopPDecayStore``
+        for the feature-level semantics) to every sampled row whose slot is
+        decay-active per ``is_decay_slot``.
+
+        All per-slot tensors are 1-D of length ``max_num_sequences``;
+        ``step_tokens`` is a slot-indexed 1-D (possibly strided) int32 view of
+        the new-tokens buffer for a fixed step/beam
+        (``new_tokens[step, :, beam]``); ``sampled_slots`` is 1-D of length
+        ``num_sampled`` (this iteration's rows). ``runtime_top_p`` is mutated
+        in place; nothing is returned.
+        """
+        torch._dynamo.mark_dynamic(sampled_slots, 0)
+        Fusions._top_p_decay_update_impl(
+            runtime_top_p,
+            initial_top_p,
+            top_p_decay,
+            top_p_min,
+            reset_ids,
+            is_decay_slot,
+            step_tokens,
+            sampled_slots,
+        )
+
+    @staticmethod
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def _top_p_decay_gather_impl(
+        runtime_top_p: torch.Tensor,
+        is_decay_slot: torch.Tensor,
+        static_top_p: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.where(is_decay_slot[slots], runtime_top_p[slots], static_top_p)
+
+    @staticmethod
+    def top_p_decay_gather(
+        *,
+        runtime_top_p: torch.Tensor,
+        is_decay_slot: torch.Tensor,
+        static_top_p: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused pre-sample per-row top-p gather for decay-active rows.
+
+        Returns a new per-row tensor::
+
+            row_top_p[i] = runtime_top_p[slots[i]]  if is_decay_slot[slots[i]]
+                         = static_top_p[i]          otherwise
+
+        ``runtime_top_p`` / ``is_decay_slot`` are per-slot arrays;
+        ``static_top_p`` and ``slots`` are per-row (length = the group's
+        per-step row count).
+        """
+        torch._dynamo.mark_dynamic(slots, 0)
+        torch._dynamo.mark_dynamic(static_top_p, 0)
+        return Fusions._top_p_decay_gather_impl(runtime_top_p, is_decay_slot, static_top_p, slots)
+
+    # --- Occurrence penalties (repetition / presence / frequency) -----------
+    # torch/torch.compile counterpart of the C++ ``batchApplyPenalty`` kernel,
+    # driven by ``PenaltyHandler`` in penalties.py, which owns the
+    # workspace and documents its semantics (see ``PenaltyStore`` there).
+
+    @staticmethod
+    def update_occurrence_workspace(
+        counts_cuda: torch.Tensor,
+        presence_prefix_cuda: Optional[torch.Tensor],
+        counted_slots: torch.Tensor,
+        counted_tokens: torch.Tensor,
+        prefix_slots: Optional[torch.Tensor] = None,
+        prefix_tokens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Scatter (slot, token) pairs into the persistent occurrence workspace.
+
+        Args:
+            counts_cuda: ``int32[num_slots, vocab_size]``, incremented in place.
+            presence_prefix_cuda: ``bool[num_slots, vocab_size]`` prefix-presence
+                mask, or ``None`` when no active request uses
+                ``prompt_ignore_length``.
+            counted_slots / counted_tokens: 1-D int64 pairs to increment in
+                ``counts_cuda``.
+            prefix_slots / prefix_tokens: 1-D int64 pairs to mark in
+                ``presence_prefix_cuda``; ``None`` when there is nothing to mark.
+        """
+        if counted_slots.numel() > 0:
+            ones = torch.ones(
+                counted_slots.shape[0], dtype=counts_cuda.dtype, device=counts_cuda.device
+            )
+            # accumulate=True sums repeated (slot, token) pairs -> occurrence count.
+            counts_cuda.index_put_((counted_slots, counted_tokens), ones, accumulate=True)
+        if (
+            presence_prefix_cuda is not None
+            and prefix_slots is not None
+            and prefix_tokens is not None
+            and prefix_slots.numel() > 0
+        ):
+            # Marking a dense bool mask is idempotent, so duplicate tokens are safe.
+            presence_prefix_cuda[prefix_slots, prefix_tokens] = True
+
+    # fullgraph=True is safe here: served model has fixed shapes and compiles ~2 graphs,
+    # well under the default limit (8)
+    @staticmethod
+    @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+    def _apply_occurrence_penalties_impl(
+        logits: torch.Tensor,
+        counts_cuda: torch.Tensor,
+        prefix_seen_cuda: Optional[torch.Tensor],
+        active_cuda: torch.Tensor,
+        has_previous_token_cuda: torch.Tensor,
+        new_tokens: torch.Tensor,
+        seq_slots: torch.Tensor,
+        request_offsets: torch.Tensor,
+        request_num_steps: torch.Tensor,
+        repetition_cuda: torch.Tensor,
+        presence_cuda: torch.Tensor,
+        frequency_cuda: torch.Tensor,
+    ) -> None:
+        vocab = logits.size(-1)
+
+        # Fold the device-pending sampled token into the persistent counts, once per armed
+        # active slot, before the gather reads them, via one flat scatter_add. Masked entries
+        # add 0 at counts[slot, 0], so inactive/unarmed/out-of-range slots are no-ops.
+        previous_token = new_tokens[0, seq_slots, 0].to(torch.int64)
+        fold_ok = (
+            active_cuda[seq_slots]
+            & has_previous_token_cuda[seq_slots]
+            & (request_num_steps > 0)
+            & (previous_token >= 0)
+            & (previous_token < vocab)
+        )
+        flat_index = seq_slots * vocab + torch.where(
+            fold_ok, previous_token, previous_token.new_zeros(())
+        )
+        counts_cuda.view(-1).scatter_add_(0, flat_index, fold_ok.to(counts_cuda.dtype))
+
+        # Map each logits row to its owning request with a broadcasted range comparison.
+        # This is O(T * R), but T and R are both small (rows per step x requests) and the
+        # whole thing fuses into the surrounding elementwise graph, so it measures faster
+        # than either a searchsorted lookup or a repeat_interleave expansion. Notably
+        # torch.repeat_interleave must NOT be used here: its output length is
+        # sum(num_steps), which -- without an explicit host-provided output_size -- torch
+        # reads back from the device, and that per-step D2H sync destroys the overlap
+        # between the sampler's host work and the model forward (measured ~20x slower).
+        rows = torch.arange(logits.size(0), device=logits.device).unsqueeze(1)  # [T, 1]
+        owned = (rows >= request_offsets) & (rows < request_offsets + request_num_steps)  # [T, R]
+        row_owned = owned.any(dim=1)  # [T]
+        row_slot = (owned * seq_slots).sum(dim=1)  # [T]; slot per row, 0 for unowned
+        row_active = row_owned & active_cuda[row_slot]
+
+        count = counts_cuda[row_slot]
+        rep = repetition_cuda[row_slot].unsqueeze(1)
+        pre = presence_cuda[row_slot].unsqueeze(1)
+        freq = frequency_cuda[row_slot].unsqueeze(1)
+
+        seen = count > 0
+        if prefix_seen_cuda is not None:
+            # Prompt-ignore-prefix tokens count for repetition only, not presence/frequency.
+            seen = seen | prefix_seen_cuda[row_slot]
+
+        penalized = logits.float()
+        repeated = torch.where(penalized < 0, penalized * rep, penalized / rep)
+        penalized = torch.where(seen, repeated, penalized)
+        penalized = penalized - torch.where(
+            count > 0,
+            pre + freq * count.to(torch.float32),
+            penalized.new_zeros(()),
+        )
+        limit = torch.finfo(logits.dtype).max
+        penalized = penalized.clamp(-limit, limit).to(logits.dtype)
+        # Cast before the select so inactive rows stay bit-identical, then write in place.
+        logits.copy_(torch.where(row_active.unsqueeze(1), penalized, logits))
+
+    @staticmethod
+    def apply_batched_occurrence_penalties(
+        logits: torch.Tensor,
+        counts_cuda: torch.Tensor,
+        presence_prefix_cuda: Optional[torch.Tensor],
+        active_cuda: torch.Tensor,
+        has_previous_token_cuda: torch.Tensor,
+        new_tokens: torch.Tensor,
+        seq_slots: torch.Tensor,
+        request_offsets: torch.Tensor,
+        request_num_steps: torch.Tensor,
+        repetition_cuda: torch.Tensor,
+        presence_cuda: torch.Tensor,
+        frequency_cuda: torch.Tensor,
+    ) -> None:
+        """Apply occurrence penalties to ``logits`` in place, before temperature handling.
+
+        Args:
+            logits: ``[T, vocab_size]`` packed generated-token logits, where
+                ``T == sum(num_steps * num_beams)``. Request ``r`` owns the rows
+                ``request_offsets[r] + step`` for ``step in [0, request_num_steps[r])``;
+                rows no request owns are left bit-identical. Modified in place.
+            counts_cuda / presence_prefix_cuda: the occurrence workspace; see
+                ``PenaltyHandler.PenaltyStore`` for their semantics.
+            active_cuda / has_previous_token_cuda / repetition_cuda / presence_cuda /
+                frequency_cuda: per-slot buffers of length ``max_num_sequences``.
+            new_tokens: ``[max_tokens, max_num_sequences, max_beam_width]`` device
+                buffer holding the previous step's sampled token.
+            seq_slots: ``int64[R]`` slot per request.
+            request_offsets / request_num_steps: ``[R]`` device tensors, already
+                staged by the caller. The owned spans must not overlap, but they need
+                not be ordered, and rows they skip are left bit-identical.
+
+        All heavy lifting is fused into the single compiled ``_apply_occurrence_penalties_impl``
+        graph; this wrapper only marks the batch-varying dims dynamic.
+        """
+        if seq_slots.numel() == 0 or logits.size(0) == 0:
+            return
+
+        # Batch-varying dim-0 tensors; mark every one, or an unmarked peer forces the marked
+        # dims to specialize (ConstraintViolationError under dynamic=None). counts/active/params
+        # keep dim 0 == max_num_sequences (fixed) and new_tokens dim 1 == max_num_sequences.
+        torch._dynamo.mark_dynamic(logits, 0)
+        torch._dynamo.mark_dynamic(seq_slots, 0)
+        torch._dynamo.mark_dynamic(request_offsets, 0)
+        torch._dynamo.mark_dynamic(request_num_steps, 0)
+        Fusions._apply_occurrence_penalties_impl(
+            logits,
+            counts_cuda,
+            presence_prefix_cuda,
+            active_cuda,
+            has_previous_token_cuda,
+            new_tokens,
+            seq_slots,
+            request_offsets,
+            request_num_steps,
+            repetition_cuda,
+            presence_cuda,
+            frequency_cuda,
+        )

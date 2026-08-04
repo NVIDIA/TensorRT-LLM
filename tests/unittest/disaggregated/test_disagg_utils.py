@@ -127,10 +127,78 @@ def test_extract_disagg_cfg(sample_yaml_config):
     assert config.disagg_coordinator_url == "http://coordinator:7999"
 
 
+def test_extract_disagg_metrics_controls():
+    yaml_config = get_yaml_config()
+    yaml_config["context_servers"]["return_perf_metrics"] = False
+    yaml_config["generation_servers"]["return_perf_metrics"] = False
+    config = extract_disagg_cfg(
+        **yaml_config,
+        return_perf_metrics=True,
+        perf_metrics_output_dir="/tmp/perf",
+    )
+
+    assert config.return_perf_metrics is True
+    assert config.perf_metrics_output_dir == "/tmp/perf"
+    assert all("perf_metrics_output_dir" not in server.other_args
+               for server in config.server_configs)
+
+
 @pytest.mark.parametrize("node_id", [-1, 256])
 def test_extract_disagg_cfg_rejects_out_of_range_node_id(node_id):
     with pytest.raises(ValueError, match="node_id must be in range"):
         extract_disagg_cfg(node_id=node_id)
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_internal_request_auth_key(sample_yaml_config):
+    sample_yaml_config["internal_request_auth_key"] = "test-secret"
+
+    config = extract_disagg_cfg(**sample_yaml_config)
+
+    assert config.internal_request_auth_key == "test-secret"
+    assert "internal_request_auth_key" not in config.server_configs[
+        0].other_args
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_accepts_matching_section_auth_keys(
+        sample_yaml_config):
+    sample_yaml_config["context_servers"][
+        "internal_request_auth_key"] = "test-secret"
+    sample_yaml_config["generation_servers"][
+        "internal_request_auth_key"] = "test-secret"
+
+    config = extract_disagg_cfg(**sample_yaml_config)
+
+    assert config.internal_request_auth_key == "test-secret"
+    assert "internal_request_auth_key" not in config.server_configs[
+        0].other_args
+
+
+@pytest.mark.parametrize("sample_yaml_config", [""], indirect=True)
+def test_extract_disagg_cfg_rejects_mismatched_section_auth_keys(
+        sample_yaml_config):
+    sample_yaml_config["context_servers"][
+        "internal_request_auth_key"] = "ctx-secret"
+    sample_yaml_config["generation_servers"][
+        "internal_request_auth_key"] = "gen-secret"
+
+    with pytest.raises(ValueError, match="must match"):
+        extract_disagg_cfg(**sample_yaml_config)
+
+
+def test_extract_disagg_cfg_rejects_invalid_internal_request_auth_key():
+    with pytest.raises(
+            ValueError,
+            match="internal_request_auth_key must be a non-empty string"):
+        extract_disagg_cfg(internal_request_auth_key="")
+
+
+def test_extract_disagg_cfg_rejects_non_string_internal_request_auth_key():
+    with pytest.raises(
+            ValueError,
+            match="internal_request_auth_key must be a non-empty string"):
+        extract_disagg_cfg(internal_request_auth_key=123)
 
 
 def test_extract_ctx_gen_cfgs():
@@ -193,6 +261,17 @@ def test_extract_router_config_propagates_tokens_per_block():
             "type": "kv_cache_aware"
         }
     }).args
+
+
+def test_extract_router_config_propagates_kv_model_path() -> None:
+    cfg = {
+        "model": "/models/gpt-oss-checkpoint",
+        "router": {
+            "type": "kv_cache_aware"
+        },
+    }
+    router_config = extract_router_config(cfg)
+    assert router_config.args["model_path"] == "/models/gpt-oss-checkpoint"
 
 
 def test_get_server_configs_dict():

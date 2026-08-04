@@ -793,8 +793,14 @@ class LTX2Pipeline(BasePipeline):
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
             model_config=model_config,
+            **self._extra_transformer_kwargs(),
         )
         self.transformer._transformer_config = vars(cfg)
+
+    def _extra_transformer_kwargs(self) -> dict:
+        """Extra LTXModel constructor kwargs; empty for the base one-stage
+        pipeline. Subclasses override to add topology-specific kwargs."""
+        return {}
 
     # ------------------------------------------------------------------
     # CUDA graph setup (Modality-aware override)
@@ -1026,7 +1032,9 @@ class LTX2Pipeline(BasePipeline):
         """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
-        # LTX-2: single transformer (one DiT for video+audio); TeaCache only with explicit coefficients.
+        # LTX-2: single transformer (one DiT for video+audio); TeaCache only with
+        # explicit coefficients. Cache acceleration itself is enabled by the
+        # loader after torch.compile (see PipelineLoader.load).
         if self.transformer is not None and self.pipeline_config.cache_backend == "teacache":
             if self.pipeline_config.teacache.coefficients is None:
                 raise ValueError(
@@ -1037,11 +1045,6 @@ class LTX2Pipeline(BasePipeline):
                 "LTXModel",
                 LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
             )
-            self._setup_cache_acceleration()
-
-        # Cache-DiT
-        if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
-            self._setup_cache_acceleration()
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width
@@ -2026,10 +2029,6 @@ class LTX2Pipeline(BasePipeline):
 
         def decode_video_fn(vid_latents):
             vid_latents = self.video_patchifier.unpatchify(vid_latents, video_shape)
-
-            if output_type == "latent":
-                return vid_latents
-
             vid_latents = vid_latents.to(self.dtype)
             tiling_config = TilingConfig.default()
             if self._parallel_vae_enabled:
@@ -2059,18 +2058,27 @@ class LTX2Pipeline(BasePipeline):
 
         def decode_audio_fn(aud_latents):
             aud_latents = self.audio_patchifier.unpatchify(aud_latents, audio_shape)
-
-            if output_type == "latent":
-                return aud_latents
-
             aud_latents = aud_latents.to(self.dtype)
             return decode_audio(aud_latents, self.audio_decoder, self.vocoder)
 
-        video, audio = self.decode_latents(
-            latents=latents,
-            decode_fn=decode_video_fn,
-            extra_latents={"audio": (audio_latents, decode_audio_fn)},
-        )
+        if output_type == "latent":
+            # Latent output is a local unpatchify with no VAE work, and every
+            # rank already holds the full latents after the denoise loop —
+            # return them on every rank. decode_latents' vae_ranks/rank-0 gate
+            # exists to skip real VAE decode only; the two-stage handoff
+            # consumes these latents in place with zero collectives.
+            video = self.video_patchifier.unpatchify(latents, video_shape)
+            audio = (
+                self.audio_patchifier.unpatchify(audio_latents, audio_shape)
+                if audio_latents is not None
+                else None
+            )
+        else:
+            video, audio = self.decode_latents(
+                latents=latents,
+                decode_fn=decode_video_fn,
+                extra_latents={"audio": (audio_latents, decode_audio_fn)},
+            )
 
         if self.rank == 0:
             logger.info(f"Decoding completed in {time.time() - decode_start:.2f}s")

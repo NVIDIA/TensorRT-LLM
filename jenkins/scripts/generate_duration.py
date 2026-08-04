@@ -222,6 +222,7 @@ def main():
 
     with open(NEW_TEST_DURATION, "w") as file:
         json.dump(test_durations, file, indent=3)
+        file.write("\n")
 
     print("\nSummary:")
     print(f"  OpenSearch index       : {OPENSEARCH_INDEX}")

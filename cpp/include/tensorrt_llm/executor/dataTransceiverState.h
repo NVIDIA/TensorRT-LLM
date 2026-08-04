@@ -619,9 +619,22 @@ public:
         return mCacheState.has_value() && mCacheState->hasRnnConfig();
     }
 
+    /// @brief Set only when exported via CacheTransceiver::getSerializedDataTransceiverState:
+    /// transfers driven by such a state have no LlmRequest on the sender.
+    [[nodiscard]] bool isArbitraryTransferState() const noexcept
+    {
+        return mIsArbitraryTransferState;
+    }
+
+    void setIsArbitraryTransferState(bool isArbitraryTransferState) noexcept
+    {
+        mIsArbitraryTransferState = isArbitraryTransferState;
+    }
+
     [[nodiscard]] bool operator==(DataTransceiverState const& other) const noexcept
     {
-        return mCacheState == other.mCacheState && mCommState == other.mCommState;
+        return mCacheState == other.mCacheState && mCommState == other.mCommState
+            && mIsArbitraryTransferState == other.mIsArbitraryTransferState;
     }
 
     [[nodiscard]] std::string toString() const
@@ -642,6 +655,7 @@ private:
     friend class Serialization;
     std::optional<kv_cache::CacheState> mCacheState;
     std::optional<kv_cache::CommState> mCommState;
+    bool mIsArbitraryTransferState{false};
 };
 
 } // namespace tensorrt_llm::executor
