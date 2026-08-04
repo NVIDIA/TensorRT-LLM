@@ -2947,6 +2947,35 @@ class TestPydanticBestPractices:
             )
 
 
+def test_kv_cache_compression_config_dispatches_by_algorithm():
+    from tensorrt_llm.llmapi.llm_args import \
+        TriAttentionKvCacheCompressionConfig
+
+    config_dict = yaml.safe_load("""
+kv_cache_compression_config:
+  algorithm: triattention
+  budget: 32
+  beta: 17
+  eviction_mode: per_head
+  normalize_scores: false
+  model_path: /tmp/model
+  calibration_path: /tmp/calibration.pt
+""")
+
+    config = TorchLlmArgs(model="/tmp/dummy_model",
+                          **config_dict).kv_cache_compression_config
+
+    assert isinstance(config, TriAttentionKvCacheCompressionConfig)
+    assert config.budget == 32
+    assert config.beta == 17
+    assert config.eviction_mode == "per_head"
+    assert config.normalize_scores is False
+    assert config.changes_physical_kv_length
+    assert config.supports_block_reuse()
+    assert not config.supports_speculative_decoding()
+    assert "changes_physical_kv_length" not in config.model_dump()
+
+
 class TestSkipSoftmaxAttentionConfig:
     """Test LLM Skip Softmax Attention config behavior."""
 
