@@ -21,11 +21,11 @@ class TestPinnedWeightStaging(unittest.TestCase):
         self.assertIs(torch.Tensor.to, orig_to)
         self.assertIs(torch.Tensor.copy_, orig_copy)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_enabled_installs_and_restores(self):
         orig_to = torch.Tensor.to
         orig_copy = torch.Tensor.copy_
-        with mock.patch.dict(os.environ,
-                             {"TRTLLM_PINNED_WEIGHT_STAGING": "1"}):
+        with mock.patch.dict(os.environ, {"TRTLLM_PINNED_WEIGHT_STAGING": "1"}):
             with pinned_weight_staging.staging_scope():
                 self.assertIsNot(torch.Tensor.to, orig_to)
                 self.assertIsNot(torch.Tensor.copy_, orig_copy)
@@ -37,8 +37,9 @@ class TestPinnedWeightStaging(unittest.TestCase):
             self.assertEqual(len(pinned_weight_staging._bufs), 0)
 
     def test_cpu_paths_unaffected_inside_scope(self):
-        with mock.patch.dict(os.environ,
-                             {"TRTLLM_PINNED_WEIGHT_STAGING": "1"}):
+        # Also covers the CPU-only case where prefer_pinned() disables
+        # staging and the scope is a no-op.
+        with mock.patch.dict(os.environ, {"TRTLLM_PINNED_WEIGHT_STAGING": "1"}):
             with pinned_weight_staging.staging_scope():
                 x = torch.randn(8, 8)
                 y = x.to(torch.float64)
@@ -49,8 +50,7 @@ class TestPinnedWeightStaging(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_staged_h2d_correctness_and_release(self):
-        with mock.patch.dict(os.environ,
-                             {"TRTLLM_PINNED_WEIGHT_STAGING": "1"}):
+        with mock.patch.dict(os.environ, {"TRTLLM_PINNED_WEIGHT_STAGING": "1"}):
             with pinned_weight_staging.staging_scope():
                 for dtype in (torch.float32, torch.bfloat16, torch.uint8):
                     if dtype.is_floating_point:
@@ -73,8 +73,7 @@ class TestPinnedWeightStaging(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_pinned_source_bypasses_staging(self):
-        with mock.patch.dict(os.environ,
-                             {"TRTLLM_PINNED_WEIGHT_STAGING": "1"}):
+        with mock.patch.dict(os.environ, {"TRTLLM_PINNED_WEIGHT_STAGING": "1"}):
             with pinned_weight_staging.staging_scope():
                 src = torch.randn(32, 32).pin_memory()
                 dev = src.to("cuda")

@@ -12,11 +12,13 @@ per-dtype pinned buffer for the duration of the scope. On exit the original
 methods are restored and the buffers are freed, leaving no pinned-memory
 footprint behind. Default off: without the env var the scope is a no-op.
 """
+
 import os
 import threading
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
 _lock = threading.RLock()
@@ -27,7 +29,7 @@ _orig_copy = None
 
 
 def _enabled() -> bool:
-    return os.environ.get("TRTLLM_PINNED_WEIGHT_STAGING", "0") == "1"
+    return os.environ.get("TRTLLM_PINNED_WEIGHT_STAGING", "0") == "1" and prefer_pinned()
 
 
 def _pinned_clone(src: torch.Tensor) -> torch.Tensor:
@@ -35,9 +37,7 @@ def _pinned_clone(src: torch.Tensor) -> torch.Tensor:
     n = s.numel()
     b = _bufs.get(s.dtype)
     if b is None or b.numel() < n:
-        _bufs[s.dtype] = b = torch.empty(n,
-                                         dtype=s.dtype,
-                                         pin_memory=True)
+        _bufs[s.dtype] = b = torch.empty(n, dtype=s.dtype, pin_memory=prefer_pinned())
     v = b[:n].view(s.shape)
     v.copy_(s)
     return v
@@ -69,36 +69,50 @@ def _target_is_cuda(args, kwargs) -> bool:
 
 def _staged_to(self, *args, **kwargs):
     try:
-        if (self.device.type == "cpu" and self.layout == torch.strided
-                and self.numel() > 0 and not self.is_pinned()
-                and _target_is_cuda(args, kwargs)):
-            # The staging buffer is reused; the copy must stay synchronous.
+        if (
+            self.device.type == "cpu"
+            and self.layout == torch.strided
+            and self.numel() > 0
+            and not self.is_pinned()
+            and _target_is_cuda(args, kwargs)
+        ):
+            # The staging buffer is reused, so the copy must stay
+            # synchronous. non_blocking/copy may be passed positionally as
+            # bools; force them to False.
+            args = tuple(False if isinstance(a, bool) else a for a in args)
             kwargs.pop("non_blocking", None)
             with _lock:
                 return _orig_to(_pinned_clone(self), *args, **kwargs)
-    except Exception:
-        pass
+    except (RuntimeError, TypeError, ValueError, AttributeError) as e:
+        logger.debug(f"[pinned_weight_staging] to() fallback: {e}")
     return _orig_to(self, *args, **kwargs)
 
 
 def _staged_copy(self, src, non_blocking=False):
     try:
-        if (self.device.type == "cuda" and isinstance(src, torch.Tensor)
-                and src.device.type == "cpu" and src.layout == torch.strided
-                and src.numel() > 0 and not src.is_pinned()):
+        if (
+            self.device.type == "cuda"
+            and isinstance(src, torch.Tensor)
+            and src.device.type == "cpu"
+            and src.layout == torch.strided
+            and src.numel() > 0
+            and not src.is_pinned()
+        ):
             with _lock:
                 return _orig_copy(self, _pinned_clone(src), False)
-    except Exception:
-        pass
+    except (RuntimeError, TypeError, ValueError, AttributeError) as e:
+        logger.debug(f"[pinned_weight_staging] copy_() fallback: {e}")
     return _orig_copy(self, src, non_blocking)
 
 
-class staging_scope:
+class _StagingScope:
     """Re-entrant: nested scopes share one installation, freed at depth 0."""
 
     def __enter__(self):
         global _depth, _orig_to, _orig_copy
-        if not _enabled():
+        # Record activation so a mid-scope env change cannot skip cleanup.
+        self._active = _enabled()
+        if not self._active:
             return self
         with _lock:
             _depth += 1
@@ -109,12 +123,13 @@ class staging_scope:
                 torch.Tensor.copy_ = _staged_copy
                 logger.info(
                     "[pinned_weight_staging] staging scope enter: pageable "
-                    "CPU->CUDA weight copies go through pinned buffers")
+                    "CPU->CUDA weight copies go through pinned buffers"
+                )
         return self
 
     def __exit__(self, exc_type, exc, tb):
         global _depth, _orig_to, _orig_copy
-        if not _enabled():
+        if not getattr(self, "_active", False):
             return False
         with _lock:
             _depth -= 1
@@ -124,19 +139,24 @@ class staging_scope:
                     torch.Tensor.to = _orig_to
                 if _orig_copy is not None:
                     torch.Tensor.copy_ = _orig_copy
-                freed = sum(b.numel() * b.element_size()
-                            for b in _bufs.values())
+                freed = sum(b.numel() * b.element_size() for b in _bufs.values())
                 _bufs.clear()
                 # Return freed pinned pages to the OS, not just to torch's
                 # caching host allocator.
-                hec = (getattr(torch.cuda, "host_empty_cache", None)
-                       or getattr(torch._C, "_host_emptyCache", None))
+                hec = getattr(torch.cuda, "host_empty_cache", None) or getattr(
+                    torch._C, "_host_emptyCache", None
+                )
                 if hec is not None:
                     try:
                         hec()
-                    except Exception:
-                        pass
+                    except (RuntimeError, AttributeError) as e:
+                        logger.debug(f"[pinned_weight_staging] host_empty_cache: {e}")
                 logger.info(
                     "[pinned_weight_staging] staging scope exit: released "
-                    f"{freed / (1 << 30):.2f} GiB of pinned staging buffers")
+                    f"{freed / (1 << 30):.2f} GiB of pinned staging buffers"
+                )
         return False
+
+
+def staging_scope() -> _StagingScope:
+    return _StagingScope()
