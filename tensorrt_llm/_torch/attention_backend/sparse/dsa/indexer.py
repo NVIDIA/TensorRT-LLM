@@ -1855,13 +1855,13 @@ class Indexer(nn.Module):
 
         if self.mtp_index_share and metadata.in_mtp_draft_loop and not reuse_topk:
             rows = None
-            if num_generations > 0:
+            if has_decode:
                 next_n = num_gen_tokens // num_generations
                 gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
                 rows = self._mtp_last_accepted_rows(
                     gen_topk, metadata, num_contexts, num_generations, next_n
                 )
-            if num_contexts > 0:
+            if has_prefill:
                 ctx_last = (
                     torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
                 )
@@ -1872,7 +1872,10 @@ class Indexer(nn.Module):
                 if shared_topk_indices is None:
                     metadata.shared_topk_indices = rows.contiguous()
                 else:
-                    shared_topk_indices[: rows.shape[0], : rows.shape[1]].copy_(rows)
+                    row_start = num_contexts if is_generation else 0
+                    shared_topk_indices[
+                        row_start : row_start + rows.shape[0], : rows.shape[1]
+                    ].copy_(rows)
         return topk_indices_buffer
 
     def _mtp_last_accepted_rows(
