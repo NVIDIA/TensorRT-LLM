@@ -928,13 +928,7 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = False
         routed_model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         routed_model_config.mapping = routed_mapping
-        # Preserve K3's TRTLLM-Gen default while allowing the explicit
-        # DeepGEMM MegaMoE opt-in used by the SM100 FP8xFP4 SiTU path.
-        routed_model_config.moe_backend = (
-            "MEGAMOE_DEEPGEMM"
-            if model_config.moe_backend.upper() == "MEGAMOE_DEEPGEMM"
-            else "TRTLLM"
-        )
+        routed_model_config.moe_backend = model_config.moe_backend
         routed_model_config._frozen = True
         return routed_model_config
 
