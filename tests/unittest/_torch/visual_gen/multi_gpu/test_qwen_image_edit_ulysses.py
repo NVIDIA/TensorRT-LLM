@@ -4,32 +4,31 @@
 """Multi-GPU tests for Qwen-Image-Edit Ulysses sequence parallelism."""
 
 import os
-
-os.environ["TLLM_DISABLE_MPI"] = "1"
-
-from typing import Callable
+import sys
+from collections.abc import Callable, Generator
+from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    import sys
-    from pathlib import Path
+_ORIGINAL_TLLM_DISABLE_MPI = os.environ.get("TLLM_DISABLE_MPI")
+os.environ["TLLM_DISABLE_MPI"] = "1"
 
-    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
+try:
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl  # noqa: E402
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig  # noqa: E402
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping  # noqa: E402
+    from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (  # noqa: E402
         QwenImageEditPlusPipeline,
     )
-    from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+    from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (  # noqa: E402
         QwenJointAttention,
     )
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
+    from _visual_gen_dist_utils import spawn_with_retry  # noqa: E402
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -37,9 +36,12 @@ except ImportError:
 
 
 @pytest.fixture(autouse=True, scope="module")
-def _cleanup_mpi_env():
+def _cleanup_mpi_env() -> Generator[None, None, None]:
     yield
-    os.environ.pop("TLLM_DISABLE_MPI", None)
+    if _ORIGINAL_TLLM_DISABLE_MPI is None:
+        os.environ.pop("TLLM_DISABLE_MPI", None)
+    else:
+        os.environ["TLLM_DISABLE_MPI"] = _ORIGINAL_TLLM_DISABLE_MPI
 
 
 def init_distributed_worker(rank: int, world_size: int, port: int) -> None:
@@ -58,18 +60,17 @@ def cleanup_distributed() -> None:
     VisualGenMapping.seq_mesh = None
 
 
-def _distributed_worker(rank: int, world_size: int, test_fn: Callable, port: int) -> None:
+def _distributed_worker(
+    rank: int, world_size: int, test_fn: Callable[[int, int], None], port: int
+) -> None:
     try:
         init_distributed_worker(rank, world_size, port)
         test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed with error: {e}")
-        raise
     finally:
         cleanup_distributed()
 
 
-def run_test_in_distributed(world_size: int, test_fn: Callable) -> None:
+def run_test_in_distributed(world_size: int, test_fn: Callable[[int, int], None]) -> None:
     if not MODULES_AVAILABLE:
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
@@ -145,5 +146,5 @@ def _test_qwen_image_edit_ulysses_attention(rank: int, world_size: int) -> None:
         )
 
 
-def test_qwen_image_edit_ulysses_attention_2gpu():
+def test_qwen_image_edit_ulysses_attention_2gpu() -> None:
     run_test_in_distributed(2, _test_qwen_image_edit_ulysses_attention)
