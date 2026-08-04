@@ -196,6 +196,36 @@ def _logic_halo_conv3d(rank: int, world_size: int) -> None:
             )
 
 
+def _logic_halo_conv3d_even_kernel(rank: int, world_size: int) -> None:
+    """Channels-last exchange trims an asymmetric halo on its physical axis."""
+    device = f"cuda:{rank}"
+    adj = _make_adj_groups(world_size)
+    chunk_dim = 4
+    conv = nn.Conv3d(4, 4, kernel_size=(3, 3, 4), padding=1).to(device).float()
+    x, local_x = _prepare(
+        rank,
+        world_size,
+        chunk_dim,
+        (1, 4, 3, 8, 8),
+        device,
+        torch.channels_last_3d,
+    )
+
+    parallel = HaloExchangeConv(conv, chunk_dim, adj, rank, world_size)
+    exchanged = parallel._exchange_halos(local_x)
+
+    padded = torch.nn.functional.pad(x, (parallel.halo_left, parallel.halo_right))
+    local_width = local_x.shape[chunk_dim]
+    expected = torch.narrow(
+        padded,
+        chunk_dim,
+        rank * local_width,
+        local_width + parallel.halo_left + parallel.halo_right,
+    )
+    torch.testing.assert_close(exchanged, expected, rtol=0, atol=0)
+    assert exchanged.is_contiguous(memory_format=torch.channels_last_3d)
+
+
 def _logic_halo_conv2d(rank: int, world_size: int) -> None:
     """HaloExchangeConv wrapping nn.Conv2d (kernel=3, stride=1)."""
     device = f"cuda:{rank}"
@@ -310,6 +340,9 @@ def _logic_halo_conv2d_stride2_offset_group(rank: int, world_size: int) -> None:
 class TestHaloExchangeConv:
     def test_wan_conv3d_with_cache_2gpu(self):
         _run(2, _logic_halo_conv3d)
+
+    def test_conv3d_even_kernel_channels_last_2gpu(self) -> None:
+        _run(2, _logic_halo_conv3d_even_kernel)
 
     def test_conv2d_2gpu(self):
         _run(2, _logic_halo_conv2d)
