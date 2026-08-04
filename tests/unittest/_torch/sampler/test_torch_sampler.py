@@ -1739,7 +1739,14 @@ class TestBatchedSampling:
             assert sample_state.sampler_event is not None
             sample_state.sampler_event.synchronize()
             assert sample_state.host is not None
-            new_tokens_tensors.append(sample_state.host.new_tokens.unsqueeze(-1))
+            host_new_tokens = sample_state.host.new_tokens
+            if sample_state.single_step_greedy:
+                # The stable greedy path copies one token per active request instead of
+                # the full [step, slot, beam] buffer. This fixture uses dense sequence
+                # slots, so restore that layout before comparing sampling results.
+                assert host_new_tokens.shape == (len(sample_state.requests),)
+                host_new_tokens = host_new_tokens.reshape(1, -1, 1)
+            new_tokens_tensors.append(host_new_tokens.unsqueeze(-1))
         new_tokens = torch.cat(new_tokens_tensors, dim=-1)
         if num_repeats is None:
             new_tokens = new_tokens.squeeze(-1)
