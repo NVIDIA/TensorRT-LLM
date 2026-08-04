@@ -692,7 +692,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             returnStdout: true
         ).trim()
 
-        if (!slurmJobID || !slurmJobID.isNumber()) {
+        if (!slurmJobID || !(slurmJobID.toString() ==~ /\d+/)) {
             echo "Slurm job may not submit successfully. No job ID found."
         } else {
             Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
@@ -740,7 +740,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         // never captured); running the dump anyway executes `scancel null` /
         // `scontrol show job null`, whose "Invalid job id specified" output then
         // shows up in failure analysis as a bogus error signature.
-        if (!slurmJobID || !slurmJobID.isNumber()) {
+        if (!slurmJobID || !(slurmJobID.toString() ==~ /\d+/)) {
             Utils.exec(pipeline, script: "echo No SLURM job ID captured for node ${nodeName}; skipping job cleanup dump")
         } else {
             Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
@@ -892,7 +892,7 @@ def sweepOrphanedSlurmResources(pipeline) {
 // Best-effort: any SSH/sacct error returns null so callers fall back to the
 // duration heuristic rather than failing the stage.
 def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID) {
-    if (!slurmJobID || !slurmJobID.toString().isNumber()) {
+    if (!slurmJobID || !(slurmJobID.toString() ==~ /\d+/)) {
         return null
     }
     String state = null
@@ -1004,7 +1004,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // node once the pod is gone). Deregistered when cleanup actually runs.
                 registerSlurmResource(stageName, [clusterName: partition.clusterName, nodeName: nodeName, slurmJobId: slurmJobID, usedSbatch: false])
 
-                if (!slurmJobID || !slurmJobID.isNumber()) {
+                if (!slurmJobID || !(slurmJobID.toString() ==~ /\d+/)) {
                     echo "Slurm job did not submit successfully. No job ID found.\nSubmission output:\n${slurmSubmitOutput}"
                 }
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
@@ -1987,13 +1987,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ).trim()
                     recordSlurmPlacementContext(placementContext, slurmJobId, null, stageName)
                 }
-                if (!slurmJobId || !slurmJobId.isNumber()) {
+                if (!slurmJobId || !(slurmJobId.toString() ==~ /\d+/)) {
                     // The job never entered the SLURM queue (sbatch failed or the ID
                     // was never captured), so nothing ran on any node: retryable
                     // infra by construction, and node-avoidance has nothing to avoid.
                     throw new InfraFailure(
-                        "SLURM job submission for ${stageName} produced no job ID " +
-                        "(slurm_job_id.txt missing or empty in ${jobWorkspace}); the job never entered the queue.",
+                        "SLURM job submission for ${stageName} produced no usable job ID " +
+                        "(slurm_job_id.txt missing, empty, or non-numeric in ${jobWorkspace}); " +
+                        "the job never entered the queue.",
                         null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-submit-no-jobid>")
                 }
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
