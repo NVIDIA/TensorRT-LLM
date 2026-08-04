@@ -588,6 +588,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
     sparse_metadata_params: Optional[DSAMetadataParams] = None
+    use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
     indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
@@ -676,6 +677,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             assert has_deepseek_v4_cache_interface, (
                 "DSAtrtllmAttentionMetadata requires DSACacheManager-compatible "
                 f"cache manager, got {type(self.kv_cache_manager)}")
+        self.use_fp8_ds_mla = self.kv_cache_manager.use_fp8_ds_mla
 
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -847,6 +849,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64) - seq_starts[req_indices]
 
             global_positions = start_positions[req_indices] + token_offsets
+            if self.use_fp8_ds_mla:
+                self.token_positions_cuda[:self.num_tokens] = (
+                    global_positions.to(torch.int32))
             # Honor MXFP4 indexer K cache layout (½ byte per value vs FP8's
             # 1 byte) when the cache manager exposes a use_fp4 flag.
             index_head_dim = self.kv_cache_manager.index_head_dim
@@ -1093,6 +1098,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
             pin_memory=prefer_pinned(),
         )
+        self.token_positions_cuda = None
+        if self.use_fp8_ds_mla:
+            self.token_positions_cuda = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens, ),
+                cache_name="token_positions_cuda",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
         # These buffers will be allocated dynamically in Indexer.prepare() based on actual total_kv_len to save memory.
         if self.enable_context_mla_with_cached_kv:
@@ -3187,6 +3201,9 @@ class DSATrtllmAttention(TrtllmAttention):
             raise ValueError(
                 "sparse_params is required for DSATrtllmAttention and cannot be None"
             )
+        self.kv_cache_dtype = kwargs.pop("kv_cache_dtype", "auto")
+        self.use_fp8_ds_mla = self.kv_cache_dtype == "fp8_ds_mla"
+
         TrtllmAttention.__init__(
             self,
             layer_idx,
@@ -3346,6 +3363,21 @@ class DSACacheManager(KVCacheManager):
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
 
+        self.use_fp8_ds_mla = kv_cache_config.dtype == "fp8_ds_mla"
+        if self.use_fp8_ds_mla:
+            from .inline_scale_kv import PAGE_SIZE, TOKEN_BYTES
+            assert tokens_per_block == PAGE_SIZE, (
+                f"FlashInfer DSA FMHA requires tokens_per_block={PAGE_SIZE}, "
+                f"got {tokens_per_block}.")
+            assert head_dim == 576, (
+                "inline-scale KV layout requires head_dim=576, "
+                f"got {head_dim}.")
+            elem_bytes = {DataType.BF16: 2, DataType.FP8: 1}.get(dtype)
+            assert elem_bytes is not None, (
+                f"inline-scale KV layout requires BF16 or FP8, got {dtype}.")
+            assert TOKEN_BYTES % elem_bytes == 0
+            head_dim = TOKEN_BYTES // elem_bytes
+
         super().__init__(
             kv_cache_config,
             kv_cache_type,
@@ -3438,8 +3470,12 @@ class DSACacheManager(KVCacheManager):
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
-        # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
-        mem_per_token *= num_attention_layers * head_dim
+        if kwargs["kv_cache_config"].dtype == "fp8_ds_mla":
+            from .inline_scale_kv import TOKEN_BYTES
+            mem_per_token = num_attention_layers * TOKEN_BYTES
+        else:
+            # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
+            mem_per_token *= num_attention_layers * head_dim
 
         # Indexer K cache: physically allocated as raw UINT8 in
         # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume

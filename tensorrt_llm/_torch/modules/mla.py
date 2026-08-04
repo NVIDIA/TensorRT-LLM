@@ -510,6 +510,7 @@ class MLA(nn.Module):
             self.register_to_config = True
 
         config = config or ModelConfig()
+        self.kv_cache_dtype = config.extra_attrs.get("kv_cache_dtype", "auto")
         sparse_attn_cfg = config.sparse_attention_config
         sparse_params = (
             sparse_attn_cfg.to_sparse_params(
@@ -792,6 +793,7 @@ class MLA(nn.Module):
             dtype=dtype,
             aux_stream=mqa_aux_stream,
             rope_append=not self.is_deepseek_v4,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
         self.compressor = getattr(self.mqa, "compressor", None)
         self.indexer = getattr(self.mqa, "indexer", None)
@@ -1037,6 +1039,8 @@ class MLA(nn.Module):
         if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
             return False
         if num_generations > 0:
+            return False
+        if self.kv_cache_dtype == "fp8_ds_mla":
             return False
         return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
@@ -2060,6 +2064,7 @@ class MLA(nn.Module):
             return False
         if not (
             self.short_seq_mha_threshold > 0
+            and self.kv_cache_dtype != "fp8_ds_mla"
             and not self.apply_rotary_emb
             and self.mapping.cp_size == 1
             and position_ids is not None
@@ -2549,18 +2554,19 @@ class MLA(nn.Module):
 
         if self.is_deepseek_v4:
             fused_q = q
-            self.mqa.mla_rope_generation(
-                fused_q,
-                q_pe,
-                latent_cache,
-                attn_metadata,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                fmha_scheduler_counter,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                quant_q_buffer,
-            )
+            if self.kv_cache_dtype != "fp8_ds_mla":
+                self.mqa.mla_rope_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                )
         else:
             fused_q = torch.empty(
                 [num_tokens, self.num_heads_tp, (self.kv_lora_rank + self.qk_rope_head_dim)],
@@ -2569,7 +2575,9 @@ class MLA(nn.Module):
             )
 
             def _mla_gen_rope():
-                if self.apply_rotary_emb:
+                if self.kv_cache_dtype == "fp8_ds_mla":
+                    fused_q[..., self.kv_lora_rank :] = q_pe
+                elif self.apply_rotary_emb:
                     # Non-fused backends (Vanilla / FlashInfer) do not fuse RoPE
                     # in the attention kernel. Reuse apply_rope, which rotates
                     # q's q_pe slice in place, then copy rotated k_pe into the
@@ -2792,7 +2800,7 @@ class MLA(nn.Module):
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
                 )
 
-            if self.apply_rotary_emb:
+            if self.kv_cache_dtype == "fp8_ds_mla" or self.apply_rotary_emb:
                 fused_q[..., self.kv_lora_rank :] = q_pe
             fused_q = fused_q.view(
                 [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]

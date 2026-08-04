@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from .fallback import FallbackFmha
+from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
 from .msa_sparse_gqa import MsaSparseGqaFmha
@@ -24,6 +25,7 @@ __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
     "FallbackFmha",
+    "FlashInferSparseMlaFmha",
     "FlashInferTrtllmGenFmha",
     "Fmha",
     "FmhaCls",
