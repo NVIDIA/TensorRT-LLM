@@ -555,6 +555,47 @@
       "path": "iter_stats_max_iterations"
     },
     {
+      "allowed_values": [
+        "triattention"
+      ],
+      "annotation": "Literal['triattention']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.beta"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.budget"
+    },
+    {
+      "allowed_values": [
+        "union",
+        "per_head",
+        "per_layer_perhead"
+      ],
+      "annotation": "Literal['union', 'per_head', 'per_layer_perhead']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.eviction_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
@@ -658,6 +699,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.fp8_context_mla_kv_len_cap"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[float]",
       "converter": "",
       "kind": "value",
@@ -720,7 +768,7 @@
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
-      "path": "kv_cache_config.mamba_state_cache_interval"
+      "path": "kv_cache_config.mamba_state_config.periodic_snapshot_interval"
     },
     {
       "allowed_values": [],
@@ -941,9 +989,10 @@
         "VANILLA",
         "TRITON",
         "MARLIN",
-        "MEGAMOE_DEEPGEMM"
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL"
       ],
-      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM']",
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
       "converter": "",
       "kind": "categorical",
       "path": "moe_config.backend"
@@ -1433,6 +1482,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.index_share_for_mtp_iteration"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
@@ -1634,6 +1690,18 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.acceptance_rate_window_size"
+    },
+    {
+      "allowed_values": [
+        "full",
+        "no_topk",
+        "no_topp",
+        "no_topk_no_topp"
+      ],
+      "annotation": "<enum 'AdvancedSamplingMode'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.advanced_sampling_mode"
     },
     {
       "allowed_values": [],

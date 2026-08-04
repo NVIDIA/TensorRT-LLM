@@ -66,6 +66,7 @@ _MX_TRANSFER_STATE_LOCK = threading.Lock()
 _MX_SOURCE_IDENTITY_METADATA_KEY = "trtllm_source_identity"
 _MX_WEIGHT_LAYOUT_METADATA_KEY = "trtllm_weight_layout"
 _MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY = "trtllm_transform_protocol_version"
+_MX_TRANSFORM_ABI_ID_METADATA_KEY = "trtllm_transform_abi_id"
 _MX_WEIGHT_LAYOUT_POST_TRANSFORM = "post_transform"
 _MX_STAGED_TRANSFORM_PROTOCOL_VERSION = 1
 
@@ -425,13 +426,24 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 **kwargs,
             )
 
-        layout_status = _metadata_weight_layout_status(source_metadata)
+        expected_transform_abi_id = (
+            self._local_source_identity.transform_abi_id
+            if self._local_source_identity is not None
+            else None
+        )
+        layout_status = _metadata_weight_layout_status(
+            source_metadata,
+            expected_transform_abi_id=expected_transform_abi_id,
+        )
         if layout_status is _MxWeightLayoutStatus.UNSUPPORTED:
             self._source_identity_compatible_for_last_load = False
             return self._fallback_to_disk(
                 checkpoint_dir,
                 mapping,
-                reason=_metadata_unsupported_layout_reason(source_metadata),
+                reason=_metadata_unsupported_layout_reason(
+                    source_metadata,
+                    expected_transform_abi_id=expected_transform_abi_id,
+                ),
                 **kwargs,
             )
 
@@ -721,6 +733,12 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 "unavailable; receivers cannot safely verify transformed weights."
             )
             return
+        if source_identity.transform_abi_id is None:
+            logger.warning(
+                "Skipping MX post-transform publish because SourceIdentity has "
+                "no qualified transform-layout ABI."
+            )
+            return
 
         try:
             from modelexpress import (
@@ -884,6 +902,8 @@ def _build_mx_source_metadata(source_identity: Optional[SourceIdentity]) -> dict
     }
     if source_identity is not None:
         metadata[_MX_SOURCE_IDENTITY_METADATA_KEY] = _serialize_source_identity(source_identity)
+        if source_identity.transform_abi_id is not None:
+            metadata[_MX_TRANSFORM_ABI_ID_METADATA_KEY] = source_identity.transform_abi_id
     return metadata
 
 
@@ -941,6 +961,7 @@ def _metadata_has_trtllm_key(metadata: dict[str, Any]) -> bool:
             _MX_SOURCE_IDENTITY_METADATA_KEY,
             _MX_WEIGHT_LAYOUT_METADATA_KEY,
             _MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY,
+            _MX_TRANSFORM_ABI_ID_METADATA_KEY,
         )
     )
 
@@ -970,13 +991,25 @@ def _source_identity_from_metadata(metadata: Optional[dict[str, Any]]) -> Option
         return None
 
 
-def _metadata_is_post_transform(metadata: Optional[dict[str, Any]]) -> bool:
+def _metadata_is_post_transform(
+    metadata: Optional[dict[str, Any]],
+    *,
+    expected_transform_abi_id: Optional[str],
+) -> bool:
     return (
-        _metadata_weight_layout_status(metadata) is _MxWeightLayoutStatus.POST_TRANSFORM_SUPPORTED
+        _metadata_weight_layout_status(
+            metadata,
+            expected_transform_abi_id=expected_transform_abi_id,
+        )
+        is _MxWeightLayoutStatus.POST_TRANSFORM_SUPPORTED
     )
 
 
-def _metadata_weight_layout_status(metadata: Optional[dict[str, Any]]) -> _MxWeightLayoutStatus:
+def _metadata_weight_layout_status(
+    metadata: Optional[dict[str, Any]],
+    *,
+    expected_transform_abi_id: Optional[str],
+) -> _MxWeightLayoutStatus:
     layout = _metadata_get(metadata, _MX_WEIGHT_LAYOUT_METADATA_KEY)
     if layout is None:
         return _MxWeightLayoutStatus.PRE_TRANSFORM
@@ -994,16 +1027,41 @@ def _metadata_weight_layout_status(metadata: Optional[dict[str, Any]]) -> _MxWei
         return _MxWeightLayoutStatus.UNSUPPORTED
     if protocol_version != _MX_STAGED_TRANSFORM_PROTOCOL_VERSION:
         return _MxWeightLayoutStatus.UNSUPPORTED
+
+    source_transform_abi_id = _metadata_get(metadata, _MX_TRANSFORM_ABI_ID_METADATA_KEY)
+    if not isinstance(source_transform_abi_id, str) or not source_transform_abi_id:
+        return _MxWeightLayoutStatus.UNSUPPORTED
+    if expected_transform_abi_id is None or source_transform_abi_id != expected_transform_abi_id:
+        return _MxWeightLayoutStatus.UNSUPPORTED
     return _MxWeightLayoutStatus.POST_TRANSFORM_SUPPORTED
 
 
-def _metadata_unsupported_layout_reason(metadata: Optional[dict[str, Any]]) -> str:
+def _metadata_unsupported_layout_reason(
+    metadata: Optional[dict[str, Any]],
+    *,
+    expected_transform_abi_id: Optional[str],
+) -> str:
     layout = _metadata_get(metadata, _MX_WEIGHT_LAYOUT_METADATA_KEY)
     if str(layout).lower() == _MX_WEIGHT_LAYOUT_POST_TRANSFORM:
         version = _metadata_get(metadata, _MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY)
+        try:
+            protocol_version = int(version)
+        except (TypeError, ValueError):
+            protocol_version = None
+        if protocol_version != _MX_STAGED_TRANSFORM_PROTOCOL_VERSION:
+            return (
+                "source publishes post-transform weights with unsupported "
+                f"transform protocol {version!r}"
+            )
+
+        source_transform_abi_id = _metadata_get(metadata, _MX_TRANSFORM_ABI_ID_METADATA_KEY)
+        if not isinstance(source_transform_abi_id, str) or not source_transform_abi_id:
+            return "source publishes post-transform weights without a transform-layout ABI"
+        if expected_transform_abi_id is None:
+            return "receiver has no qualified transform-layout ABI for post-transform weights"
         return (
-            "source publishes post-transform weights with unsupported "
-            f"transform protocol {version!r}"
+            "source publishes post-transform weights with transform-layout ABI "
+            f"{source_transform_abi_id!r}; receiver requires {expected_transform_abi_id!r}"
         )
     return f"source publishes unsupported MX weight layout {layout!r}"
 

@@ -1,10 +1,11 @@
 # Cosmos3 Text(+Image)-to-Video(+Audio) generation
 
-Cosmos3 supports four generation modes from a single checkpoint:
+Cosmos3 supports the following generation modes from a single checkpoint:
 
 - **T2V** — text-to-video (`prompts/t2v.json`).
 - **T2I** — text-to-image (`prompts/t2i.json`); emits a still frame (use `--output_type image` / a non-video `--output_path`).
 - **I2V / TI2V** — image-conditioned video (`prompts/i2v.json`). Condition on a reference frame via the prompt file's `vision_path` or `--image_path`. The image may be a local path, a `file://` / `http(s)://` URL, or a `data:` URI.
+- **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local MP4/AVI file). Only the first (or last, per `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` input frames condition the output (5 by default); the encoded bytes pass through and each worker decodes just that window on NVDEC (see [Media I/O dependencies](#media-io-dependencies)).
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
 
 ## Checkpoints
@@ -13,6 +14,8 @@ Pass the Hub ID or local path via `--model`:
 
 - [`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano)
 - [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super)
+- [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
+- [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
 
 ## Guardrails
 
@@ -30,12 +33,18 @@ To run without guardrails (you are responsible for safe deployment):
 export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 ```
 
+## Media I/O dependencies
+
+- Saving `.mp4` output requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`); without it the encoder falls back to `.avi`.
+- Decoding MP4/AVI reference videos (V2V) happens in the worker processes on NVDEC via PyNvVideoCodec, a declared TensorRT-LLM dependency — nothing extra to install. Tested combinations: H.264 in MP4 and H.264 in AVI; other containers/codecs/profiles depend on the demuxer and the GPU's NVDEC capabilities and are best-effort.
+
 ## Deployment configs
 
 See `examples/visual_gen/configs/`:
 
 - `cosmos3-nano-1gpu.yaml` — 1 GPU
 - `cosmos3-super-4gpu.yaml` — 4 GPU, CFG + Ulysses + parallel VAE
+- `cosmos3-t2i-1gpu.yaml` — 1 GPU, text-to-image deployments (base or distilled): warms the deployed 1024×1024 single-frame shape instead of the omni video shape.
 
 Example prompts live under `prompts/` (mirroring `cosmos3-internal/inputs/omni`).
 
@@ -59,6 +68,15 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --image_path https://example.com/frame.jpg \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
+# V2V: video-conditioned video (continues the first frames of --video_path).
+# Best results when the prompt describes the input video — e.g. continue a
+# T2V output reusing its original prompt. Output size is fixed (1280x720
+# default); inputs are center-cropped, not aspect-matched.
+python cosmos3.py --model /path/to/Cosmos3-Nano \
+    --prompt_file prompts/v2v.json \
+    --video_path /path/to/Cosmos3-Nano/assets/example_i2v_output.mp4 \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
 # T2AV: text-to-video with synchronized audio
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2av.json \
@@ -69,6 +87,22 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2i.json \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
     --output_path output.png
+
+# T2I, distilled 4-step checkpoint (use the T2I config so warmup runs the
+# image shape; steps/guidance come from the checkpoint automatically)
+python cosmos3.py --model nvidia/Cosmos3-Super-Text2Image-4Step \
+    --prompt_file prompts/t2i.json \
+    --visual_gen_args ../../configs/cosmos3-t2i-1gpu.yaml \
+    --output_type image \
+    --output_path output.png
+
+# I2V, distilled 4-step checkpoint (steps/guidance and the system-prompt
+# default come from the checkpoint automatically; defaults are the deployed
+# 720p x 189-frame shape, so no config is required)
+python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step \
+    --prompt "The camera slowly pans right across the scene" \
+    --image_path https://example.com/frame.jpg \
+    --output_path output.mp4
 
 # Inline prompt (--prompt or a JSON file path)
 python cosmos3.py --model nvidia/Cosmos3-Nano \

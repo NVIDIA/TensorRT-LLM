@@ -11,9 +11,16 @@ numa_bind=${5}
 log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
+cuda_devices=${9}
 # CUDA_VISIBLE_DEVICES selection:
 #   - Default packing (no gpu_map file): each node is dedicated to one
-#     worker, so SLURM_LOCALID maps directly to the physical GPU id.
+#     worker, so every rank on the node is given the node's full GPU list
+#     (passed as ${9} by submit.py) and binds to its own device via
+#     mapping.local_rank (= rank % gpus_per_node). Exposing the whole node
+#     is required for intra-node TP custom all-reduce (attention_dp=false /
+#     TEP): its cudaDeviceCanAccessPeer() topology check must be able to see
+#     the peer GPUs. Pinning a single GPU per rank only works for DEP
+#     (attention_dp=true), which has no intra-node TP all-reduce.
 #   - Compact packing (gpu_map file emitted by submit.py): two workers may
 #     share a node and would both see LOCALID=0, so look up the per-worker
 #     gpu_map "<rank> <host> <local_gpu_id>" by SLURM_PROCID. srun
@@ -28,7 +35,7 @@ if [ -f "${gpu_map_file}" ]; then
     fi
     export CUDA_VISIBLE_DEVICES=${gpu_id}
 else
-    export CUDA_VISIBLE_DEVICES=${SLURM_LOCALID}
+    export CUDA_VISIBLE_DEVICES=${cuda_devices}
 fi
 
 # Clear UCX_TLS for specific clusters

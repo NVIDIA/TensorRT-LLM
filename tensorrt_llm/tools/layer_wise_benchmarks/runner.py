@@ -3,7 +3,6 @@ import functools
 import inspect
 import itertools
 import os
-import unittest.mock
 import weakref
 from enum import IntEnum
 from typing import Optional
@@ -17,7 +16,6 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputs
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -509,37 +507,9 @@ class Runner:
 
             return select_alltoall_method_type
 
-        def make_select_alltoall_method_type_2(select_alltoall_method_type_orig):
-            def select_alltoall_method_type(self):
-                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
-                # by replacing `top_k` with `fake_top_k`
-                top_k = self.routing_method.experts_per_token
-                if scaled_from <= top_k:
-                    fake_top_k = mapping.moe_ep_size + 1
-                else:
-                    fake_top_k = mapping.moe_ep_size - 1
-                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
-                with unittest.mock.patch.object(
-                    self.routing_method.__class__,
-                    "experts_per_token",
-                    new_callable=unittest.mock.PropertyMock,
-                ) as mock_top_k:
-                    mock_top_k.return_value = fake_top_k
-                    return select_alltoall_method_type_orig(self)
-
-            return select_alltoall_method_type
-
-        select_alltoall_method_type_cutlass = CutlassFusedMoE.select_alltoall_method_type
-        select_alltoall_method_type_trtllm_gen = TRTLLMGenFusedMoE.select_alltoall_method_type
         select_alltoall_method_type_wide_ep = WideEPMoE.select_alltoall_method_type
         tensorrt_llm._torch.model_config.load_pretrained_config = make_load_pretrained_config(
             mapping, load_pretrained_config
-        )
-        CutlassFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
-            select_alltoall_method_type_cutlass
-        )
-        TRTLLMGenFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
-            select_alltoall_method_type_trtllm_gen
         )
         WideEPMoE.select_alltoall_method_type = make_select_alltoall_method_type(
             select_alltoall_method_type_wide_ep
@@ -548,8 +518,6 @@ class Runner:
             yield
         finally:
             tensorrt_llm._torch.model_config.load_pretrained_config = load_pretrained_config
-            CutlassFusedMoE.select_alltoall_method_type = select_alltoall_method_type_cutlass
-            TRTLLMGenFusedMoE.select_alltoall_method_type = select_alltoall_method_type_trtllm_gen
             WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod

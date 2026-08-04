@@ -65,6 +65,16 @@ def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
 
 
+def _pop_optional_str_config_option(config: dict[str, Any],
+                                    key: str) -> Optional[str]:
+    value = config.pop(key, None)
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError(f"{key} must be a non-empty string")
+
+
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
     for middleware in middlewares:
@@ -529,7 +539,8 @@ def launch_server(
         allow_request_chat_template: bool = False,
         num_input_processor_workers: int = 8,
         num_media_load_workers: int = 8,
-        multi_frontend_enabled: bool = True):
+        multi_frontend_enabled: bool = True,
+        internal_disagg_auth_key: Optional[str] = None):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -605,7 +616,8 @@ def launch_server(
                 chat_template=chat_template,
                 allow_request_chat_template=allow_request_chat_template,
                 input_processor_workers=num_input_processor_workers,
-                media_load_workers=num_media_load_workers)
+                media_load_workers=num_media_load_workers,
+                internal_disagg_auth_key=internal_disagg_auth_key)
             _apply_fastapi_middlewares(server.app, middleware)
 
             # Optionally disable GC (default: not disabled)
@@ -1386,11 +1398,17 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f) or {}
+                llm_args_extra_dict = yaml.safe_load(f)
+            if llm_args_extra_dict is None:
+                llm_args_extra_dict = {}
+            elif not isinstance(llm_args_extra_dict, dict):
+                raise ValueError("Configuration file root must be a mapping.")
         extra_allow_request_chat_template = _pop_bool_config_option(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
+        internal_disagg_auth_key = _pop_optional_str_config_option(
+            llm_args_extra_dict, "internal_request_auth_key")
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
@@ -1445,6 +1463,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 "allow_request_chat_template":
                 allow_request_chat_template
                 if allow_request_chat_template else None,
+                "internal_request_auth_key":
+                internal_disagg_auth_key,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1478,7 +1498,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
                 num_input_processor_workers=num_input_processor_workers,
-                num_media_load_workers=num_media_load_workers)
+                num_media_load_workers=num_media_load_workers,
+                internal_disagg_auth_key=internal_disagg_auth_key)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1621,7 +1642,11 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
         with open(extra_encoder_options, 'r') as f:
-            encoder_args_extra_dict = yaml.safe_load(f) or {}
+            encoder_args_extra_dict = yaml.safe_load(f)
+        if encoder_args_extra_dict is None:
+            encoder_args_extra_dict = {}
+        elif not isinstance(encoder_args_extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
     extra_allow_request_chat_template = _pop_bool_config_option(
         encoder_args_extra_dict, "allow_request_chat_template")
     allow_request_chat_template = (allow_request_chat_template
@@ -1739,6 +1764,10 @@ def serve_embedding(
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             extra_dict = yaml.safe_load(f)
+        if extra_dict is None:
+            extra_dict = {}
+        elif not isinstance(extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
     llm_args = update_llm_args_with_extra_dict(
         llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
 
@@ -2066,7 +2095,12 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     #    ZMQ ingest server, started once here).
     def _client_factory(router, role, max_retries=1):
         from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-        return OpenAIHttpClient(router, role, request_timeout, max_retries)
+        return OpenAIHttpClient(
+            router,
+            role,
+            request_timeout,
+            max_retries,
+            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key)
 
     coordinator = DisaggCoordinatorService(
         disagg_cfg,
@@ -2338,13 +2372,21 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
 
-    launch_server(
-        host=server_cfg.hostname,
-        port=server_cfg.port,
-        llm_args=llm_args,
-        allow_request_chat_template=disagg_config.allow_request_chat_template,
+    launch_kwargs = {
+        "allow_request_chat_template":
+        disagg_config.allow_request_chat_template,
         # Disagg ctx/gen MPI workers must not enter multi-frontend mode.
-        multi_frontend_enabled=False)
+        "multi_frontend_enabled": False,
+    }
+    internal_disagg_auth_key = getattr(disagg_config,
+                                       "internal_request_auth_key", None)
+    if internal_disagg_auth_key is not None:
+        launch_kwargs["internal_disagg_auth_key"] = internal_disagg_auth_key
+
+    launch_server(host=server_cfg.hostname,
+                  port=server_cfg.port,
+                  llm_args=llm_args,
+                  **launch_kwargs)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,

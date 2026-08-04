@@ -34,7 +34,7 @@ import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, field_validator, model_validator)
+                      PrivateAttr, StrictInt, field_validator, model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -58,9 +58,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
                                  ContextChunkingPolicy as _ContextChunkingPolicy,
                                  DecodingConfig,
-                                 DecodingMode,
                                  DynamicBatchConfig as _DynamicBatchConfig,
-                                 EagleConfig as _EagleConfig,
                                  ExecutorConfig as _ExecutorConfig,
                                  ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
                                  KvCacheConfig as _KvCacheConfig,
@@ -563,7 +561,7 @@ class MultimodalConfig(StrictBaseModel):
         ("Maximum number of pending multimodal requests whose encoder work can be prefetched "
          "on a side CUDA stream ahead of admission. 0 disables side-stream prefetch. "
          "Incompatible with encoder_cuda_graph because graph replay uses static buffers. "
-         "For the time being, this is also incompatible with encoder_cache_max_bytes > 0."
+         "Can be combined with encoder_cache_max_bytes; the two memory limits are additive."
          ),
         status="prototype",
     )
@@ -576,7 +574,7 @@ class MultimodalConfig(StrictBaseModel):
          "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
          "every item in the request must hit the cache before cached embeddings are reused. "
          "Only single-modality requests are cacheable for the time being. "
-         "For the time being, this is incompatible with encoder_side_stream_max_ahead > 0. "
+         "Can be combined with encoder_side_stream_max_ahead. "
          "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
          ),
         status="prototype",
@@ -607,14 +605,6 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
-        # TODO(TRTLLM-14034): Make encoder side-stream read and write from the cache.
-        if (self.encoder_cache_max_bytes > 0
-                and self.encoder_side_stream_max_ahead > 0):
-            raise ValueError(
-                "multimodal_config.encoder_cache_max_bytes > 0 and "
-                "multimodal_config.encoder_side_stream_max_ahead > 0 are "
-                "mutually exclusive. Disable side-stream MM prefetch or set "
-                "the MM encoder cache capacity to 0.")
         return self
 
 
@@ -920,6 +910,12 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "`fp4` requires Blackwell+ (SM>=100) at runtime and "
         "index_head_dim=128.",
     )
+    index_share_for_mtp_iteration: Optional[bool] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Reuse the indexer Top-K across MTP draft steps instead of recomputing "
+        "it each step. Defaults to the model's HF config value.")
 
     @model_validator(mode="after")
     def _validate_indexer_k_dtype(self):
@@ -1048,6 +1044,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
+            mtp_index_share=bool(_value("index_share_for_mtp_iteration",
+                                        False)),
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1384,7 +1382,8 @@ class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM"] = Field(
+        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL"] = Field(
             default='AUTO',
             description="MoE backend to use. "
             "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
@@ -1688,6 +1687,32 @@ class CalibConfig(StrictBaseModel):
         "The maximum sequence length to initialize tokenizer for calibration.")
 
 
+class AdvancedSamplingMode(StrEnum):
+    """Deploy-time specialization of the one-model advanced sampler.
+
+    FULL    - per-row tensor top_k/top_p (default; mixed per-request sampling).
+    NO_TOPK - top_k disabled, top_p honored. Skips the top_k mask kernel.
+    NO_TOPP - top_p disabled, top_k honored. Skips the top_p renorm kernel.
+    NO_TOPK_NO_TOPP - both disabled (pure temperature sampling). Skips both kernels.
+    """
+    FULL = "full"
+    NO_TOPK = "no_topk"
+    NO_TOPP = "no_topp"
+    NO_TOPK_NO_TOPP = "no_topk_no_topp"
+
+    @property
+    def skips_top_k(self) -> bool:
+        """Single source of truth: does this mode disable the top_k filter?"""
+        return self in (AdvancedSamplingMode.NO_TOPK,
+                        AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+
+    @property
+    def skips_top_p(self) -> bool:
+        """Single source of truth: does this mode disable the top_p filter?"""
+        return self in (AdvancedSamplingMode.NO_TOPP,
+                        AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+
+
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
         default=None, description="The maximum number of draft tokens.")
@@ -1769,6 +1794,13 @@ class DecodingBaseConfig(StrictBaseModel):
         "in a future release. Non-greedy sampling is now auto-detected per "
         "request; this flag no longer has any effect.")
 
+    advanced_sampling_mode: AdvancedSamplingMode = Field(
+        default=AdvancedSamplingMode.FULL,
+        description=
+        "Deploy-time specialization of the one-model advanced sampler that skips disabled "
+        "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
+        "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -1777,6 +1809,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
     # If set, drafting will use separate KV cache in one-model speculative decoding.
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
+    # If set, the draft model attends directly over the target model KV cache.
+    _use_shared_kv_cache: bool = PrivateAttr(False)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
@@ -3530,19 +3564,83 @@ class KvCacheCompressionConfig(StrictBaseModel):
     as a resource manager in create_py_executor (_util.py), like the KV cache
     manager itself. Concrete algorithms subclass this and add their parameters.
     """
+
+    changes_physical_kv_length: ClassVar[bool] = False
+    """Whether physical and logical KV lengths can diverge."""
+
     algorithm: str = Field(
         description=
         "Name of the KV-cache compression algorithm to run; selects which "
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
 
-    @property
-    def kv_cache_compression_mode(self):
-        # The mode carries algorithm-level traits (``is_*`` predicates) the
-        # raw algorithm string does not.
-        from tensorrt_llm._torch.kv_cache_compression.interface import \
-            KvCacheCompressionMode
-        return KvCacheCompressionMode.from_string(self.algorithm)
+    def supports_block_reuse(self) -> bool:
+        return False
+
+    def supports_speculative_decoding(self) -> bool:
+        return False
+
+
+class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
+    """TriAttention KV-cache compression: periodic decode-time eviction.
+
+    Scored by offline calibration (github.com/WeianMao/triattention; supply
+    the official .pt via ``calibration_path``). Pure compression — decode
+    runs the model's standard attention over the compacted cache.
+    """
+
+    changes_physical_kv_length: ClassVar[bool] = True
+
+    algorithm: Literal["triattention"] = "triattention"
+    eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
+        default="union",
+        description=
+        "Which token set each eviction round keeps. `union` (default) takes "
+        "the union of each KV head's top-B and re-ranks it by the per-token max "
+        "score; it matches the official base setting (per-head and "
+        "per-layer-per-head pruning both off). `per_head` keeps a per-KV-head "
+        "set shared across layers (mean of per-layer max); `per_layer_perhead` "
+        "keeps a fully independent set per (layer, KV head).")
+    normalize_scores: bool = Field(
+        default=True,
+        description="Z-normalize each head's scores over the decode region "
+        "before selection (upstream default). `union` eviction requires True: "
+        "its fused score+stats+union pipeline always normalizes.")
+    budget: int = Field(
+        default=2048,
+        gt=0,
+        description="Tokens kept at each periodic eviction; prompt tokens are "
+        "always preserved on top.")
+    beta: int = Field(
+        default=128,
+        gt=0,
+        description="Eviction period in confirmed generation tokens (upstream "
+        "`divide_length`): one speculative iteration may advance the counter "
+        "by multiple accepted tokens; at most one eviction is coalesced per update."
+    )
+    model_path: str = Field(
+        min_length=1,
+        description="Checkpoint path used to derive RoPE tables when converting "
+        "the official calibration and to classify kernel-masked sliding-attention "
+        "layers.")
+    calibration_path: str = Field(
+        min_length=1,
+        description="Path to the official TriAttention calibration `.pt` "
+        "(produced by github.com/WeianMao/triattention). TRT-LLM does not "
+        "compute calibration; it converts this file to the runtime schema at "
+        "load.")
+
+    def supports_block_reuse(self) -> bool:
+        return True
+
+    def supports_speculative_decoding(self) -> bool:
+        return self.eviction_mode == "union"
+
+
+KvCacheCompressionConfigType: TypeAlias = Annotated[
+    Union[TriAttentionKvCacheCompressionConfig],
+    Field(discriminator="algorithm"),
+]
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
@@ -3581,6 +3679,42 @@ class ReorderRequestPolicyConfig(StrictBaseModel):
     policy_args: AgentTreeConfig = Field(
         default_factory=AgentTreeConfig,
         description="The arguments of the request reordering policy.")
+
+
+_StrictPositiveInt = Annotated[StrictInt, PydanticField(gt=0)]
+_StrictNonNegativeInt = Annotated[StrictInt, PydanticField(ge=0)]
+
+
+class MambaStateConfig(StrictBaseModel):
+    """Configuration for reusable Mamba recurrent-state snapshots."""
+
+    periodic_snapshot_interval: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        telemetry=True,
+        description=
+        "The number of tokens between periodic snapshots in the Mamba "
+        "prefix cache. Periodic snapshots are disabled by default; set this "
+        "to a positive value to enable them.")
+
+    additional_snapshot_offsets_from_start: List[_StrictPositiveInt] = Field(
+        default_factory=list,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Additional Mamba state snapshot offsets measured from the start "
+        "of each prompt. Offsets beyond the prompt length are ignored. "
+        "These snapshots require KV cache manager V2.")
+
+    additional_snapshot_offsets_from_end: List[_StrictNonNegativeInt] = Field(
+        default_factory=list,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Additional Mamba state snapshot offsets measured backward from "
+        "the end of each prompt. An offset of 0 selects the prompt end. "
+        "Offsets that do not resolve inside the prompt are ignored. These "
+        "snapshots require KV cache manager V2.")
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -3716,10 +3850,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                                   description="The number of tokens per block.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    mamba_state_cache_interval: PositiveInt = Field(
-        default=256,
+    mamba_state_cache_interval: Optional[NonNegativeInt] = Field(
+        default=None,
+        status="deprecated",
+        telemetry=False,
+        exclude=True,
         description=
-        "The number of tokens between cache steps in the Mamba prefix cache.")
+        "Deprecated alias for mamba_state_config.periodic_snapshot_interval.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_state_config: MambaStateConfig = Field(
+        default_factory=MambaStateConfig,
+        description="Configuration for reusable Mamba state snapshots.")
 
     use_kv_cache_manager_v2: bool | Literal["auto"] = Field(
         default="auto",
@@ -3777,24 +3919,38 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    fp8_context_mla_kv_len_cap: Optional[int] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Override, in tokens, for the max summed attended-KV length (total_kv_len) per forward step that "
+        "the fp8 context-MLA attention workspace is reserved and scheduled for. Only affects fp8 "
+        "context-MLA models (e.g. DeepSeek / Kimi with an fp8 KV cache). None (default) reserves for the "
+        "never-stall worst case min(max_batch_size, max_num_tokens) * max_seq_len. A smaller value reserves "
+        "less workspace (freeing KV cache) and defers context requests whose summed attended KV would "
+        "exceed it; it is floored at max_seq_len and capped at the worst case. Safe at any value -- the "
+        "scheduler enforces it -- trading prefill batching under heavy reuse for KV cache capacity."
+    )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     pool_ratio: Optional[List[float]] = Field(
         default=None,
         min_length=1,
         status="prototype",
-        description=
-        "Initial pool ratios for KV cache manager v2. When used by DeepSeek-V4, "
-        "values map to KVCacheManagerV2 pool_group_id order and must sum to 1.0. "
-        "When set, DeepSeek-V4 uses this directly and avg_seq_len does not take effect."
-    )
+        description="Initial pool ratios for KV cache manager v2. Values map to "
+        "KVCacheManagerV2 pool_group_id order and must sum to 1.0. Hybrid Mamba "
+        "models and DeepSeek-V4 use this directly, so avg_seq_len does not take "
+        "effect when this is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     avg_seq_len: Optional[PositiveInt] = Field(
         default=None,
         status="prototype",
         description=
-        "Average sequence length used by DeepSeek-V4 to build the KV cache manager v2 "
-        "typical step. If unset, max_seq_len is used. This does not take effect when "
-        "pool_ratio is set.")
+        "Average total sequence length of the serving workload, used to build the "
+        "KV cache manager v2 typical step for hybrid Mamba models and DeepSeek-V4. "
+        "Hybrid Mamba models warn and fall back to half of max_seq_len when this is "
+        "unset. This does not take effect when pool_ratio is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     block_reuse_policy: Literal[
@@ -3805,8 +3961,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             "'all_reusable' commits reusable blocks after every context chunk; "
             "'per_request' commits them only after the final context chunk; "
             "'per_conversation' uses 'per_request' commits and drops the previous "
-            "turn's committed SWA-window blocks after the current turn's final context "
-            "chunk. All reusable blocks remain subject to normal cache eviction. "
+            "turn's committed SWA-window blocks and Mamba stable-boundary state "
+            "after the current turn's final context chunk. Periodic Mamba state "
+            "snapshots are disabled with 'per_conversation'. All reusable blocks "
+            "remain subject to normal cache eviction. "
             "Requests without conversation params use 'per_request' behavior. When "
             "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
             "blocks are committed for reuse.")
@@ -3871,6 +4029,43 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         return v
 
     @model_validator(mode='after')
+    def migrate_legacy_mamba_interval(self) -> 'KvCacheConfig':
+        """Copy the deprecated Mamba interval into its nested replacement."""
+        if self.mamba_state_cache_interval is None:
+            return self
+        if ("periodic_snapshot_interval"
+                in self.mamba_state_config.model_fields_set):
+            raise ValueError("Cannot set both "
+                             "'kv_cache_config.mamba_state_cache_interval' and "
+                             "'kv_cache_config.mamba_state_config."
+                             "periodic_snapshot_interval'.")
+        logger.warning(
+            "'kv_cache_config.mamba_state_cache_interval' is deprecated; use "
+            "'kv_cache_config.mamba_state_config."
+            "periodic_snapshot_interval' instead.")
+        self.mamba_state_config = self.mamba_state_config.model_copy(
+            update={
+                "periodic_snapshot_interval": self.mamba_state_cache_interval
+            })
+        return self
+
+    @model_validator(mode='after')
+    def disable_periodic_mamba_snapshots_for_conversations(
+            self) -> 'KvCacheConfig':
+        """Use only explicit stable boundaries for conversation reuse."""
+        if (self.block_reuse_policy == "per_conversation"
+                and self.mamba_state_config.periodic_snapshot_interval != 0):
+            interval = self.mamba_state_config.periodic_snapshot_interval
+            logger.warning(
+                f"'kv_cache_config.mamba_state_config.periodic_snapshot_interval={interval}' "
+                "is ignored because "
+                "'kv_cache_config.block_reuse_policy=per_conversation' disables "
+                "periodic Mamba snapshots; setting it to 0.")
+            self.mamba_state_config = self.mamba_state_config.model_copy(
+                update={"periodic_snapshot_interval": 0})
+        return self
+
+    @model_validator(mode='after')
     def validate_disk_cache_config(self):
         if self.disk_cache_size is not None and self.disk_cache_size > 0:
             if not self.disk_cache_path:
@@ -3881,6 +4076,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     f"kv_cache_config.disk_cache_path {self.disk_cache_path} does not exist or is not a directory"
                 )
+        return self
+
+    @model_validator(mode='after')
+    def validate_mamba_snapshot_offsets(self) -> 'KvCacheConfig':
+        state_config = self.mamba_state_config
+        has_additional_snapshots = bool(
+            state_config.additional_snapshot_offsets_from_start
+            or state_config.additional_snapshot_offsets_from_end)
+        if (has_additional_snapshots and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.mamba_state_config additional snapshot "
+                "offsets require kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @field_validator('max_attention_window')
@@ -4294,8 +4501,8 @@ class BaseLlmArgs(StrictBaseModel):
         status="prototype")
 
     # KV cache compression config (separate from sparse attention: changes which
-    # KV is stored, not the attention computation)
-    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
+    # KV is stored, not the attention computation).
+    kv_cache_compression_config: Optional[KvCacheCompressionConfigType] = Field(
         default=None,
         description="KV-cache compression config; None disables compression.",
         status="prototype")
@@ -4392,15 +4599,27 @@ class BaseLlmArgs(StrictBaseModel):
         status="deprecated",
         telemetry=TelemetryField.categorical('pytorch', '_autodeploy'))
 
-    return_perf_metrics: bool = Field(default=False,
-                                      description="Return perf metrics.",
-                                      status="prototype")
+    return_perf_metrics: bool = Field(
+        default=False,
+        description=
+        "Allow serving responses to include per-request performance metrics when "
+        "the request sets X-TRTLLM-return-metrics: 1.",
+        status="prototype")
+
+    perf_metrics_output_dir: Optional[str] = Field(
+        default=None,
+        description="Directory for per-process performance metrics JSONL "
+        "files. Setting this enables collection even when "
+        "return_perf_metrics is false.",
+        status="prototype",
+        telemetry=False)
 
     perf_metrics_max_requests: NonNegativeInt = Field(
         default=0,
         description=
-        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
-        status="prototype")
+        "Deprecated compatibility field. Completed per-request metrics are no "
+        "longer retained in memory.",
+        status="deprecated")
 
     prometheus_metrics_config: Optional[PrometheusMetricsConfig] = Field(
         default=None,
@@ -4454,6 +4673,10 @@ class BaseLlmArgs(StrictBaseModel):
     def from_yaml(cls, yaml_path: Union[str, Path]):
         with open(yaml_path, "r") as f:
             config_dict = yaml.safe_load(f)
+        if config_dict is None:
+            config_dict = {}
+        elif not isinstance(config_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
         return cls(**config_dict)
 
     @field_validator("dtype")
@@ -5884,6 +6107,8 @@ def update_llm_args_with_extra_dict(
 
     If `explicit_cli_keys` is None, YAML wins on conflicts.
     """
+    llm_args_dict = dict(llm_args_dict)
+
     # CLI scalar -> nested KvCacheConfig field. Callers add the CLI scalar
     # name to `explicit_cli_keys` to make it win over YAML's same-named
     # field inside `kv_cache_config:`.
@@ -5995,11 +6220,15 @@ def update_llm_args_with_extra_options(
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            llm_args = update_llm_args_with_extra_dict(
-                llm_args,
-                llm_args_dict,
-                extra_llm_api_options,
-                explicit_cli_keys=explicit_cli_keys)
+        if llm_args_dict is None:
+            llm_args_dict = {}
+        elif not isinstance(llm_args_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+        llm_args = update_llm_args_with_extra_dict(
+            llm_args,
+            llm_args_dict,
+            extra_llm_api_options,
+            explicit_cli_keys=explicit_cli_keys)
     return llm_args
 
 

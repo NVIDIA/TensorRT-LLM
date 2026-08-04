@@ -19,7 +19,6 @@ import torch
 
 from .msa_utils import (
     MSA_REQUIRED_TOPK,
-    cache_view_to_msa_paged,
     per_token_valid_blocks,
     require_msa_module,
     select_blocks_from_maxscore,
@@ -122,7 +121,7 @@ class MsaIndexer:
     def select_blocks(
         self,
         idx_q: torch.Tensor,
-        idx_k_cache: torch.Tensor,
+        idx_k_paged: torch.Tensor,
         *,
         idx_sm_scale: float,
         kv_indices: torch.Tensor,
@@ -135,16 +134,13 @@ class MsaIndexer:
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
-        Plan/run split, mirroring the sparse GQA. When `proxy_plan` is None
-        (prefill and focused tests) the proxy plan is built inline and the
-        per-query valid-block count is derived here; when provided (CUDA-graph
-        decode) the proxy runs from the prebuilt plan into the preallocated
-        `max_score` buffer with a precomputed `n_valid_blocks`, so there is
-        no host sync inside the captured region. The same top-k selection serves
-        both, and generation is the one-query-token-per-request special case.
+        Plan/run split, mirroring the sparse GQA. Both production paths pass a
+        prebuilt `proxy_plan` and a precomputed device `n_valid_blocks` (decode
+        from the graph-safe scratch, eager from the step-level device buffer);
+        decode additionally runs into the preallocated `max_score` buffer inside
+        the captured region.
         """
         config = self.config
-        idx_k_paged = cache_view_to_msa_paged(idx_k_cache)
 
         if proxy_plan is None:
             max_score = _proxy_max_score(
@@ -170,6 +166,7 @@ class MsaIndexer:
                 max_score=max_score,
                 sm_scale=idx_sm_scale,
             )
+
         max_score_kv = _group_max_reduce(max_score, config)
 
         if n_valid_blocks is None:
@@ -180,15 +177,6 @@ class MsaIndexer:
                 causal=True,
                 block_size=int(idx_k_paged.shape[2]),
             )
-            # The empty-selection guard uses a host sync, so it only runs on the
-            # eager path; a decode batch always has valid blocks.
-            if n_valid_blocks.numel() == 0 or int(n_valid_blocks.max().item()) <= 0:
-                return torch.full(
-                    (idx_q.shape[0], config.num_kv_heads, MSA_REQUIRED_TOPK),
-                    -1,
-                    dtype=torch.int32,
-                    device=idx_q.device,
-                )
         return select_blocks_from_maxscore(
             max_score_kv,
             topk=MSA_REQUIRED_TOPK,
