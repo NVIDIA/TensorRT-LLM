@@ -78,6 +78,7 @@ void validate_kda_decode_fusion_inputs(at::Tensor x_q, at::Tensor x_k, at::Tenso
     int const B = static_cast<int>(x_q.size(1));
     int const H = static_cast<int>(x_q.size(2));
     int const HV = static_cast<int>(x_v.size(2));
+    TORCH_CHECK(B > 0, "KDA decode requires a non-empty batch");
     bool const supportedHeads = H == 1 || H == 2 || H == 3 || H == 4 || H == 6 || H == 8 || H == 12 || H == 16
         || H == 24 || H == 32 || H == 48 || H == 96;
     TORCH_CHECK(
