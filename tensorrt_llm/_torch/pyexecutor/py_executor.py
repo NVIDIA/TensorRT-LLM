@@ -5671,6 +5671,8 @@ class PyExecutor:
             future = executor.submit(self._run_encoder_step_unchecked,
                                      encoder_requests)
             result = future.result()
+            if self.dist.tp_size > 1:
+                result.ready_event.synchronize()
             self._publish_encoder_step(encoder_requests, result)
         except Exception as e:
             self._finish_failed_encoder_step(encoder_requests, e)

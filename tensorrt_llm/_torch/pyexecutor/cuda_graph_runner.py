@@ -554,7 +554,9 @@ class CUDAGraphRunner:
     def _get_num_tokens_for_key(self, key: KeyType) -> int:
         batch_size = key[0]
         token_per_generation = key[1] + 1
-        context_query_lens = key[5]
+        # Direct capture callers predating mixed encoder-decoder graphs pass
+        # only the generation-key prefix. A missing suffix means gen-only.
+        context_query_lens = key[5] if len(key) > 5 else ()
         num_contexts = len(context_query_lens)
         return (sum(context_query_lens) +
                 (batch_size * self.max_beam_width - num_contexts) *
@@ -591,7 +593,7 @@ class CUDAGraphRunner:
 
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
-        encoder_input_lens = key[6]
+        encoder_input_lens = key[6] if len(key) > 6 else ()
         num_encoder_tokens = sum(encoder_input_lens)
         if num_encoder_tokens:
             encoder_hidden_states = initial_inputs.get("encoder_hidden_states")
@@ -695,7 +697,8 @@ class CUDAGraphRunner:
         else:
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
-        num_encoder_tokens = sum(key[6])
+        encoder_input_lens = key[6] if len(key) > 6 else ()
+        num_encoder_tokens = sum(encoder_input_lens)
         if num_encoder_tokens:
             encoder_hidden_states = current_inputs.get("encoder_hidden_states")
             if encoder_hidden_states is None:

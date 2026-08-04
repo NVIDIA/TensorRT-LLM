@@ -769,7 +769,7 @@ def test_greedy_no_repeat_ngram_uses_token_ban_path():
         seq_slot=0,
         is_streaming=False,
     )
-    request.py_no_repeat_ngram_size = 2
+    setattr(request, "py_no_repeat_ngram_size", 2)
     scheduled_requests = ScheduledRequests()
     scheduled_requests.generation_requests = [request]
     logits = torch.tensor([[0.0, 0.0, 10.0, 9.0]], device="cuda")
