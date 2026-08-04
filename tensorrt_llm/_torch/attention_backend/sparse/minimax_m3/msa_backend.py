@@ -25,6 +25,7 @@ not reach this module.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -88,8 +89,53 @@ def _worst_case_proxy_max_k_tiles(
     return int(proxy_plan[3]["max_k_tiles"])
 
 
+# Number of KV pieces the decode indexer-proxy plan asks fmha_sm100 to cut each
+# work item into. Rationale and safety argument:
+#
+# The proxy is MQA over the index-K cache with qo_len 1 per row, and
+# _compute_pack_factor (fmha_sm100/api.py:110-120) folds all num_index_heads
+# into one packed head, so the planner emits exactly `batch` work items
+# (plan.cuh:270-276 with num_heads=1, one qo tile). A persistent grid of
+# num_ctas CTAs therefore leaves all but `batch` CTAs idle while each busy CTA
+# walks ceil(kv_len / 256) KV tiles serially. Splitting the KV axis multiplies
+# the work-item count by up to this factor (plan.cuh:279-283), which is the only
+# lever that raises SM occupancy for this pass.
+#
+# The split is numerically inert for max_score because the proxy runs
+# sparse_mode=OnlyScore (out=None) and each per-k-tile max is written by exactly
+# one split: the softmax warp seeds k_tile_idx from its own `effective_end`
+# (mainloop:1322) and walks its own [kv_tile_begin, effective_end) range, and the
+# stored value is a per-tile reduction seeded at -INFINITY (mainloop:921-926),
+# never a running cross-tile max. The split-KV combine that would need a
+# reduction is O/LSE only, and api.py:919 skips it when out is None.
+#
+# The planner clamps to min(num_kv_splits, total_kv_iters // MIN_ITERS_PER_SPLIT)
+# (plan.cuh:279-280, MIN_ITERS_PER_SPLIT=4), so short contexts silently get fewer
+# pieces and this is an upper bound, not a demand. 8 is where the standalone A/B
+# stops improving at the ~8700-token decode lengths this model serves (34 tiles):
+# measured 32.16 -> 21.92 -> 16.80 -> 15.74 us at 1/2/4/8 pieces, flat at 16 and
+# 32, with busy CTAs rising 16 -> 128 of 152 and max_score bitwise-identical to
+# the unsplit plan at every setting.
+_MSA_PROXY_DECODE_KV_SPLITS = 4
+# Escape hatch for A/B measurement and for bisecting a suspected split-KV
+# regression: 1 restores the previous single-piece plan exactly.
+_MSA_PROXY_KV_SPLITS_ENV = "TRTLLM_MINIMAX_M3_MSA_PROXY_KV_SPLITS"
+
+
+def _msa_proxy_decode_kv_splits() -> int:
+    """``num_kv_splits`` for the decode indexer-proxy plan (1 disables splitting)."""
+    raw = os.environ.get(_MSA_PROXY_KV_SPLITS_ENV, "")
+    if raw:
+        value = int(raw)
+        if value < 1:
+            raise ValueError(
+                f"{_MSA_PROXY_KV_SPLITS_ENV} must be >= 1 (1 disables split-KV); got {value}."
+            )
+        return value
+    return _MSA_PROXY_DECODE_KV_SPLITS
+
+
 # Per-step fmha_sm100 plan tensors that must live in CUDA-graph-stable buffers.
-# At num_kv_splits=1 the plan carries no split-KV workspaces, and
 # cute_workspace_buffer is the vendor's cached scratch (kept by reference, not
 # copied).
 _MSA_PLAN_STABLE_KEYS = (
@@ -106,9 +152,8 @@ _MSA_PLAN_STABLE_KEYS = (
     "seqused_k",
 )
 _MSA_PLAN_INT64_KEYS = ("packed_work_range", "packed_work_info")
-# fmha_sm100 sizes packed_work_info at 131072 * max(num_kv_splits, 1); forcing
-# num_kv_splits=1 pins this worklist width.
-_MSA_PACKED_WORK_INFO_LEN = 131072
+# fmha_sm100 sizes packed_work_info at 131072 * max(num_kv_splits, 1).
+_MSA_PACKED_WORK_INFO_UNIT = 131072
 _MSA_SPLIT_KV_KEYS = (
     "kv_tile_begin_indices",
     "kv_tile_end_indices",
@@ -117,6 +162,30 @@ _MSA_SPLIT_KV_KEYS = (
     "workspace_o",
     "workspace_lse",
 )
+# Split-KV worklists carry per-split tile bounds, so they need the same
+# graph-stable mirroring as the unsplit worklist. workspace_o/workspace_lse are
+# kernel-written scratch, not data inputs: they are pinned by address like
+# cute_workspace_buffer rather than copied.
+_MSA_SPLIT_KV_INDEX_KEYS = (
+    "kv_tile_begin_indices",
+    "kv_tile_end_indices",
+    "kv_split_indices",
+    "num_kv_splits_per_row",
+)
+# Both split-KV workspaces are reallocated by the planner -- workspace_o through
+# _alloc_workspace_buf, which reallocates whenever the requested size grows, and
+# workspace_lse through _alloc_perplan_buf, which reallocates on every call
+# (api.py:78-101) -- so neither address can be pinned and both are mirrored.
+# They are pure kernel scratch: the kernel writes them and nothing reads them
+# across steps, so only the address must be stable, never the contents.
+_MSA_SPLIT_KV_SCRATCH_KEYS = ()
+_MSA_SPLIT_KV_MIRROR_SCRATCH_KEYS = ("workspace_o", "workspace_lse")
+
+# The planner row-expands the proxy's per-row worklists over query tokens times
+# pack_factor, which is num_index_heads at decode (all index heads fold into one
+# packed qo head), so this bounds the per-row fan-out the graph-stable mirrors
+# must hold. Measured: num_kv_splits_per_row carries 4*batch entries.
+_MSA_PROXY_PLAN_ROW_FANOUT = 4
 # The per-row lengths on_update_kv_lens patches, by plan flavour. Dense plans
 # mask with kv_segment_lens/qo_offset; sparse plans mask with seqused_k and keep
 # kv_segment_lens on the host for the page-table builder, which consumed it at
@@ -143,30 +212,72 @@ class _MsaGraphSafePlan:
     stable buffers, so the captured fmha_sm100 run reads addresses that do not
     change across replays. Mirrors FlashInfer's fixed indptr/indices buffers.
 
-    Only valid at num_kv_splits=1: the plan then has no split-KV workspaces
-    (refresh() asserts this), and cute_workspace_buffer and the scalar fields
-    pass through unchanged.
+    `num_kv_splits` declares the plan's split width. At 1 the plan carries no
+    split-KV worklists (refresh() asserts this). Above 1 the per-split tile
+    bounds are mirrored like any other worklist, while the kernel-written
+    workspaces are pinned by address alongside cute_workspace_buffer.
     """
 
-    def __init__(self, metadata, name: str, *, max_batch: int, num_ctas: int, capture_graph: bool):
+    def __init__(self, metadata, name: str, *, max_batch: int, num_ctas: int,
+                 capture_graph: bool, num_kv_splits: int = 1):
         buffers = metadata.cuda_graph_buffers
         self._buf = {}
         # Set by refresh(), read through the plan property.
         self._plan: Optional[tuple] = None
-        # cute_workspace_buffer must keep a fixed address across steps for the
-        # captured graph to replay correctly. Pin it on first use and fail if
-        # it moves.
-        self._ws_ptr: Optional[int] = None
-        for key in _MSA_PLAN_STABLE_KEYS:
+        self._num_kv_splits = int(num_kv_splits)
+        # Mirror widths may grow while steps are still eager; once graphs hold the
+        # addresses they are frozen. See _lazy_buf.
+        self._captured = bool(capture_graph)
+        # Buffers the kernel writes rather than reads must also keep a fixed
+        # address across replays, but their contents carry no step state, so they
+        # are pinned by pointer instead of copied. cute_workspace_buffer is the
+        # vendor's cached scratch; the split-KV workspaces behave the same way.
+        self._pinned_ptr: dict = {}
+        # The planner row-expands the proxy over query tokens times pack_factor,
+        # so the per-row worklists carry total_qo_len entries rather than one per
+        # request (measured: 4 * batch at the decode geometry). Size by that bound.
+        rows = max_batch * _MSA_PROXY_PLAN_ROW_FANOUT
+        split_keys = (
+            ()
+            if self._num_kv_splits <= 1
+            else (*_MSA_SPLIT_KV_INDEX_KEYS, *_MSA_SPLIT_KV_MIRROR_SCRATCH_KEYS)
+        )
+        for key in (*_MSA_PLAN_STABLE_KEYS, *split_keys):
             if key == "packed_work_range":
                 shape = (num_ctas,)
-            elif key == "packed_work_info":
-                shape = (_MSA_PACKED_WORK_INFO_LEN,)
+            elif key == "packed_work_info" or key in (
+                "kv_tile_begin_indices", "kv_tile_end_indices", "kv_split_indices",
+            ):
+                # fmha_sm100/api.py:704-709 computes one shared
+                #   max_work_items = 131072 * max(num_kv_splits, 1)
+                # and allocates packed_work_info and all three kv_tile_* /
+                # kv_split_indices worklists at exactly that width. refresh()
+                # copies src.shape[0] elements, i.e. the full allocation width
+                # rather than a live prefix, so the mirror matches that width.
+                shape = (_MSA_PACKED_WORK_INFO_UNIT * max(self._num_kv_splits, 1),)
+            elif key == "num_kv_splits_per_row":
+                shape = (rows,)
+            elif key == "workspace_lse":
+                # api.py:715: num_kv_splits * total_qo_len * num_qo_heads, fp32.
+                shape = (rows * max(self._num_kv_splits, 1) * _MSA_PROXY_PLAN_ROW_FANOUT,)
+            elif key == "workspace_o":
+                # api.py:711: total_qo_len * num_kv_splits * num_qo_heads * 128.
+                # `rows` already bounds the packed total_qo_len (max_batch *
+                # pack_factor) and num_qo_heads is 1 at decode. The trailing 128 is
+                # the head dim, which makes this the largest mirror by far, so it
+                # is the term that argues for the smallest num_kv_splits that still
+                # reaches the kernel's saturation point.
+                shape = (rows * max(self._num_kv_splits, 1) * 128,)
             elif key in ("qo_segment_offsets", "kv_segment_offsets", "kv_page_indptr"):
                 shape = (max_batch + 1,)
             else:
                 shape = (max_batch,)
-            dtype = torch.int64 if key in _MSA_PLAN_INT64_KEYS else torch.int32
+            if key in _MSA_PLAN_INT64_KEYS:
+                dtype = torch.int64
+            elif key in _MSA_SPLIT_KV_MIRROR_SCRATCH_KEYS:
+                dtype = torch.float32
+            else:
+                dtype = torch.int32
             self._buf[key] = metadata.get_empty(
                 buffers,
                 shape,
@@ -174,6 +285,35 @@ class _MsaGraphSafePlan:
                 dtype=dtype,
                 capture_graph=capture_graph,
             )
+
+    def _lazy_buf(self, key: str, n: int, dtype) -> torch.Tensor:
+        """The mirror for ``key``, grown to hold ``n`` elements if it is short.
+
+        The widths chosen in __init__ re-derive fmha_sm100's internal allocation
+        formulae, which is necessarily a prediction: they are fixed before any
+        plan exists. A CUDA graph only requires the mirror address to be stable
+        across replays, and before capture there are none, so while steps are
+        still eager the mirror is simply grown to whatever width the plan
+        actually has. That leaves the __init__ widths as pre-allocation hints --
+        the steady state allocates nothing -- without making them load-bearing
+        for correctness on the eager path.
+
+        Growth is allowed only on a non-capturing metadata (`capture_graph=False`).
+        Swapping a buffer that a captured graph has already baked into a kernel
+        launch would make the replay read the old pointer, so on the graph path
+        the widths must be right and a short mirror is a hard error.
+        """
+        dst = self._buf.get(key)
+        if dst is not None and dst.numel() >= n and dst.dtype == dtype:
+            return dst
+        if self._captured:
+            # Cannot reallocate: replays hold this address. Return as-is and let
+            # the caller's bound check raise with the concrete widths.
+            return dst if dst is not None else torch.empty(0, dtype=dtype,
+                                                           device="cuda")
+        grown = torch.zeros(n, dtype=dtype, device="cuda")
+        self._buf[key] = grown
+        return grown
 
     @property
     def plan(self) -> Optional[tuple]:
@@ -191,28 +331,64 @@ class _MsaGraphSafePlan:
                 "MSA decode expects a single (non-mixed) fmha_sm100 plan; a decode "
                 "batch must be pure decode."
             )
-        for key in _MSA_SPLIT_KV_KEYS:
-            if decode.get(key) is not None:
+        if self._num_kv_splits <= 1:
+            for key in _MSA_SPLIT_KV_KEYS:
+                if decode.get(key) is not None:
+                    raise RuntimeError(
+                        f"MSA decode plan used split-KV workspace {key!r}; num_kv_splits=1 "
+                        "is required for graph-safe decode."
+                    )
+        else:
+            # The planner elects a split width from its own cost model, so a plan
+            # built at num_kv_splits > 1 may still come back unsplit. Mirroring
+            # would then read absent worklists, so require the split form.
+            missing = [k for k in _MSA_SPLIT_KV_INDEX_KEYS if decode.get(k) is None]
+            if missing:
                 raise RuntimeError(
-                    f"MSA decode plan used split-KV workspace {key!r}; num_kv_splits=1 "
-                    "is required for graph-safe decode."
+                    f"MSA decode plan built at num_kv_splits={self._num_kv_splits} is "
+                    f"missing split-KV worklist(s) {missing}; the plan shape must not "
+                    "vary across steps under CUDA-graph capture."
                 )
-        ws = decode.get("cute_workspace_buffer")
-        if ws is not None:
-            if self._ws_ptr is None:
-                self._ws_ptr = ws.data_ptr()
-            elif ws.data_ptr() != self._ws_ptr:
+        pinned = ("cute_workspace_buffer",)
+        if self._num_kv_splits > 1:
+            pinned = (*pinned, *_MSA_SPLIT_KV_SCRATCH_KEYS)
+        for key in pinned:
+            buf = decode.get(key)
+            if buf is None:
+                continue
+            prev = self._pinned_ptr.get(key)
+            if prev is None:
+                self._pinned_ptr[key] = buf.data_ptr()
+            elif buf.data_ptr() != prev:
                 raise RuntimeError(
-                    "cute_workspace_buffer moved across steps; the fmha_sm100 plan "
-                    "is not CUDA-graph safe."
+                    f"{key} moved across steps; the fmha_sm100 plan is not "
+                    "CUDA-graph safe."
                 )
         rebuilt = dict(decode)
-        for key in _MSA_PLAN_STABLE_KEYS:
+        if self._num_kv_splits > 1:
+            # Pure kernel scratch: only the address must be stable across
+            # replays, so substitute the fixed buffer instead of copying into it.
+            for key in _MSA_SPLIT_KV_MIRROR_SCRATCH_KEYS:
+                src = decode.get(key)
+                if src is None:
+                    continue
+                n = int(src.numel())
+                dst = self._lazy_buf(key, n, src.dtype)
+                if n > dst.numel():
+                    raise ValueError(
+                        f"MSA plan buffer {key} ({dst.numel()}) is smaller than the "
+                        f"plan tensor ({n})."
+                    )
+                rebuilt[key] = dst[:n]
+        for key in (
+            *_MSA_PLAN_STABLE_KEYS,
+            *(() if self._num_kv_splits <= 1 else _MSA_SPLIT_KV_INDEX_KEYS),
+        ):
             src = decode.get(key)
             if src is None:
                 continue
             n = int(src.shape[0])
-            dst = self._buf[key]
+            dst = self._lazy_buf(key, n, src.dtype)
             if n > dst.shape[0]:
                 raise ValueError(
                     f"MSA plan buffer {key} ({dst.shape[0]}) is smaller than the plan tensor ({n})."
@@ -783,7 +959,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             qo_offset=qo_offset_cpu,
             page_size=page_size,
             output_maxscore=True,
-            num_kv_splits=1,
+            num_kv_splits=_msa_proxy_decode_kv_splits() if is_decode else 1,
             causal=True,
         )
         # Sparse-layer plan: kv_block_num=topk limits attention to top-k blocks.
@@ -856,6 +1032,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 max_batch=max_plan_rows,
                 num_ctas=num_ctas,
                 capture_graph=capture_graph,
+                num_kv_splits=_msa_proxy_decode_kv_splits(),
             )
             self._msa_gqa_plan = _MsaGraphSafePlan(
                 self,
