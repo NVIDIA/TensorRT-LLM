@@ -1869,13 +1869,13 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
     Three invariants are exercised:
 
-    1. `TorchCompileConfig.capture_num_tokens` defaults to a fixed
-       powers-of-2 + 256-stride list when `enable_piecewise_cuda_graph`
-       is True (and stays `None` otherwise). The fixed list keeps the
-       capture set small to bound startup time and CUDA graph memory;
-       the model-engine filter (invariants 2 and 3) clamps out-of-range
-       entries to the reachable ceiling and never invents sizes beyond
-       this list.
+    1. `TorchLlmArgs.prefill_capture_num_tokens` defaults to a fixed
+       powers-of-2 + 256-stride list when a prefill CUDA graph backend is
+       enabled. The deprecated `TorchCompileConfig.capture_num_tokens` stays
+       `None` unless explicitly set. The fixed list keeps the capture set small
+       to bound startup time and CUDA graph memory; the model-engine filter
+       (invariants 2 and 3) clamps out-of-range entries to the reachable ceiling
+       and never invents sizes beyond this list.
     2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
        `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
        the largest forward-pass `num_tokens` the warmup builder can
@@ -1920,6 +1920,14 @@ class TestPiecewiseCudaGraphCaptureDefaults:
                                 capture_num_tokens=[128, 256]))
         assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
         assert args.prefill_capture_num_tokens == [256, 128]
+
+    def test_explicit_new_buckets_with_legacy_piecewise_enable(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            prefill_capture_num_tokens=[128, 256],
+                            torch_compile_config=TorchCompileConfig(
+                                enable_piecewise_cuda_graph=True))
+        assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
+        assert args.prefill_capture_num_tokens == [128, 256]
 
     def test_explicit_legacy_and_new_config_conflicts(self):
         with pytest.raises(ValueError, match="conflicts"):
@@ -2000,18 +2008,10 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert engine._get_padding_params(
             1, 0, all_rank_num_tokens) == (1, False, all_rank_num_tokens)
 
-    def test_torch_compile_config_capture_num_tokens_default_when_piecewise_enabled(
+    def test_torch_compile_config_does_not_populate_legacy_capture_buckets(
             self):
-        """Default capture set is the powers-of-2 + 256-stride list.
-
-        Keeps the capture set bounded (~20 entries) so server startup
-        time and CUDA graph memory stay predictable. The model engine
-        further filters and appends the reachable ceiling, so
-        out-of-range entries (e.g. > max_seq_len-1) are never recorded
-        and gap ISLs still get a graph.
-        """
         config = TorchCompileConfig(enable_piecewise_cuda_graph=True)
-        assert config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+        assert config.capture_num_tokens is None
 
     def test_torch_compile_config_capture_num_tokens_stays_none_when_piecewise_disabled(
             self):
@@ -2032,12 +2032,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         # `validate_capture_num_tokens` dedupes and reverse-sorts.
         assert config.capture_num_tokens == sorted(set(user_list), reverse=True)
 
-    def test_torch_llm_args_capture_num_tokens_default_when_piecewise_enabled(
+    def test_torch_llm_args_prefill_buckets_default_when_piecewise_enabled(
             self):
-        """Same default applies when reached through `TorchLlmArgs` construction.
-
-        This is the path real users hit via `trtllm-serve` YAML.
-        """
         args = TorchLlmArgs(
             model=llama_model_path,
             max_batch_size=1,
@@ -2049,7 +2045,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             torch_compile_config=TorchCompileConfig(
                 enable_piecewise_cuda_graph=True),
         )
-        assert args.torch_compile_config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+        assert args.prefill_capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+        assert args.torch_compile_config.capture_num_tokens is None
 
     def test_piecewise_filter_never_invents_far_ceiling(self):
         """A ceiling far above the largest candidate is NOT added.
