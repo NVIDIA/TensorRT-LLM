@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from qualname_map import qualnames_for_lines
+from rules._helpers import iter_diff_post_line_numbers
 from touch_db import (
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
@@ -30,8 +31,6 @@ from touch_db import (
     split_stage,
     stage_family,
 )
-
-from rules._helpers import iter_diff_post_line_numbers
 
 
 @dataclass

@@ -58,7 +58,6 @@ from coverage_tier import (  # noqa: E402
     open_db,
     write_coverage_test_db,
 )
-
 from rules._helpers import strip_noop_diff_lines  # noqa: E402
 from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
