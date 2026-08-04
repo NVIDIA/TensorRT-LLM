@@ -282,6 +282,8 @@ public:
         int numTokens;
         // Total query length passed to match() (== len(tokens)).
         int numLookupTokens;
+        // Longest attention prefix after attention-page checks and before SSM snapshot pruning.
+        int numTokensBeforeSsmPruning;
     };
 
     ReuseMatch match(
@@ -321,9 +323,15 @@ public:
     }
 
 private:
+    struct PrunedMatch
+    {
+        std::vector<MatchResult> matches;
+        int numTokensBeforeSsmPruning;
+    };
+
     std::vector<MatchResult> matchTokenPath(
         ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const;
-    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched) const;
+    PrunedMatch pruneMatch(std::vector<MatchResult> matched) const;
 
     // Erase any pending empty root blocks from mRoots.
     // Const-qualified: deferred cleanup is not a logical mutation.

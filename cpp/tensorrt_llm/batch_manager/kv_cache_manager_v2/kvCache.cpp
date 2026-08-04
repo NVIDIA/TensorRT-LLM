@@ -70,6 +70,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     , mHistoryLength(0)
     , mExpectedPromptLength(
           expectedPromptLength.has_value() ? std::optional<int>{std::max(*expectedPromptLength, 0)} : std::nullopt)
+    , mNumTokensBeforeSsmPruning(reuseMatch.has_value() ? reuseMatch->numTokensBeforeSsmPruning : 0)
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())
 {
@@ -615,8 +616,7 @@ void KvCache::_refreshStatsDirtyState()
 
 void KvCache::_recordDirectIterationStats(LifeCycleId lifeCycle, KVCacheIterationStatsDelta const& iterationStats)
 {
-    if (!_shouldRecordStats() || iterationStats.empty()
-        || !std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle)))
+    if (!_shouldRecordStats() || iterationStats.empty())
     {
         return;
     }
@@ -636,10 +636,7 @@ void KvCache::_recordMigratedSlots(
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
-        if (!std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle)))
-        {
-            continue;
-        }
+        bool const isAttention = std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle));
 
         PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
         int64_t pageSize = 0;
@@ -657,8 +654,13 @@ void KvCache::_recordMigratedSlots(
         }
         else if (dstLevel == kGpuLevel)
         {
-            stats.allocTotalBlocks = 1;
-            stats.allocNewBlocks = 1;
+            // Global cache-hit accounting is attention-only. SSM movement is
+            // reported by lifecycle/pool-group iteration statistics instead.
+            if (isAttention)
+            {
+                stats.allocTotalBlocks = 1;
+                stats.allocNewBlocks = 1;
+            }
             iterationStats.iterAllocTotalBlocks = 1;
             iterationStats.iterAllocNewBlocks = 1;
             if (srcLevel > kGpuLevel)
@@ -692,10 +694,6 @@ void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, Cac
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
-        if (!std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle)))
-        {
-            continue;
-        }
         PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
         int64_t pageSize = 0;
         for (size_t const size : mManager->storage().slotSize(poolGroup))

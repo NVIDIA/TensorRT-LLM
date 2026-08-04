@@ -724,7 +724,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     return results;
 }
 
-std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<MatchResult> matched) const
+BlockRadixTree::PrunedMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> matched) const
 {
     // All blocks except the last must be fully matched (mirrors Python: matched[:-1]).
     TLLM_CHECK_DEBUG(matched.size() <= 1
@@ -774,6 +774,8 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
             matched.resize(static_cast<size_t>(n));
         }
     }
+
+    int const numTokensBeforeSsmPruning = numMatchedTokens(matched, mTokensPerBlock);
 
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
     while (!matched.empty())
@@ -844,16 +846,18 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
         }
     }
 
-    return matched;
+    return {std::move(matched), numTokensBeforeSsmPruning};
 }
 
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
     ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
 {
-    auto const matched = pruneMatch(matchTokenPath(reuseScope, tokens, enablePartialMatch));
+    auto const prunedMatch = pruneMatch(matchTokenPath(reuseScope, tokens, enablePartialMatch));
+    auto const& matched = prunedMatch.matches;
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
+    result.numTokensBeforeSsmPruning = prunedMatch.numTokensBeforeSsmPruning;
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

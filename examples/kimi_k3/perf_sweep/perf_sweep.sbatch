@@ -184,6 +184,9 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
         mkdir -p \"\$FLASHINFER_WORKSPACE_BASE\" \"\$FLASHINFER_CUBIN_DIR\" \"\$HF_HOME\"
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
         export PYTHONPATH=\"$REPO\${PYTHONPATH:+:\$PYTHONPATH}\"
+        # Non-leader MPI workers inherit their TRT-LLM log level from the
+        # environment rather than the trtllm-serve CLI.
+        export TLLM_LOG_LEVEL=\${TLLM_LOG_LEVEL:-info}
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' trtllm-serve \
             \"$MODEL\" \
             --backend pytorch --host 0.0.0.0 --port $PORT \

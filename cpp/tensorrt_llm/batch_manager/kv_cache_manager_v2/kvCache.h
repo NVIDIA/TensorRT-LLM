@@ -321,6 +321,11 @@ public:
         return static_cast<int>(mCommittedTokens.size());
     }
 
+    int numTokensBeforeSsmPruning() const noexcept
+    {
+        return mNumTokensBeforeSsmPruning;
+    }
+
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
@@ -609,6 +614,7 @@ private:
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
     std::vector<TokenIdExt> mCommittedTokens;
+    int mNumTokensBeforeSsmPruning;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;
     int mTokensPerBlock;

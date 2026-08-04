@@ -156,29 +156,6 @@ def get_kv_cache_manager_cls(
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
 
-        # Kimi K3 (KDA + MLA hybrid): block reuse uses the unified C++ pool
-        # (CppMambaHybridCacheManager) like the other hybrid linear models —
-        # per-block KDA state snapshots every mamba_state_cache_interval
-        # tokens with FORCE_CHUNK context chunking. Without block reuse the
-        # Mixed manager (separate KV / recurrent-state pools) stays the
-        # default. SA speculative decoding is validated on the Mixed
-        # manager's SpeculativeState scratch path only; reuse + SA is
-        # unvalidated.
-        if is_kimi_linear(config):
-            if use_v2:
-                raise ValueError(
-                    "Kimi K3 (KDA) is not supported on "
-                    "MambaHybridCacheManagerV2 yet (TRTLLM-14769); unset "
-                    "use_kv_cache_manager_v2.")
-            if kv_cache_config.enable_block_reuse:
-                logger.info(
-                    "Using CppMambaHybridCacheManager for Kimi K3 hybrid "
-                    "model (block reuse enabled)")
-                return CppMambaHybridCacheManager
-            logger.info(
-                "Using MixedMambaHybridCacheManager for Kimi K3 hybrid model")
-            return MixedMambaHybridCacheManager
-
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
         if is_disagg:
@@ -486,6 +463,10 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._fallback_if_unsupported_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
+        if is_hybrid_linear(model_config.pretrained_config):
+            logger.info_once(
+                f"Selected hybrid KV cache manager: {cls.__name__}",
+                key=f"hybrid_kv_cache_manager_{cls.__name__}")
         # Compatibility managers do not support MTP block reuse. Warn at the
         # routing site so users see the concrete manager selected for the
         # incompatible combination.
@@ -2053,7 +2034,11 @@ def _create_kv_cache_manager(
         # kernel replays accepted drafts from these caches and commits
         # states in place, replacing the intermediate-buffer + promotion
         # flow for KDA layers.
-        kimi_extra_kwargs = {}
+        kimi_extra_kwargs = dict(manager_extra_kwargs)
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            kimi_extra_kwargs["conv_state_layout"] = "q_k_v"
+        else:
+            kimi_extra_kwargs["model_type"] = "qwen3_next"
         if spec_config is not None and issubclass(kv_cache_manager_cls,
                                                   MixedMambaHybridCacheManager):
             from ..modules.kimi_kda._kda_kernels import \
@@ -2088,11 +2073,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            # Reuse the qwen3_next [Q | K | V] conv-state section layout;
-            # all three KDA sections have identical width.
-            model_type="qwen3_next",
             **kimi_extra_kwargs,
-            **manager_extra_kwargs,
         )
     elif is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
