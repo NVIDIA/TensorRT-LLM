@@ -31,6 +31,7 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/contextTransferCoordinator.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -43,6 +44,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +56,7 @@
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include <gmock/gmock.h>
@@ -89,6 +92,95 @@ T serializeDeserialize(T const& val)
 }
 
 } // namespace
+
+TEST(ContextTransferCoordinatorTest, CommitsStaggeredSuccessAndFailureWithoutCollectivePolling)
+{
+    auto& world = tensorrt_llm::mpi::MpiComm::world();
+    if (world.getSize() < 2)
+    {
+        GTEST_SKIP() << "mpirun with at least two processes is required to run this test.";
+    }
+
+    auto comm = std::make_shared<CacheTransceiverComm>(std::addressof(world));
+    {
+        ContextTransferCoordinator coordinator(comm);
+        auto waitForOutcome = [&](std::uint64_t const requestId, bool const expectFailure)
+        {
+            bool observed = false;
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!observed && std::chrono::steady_clock::now() < deadline)
+            {
+                auto result = coordinator.poll();
+                observed = expectFailure ? result.failedRequestIds.count(requestId) != 0
+                                         : result.completedRequestIds.count(requestId) != 0;
+                if (!observed)
+                {
+                    std::this_thread::yield();
+                }
+            }
+            EXPECT_TRUE(observed);
+        };
+        auto waitForTimeout = [&](std::uint64_t const requestId)
+        {
+            bool observed = false;
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!observed && std::chrono::steady_clock::now() < deadline)
+            {
+                auto const result = coordinator.poll();
+                observed = result.timedOutRequestIds.count(requestId) != 0;
+                if (!observed)
+                {
+                    std::this_thread::yield();
+                }
+            }
+            EXPECT_TRUE(observed);
+        };
+
+        constexpr std::uint64_t kCompletedRequestId = 644815201;
+        world.barrier();
+        if (world.getRank() == world.getSize() - 1)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        coordinator.publishLocalOutcome(kCompletedRequestId, /*failed=*/false);
+        if (world.getRank() != world.getSize() - 1)
+        {
+            auto const earlyResult = coordinator.poll();
+            EXPECT_TRUE(earlyResult.completedRequestIds.empty());
+            EXPECT_TRUE(earlyResult.failedRequestIds.empty());
+        }
+        waitForOutcome(kCompletedRequestId, /*expectFailure=*/false);
+
+        constexpr std::uint64_t kFailedRequestId = 644815202;
+        world.barrier();
+        coordinator.publishLocalOutcome(kFailedRequestId, /*failed=*/world.getRank() == 0);
+        waitForOutcome(kFailedRequestId, /*expectFailure=*/true);
+
+        constexpr std::uint64_t kTimedOutRequestId = 644815203;
+        world.barrier();
+        if (world.getRank() == 0)
+        {
+            coordinator.publishTimeout(kTimedOutRequestId);
+            coordinator.publishTimeout(kTimedOutRequestId);
+        }
+        waitForTimeout(kTimedOutRequestId);
+        coordinator.publishLocalOutcome(kTimedOutRequestId, /*failed=*/false);
+        waitForOutcome(kTimedOutRequestId, /*expectFailure=*/true);
+
+        constexpr std::uint64_t kInvalidOrderingRequestId = 644815204;
+        world.barrier();
+        coordinator.publishLocalOutcome(kInvalidOrderingRequestId, /*failed=*/false);
+        EXPECT_ANY_THROW(coordinator.publishTimeout(kInvalidOrderingRequestId));
+        waitForOutcome(kInvalidOrderingRequestId, /*expectFailure=*/false);
+
+        // Exercise asymmetric but orderly teardown after every decision has committed.
+        if (world.getRank() == 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    world.barrier();
+}
 
 class RequestInfoTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -194,7 +286,7 @@ protected:
         return mWorldSize;
     }
 
-    void setUpCacheManager()
+    void setUpCacheManager(bool enableBlockReuse = false)
     {
         auto constexpr numLayers = 4;
         auto constexpr numHeads = 2;
@@ -216,7 +308,6 @@ protected:
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
         auto constexpr blocksInSecondaryPool = 0;
 
-        auto constexpr enableBlockReuse = false;
         auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -330,6 +421,21 @@ protected:
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
 
+    // Generation-only request whose DataTransceiverState carries the arbitrary-transfer
+    // provenance marker, as getSerializedDataTransceiverState would produce.
+    auto makeArbitraryLlmRequest(SizeType32 length, LlmRequest::RequestIdType arbitraryId)
+    {
+        constexpr SizeType32 maxNewTokens{1};
+        texec::Request request{VecTokens(length, length), maxNewTokens};
+        auto state = std::make_unique<texec::DataTransceiverState>();
+        state->setCommState(*mContextCommState);
+        state->setCacheState(*mCacheState);
+        state->setIsArbitraryTransferState(true);
+        auto stats = texec::ContextPhaseParams({}, arbitraryId, state.release(), std::nullopt);
+        request.setContextPhaseParams(std::move(stats));
+        return std::make_unique<LlmRequest>(arbitraryId, std::move(request));
+    }
+
     void addRequestAndTransportCache(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         auto constexpr beamIdx{0};
@@ -425,6 +531,79 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     {
         future.get();
     }
+}
+
+TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
+{
+    auto worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager(/*enableBlockReuse=*/true);
+    setUpCacheTransceiver();
+
+    // 3 full blocks (tokensPerBlock = 8) so every requested chunk fully matches a stored block.
+    constexpr SizeType32 promptLen = 24;
+    constexpr SizeType32 missPromptLen = 40;
+    constexpr LlmRequest::RequestIdType arbitraryId = 4242;
+    auto constexpr beamIdx{0};
+    auto constexpr beamWidth{1};
+
+    if (isSender)
+    {
+        // Store a patterned request in the reuse tree; no LlmRequest exists on the
+        // sender for the transfers below.
+        auto request = makeLlmRequest(promptLen);
+        mManager->addSequenceBatch(
+            {{{request->mRequestId, request->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*request)});
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, request->mRequestId);
+        for (auto const& windowSize : blockRange.getWindowSizes())
+        {
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
+            {
+                TLLM_CUDA_CHECK(cudaMemset(it->data(), request->getPromptLen(), it->getSizeInBytes()));
+            }
+        }
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+        // A completed context request carries one generated token beyond the prompt;
+        // without it, storeBlocksForReuse drops the trailing prompt token and the
+        // final block never enters the reuse tree.
+        request->addNewToken(0, beamIdx);
+        mManager->removeSequence(request->mRequestId, request);
+    }
+    else
+    {
+        // Hit: the requested tokens are stored in the sender's reuse tree.
+        std::shared_ptr<LlmRequest> request = makeArbitraryLlmRequest(promptLen, arbitraryId);
+        mManager->addSequenceBatch(
+            {{{request->mRequestId, request->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*request)});
+        auto future = mRequester->receiveAsync(request);
+        future.get();
+        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, request->mRequestId);
+        for (auto const& windowSize : blockRange.getWindowSizes())
+        {
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
+            {
+                std::vector<uint8_t> bytes(it->getSizeInBytes());
+                TLLM_CUDA_CHECK(cudaMemcpy(bytes.data(), it->data(), it->getSizeInBytes(), cudaMemcpyDeviceToHost));
+                EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](uint8_t i) { return i == (promptLen & 0xff); }));
+            }
+        }
+
+        // Miss: tokens never stored on the sender are rejected; the rejection
+        // surfaces as an exception on the receive future.
+        std::shared_ptr<LlmRequest> missRequest = makeArbitraryLlmRequest(missPromptLen, arbitraryId + 1);
+        mManager->addSequenceBatch(
+            {{{missRequest->mRequestId, missRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*missRequest)});
+        auto missFuture = mRequester->receiveAsync(missRequest);
+        EXPECT_THROW(missFuture.get(), tensorrt_llm::common::TllmException);
+    }
+    // The sender must not tear down while the receiver's transfers are in flight.
+    tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
 #if ENABLE_MULTI_DEVICE
@@ -791,15 +970,18 @@ protected:
                 = [this, bufferManagers]() { return createCacheFormatter(mManager.get(), bufferManagers, mIsMLA); };
             TLLM_LOG_DEBUG("setUpCacheTransceiver makeFormatter");
 
+            // Generate a per-instance ID so each ctx/gen instance writes to
+            // its own CSV files (mirrors CacheTransceiver behaviour).
+            auto instanceId = "test_" + std::to_string(tensorrt_llm::mpi::MpiComm::world().getRank());
             if (mIsContext)
             {
-                mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
+                mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mRankInInstance,
+                    CacheTransferLayer(*mCacheState, makeFormatter()), instanceId);
             }
             else
             {
-                mRequester = std::make_unique<CacheReceiver>(
-                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
+                mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), mRankInInstance,
+                    CacheTransferLayer(*mCacheState, makeFormatter()), instanceId);
             }
             TLLM_LOG_DEBUG("setUpCacheTransceiver mSender");
 

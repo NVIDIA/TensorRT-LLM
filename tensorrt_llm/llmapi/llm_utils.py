@@ -558,9 +558,18 @@ def apply_model_defaults_to_llm_args(
 
 
 def _resolve_kv_cache_manager_v2_auto(
-        llm_args: 'TorchLlmArgs', model_defaults_dict: Dict[str, Any]) -> bool:
-    """Resolve the KV cache manager auto setting after model defaults are applied."""
-    setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
+        llm_args: 'TorchLlmArgs',
+        model_defaults_dict: Dict[str, Any],
+        original_setting: Optional[Union[bool, str]] = None) -> bool:
+    """Resolve the KV cache manager auto setting after model defaults are applied.
+
+    The transceiver runtime auto setting must be resolved first. In
+    disaggregated serving, hybrid Mamba V2 requires the Python transceiver with
+    NIXL, so an incompatible route falls back to V1 unless the user explicitly
+    selected V2.
+    """
+    setting = (llm_args.kv_cache_config.use_kv_cache_manager_v2
+               if original_setting is None else original_setting)
     if setting != "auto":
         return setting
 
@@ -573,6 +582,18 @@ def _resolve_kv_cache_manager_v2_auto(
         raise ValueError(
             "Model default kv_cache_config.use_kv_cache_manager_v2 must be "
             f"True, False, or 'auto', got {model_default!r}.")
+
+    transceiver_config = llm_args.cache_transceiver_config
+    if (model_default and transceiver_config is not None
+            and transceiver_config.backend is not None):
+        effective_backend, _ = transceiver_config._resolve_default_backend()
+        runtime = transceiver_config.transceiver_runtime
+        if effective_backend != "NIXL" or runtime != "PYTHON":
+            logger.info(
+                "KV cache manager V2 is the model default, but disaggregated "
+                "serving uses transceiver_runtime=%r with backend=%r; "
+                "falling back to V1.", runtime, effective_backend)
+            model_default = False
 
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = model_default
     return model_default

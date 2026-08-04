@@ -2041,7 +2041,9 @@ def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
 def silu_and_mul(x: torch.Tensor,
                  scale: Optional[torch.Tensor] = None,
                  dtype: Optional[torch.dtype] = None,
-                 swiglu_limit: Optional[float] = None) -> torch.Tensor:
+                 swiglu_limit: Optional[float] = None,
+                 swiglu_alpha: Optional[float] = None,
+                 swiglu_beta: Optional[float] = None) -> torch.Tensor:
     b, n = x.shape
 
     assert n % 2 == 0
@@ -2061,6 +2063,8 @@ def silu_and_mul(x: torch.Tensor,
         x_stride=x.stride(0),
         d=d,
         swiglu_limit=swiglu_limit or 0.0,
+        swiglu_alpha=swiglu_alpha if swiglu_alpha is not None else 1.0,
+        swiglu_beta=swiglu_beta if swiglu_beta is not None else 0.0,
         BLOCK_SIZE=1024,
         HAS_O_SCALE=scale is not None,
         HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
@@ -2075,6 +2079,8 @@ def _(
     scale: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = None,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
 ) -> torch.Tensor:
     b, n = x.shape
 

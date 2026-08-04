@@ -212,7 +212,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
     def nodeLabelPrefix = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -325,10 +325,10 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
     if (env.gitlabMergeRequestLastCommit) {
         env.gitlabCommit = env.gitlabMergeRequestLastCommit
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
     } else {
         branch = env.gitlabBranch ? env.gitlabBranch : "main"
-        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, false, true)
+        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
         checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
         env.gitlabCommit = checkoutCommit
     }
@@ -339,6 +339,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
     testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
     // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+    // Coverage runs only on the official post-merge pipeline.
     testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     getContainerURIs().each { k, v ->
@@ -451,7 +452,7 @@ def launchReleaseCheck(pipeline, globalVars)
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
         // Step 1: Clone TRT-LLM source codes
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
 
         // Step 2: Run guardwords scan
@@ -1213,7 +1214,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
             echo "Result File Number: ${resultFileNumber}, Downloaded: ${resultFileDownloadedNumber}"
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
 

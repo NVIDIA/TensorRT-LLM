@@ -15,7 +15,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -33,6 +33,27 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+# Some Cosmos3OmniTransformer checkpoint configs omit these fields; the values
+# match what other conversions carry explicitly.
+PRETRAINED_CONFIG_COMPAT_DEFAULTS = {
+    "position_embedding_type": "unified_3d_mrope",
+    "max_position_embeddings": 262144,
+    "temporal_compression_factor_sound": 1,
+}
+
+
+_PretrainedConfigT = TypeVar("_PretrainedConfigT")
+
+
+def apply_pretrained_config_compat_defaults(
+    pretrained_config: _PretrainedConfigT,
+) -> _PretrainedConfigT:
+    """Fill missing schema fields in place (idempotent); returns the config."""
+    for key, value in PRETRAINED_CONFIG_COMPAT_DEFAULTS.items():
+        if getattr(pretrained_config, key, None) is None:
+            setattr(pretrained_config, key, value)
+    return pretrained_config
 
 
 class Qwen3VLTextRMSNorm(nn.Module):
@@ -702,7 +723,7 @@ class Cosmos3LanguageModel(nn.Module):
 class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__(model_config)
-        pretrained_config = model_config.pretrained_config
+        pretrained_config = apply_pretrained_config_compat_defaults(model_config.pretrained_config)
         self.audio_gen = getattr(pretrained_config, "sound_gen", False)
         self.action_gen = getattr(pretrained_config, "action_gen", False)
 

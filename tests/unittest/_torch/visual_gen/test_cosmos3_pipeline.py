@@ -28,25 +28,35 @@ import gc
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
-os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
 import PIL.Image
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_T2I_PARAMS
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
+    COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
+    COSMOS3_EXTRA_SPECS,
+    COSMOS3_T2I_PARAMS,
+    _normalize_condition_video_keep,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+    COSMOS3_DEFAULT_SYSTEM_PROMPT,
     COSMOS3_DURATION_TEMPLATE,
     COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     Cosmos3OmniMoTPipeline,
+    _condition_pixel_frame_count,
+    _load_reference_image,
+    _normalize_condition_video_latent_indexes,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
-pytestmark = pytest.mark.cosmos3
+pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -215,6 +225,36 @@ def _require_audio_pipeline(pipeline) -> None:
         pytest.skip("Audio tokenizer was not loaded for this pipeline")
 
 
+def _scheduler_use_karras_sigmas(scheduler) -> bool | None:
+    value = getattr(scheduler.config, "use_karras_sigmas", None)
+    return None if value is None else bool(value)
+
+
+def _base_use_karras_sigmas(pipeline) -> bool:
+    """Karras setting the checkpoint shipped with — what ``None`` restores."""
+    return bool(getattr(pipeline.sampling.unipc_base_config, "use_karras_sigmas", False))
+
+
+def _assert_scheduler_config(
+    pipeline,
+    *,
+    flow_shift: float,
+    use_karras_sigmas: bool | None,
+):
+    assert float(getattr(pipeline.scheduler.config, "flow_shift")) == pytest.approx(
+        float(flow_shift)
+    )
+    assert _scheduler_use_karras_sigmas(pipeline.scheduler) == use_karras_sigmas
+
+
+def _assert_default_video_scheduler_config(pipeline):
+    _assert_scheduler_config(
+        pipeline,
+        flow_shift=pipeline.sampling.checkpoint_flow_shift,
+        use_karras_sigmas=_base_use_karras_sigmas(pipeline),
+    )
+
+
 def _make_test_image() -> PIL.Image.Image:
     image_path = os.environ.get("COSMOS3_TEST_IMAGE")
     if image_path and os.path.exists(image_path):
@@ -296,6 +336,68 @@ class TestFormatPromptWithMetadataPlainText:
         result = _format_prompt_with_metadata(cosmos3_format_pipeline, '["a", "b"]')
         assert result.startswith('["a", "b"].')
         assert "720x1280" in result
+
+
+class _CapturingTokenizer:
+    eos_token_id = 99
+    pad_token_id = 0
+
+    def __init__(self):
+        self.conversations = []
+
+    def apply_chat_template(
+        self,
+        conversations,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+    ):
+        assert tokenize is True
+        assert add_generation_prompt is True
+        assert return_dict is False
+        self.conversations.append(conversations)
+        return [1, 2, 3]
+
+    def convert_tokens_to_ids(self, token):
+        assert token == "<|vision_start|>"
+        return 98
+
+
+class TestTokenizePrompt:
+    def test_system_prompt_included_when_enabled(self, cosmos3_format_pipeline):
+        tokenizer = _CapturingTokenizer()
+        cosmos3_format_pipeline.tokenizer = tokenizer
+        cosmos3_format_pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+
+        input_ids, attention_mask = cosmos3_format_pipeline._tokenize_prompt(
+            "Describe motion.",
+            max_sequence_length=8,
+            use_system_prompt=True,
+            system_prompt="System text.",
+        )
+
+        assert tokenizer.conversations == [
+            [
+                {"role": "system", "content": "System text."},
+                {"role": "user", "content": "Describe motion."},
+            ]
+        ]
+        assert input_ids.tolist() == [[1, 2, 3, 99, 98, 0, 0, 0]]
+        assert attention_mask.tolist() == [[1, 1, 1, 1, 1, 0, 0, 0]]
+
+    def test_system_prompt_omitted_when_disabled(self, cosmos3_format_pipeline):
+        tokenizer = _CapturingTokenizer()
+        cosmos3_format_pipeline.tokenizer = tokenizer
+        cosmos3_format_pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+
+        cosmos3_format_pipeline._tokenize_prompt(
+            "Describe motion.",
+            max_sequence_length=8,
+            use_system_prompt=False,
+            system_prompt="System text.",
+        )
+
+        assert tokenizer.conversations == [[{"role": "user", "content": "Describe motion."}]]
 
 
 class TestFormatPromptWithMetadataJson:
@@ -391,6 +493,7 @@ class TestCosmos3T2V:
         result = _run_forward(cosmos3_pipeline, image=None, num_frames=NUM_FRAMES)
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
         assert result.frame_rate == FRAME_RATE
+        _assert_default_video_scheduler_config(cosmos3_pipeline)
 
 
 @pytest.mark.integration
@@ -402,6 +505,301 @@ class TestCosmos3I2V:
         result = _run_forward(cosmos3_pipeline, image=image, num_frames=NUM_FRAMES)
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
         assert result.frame_rate == FRAME_RATE
+        _assert_default_video_scheduler_config(cosmos3_pipeline)
+
+
+class TestCosmos3V2VExtraParams:
+    def test_condition_defaults_are_declared(self):
+        assert COSMOS3_EXTRA_SPECS["condition_video_latent_indexes"].default == list(
+            COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES
+        )
+        assert (
+            COSMOS3_EXTRA_SPECS["condition_video_keep"].default
+            == COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP
+        )
+
+    def test_flow_shift_default_is_request_optional(self):
+        spec = COSMOS3_EXTRA_SPECS["flow_shift"]
+        assert spec.type == "float"
+        assert spec.default is None
+
+
+class TestCosmos3V2VConditioningParams:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (None, (0, 1)),
+            ([0, 2], (0, 2)),
+            ((1, 3), (1, 3)),
+        ],
+    )
+    def test_normalize_condition_video_latent_indexes(self, value, expected):
+        assert _normalize_condition_video_latent_indexes(value) == expected
+
+    @pytest.mark.parametrize("value", [[], [-1], [0, -2]])
+    def test_invalid_condition_video_latent_indexes_raise(self, value):
+        with pytest.raises(ValueError):
+            _normalize_condition_video_latent_indexes(value)
+
+    @pytest.mark.parametrize(
+        "indexes,expected",
+        [
+            ((0,), 1),
+            ((0, 1), 5),
+            ((2,), 9),
+        ],
+    )
+    def test_condition_pixel_frame_count(self, indexes, expected):
+        assert _condition_pixel_frame_count(indexes, temporal_compression=4) == expected
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (None, "first"),
+            ("first", "first"),
+            ("FIRST", "first"),
+            (" last ", "last"),
+        ],
+    )
+    def test_normalize_condition_video_keep(self, value, expected):
+        assert _normalize_condition_video_keep(value) == expected
+
+    def test_invalid_condition_video_keep_raises(self):
+        with pytest.raises(ValueError, match="first or last"):
+            _normalize_condition_video_keep("middle")
+
+
+class TestReferenceImageLoad:
+    """The worker's image load is the acceptance check for an I2V reference.
+
+    The serve boundary only routes on the container signature, so unreadable
+    content has to surface here as a client error (``ValueError`` → 400) and
+    not as a server fault.
+    """
+
+    def test_truncated_image_is_a_client_error(self, tmp_path):
+        # Incompressible content, so half the file is genuinely half the image.
+        noise = PIL.Image.frombytes("RGB", (64, 64), os.urandom(64 * 64 * 3))
+        whole = tmp_path / "whole.png"
+        noise.save(whole, format="PNG")
+        data = whole.read_bytes()
+        path = tmp_path / "truncated.png"
+        path.write_bytes(data[: len(data) // 2])
+
+        with pytest.raises(ValueError, match="could not be decoded"):
+            _load_reference_image(str(path))
+
+    def test_unidentifiable_content_is_a_client_error(self, tmp_path):
+        path = tmp_path / "notreally.png"
+        path.write_bytes(b"not an image at all")
+        with pytest.raises(ValueError, match="could not be decoded"):
+            _load_reference_image(str(path))
+
+    def test_missing_file_is_a_client_error(self, tmp_path):
+        with pytest.raises(ValueError, match="could not be decoded"):
+            _load_reference_image(str(tmp_path / "nope.png"))
+
+    def test_valid_image_loads(self, tmp_path):
+        path = tmp_path / "ok.png"
+        PIL.Image.new("RGB", (8, 8), (1, 2, 3)).save(path, format="PNG")
+        assert _load_reference_image(str(path)).size == (8, 8)
+
+
+_V2V_FIXTURE_MP4 = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
+
+
+@pytest.mark.integration
+@pytest.mark.cosmos3_v2v
+@pytest.mark.high_cuda_memory
+class TestCosmos3V2V:
+    def test_v2v_smoke(self, cosmos3_pipeline):
+        """The production V2V path end to end: encoded MP4 bytes (the only
+        ``video`` form) — each rank demuxes from memory, NVDEC-decodes the
+        conditioning window, resizes to the output resolution, VAE-encodes,
+        and generates with the V2V scheduler policy."""
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=None,
+            video=_V2V_FIXTURE_MP4.read_bytes(),
+            num_frames=NUM_FRAMES,
+            condition_video_latent_indexes=[0, 1],
+        )
+        _assert_valid_video(result.video, num_frames=NUM_FRAMES)
+        assert result.frame_rate == FRAME_RATE
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+        )
+
+    def test_v2v_keep_last_smoke(self, cosmos3_pipeline):
+        """condition_video_keep="last" pins the tail of the input, not the head.
+
+        Drives the real bytes path end to end: ``keep`` is applied inside the
+        worker's NVDEC decode (ring buffer over the demuxed stream), exactly
+        as a request flows. The fixture's red channel encodes the frame index
+        (R = 20 + 25*i over 9 frames); with keep="last" the conditioning
+        window is frames 4-8, so output frame 0 must be a pinned VAE
+        round-trip of fixture frame 4 (R=120) — not fixture frame 0 (R=20).
+        """
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=None,
+            video=_V2V_FIXTURE_MP4.read_bytes(),
+            num_frames=NUM_FRAMES,
+            condition_video_latent_indexes=[0, 1],
+            condition_video_keep="last",
+        )
+        _assert_valid_video(result.video, num_frames=NUM_FRAMES)
+        red_mean = result.video[0, 0, :, :, 0].float().mean().item()
+        assert red_mean > 70, (
+            f"keep='last' must condition on the tail frames (R=120..220); "
+            f"output frame-0 red mean {red_mean:.1f} matches the head (R=20) instead"
+        )
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+        )
+
+    def test_v2v_flow_shift_override_request_path(self):
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.audio_gen = False
+        calls = []
+        token_calls = []
+
+        class StopAfterTokenize(Exception):
+            pass
+
+        class FakeSampling:
+            """Minimal Cosmos3SamplingPolicy stand-in recording flow-shift calls.
+
+            forward() consults the policy for request validation and the
+            distilled guard before it ever reaches the flow-shift block, so a
+            stub carrying only ``set_flow_shift`` never gets there.
+            """
+
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+                calls.append((target, use_karras_sigmas))
+                return scheduler
+
+        def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
+            token_calls.append((text, max_sequence_length, use_system_prompt, system_prompt))
+            raise StopAfterTokenize
+
+        pipeline.scheduler = SimpleNamespace(config=SimpleNamespace(flow_shift=1.0))
+        pipeline.sampling = FakeSampling()
+        pipeline._tokenize_prompt = fake_tokenize_prompt
+
+        with pytest.raises(StopAfterTokenize):
+            pipeline.forward(
+                prompt="continue",
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=None,
+                use_guardrails=False,
+                flow_shift=7.0,
+            )
+
+        assert calls == [(7.0, False)]
+        assert token_calls[0][2] is True
+        assert token_calls[0][3] == COSMOS3_DEFAULT_SYSTEM_PROMPT
+
+    def test_v2v_rebuilds_the_audio_scheduler_too(self):
+        """Video and audio denoise in lockstep in one loop, so a V2V request
+        must rebuild both. Rebuilding only the video scheduler leaves audio on
+        the checkpoint's flow shift / Karras sigmas and the streams step on
+        different schedules."""
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.audio_gen = True
+        rebuilt = []
+
+        class StopAfterTokenize(Exception):
+            pass
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+                rebuilt.append((scheduler.name, target, use_karras_sigmas))
+                return scheduler
+
+        def fake_tokenize_prompt(text, max_sequence_length, use_system_prompt, system_prompt=None):
+            raise StopAfterTokenize
+
+        pipeline.scheduler = SimpleNamespace(name="video", config=SimpleNamespace(flow_shift=1.0))
+        pipeline.audio_scheduler = SimpleNamespace(
+            name="audio", config=SimpleNamespace(flow_shift=1.0)
+        )
+        pipeline.sampling = FakeSampling()
+        pipeline._tokenize_prompt = fake_tokenize_prompt
+
+        with pytest.raises(StopAfterTokenize):
+            pipeline.forward(
+                prompt="continue",
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=None,
+                use_guardrails=False,
+                enable_audio=True,
+            )
+
+        assert rebuilt == [("video", 10.0, False), ("audio", 10.0, False)]
+
+    def test_image_and_video_rejected(self, cosmos3_pipeline):
+        with pytest.raises(ValueError, match="not both image and video"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=_make_test_image(),
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+            )
+
+    def test_t2i_and_video_rejected(self, cosmos3_pipeline):
+        with pytest.raises(ValueError, match="supported only for video outputs"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=None,
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                output_type="image",
+                height=T2I_HEIGHT,
+                width=T2I_WIDTH,
+            )
 
 
 @pytest.mark.integration
@@ -419,6 +817,11 @@ class TestCosmos3T2I:
         )
         assert result.video is None
         _assert_valid_image(result.image, height=T2I_HEIGHT, width=T2I_WIDTH)
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=COSMOS3_T2I_PARAMS["flow_shift"],
+            use_karras_sigmas=_base_use_karras_sigmas(cosmos3_pipeline),
+        )
 
 
 @pytest.mark.integration
@@ -432,6 +835,24 @@ class TestCosmos3Audio:
         assert result.frame_rate == FRAME_RATE
         _assert_valid_audio(result.audio, result.audio_sample_rate)
 
+    def test_v2v_audio_smoke(self, cosmos3_pipeline):
+        """Audio + V2V combined — allowed in both implementations (no guard),
+        previously untested in either."""
+        _require_audio_pipeline(cosmos3_pipeline)
+        result = _run_forward(
+            cosmos3_pipeline,
+            enable_audio=True,
+            video=_V2V_FIXTURE_MP4.read_bytes(),
+            condition_video_latent_indexes=[0, 1],
+        )
+        _assert_valid_video(result.video, num_frames=NUM_FRAMES)
+        _assert_valid_audio(result.audio, result.audio_sample_rate)
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+        )
+
 
 @pytest.mark.integration
 @pytest.mark.cosmos3_t2v
@@ -443,8 +864,9 @@ class TestCosmos3PromptTemplates:
             (True, True, True),
             (False, False, False),
             (False, False, True),
+            (False, False, None),
         ],
-        ids=["all-on", "all-off", "system-prompt-only"],
+        ids=["all-on", "all-off", "system-prompt-only", "system-prompt-default"],
     )
     def test_template_variants(
         self,
@@ -505,3 +927,30 @@ class TestCosmos3FP8Load:
             del pipeline
             gc.collect()
             torch.cuda.empty_cache()
+
+
+class TestErrorClassificationIsOptIn:
+    """Failure classification is per-pipeline, not inferred from the exception
+    class alone. A ``ValueError`` is as likely to be an internal invariant as a
+    rejected input, so a pipeline that hasn't opted in must leave every failure
+    unclassified -- otherwise adding V2V would silently turn other models'
+    internal errors into client errors on the public API.
+    """
+
+    def test_base_pipeline_classifies_nothing(self):
+        from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+
+        pipeline = object.__new__(BasePipeline)
+        for exc in (ValueError("x"), MemoryError("x"), RuntimeError("x")):
+            assert pipeline.classify_request_failure(exc) is None
+
+    def test_cosmos3_opts_in(self):
+        pipeline = object.__new__(Cosmos3OmniMoTPipeline)
+        assert pipeline.classify_request_failure(ValueError("bad reference")) == "client"
+        assert pipeline.classify_request_failure(MemoryError("no room")) == "capacity"
+        assert (
+            pipeline.classify_request_failure(torch.cuda.OutOfMemoryError("no room")) == "capacity"
+        )
+        # Unclassified stays unclassified: an internal fault is not the
+        # caller's fault.
+        assert pipeline.classify_request_failure(RuntimeError("internal")) is None
