@@ -154,6 +154,46 @@ inline __device__ void quantCopy(
     }
 }
 
+// Store NUM already-scaled floats as FP8. The fused kv-norm kernels compute in
+// float and would otherwise round to bf16 just so `quantCopy` could convert back
+// (bf16 -> f32 -> bf16 -> f32 -> fp8); this drops both conversions and the extra
+// rounding step.
+// One FP8 byte per element, so the store width follows NUM directly. T=float gives
+// NUM=4 (4B), T=bf16/half gives NUM=8 (8B); 16 is here for completeness.
+template <int BYTES>
+struct Fp8StoreVec;
+template <>
+struct Fp8StoreVec<4>
+{
+    using Type = uint32_t;
+};
+template <>
+struct Fp8StoreVec<8>
+{
+    using Type = uint2;
+};
+template <>
+struct Fp8StoreVec<16>
+{
+    using Type = uint4;
+};
+
+template <int NUM>
+inline __device__ void quantStoreFromFloat(__nv_fp8_e4m3* dst_global_ptr, float const* vals)
+{
+    static_assert(NUM % 2 == 0, "FP8 pair conversion needs an even count.");
+    using DstVecType = typename Fp8StoreVec<NUM>::Type;
+    static_assert(sizeof(DstVecType) == NUM * sizeof(__nv_fp8_e4m3), "FP8 store width mismatch.");
+    DstVecType fragment;
+#pragma unroll
+    for (int j = 0; j < NUM / 2; ++j)
+    {
+        float2 const val2 = make_float2(vals[2 * j], vals[2 * j + 1]);
+        reinterpret_cast<__nv_fp8x2_e4m3*>(&fragment)[j] = __nv_fp8x2_e4m3(val2);
+    }
+    *reinterpret_cast<DstVecType*>(dst_global_ptr) = fragment;
+}
+
 template <typename DstType, int NUM>
 inline __device__ void dequantCopy(
     DstType* dst_global_ptr, __nv_fp8_e4m3 const* src_fragment_ptr, float const scale_val = 1.f)
@@ -912,12 +952,14 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 // them here empties that kernel's prologue so it is pure Q work. Correctness is
 // per-LAUNCH, not per-iteration: the counter has to be zero before every FMHA
 // launch, and this kernel is launched exactly once per RoPE kernel launch.
-template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
-__global__ void mlaKvNormRopeQuantGenerationKernel(T const* fuse_buf, KVCacheBuffer kv_cache,
-    float2 const* cos_sin_cache, T const* kv_norm_weight, float kv_norm_eps, int latent_row_stride, int total_s_len,
-    int seq_len, int32_t const* kv_cache_lengths, KvCacheDataType cache_type, float const* quant_scale_kv,
-    uint32_t* fmha_tile_counter, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
-    float const* dequant_scale_q, float const* dequant_scale_kv, float host_bmm1_scale)
+template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, bool FP8_CACHE, typename KVCacheBuffer>
+__global__ void mlaKvNormRopeQuantGenerationKernel(T const* __restrict__ fuse_buf, KVCacheBuffer kv_cache,
+    float2 const* __restrict__ cos_sin_cache, T const* __restrict__ kv_norm_weight, float kv_norm_eps,
+    int latent_row_stride, int total_s_len, int seq_len, bool seq_len_pow2, uint32_t seq_len_shift,
+    int32_t const* __restrict__ kv_cache_lengths, float const* __restrict__ quant_scale_kv,
+    uint32_t* __restrict__ fmha_tile_counter, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale,
+    float const* __restrict__ quant_scale_o, float const* __restrict__ dequant_scale_q,
+    float const* __restrict__ dequant_scale_kv, float host_bmm1_scale)
 {
     using VecT = typename VecType<T>::Type;
     using GPTJEltT = typename VecType<T>::GPTJEltType;
@@ -940,19 +982,27 @@ __global__ void mlaKvNormRopeQuantGenerationKernel(T const* fuse_buf, KVCacheBuf
 
     int const lane = threadIdx.x % kWarpSize;
     int const warp_id = threadIdx.x / kWarpSize;
+
+    // The launch sets `programmaticStreamSerializationAllowed`, so this kernel can
+    // start before its predecessor -- the kv_a_proj GEMM that produces `fuse_buf` --
+    // has finished. Wait before ANY global read: the scale tensors below are static
+    // today, but reading them ahead of the barrier would silently pick up a stale
+    // value the moment a per-iteration KV scale is wired in.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     float const quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.f;
 
-    // FMHA scheduler prologue, rehomed from the RoPE kernel. It reads only static
-    // scale tensors, so it deliberately runs BEFORE the grid-dependency wait below:
-    // useful work while the producing GEMM drains. The launcher passes null pointers
-    // when the DSv4 sparse indices kernel already owns this.
+    // FMHA scheduler prologue, rehomed from the RoPE kernel. The launcher passes
+    // null pointers when the DSv4 sparse indices kernel already owns this.
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
         if (fmha_tile_counter != nullptr)
         {
             fmha_tile_counter[0] = 0;
         }
-        if (cache_type == KvCacheDataType::FP8)
+        if (FP8_CACHE)
         {
             float const dequant_scale_q_val = dequant_scale_q ? dequant_scale_q[0] : 1.f;
             float const dequant_scale_kv_val = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
@@ -972,20 +1022,39 @@ __global__ void mlaKvNormRopeQuantGenerationKernel(T const* fuse_buf, KVCacheBuf
         }
     }
 
-    // The launch sets `programmaticStreamSerializationAllowed`, so this kernel can
-    // start before its predecessor -- the kv_a_proj GEMM that produces `fuse_buf` --
-    // has finished. Wait for it before touching the latent.
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-#endif
+    // `kv_norm_weight` is indexed by dim only, so each lane's 16 elements are the
+    // same for every row this warp processes. Load them once as 16B vectors (the
+    // per-element indexing the scalar form implied could not be proven aligned, so
+    // it emitted ELTS_PER_VEC separate 2B loads per vector per row) and keep them in
+    // registers as float, pre-multiplied by the quant scale so pass 2 needs a single
+    // multiply per element.
+    float weight_f[kVecsPerLane][ELTS_PER_VEC];
+#pragma unroll
+    for (int i = 0; i < kVecsPerLane; ++i)
+    {
+        int const dim_idx = (i * kWarpSize + lane) * ELTS_PER_VEC;
+        VecT const w_vec = *reinterpret_cast<VecT const*>(kv_norm_weight + dim_idx);
+        auto const* w_elts = reinterpret_cast<T const*>(&w_vec);
+#pragma unroll
+        for (int j = 0; j < ELTS_PER_VEC; ++j)
+        {
+            weight_f[i][j] = static_cast<float>(w_elts[j]);
+        }
+    }
 
     // One warp per row. Every lane of a warp shares `global_token_idx`, so the
     // early-continue below keeps the shuffles convergent.
     for (int global_token_idx = warp_id + blockIdx.x * kRowsPerBlock; global_token_idx < total_s_len;
          global_token_idx += kRowsPerBlock * gridDim.x)
     {
-        int const batch_idx = global_token_idx / seq_len;
-        int const local_token_idx = global_token_idx % seq_len;
+        // `seq_len` is a runtime argument, so `/` and `%` each emit an emulated
+        // 32-bit divide (~20 instructions) per row. It is a power of two in every
+        // shipping config, and the host says so, turning both into a shift/mask.
+        int const batch_idx = seq_len_pow2 ? static_cast<int>(static_cast<uint32_t>(global_token_idx) >> seq_len_shift)
+                                           : global_token_idx / seq_len;
+        int const local_token_idx = seq_len_pow2
+            ? static_cast<int>(static_cast<uint32_t>(global_token_idx) & (static_cast<uint32_t>(seq_len) - 1u))
+            : global_token_idx - batch_idx * seq_len;
         int const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
         if (token_kv_idx < 0)
         {
@@ -994,6 +1063,11 @@ __global__ void mlaKvNormRopeQuantGenerationKernel(T const* fuse_buf, KVCacheBuf
         int const position_id = token_kv_idx;
 
         T const* row = fuse_buf + static_cast<size_t>(global_token_idx) * static_cast<size_t>(latent_row_stride);
+
+        // Issue the page-table load now, not after the reduction: it depends on
+        // nothing the row loads produce, so it overlaps pass 1 and the shuffle chain
+        // instead of serialising behind them.
+        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
 
         // Pass 1: load the whole row into registers and reduce.
         VecT vals[kVecsPerLane];
@@ -1020,22 +1094,41 @@ __global__ void mlaKvNormRopeQuantGenerationKernel(T const* fuse_buf, KVCacheBuf
 
         // Pass 2: scale by weight, rotate the rope tail, quantize, scatter.
         // Values never leave registers between the two passes.
-        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
 #pragma unroll
         for (int i = 0; i < kVecsPerLane; ++i)
         {
             int const vec_idx = i * kWarpSize + lane;
             int const dim_idx = vec_idx * ELTS_PER_VEC;
 
+            auto const inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, kRowVecs, vec_idx);
+            bool const is_rope = vec_idx >= kRopeVecStart;
+
+            if (FP8_CACHE && !is_rope)
+            {
+                // Fast path for the 448-wide nope segment: one multiply per element
+                // in float, then straight to FP8. No bf16 round trip.
+                float scaled[ELTS_PER_VEC];
+                auto const* elts = reinterpret_cast<T const*>(&vals[i]);
+#pragma unroll
+                for (int j = 0; j < ELTS_PER_VEC; ++j)
+                {
+                    scaled[j] = static_cast<float>(elts[j]) * (norm_scale * weight_f[i][j] * quant_scale_kv_val);
+                }
+                quantStoreFromFloat<ELTS_PER_VEC>(
+                    reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC, scaled);
+                continue;
+            }
+
+            // Rope vectors must land back in T: `rotary_embedding_transform` is
+            // typed on GPTJEltT. Same for a non-FP8 cache, which stores T directly.
             auto* elts = reinterpret_cast<T*>(&vals[i]);
 #pragma unroll
             for (int j = 0; j < ELTS_PER_VEC; ++j)
             {
-                elts[j] = static_cast<T>(
-                    static_cast<float>(elts[j]) * norm_scale * static_cast<float>(kv_norm_weight[dim_idx + j]));
+                elts[j] = static_cast<T>(static_cast<float>(elts[j]) * norm_scale * weight_f[i][j]);
             }
 
-            if (vec_idx >= kRopeVecStart)
+            if (is_rope)
             {
                 float2 const* rope_coef
                     = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + ((dim_idx - K_DIM) / 2);
@@ -1047,8 +1140,7 @@ __global__ void mlaKvNormRopeQuantGenerationKernel(T const* fuse_buf, KVCacheBuf
                 }
             }
 
-            auto const inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, kRowVecs, vec_idx);
-            if (cache_type == KvCacheDataType::FP8)
+            if (FP8_CACHE)
             {
                 quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                     reinterpret_cast<T const*>(&vals[i]), quant_scale_kv_val);
@@ -1419,13 +1511,14 @@ __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quan
 // `fuse_buf` is the RAW `kv_a_proj_with_mqa` slice, so its row stride is
 // `q_lora_rank + K_DIM + ROPE_DIM`; it is a last-dim view, not a contiguous row, and
 // only the innermost dim is unit-stride.
-template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
-__global__ void mlaKvNormRopeQuantContextKernel(T const* fuse_buf, KVCacheBuffer kv_cache, float2 const* cos_sin_cache,
-    T const* kv_norm_weight, float kv_norm_eps, int latent_row_stride, int const* cu_q_seqlens,
-    int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv, float* bmm1_scale_out, float* bmm2_scale_out, float const* quant_scale_o,
-    float const* dequant_scale_q, float const* dequant_scale_kv, float host_bmm1_scale,
-    int32_t const* helix_position_offsets)
+template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, bool FP8_CACHE, typename KVCacheBuffer>
+__global__ void mlaKvNormRopeQuantContextKernel(T const* __restrict__ fuse_buf, KVCacheBuffer kv_cache,
+    float2 const* __restrict__ cos_sin_cache, T const* __restrict__ kv_norm_weight, float kv_norm_eps,
+    int latent_row_stride, int const* __restrict__ cu_q_seqlens, int32_t const* __restrict__ kv_cache_lengths,
+    uint32_t max_input_seq_len, float const* __restrict__ quant_scale_kv, float* __restrict__ bmm1_scale_out,
+    float* __restrict__ bmm2_scale_out, float const* __restrict__ quant_scale_o,
+    float const* __restrict__ dequant_scale_q, float const* __restrict__ dequant_scale_kv, float host_bmm1_scale,
+    int32_t const* __restrict__ helix_position_offsets)
 {
     using VecT = typename VecType<T>::Type;
     using GPTJEltT = typename VecType<T>::GPTJEltType;
@@ -1447,9 +1540,8 @@ __global__ void mlaKvNormRopeQuantContextKernel(T const* fuse_buf, KVCacheBuffer
         kRowVecs % kWarpSize == 0, "Fused kv-norm needs the latent row to split evenly across a warp's 16B vectors.");
     static_assert(kVecsPerLane >= 1, "Latent row is too narrow for one warp.");
 
-    // The bmm scales the FMHA kernel reads. Static tensors only -- emitted before the
-    // grid-dependency wait so a PDL predecessor cannot delay them.
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && cache_type == KvCacheDataType::FP8)
+    // The bmm scales the FMHA kernel reads.
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && FP8_CACHE)
     {
         float const dq_q = dequant_scale_q ? dequant_scale_q[0] : 1.f;
         float const dq_kv = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
@@ -1472,15 +1564,35 @@ __global__ void mlaKvNormRopeQuantContextKernel(T const* fuse_buf, KVCacheBuffer
     int const warp_id = threadIdx.x / kWarpSize;
     float const quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.f;
 
+    // These are functions of blockIdx.y alone. Inside the loop they were three
+    // dependent global loads on the critical path of every iteration, and nothing
+    // could hoist them because the FP8 stores below alias through `unsigned char`.
+    int const global_token_offset = cu_q_seqlens[batch_idx];
+    int const cache_seq_len = kv_cache_lengths[batch_idx];
+    int const current_seq_len = cu_q_seqlens[batch_idx + 1] - global_token_offset;
+    int const cached_offset = cache_seq_len - current_seq_len;
+
+    // Row-invariant per lane: load once as 16B vectors instead of ELTS_PER_VEC
+    // scalar 2B loads per vector per row.
+    float weight_f[kVecsPerLane][ELTS_PER_VEC];
+#pragma unroll
+    for (int i = 0; i < kVecsPerLane; ++i)
+    {
+        int const dim_idx = (i * kWarpSize + lane) * ELTS_PER_VEC;
+        VecT const w_vec = *reinterpret_cast<VecT const*>(kv_norm_weight + dim_idx);
+        auto const* w_elts = reinterpret_cast<T const*>(&w_vec);
+#pragma unroll
+        for (int j = 0; j < ELTS_PER_VEC; ++j)
+        {
+            weight_f[i][j] = static_cast<float>(w_elts[j]);
+        }
+    }
+
     // Every lane of a warp shares `local_token_idx`, so the early-continue keeps the
     // shuffles convergent.
     for (int local_token_idx = warp_id + blockIdx.x * kTokensPerBlock;
          local_token_idx < static_cast<int>(max_input_seq_len); local_token_idx += kTokensPerBlock * gridDim.x)
     {
-        int const global_token_offset = cu_q_seqlens[batch_idx];
-        int const cache_seq_len = kv_cache_lengths[batch_idx];
-        int const current_seq_len = cu_q_seqlens[batch_idx + 1] - global_token_offset;
-        int const cached_offset = cache_seq_len - current_seq_len;
         int const token_idx_in_kv_cache = local_token_idx + cached_offset;
 
         if (token_idx_in_kv_cache >= cache_seq_len || local_token_idx >= current_seq_len)
@@ -1493,6 +1605,10 @@ __global__ void mlaKvNormRopeQuantContextKernel(T const* fuse_buf, KVCacheBuffer
 
         size_t const row_stride = latent_row_stride > 0 ? static_cast<size_t>(latent_row_stride) : kRowElts;
         T const* row = fuse_buf + static_cast<size_t>(global_token_idx) * row_stride;
+
+        // Issue the page-table load before pass 1: it does not depend on the row
+        // data, so it overlaps the loads and the shuffle chain.
+        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
 
         // Pass 1: load the whole row into registers and reduce.
         VecT vals[kVecsPerLane];
@@ -1519,24 +1635,40 @@ __global__ void mlaKvNormRopeQuantContextKernel(T const* fuse_buf, KVCacheBuffer
 
         // Pass 2: scale by weight, rotate the rope tail, quantize, scatter. Values
         // never leave registers between the two passes.
-        auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
 #pragma unroll
         for (int i = 0; i < kVecsPerLane; ++i)
         {
             int const vec_idx = i * kWarpSize + lane;
             int const dim_idx = vec_idx * ELTS_PER_VEC;
 
+            auto const inBlockIdx = kv_cache.getKVLocalIdx(token_idx_in_kv_cache, 0, TOTAL_VECS_PER_HEAD, vec_idx);
+            // The rope tail occupies dims [K_HEAD_SIZE, K_HEAD_SIZE + ROPE_DIM).
+            // ELTS_PER_VEC divides both segments, so a vector never straddles them.
+            bool const is_rope = vec_idx >= K_VECS_PER_HEAD;
+
+            if (FP8_CACHE && !is_rope)
+            {
+                // Nope segment: one multiply per element in float, straight to FP8.
+                float scaled[ELTS_PER_VEC];
+                auto const* elts = reinterpret_cast<T const*>(&vals[i]);
+#pragma unroll
+                for (int j = 0; j < ELTS_PER_VEC; ++j)
+                {
+                    scaled[j] = static_cast<float>(elts[j]) * (norm_scale * weight_f[i][j] * quant_scale_kv_val);
+                }
+                quantStoreFromFloat<ELTS_PER_VEC>(
+                    reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC, scaled);
+                continue;
+            }
+
             auto* elts = reinterpret_cast<T*>(&vals[i]);
 #pragma unroll
             for (int j = 0; j < ELTS_PER_VEC; ++j)
             {
-                elts[j] = static_cast<T>(
-                    static_cast<float>(elts[j]) * norm_scale * static_cast<float>(kv_norm_weight[dim_idx + j]));
+                elts[j] = static_cast<T>(static_cast<float>(elts[j]) * norm_scale * weight_f[i][j]);
             }
 
-            // The rope tail occupies dims [K_HEAD_SIZE, K_HEAD_SIZE + ROPE_DIM).
-            // ELTS_PER_VEC divides both segments, so a vector never straddles them.
-            if (vec_idx >= K_VECS_PER_HEAD)
+            if (is_rope)
             {
                 float2 const* rope_coef
                     = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + ((dim_idx - K_HEAD_SIZE) / 2);
@@ -1548,8 +1680,7 @@ __global__ void mlaKvNormRopeQuantContextKernel(T const* fuse_buf, KVCacheBuffer
                 }
             }
 
-            auto const inBlockIdx = kv_cache.getKVLocalIdx(token_idx_in_kv_cache, 0, TOTAL_VECS_PER_HEAD, vec_idx);
-            if (cache_type == KvCacheDataType::FP8)
+            if (FP8_CACHE)
             {
                 quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                     reinterpret_cast<T const*>(&vals[i]), quant_scale_kv_val);
@@ -1619,13 +1750,25 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
             constexpr int kTokensPerBlock = kCtxBlockSize / 32;
             dim3 const kv_grid(
                 int(tensorrt_llm::common::divUp(params.max_input_seq_len, kTokensPerBlock)), params.batch_size);
-            mlaKvNormRopeQuantContextKernel<T, kCtxBlockSize, 448, 64, KVCacheBuffer>
-                <<<kv_grid, kCtxBlockSize, 0, stream>>>(params.latent_cache, kv_cache_buffer, params.cos_sin_cache,
-                    kv_norm_w, params.kv_norm_eps, params.latent_row_stride, params.cu_q_seqlens, params.cache_seq_lens,
-                    params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
-                    useFusedFp8Q ? params.bmm1_scale : nullptr, useFusedFp8Q ? params.bmm2_scale : nullptr,
-                    params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale,
-                    params.helix_position_offsets);
+            auto launch_ctx = [&](auto fp8_tag)
+            {
+                constexpr bool kFp8Cache = decltype(fp8_tag)::value;
+                mlaKvNormRopeQuantContextKernel<T, kCtxBlockSize, 448, 64, kFp8Cache, KVCacheBuffer>
+                    <<<kv_grid, kCtxBlockSize, 0, stream>>>(params.latent_cache, kv_cache_buffer, params.cos_sin_cache,
+                        kv_norm_w, params.kv_norm_eps, params.latent_row_stride, params.cu_q_seqlens,
+                        params.cache_seq_lens, params.max_input_seq_len, params.quant_scale_kv,
+                        useFusedFp8Q ? params.bmm1_scale : nullptr, useFusedFp8Q ? params.bmm2_scale : nullptr,
+                        params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale,
+                        params.helix_position_offsets);
+            };
+            if (params.cache_type == KvCacheDataType::FP8)
+            {
+                launch_ctx(std::true_type{});
+            }
+            else
+            {
+                launch_ctx(std::false_type{});
+            }
             return;
         }
 
@@ -1859,12 +2002,34 @@ void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_c
     // batch 32 and 8 at batch 224, i.e. the slower option at both ends: the kernel
     // is latency-bound, not occupancy-bound, so SM coverage is the wrong knob.
     // `TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK` pins it for re-tuning.
-    int rows_per_block = 4;
-    if (auto const env_rows = tensorrt_llm::common::getIntEnv("TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK"))
+    // `getIntEnv` is uncached, unlike `getEnvEnablePDL`, so without the static this
+    // would getenv+stoi on every launch of every layer.
+    static int const rows_per_block = []
     {
-        rows_per_block = env_rows.value();
+        int rows = 4;
+        if (auto const env_rows = tensorrt_llm::common::getIntEnv("TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK"))
+        {
+            rows = env_rows.value();
+        }
+        return std::min(std::max(rows, 1), 8);
+    }();
+
+    // `seq_len` is 1 + MTP depth, so it is a power of two in every shipping config
+    // (MTP0 -> 1, MTP1 -> 2, MTP3 -> 4). Pass a shift for that case so the kernel
+    // replaces its per-row `/` and `%` -- two emulated 32-bit divides -- with a
+    // shift and a mask. Non-power-of-two depths keep the divide; the branch is
+    // uniform across the grid, so it costs nothing in the loop.
+    TLLM_CHECK_WITH_INFO(seq_len > 0, "MLA fused kv-norm: seq_len must be positive, got %d", seq_len);
+    uint32_t const seq_len_u = static_cast<uint32_t>(seq_len);
+    bool const seq_len_pow2 = (seq_len_u & (seq_len_u - 1u)) == 0u;
+    uint32_t seq_len_shift = 0u;
+    if (seq_len_pow2)
+    {
+        while ((1u << seq_len_shift) < seq_len_u)
+        {
+            ++seq_len_shift;
+        }
     }
-    rows_per_block = std::min(std::max(rows_per_block, 1), 8);
 
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -1883,11 +2048,26 @@ void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_c
         config.stream = stream;
         config.numAttrs = 1;
         config.attrs = attrs;
-        cudaLaunchKernelEx(&config, &mlaKvNormRopeQuantGenerationKernel<T, kBlockSize, 448, 64, KVCacheBuffer>,
-            params.latent_cache, kv_cache_buffer, params.cos_sin_cache, kv_norm_w, params.kv_norm_eps, row_stride,
-            params.acc_q_len, seq_len, params.cache_seq_lens, params.cache_type, params.quant_scale_kv, tile_counter,
-            bmm1_scale, bmm2_scale, params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv,
-            params.host_bmm1_scale);
+        auto launch_typed = [&](auto fp8_tag)
+        {
+            constexpr bool kFp8Cache = decltype(fp8_tag)::value;
+            cudaLaunchKernelEx(&config,
+                &mlaKvNormRopeQuantGenerationKernel<T, kBlockSize, 448, 64, kFp8Cache, KVCacheBuffer>,
+                params.latent_cache, kv_cache_buffer, params.cos_sin_cache, kv_norm_w, params.kv_norm_eps, row_stride,
+                params.acc_q_len, seq_len, seq_len_pow2, seq_len_shift, params.cache_seq_lens, params.quant_scale_kv,
+                tile_counter, bmm1_scale, bmm2_scale, params.quant_scale_o, params.dequant_scale_q,
+                params.dequant_scale_kv, params.host_bmm1_scale);
+        };
+        // Cache dtype is uniform for the launch, so specialise on it: it drops the
+        // per-vector branch and lets the FP8 path skip the bf16 round trip.
+        if (params.cache_type == KvCacheDataType::FP8)
+        {
+            launch_typed(std::true_type{});
+        }
+        else
+        {
+            launch_typed(std::false_type{});
+        }
     };
 
     if (rows_per_block <= 1)

@@ -22,6 +22,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -31,6 +32,28 @@ namespace
 {
 
 constexpr int kWarpSize = 32;
+
+// FP8 is one byte per element, so an N-element vector is an N-byte store.
+template <int BYTES>
+struct Fp8VecStore;
+template <>
+struct Fp8VecStore<8>
+{
+    using Type = uint2;
+};
+template <>
+struct Fp8VecStore<16>
+{
+    using Type = uint4;
+};
+
+template <int NUM_ELTS>
+__device__ inline void storeFp8Vec(__nv_fp8_e4m3* dst, __nv_fp8x2_e4m3 const* packed)
+{
+    using StoreT = typename Fp8VecStore<NUM_ELTS>::Type;
+    static_assert(sizeof(StoreT) == NUM_ELTS, "FP8 store width mismatch.");
+    *reinterpret_cast<StoreT*>(dst) = *reinterpret_cast<StoreT const*>(packed);
+}
 constexpr int kWarpsPerBlock = 4;
 constexpr int kThreadsPerBlock = kWarpSize * kWarpsPerBlock;
 
@@ -159,12 +182,13 @@ void dispatchDeepseekV4QNorm(
 //                 The second term is the chunked-prefill cached offset.
 // Passing `cu_q_seqlens` selects the context form. Every lane of a warp shares
 // `row`, so the search is uniform across the warp and does not diverge.
-template <typename T, int kHeadDim, int kNopeDim, bool kFuseRope = false>
+template <typename T, int kHeadDim, int kNopeDim, bool kFuseRope = false, bool kWideVec = true>
 __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8_e4m3* __restrict__ quant_q_nope,
     T* __restrict__ q_pe_out, float const* __restrict__ quant_scale_qkv_ptr, int totalRows,
     int quantQNopeRowStrideBytes, float eps, float2 const* __restrict__ cos_sin_cache = nullptr,
     int const* __restrict__ cache_seq_lens = nullptr, int num_heads = 0, int seq_len = 0,
-    int const* __restrict__ cu_q_seqlens = nullptr, int num_seqs = 0)
+    int const* __restrict__ cu_q_seqlens = nullptr, int num_seqs = 0, int num_heads_shift = -1,
+    int seq_len_shift = -1)
 {
     static_assert(kHeadDim % (2 * kWarpSize) == 0);
     static_assert(kNopeDim > 0 && kNopeDim < kHeadDim);
@@ -172,11 +196,32 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
     constexpr int kPairsPerRow = kHeadDim / 2;
     constexpr int kPairsPerLane = kPairsPerRow / kWarpSize;
     constexpr int kNopePairs = kNopeDim / 2;
-    constexpr int kRopePairs = kRopeDim / 2;
     static_assert(kPairsPerLane >= 2);
-    static_assert(kNopePairs == (kPairsPerLane - 1) * kWarpSize,
-        "Fused kernel assumes the last per-lane iteration covers the rope segment.");
-    static_assert(kRopePairs == kWarpSize, "Each lane should own exactly one rope pair.");
+
+    // Two decompositions of the same row, chosen per phase by `kWideVec`.
+    //
+    //   narrow (kWideVec=false): lane owns kPairsPerLane pairs, strided by the warp.
+    //     kPairsPerLane 4B loads + kPairsPerLane 2B FP8 stores per row.
+    //   wide   (kWideVec=true):  lane owns kVecsPerLane 16B vectors.
+    //     kVecsPerLane 16B loads + kVecsPerLane 8B FP8 stores per row.
+    //
+    // Wide is strictly fewer instructions but needs ~3 more registers, which drops
+    // reg-limited occupancy from 16 to 14 blocks/SM. That is the wrong trade for the
+    // CONTEXT instance: it moves 1.6 GB per launch and already runs at ~81% of HBM
+    // SOL, where resident waves are the bandwidth -- measured 248 -> 277 us when it
+    // was forced onto the wide path. The GENERATION instance moves 6 MB and runs at
+    // ~25% of SOL, so it is instruction-bound and wide wins there (3.10 -> 2.77 us).
+    constexpr int kEltsPerVec = 16 / sizeof(T);
+    constexpr int kPairsPerVec = kEltsPerVec / 2;
+    constexpr int kRowVecs = kHeadDim / kEltsPerVec;
+    constexpr int kNopeVecs = kNopeDim / kEltsPerVec;
+    constexpr int kVecsPerLane = kRowVecs / kWarpSize;
+    static_assert(!kWideVec || kHeadDim % kEltsPerVec == 0, "Row must split into whole 16B vectors.");
+    static_assert(!kWideVec || kNopeDim % kEltsPerVec == 0, "A 16B vector must not straddle nope/rope.");
+    static_assert(!kWideVec || kRowVecs % kWarpSize == 0, "Row vectors must split evenly across a warp.");
+    static_assert(kWideVec || kNopePairs == (kPairsPerLane - 1) * kWarpSize,
+        "Narrow path assumes the last per-lane iteration covers the rope segment.");
+    static_assert(kWideVec || kRopeDim / 2 == kWarpSize, "Narrow path gives each lane one rope pair.");
 
     using Vec2 = typename Vec2Traits<T>::Type;
 
@@ -189,91 +234,178 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
         return;
     }
 
-    auto const* inputPair = reinterpret_cast<Vec2 const*>(input + static_cast<int64_t>(row) * kHeadDim);
+    T const* rowPtr = input + static_cast<int64_t>(row) * kHeadDim;
     // Nope output: row stride is caller-controlled (kNopeDim for packed, kHeadDim
     // when interleaved with the rope segment of a full Q-buffer that RoPE writes).
-    auto* nopeOutPair = reinterpret_cast<__nv_fp8x2_e4m3*>(
-        reinterpret_cast<__nv_fp8_e4m3*>(quant_q_nope) + static_cast<int64_t>(row) * quantQNopeRowStrideBytes);
+    auto* nopeOut
+        = reinterpret_cast<__nv_fp8_e4m3*>(quant_q_nope) + static_cast<int64_t>(row) * quantQNopeRowStrideBytes;
+    auto* nopeOutPair = reinterpret_cast<__nv_fp8x2_e4m3*>(nopeOut);
     auto* ropeOutPair = reinterpret_cast<Vec2*>(q_pe_out + static_cast<int64_t>(row) * kRopeDim);
 
     float const quantScale = quant_scale_qkv_ptr ? quant_scale_qkv_ptr[0] : 1.0F;
 
-    float2 values[kPairsPerLane];
+    // The wide path keeps the RAW vectors (kVecsPerLane x 16B = 8 registers) and
+    // re-converts in pass 2, rather than holding their float expansion
+    // (kPairsPerLane x float2 = 16 registers) live across the reduction. The extra
+    // bf16->float converts are nearly free; the 8 registers are not. At 128
+    // threads/block an SM caps at 2048 threads = 64 warps, and 32 regs/thread is
+    // exactly that ceiling (32 x 2048 = 65536), so anything above 32 costs waves.
+    uint4 raw[kWideVec ? kVecsPerLane : 1];
+    float2 values[kWideVec ? 1 : kPairsPerLane];
     float sumSquares = 0.0F;
 
-#pragma unroll
-    for (int i = 0; i < kPairsPerLane; ++i)
+    if constexpr (kWideVec)
     {
-        int const pairIdx = i * kWarpSize + laneId;
-        values[i] = Vec2Traits<T>::toFloat2(inputPair[pairIdx]);
-        sumSquares += values[i].x * values[i].x + values[i].y * values[i].y;
+        auto const* inputVec = reinterpret_cast<uint4 const*>(rowPtr);
+#pragma unroll
+        for (int i = 0; i < kVecsPerLane; ++i)
+        {
+            raw[i] = inputVec[i * kWarpSize + laneId];
+            auto const* pairs = reinterpret_cast<Vec2 const*>(&raw[i]);
+#pragma unroll
+            for (int j = 0; j < kPairsPerVec; ++j)
+            {
+                float2 const v = Vec2Traits<T>::toFloat2(pairs[j]);
+                sumSquares += v.x * v.x + v.y * v.y;
+            }
+        }
+    }
+    else
+    {
+        auto const* inputPair = reinterpret_cast<Vec2 const*>(rowPtr);
+#pragma unroll
+        for (int i = 0; i < kPairsPerLane; ++i)
+        {
+            values[i] = Vec2Traits<T>::toFloat2(inputPair[i * kWarpSize + laneId]);
+            sumSquares += values[i].x * values[i].x + values[i].y * values[i].y;
+        }
     }
 
     sumSquares = warpReduceSum(sumSquares);
     float const normScale = rsqrtf(sumSquares / static_cast<float>(kHeadDim) + eps);
     float const fp8Scale = normScale * quantScale;
 
-    // First kPairsPerLane-1 iters land in the nope range -> FP8 STG.
-#pragma unroll
-    for (int i = 0; i < kPairsPerLane - 1; ++i)
+    // Position depends on the token, which every lane of the warp shares, so this is
+    // warp-uniform and hoisted out of the store loop.
+    int positionId = 0;
+    if constexpr (kFuseRope)
     {
-        int const pairIdx = i * kWarpSize + laneId;
-        float2 scaled{values[i].x * fp8Scale, values[i].y * fp8Scale};
-        nopeOutPair[pairIdx] = __nv_fp8x2_e4m3(scaled);
-    }
-
-    // Last iter is the rope segment.
-    {
-        constexpr int i = kPairsPerLane - 1;
-        int const pairIdx = i * kWarpSize + laneId;   // in [kNopePairs, kPairsPerRow)
-        int const ropePairIdx = pairIdx - kNopePairs; // in [0, kRopePairs)
-        float2 normalized{values[i].x * normScale, values[i].y * normScale};
-        if constexpr (kFuseRope)
+        int const token = num_heads_shift >= 0 ? (row >> num_heads_shift) : (row / num_heads);
+        if (cu_q_seqlens != nullptr)
         {
-            // Rows are (token, head) pairs, and the position depends on the token
-            // alone. Same derivation the generation RoPE kernel uses.
-            int const token = row / num_heads;
-            int positionId;
-            if (cu_q_seqlens != nullptr)
+            int lo = 0;
+            int hi = num_seqs - 1;
+            while (lo < hi)
             {
-                int lo = 0;
-                int hi = num_seqs - 1;
-                while (lo < hi)
+                int const mid = (lo + hi + 1) >> 1;
+                if (cu_q_seqlens[mid] <= token)
                 {
-                    int const mid = (lo + hi + 1) >> 1;
-                    if (cu_q_seqlens[mid] <= token)
-                    {
-                        lo = mid;
-                    }
-                    else
-                    {
-                        hi = mid - 1;
-                    }
+                    lo = mid;
                 }
-                int const seqBegin = cu_q_seqlens[lo];
-                int const currentSeqLen = cu_q_seqlens[lo + 1] - seqBegin;
-                positionId = (token - seqBegin) + (cache_seq_lens[lo] - currentSeqLen);
+                else
+                {
+                    hi = mid - 1;
+                }
             }
-            else
-            {
-                int const batchIdx = token / seq_len;
-                positionId = cache_seq_lens[batchIdx] - seq_len + (token % seq_len);
-            }
-            // The cos/sin table is float2 (cos, sin) with a stride of kRopeDim per
-            // position; GPT-J style rotation pairs adjacent elements, so pair p
-            // reads entry p.
-            float2 const coef = cos_sin_cache[static_cast<int64_t>(kRopeDim) * positionId + ropePairIdx];
-            float2 const rotated{
-                coef.x * normalized.x - coef.y * normalized.y, coef.x * normalized.y + coef.y * normalized.x};
-            // Straight into the rope slots of the same FP8 row the nope segment
-            // just filled, so the whole Q row is complete when this kernel exits.
-            float2 const scaled{rotated.x * quantScale, rotated.y * quantScale};
-            nopeOutPair[kNopePairs + ropePairIdx] = __nv_fp8x2_e4m3(scaled);
+            int const seqBegin = cu_q_seqlens[lo];
+            int const currentSeqLen = cu_q_seqlens[lo + 1] - seqBegin;
+            positionId = (token - seqBegin) + (cache_seq_lens[lo] - currentSeqLen);
         }
         else
         {
-            // bf16/fp16 STG, no extra quant scale; the RoPE kernel rotates it later.
-            ropeOutPair[ropePairIdx] = Vec2Traits<T>::fromFloat2(normalized);
+            int const batchIdx = seq_len_shift >= 0 ? (token >> seq_len_shift) : (token / seq_len);
+            int const localToken = seq_len_shift >= 0 ? (token & (seq_len - 1)) : (token % seq_len);
+            positionId = cache_seq_lens[batchIdx] - seq_len + localToken;
+        }
+    }
+
+    if constexpr (kWideVec)
+    {
+        // One store word per vector, written in place: no separate staging array
+        // and no second lifetime for the packed bytes.
+        union StoreWord
+        {
+            typename Fp8VecStore<kEltsPerVec>::Type packed;
+            __nv_fp8x2_e4m3 pairs[kPairsPerVec];
+            Vec2 raw_pairs[kPairsPerVec];
+        };
+#pragma unroll
+        for (int i = 0; i < kVecsPerLane; ++i)
+        {
+            int const vecIdx = i * kWarpSize + laneId;
+            auto const* srcPairs = reinterpret_cast<Vec2 const*>(&raw[i]);
+            StoreWord out;
+
+            if (vecIdx < kNopeVecs)
+            {
+#pragma unroll
+                for (int j = 0; j < kPairsPerVec; ++j)
+                {
+                    float2 const v = Vec2Traits<T>::toFloat2(srcPairs[j]);
+                    out.pairs[j] = __nv_fp8x2_e4m3(float2{v.x * fp8Scale, v.y * fp8Scale});
+                }
+                *reinterpret_cast<typename Fp8VecStore<kEltsPerVec>::Type*>(nopeOut + vecIdx * kEltsPerVec)
+                    = out.packed;
+                continue;
+            }
+
+            int const ropePairBase = (vecIdx - kNopeVecs) * kPairsPerVec;
+            if constexpr (kFuseRope)
+            {
+#pragma unroll
+                for (int j = 0; j < kPairsPerVec; ++j)
+                {
+                    float2 const v = Vec2Traits<T>::toFloat2(srcPairs[j]);
+                    float2 const normalized{v.x * normScale, v.y * normScale};
+                    float2 const coef = cos_sin_cache[static_cast<int64_t>(kRopeDim) * positionId + ropePairBase + j];
+                    float2 const rotated{coef.x * normalized.x - coef.y * normalized.y,
+                        coef.x * normalized.y + coef.y * normalized.x};
+                    out.pairs[j] = __nv_fp8x2_e4m3(float2{rotated.x * quantScale, rotated.y * quantScale});
+                }
+                *reinterpret_cast<typename Fp8VecStore<kEltsPerVec>::Type*>(nopeOut + vecIdx * kEltsPerVec)
+                    = out.packed;
+            }
+            else
+            {
+#pragma unroll
+                for (int j = 0; j < kPairsPerVec; ++j)
+                {
+                    float2 const v = Vec2Traits<T>::toFloat2(srcPairs[j]);
+                    out.raw_pairs[j] = Vec2Traits<T>::fromFloat2(float2{v.x * normScale, v.y * normScale});
+                }
+                *reinterpret_cast<uint4*>(ropeOutPair + ropePairBase) = *reinterpret_cast<uint4 const*>(&out);
+            }
+        }
+    }
+    else
+    {
+        // First kPairsPerLane-1 iters land in the nope range -> FP8 STG.
+#pragma unroll
+        for (int i = 0; i < kPairsPerLane - 1; ++i)
+        {
+            int const pairIdx = i * kWarpSize + laneId;
+            float2 const scaled{values[i].x * fp8Scale, values[i].y * fp8Scale};
+            nopeOutPair[pairIdx] = __nv_fp8x2_e4m3(scaled);
+        }
+
+        // Last iter is the rope segment.
+        {
+            constexpr int i = kPairsPerLane - 1;
+            int const pairIdx = i * kWarpSize + laneId;   // in [kNopePairs, kPairsPerRow)
+            int const ropePairIdx = pairIdx - kNopePairs; // in [0, kRopeDim/2)
+            float2 const normalized{values[i].x * normScale, values[i].y * normScale};
+            if constexpr (kFuseRope)
+            {
+                float2 const coef = cos_sin_cache[static_cast<int64_t>(kRopeDim) * positionId + ropePairIdx];
+                float2 const rotated{
+                    coef.x * normalized.x - coef.y * normalized.y, coef.x * normalized.y + coef.y * normalized.x};
+                nopeOutPair[kNopePairs + ropePairIdx]
+                    = __nv_fp8x2_e4m3(float2{rotated.x * quantScale, rotated.y * quantScale});
+            }
+            else
+            {
+                ropeOutPair[ropePairIdx] = Vec2Traits<T>::fromFloat2(normalized);
+            }
         }
     }
 }
@@ -295,21 +427,62 @@ void dispatchDeepseekV4QNormFused(void const* input, void* quant_q_nope, void* q
     // Context supplies cu_q_seqlens and needs no uniform seq_len; generation
     // supplies seq_len and no cu_q_seqlens. Either way the rope slots must live in
     // this row, i.e. the interleaved layout.
+    // `row / num_heads`, `token / seq_len` and `token % seq_len` divide by runtime
+    // values, so each emits an emulated 32-bit division per row. Both are powers of
+    // two in every DSv4 config (128 heads; seq_len = 1 + MTP depth), so pass the
+    // shift and let the kernel use shift/mask; -1 keeps the divide.
+    auto const pow2_shift = [](int v) -> int
+    {
+        if (v <= 0 || (v & (v - 1)) != 0)
+        {
+            return -1;
+        }
+        int shift = 0;
+        while ((1 << shift) < v)
+        {
+            ++shift;
+        }
+        return shift;
+    };
+    int const num_heads_shift = pow2_shift(num_heads);
+    int const seq_len_shift = pow2_shift(seq_len);
+
     bool const haveRopePositions = cu_q_seqlens != nullptr ? num_seqs > 0 : seq_len > 0;
     bool const fuseRope = cos_sin_cache != nullptr && cache_seq_lens != nullptr && num_heads > 0 && haveRopePositions
         && quantQNopeRowStrideBytes == headDim;
+    // Phase picks the decomposition (see the kernel's comment): context is
+    // bandwidth-bound and wants the extra occupancy the narrow path leaves free;
+    // generation is instruction-bound and wants the wider loads and stores.
+    // `cu_q_seqlens` is the context marker -- generation passes `seq_len` instead.
+    bool const wideVec = cu_q_seqlens == nullptr;
+
+    auto launch = [&](auto fuse_tag, auto wide_tag)
+    {
+        constexpr bool kFuse = decltype(fuse_tag)::value;
+        constexpr bool kWide = decltype(wide_tag)::value;
+        if constexpr (kFuse)
+        {
+            deepseekV4QNormFusedKernel<T, 512, 448, true, kWide><<<grid, block, 0, stream>>>(
+                static_cast<T const*>(input), static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
+                static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps,
+                static_cast<float2 const*>(cos_sin_cache), cache_seq_lens, num_heads, seq_len, cu_q_seqlens, num_seqs,
+                num_heads_shift, seq_len_shift);
+        }
+        else
+        {
+            deepseekV4QNormFusedKernel<T, 512, 448, false, kWide><<<grid, block, 0, stream>>>(
+                static_cast<T const*>(input), static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
+                static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps);
+        }
+    };
+
     if (fuseRope)
     {
-        deepseekV4QNormFusedKernel<T, 512, 448, true><<<grid, block, 0, stream>>>(static_cast<T const*>(input),
-            static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
-            static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps,
-            static_cast<float2 const*>(cos_sin_cache), cache_seq_lens, num_heads, seq_len, cu_q_seqlens, num_seqs);
+        wideVec ? launch(std::true_type{}, std::true_type{}) : launch(std::true_type{}, std::false_type{});
     }
     else
     {
-        deepseekV4QNormFusedKernel<T, 512, 448, false><<<grid, block, 0, stream>>>(static_cast<T const*>(input),
-            static_cast<__nv_fp8_e4m3*>(quant_q_nope), static_cast<T*>(q_pe_out),
-            static_cast<float const*>(quant_scale_qkv_ptr), totalRows, quantQNopeRowStrideBytes, eps);
+        wideVec ? launch(std::false_type{}, std::true_type{}) : launch(std::false_type{}, std::false_type{});
     }
 }
 
