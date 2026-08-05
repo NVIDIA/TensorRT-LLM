@@ -21,6 +21,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import traceback
 from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
@@ -32,6 +33,7 @@ import zmq
 
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.kv_cache_hash import truncate_sha256_hash_to_int64
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEvent, KVCacheEventDiff
 
 ExternalBlockHash = bytes | int
@@ -242,7 +244,10 @@ class ZmqEventPublisher(EventPublisher):
                     try:
                         self._service_replay()
                     except Exception:
-                        logger.exception("Failed to service native KV event replay request")
+                        logger.error(
+                            "Failed to service native KV event replay request\n"
+                            f"{traceback.format_exc()}"
+                        )
                 try:
                     event = self._event_queue.get(timeout=0.1)
                 except queue.Empty:
@@ -264,8 +269,9 @@ class ZmqEventPublisher(EventPublisher):
                     self.published_batches += 1
                 except Exception:
                     self._send_error_drops += 1
-                    logger.exception(
-                        f"Failed to publish native KV event batch rank={self._rank} seq={seq}"
+                    logger.error(
+                        f"Failed to publish native KV event batch rank={self._rank} "
+                        f"seq={seq}\n{traceback.format_exc()}"
                     )
                     time.sleep(0.1)
                 finally:
@@ -338,8 +344,10 @@ def _vllm_wire_hash_from_radix_key(block_key: bytes) -> int:
     """Reuse an existing SHA-256 radix key as vLLM's signed integer event hash."""
     if len(block_key) < 8:
         raise ValueError("V2 radix block keys must contain at least 8 bytes")
-    unsigned_hash = int.from_bytes(block_key[-8:], "big", signed=False)
-    # Reinterpret the low 64 bits as signed two's-complement for the wire format.
+    # Reuse the canonical SHA-256 -> int64 truncation (first 8 bytes) shared with
+    # the rest of the KV-cache-event machinery instead of a second, divergent
+    # truncation, then reinterpret the low 64 bits as vLLM's signed wire hash.
+    unsigned_hash = truncate_sha256_hash_to_int64(block_key)
     return unsigned_hash - 2**64 if unsigned_hash >= 2**63 else unsigned_hash
 
 
@@ -454,7 +462,10 @@ class NativeKVCacheEventManager:
         except ValueError:
             self.dropped_events += 1
             self._pending_entries -= 1
-            logger.exception("Dropping native KV store event with unsupported token data")
+            logger.error(
+                "Dropping native KV store event with unsupported token data\n"
+                f"{traceback.format_exc()}"
+            )
             return
         self._stored_blocks[key] = state
         if self._pending_events and isinstance(self._pending_events[-1], BlockStored):
@@ -577,7 +588,10 @@ class NativeKVCacheEventManager:
                 self.dropped_batches += 1
         except Exception:
             self.dropped_batches += 1
-            logger.exception(f"Dropping native KV event iteration batch on rank={self._rank}")
+            logger.error(
+                f"Dropping native KV event iteration batch on rank={self._rank}\n"
+                f"{traceback.format_exc()}"
+            )
 
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]:
         # Native publishing pushes events out-of-band, so the pull API has
