@@ -130,6 +130,9 @@ class BeamSearch(NamedTuple):
     length_penalty: float
     diversity_rate: float
     early_stopping: BeamSearchEarlyStop
+    # Appended last on purpose: _common_fields() reads the fields above by
+    # position, so inserting earlier would shift those indices.
+    row_stride: int = 0
 
 
 GREEDY: Greedy = ("greedy", None)
@@ -242,6 +245,7 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
             length_penalty=params.length_penalty or 0.0,
             diversity_rate=params.beam_search_diversity_rate or 0.0,
             early_stopping=BeamSearchEarlyStop.from_raw(params.early_stopping),
+            row_stride=params.row_stride or params.beam_width_in,
         )
 
     # NB: not greedy, hence top_p != 0 if specified
@@ -332,7 +336,9 @@ def sample(
             length_penalty,
             beam_search_diversity_rate,
             early_stopping,
+            *_,
         ):
+            row_stride = cast(BeamSearch, strategy).row_stride
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
                 "BeamSearchMetadata is required for beam_search_sampling_batch"
             )
@@ -341,6 +347,7 @@ def sample(
                     logits,
                     beam_width_in=cast(int, beam_width_in),
                     beam_width_out=cast(int, beam_width_out),
+                    row_stride=cast(int, row_stride),
                     beam_search_args=group_metadata,
                     temperature=cast(float, temperature),
                     early_stopping=cast(int, early_stopping),
@@ -353,6 +360,7 @@ def sample(
                     logits,
                     beam_width_in=cast(int, beam_width_in),
                     beam_width_out=cast(int, beam_width_out),
+                    row_stride=cast(int, row_stride),
                     beam_search_args=group_metadata,
                     temperature=cast(float, temperature),
                     length_penalty=cast(float, length_penalty),
@@ -1026,6 +1034,7 @@ class _StrategyImpls:
 
             beam_width_in: int
             beam_width_out: int
+            row_stride: int
             temperature: torch.Tensor
             length_penalty: Optional[torch.Tensor]
             diversity_rate: Optional[torch.Tensor]
@@ -1034,6 +1043,7 @@ class _StrategyImpls:
             self,
             beam_width_in: int,
             beam_width_out: int,
+            row_stride: int,
             temperature: torch.Tensor,
             length_penalty: Optional[torch.Tensor],
             diversity_rate: Optional[torch.Tensor],
@@ -1042,6 +1052,7 @@ class _StrategyImpls:
         ):
             self._beam_width_in = beam_width_in
             self._beam_width_out = beam_width_out
+            self._row_stride = row_stride
             self._temperature = temperature
             self._length_penalty = length_penalty
             self._diversity_rate = diversity_rate
@@ -1072,6 +1083,9 @@ class _StrategyImpls:
             narrowed_strats = cast(list[BeamSearch], strategies)
             (beam_width_in,) = set(strat[1] for strat in narrowed_strats)
             (beam_width_out,) = set(strat[2] for strat in narrowed_strats)
+            # Grouping already keys on the strategy tuple, so a group cannot
+            # mix row strides; assert rather than silently pick one.
+            (row_stride,) = set(strat.row_stride or beam_width_in for strat in narrowed_strats)
             temperature = _StrategyImpls.BeamSearchStep._make_tensor(
                 [strat[3] or 1.0 for strat in narrowed_strats], torch.float32, cuda_device
             )
@@ -1090,6 +1104,7 @@ class _StrategyImpls:
             return _StrategyImpls.BeamSearchStep.CommonFields(
                 beam_width_in=beam_width_in,
                 beam_width_out=beam_width_out,
+                row_stride=row_stride,
                 temperature=temperature,
                 length_penalty=length_penalty,
                 diversity_rate=diversity_rate,
@@ -1104,6 +1119,7 @@ class _StrategyImpls:
             return cls(
                 fields.beam_width_in,
                 fields.beam_width_out,
+                fields.row_stride,
                 fields.temperature,
                 fields.length_penalty,
                 fields.diversity_rate,
@@ -1141,6 +1157,7 @@ class _StrategyImpls:
                 logits,
                 beam_width_in=self._beam_width_in,
                 beam_width_out=self._beam_width_out,
+                row_stride=self._row_stride,
                 beam_search_args=group_metadata,
                 temperature=None,
                 length_penalty=self._length_penalty,
@@ -1155,6 +1172,7 @@ class _StrategyImpls:
             self,
             beam_width_in: int,
             beam_width_out: int,
+            row_stride: int,
             temperature: torch.Tensor,
             length_penalty: Optional[torch.Tensor],
             diversity_rate: Optional[torch.Tensor],
@@ -1165,6 +1183,7 @@ class _StrategyImpls:
             super().__init__(
                 beam_width_in,
                 beam_width_out,
+                row_stride,
                 temperature,
                 length_penalty,
                 diversity_rate,
@@ -1184,6 +1203,7 @@ class _StrategyImpls:
             return cls(
                 fields.beam_width_in,
                 fields.beam_width_out,
+                fields.row_stride,
                 fields.temperature,
                 fields.length_penalty,
                 fields.diversity_rate,
@@ -1198,6 +1218,7 @@ class _StrategyImpls:
                 logits,
                 beam_width_in=self._beam_width_in,
                 beam_width_out=self._beam_width_out,
+                row_stride=self._row_stride,
                 beam_search_args=group_metadata,
                 temperature=None,
                 early_stopping=self._early_stopping,

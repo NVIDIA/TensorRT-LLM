@@ -3281,9 +3281,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             req_num_generation_steps_list, dtype=torch.int32, pin_memory=prefer_pinned()
         )
 
-        # context requests do not have multiple beams yet, so beam width may differ in mixed batches
+        # Rows in the logits tensor, i.e. how many rows each request occupies.
+        # ModelEngine lays out generation requests at the *static* admission
+        # width (py_beam_width), not the per-iteration width: with a variable
+        # beam width array the two differ, and offsetting by the narrower
+        # per-iteration width would make every request after the first read
+        # another request's rows. logits.view() succeeds for any shape whose
+        # element count divides, so that is silent corruption rather than an
+        # error. Match the layout here and slice down to the per-iteration
+        # width where the beams are actually consumed. TRTLLMSampler already
+        # offsets by the static width for the same reason.
+        # NB: context requests do not have multiple beams yet, hence the 1s.
         req_num_beams_list = [1] * len(finished_context_requests) + [
-            req.get_beam_width_by_iter(False) for req in scheduled_requests.generation_requests
+            req.py_beam_width for req in scheduled_requests.generation_requests
         ]
         req_num_beams = torch.tensor(
             req_num_beams_list, dtype=torch.int32, pin_memory=prefer_pinned()

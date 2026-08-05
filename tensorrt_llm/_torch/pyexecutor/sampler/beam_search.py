@@ -364,6 +364,7 @@ def _beam_step_preprocess(
     logits: torch.Tensor,
     *,
     beam_width_in: int,
+    row_stride: int | None = None,
     temperature: float | None,
     return_probs: bool,
     args: "BeamSearchMetadata",
@@ -373,12 +374,28 @@ def _beam_step_preprocess(
     Applies temperature, snapshots the cache indirection into its buffer, and
     returns ``(logprobs, softmax, batch_size)``. ``softmax`` is None when
     ``return_probs`` is False.
+
+    ``row_stride`` is how many rows the forward path allocated per request,
+    which is the static admission width. It differs from ``beam_width_in``
+    under Variable-Beam-Width-Search, where only the first ``beam_width_in``
+    rows of each request hold live beams and the rest are padding. Reshaping
+    by ``beam_width_in`` alone would silently mix rows across requests, since
+    ``view`` accepts any shape whose element count divides. Defaults to
+    ``beam_width_in`` for callers whose layout already matches.
     """
     assert logits.dim() == 2, "logits should be 2D: [batch_size * beam_width, vocab_size]"
-    batch_size, vocab_size = logits.size()
-    batch_size = batch_size // beam_width_in
+    num_rows, vocab_size = logits.size()
+    if row_stride is None:
+        row_stride = beam_width_in
+    assert row_stride >= beam_width_in, (
+        f"row_stride ({row_stride}) must cover beam_width_in ({beam_width_in})"
+    )
+    batch_size = num_rows // row_stride
 
-    logits = logits.view(batch_size, beam_width_in, vocab_size)
+    logits = logits.view(batch_size, row_stride, vocab_size)
+    if row_stride != beam_width_in:
+        # Drop the padding rows; the live beams are the leading ones.
+        logits = logits[:, :beam_width_in, :]
     if temperature is not None and temperature != 0:
         logits = logits / max(temperature, 1e-5)
     softmax: Optional[torch.Tensor] = None
@@ -508,6 +525,7 @@ def beam_search_sampling_batch(
     *,
     beam_width_in: int,
     beam_width_out: int,
+    row_stride: int | None = None,
     beam_search_args: BeamSearchMetadata,
     temperature: float | None,
     length_penalty: "torch.Tensor | float | None" = None,
@@ -528,6 +546,7 @@ def beam_search_sampling_batch(
     logprobs, softmax, batch_size = _beam_step_preprocess(
         logits,
         beam_width_in=beam_width_in,
+        row_stride=row_stride,
         temperature=temperature,
         return_probs=return_probs,
         args=beam_search_args,
@@ -866,6 +885,7 @@ def beam_search_sampling_batch_cba(
     *,
     beam_width_in: int,
     beam_width_out: int,
+    row_stride: int | None = None,
     beam_search_args: BeamSearchMetadata,
     temperature: float | None,
     early_stopping: int,  # BeamSearchEarlyStop
@@ -912,6 +932,7 @@ def beam_search_sampling_batch_cba(
     logprobs, softmax, batch_size = _beam_step_preprocess(
         logits,
         beam_width_in=beam_width_in,
+        row_stride=row_stride,
         temperature=temperature,
         return_probs=return_probs,
         args=args,
