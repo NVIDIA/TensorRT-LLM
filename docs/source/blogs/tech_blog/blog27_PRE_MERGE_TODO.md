@@ -12,11 +12,13 @@
 ## External reproduction package
 
 - [ ] **Waiting on ModelOpt:** publish the calibrated Skip Softmax configuration
-  in a public location. Once available, link it from the reproduction package
-  and verify that it contains the component-specific
+  in a public location. Prefer
+  `examples/visual_gen/skip_softmax/wan2.2-t2v-a14b/` so the article can use a
+  repository-local, component-aware merge helper. Once available, link it from
+  the reproduction section and verify that it contains the component-specific
   `sparse_attention_config` blocks, calibration formulas, and ignore lists for
-  both transformers. The internal checkpoint itself is not a publication
-  artifact.
+  both transformers. Test the documented helper from a clean Hugging Face
+  download. The internal checkpoint itself is not a publication artifact.
 - [x] Correct the configuration guidance: one direct
   `threshold_scale_factor` does not reproduce this dual-transformer result,
   because the two transformer components use different calibration formulas.
@@ -37,6 +39,10 @@
 - [ ] For the component breakdown, publish the Nsight Systems command and
   version plus the kernel-classification script or a reproducible trace
   summary.
+- [ ] Add a synchronized compiled-BF16 versus NVFP4 + SAGE + Skip Softmax
+  results video using the same prompt, seed, resolution, frame count, and
+  denoising steps. Host it through an approved NVIDIA media service and keep
+  only its poster image in the repository; do not commit a raw MP4.
 
 ## Validation backlog
 
@@ -57,15 +63,23 @@
 
 ## Final-blog cleanup
 
-- [x] Replace the six-item `Limitations` checklist with a short audience-facing
-  scope statement.
+- [x] Remove the six-item `Limitations` checklist and weave practical tuning
+  scope into the results narrative.
 - [x] Remove repeated reviewer-facing defenses around family anchors,
   end-to-end measurement, single-GPU attribution, and the interpretation of
   small LPIPS deltas.
 - [x] Change “previous post” to “earlier post” and describe SAGE quantization
   as occurring in the attention path rather than necessarily inside one
   kernel.
-- [x] State the RC21 provenance of the representative profile in one concise
-  sentence without adding the internal cross-GPU validation narrative.
-- [x] In the runtime table, identify only the release image used for the main
-  sweep; omit source commit and feature-PR identifiers.
+- [x] Keep the representative profile framing concise and omit the internal
+  cross-GPU validation narrative.
+- [x] Identify only the release image in Reproduction; omit source commit and
+  feature-PR identifiers.
+- [x] Remove single-GPU framing from the article and latency-chart titles while
+  retaining B200 as factual evaluation context.
+- [x] Keep the pipeline chart title to “Pipeline Breakdown,” use dark green for
+  attention, label the remainder “Others,” and remove its subtitle.
+- [x] Merge the quality-anchor and operating-point discussion into the results
+  narrative, and align points ①–③ with the table immediately below Figure 3.
+- [ ] Remove every `TODO(blog27, remove before merge)` HTML comment after its
+  corresponding publication asset is linked and verified.
