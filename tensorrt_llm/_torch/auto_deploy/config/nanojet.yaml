@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# NanoJet is a prefill-only execution mode. This file is merged on top of default.yaml.
+attn_backend: nanojet
+compile_backend: torch-simple
+cuda_graph_config: null
+
+transforms:
+  fuse_nanojet_fused_qkv_gemm_norm_rope:
+    enabled: true
+  fuse_nanojet_rmsnorm_fp8:
+    enabled: true
+  fuse_nanojet_swiglu_gemm_fp8:
+    enabled: true
+  fuse_nanojet_attn_quant_fp8:
+    enabled: true
+  fuse_nanojet_gemm_fp8_add:
+    enabled: true
