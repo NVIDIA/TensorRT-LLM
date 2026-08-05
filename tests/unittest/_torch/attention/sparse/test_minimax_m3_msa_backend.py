@@ -3,8 +3,9 @@
 """Structural tests for the MiniMax-M3 MSA sparse attention backend.
 
 These validate backend selection, decode scratch-buffer sizing, and the paged
-HND view contract passed to the packaged MSA kernel. Numerical parity against
-the Triton reference is covered by the SM100 integration accuracy test.
+HND and sparse block-index stride contracts passed to the packaged MSA kernel.
+Numerical parity against the Triton reference is covered by the SM100
+integration accuracy test.
 """
 
 from unittest.mock import Mock
@@ -280,3 +281,86 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed():
     assert not index_k_strided.is_contiguous()
     assert index_k_strided.stride(0) == coalescing_scale * page_size * head_dim
     assert torch.equal(strided_scores, packed_scores)
+
+
+def _run_msa_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    plan: tuple,
+    kv_indices: torch.Tensor,
+    selected: torch.Tensor,
+) -> torch.Tensor:
+    from fmha_sm100.api import fmha_sm100
+
+    out = torch.empty_like(q)
+    returned, _ = fmha_sm100(
+        q,
+        k,
+        v,
+        plan,
+        kv_indices=kv_indices,
+        kv_block_indexes=selected,
+        out=out,
+        sm_scale=128.0**-0.5,
+        output_maxscore=False,
+    )
+    torch.cuda.synchronize()
+    assert returned.data_ptr() == out.data_ptr()
+    assert torch.isfinite(out).all()
+    return out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("query_len", [1, 5])
+@pytest.mark.parametrize("num_kv_splits", [1, 2])
+def test_msa_sparse_attention_honors_noncontiguous_block_indexes(
+    query_len: int,
+    num_kv_splits: int,
+) -> None:
+    from fmha_sm100.api import fmha_sm100_plan
+
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    total_selector_rows = query_len + 2
+    q = torch.zeros((query_len, 32, 128), dtype=torch.bfloat16, device=device)
+    k = torch.zeros((8, 2, 128, 128), dtype=torch.bfloat16, device=device)
+    v = torch.empty_like(k)
+    for page in range(8):
+        v[page].fill_(page + 1)
+    kv_indices = torch.arange(8, dtype=torch.int32, device=device)
+
+    intended = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    poison = torch.tensor([4, 5, 6, 7], dtype=torch.int32, device=device)
+    logical = intended.expand(total_selector_rows, 2, 4).clone()
+    # These rows are outside the logical slice but occupy addresses reached by
+    # a pointer-only contiguous read for later query/head pairs.
+    logical[:2, 1, :] = poison
+    backing = logical.permute(1, 0, 2).contiguous()
+    selected_strided = backing.permute(1, 0, 2)[-query_len:]
+    selected_contiguous = logical[-query_len:].contiguous()
+
+    assert selected_strided.stride() == (4, total_selector_rows * 4, 1)
+    assert not selected_strided.is_contiguous()
+    assert torch.equal(selected_strided, selected_contiguous)
+
+    plan = fmha_sm100_plan(
+        torch.tensor([query_len], dtype=torch.int32),
+        torch.tensor([1024], dtype=torch.int32),
+        32,
+        num_kv_heads=2,
+        qo_offset=torch.tensor([1024 - query_len], dtype=torch.int32),
+        num_kv_splits=num_kv_splits,
+        page_size=128,
+        output_maxscore=False,
+        kv_block_num=4,
+        causal=True,
+        device=device,
+    )
+    short_plan = plan[3]
+    assert short_plan["MM-SA-Nv"] is False
+    assert short_plan["num_kv_splits"] == num_kv_splits
+
+    expected = _run_msa_sparse_attention(q, k, v, plan, kv_indices, selected_contiguous)
+    actual = _run_msa_sparse_attention(q, k, v, plan, kv_indices, selected_strided)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
