@@ -3516,44 +3516,24 @@ class PyExecutor:
                 ragged_active = bucket is not None
                 if bucket is None:
                     fallback_reason = "no_captured_shape"
-            elif os.environ.get("TLLM_DSPARK_EAGER_RAGGED"):
-                # OFF BY DEFAULT. This path triggers a CUDA illegal memory
-                # access that is not yet located.
-                #
-                # The reasoning behind it is sound and is why the code is kept
-                # rather than reverted: these steps are eager no matter what
-                # this feature does -- can_run_cuda_graph is
-                # `num_context_requests == 0`, which predates it by a long way
-                # -- so declining ragged buys no graph replay. It only gives up
-                # the trimming, and that was measured: 46 of the first 64 steps
-                # fell back, trim_ratio 0.62 -> 0.
-                #
-                # What is NOT understood is why publishing ragged metadata on a
-                # step that then runs eager faults at all. Nine hypotheses have
-                # been falsified, most usefully: setting every window to the
-                # FULL block, which makes the step semantically identical to
-                # static verification, still faults -- so it is not about
-                # windows, raggedness, or trimming. A barrier at this point does
-                # not help while CUDA_LAUNCH_BLOCKING=1 completes a full 128-step
-                # run, which places the race inside the forward.
-                #
-                # The env var keeps the reproduction to one line.
+            else:
+                # No rank can replay a graph this step -- such steps were
+                # eager long before this feature existed (can_run_cuda_graph
+                # is num_context_requests == 0), so declining ragged would buy
+                # no replay and only forfeit the trimming (measured: 46 of the
+                # first 64 steps, trim_ratio 0.62 -> 0). Run the windows
+                # eagerly, and do not fit a bucket: fitting sizes pad rows
+                # `_get_padded_batch` will not append on an ungraphable step.
+                # The fault once blamed on this path was a ragged graph KEY
+                # derived over a window-less step replaying stale row maps;
+                # with the key derivation checking windows, this path
+                # publishes no bucket and replays nothing.
                 runner = self.model_engine.cuda_graph_runner
                 runner.agreed_ragged_bucket = None
                 runner.ragged_pad_verify_len = 0
                 for request, window in zip(gen_requests, ragged_lens):
                     request.py_verify_len = int(window)
                 ragged_active = True
-            else:
-                # No rank can replay a graph this step, so there is no captured
-                # shape to land on. Fitting one anyway budgets tokens for pad
-                # rows `_get_padded_batch` will not append -- it pads the TOTAL
-                # batch while this fit counts generation rows -- which is how
-                # `requests carry 18 generation tokens but the key's token axis
-                # is 24` reached two ranks, threw inside the forward, and
-                # deadlocked the other six behind it.
-                fallback_reason = "no_graph_this_step"
-                ragged_lens = None
 
         # Record what the step actually decided, reading the windows back off
         # the requests rather than off `ragged_lens`: fit_ragged_verify_lens
