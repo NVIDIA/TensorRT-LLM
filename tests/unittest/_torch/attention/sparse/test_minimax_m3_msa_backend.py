@@ -35,6 +35,20 @@ def test_msa_requires_block_size_128():
     assert cfg.sparse_block_size == 64
 
 
+def test_msa_fp8_indexer_config_is_explicit_and_lowered():
+    cfg = MiniMaxM3SparseAttentionConfig(implementation="msa", indexer_kv_dtype="fp8")
+    assert cfg.to_sparse_params().indexer_kv_dtype == "fp8"
+
+    with pytest.raises(ValueError, match=r"requires the 'msa' implementation"):
+        MiniMaxM3SparseAttentionConfig(implementation="triton", indexer_kv_dtype="fp8")
+    with pytest.raises(ValueError, match=r"sparse_disable_index_value=True"):
+        MiniMaxM3SparseAttentionConfig(
+            implementation="msa",
+            indexer_kv_dtype="fp8",
+            sparse_disable_index_value=False,
+        )
+
+
 def test_msa_metadata_rejects_undersized_max_score_buffer():
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
@@ -163,6 +177,74 @@ def test_msa_indexer_preserves_strided_hnd_index_k(monkeypatch):
     assert captured["idx_k"].data_ptr() == idx_k_paged.data_ptr()
     assert not captured["idx_k"].is_contiguous()
     assert result is expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_msa_fp8_cache_converts_live_index_query_before_scoring():
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+
+    config = MiniMaxM3SparseConfig(
+        num_q_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        num_index_heads=4,
+        sparse_index_dim=128,
+        block_size=128,
+        topk=16,
+    )
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.m3_config = config
+    attention.layer_idx = 3
+    captured = {}
+
+    class FakeIndexer:
+        def select_blocks(self, idx_q, idx_k, **kwargs):
+            captured["idx_q"] = idx_q
+            captured["idx_k"] = idx_k
+            captured["kwargs"] = kwargs
+            return torch.zeros(2, 4, 16, dtype=torch.int32, device="cuda")
+
+    attention.indexer = FakeIndexer()
+
+    class FakeMetadata:
+        msa_decode_proxy_plan = None
+        msa_eager_proxy_plan = (False, 0, 2, {}, None)
+        msa_eager_all_blocks_empty = False
+        msa_eager_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
+        msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
+        msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
+        msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
+        msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
+
+        def __init__(self):
+            self.cache = torch.empty(2, 1, 128, 128, dtype=torch.float8_e4m3fn, device="cuda")
+
+        def msa_write_idx_k(self, layer_idx, idx_k):
+            captured["write"] = (layer_idx, idx_k)
+
+        def msa_idx_k_cache(self, layer_idx):
+            captured["read_layer"] = layer_idx
+            return self.cache
+
+    idx_q = torch.randn(2, 4 * 128, dtype=torch.bfloat16, device="cuda")
+    idx_k = torch.randn(2, 128, dtype=torch.bfloat16, device="cuda")
+    result = attention.run_indexer(idx_q, idx_k, FakeMetadata())
+
+    assert result.shape == (2, 4, 16)
+    assert captured["idx_q"].dtype == torch.float8_e4m3fn
+    assert captured["idx_k"].dtype == torch.float8_e4m3fn
+    assert captured["idx_k"].stride(0) > captured["idx_k"].shape[-1]
+    assert captured["write"][0] == 3
+    assert captured["write"][1].data_ptr() == idx_k.data_ptr()
+
+    # The production fused producer has already inserted K and passes no live
+    # K tensor; E4M3 Q must flow to the scorer without a duplicate cache write.
+    captured.pop("write")
+    fused_q = idx_q.to(torch.float8_e4m3fn)
+    result = attention.run_indexer(fused_q, None, FakeMetadata())
+    assert result.shape == (2, 4, 16)
+    assert captured["idx_q"].data_ptr() == fused_q.data_ptr()
+    assert "write" not in captured
 
 
 def test_msa_proxy_max_score_strided_index_k_matches_packed():
