@@ -17,7 +17,6 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.version import __version__ as trtllm_version
 
 from .fp8_block_scaling_dispatch import (
-    ActivationScaleLayout,
     CacheIdentity,
     DispatchBackend,
     DispatchCache,
@@ -25,12 +24,16 @@ from .fp8_block_scaling_dispatch import (
     DispatchKey,
     DispatchPolicy,
     DispatchReason,
-    MatrixLayout,
-    WeightScaleLayout,
     select_backend,
     select_static_backend,
 )
 from .fp8_block_scaling_dispatch_cache import load_dispatch_cache
+from .fp8_block_scaling_dispatch_inputs import (
+    classify_activation_scale_layout,
+    is_deep_gemm_compatible,
+    is_deep_gemm_tensor_metadata_compatible,
+    make_dispatch_key,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _CACHE_PATH_ENV = "TRTLLM_FP8_BLOCK_SCALING_GEMM_DISPATCH_CACHE"
@@ -91,10 +94,9 @@ def make_runtime_identity(reference: torch.Tensor) -> CacheIdentity:
     device_index = reference.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    with _IDENTITY_LOCK:
-        cached = _IDENTITIES.get(device_index)
-        if cached is not None:
-            return cached
+    cached = _IDENTITIES.get(device_index)
+    if cached is not None:
+        return cached
 
     sm = get_sm_version()
     available = _deep_gemm_available(reference)
@@ -111,70 +113,6 @@ def make_runtime_identity(reference: torch.Tensor) -> CacheIdentity:
     )
     with _IDENTITY_LOCK:
         return _IDENTITIES.setdefault(device_index, identity)
-
-
-def _activation_scale_layout(
-    scale: torch.Tensor,
-    m: int,
-    k_blocks: int,
-) -> ActivationScaleLayout:
-    if scale.dim() == 2 and tuple(scale.shape) == (m, k_blocks):
-        return ActivationScaleLayout.LOGICAL_M_K_BLOCKS
-    if scale.dim() == 2 and scale.shape[0] == k_blocks and scale.shape[1] >= m:
-        return ActivationScaleLayout.TRT_TRANSPOSED_K_M
-    m_padded = ((m + 3) // 4) * 4
-    if scale.dim() == 1 and scale.numel() >= k_blocks * m_padded:
-        return ActivationScaleLayout.TRT_PADDED_1D
-    return ActivationScaleLayout.UNSUPPORTED
-
-
-def make_dispatch_key(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_scale: torch.Tensor,
-    b_scale: torch.Tensor,
-) -> DispatchKey:
-    """Classify a runtime call into an exact cache key."""
-    m, k = a.shape
-    n = b.shape[0]
-    k_blocks = k // 128
-    activation_layout = _activation_scale_layout(a_scale, m, k_blocks)
-    weight_layout = (
-        WeightScaleLayout.LOGICAL_N_K_BLOCKS
-        if b_scale.dim() == 2 and tuple(b_scale.shape) == ((n + 127) // 128, k_blocks)
-        else WeightScaleLayout.UNSUPPORTED
-    )
-    same_device = a.device == b.device == a_scale.device == b_scale.device
-    matrix_layout = (
-        MatrixLayout.K_MAJOR_CONTIGUOUS
-        if same_device and a.stride(1) == 1 and b.stride(1) == 1
-        else MatrixLayout.UNSUPPORTED
-    )
-    return DispatchKey(
-        m=m,
-        n=n,
-        k=k,
-        activation_scale_layout=activation_layout,
-        weight_scale_layout=weight_layout,
-        matrix_layout=matrix_layout,
-    )
-
-
-def is_deep_gemm_compatible(key: DispatchKey, tensors: tuple[torch.Tensor, ...]) -> bool:
-    a, b, a_scale, b_scale = tensors
-    return (
-        key.k % 128 == 0
-        and key.activation_scale_layout is not ActivationScaleLayout.UNSUPPORTED
-        and key.weight_scale_layout is WeightScaleLayout.LOGICAL_N_K_BLOCKS
-        and key.matrix_layout is MatrixLayout.K_MAJOR_CONTIGUOUS
-        and a.is_cuda
-        and a.dtype is torch.float8_e4m3fn
-        and b.dtype is torch.float8_e4m3fn
-        and a_scale.dtype is torch.float32
-        and b_scale.dtype is torch.float32
-        and a_scale.is_contiguous()
-        and b_scale.is_contiguous()
-    )
 
 
 @lru_cache(maxsize=8)
@@ -195,8 +133,8 @@ def _warn_identity_mismatch(cache_identity: CacheIdentity, current_identity: Cac
     )
 
 
-def _policy() -> DispatchPolicy:
-    configured = os.getenv(_SMALL_M_ENV)
+@lru_cache(maxsize=8)
+def _policy(configured: str | None) -> DispatchPolicy:
     if configured is None:
         return DispatchPolicy()
     small_m = int(configured)
@@ -230,7 +168,7 @@ def get_dispatch_decision(
 ) -> DispatchDecision:
     """Resolve the configured cache entry for one GEMM invocation."""
     key = make_dispatch_key(a, b, a_scale, b_scale)
-    policy = _policy()
+    policy = _policy(os.getenv(_SMALL_M_ENV))
     is_capturing = torch.cuda.is_current_stream_capturing()
     static_decision = select_static_backend(
         policy, key, get_sm_version(), is_capturing=is_capturing
@@ -252,15 +190,79 @@ def get_dispatch_decision(
     else:
         cache = loaded_cache
 
+    entry = cache.find(key)
+    deep_gemm_compatible = (
+        entry is not None
+        and entry.backend is DispatchBackend.DEEP_GEMM
+        and is_deep_gemm_compatible(key, (a, b, a_scale, b_scale))
+    )
     decision = select_backend(
         policy,
         key,
         identity,
         cache,
         is_capturing=False,
-        deep_gemm_compatible=is_deep_gemm_compatible(key, (a, b, a_scale, b_scale)),
+        deep_gemm_compatible=deep_gemm_compatible,
     )
     if decision.reason is DispatchReason.CACHE_IDENTITY_MISMATCH:
         _warn_identity_mismatch(cache.identity, identity)
     _log_decision(key, decision)
     return decision
+
+
+def get_dispatch_backend(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+) -> DispatchBackend:
+    """Resolve a backend without allocating a diagnostic decision on the hot path."""
+    if os.getenv(_DEBUG_ENV) == "1":
+        return get_dispatch_decision(a, b, a_scale, b_scale).backend
+
+    m, k = a.shape
+    n = b.shape[0]
+    policy = _policy(os.getenv(_SMALL_M_ENV))
+    is_capturing = torch.cuda.is_current_stream_capturing()
+    sm = get_sm_version()
+    if (
+        is_capturing
+        or sm not in policy.deep_gemm_sms
+        or m <= policy.small_m
+        or (m, n, k) in policy.denylist
+    ):
+        return DispatchBackend.TRTLLM
+
+    cache_path = os.getenv(_CACHE_PATH_ENV)
+    if cache_path is None:
+        return DispatchBackend.TRTLLM
+
+    identity = make_runtime_identity(a)
+    cache = _load_cache(cache_path)
+    if cache is None:
+        return DispatchBackend.TRTLLM
+    if cache.identity != identity:
+        _warn_identity_mismatch(cache.identity, identity)
+        return DispatchBackend.TRTLLM
+    deep_gemm_layouts = cache.deep_gemm_activation_layouts(m, n, k)
+    if deep_gemm_layouts is None:
+        return DispatchBackend.TRTLLM
+
+    k_blocks = k // 128
+    activation_layout = classify_activation_scale_layout(a_scale, m, k_blocks)
+    if activation_layout not in deep_gemm_layouts:
+        return DispatchBackend.TRTLLM
+    if not identity.deep_gemm_available:
+        return DispatchBackend.TRTLLM
+    if k % 128 != 0:
+        return DispatchBackend.TRTLLM
+    if not is_deep_gemm_tensor_metadata_compatible(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        n,
+        k_blocks,
+    ):
+        return DispatchBackend.TRTLLM
+    return DispatchBackend.DEEP_GEMM

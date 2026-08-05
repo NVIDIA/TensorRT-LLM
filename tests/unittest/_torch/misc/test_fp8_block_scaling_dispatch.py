@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from tensorrt_llm._torch.custom_ops.fast_custom_op import FastCustomOp
 from tensorrt_llm._torch.custom_ops.fp8_block_scaling_dispatch import (
     ActivationScaleLayout,
     BackendMeasurement,
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.custom_ops.fp8_block_scaling_dispatch_cache import (
 from tensorrt_llm._torch.custom_ops.fp8_block_scaling_dispatch_runtime import (
     is_deep_gemm_compatible,
 )
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import fp8_block_scaling_gemm
 
 
 def _identity(*, build_id: str = "build-a") -> CacheIdentity:
@@ -55,6 +57,13 @@ def _key(m: int, n: int = 1536, k: int = 1536) -> DispatchKey:
 
 def _cache(*entries: DispatchEntry, identity: CacheIdentity | None = None) -> DispatchCache:
     return DispatchCache(identity=identity or _identity(), entries=entries)
+
+
+def test_fp8_dispatcher_does_not_pay_torch_custom_op_wrapper_tax() -> None:
+    assert isinstance(fp8_block_scaling_gemm, FastCustomOp), (
+        "FP8 dispatch must use the low-overhead custom-op registration path"
+    )
+    assert torch.Tag.pt2_compliant_tag in (torch.ops.trtllm.fp8_block_scaling_gemm.default.tags)
 
 
 def test_small_m_guard_precedes_deep_gemm_cache_hit() -> None:
@@ -101,6 +110,48 @@ def test_exact_cache_keeps_distinct_large_m_decisions() -> None:
     assert decision_64k.backend is DispatchBackend.DEEP_GEMM
     assert decision_16k.reason is DispatchReason.CACHE_HIT
     assert decision_64k.reason is DispatchReason.CACHE_HIT
+
+
+def test_trt_only_shape_does_not_enter_deep_gemm_slow_path() -> None:
+    trt_key = _key(16384)
+    deep_gemm_key = _key(65536)
+    cache = _cache(
+        DispatchEntry(key=trt_key, backend=DispatchBackend.TRTLLM),
+        DispatchEntry(key=deep_gemm_key, backend=DispatchBackend.DEEP_GEMM),
+    )
+
+    assert not cache.might_select_deep_gemm(trt_key.m, trt_key.n, trt_key.k)
+    assert cache.might_select_deep_gemm(
+        deep_gemm_key.m,
+        deep_gemm_key.n,
+        deep_gemm_key.k,
+    )
+
+
+def test_deep_shape_fast_path_keeps_exact_activation_scale_layout() -> None:
+    logical_key = _key(16384)
+    transposed_key = DispatchKey(
+        m=logical_key.m,
+        n=logical_key.n,
+        k=logical_key.k,
+        activation_scale_layout=ActivationScaleLayout.TRT_TRANSPOSED_K_M,
+        weight_scale_layout=logical_key.weight_scale_layout,
+        matrix_layout=logical_key.matrix_layout,
+    )
+    cache = _cache(DispatchEntry(key=logical_key, backend=DispatchBackend.DEEP_GEMM))
+
+    assert cache.has_deep_gemm_entry(
+        logical_key.m,
+        logical_key.n,
+        logical_key.k,
+        logical_key.activation_scale_layout,
+    )
+    assert not cache.has_deep_gemm_entry(
+        transposed_key.m,
+        transposed_key.n,
+        transposed_key.k,
+        transposed_key.activation_scale_layout,
+    )
 
 
 def test_capture_guard_precedes_deep_gemm_cache_hit() -> None:

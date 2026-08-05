@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.custom_ops.fp8_block_scaling_dispatch import (
+    ActivationScaleLayout,
     DispatchBackend,
     DispatchCache,
     DispatchEntry,
@@ -14,6 +16,7 @@ from tensorrt_llm._torch.custom_ops.fp8_block_scaling_dispatch import (
 from tensorrt_llm._torch.custom_ops.fp8_block_scaling_dispatch_cache import write_dispatch_cache
 from tensorrt_llm._torch.custom_ops.fp8_block_scaling_dispatch_runtime import (
     _load_cache,
+    get_dispatch_backend,
     make_dispatch_key,
     make_runtime_identity,
 )
@@ -119,6 +122,62 @@ def test_small_m_guard_routes_to_trt_without_using_deep_gemm_cache(
 
     # Then
     torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
+def test_same_shape_different_layout_does_not_route_to_deep_gemm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Given
+    inputs = _inputs()
+    identity = make_runtime_identity(inputs[0])
+    runtime_key = make_dispatch_key(*inputs)
+    cached_layout = next(
+        layout
+        for layout in (
+            ActivationScaleLayout.LOGICAL_M_K_BLOCKS,
+            ActivationScaleLayout.TRT_PADDED_1D,
+            ActivationScaleLayout.TRT_TRANSPOSED_K_M,
+        )
+        if layout is not runtime_key.activation_scale_layout
+    )
+    cache_path = tmp_path / "dispatch.json"
+    write_dispatch_cache(
+        cache_path,
+        DispatchCache(
+            identity=identity,
+            entries=(
+                DispatchEntry(
+                    key=replace(runtime_key, activation_scale_layout=cached_layout),
+                    backend=DispatchBackend.DEEP_GEMM,
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setenv("TRTLLM_FP8_BLOCK_SCALING_GEMM_DISPATCH_CACHE", str(cache_path))
+    _load_cache.cache_clear()
+
+    # When
+    backend = get_dispatch_backend(*inputs)
+    output = torch.ops.trtllm.fp8_block_scaling_gemm(*inputs)
+    expected = torch.ops.trtllm.fp8_block_scaling_gemm_trtllm(*inputs)
+
+    # Then
+    assert backend is DispatchBackend.TRTLLM
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
+def test_public_op_preserves_no_autograd_error() -> None:
+    # Given
+    a, b, a_scale, b_scale = _inputs()
+    a.requires_grad_(True)
+
+    # When
+    output = torch.ops.trtllm.fp8_block_scaling_gemm(a, b, a_scale, b_scale)
+
+    # Then
+    with pytest.raises(RuntimeError, match="no autograd formula was registered"):
+        output.sum().backward()
 
 
 def test_deep_gemm_availability_reports_hopper_build_support() -> None:

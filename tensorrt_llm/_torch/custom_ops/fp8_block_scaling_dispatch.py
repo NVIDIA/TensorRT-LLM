@@ -77,16 +77,61 @@ class DispatchCache:
     identity: CacheIdentity
     entries: tuple[DispatchEntry, ...]
     _index: Mapping[DispatchKey, DispatchEntry] = field(init=False, repr=False, compare=False)
+    _deep_gemm_layouts: Mapping[tuple[int, int, int], frozenset[ActivationScaleLayout]] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         index = {entry.key: entry for entry in self.entries}
         if len(index) != len(self.entries):
             raise ValueError("FP8 dispatch cache contains duplicate exact keys")
         object.__setattr__(self, "_index", MappingProxyType(index))
+        deep_gemm_layouts: dict[tuple[int, int, int], set[ActivationScaleLayout]] = {}
+        for entry in self.entries:
+            key = entry.key
+            if (
+                entry.backend is DispatchBackend.DEEP_GEMM
+                and key.activation_scale_layout is not ActivationScaleLayout.UNSUPPORTED
+                and key.weight_scale_layout is WeightScaleLayout.LOGICAL_N_K_BLOCKS
+                and key.matrix_layout is MatrixLayout.K_MAJOR_CONTIGUOUS
+            ):
+                shape = (key.m, key.n, key.k)
+                deep_gemm_layouts.setdefault(shape, set()).add(key.activation_scale_layout)
+        object.__setattr__(
+            self,
+            "_deep_gemm_layouts",
+            MappingProxyType(
+                {shape: frozenset(layouts) for shape, layouts in deep_gemm_layouts.items()}
+            ),
+        )
 
     def find(self, key: DispatchKey) -> DispatchEntry | None:
         """Return the exact validated entry for a runtime input signature."""
         return self._index.get(key)
+
+    def might_select_deep_gemm(self, m: int, n: int, k: int) -> bool:
+        """Return whether any viable DeepGEMM entry exists for this shape."""
+        return (m, n, k) in self._deep_gemm_layouts
+
+    def deep_gemm_activation_layouts(
+        self,
+        m: int,
+        n: int,
+        k: int,
+    ) -> frozenset[ActivationScaleLayout] | None:
+        """Return the validated DeepGEMM activation layouts for a shape."""
+        return self._deep_gemm_layouts.get((m, n, k))
+
+    def has_deep_gemm_entry(
+        self,
+        m: int,
+        n: int,
+        k: int,
+        activation_scale_layout: ActivationScaleLayout,
+    ) -> bool:
+        """Return whether a compatible exact DeepGEMM cache entry exists."""
+        layouts = self.deep_gemm_activation_layouts(m, n, k)
+        return layouts is not None and activation_scale_layout in layouts
 
 
 @dataclass(frozen=True, slots=True)
