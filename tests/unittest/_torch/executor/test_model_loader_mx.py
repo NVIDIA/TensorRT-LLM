@@ -207,6 +207,30 @@ def _llama_alias_state(model):
     }
 
 
+def _mx_canonical_parameter_catalog(model: nn.Module):
+    """Mirror MX's canonical TRT-LLM parameter view without importing MX."""
+    catalog = {}
+    seen_storages = set()
+    runtime_alias_components = {"next_attn", "next_layer_layernorm"}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        storage = (
+            parameter.device.type,
+            parameter.device.index,
+            parameter.data_ptr(),
+        )
+        if runtime_alias_components.intersection(name.split(".")):
+            continue
+        if storage in seen_storages:
+            continue
+        seen_storages.add(storage)
+        catalog[name] = (
+            parameter.data_ptr(),
+            tuple(parameter.shape),
+            parameter.dtype,
+        )
+    return catalog
+
+
 def _llama_input_embeddings(model: nn.Module) -> torch.Tensor:
     input_ids = torch.tensor(
         [0, 1, 2],
@@ -1085,6 +1109,26 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     )
 
     assert decision.qualified
+
+
+@pytest.mark.cpu_only
+def test_staged_llama_finalization_preserves_mx_tensor_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _tiny_llama_model(monkeypatch)
+
+    # MX discovers and registers tensors after receiver alias preparation.
+    ModelLoader._setup_aliases(model)
+    registered_catalog = _mx_canonical_parameter_catalog(model)
+
+    # This is the receiver-side finalization sequence after RDMA completes.
+    ModelLoader._setup_aliases(model)
+    ModelLoader._mark_weights_transformed(model)
+    ModelLoader._walk_cache_state(model)
+    published_catalog = _mx_canonical_parameter_catalog(model)
+
+    assert registered_catalog
+    assert published_catalog == registered_catalog
 
 
 @pytest.mark.cpu_only

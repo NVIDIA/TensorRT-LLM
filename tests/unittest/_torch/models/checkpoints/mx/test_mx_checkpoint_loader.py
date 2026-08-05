@@ -39,7 +39,6 @@ from tensorrt_llm._torch.weight_sharing import (
     SourceIdentity,
 )
 
-
 pytestmark = pytest.mark.cpu_only
 
 
