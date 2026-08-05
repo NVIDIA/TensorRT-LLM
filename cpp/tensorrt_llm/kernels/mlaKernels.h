@@ -140,7 +140,6 @@ struct MlaParams
     // q_b_layernorm already applied the Q RoPE and wrote the rotated rope segment
     // as FP8, so the context RoPE kernel must skip its Q region entirely -- the
     // bf16 `q_pe` it would rotate is stale on that path.
-    bool q_rope_done = false;
 
     // Fused kv_a_layernorm in the absorption-mode context RoPE kernel. When set,
     // `latent_cache` holds the RAW (un-normalized) kv_a_proj output and the kernel
