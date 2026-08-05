@@ -52,6 +52,15 @@ __all__ = [
 ]
 
 
+# Raw logit written into confidence rows that carry no measurement (slot-free
+# fill, never-drafted slots): sigmoid(30/T) ~ 1.0 at any fitted temperature, so
+# an unknown row is treated as "certainly accept" -- optimistic by design, the
+# same convention as SGLang's ones-fill for stale rows. Shared from here
+# because both the worker (writes it) and the planner (counts it) need it and
+# they cannot import each other.
+NEUTRAL_CONFIDENCE_LOGIT = 30.0
+
+
 @dataclass(frozen=True)
 class DSparkScheduleConfig:
     """Bounds for the per-request verify length.

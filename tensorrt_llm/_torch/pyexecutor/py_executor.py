@@ -2507,6 +2507,14 @@ class PyExecutor:
         """
         worker = getattr(self.model_engine, "_get_spec_worker", None)
         stats = getattr(worker(), "ragged_stats", None) if worker else None
+        # Drained BEFORE the ragged early-return. The two are unrelated: STS
+        # collection runs in static mode too, and gating its final flush on
+        # `ragged_stats.steps_total > 0` silently discarded the tail of every
+        # static-mode collection run -- up to flush_every steps x batch rows,
+        # and the shards still looked well-formed.
+        recorder = getattr(self.sampler, "sts_recorder", None)
+        if recorder is not None:
+            recorder.flush()
         if stats is None or not getattr(stats, "steps_total", 0):
             return
         stats.log_summary(prefix="DSpark ragged verify [final]")
@@ -3376,6 +3384,16 @@ class PyExecutor:
         if (stats is not None and self.sampler is not None
                 and getattr(self.sampler, "acceptance_stats", None) is None):
             self.sampler.acceptance_stats = stats
+        # Same wiring, same reason, for STS collection: the logits live on the
+        # worker and the accepted count is only host-side in the sampler, and
+        # `py_seq_slot` indexes both. None on every path that is not collecting.
+        if (self.sampler is not None
+                and getattr(self.sampler, "sts_recorder", None) is None):
+            recorder = getattr(worker, "sts_recorder", None)
+            if recorder is not None:
+                self.sampler.sts_recorder = recorder
+                self.sampler.sts_logits_buffer = getattr(
+                    worker, "_confidence_logits", None)
         mode = getattr(worker, "ragged_verify_mode", None)
         compute_windows = (mode.computes_windows if mode is not None else
                            getattr(self.model_engine.spec_config,
@@ -3463,8 +3481,10 @@ class PyExecutor:
                     fallback_reason = "peer_declined"
                 ragged_lens = None
             else:
-                agreed_max = max(int(payload[3]) for payload in payloads)
-                ragged_lens = [min(int(v), agreed_max) for v in ragged_lens]
+                # payload[3] (the local max window) stays in the collective so
+                # its shape is stable, but capping local windows at the global
+                # max was a no-op by construction (the global max is >= every
+                # local window) and nothing else consumed it.
                 # Third element is the group's answer, identical on every rank
                 # by construction, not each rank's own flag: what the fit needs
                 # to know is whether the row maximum will be taken at all.
@@ -3570,7 +3590,13 @@ class PyExecutor:
             stats.record_step(num_gen_requests=num_gen_requests,
                               verify_lens=fitted,
                               bucket=bucket,
-                              padded_bs=None,
+                              # Was hardcoded None, which both left
+                              # padded_bs_hist empty in every summary ever
+                              # logged and denied record_step the row count it
+                              # needs to book a comparable ceiling.
+                              padded_bs=getattr(
+                                  self.model_engine,
+                                  "_dspark_last_padded_bs", None),
                               fallback=fallback_reason,
                               delivered=delivered)
 
@@ -3605,7 +3631,18 @@ class PyExecutor:
         # whichever requests it happens to be scheduling.
         buffer = worker.staged_confidence_buffer()
         if buffer is not None:
-            planner.stage_confidence(buffer)
+            # The stamp buffer says which draft pass last wrote each slot; the
+            # sequence bump marks "everything drafted so far" so the planner
+            # can histogram how stale each gathered row was at decision time.
+            staged_seq = None
+            bump = getattr(worker, "bump_draft_seq", None)
+            if bump is not None:
+                staged_seq = bump()
+            stamps_fn = getattr(worker, "confidence_stamp_buffer", None)
+            planner.stage_confidence(
+                buffer,
+                stamps=stamps_fn() if stamps_fn is not None else None,
+                staged_seq=staged_seq)
 
         return int(runtime_draft_len)
 

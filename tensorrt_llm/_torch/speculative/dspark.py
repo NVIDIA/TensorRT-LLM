@@ -30,6 +30,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
 
 # Raw-logit fill for an unscored confidence slot: sigmoid(30) rounds to 1.0 in
 # fp32, so an unwritten row schedules as "verify the whole block".
-_NEUTRAL_CONFIDENCE_LOGIT = 30.0
+_NEUTRAL_CONFIDENCE_LOGIT = NEUTRAL_CONFIDENCE_LOGIT
 
 
 @dataclass
@@ -250,8 +251,22 @@ class DSparkWorker(SpecWorkerBase):
         # here (never per step) so the captured draft graph cannot diverge.
         # ``_confidence_logits`` is the slot-indexed handoff buffer to the
         # verification scheduler; see ``_lazy_init`` for its neutral value.
-        self.return_confidence = bool(getattr(spec_config, "enable_confidence_scheduling", False))
+        self.return_confidence = bool(spec_config.enable_confidence_scheduling)
+        import os as _os
+
+        from .dspark_sts import STS_COLLECT_ENV
+        if _os.environ.get(STS_COLLECT_ENV) and not self.return_confidence:
+            raise ValueError(
+                f"{STS_COLLECT_ENV} is set but enable_confidence_scheduling is "
+                f"off; the recorder is only built on the confidence path, so "
+                f"this run would complete cleanly and collect NOTHING. Enable "
+                f"confidence scheduling (a missing cost table keeps the "
+                f"planner on the full block) or unset the variable.")
         self._confidence_logits: Optional[torch.Tensor] = None  # [max_batch+2, block]
+        # Draft-pass stamps for the buffer above; allocated in ``_lazy_init``.
+        self._confidence_stamp: Optional[torch.Tensor] = None
+        self._draft_seq_host = 0
+        self._draft_seq_cuda: Optional[torch.Tensor] = None
         # Row index of the permanently-neutral confidence row; see ``_lazy_init``.
         self._neutral_conf_row = 0
         # Host-side coordinator that turns the confidence snapshot into this
@@ -281,6 +296,25 @@ class DSparkWorker(SpecWorkerBase):
         row ordering across the one-iteration lag.
         """
         return self._confidence_logits
+
+    def confidence_stamp_buffer(self) -> Optional[torch.Tensor]:
+        """The slot-indexed draft-pass stamps, or None before ``_lazy_init``."""
+        return self._confidence_stamp
+
+    def bump_draft_seq(self) -> int:
+        """Advance the draft-pass sequence and return the PREVIOUS value.
+
+        Called once per step from the executor's host path, before this step's
+        forward is enqueued: the in-graph stamp scatter then labels this step's
+        confidence rows with the new sequence, while the returned previous
+        value is the sequence of the last COMPLETED draft -- i.e. the newest
+        content a snapshot staged right now can possibly contain.
+        """
+        prev = self._draft_seq_host
+        self._draft_seq_host += 1
+        if self._draft_seq_cuda is not None:
+            self._draft_seq_cuda.fill_(self._draft_seq_host)
+        return prev
 
     def confidence_row_for(self, req_id: int) -> int:
         """Buffer row holding ``req_id``'s confidence, host-side.
@@ -366,6 +400,25 @@ class DSparkWorker(SpecWorkerBase):
                 dtype=torch.float32,
                 device="cuda",
             )
+            # Freshness stamps, one per buffer row: the draft-pass sequence
+            # number of the last write. SGLang carries the same thing
+            # (_carry_generation) next to its confidence ring; without it there
+            # is no way to know whether a gathered row is this step's data, a
+            # stale replay, or the neutral fill -- the planner path has never
+            # been measured. Written in-graph through the same `slots` scatter
+            # as the confidence itself; the scalar is bumped outside the graph.
+            self._confidence_stamp = torch.zeros(
+                (num_rows + 1,), dtype=torch.int32, device="cuda")
+            self._draft_seq_host = 0
+            # Bumped by fill_ from the executor's host path, which runs
+            # OUTSIDE inference mode; a tensor born here (inside the draft
+            # forward's inference mode) is an "inference tensor" and refuses
+            # that update -- it killed all 8 ranks on the first decode step.
+            # The stamp buffer above stays an inference tensor on purpose:
+            # it is only written in-graph, like _confidence_logits.
+            with torch.inference_mode(False):
+                self._draft_seq_cuda = torch.zeros((), dtype=torch.int32,
+                                                   device="cuda")
             self._build_verify_planner(draft_model, block_size, max_batch)
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
@@ -392,7 +445,7 @@ class DSparkWorker(SpecWorkerBase):
         cfg = DSparkScheduleConfig(block_size=block_size, min_verify_len=1)
 
         cost_table = None
-        table_path = getattr(self.spec_config, "confidence_sps_table_path", None)
+        table_path = self.spec_config.confidence_sps_table_path
         if table_path:
             with open(table_path, encoding="utf-8") as f:
                 raw = json.load(f)
@@ -400,6 +453,19 @@ class DSparkWorker(SpecWorkerBase):
             # a ratio, so the non-trimmable part of the step time moves the
             # argmax. Omitting them says "step_time_ms already measures whole
             # steps at the deployment's batch size".
+            from .dspark_planner import check_table_fingerprint
+            check_table_fingerprint(payload=raw, live={
+                "tp": int(getattr(self.mapping, "tp_size", 0) or 0),
+                "ep": int(getattr(self.mapping, "moe_ep_size", 0) or 0),
+                "attention_dp": bool(getattr(self.mapping, "enable_attention_dp", False)),
+                "block": int(block_size),
+                "max_batch_size": int(max_batch),
+                # moe_backend deliberately NOT in the live dict yet: the
+                # MoeConfig.backend -> model_config.moe_backend propagation is
+                # not textually obvious, and a wrong live value here would
+                # false-reject a correct table. Until verified, the table's
+                # moe_backend surfaces on the "check manually" INFO line.
+            })
             cost_table = SpsCostTable(
                 token_counts=[int(v) for v in raw["token_counts"]],
                 step_time_ms=[float(v) for v in raw["step_time_ms"]],
@@ -421,16 +487,37 @@ class DSparkWorker(SpecWorkerBase):
 
         # Calibration lives on the draft's confidence head; fall back to a plain
         # sigmoid when the head is absent (no confidence to calibrate anyway).
-        head = getattr(getattr(draft_model, "mtp_layers", [None])[-1], "confidence_head", None)
+        from .dspark_sts import resolve_confidence_head
+        head = resolve_confidence_head(draft_model)
         apply_calibration = head.apply_sts if head is not None else None
-        sts_path = getattr(self.spec_config, "confidence_sts_path", None)
+        sts_path = self.spec_config.confidence_sts_path
+        if sts_path and head is None:
+            # Refuse rather than degrade. The old chained getattr defaulted to
+            # None when the runtime object was the DSparkForCausalLM wrapper
+            # (which keeps the stages under .dspark_model, not .mtp_layers), so
+            # every confidence-scheduled run in the first campaign silently
+            # planned on RAW sigmoid survivals -- wildly overconfident (the
+            # fitted temperatures are 2.8-10) -- and chose the full block 99.7%
+            # of the time. The only visible symptom was the ABSENCE of one log
+            # line. A configured calibration that cannot be attached is a
+            # wiring bug, never a preference.
+            raise ValueError(
+                f"confidence_sts_path is set but no confidence head was found "
+                f"on {type(draft_model).__name__}; calibration cannot be "
+                f"applied, so the planner would schedule on raw sigmoid "
+                f"survivals. This is a model-wiring bug, not a config choice.")
         if sts_path and head is not None:
-            with open(sts_path, encoding="utf-8") as f:
-                temps = json.load(f)["sts_temperatures"]
+            # Accepts either key spelling: this repo writes "sts_temperatures",
+            # SGLang's DSparkStsCalibration writes "temperatures". The vectors
+            # are interchangeable -- both are fitted against the same cumulative
+            # product with the same sigmoid -- so rejecting the other spelling
+            # would refuse a usable table over a name.
+            from .dspark_sts import load_sts_temperatures_from_path
+            temps = load_sts_temperatures_from_path(sts_path)
             head.load_sts_temperatures(torch.tensor(temps, dtype=torch.float32))
             logger.info(f"DSpark: loaded STS calibration from {sts_path}")
 
-        tiers = getattr(self.spec_config, "verify_len_tiers", None)
+        tiers = self.spec_config.verify_len_tiers
         if not tiers:
             # Not configured: derive the ladder from the measured cost curve
             # instead of hardcoding one. Each tier is a captured graph whose
@@ -465,6 +552,19 @@ class DSparkWorker(SpecWorkerBase):
             self.spec_config, "enable_ragged_verify", False) else
                       RaggedVerifyMode.STATIC)
         self.ragged_verify_mode = read_ragged_verify_mode(default=configured)
+        # STS calibration data collection. Off unless the env var is set; when
+        # on it costs one device->host copy per decode step, which is why it is
+        # a collection mode rather than something a serving run carries.
+        from .dspark_sts import make_recorder_from_env
+        # `block_size` is the local parameter, not an attribute -- the very
+        # next line uses it the same way.
+        self.sts_recorder = make_recorder_from_env(
+            block_size=int(block_size),
+            rank=int(getattr(getattr(self, "mapping", None), "rank", 0) or 0),
+            has_cost_table=bool(
+                self.spec_config.confidence_sps_table_path),
+            ragged_mode=getattr(self.ragged_verify_mode, "value", None))
+
         self.ragged_stats = DSparkRaggedStats(mode=self.ragged_verify_mode,
                                               max_draft_len=block_size)
         # goal doc A6: the ragged counters say what happened, the planner's say
@@ -677,6 +777,18 @@ class DSparkWorker(SpecWorkerBase):
         # one-iteration lag.
         if confidence is not None:
             self._confidence_logits[slots] = confidence.detach()
+            # Same slots, same capture region: content-only update, graph-safe.
+            self._confidence_stamp[slots] = self._draft_seq_cuda
+            # STS collection reads this buffer from inside the sampler, which
+            # under the overlap scheduler can run AFTER the next step's draft
+            # has already overwritten it. SGLang avoids the question by keeping
+            # what the draft produced (`last_confidence_raw`) rather than
+            # re-reading a shared buffer later. Stash the same thing here, so
+            # the recorder can pair against the step that actually produced it
+            # -- and, for one diagnostic run, compare the two sources.
+            if getattr(self, "sts_recorder", None) is not None:
+                self.sts_recorder.stash_draft_confidence(
+                    logits=confidence.detach(), slots=slots)
         return block_logits
 
     def _forward_impl(

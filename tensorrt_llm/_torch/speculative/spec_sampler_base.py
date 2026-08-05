@@ -199,6 +199,11 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
     #: Optional observability sink, attached by the DSpark worker. Left None
     #: everywhere else so this costs one attribute read per request.
     acceptance_stats = None
+    #: STS calibration collection; attached alongside `acceptance_stats` and
+    #: None everywhere else. `sts_logits_buffer` is the worker's persistent
+    #: [rows, K] confidence buffer, indexed by the same py_seq_slot.
+    sts_recorder = None
+    sts_logits_buffer = None
 
     @staticmethod
     def _verified_len(request: LlmRequest, runtime_draft_len: int,
@@ -252,6 +257,12 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
         caps = state.verify_caps_snapshot
+        if self.sts_recorder is not None:
+            # A fresh step: drop the cached host mirror so the first `record`
+            # below pulls this step's logits rather than the previous step's.
+            self._sts_step = getattr(self, "_sts_step", 0) + 1
+            self.sts_recorder.begin_step(self._sts_step)
+
         for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
@@ -290,7 +301,23 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                     window=verified_len if cap is None else int(cap),
                     cap_trim=(0 if cap_trim_list is None else
                               cap_trim_list[req.py_seq_slot]))
+            # STS calibration pairs this request's drafted-block logits with
+            # how much of that block was accepted. Recorded here for the same
+            # reason acceptance is: this is the only place both are host-side
+            # and belong to the same step. The recorder pulls the logits buffer
+            # once per step, not once per request.
+            if (self.sts_recorder is not None
+                    and self.sts_logits_buffer is not None):
+                self.sts_recorder.record(
+                    slot=req.py_seq_slot,
+                    accepted=req.py_num_accepted_draft_tokens,
+                    device_logits=self.sts_logits_buffer)
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
+
+        if self.sts_recorder is not None:
+            # Periodic flush, so a run killed mid-collection still leaves usable
+            # shards rather than everything living in a list that dies with it.
+            self.sts_recorder.end_step()
 
     def sample_async(
         self,

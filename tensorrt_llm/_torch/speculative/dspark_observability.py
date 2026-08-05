@@ -277,9 +277,27 @@ class DSparkRaggedStats:
         # and blame the scheduler for a batch that had not filled yet.
         if int(num_gen_requests) >= 2:
             self.steps_multi_request += 1
-        # What a no-trim step would have submitted: every request sends its
-        # bonus token plus the full block.
-        self.ceiling_tokens += int(num_gen_requests) * (1 + self.max_draft_len)
+        # What a no-trim step would have submitted: every row sends its bonus
+        # token plus the full block.
+        #
+        # ROWS, not requests. When the step ran on a fitted bucket, `delivered`
+        # below books `bucket = padded_bs * (tier + 1)`, and `padded_bs` is the
+        # CUDA-graph-rounded maximum row count ACROSS RANKS -- so a rank holding
+        # fewer requests than its widest peer still submits the peer's rows.
+        # Booking those rows as delivered against a ceiling counted over this
+        # rank's real requests made trim_ratio negative in four separate runs
+        # (jobs 2560992 -0.001, 2561519 -0.0438, 2563581 -0.0082), and the
+        # assert_ragged_active gate then reported "nothing was saved", which is
+        # the opposite of what a negative ratio means.
+        #
+        # Only that one case rebases. Every other path books `delivered` over
+        # the real rows -- the no-window path and the cap-accept path each add
+        # exactly n*(1+K), and the bucket-less ragged path adds sum(1+v) <=
+        # n*(1+K) -- so widening their ceiling would understate the trim.
+        ceiling_rows = int(num_gen_requests)
+        if bucket and delivered is None and padded_bs:
+            ceiling_rows = max(ceiling_rows, int(padded_bs))
+        self.ceiling_tokens += ceiling_rows * (1 + self.max_draft_len)
 
         if fallback:
             self.fallbacks[fallback] += 1
