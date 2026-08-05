@@ -18,7 +18,6 @@ from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
-from .spec_sampler_base import SpecSampler
 from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
@@ -589,12 +588,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                    i * self.hidden_size,
                                    (i + 1) * self.hidden_size)
                 break
-
-
-# Alias for backwards compatibility -- see SpecSampler. Dynamic tree used to
-# narrow new_tokens to max_draft_len + 1 here; SpecSampler now allocates the
-# wire width uniformly, which is a superset.
-Eagle3OneModelSampler = SpecSampler
 
 
 class Eagle3OneModelWorker(SpecWorkerBase):

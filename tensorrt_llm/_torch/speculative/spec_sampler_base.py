@@ -307,9 +307,3 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
         )
-
-
-# Backwards-compatible alias. The class used to be an abstract base with one
-# subclass per speculative mode; the subclasses differed only in buffer sizing
-# and are now folded into SpecSampler itself.
-SpecSamplerBase = SpecSampler
