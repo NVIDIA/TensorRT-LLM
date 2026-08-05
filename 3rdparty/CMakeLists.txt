@@ -101,6 +101,7 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   # Extract optional fields with error handling
   string(JSON DEP_GIT_SHALLOW            ERROR_VARIABLE _err GET "${DEP_OBJECT}" "git_shallow")
   string(JSON DEP_SOURCE_SUBDIR          ERROR_VARIABLE _err GET "${DEP_OBJECT}" "source_subdir")
+  string(JSON DEP_GIT_SUBMODULES         ERROR_VARIABLE _git_submodules_error GET "${DEP_OBJECT}" "git_submodules")
   string(JSON DEP_GIT_SUBMODULES_RECURSE ERROR_VARIABLE _err GET "${DEP_OBJECT}" "git_submodules_recurse")
   string(JSON DEP_USE_URL                ERROR_VARIABLE _err GET "${DEP_OBJECT}" "use_url")
   string(JSON DEP_PATCH_FILE            ERROR_VARIABLE _err GET "${DEP_OBJECT}" "patch_file")
@@ -139,7 +140,11 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
     )
   endif()
 
-  FetchContent_Declare(${FETCH_ARGS})
+  if(_git_submodules_error STREQUAL "NOTFOUND")
+    FetchContent_Declare(${FETCH_ARGS} GIT_SUBMODULES "${DEP_GIT_SUBMODULES}")
+  else()
+    FetchContent_Declare(${FETCH_ARGS})
+  endif()
 
   # Special handling: Export deep_ep commit to global property
   if(DEP_NAME STREQUAL "deep_ep_download")

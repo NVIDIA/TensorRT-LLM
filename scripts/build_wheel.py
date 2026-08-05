@@ -1083,6 +1083,7 @@ def main(*,
 
         # Stage the FetchContent-patched MSA package for setup.py packaging.
         msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
+        cutlass_src = build_dir / "_deps" / "cutlass-src"
         msa_dst = project_dir / "3rdparty" / "fmha_sm100"
         if not (msa_src / "cute" / "interface.py").is_file():
             raise FileNotFoundError(
@@ -1095,19 +1096,20 @@ def main(*,
         msa_dst.mkdir(parents=True)
         for python_source in msa_src.glob("*.py"):
             install_file(python_source, msa_dst)
-        for relative_dir in (
-                Path("csrc"),
-                Path("cute"),
-                Path("cutlass/include"),
-                Path("cutlass/tools/util/include"),
+        for source_dir, relative_dir in (
+            (msa_src / "csrc", Path("csrc")),
+            (msa_src / "cute", Path("cute")),
+            (cutlass_src / "include", Path("cutlass/include")),
+            (cutlass_src / "tools/util/include",
+             Path("cutlass/tools/util/include")),
         ):
             (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
             install_tree(
-                msa_src / relative_dir,
+                source_dir,
                 msa_dst / relative_dir,
                 dirs_exist_ok=True,
             )
-        install_file(msa_src / "cutlass" / "LICENSE.txt", msa_dst / "cutlass")
+        install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
 
         if not skip_stubs:
             with working_directory(pkg_dir):
