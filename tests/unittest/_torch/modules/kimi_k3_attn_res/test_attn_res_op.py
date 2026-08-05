@@ -156,7 +156,7 @@ def test_preallocated_snapshot_bank_matches_legacy_growth() -> None:
             layer, legacy_hidden_states, legacy_block_residual
         )
         preallocated_hidden_states, num_snapshots = layer(
-            preallocated_hidden_states, snapshot_bank, num_snapshots, None, None
+            preallocated_hidden_states, snapshot_bank, num_snapshots, None
         )
         torch.testing.assert_close(preallocated_hidden_states, legacy_hidden_states, rtol=0, atol=0)
         assert snapshot_bank.data_ptr() == bank_ptr
