@@ -345,9 +345,7 @@ def _run_wan22_multinode_slurm_rank(request, tmp_path):
 
 
 def _run_wan22_multinode_slurm_parent():
-    # Guard on the wrapper alone, not on its world size: trtllm-llmapi-launch
-    # strips SLURM_* at any scale, and a size-gated check would let the
-    # stripped-env case fall through to a misleading "no SLURM allocation" skip.
+    # The wrapper strips SLURM_* at any scale, so do not gate this on world size.
     if os.environ.get("TLLM_SPAWN_PROXY_PROCESS") == "1":
         pytest.fail(
             "VisualGen SLURM external-launch coverage cannot run under "
