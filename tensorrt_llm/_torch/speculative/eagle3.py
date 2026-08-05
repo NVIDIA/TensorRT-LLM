@@ -18,11 +18,11 @@ from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
-from .mtp import MTPSampler, _select_mtp_position_ids
+from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
+from .spec_sampler_base import SpecSampler
 from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
@@ -601,20 +601,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
 
-class Eagle3OneModelSampler(MTPSampler):
-    """Sampler for one-model EAGLE3 (linear and dynamic tree modes)."""
-
-    def __init__(self, args: TorchSampler.Args, spec_config=None):
-        self._spec_config = spec_config
-        super().__init__(args, nextn=args.max_total_draft_tokens)
-
-    def _get_max_new_tokens(self, args: TorchSampler.Args,
-                            draft_len: int) -> int:
-        """Dynamic tree: accepted path depth <= max_draft_len + 1."""
-        if (self._spec_config is not None
-                and getattr(self._spec_config, 'use_dynamic_tree', False)):
-            return self._spec_config.max_draft_len + 1
-        return self._get_max_tokens(args, draft_len)
+# Alias for backwards compatibility -- see SpecSampler. Dynamic tree used to
+# narrow new_tokens to max_draft_len + 1 here; SpecSampler now allocates the
+# wire width uniformly, which is a superset.
+Eagle3OneModelSampler = SpecSampler
 
 
 class Eagle3OneModelWorker(SpecWorkerBase):
