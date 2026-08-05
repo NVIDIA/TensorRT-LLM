@@ -671,23 +671,37 @@ class KimiKDALinearAttention(nn.Module):
                 f"captured CUDA graphs"
             )
 
-        # kda_decode writes its [B, 1, H, hd] result into this buffer. It is
-        # sized to the pool slot count on the first decode and never
-        # reallocated, because captured graphs bind this pointer.
-        if self._o_dense is None:
-            if torch.cuda.is_current_stream_capturing():
-                return self.forward_decode_fallback(
-                    x2d, conv_pool, ssm_pool, slot_indices, layer_cache, ssm_state_indices
-                )
-            self._o_dense = torch.empty(
-                max(conv_pool.shape[0], B), 1, H, hd, dtype=torch.bfloat16, device=x2d.device
-            )
+        # kda_decode is inplace-only. BCG supplies its graph-owned core buffer;
+        # eager decode uses a persistent buffer whose pointer remains stable
+        # across CUDA graph captures.
+        if output is not None:
+            kda_out = output.view(B, 1, H, hd)
         else:
-            assert self._o_dense.shape[0] >= B, (
-                f"KDA decode output buffer holds {self._o_dense.shape[0]} rows "
-                f"but the decode batch is {B}; reallocating would corrupt "
-                f"previously captured CUDA graphs"
-            )
+            if self._o_dense is None:
+                if torch.cuda.is_current_stream_capturing():
+                    return self.forward_decode_fallback(
+                        x2d,
+                        conv_pool,
+                        ssm_pool,
+                        slot_indices,
+                        layer_cache,
+                        ssm_state_indices,
+                    )
+                self._o_dense = torch.empty(
+                    max(conv_pool.shape[0], B),
+                    1,
+                    H,
+                    hd,
+                    dtype=torch.bfloat16,
+                    device=x2d.device,
+                )
+            else:
+                assert self._o_dense.shape[0] >= B, (
+                    f"KDA decode output buffer holds {self._o_dense.shape[0]} rows "
+                    f"but the decode batch is {B}; reallocating would corrupt "
+                    f"previously captured CUDA graphs"
+                )
+            kda_out = self._o_dense[:B]
 
         def _project_qkvg() -> torch.Tensor:
             if self._qkvg_proj_weight is not None:
@@ -739,7 +753,7 @@ class KimiKDALinearAttention(nn.Module):
             state=ssm_pool,
             onorm_g=x_qkvg[:, 3 * d :].unflatten(-1, (H, hd)).unsqueeze(0),
             onorm_weight=self._onorm_w_f32,
-            out=self._o_dense[:B],
+            out=kda_out,
             ssm_state_indices=ssm_state_indices,
             cu_seqlens=mamba_metadata._arange_buffer[: B + 1],
             scale=hd**-0.5,
@@ -754,7 +768,7 @@ class KimiKDALinearAttention(nn.Module):
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
         if output is not None:
-            output.copy_(o.view(B, H, hd))
+            # decode_kda already wrote the core in place via out=kda_out.
             return None
         return self.o_proj(o.view(B, d))
 
