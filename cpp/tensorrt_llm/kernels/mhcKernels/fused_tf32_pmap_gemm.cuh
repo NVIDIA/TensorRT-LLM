@@ -174,11 +174,11 @@ __device__ __forceinline__ void stsm_x4_b16_rout(void* smem_dst, uint32_t a, uin
 
 template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
     uint32_t kSwizzleCDMode, uint32_t N_B_STAGES, uint32_t N_INPUT_STAGES, uint32_t kNumMMAThreads,
-    uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kEarlyRelease = false>
+    uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kEarlyRelease = false, uint32_t kXSplit = 1>
 __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf32_pmap_gemm_rout_atomic_impl(
-    const uint32_t shape_m, const __grid_constant__ cute::TmaDescriptor tensor_map_residual,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_x, const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_residual_out,
+    uint32_t const shape_m, __grid_constant__ const cute::TmaDescriptor tensor_map_residual,
+    __grid_constant__ const cute::TmaDescriptor tensor_map_x, __grid_constant__ const cute::TmaDescriptor tensor_map_b,
+    __grid_constant__ const cute::TmaDescriptor tensor_map_residual_out,
     float* __restrict__ D, // [M, SHAPE_N]  (caller memsets to 0)
     float const* __restrict__ post_mix, float const* __restrict__ comb_mix, float* __restrict__ sqr_sum)
 {                          // [M]            (caller memsets to 0)
@@ -241,6 +241,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     auto smem_res = PatternVisitor(
         [&, base = cursor](uint32_t const& i) { return reinterpret_cast<nv_bfloat16*>(base + i * SMEM_RES_PER_ISTG); });
     cursor += N_INPUT_STAGES * SMEM_RES_PER_ISTG;
+    // Stream split-x tiles through the existing x buffers.
     auto smem_x_stg = PatternVisitor(
         [&, base = cursor](uint32_t const& i) { return reinterpret_cast<nv_bfloat16*>(base + i * SMEM_X_PER_ISTG); });
     cursor += N_INPUT_STAGES * SMEM_X_PER_ISTG;
@@ -258,13 +259,18 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     auto full_input = PatternVisitor([=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + i; });
     auto empty_input
         = PatternVisitor([=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + N_INPUT_STAGES + i; });
-    auto full_cast = PatternVisitor(
+    constexpr uint32_t kXBarriers = (kXSplit > 1) ? 2 * N_INPUT_STAGES : 0;
+    auto full_x = PatternVisitor(
         [=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + i; });
+    auto empty_x = PatternVisitor(
+        [=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + 3 * N_INPUT_STAGES + i; });
+    auto full_cast = PatternVisitor(
+        [=](uint32_t const& i) { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kXBarriers + i; });
     auto empty_cast = PatternVisitor([=](uint32_t const& i)
-        { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kNumCastStages + i; });
-    auto tmem_full_barrier = barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages;
+        { return barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kXBarriers + kNumCastStages + i; });
+    auto tmem_full_barrier = barrier_start_ptr + 2 * N_B_STAGES + 2 * N_INPUT_STAGES + kXBarriers + 2 * kNumCastStages;
 
-    cursor += (2 * N_B_STAGES + 2 * N_INPUT_STAGES + 2 * kNumCastStages + 1) * sizeof(Barrier);
+    cursor += (2 * N_B_STAGES + 2 * N_INPUT_STAGES + kXBarriers + 2 * kNumCastStages + 1) * sizeof(Barrier);
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(cursor);
 
     if (warp_idx == 1 and cute::elect_one_sync())
@@ -281,6 +287,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             full_input[i]->init(1);
             empty_input[i]->init(kNumPmapThreads);
         }
+        if constexpr (kXSplit > 1)
+        {
+#pragma unroll
+            for (uint32_t i = 0; i < N_INPUT_STAGES; ++i)
+            {
+                full_x[i]->init(1);
+                empty_x[i]->init(kNumPmapThreads);
+            }
+        }
 #pragma unroll
         for (uint32_t i = 0; i < kNumCastStages; ++i)
         {
@@ -296,11 +311,11 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     }
     __syncthreads();
 
-    const uint32_t block_idx = __shfl_sync(0xffffffff, blockIdx.x, 0);
-    const uint32_t m_block_idx = block_idx / kNumSplits;
-    const uint32_t k_split_idx = block_idx % kNumSplits;
-    const uint32_t m_offset = m_block_idx * BLOCK_M;
-    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
+    uint32_t const block_idx = __shfl_sync(0xffffffff, blockIdx.x, 0);
+    uint32_t const m_block_idx = block_idx / kNumSplits;
+    uint32_t const k_split_idx = block_idx % kNumSplits;
+    uint32_t const m_offset = m_block_idx * BLOCK_M;
+    uint32_t const h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
     constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
 
     // Prologue removed: pmap threads load their own post_mix/comb_mix rows
@@ -314,9 +329,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             uint32_t b_stage = 0;
             uint32_t i_stage = 0;
             uint32_t s = 0;
+            uint32_t xs = 0;
             for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
             {
-                const uint32_t h_tile = h_tile_start + ht;
+                uint32_t const h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
                 uint32_t m_idx = m_block_idx * BLOCK_M;
                 uint32_t h_idx = h_tile * BLOCK_K;
@@ -326,10 +342,27 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                     deep_gemm::tma::copy<BLOCK_K, BLOCK_M, kSwizzleResMode>(&tensor_map_residual, full_input[i_stage],
                         smem_res[i_stage] + j * BLOCK_M * BLOCK_K, j * HIDDEN + h_idx, m_idx);
                 }
-                deep_gemm::tma::copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
-                    &tensor_map_x, full_input[i_stage], smem_x_stg[i_stage], h_idx, m_idx);
-                constexpr uint32_t kInputBytes = SMEM_RES_PER_ISTG + SMEM_X_PER_ISTG;
-                full_input[i_stage]->arrive_and_expect_tx(kInputBytes);
+                if constexpr (kXSplit == 1)
+                {
+                    deep_gemm::tma::copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
+                        &tensor_map_x, full_input[i_stage], smem_x_stg[i_stage], h_idx, m_idx);
+                    constexpr uint32_t kInputBytes = SMEM_RES_PER_ISTG + SMEM_X_PER_ISTG;
+                    full_input[i_stage]->arrive_and_expect_tx(kInputBytes);
+                }
+                else
+                {
+                    full_input[i_stage]->arrive_and_expect_tx(SMEM_RES_PER_ISTG);
+#pragma unroll
+                    for (uint32_t xp = 0; xp < kXSplit; ++xp)
+                    {
+                        uint32_t const xslot = xs % N_INPUT_STAGES;
+                        empty_x[xslot]->wait(((xs / N_INPUT_STAGES) & 1) ^ 1);
+                        deep_gemm::tma::copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
+                            &tensor_map_x, full_x[xslot], smem_x_stg[xslot], h_idx, xp * shape_m + m_idx);
+                        full_x[xslot]->arrive_and_expect_tx(SMEM_X_PER_ISTG);
+                        ++xs;
+                    }
+                }
 
 #pragma unroll
                 for (uint32_t hc = 0; hc < HC_MULT; ++hc)
@@ -364,8 +397,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 
             for (uint32_t s = 0; s < num_total_stages; ++s)
             {
-                const uint32_t b_stage = s % N_B_STAGES;
-                const uint32_t cast_stage_idx = s % kNumCastStages;
+                uint32_t const b_stage = s % N_B_STAGES;
+                uint32_t const cast_stage_idx = s % kNumCastStages;
                 full_cast[cast_stage_idx]->wait((s / kNumCastStages) & 1);
                 full_B[b_stage]->wait((s / N_B_STAGES) & 1);
                 tcgen05_after_thread_sync();
@@ -412,7 +445,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         cutlass::arch::NamedBarrier::sync(kNumMMAThreads, 0);
 
         constexpr uint32_t kTotalOut = BLOCK_M * SHAPE_N;
-        const uint32_t tid = threadIdx.x;
+        uint32_t const tid = threadIdx.x;
 #pragma unroll
         for (uint32_t k = tid; k < kTotalOut; k += kNumMMAThreads)
         {
@@ -445,17 +478,17 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     else
     {
         // ----- Pmap warp group (warps 4..7, 128 threads) -----
-        const uint32_t sub_warp_idx = warp_idx - kNumMMAThreads / 32;
-        const uint32_t upper_row = sub_warp_idx * 16 + lane_idx / 4;
-        const uint32_t lower_row = upper_row + 8;
-        const uint32_t col_lane = lane_idx % 4;
+        uint32_t const sub_warp_idx = warp_idx - kNumMMAThreads / 32;
+        uint32_t const upper_row = sub_warp_idx * 16 + lane_idx / 4;
+        uint32_t const lower_row = upper_row + 8;
+        uint32_t const col_lane = lane_idx % 4;
 
         float pm_u[HC_MULT], pm_l[HC_MULT];
         float cm_u[HC_MULT][HC_MULT], cm_l[HC_MULT][HC_MULT];
         {
             static_assert(HC_MULT == 4, "float4 row loads assume HC_MULT == 4");
-            const uint32_t gm_u = m_offset + upper_row;
-            const uint32_t gm_l = m_offset + lower_row;
+            uint32_t const gm_u = m_offset + upper_row;
+            uint32_t const gm_l = m_offset + lower_row;
             auto load_row4
                 = [](float const* base, uint32_t row, uint32_t row_floats, uint32_t vec_idx, bool valid) -> float4
             {
@@ -483,129 +516,280 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         static_assert(BLOCK_K * sizeof(nv_bfloat16) == kSwizzleAMode, "BLOCK_K must match swizzle A mode");
         static_assert(kNumLoads % 2 == 0, "kNumLoads must be even for LDSM.x4");
 
-        uint32_t s = 0;
-        for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+        auto process_column_pair = [&](auto const& r_vals, auto const& xf, uint32_t input_i, uint32_t output_i)
         {
-            const uint32_t i_stage = ht % N_INPUT_STAGES;
-            full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
-
-            uint32_t x_vals[2][kNumLoads];
-            {
-                uint8_t const* x_base
-                    = reinterpret_cast<uint8_t*>(smem_x_stg[i_stage]) + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleXMode;
-#pragma unroll
-                for (uint32_t i = 0; i < kNumLoads; i += 2)
-                {
-                    auto smem_ptr = x_base + get_swizzled_smem_offset<kSwizzleXMode>(i + lane_idx / 16, lane_idx % 16);
-                    deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(x_vals[0][i + 0], x_vals[1][i + 0], x_vals[0][i + 1],
-                        x_vals[1][i + 1], const_cast<uint8_t*>(smem_ptr));
-                }
-            }
-
-            uint32_t r_vals[HC_MULT][2][kNumLoads];
+            float2 r_u[HC_MULT][2], r_l[HC_MULT][2];
 #pragma unroll
             for (uint32_t j = 0; j < HC_MULT; ++j)
             {
-                uint8_t const* r_base = reinterpret_cast<uint8_t*>(smem_res[i_stage])
-                    + j * BLOCK_M * BLOCK_K * sizeof(nv_bfloat16) + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleResMode;
-#pragma unroll
-                for (uint32_t i = 0; i < kNumLoads; i += 2)
-                {
-                    auto smem_ptr
-                        = r_base + get_swizzled_smem_offset<kSwizzleResMode>(i + lane_idx / 16, lane_idx % 16);
-                    deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(r_vals[j][0][i + 0], r_vals[j][1][i + 0],
-                        r_vals[j][0][i + 1], r_vals[j][1][i + 1], const_cast<uint8_t*>(smem_ptr));
-                }
+                r_u[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162 const*>(&r_vals[j][0][input_i + 0]));
+                r_u[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162 const*>(&r_vals[j][0][input_i + 1]));
+                r_l[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162 const*>(&r_vals[j][1][input_i + 0]));
+                r_l[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162 const*>(&r_vals[j][1][input_i + 1]));
             }
-
-            float2 xf[2][kNumLoads];
 #pragma unroll
-            for (uint32_t u = 0; u < 2; ++u)
+            for (uint32_t hc = 0; hc < HC_MULT; ++hc)
             {
-#pragma unroll
-                for (uint32_t i = 0; i < kNumLoads; ++i)
-                {
-                    xf[u][i] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&x_vals[u][i]));
-                }
-            }
-
-            if constexpr (kEarlyRelease)
-            {
-                empty_input[i_stage]->arrive();
-            }
-
-            // ---- tile-batched f32x2 post-mapping ----
-            // s is a multiple of kNumCastStages at tile start and all four cast
-            // stages share one phase parity, so claim them all up front, then
-            // process column pairs with hc innermost: residual bf16->f32
-            // conversion happens once per (j, column) instead of once per
-            // (j, column, hc).
-            static_assert(kNumCastStages == HC_MULT, "tile-batched cast protocol expects one stage per hc");
-#pragma unroll
-            for (uint32_t c = 0; c < kNumCastStages; ++c)
-            {
-                empty_cast[c]->wait(((s / kNumCastStages) & 1) ^ 1);
-            }
-
-            // smem_rc is single-buffered: previous tile's residual_cur TMA
-            // stores must drain before this tile overwrites it.
-            if (ht > 0)
-            {
-                cute::tma_store_wait<0>();
-            }
-
-#pragma unroll
-            for (uint32_t i = 0; i < kNumLoads; i += 2)
-            {
-                float2 r_u[HC_MULT][2], r_l[HC_MULT][2];
+                float2 nu0 = mul_f32x2(pm_u[hc], xf[0][input_i + 0]);
+                float2 nu1 = mul_f32x2(pm_u[hc], xf[0][input_i + 1]);
+                float2 nl0 = mul_f32x2(pm_l[hc], xf[1][input_i + 0]);
+                float2 nl1 = mul_f32x2(pm_l[hc], xf[1][input_i + 1]);
 #pragma unroll
                 for (uint32_t j = 0; j < HC_MULT; ++j)
                 {
-                    r_u[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][0][i + 0]));
-                    r_u[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][0][i + 1]));
-                    r_l[j][0] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][1][i + 0]));
-                    r_l[j][1] = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&r_vals[j][1][i + 1]));
+                    nu0 = fma_f32x2(cm_u[j][hc], r_u[j][0], nu0);
+                    nu1 = fma_f32x2(cm_u[j][hc], r_u[j][1], nu1);
+                    nl0 = fma_f32x2(cm_l[j][hc], r_l[j][0], nl0);
+                    nl1 = fma_f32x2(cm_l[j][hc], r_l[j][1], nl1);
                 }
+                nv_bfloat162 b_u0 = __float22bfloat162_rn(nu0);
+                nv_bfloat162 b_u1 = __float22bfloat162_rn(nu1);
+                nv_bfloat162 b_l0 = __float22bfloat162_rn(nl0);
+                nv_bfloat162 b_l1 = __float22bfloat162_rn(nl1);
+                float2 ru0 = __bfloat1622float2(b_u0);
+                float2 ru1 = __bfloat1622float2(b_u1);
+                float2 rl0 = __bfloat1622float2(b_l0);
+                float2 rl1 = __bfloat1622float2(b_l1);
+                sqr2_u = fma_f32x2_vv(ru0, ru0, sqr2_u);
+                sqr2_u = fma_f32x2_vv(ru1, ru1, sqr2_u);
+                sqr2_l = fma_f32x2_vv(rl0, rl0, sqr2_l);
+                sqr2_l = fma_f32x2_vv(rl1, rl1, sqr2_l);
+                cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru0.x),
+                    *reinterpret_cast<uint32_t*>(&ru0.y), *reinterpret_cast<uint32_t*>(&rl0.x),
+                    *reinterpret_cast<uint32_t*>(&rl0.y), hc * BLOCK_K + (output_i + 0) * 8);
+                cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru1.x),
+                    *reinterpret_cast<uint32_t*>(&ru1.y), *reinterpret_cast<uint32_t*>(&rl1.x),
+                    *reinterpret_cast<uint32_t*>(&rl1.y), hc * BLOCK_K + (output_i + 1) * 8);
+
+                uint8_t* rc_base = reinterpret_cast<uint8_t*>(smem_rc) + hc * SMEM_RC_PER_HC
+                    + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleRoutMode;
+                auto smem_ptr
+                    = rc_base + get_swizzled_smem_offset<kSwizzleRoutMode>(output_i + lane_idx / 16, lane_idx % 16);
+                stsm_x4_b16_rout(smem_ptr, *reinterpret_cast<uint32_t*>(&b_u0), *reinterpret_cast<uint32_t*>(&b_l0),
+                    *reinterpret_cast<uint32_t*>(&b_u1), *reinterpret_cast<uint32_t*>(&b_l1));
+            }
+        };
+
+        uint32_t s = 0;
+        for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
+        {
+            uint32_t const i_stage = ht % N_INPUT_STAGES;
+            full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
+
+            if constexpr (kXSplit <= 2 && H_TILES_PER_SPLIT <= 2)
+            {
+                // ---- tile-batched f32x2 post-mapping ----
+                // s is a multiple of kNumCastStages at tile start and all four cast
+                // stages share one phase parity, so claim them all up front, then
+                // process column pairs with hc innermost: residual bf16->f32
+                // conversion happens once per (j, column) instead of once per
+                // (j, column, hc).
+                static_assert(kNumCastStages == HC_MULT, "tile-batched cast protocol expects one stage per hc");
 #pragma unroll
-                for (uint32_t hc = 0; hc < HC_MULT; ++hc)
+                for (uint32_t c = 0; c < kNumCastStages; ++c)
                 {
-                    float2 nu0 = mul_f32x2(pm_u[hc], xf[0][i + 0]);
-                    float2 nu1 = mul_f32x2(pm_u[hc], xf[0][i + 1]);
-                    float2 nl0 = mul_f32x2(pm_l[hc], xf[1][i + 0]);
-                    float2 nl1 = mul_f32x2(pm_l[hc], xf[1][i + 1]);
+                    empty_cast[c]->wait(((s / kNumCastStages) & 1) ^ 1);
+                }
+
+                // smem_rc is single-buffered: previous tile's residual_cur TMA
+                // stores must drain before this tile overwrites it.
+                if (ht > 0)
+                {
+                    cute::tma_store_wait<0>();
+                }
+
+                // XSplit=2 fills both X slots before either is reused, so the
+                // consumer can hold both barriers while streaming column pairs
+                // and release the slots after the tile.  XSplit=4 cannot use
+                // this schedule: its fourth load reuses slot 0 and would
+                // deadlock before all four full barriers became available.
+                if constexpr (kXSplit == 2)
+                {
+#pragma unroll
+                    for (uint32_t xp = 0; xp < kXSplit; ++xp)
+                    {
+                        uint32_t const xsg = ht * kXSplit + xp;
+                        uint32_t const xslot = xsg % N_INPUT_STAGES;
+                        full_x[xslot]->wait((xsg / N_INPUT_STAGES) & 1);
+                    }
+                }
+
+#pragma unroll 1
+                for (uint32_t i = 0; i < kNumLoads; i += 2)
+                {
+                    // Stream one column-pair through registers instead of keeping
+                    // the entire 64-column input tile live.  This keeps the loop
+                    // compact without forcing runtime-indexed arrays into local
+                    // memory, which is important for the one/two-h-tile high-KS path.
+                    uint32_t r_vals[HC_MULT][2][2];
 #pragma unroll
                     for (uint32_t j = 0; j < HC_MULT; ++j)
                     {
-                        nu0 = fma_f32x2(cm_u[j][hc], r_u[j][0], nu0);
-                        nu1 = fma_f32x2(cm_u[j][hc], r_u[j][1], nu1);
-                        nl0 = fma_f32x2(cm_l[j][hc], r_l[j][0], nl0);
-                        nl1 = fma_f32x2(cm_l[j][hc], r_l[j][1], nl1);
+                        uint8_t const* r_base = reinterpret_cast<uint8_t*>(smem_res[i_stage])
+                            + j * BLOCK_M * BLOCK_K * sizeof(nv_bfloat16)
+                            + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleResMode;
+                        auto smem_ptr
+                            = r_base + get_swizzled_smem_offset<kSwizzleResMode>(i + lane_idx / 16, lane_idx % 16);
+                        deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(r_vals[j][0][0], r_vals[j][1][0], r_vals[j][0][1],
+                            r_vals[j][1][1], const_cast<uint8_t*>(smem_ptr));
                     }
-                    nv_bfloat162 b_u0 = __float22bfloat162_rn(nu0);
-                    nv_bfloat162 b_u1 = __float22bfloat162_rn(nu1);
-                    nv_bfloat162 b_l0 = __float22bfloat162_rn(nl0);
-                    nv_bfloat162 b_l1 = __float22bfloat162_rn(nl1);
-                    float2 ru0 = __bfloat1622float2(b_u0);
-                    float2 ru1 = __bfloat1622float2(b_u1);
-                    float2 rl0 = __bfloat1622float2(b_l0);
-                    float2 rl1 = __bfloat1622float2(b_l1);
-                    sqr2_u = fma_f32x2_vv(ru0, ru0, sqr2_u);
-                    sqr2_u = fma_f32x2_vv(ru1, ru1, sqr2_u);
-                    sqr2_l = fma_f32x2_vv(rl0, rl0, sqr2_l);
-                    sqr2_l = fma_f32x2_vv(rl1, rl1, sqr2_l);
-                    cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru0.x),
-                        *reinterpret_cast<uint32_t*>(&ru0.y), *reinterpret_cast<uint32_t*>(&rl0.x),
-                        *reinterpret_cast<uint32_t*>(&rl0.y), hc * BLOCK_K + (i + 0) * 8);
-                    cute::SM100_TMEM_STORE_16dp256b1x::copy(*reinterpret_cast<uint32_t*>(&ru1.x),
-                        *reinterpret_cast<uint32_t*>(&ru1.y), *reinterpret_cast<uint32_t*>(&rl1.x),
-                        *reinterpret_cast<uint32_t*>(&rl1.y), hc * BLOCK_K + (i + 1) * 8);
 
-                    uint8_t* rc_base = reinterpret_cast<uint8_t*>(smem_rc) + hc * SMEM_RC_PER_HC
-                        + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleRoutMode;
-                    auto smem_ptr
-                        = rc_base + get_swizzled_smem_offset<kSwizzleRoutMode>(i + lane_idx / 16, lane_idx % 16);
-                    stsm_x4_b16_rout(smem_ptr, *reinterpret_cast<uint32_t*>(&b_u0), *reinterpret_cast<uint32_t*>(&b_l0),
-                        *reinterpret_cast<uint32_t*>(&b_u1), *reinterpret_cast<uint32_t*>(&b_l1));
+                    float2 xf[2][2];
+#pragma unroll
+                    for (uint32_t u = 0; u < 2; ++u)
+#pragma unroll
+                        for (uint32_t ii = 0; ii < 2; ++ii)
+                        {
+                            xf[u][ii] = make_float2(0.f, 0.f);
+                        }
+#pragma unroll
+                    for (uint32_t xp = 0; xp < kXSplit; ++xp)
+                    {
+                        nv_bfloat16* x_buf;
+                        if constexpr (kXSplit == 1)
+                        {
+                            x_buf = smem_x_stg[i_stage];
+                        }
+                        else
+                        {
+                            uint32_t const xsg = ht * kXSplit + xp;
+                            x_buf = smem_x_stg[xsg % N_INPUT_STAGES];
+                        }
+
+                        uint32_t x_vals[2][2];
+                        uint8_t const* x_base
+                            = reinterpret_cast<uint8_t*>(x_buf) + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleXMode;
+                        auto x_smem_ptr
+                            = x_base + get_swizzled_smem_offset<kSwizzleXMode>(i + lane_idx / 16, lane_idx % 16);
+                        deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(
+                            x_vals[0][0], x_vals[1][0], x_vals[0][1], x_vals[1][1], const_cast<uint8_t*>(x_smem_ptr));
+#pragma unroll
+                        for (uint32_t u = 0; u < 2; ++u)
+#pragma unroll
+                            for (uint32_t ii = 0; ii < 2; ++ii)
+                            {
+                                float2 const value
+                                    = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&x_vals[u][ii]));
+                                if constexpr (kXSplit == 1)
+                                {
+                                    xf[u][ii] = value;
+                                }
+                                else
+                                {
+                                    xf[u][ii].x += value.x;
+                                    xf[u][ii].y += value.y;
+                                }
+                            }
+                    }
+
+                    process_column_pair(r_vals, xf, 0, i);
+                }
+
+                if constexpr (kXSplit == 2)
+                {
+#pragma unroll
+                    for (uint32_t xp = 0; xp < kXSplit; ++xp)
+                    {
+                        empty_x[(ht * kXSplit + xp) % N_INPUT_STAGES]->arrive();
+                    }
+                }
+
+                if constexpr (kEarlyRelease)
+                {
+                    empty_input[i_stage]->arrive();
+                }
+            }
+            else
+            {
+                // Multi-tile and XSplit=4 instances keep the fully-unrolled
+                // preload path. XSplit=4 must release slot 0 before the
+                // producer can issue its fourth X load into that slot.
+                uint32_t r_vals[HC_MULT][2][kNumLoads];
+#pragma unroll
+                for (uint32_t j = 0; j < HC_MULT; ++j)
+                {
+                    uint8_t const* r_base = reinterpret_cast<uint8_t*>(smem_res[i_stage])
+                        + j * BLOCK_M * BLOCK_K * sizeof(nv_bfloat16)
+                        + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleResMode;
+#pragma unroll
+                    for (uint32_t i = 0; i < kNumLoads; i += 2)
+                    {
+                        auto smem_ptr
+                            = r_base + get_swizzled_smem_offset<kSwizzleResMode>(i + lane_idx / 16, lane_idx % 16);
+                        deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(r_vals[j][0][i + 0], r_vals[j][1][i + 0],
+                            r_vals[j][0][i + 1], r_vals[j][1][i + 1], const_cast<uint8_t*>(smem_ptr));
+                    }
+                }
+
+                float2 xf[2][kNumLoads];
+#pragma unroll
+                for (uint32_t u = 0; u < 2; ++u)
+#pragma unroll
+                    for (uint32_t i = 0; i < kNumLoads; ++i)
+                        xf[u][i] = make_float2(0.f, 0.f);
+#pragma unroll
+                for (uint32_t xp = 0; xp < kXSplit; ++xp)
+                {
+                    nv_bfloat16* x_buf;
+                    if constexpr (kXSplit == 1)
+                    {
+                        x_buf = smem_x_stg[i_stage];
+                    }
+                    else
+                    {
+                        uint32_t const xsg = ht * kXSplit + xp;
+                        uint32_t const xslot = xsg % N_INPUT_STAGES;
+                        full_x[xslot]->wait((xsg / N_INPUT_STAGES) & 1);
+                        x_buf = smem_x_stg[xslot];
+                    }
+
+                    uint32_t x_vals[2][kNumLoads];
+                    uint8_t const* x_base
+                        = reinterpret_cast<uint8_t*>(x_buf) + sub_warp_idx * BLOCK_M_PER_WARP * kSwizzleXMode;
+#pragma unroll
+                    for (uint32_t i = 0; i < kNumLoads; i += 2)
+                    {
+                        auto smem_ptr
+                            = x_base + get_swizzled_smem_offset<kSwizzleXMode>(i + lane_idx / 16, lane_idx % 16);
+                        deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(x_vals[0][i + 0], x_vals[1][i + 0], x_vals[0][i + 1],
+                            x_vals[1][i + 1], const_cast<uint8_t*>(smem_ptr));
+                    }
+                    if constexpr (kXSplit > 1)
+                    {
+                        empty_x[(ht * kXSplit + xp) % N_INPUT_STAGES]->arrive();
+                    }
+#pragma unroll
+                    for (uint32_t u = 0; u < 2; ++u)
+#pragma unroll
+                        for (uint32_t i = 0; i < kNumLoads; ++i)
+                        {
+                            float2 value = __bfloat1622float2(*reinterpret_cast<nv_bfloat162*>(&x_vals[u][i]));
+                            xf[u][i].x += value.x;
+                            xf[u][i].y += value.y;
+                        }
+                }
+
+                if constexpr (kEarlyRelease)
+                {
+                    empty_input[i_stage]->arrive();
+                }
+
+                static_assert(kNumCastStages == HC_MULT, "tile-batched cast protocol expects one stage per hc");
+#pragma unroll
+                for (uint32_t c = 0; c < kNumCastStages; ++c)
+                {
+                    empty_cast[c]->wait(((s / kNumCastStages) & 1) ^ 1);
+                }
+
+                if (ht > 0)
+                {
+                    cute::tma_store_wait<0>();
+                }
+
+#pragma unroll
+                for (uint32_t i = 0; i < kNumLoads; i += 2)
+                {
+                    process_column_pair(r_vals, xf, i, i);
                 }
             }
 
@@ -622,7 +806,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             cute::tma_store_fence();
             if (cute::elect_one_sync())
             {
-                const uint32_t h_idx = (h_tile_start + ht) * BLOCK_K;
+                uint32_t const h_idx = (h_tile_start + ht) * BLOCK_K;
 #pragma unroll
                 for (uint32_t hc = 0; hc < HC_MULT; ++hc)
                 {
@@ -707,11 +891,11 @@ template <uint32_t SHAPE_N, uint32_t HIDDEN, uint32_t HC_MULT, uint32_t BLOCK_M,
     uint32_t kSwizzleCDMode, uint32_t N_B_STAGES, uint32_t N_INPUT_STAGES, uint32_t kNumMMAThreads,
     uint32_t kNumPmapThreads, uint32_t kNumSplits = 1, bool kFuseNorm = false>
 __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
-    fused_allinone_tf32_pmap_gemm_atomic_impl(const uint32_t shape_m,
-        const __grid_constant__ cute::TmaDescriptor tensor_map_residual,     // residual_prev, bf16
-        const __grid_constant__ cute::TmaDescriptor tensor_map_x,            // x_prev,        bf16
-        const __grid_constant__ cute::TmaDescriptor tensor_map_b,            // W_T,           tf32
-        const __grid_constant__ cute::TmaDescriptor tensor_map_residual_out, // residual_cur,  bf16 (TMA store)
+    fused_allinone_tf32_pmap_gemm_atomic_impl(uint32_t const shape_m,
+        __grid_constant__ const cute::TmaDescriptor tensor_map_residual,     // residual_prev, bf16
+        __grid_constant__ const cute::TmaDescriptor tensor_map_x,            // x_prev,        bf16
+        __grid_constant__ const cute::TmaDescriptor tensor_map_b,            // W_T,           tf32
+        __grid_constant__ const cute::TmaDescriptor tensor_map_residual_out, // residual_cur,  bf16 (TMA store)
         __nv_bfloat16 const* __restrict__ residual_cur_ptr,                  // same buffer as TMA target
         __nv_bfloat16* __restrict__ layer_input_out,                         // [M, HIDDEN]    bf16
         float* __restrict__ D,                   // [M, SHAPE_N]   fp32 (y_acc, caller zeros)
@@ -847,17 +1031,17 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     }
     __syncthreads();
 
-    const uint32_t block_idx = __shfl_sync(0xffffffff, blockIdx.x, 0);
-    const uint32_t m_block_idx = block_idx / kNumSplits;
-    const uint32_t k_split_idx = block_idx % kNumSplits;
-    const uint32_t m_offset = m_block_idx * BLOCK_M;
-    const uint32_t h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
+    uint32_t const block_idx = __shfl_sync(0xffffffff, blockIdx.x, 0);
+    uint32_t const m_block_idx = block_idx / kNumSplits;
+    uint32_t const k_split_idx = block_idx % kNumSplits;
+    uint32_t const m_offset = m_block_idx * BLOCK_M;
+    uint32_t const h_tile_start = k_split_idx * H_TILES_PER_SPLIT;
     constexpr uint32_t num_total_stages = H_TILES_PER_SPLIT * HC_MULT;
 
     // Prologue: pmap warp group loads post_mix_prev, comb_mix_prev into SMEM
     if (warp_idx >= kNumMMAThreads / 32)
     {
-        const uint32_t pmap_tid = threadIdx.x - kNumMMAThreads;
+        uint32_t const pmap_tid = threadIdx.x - kNumMMAThreads;
 #pragma unroll
         for (uint32_t t = 0; t < 2; ++t)
         {
@@ -897,7 +1081,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             uint32_t s = 0;
             for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
             {
-                const uint32_t h_tile = h_tile_start + ht;
+                uint32_t const h_tile = h_tile_start + ht;
                 empty_input[i_stage]->wait(((ht / N_INPUT_STAGES) & 1) ^ 1);
                 uint32_t m_idx = m_block_idx * BLOCK_M;
                 uint32_t h_idx = h_tile * BLOCK_K;
@@ -945,8 +1129,8 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 
             for (uint32_t s = 0; s < num_total_stages; ++s)
             {
-                const uint32_t b_stage = s % N_B_STAGES;
-                const uint32_t cast_stage_idx = s % kNumCastStages;
+                uint32_t const b_stage = s % N_B_STAGES;
+                uint32_t const cast_stage_idx = s % kNumCastStages;
                 full_cast[cast_stage_idx]->wait((s / kNumCastStages) & 1);
                 full_B[b_stage]->wait((s / N_B_STAGES) & 1);
                 tcgen05_after_thread_sync();
@@ -993,7 +1177,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         cutlass::arch::NamedBarrier::sync(kNumMMAThreads, 0);
 
         constexpr uint32_t kTotalOut = BLOCK_M * SHAPE_N;
-        const uint32_t tid = threadIdx.x;
+        uint32_t const tid = threadIdx.x;
 #pragma unroll
         for (uint32_t k = tid; k < kTotalOut; k += kNumMMAThreads)
         {
@@ -1026,10 +1210,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     else
     {
         // ----- Pmap warp group (warps 4..7, 128 threads) -----
-        const uint32_t sub_warp_idx = warp_idx - kNumMMAThreads / 32;
-        const uint32_t upper_row = sub_warp_idx * 16 + lane_idx / 4;
-        const uint32_t lower_row = upper_row + 8;
-        const uint32_t col_lane = lane_idx % 4;
+        uint32_t const sub_warp_idx = warp_idx - kNumMMAThreads / 32;
+        uint32_t const upper_row = sub_warp_idx * 16 + lane_idx / 4;
+        uint32_t const lower_row = upper_row + 8;
+        uint32_t const col_lane = lane_idx % 4;
 
         float pm_u[HC_MULT], pm_l[HC_MULT];
         float cm_u[HC_MULT][HC_MULT], cm_l[HC_MULT][HC_MULT];
@@ -1061,7 +1245,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         uint32_t s = 0;
         for (uint32_t ht = 0; ht < H_TILES_PER_SPLIT; ++ht)
         {
-            const uint32_t i_stage = ht % N_INPUT_STAGES;
+            uint32_t const i_stage = ht % N_INPUT_STAGES;
             full_input[i_stage]->wait((ht / N_INPUT_STAGES) & 1);
 
             uint32_t x_vals[2][kNumLoads];
@@ -1114,7 +1298,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 #pragma unroll
             for (uint32_t hc = 0; hc < HC_MULT; ++hc)
             {
-                const uint32_t cast_stage_idx = s % kNumCastStages;
+                uint32_t const cast_stage_idx = s % kNumCastStages;
                 empty_cast[cast_stage_idx]->wait(((s / kNumCastStages) & 1) ^ 1);
 
                 uint32_t rc_u_buf[kNumLoads], rc_l_buf[kNumLoads];
@@ -1171,7 +1355,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             cute::tma_store_fence();
             if (cute::elect_one_sync())
             {
-                const uint32_t h_idx = (h_tile_start + ht) * BLOCK_K;
+                uint32_t const h_idx = (h_tile_start + ht) * BLOCK_K;
 #pragma unroll
                 for (uint32_t hc = 0; hc < HC_MULT; ++hc)
                 {
@@ -1287,23 +1471,23 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     // old static_assert so HIDDEN values like 7168 (which 8-warp teams cannot
     // cleanly span) are also valid.
     static_assert(HIDDEN % BF16_VEC_LI == 0, "HIDDEN must be a multiple of BF16_VEC_LI=8");
-    const uint32_t tid_bf = threadIdx.x;
-    const uint32_t lane_bf = tid_bf % WARP_SIZE_BF;
-    const uint32_t warp_bf = tid_bf / WARP_SIZE_BF;
-    const uint32_t warp_tok_pos = warp_bf / WARPS_PER_TOK; // which token in a pass
-    const uint32_t warp_in_team = warp_bf % WARPS_PER_TOK; // which warp inside team
-    const uint32_t cta_tok_base = k_split_idx * TOKS_PER_CTA;
+    uint32_t const tid_bf = threadIdx.x;
+    uint32_t const lane_bf = tid_bf % WARP_SIZE_BF;
+    uint32_t const warp_bf = tid_bf / WARP_SIZE_BF;
+    uint32_t const warp_tok_pos = warp_bf / WARPS_PER_TOK; // which token in a pass
+    uint32_t const warp_in_team = warp_bf % WARPS_PER_TOK; // which warp inside team
+    uint32_t const cta_tok_base = k_split_idx * TOKS_PER_CTA;
 
 #pragma unroll 1
     for (uint32_t pass = 0; pass < TOKEN_PASSES; ++pass)
     {
-        const uint32_t t_in_cta = pass * TOKS_PER_PASS + warp_tok_pos;
+        uint32_t const t_in_cta = pass * TOKS_PER_PASS + warp_tok_pos;
         if (t_in_cta >= TOKS_PER_CTA)
             continue;
-        const uint32_t t = cta_tok_base + t_in_cta;
+        uint32_t const t = cta_tok_base + t_in_cta;
         if (t >= BLOCK_M)
             continue;
-        const uint32_t tok = m_offset + t;
+        uint32_t const tok = m_offset + t;
         if (tok >= shape_m)
             continue;
 
@@ -1404,7 +1588,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         // the scalar-vec tail (only relevant when WARPS_PER_TOK*32*8 > HIDDEN
         // residue, e.g. KS=112 / HIDDEN=7168 / H_STRIDE=2048 → tail = 1024).
         constexpr uint32_t H_VEC_END = (HIDDEN / H_STRIDE) * H_STRIDE;
-        const uint32_t h_start = warp_in_team * WARP_SIZE_BF * BF16_VEC_LI + lane_bf * BF16_VEC_LI;
+        uint32_t const h_start = warp_in_team * WARP_SIZE_BF * BF16_VEC_LI + lane_bf * BF16_VEC_LI;
 
         if constexpr (!kFuseNorm)
         {
@@ -1450,10 +1634,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             if constexpr (H_VEC_END < HIDDEN)
             {
                 constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
-                const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+                uint32_t const my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
                 if (my_chunk < TAIL_CHUNKS)
                 {
-                    const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                    uint32_t const h = H_VEC_END + my_chunk * BF16_VEC_LI;
                     uint4 raws[HC_MULT];
 #pragma unroll
                     for (uint32_t j = 0; j < HC_MULT; ++j)
@@ -1544,10 +1728,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             if constexpr (H_VEC_END < HIDDEN)
             {
                 constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
-                const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+                uint32_t const my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
                 if (my_chunk < TAIL_CHUNKS)
                 {
-                    const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                    uint32_t const h = H_VEC_END + my_chunk * BF16_VEC_LI;
                     uint4 raws[HC_MULT];
 #pragma unroll
                     for (uint32_t j = 0; j < HC_MULT; ++j)
@@ -1632,10 +1816,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             if constexpr (H_VEC_END < HIDDEN)
             {
                 constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
-                const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+                uint32_t const my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
                 if (my_chunk < TAIL_CHUNKS)
                 {
-                    const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                    uint32_t const h = H_VEC_END + my_chunk * BF16_VEC_LI;
                     uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
                     uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&nbase[h]));
                     __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);

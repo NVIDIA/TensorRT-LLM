@@ -46,6 +46,7 @@ from ..attention_backend.sparse.dsa import (
     transform_local_topk_and_prepare_pool_view,
 )
 from ..attention_backend.utils import create_attention
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..utils import (
@@ -75,8 +76,11 @@ except ImportError:
     flash_mla_sparse_fwd = None
 
 
-def _is_env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "on")
+def _is_env_truthy(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "on")
 
 
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
@@ -126,6 +130,12 @@ def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
         is_sf_swizzled=True,
         unquantized_hidden_states=sliced_unquant,
     )
+
+
+_DSV4_OB_SCALE_BLOCK_K = 128
+_UE8M0_SCALES_PER_WORD = 4
+_DSV4_PRO_OB_N = 7168
+_DSV4_PRO_OB_K = 16384
 
 
 def _extract_mla_extra_attrs(layer_idx: str):
@@ -433,6 +443,7 @@ class MLA(nn.Module):
         reduce_output: bool = True,
         num_groups: int = 1,
         o_lora_rank: int = 1024,
+        allow_dsv4_split_output: bool = False,
     ):
         """
         Initialize the MLA module.
@@ -459,6 +470,8 @@ class MLA(nn.Module):
             config (ModelConfig): The model configuration.
             num_groups (int): The number of groups.
             o_lora_rank (int): The dimension of the compressed output.
+            allow_dsv4_split_output (bool): Whether the downstream consumer accepts
+                split-major DeepSeek-V4 output projection partials.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -482,6 +495,7 @@ class MLA(nn.Module):
         self.dense_bias = dense_bias
         self.num_groups = num_groups
         self.o_lora_rank = o_lora_rank
+        self.allow_dsv4_split_output = allow_dsv4_split_output
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -1232,6 +1246,79 @@ class MLA(nn.Module):
             raise RuntimeError("Invalid DSv4 fused epilogue buffers for current token count.")
         return fp8_o, output_sf
 
+    def _should_use_fused_oproj(self) -> bool:
+        # Eligible Blackwell paths are on by default; keep an emergency fallback.
+        return (
+            self.allow_dsv4_split_output
+            and not _is_env_truthy("TRTLLM_DSV4_DISABLE_FUSED_OPROJ")
+            and _is_env_truthy("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", default=True)
+            and is_sm_100f()
+            and IS_CUTLASS_DSL_AVAILABLE
+            and self.n_local_groups == self.num_groups
+            and self.hidden_size == _DSV4_PRO_OB_N
+            and self.n_local_groups * self.o_lora_rank == _DSV4_PRO_OB_K
+            and getattr(self.o_b_proj, "tp_size", 1) == 1
+            and self.o_a_proj.dtype == torch.float8_e4m3fn
+            and self.o_b_proj.has_fp8_block_scales
+            and self.dtype == torch.bfloat16
+            and not getattr(self.o_b_proj, "use_cute_dsl_blockscaling_mm", False)
+        )
+
+    def _fused_oa_ob_proj(
+        self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        num_groups, o_lora_rank = self.n_local_groups, self.o_lora_rank
+        aligned_m = (
+            (num_tokens + _UE8M0_SCALES_PER_WORD - 1) // _UE8M0_SCALES_PER_WORD
+        ) * _UE8M0_SCALES_PER_WORD
+        n_tiles = (o_lora_rank + _DSV4_OB_SCALE_BLOCK_K - 1) // _DSV4_OB_SCALE_BLOCK_K
+        packed_k = (num_groups * n_tiles + _UE8M0_SCALES_PER_WORD - 1) // _UE8M0_SCALES_PER_WORD
+        o_lora_fp8 = torch.empty(
+            [num_tokens, num_groups * o_lora_rank],
+            device=attn_fp8.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        # Both O_b backends consume MN-major packed UE8M0 scales. Allocate the
+        # final layout directly; the O_a epilogue also clears its M padding.
+        sf_out_padded = torch.empty_strided(
+            (aligned_m, packed_k),
+            (1, aligned_m),
+            device=attn_fp8.device,
+            dtype=torch.int32,
+        )
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(
+            attn_fp8,
+            self.o_a_proj,
+            attn_scale,
+            self.o_a_proj_scale,
+            o_lora_fp8,
+            sf_out_padded,
+        )
+        sf_out = sf_out_padded[:num_tokens]
+        return self._fused_ob_gemm(o_lora_fp8, sf_out)
+
+    def _fused_ob_gemm(self, o_lora_fp8: torch.Tensor, sf_out: torch.Tensor) -> torch.Tensor:
+        """Run the fused DSV4-Pro O_b CuTe DSL kernel."""
+        n = self.hidden_size
+        k_ob = o_lora_fp8.shape[1]
+        weight, weight_scale = self.o_b_proj.weight, self.o_b_proj.weight_scale
+
+        cute_weight_scale = weight_scale
+        if cute_weight_scale.dtype != torch.int32:
+            cute_weight_scale = getattr(self.o_b_proj, "_ob_wsf_int", None)
+            if cute_weight_scale is None:
+                # Convert the static weight scale once.
+                cute_weight_scale = fp8_utils.transform_sf_into_required_layout(
+                    weight_scale,
+                    mn=n,
+                    k=k_ob,
+                    recipe=(1, _DSV4_OB_SCALE_BLOCK_K, _DSV4_OB_SCALE_BLOCK_K),
+                    is_sfa=False,
+                )
+                self.o_b_proj._ob_wsf_int = cute_weight_scale
+
+        return torch.ops.trtllm.dsv4_fp8_splitk_gemm(o_lora_fp8, sf_out, weight, cute_weight_scale)
+
     def _deepseek_v4_o_proj(
         self,
         attn_out_latent: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1240,6 +1327,9 @@ class MLA(nn.Module):
         if isinstance(attn_out_latent, tuple):
             attn_fp8, attn_scale = attn_out_latent
             num_tokens = attn_fp8.shape[1]
+            if num_tokens > 0 and self._should_use_fused_oproj():
+                return self._fused_oa_ob_proj(attn_fp8, attn_scale, num_tokens)
+
             o_lora = torch.empty(
                 [num_tokens, self.n_local_groups, self.o_lora_rank],
                 device=attn_fp8.device,
@@ -1280,6 +1370,9 @@ class MLA(nn.Module):
                 128,
                 self.inverse_rotary_emb.is_neox,
             )
+            if num_tokens > 0 and self._should_use_fused_oproj():
+                return self._fused_oa_ob_proj(attn_fp8, attn_scale, num_tokens)
+
             o_lora = torch.empty(
                 [num_tokens, self.n_local_groups, self.o_lora_rank],
                 device=attn_out_latent.device,
