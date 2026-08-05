@@ -73,6 +73,7 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionResponseChoice, EmbeddingRequest, EmbeddingResponse,
     EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
     ImageGenerationRequest, ImageGenerationResponse, ImageObject,
+    DSparkVerifyLenPinRequest,
     MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
     ResponseFormat, ResponsesRequest, ResponsesResponse, TokenizeRequest,
     TokenizeResponse, UpdateWeightsRequest, UsageInfo,
@@ -888,6 +889,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/server_info",
                                self.get_server_info,
                                methods=["GET"])
+        self.app.add_api_route("/dspark/verify_len_pin",
+                               self.set_dspark_verify_len_pin,
+                               methods=["POST"])
         if self.generator.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -2380,6 +2384,30 @@ class OpenAIServer(_VideoRoutesMixin):
         await self.generator.collective_rpc('update_weights',
                                             args=(request.weights, ))
         return JSONResponse(content={"status": "success"})
+
+    async def set_dspark_verify_len_pin(
+            self, request: DSparkVerifyLenPinRequest) -> JSONResponse:
+        """Pin (or clear) the DSpark verify length at runtime.
+
+        Lets a cost-table sweep walk the verify-length ladder against a
+        RUNNING server -- the shape each cell needs in order to be labelled --
+        instead of rebuilding the engine per length, which is what the
+        ``TLLM_DSPARK_FORCE_VERIFY_LEN`` environment variable requires and
+        which cannot reach ranks spawned before it was set. The pin takes
+        effect on the next decode step, simultaneously on every rank.
+        """
+        assert isinstance(
+            self.generator, AsyncLLM
+        ), "/dspark/verify_len_pin endpoint is only supported with AsyncLLM()"
+        try:
+            applied = await self.generator.collective_rpc(
+                'set_dspark_verify_len_pin', args=(request.verify_len, ))
+        except (ValueError, RuntimeError) as exc:
+            # A bad tier or a non-DSpark engine is a caller error, not a server
+            # fault: answer it rather than returning a 500 with a stack trace.
+            return JSONResponse(content={"error": str(exc)}, status_code=400)
+        value = applied[0] if isinstance(applied, list) and applied else applied
+        return JSONResponse(content={"verify_len": value})
 
     async def get_server_info(self) -> JSONResponse:
         content = {"disaggregated_params": self.generator.disaggregated_params}

@@ -1370,6 +1370,16 @@ class MemoryUpdateRequest(OpenAIBaseModel):
     tags: List[str] = Field(default=["model", "kv_cache"])
 
 
+class DSparkVerifyLenPinRequest(OpenAIBaseModel):
+    verify_len: Optional[int] = Field(
+        default=None,
+        description="DSpark verify length to pin every request to, or null to "
+        "clear the pin and hand scheduling back to the confidence planner. "
+        "Must be one of the captured verify-length tiers: an uncaptured "
+        "length drops every step out of CUDA-graph replay. Profiling knob -- "
+        "it bypasses the planner and is not a serving configuration.")
+
+
 class UpdateWeightsRequest(OpenAIBaseModel):
     weights: Optional[Dict[str, str]] = Field(
         default=None,

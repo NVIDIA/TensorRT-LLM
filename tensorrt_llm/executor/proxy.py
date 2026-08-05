@@ -61,7 +61,10 @@ __all__ = [
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
 # communicator started in PyExecutor.start_worker(); rank-0 is the entry
 # point, so routing through the rank-0 RPC shim is correct.
-_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup"})
+# set_dspark_verify_len_pin() needs no control communicator at all: it queues
+# a scalar that the decode loop's own per-step allgather hands to every rank,
+# so rank-0 receiving it is sufficient and the loop is never paused.
+_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup", "set_dspark_verify_len_pin"})
 
 
 def _check_collective_rpc_guard(

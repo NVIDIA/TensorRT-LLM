@@ -872,6 +872,20 @@ class BaseWorker(GenerationExecutor):
                         f"{action}() failed on {len(errors)} rank(s):\n" +
                         "\n".join(errors))
 
+    def set_dspark_verify_len_pin(self,
+                                  verify_len: Optional[int]) -> Optional[int]:
+        """Pin (or unpin) the DSpark verify length on this worker's executor.
+
+        Safe under TP/PP without the control-communicator dance ``sleep`` needs:
+        the pin is a scalar the decode loop reads on its next step, and it is
+        broadcast to the other ranks by the step's own allgather rather than by
+        this call. So rank 0 alone receiving the RPC is sufficient and the loop
+        never has to be paused.
+        """
+        if self.engine is None:
+            raise RuntimeError("engine is not initialized")
+        return self.engine.set_dspark_verify_len_pin(verify_len)
+
     def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 

@@ -108,6 +108,17 @@ class DSparkVerifyPlanner:
         # one M and filed under another. With an absolute L every request gets
         # exactly L, so M = bs * (L + 1) is the captured bucket by construction.
         self._forced_verify_len = self._read_forced_verify_len()
+        # A pin requested at runtime (profiling endpoint) but not yet in force,
+        # held as its WIRE value because three states have to survive the trip:
+        # -1 nothing queued, 0 clear the pin, >0 pin to that length. Storing
+        # Optional[int] collapsed "clear" into "nothing queued", so a clear
+        # never reached the peers. min_verify_len is validated >= 1, so 0 can
+        # never collide with a real length.
+        # It is adopted through the step's existing cross-rank allgather so
+        # every rank starts pinning on the SAME step. Setting it locally would
+        # diverge the shape gate for as long as the ranks disagreed -- the same
+        # failure the env-var pin has on a pre-spawned world.
+        self._pending_verify_len_pin: int = -1
 
         self._host_buffer: Optional[torch.Tensor] = None
         self._copy_event: Optional[torch.cuda.Event] = None
@@ -208,6 +219,56 @@ class DSparkVerifyPlanner:
             f"This bypasses the planner entirely and is a profiling mode, not a "
             f"serving configuration.")
         return value
+
+    def validate_verify_len_pin(self, value: Optional[int]) -> Optional[int]:
+        """Check a pin against this planner's ladder; None clears the pin."""
+        if value is None:
+            return None
+        value = int(value)
+        lo, hi = int(self.cfg.min_verify_len), int(self.cfg.resolved_max_verify_len)
+        if not lo <= value <= hi:
+            raise ValueError(f"verify-length pin {value} outside [{lo}, {hi}]")
+        if value not in self.tiers:
+            raise ValueError(
+                f"verify-length pin {value} is not in the captured tier ladder "
+                f"{self.tiers}; every step would fall out of CUDA-graph replay "
+                f"and the measured times would not be step costs")
+        return value
+
+    def request_verify_len_pin(self, value: Optional[int]) -> Optional[int]:
+        """Queue a pin (or ``None`` to clear) for the next decode step.
+
+        Validated here so a bad value is rejected at the call site rather than
+        on some later step, but NOT applied here: the step's allgather carries
+        it so all ranks adopt it together (see ``adopt_verify_len_pin``).
+        """
+        value = self.validate_verify_len_pin(value)
+        self._pending_verify_len_pin = 0 if value is None else int(value)
+        return value
+
+    def pending_verify_len_pin(self) -> int:
+        """The queued request as a wire value: -1 none, 0 clear, >0 pin."""
+        return int(self._pending_verify_len_pin)
+
+    def adopt_verify_len_pin(self, wire_value: int) -> None:
+        """Apply the group's agreed pin. ``-1`` leaves the current one alone.
+
+        Called from the executor with a value every rank read out of the same
+        allgathered payload, so the pin takes effect on the same step
+        everywhere. 0 is the wire encoding for "clear the pin".
+        """
+        wire_value = int(wire_value)
+        if wire_value < 0:
+            return
+        self._pending_verify_len_pin = -1
+        new_pin = None if wire_value == 0 else wire_value
+        if new_pin == self._forced_verify_len:
+            return
+        self._forced_verify_len = new_pin
+        logger.warning(
+            f"DSpark: verify length pin set to {new_pin} at runtime. This "
+            f"bypasses the planner and is a profiling mode, not a serving "
+            f"configuration.")
 
     def _note_snapshot_stats(self, selected: torch.Tensor,
                              rows: Optional[Sequence[int]]) -> None:

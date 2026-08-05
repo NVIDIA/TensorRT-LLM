@@ -3338,6 +3338,37 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    def set_dspark_verify_len_pin(self, verify_len: Optional[int]) -> Optional[int]:
+        """Queue a DSpark verify-length pin, or ``None`` to clear it.
+
+        The pin bypasses the confidence planner and makes every request verify
+        the same number of positions -- the shape a cost-table sweep needs to
+        measure a cell it can label. It exists so a sweep can walk the ladder
+        against a RUNNING server instead of rebuilding the engine per length
+        (which is what the ``TLLM_DSPARK_FORCE_VERIFY_LEN`` environment
+        variable requires, and which cannot reach ranks that were spawned
+        before it was set).
+
+        Validated here and applied on the next decode step, when the step's
+        existing cross-rank allgather hands the same value to every rank.
+
+        Returns:
+            The validated pin, or None when cleared.
+
+        Raises:
+            RuntimeError: if this executor has no DSpark confidence planner.
+            ValueError: if the length is outside the ladder (see
+                :meth:`DSparkVerifyPlanner.validate_verify_len_pin`).
+        """
+        worker = getattr(self.model_engine, "_get_spec_worker", None)
+        planner = getattr(worker(), "verify_planner", None) if worker else None
+        if planner is None:
+            raise RuntimeError(
+                "no DSpark confidence planner on this executor; the verify-len "
+                "pin only applies to a DSpark engine with confidence "
+                "scheduling enabled")
+        return planner.request_verify_len_pin(verify_len)
+
     def _dspark_confidence_draft_len(self,
                                      scheduled_batch: ScheduledRequests) -> int:
         """Draft length for this iteration, from the DSpark confidence planner.
@@ -3470,7 +3501,19 @@ class PyExecutor:
                 local_tokens,
                 local_max_window,
                 1 if scheduled_batch.can_run_cuda_graph else 0,
+                planner.pending_verify_len_pin(),
             ])
+            # A runtime verify-length pin (profiling endpoint) reaches the
+            # group here rather than through each rank's own environment: the
+            # endpoint lands on one rank, and a pin applied locally would make
+            # that rank disagree with its peers for as long as it held. Taking
+            # the first rank that queued one makes the choice a function of the
+            # allgathered payload, identical everywhere, effective on the same
+            # step. -1 means nobody queued anything.
+            agreed_pin = next(
+                (int(payload[5]) for payload in payloads
+                 if len(payload) > 5 and int(payload[5]) >= 0), -1)
+            planner.adopt_verify_len_pin(agreed_pin)
             if not all(int(payload[0]) for payload in payloads):
                 # Any rank that cannot go ragged takes the whole group with it:
                 # a mixed step means one rank replays a ragged graph while
