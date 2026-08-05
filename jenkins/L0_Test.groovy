@@ -983,13 +983,20 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         usernameVariable: 'ARTIFACTORY_USER',
                         passwordVariable: 'ARTIFACTORY_PASSWORD'
                     )]) {
-                        def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials_slurm")
-                        // Create + chmod before writing so the secret never exists world-readable.
-                        Utils.exec(pipeline, script: "install -m 600 /dev/null ${credsLocal}")
-                        pipeline.writeFile(
-                            file: credsLocal,
-                            text: "machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}\n"
-                        )
+                        def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials_slurm-${nodeName}")
+                        withEnv([
+                            "ENROOT_CREDS_PATH=${credsLocal}",
+                            "ARTIFACTORY_DOCKER_HOST=${ARTIFACTORY_DOCKER_HOST}",
+                        ]) {
+                            Utils.exec(pipeline, script: '''
+                                set +x
+                                umask 077
+                                ENROOT_CREDS_CONTENT="machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}"
+                                cat > "$ENROOT_CREDS_PATH" <<EOF
+                                $ENROOT_CREDS_CONTENT
+                                EOF
+                            '''.stripIndent())
+                        }
                         Utils.exec(pipeline, script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd("mkdir -p '${enrootConfigDir}'")))
                         Utils.copyFileToRemoteHost(
                             pipeline,
@@ -1703,13 +1710,23 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         usernameVariable: 'ARTIFACTORY_USER',
                         passwordVariable: 'ARTIFACTORY_PASSWORD'
                     )]) {
-                        def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials")
-                        // Create + chmod before writing so the secret never exists world-readable.
-                        Utils.exec(pipeline, script: "install -m 600 /dev/null ${credsLocal}")
-                        pipeline.writeFile(
-                            file: credsLocal,
-                            text: "machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}\n"
-                        )
+                        // Unique per stage so parallel stages do not share one @tmp path.
+                        def credsLocal = Utils.createTempLocation(pipeline, "./enroot_credentials-${stageName}")
+                        // Write via shell env (not writeFile/Groovy interpolation): keeps the
+                        // password out of process argv and avoids AccessDenied on pre-chmod'd files.
+                        withEnv([
+                            "ENROOT_CREDS_PATH=${credsLocal}",
+                            "ARTIFACTORY_DOCKER_HOST=${ARTIFACTORY_DOCKER_HOST}",
+                        ]) {
+                            Utils.exec(pipeline, script: '''
+                                set +x
+                                umask 077
+                                ENROOT_CREDS_CONTENT="machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}"
+                                cat > "$ENROOT_CREDS_PATH" <<EOF
+                                $ENROOT_CREDS_CONTENT
+                                EOF
+                            '''.stripIndent())
+                        }
                         Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${enrootConfigDirNode}\""), numRetries: 3)
                         Utils.copyFileToRemoteHost(
                             pipeline,
