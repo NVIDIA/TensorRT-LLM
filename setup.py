@@ -347,8 +347,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         dst_fmha = os.path.join("3rdparty", "fmha_sm100")
         wheel_has_fmha = any(
             file.filename.startswith("fmha_sm100/") for file in wheel.filelist)
-        if wheel_has_fmha and os.path.isdir(dst_fmha):
-            shutil.rmtree(dst_fmha)
+        if wheel_has_fmha:
+            if os.path.islink(dst_fmha):
+                os.unlink(dst_fmha)
+            elif os.path.isdir(dst_fmha):
+                shutil.rmtree(dst_fmha)
         for file in wheel.filelist:
             # Skip yaml files
             if file.filename.endswith(".yaml"):

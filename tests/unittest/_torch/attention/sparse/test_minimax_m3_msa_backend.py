@@ -81,6 +81,16 @@ def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_msa_paged_kv_preserves_tma_compatible_outer_stride() -> None:
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 (Blackwell) required")
+
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) not importable")
+
     from fmha_sm100.cute import interface as sparse_interface
 
     pages, roles, heads, page_size, head_dim = 5, 2, 2, 128, 128
@@ -113,6 +123,16 @@ def test_msa_paged_kv_preserves_tma_compatible_outer_stride() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 (Blackwell) required")
+
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) not importable")
+
     from fmha_sm100.cute import interface as sparse_interface
 
     pages, heads, page_size, head_dim = 5, 2, 128, 128
@@ -131,6 +151,7 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
 
     assert prepared.is_contiguous()
     assert prepared.data_ptr() != view.data_ptr()
+    torch.testing.assert_close(prepared, view)
 
 
 def test_msa_index_k_uses_hnd_cache_view_and_writer():

@@ -1088,7 +1088,9 @@ def main(*,
             raise FileNotFoundError(
                 f"MSA package missing at {msa_src}; CMake FetchContent for msa "
                 "did not populate the expected sources.")
-        if msa_dst.exists():
+        if msa_dst.is_symlink():
+            msa_dst.unlink()
+        elif msa_dst.exists():
             rmtree(msa_dst)
         msa_dst.mkdir(parents=True)
         for python_source in msa_src.glob("*.py"):
@@ -1099,6 +1101,7 @@ def main(*,
                 Path("cutlass/include"),
                 Path("cutlass/tools/util/include"),
         ):
+            (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
             install_tree(
                 msa_src / relative_dir,
                 msa_dst / relative_dir,
