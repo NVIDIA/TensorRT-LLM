@@ -118,12 +118,16 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
 
-    def __init__(self, args: TorchSampler.Args):
+    def __init__(self, args: TorchSampler.Args, *, accepted_path_len: Optional[int] = None):
         """
         Initialize the speculative sampler.
 
         Args:
             args: TorchSampler.Args with max_num_sequences, max_seq_len, etc.
+            accepted_path_len: Upper bound on the number of tokens a single step
+                can accept, used to size new_tokens. Defaults to
+                ``args.max_draft_len + 1``; see the store comment below for the
+                one mode that has to override it.
         """
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
@@ -138,18 +142,26 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.max_beam_width = args.max_beam_width
         assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
-        # new_tokens holds only the accepted path, whose depth is bounded by
-        # max_draft_len + 1 (one root-to-leaf path, plus the golden token), so
-        # it could be narrower than the wire width for static trees and PARD.
-        # It is deliberately sized to the wire width here: sample_async
-        # truncates the worker output to the store width, so narrowing it would
-        # depend on the worker packing accepted tokens at the front. The
-        # over-allocation is a few hundred KB of int32 and buys that
-        # independence.
+        # new_tokens holds the accepted tokens only, so it is sized to how many
+        # a step can accept rather than to the wire width. Normally that is
+        # max_draft_len + 1: the drafter advances max_draft_len times, and the
+        # golden token the target always accepts adds one. Verified against
+        # Eagle3 dynamic tree (K=6, T=60), MTP dynamic tree, PARD (T=2K-1) and
+        # the linear modes -- none exceed it.
+        #
+        # The exception is the deprecated eagle_choices static tree. There the
+        # one-model drafter ignores the tree and runs _forward_draft_loop, a
+        # linear loop over runtime_draft_len == max_total_draft_tokens, so a
+        # step can accept up to max_total_draft_tokens + 1 tokens even though
+        # max_draft_len only describes the depth of a tree that is never built.
+        # (Tree-aware acceptance lives in TorchSampler, i.e. the two-model
+        # path.) get_spec_decoder passes the wire width for that mode; both it
+        # and this workaround go away with the feature in release 1.4.
+        self.max_accepted_path_len = (
+            accepted_path_len if accepted_path_len is not None else args.max_draft_len + 1
+        )
         self.store = self.Store(
-            new_tokens=int_tensor(
-                (args.max_total_draft_tokens + 1, seq_slots, self.max_beam_width)
-            ),
+            new_tokens=int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width)),
             next_new_tokens=int_tensor(
                 (args.max_total_draft_tokens + 1, seq_slots, self.max_beam_width)
             ),
@@ -210,6 +222,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
+            # new_tokens is sized to this bound, and add_token indexes a plain
+            # host-side list, so a violation would otherwise surface as an
+            # opaque IndexError.
+            assert num_new_tokens <= self.max_accepted_path_len, (
+                f"accepted {num_new_tokens} tokens in one step, but new_tokens is "
+                f"sized for {self.max_accepted_path_len}"
+            )
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
                 if TorchSampler._handle_stop_criteria(

@@ -404,7 +404,19 @@ def get_spec_decoder(
         # One sampler for every one-model mode: it only moves the worker's
         # pre-sampled output around, and its buffer shapes derive from
         # sampler_args alone.
-        return SpecSampler(sampler_args)
+        #
+        # WORKAROUND (remove with eagle_choices in release 1.4): the static
+        # tree is the one mode where a step can accept more than
+        # max_draft_len + 1 tokens. The one-model drafter never builds the tree
+        # -- _forward_draft_loop is linear over runtime_draft_len, which for a
+        # non-linear tree is max_total_draft_tokens -- so max_draft_len only
+        # describes a tree depth that is never used, and acceptance is bounded
+        # by the wire width instead. Tree-aware acceptance only exists in the
+        # two-model TorchSampler path, which is deprecated alongside this.
+        accepted_path_len = None
+        if getattr(spec_config, "eagle_choices", None):
+            accepted_path_len = sampler_args.max_total_draft_tokens + 1
+        return SpecSampler(sampler_args, accepted_path_len=accepted_path_len)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
