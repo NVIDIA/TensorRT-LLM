@@ -560,6 +560,15 @@ class DeepseekV4WeightLoader:
         self.is_draft_model = is_draft_model
 
     def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+        # Opt-in WAR (TRTLLM_PINNED_WEIGHT_STAGING=1) for drivers where
+        # pageable H2D copies stall during weight loading; staging buffers
+        # are freed on scope exit. See pinned_weight_staging.py.
+        from tensorrt_llm._torch import pinned_weight_staging
+
+        with pinned_weight_staging.staging_scope():
+            return self._load_weights_impl(weights, skip_modules=skip_modules)
+
+    def _load_weights_impl(self, weights: Dict, skip_modules: List[str] = []):
         # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
         # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
         # named-parameter keys before iterating modules. The detection is by

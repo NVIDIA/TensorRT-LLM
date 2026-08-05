@@ -82,8 +82,8 @@ if(FAST_BUILD)
     STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
 endif()
 
-# Marlin NVFP4: build the existing Hopper kernels and the dense W4A16/repack
-# kernels used on SM12x. Unsupported device passes emit empty kernel stubs.
+# Marlin NVFP4: build Ada/Hopper kernels and the dense W4A16/repack kernels used
+# on SM12x. Unsupported device passes emit empty kernel stubs.
 file(GLOB_RECURSE MARLIN_SRC "marlin/*.cu" "marlin/*.cpp")
 if(MARLIN_SRC)
   add_library(marlin_src OBJECT ${MARLIN_SRC})
@@ -95,7 +95,7 @@ if(MARLIN_SRC)
       $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
   )
   target_link_libraries(marlin_src PRIVATE trtllm_gen_fmha_interface)
-  set_cuda_architectures(marlin_src 90 120f)
+  set_cuda_architectures(marlin_src 89 90 120f)
 endif()
 
 add_library(

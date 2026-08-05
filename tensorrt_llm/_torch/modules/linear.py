@@ -106,15 +106,10 @@ def quant_config_has_nvfp4_activation_quantization(
             and quant_config.quant_algo != QuantAlgo.W4A16_NVFP4)
 
 
-_DEFAULT_NVFP4_ALLOWED_BACKENDS = ('cutlass', 'cublaslt', 'cuda_core')
-
-
-def _uses_hopper_marlin_nvfp4(module) -> bool:
-    """Whether a regular NVFP4 linear should use Marlin on Hopper."""
-    allowed_backends = tuple(getattr(module, "nvfp4_allowed_backends", ()))
-    marlin_selected = (allowed_backends == _DEFAULT_NVFP4_ALLOWED_BACKENDS
-                       or "marlin" in allowed_backends)
-    return (marlin_selected and 90 <= get_sm_version() < 100
+def _uses_marlin_nvfp4_backend(module) -> bool:
+    """Whether a regular NVFP4 linear explicitly selects Marlin."""
+    allowed_backends = getattr(module, "nvfp4_allowed_backends", ())
+    return ("marlin" in allowed_backends and 89 <= get_sm_version() < 100
             and getattr(module, "dtype", None) == torch.bfloat16
             and not getattr(module, "use_fused_gemm_allreduce", False)
             and hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
@@ -1513,7 +1508,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
-        use_marlin = _uses_hopper_marlin_nvfp4(module)
+        use_marlin = _uses_marlin_nvfp4_backend(module)
         allowed_backends_str = ('marlin' if use_marlin else ','.join(
             module.nvfp4_allowed_backends))
         output_buffer_kind = (
@@ -2138,11 +2133,20 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     @staticmethod
     def is_supported(module: Linear) -> bool:
         sm_version = get_sm_version()
-        return ((90 <= sm_version < 100 or sm_version in (120, 121))
+        return ((89 <= sm_version < 100 or sm_version in (120, 121))
                 and getattr(module, "dtype", None) == torch.bfloat16
                 and not getattr(module, "use_fused_gemm_allreduce", False)
                 and hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
                 and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
+
+    @classmethod
+    def is_enabled(cls, module: Linear) -> bool:
+        """Apply the architecture policy on top of kernel capability."""
+        if not cls.is_supported(module):
+            return False
+        sm_version = get_sm_version()
+        return (sm_version in (120, 121)
+                or "marlin" in getattr(module, "nvfp4_allowed_backends", ()))
 
     def transform_weights(self, module: Linear) -> None:
         from tensorrt_llm.quantization.utils import marlin_utils
@@ -3356,8 +3360,8 @@ class Linear(nn.Module):
                 Default (via config): ['cutlass', 'cublaslt', 'cuda_core'] - excludes cutedsl for faster build.
                 Add 'cutedsl' for extreme performance at the cost of longer build time.
                 Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
-                NVFP4 uses Marlin by default on Hopper. W4A16 BF16 linear
-                layers use Marlin by default on Hopper and SM120/121.
+                Marlin is opt-in on SM89-99. W4A16 BF16 linear layers use
+                Marlin by default on SM120/121.
                 Configure via nvfp4_gemm_config.allowed_backends in extra_llm_api_options.yaml.
         """
         from ..distributed import AllReduce
@@ -3500,7 +3504,7 @@ class Linear(nn.Module):
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
         quant_method = get_quant_method(quant_config)
         use_marlin = type(quant_method) is W4A16NVFP4LinearMethod
-        if use_marlin and MarlinNVFP4LinearMethod.is_supported(self):
+        if use_marlin and MarlinNVFP4LinearMethod.is_enabled(self):
             return MarlinNVFP4LinearMethod()
         return quant_method
 
@@ -3724,7 +3728,7 @@ class Linear(nn.Module):
         assert self._weights_created
         return (isinstance(self.quant_method, MarlinNVFP4LinearMethod)
                 or (type(self.quant_method) is NVFP4LinearMethod
-                    and _uses_hopper_marlin_nvfp4(self)))
+                    and _uses_marlin_nvfp4_backend(self)))
 
     @property
     def has_weight_only_quant(self):

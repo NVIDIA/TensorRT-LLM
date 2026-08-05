@@ -637,6 +637,14 @@ class Attention(nn.Module):
                                     key="disable_rope_fusion_for_rocketkv")
                 self.rope_fusion = False
 
+        if (config.kv_cache_compression_config is not None and
+                config.kv_cache_compression_config.changes_physical_kv_length):
+            logger.warning_once(
+                "KV-cache eviction changes the physical cache length; "
+                "setting rope_fusion=False.",
+                key="disable_rope_fusion_for_kv_cache_compression")
+            self.rope_fusion = False
+
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning_once(
                 "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion.",

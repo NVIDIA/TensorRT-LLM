@@ -51,6 +51,7 @@ def _run_w4a16_marlin_reference_case(m: int, n: int, k: int) -> None:
         dtype=torch.bfloat16,
         quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4),
         reduce_output=False,
+        nvfp4_allowed_backends=["marlin"],
     ).cuda()
     assert isinstance(linear.quant_method, MarlinNVFP4LinearMethod)
     linear.weight.data.copy_(weight)
@@ -109,8 +110,9 @@ def _make_w4a16_nvfp4_case(m: int, n: int, k: int, dtype: torch.dtype):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() not in (90, 120, 121),
-    reason="requires CUDA SM90 or SM120/121",
+    not torch.cuda.is_available()
+    or not (89 <= get_sm_version() < 100 or get_sm_version() in (120, 121)),
+    reason="requires CUDA SM89-99 or SM120/121",
 )
 @pytest.mark.parametrize(
     "shape",
@@ -211,6 +213,7 @@ def test_nvfp4_attention_keeps_high_precision_output_for_hopper_marlin():
             dtype=torch.bfloat16,
             quant_config=quant_config,
             reduce_output=False,
+            nvfp4_allowed_backends=["marlin"],
         )
         attention = SimpleNamespace(
             attn=SimpleNamespace(has_nvfp4=False),
@@ -261,7 +264,8 @@ def test_w4a16_disables_fused_gemm_allreduce(monkeypatch):
 @pytest.mark.parametrize(
     ("sm_version", "dtype", "expected_backends"),
     [
-        (90, torch.bfloat16, "marlin"),
+        (89, torch.bfloat16, "cutlass,cublaslt,cuda_core"),
+        (90, torch.bfloat16, "cutlass,cublaslt,cuda_core"),
         (90, torch.float16, "cutlass,cublaslt,cuda_core"),
         (120, torch.bfloat16, "cutlass,cublaslt,cuda_core"),
         (121, torch.bfloat16, "cutlass,cublaslt,cuda_core"),
@@ -308,7 +312,7 @@ def test_nvfp4_linear_uses_architecture_default_backend(sm_version, dtype, expec
     assert output.shape == (2, 4)
 
 
-@pytest.mark.parametrize("sm_version", [90, 120, 121])
+@pytest.mark.parametrize("sm_version", [89, 90, 120, 121])
 def test_nvfp4_linear_preserves_activation_quant_method(sm_version):
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
 
@@ -330,7 +334,31 @@ def test_nvfp4_linear_preserves_activation_quant_method(sm_version):
         )
         assert type(linear.quant_method) is NVFP4LinearMethod
         assert linear.has_nvfp4_activation_quantization
-        assert linear.uses_marlin_nvfp4 is (sm_version == 90)
+        assert not linear.uses_marlin_nvfp4
+
+
+@pytest.mark.parametrize("sm_version", [89, 90])
+def test_nvfp4_linear_uses_marlin_when_explicitly_enabled(sm_version):
+    with (
+        patch(
+            "tensorrt_llm._torch.modules.linear.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
+        patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
+    ):
+        linear = Linear(
+            32,
+            32,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            reduce_output=False,
+            nvfp4_allowed_backends=["marlin"],
+        )
+        assert type(linear.quant_method) is NVFP4LinearMethod
+        assert linear.has_nvfp4_activation_quantization
+        assert linear.uses_marlin_nvfp4
 
 
 def test_nvfp4_linear_hopper_fp16_keeps_normal_method():
@@ -360,7 +388,7 @@ def test_nvfp4_linear_hopper_marlin_applies_bias_as_post_op():
         weight_scale=torch.empty((128 * 4,), dtype=torch.uint8),
         out_features=4,
         dtype=torch.bfloat16,
-        nvfp4_allowed_backends=["cutlass", "cublaslt", "cuda_core"],
+        nvfp4_allowed_backends=["marlin"],
         all_reduce=None,
         mapping=None,
     )
@@ -783,7 +811,7 @@ def test_w4a16_nvfp4_marlin_selection_requires_supported_module(dtype, use_fused
         assert not MarlinNVFP4LinearMethod.is_supported(module)
 
 
-@pytest.mark.parametrize("sm_version", [90, 120, 121])
+@pytest.mark.parametrize("sm_version", [120, 121])
 def test_w4a16_nvfp4_linear_selects_marlin_by_default(sm_version):
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
 
@@ -806,6 +834,54 @@ def test_w4a16_nvfp4_linear_selects_marlin_by_default(sm_version):
 
     assert isinstance(linear.quant_method, MarlinNVFP4LinearMethod)
     assert isinstance(linear.quant_method, W4A16NVFP4LinearMethod)
+
+
+@pytest.mark.parametrize("sm_version", [89, 90])
+def test_w4a16_nvfp4_linear_selects_marlin_when_explicitly_enabled(sm_version):
+    quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+
+    with (
+        patch(
+            "tensorrt_llm._torch.modules.linear.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
+        patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
+    ):
+        linear = Linear(
+            32,
+            32,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=quant_config,
+            reduce_output=False,
+            nvfp4_allowed_backends=["marlin"],
+        )
+
+    assert isinstance(linear.quant_method, MarlinNVFP4LinearMethod)
+    assert isinstance(linear.quant_method, W4A16NVFP4LinearMethod)
+
+
+@pytest.mark.parametrize("sm_version", [89, 90])
+def test_w4a16_nvfp4_linear_uses_fallback_without_opt_in(sm_version):
+    with (
+        patch(
+            "tensorrt_llm._torch.modules.linear.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch("torch.ops.trtllm.marlin_nvfp4_gemm", create=True),
+        patch("torch.ops.trtllm.gptq_marlin_repack", create=True),
+    ):
+        linear = Linear(
+            32,
+            32,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4),
+            reduce_output=False,
+        )
+
+    assert type(linear.quant_method) is W4A16NVFP4LinearMethod
 
 
 def test_w4a16_nvfp4_linear_uses_default_method_on_sm100():

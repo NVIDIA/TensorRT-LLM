@@ -128,7 +128,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         # handshake. Keep the ID used to reserve the generation server separate
         # so its coordinator-side load is released under the original key.
         gen_reservation_id = disagg_request_id if gen_server else None
-        need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
+        benchmark_gen_only = await self._check_gen_only_disagg(request)
+        need_ctx = need_ctx and not benchmark_gen_only
         ctx_response = None
         gen_req = request
         if need_ctx:
@@ -160,14 +161,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                 raise
         else:
             # When need_ctx=False the gen server handles full generation and
-            # must not see a stale request_type="context_only".
-            # _check_gen_only_disagg already sets proper generation_only
-            # params when applicable.
-            if (
-                gen_req.disaggregated_params is not None
-                and gen_req.disaggregated_params.request_type == "context_only"
-            ):
-                gen_req.disaggregated_params = None
+            # must not see client-supplied disaggregated handoff params. The
+            # benchmark-only path above is the only trusted source here.
+            if not benchmark_gen_only:
+                gen_req = request.model_copy(update={"disaggregated_params": None})
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
                 gen_server, _ = await self._gen_router.get_next_server(

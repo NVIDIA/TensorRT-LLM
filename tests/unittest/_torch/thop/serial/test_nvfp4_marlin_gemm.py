@@ -66,8 +66,8 @@ class TestNvfp4MarlinGemm(unittest.TestCase):
         name_func=unittest_name_func,
     )
     @unittest.skipUnless(
-        getSMVersion() == 90 or 120 <= getSMVersion() < 130,
-        "Marlin NVFP4 GEMM requires SM90 or SM12x",
+        89 <= getSMVersion() < 100 or getSMVersion() in (120, 121),
+        "Marlin NVFP4 GEMM requires SM89-99 or SM120/121",
     )
     def test_nvfp4_marlin_gemm(
         self, input_dim, output_dim, batch_size, sf_vec_size, alpha, act_dtype

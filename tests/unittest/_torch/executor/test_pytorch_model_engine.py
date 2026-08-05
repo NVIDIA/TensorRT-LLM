@@ -11,6 +11,8 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
+    MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
     MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
@@ -39,6 +41,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
 from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
 from tensorrt_llm.mapping import CpType, Mapping
@@ -1114,6 +1117,55 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         spec_metadata.write_padding_onehot_draft_probs.assert_called_once_with(
             [generation.py_seq_slot], 0)
         kv_cache_manager.shutdown()
+
+    def test_multimodal_encoder_max_seq_len(self) -> None:
+
+        class CapturingEncoder(torch.nn.Module, MultimodalEncoderMixin):
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.setup_args = None
+                self.max_seq_len = None
+
+            def setup_attn_metadata(self, max_num_requests: int,
+                                    max_num_tokens: int) -> None:
+                self.setup_args = (max_num_requests, max_num_tokens)
+
+            def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+                self.max_seq_len = max_seq_len
+
+        encoder_batch_size = 32
+        encoder_max_num_tokens = 16384
+        processor_max_num_tokens = 65536
+        cases = [
+            ({
+                "image": processor_max_num_tokens
+            }, processor_max_num_tokens),
+            ({
+                "image": 4096
+            }, encoder_max_num_tokens),
+            ({}, encoder_max_num_tokens),
+            (None, encoder_max_num_tokens),
+        ]
+        for max_tokens_per_item, expected_max_seq_len in cases:
+            with self.subTest(max_tokens_per_item=max_tokens_per_item):
+                encoder = CapturingEncoder()
+                model_engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+                model_engine.model = torch.nn.Sequential(encoder)
+                model_engine.encoder_batch_size = encoder_batch_size
+                model_engine.encoder_max_num_tokens = encoder_max_num_tokens
+                if max_tokens_per_item is None:
+                    model_engine.input_processor = Mock()
+                else:
+                    model_engine.input_processor = Mock(
+                        spec=BaseMultimodalDummyInputsBuilder)
+                    model_engine.input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
+
+                model_engine._set_up_multimodal_encoder_attn_metadata()
+
+                self.assertEqual(encoder.setup_args,
+                                 (encoder_batch_size, encoder_max_num_tokens))
+                self.assertEqual(encoder.max_seq_len, expected_max_seq_len)
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()

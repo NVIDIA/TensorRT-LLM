@@ -766,8 +766,8 @@ def test_fp4_linear_cuda_core(dtype, mnk):
 
 
 @pytest.mark.skipif(
-    get_sm_version() < 90 or get_sm_version() >= 100,
-    reason="Marlin NVFP4 backend runs Hopper",
+    not (89 <= get_sm_version() < 100 or get_sm_version() in (120, 121)),
+    reason="Dense Marlin NVFP4 runs on SM89-99 and SM120/121",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
