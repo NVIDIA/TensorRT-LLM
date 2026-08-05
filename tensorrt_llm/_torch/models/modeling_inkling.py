@@ -721,16 +721,38 @@ class InklingAttention(QKNormRoPEAttention):
         self.sm_scale = 1.0 / float(head_dim)
         self.window_left = (self.attention_window_size - 1) if self.is_local else -1
 
-        tp_size = model_config.mapping.tp_size
+        # Attention-scoped TP. Under attention DP every rank runs the FULL head
+        # set over its own requests, so the base Attention above built qkv_proj /
+        # o_proj from an internal ``tp_size=1`` mapping (modules/attention.py).
+        # The three Inkling-only tensors below (r_proj, k/v sconv) hang off that
+        # same head/kv-head split, so they must follow the attention TP, not the
+        # global one -- sharding them by mapping.tp_size while the base keeps
+        # full heads is a silent shape mismatch, not a slowdown.
+        tp_size = 1 if model_config.mapping.enable_attention_dp else model_config.mapping.tp_size
+        # Cross-check against the base rather than trusting two copies of the
+        # rule to stay in step: if modules/attention.py ever changes how it
+        # scopes attention TP, fail here at load instead of silently building
+        # r_proj and the sconvs for a different head count than qkv_proj.
+        assert self.num_heads == num_heads // tp_size, (
+            f"attention TP disagrees with the base Attention: base kept "
+            f"{self.num_heads} of {num_heads} heads, this rule expects "
+            f"{num_heads // tp_size} (enable_attention_dp="
+            f"{model_config.mapping.enable_attention_dp}, "
+            f"mapping.tp_size={model_config.mapping.tp_size})"
+        )
         # r projection: per-head relative states (num_heads * d_rel), sharded by
         # head like q. Output is not gathered (consumed locally to build bias).
+        # Under attention DP it is replicated: no mapping / no TP mode, matching
+        # how DeepSeek-V3 builds its non-expert Linears under ADP.
         self.r_proj = Linear(
             config.hidden_size,
             num_heads * self.d_rel,
             bias=False,
             dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            mapping=None if model_config.mapping.enable_attention_dp else model_config.mapping,
+            tensor_parallel_mode=(
+                None if model_config.mapping.enable_attention_dp else TensorParallelMode.COLUMN
+            ),
             gather_output=False,
         )
         # Learned relative-logit profiles, replicated across TP ranks. The
@@ -742,12 +764,21 @@ class InklingAttention(QKNormRoPEAttention):
         # k/v short convs act on the k/v stream from the fused qkv projection,
         # so they are sharded by kv-head like that projection. Pass the FULL
         # channel count and let InklingShortConv slice this rank's block at load.
+        # Under attention DP that projection keeps every kv head, so the convs
+        # must keep every channel: tp_shard follows the attention TP.
         full_kv_dim = num_kv_heads * head_dim
+        sconv_tp_shard = not model_config.mapping.enable_attention_dp
         self.k_sconv = InklingShortConv(
-            full_kv_dim, config.sconv_kernel_size, mapping=model_config.mapping, tp_shard=True
+            full_kv_dim,
+            config.sconv_kernel_size,
+            mapping=model_config.mapping,
+            tp_shard=sconv_tp_shard,
         )
         self.v_sconv = InklingShortConv(
-            full_kv_dim, config.sconv_kernel_size, mapping=model_config.mapping, tp_shard=True
+            full_kv_dim,
+            config.sconv_kernel_size,
+            mapping=model_config.mapping,
+            tp_shard=sconv_tp_shard,
         )
         self.local_num_heads = num_heads // tp_size
         # Stable GPU buffers for the CUDA-graph-safe runtime decode metadata,
@@ -1076,13 +1107,25 @@ class InklingDenseMLP(nn.Module):
         super().__init__()
         config = model_config.pretrained_config
         inter = config.dense_intermediate_size
+        # Under attention DP the dense MLP goes data-parallel too: each rank
+        # holds the full weight and runs it over its OWN tokens. Keeping the
+        # column/row split here would be a correctness bug, not just a
+        # different partitioning -- the row-parallel down_proj all-reduces its
+        # partial sum across the TP group, and under ADP the peers' partials
+        # belong to DIFFERENT requests, so the reduce would add unrelated
+        # tokens together. This mirrors DeepSeek-V3, whose
+        # ``_compute_mlp_tp_size`` returns 1 under ADP for the same reason:
+        # only the routed experts stay sharded, and FusedMoE re-joins the ranks
+        # explicitly via all_rank_num_tokens.
+        dp = model_config.mapping.enable_attention_dp
+        mlp_mapping = None if dp else model_config.mapping
         self.gate_up_proj = Linear(
             config.hidden_size,
             2 * inter,
             bias=False,
             dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            mapping=mlp_mapping,
+            tensor_parallel_mode=None if dp else TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
             ),
@@ -1092,8 +1135,8 @@ class InklingDenseMLP(nn.Module):
             config.hidden_size,
             bias=False,
             dtype=config.torch_dtype,
-            mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.ROW,
+            mapping=mlp_mapping,
+            tensor_parallel_mode=None if dp else TensorParallelMode.ROW,
         )
         self.global_scale = nn.Parameter(torch.ones(1))
         self.act_fn = torch.nn.functional.silu

@@ -84,12 +84,21 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         conv_dtype = getattr(text_config, "torch_dtype", None)
         if not isinstance(conv_dtype, torch.dtype):
             conv_dtype = torch.bfloat16
+        # The conv pool's k/v width follows the attention kv-head split, so it
+        # takes the ATTENTION TP, not the global one. Under attention DP every
+        # rank keeps the full kv-head set for its own requests -- the same rule
+        # KVCacheManagerV2 already applies to the paged pool
+        # (``tp_size = 1 if mapping.enable_attention_dp``) and that
+        # InklingAttention applies to the k/v short convs themselves. Dividing
+        # by the global tp_size here would allocate quarter-width conv rows for
+        # full-width convs.
+        attn_tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
         # +1 row for the CUDA-graph padding / dummy-request slot (the mamba
         # pattern): a padded decode batch admits up to max_batch_size real
         # requests plus a shared dummy row.
         self._conv_cache = InklingConvStateCache(
             pretrained_config,
-            mapping.tp_size,
+            attn_tp_size,
             max_batch_size + 1,
             torch.device("cuda", torch.cuda.current_device()),
             conv_dtype,

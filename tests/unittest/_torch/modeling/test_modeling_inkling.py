@@ -803,3 +803,363 @@ def test_every_deferred_import_in_the_inkling_package_resolves():
 
     assert checked >= 10, f"expected to inspect the package's imports, saw {checked}"
     assert not unresolved, unresolved
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: attention data parallelism
+#
+# Under ADP every rank runs the FULL attention over its OWN requests, and only
+# the routed experts stay sharded. So the rule for everything outside the
+# experts is "replicate", and the failure mode when a tensor keeps the global TP
+# split is not a slowdown -- it is either a shape mismatch against the base
+# Attention (which already scoped itself to attention TP) or an all-reduce that
+# sums activations belonging to different requests.
+# ---------------------------------------------------------------------------
+def _adp_mapping(adp, tp_size=4):
+    from tensorrt_llm.mapping import Mapping
+
+    return Mapping(world_size=tp_size, tp_size=tp_size, rank=0, enable_attention_dp=adp)
+
+
+def test_short_conv_keeps_every_channel_under_attention_dp():
+    """The k/v convs act on the k/v stream out of the fused qkv projection. Under
+    ADP that projection keeps every kv head, so the convs must keep every
+    channel -- a 1/tp slice here would silently convolve a quarter of the
+    stream."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingShortConv
+
+    sc = InklingShortConv(32, 4, mapping=_adp_mapping(True), tp_shard=False)
+
+    assert sc.tp_size == 1
+    assert sc.channels == 32 == sc.channels_full
+
+
+def test_short_conv_still_shards_by_kv_head_under_pure_tp():
+    """Regression guard for the ADP change: pure TP must keep the split that
+    every Inkling accuracy run to date measured."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingShortConv
+
+    sc = InklingShortConv(32, 4, mapping=_adp_mapping(False), tp_shard=True)
+
+    assert sc.tp_size == 4
+    assert sc.channels == 8
+    assert sc.channels_full == 32
+
+
+def _tiny_dense_mlp(adp, hidden=8, inter=16):
+    import torch
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_inkling import InklingDenseMLP
+
+    cfg = SimpleNamespace(
+        hidden_size=hidden, dense_intermediate_size=inter, torch_dtype=torch.bfloat16
+    )
+    return InklingDenseMLP(ModelConfig(pretrained_config=cfg, mapping=_adp_mapping(adp)))
+
+
+class _StubAllReduce:
+    """Stands in for the real collective so a 4-rank Linear can be built in a
+    single-process pytest.
+
+    ``AllReduce.__init__`` opens a communicator, which calls
+    ``_validate_world_size`` and refuses a Mapping wider than the actual MPI
+    world (1 here). Only the collective is stubbed -- the sharding arithmetic
+    under test is Linear's own and runs untouched.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+
+@pytest.fixture
+def no_collectives(monkeypatch):
+    # Patch the DEFINING module, not linear.py: Linear.__init__ does
+    # ``from ..distributed import AllReduce`` in its own body, so the name is
+    # resolved fresh from tensorrt_llm._torch.distributed on every call and a
+    # patch on linear.AllReduce would be silently ignored.
+    from tensorrt_llm._torch import distributed as dist_mod
+
+    monkeypatch.setattr(dist_mod, "AllReduce", _StubAllReduce)
+
+
+def test_dense_mlp_is_replicated_under_attention_dp(no_collectives):
+    """Layers 0/1 are dense. Under ADP the row-parallel down_proj would
+    all-reduce its partial sum across the TP group -- but each rank's partial
+    belongs to DIFFERENT requests, so the reduce would add unrelated tokens
+    together. Replicating the weights is the only correct answer, and it is what
+    DeepSeek-V3's _compute_mlp_tp_size does (returns 1 under ADP)."""
+    mlp = _tiny_dense_mlp(adp=True)
+
+    # tp_mode is what Linear.forward dispatches on: the ROW branch is the only
+    # one that calls all_reduce, so None means no cross-rank reduce can happen.
+    assert mlp.gate_up_proj.tp_mode is None
+    assert mlp.down_proj.tp_mode is None
+    # And the module must not believe it owns a shard of anything.
+    assert mlp.down_proj.tp_size == 1
+    # Full width on every rank: 2*inter rows out, hidden columns in.
+    assert tuple(mlp.gate_up_proj.weight.shape) == (32, 8)
+    assert tuple(mlp.down_proj.weight.shape) == (8, 16)
+
+
+def test_dense_mlp_still_tp_shards_and_reduces_without_attention_dp(no_collectives):
+    """Regression guard: pure TP must keep column/row parallelism AND the
+    down_proj all-reduce. Dropping that reduce is the bug this pair is here to
+    make impossible to introduce by accident."""
+    from tensorrt_llm._torch.modules.linear import TensorParallelMode
+
+    mlp = _tiny_dense_mlp(adp=False)
+
+    assert mlp.gate_up_proj.tp_mode == TensorParallelMode.COLUMN
+    assert mlp.down_proj.tp_mode == TensorParallelMode.ROW
+    assert isinstance(mlp.down_proj.all_reduce, _StubAllReduce)
+    assert tuple(mlp.gate_up_proj.weight.shape) == (8, 8)  # 2*16 / 4 ranks
+    assert tuple(mlp.down_proj.weight.shape) == (8, 4)  # 16 / 4 ranks
+
+
+def _conv_pool(tp_size, kv_heads=16, head_dim=8):
+    import torch
+
+    from tensorrt_llm._torch.models.modeling_inkling import InklingConvStateCache
+
+    cfg = SimpleNamespace(
+        num_hidden_layers=2,
+        hidden_size=8,
+        sconv_kernel_size=4,
+        layer_num_kv_heads=lambda i: kv_heads,
+        layer_head_dim=lambda i: head_dim,
+    )
+    return InklingConvStateCache(cfg, tp_size, 2, torch.device("cpu"), torch.bfloat16)
+
+
+def test_conv_pool_k_v_width_follows_the_split_it_is_given():
+    """The pool's k/v rows must be exactly as wide as the convs that write them.
+    tp_size 1 (the ADP case) is full width; tp_size 4 is the TP slice."""
+    assert tuple(_conv_pool(1).layer_state(0).k.shape) == (2, 128, 3)
+    assert tuple(_conv_pool(4).layer_state(0).k.shape) == (2, 32, 3)
+
+
+def test_conv_pool_attn_and_mlp_rows_are_never_split():
+    """The post-attention / post-MLP convs run on the full residual stream and
+    are replicated under both TP and ADP, so their width is hidden_size
+    regardless of the split."""
+    for tp in (1, 4):
+        st = _conv_pool(tp).layer_state(0)
+        assert tuple(st.attn.shape) == (2, 8, 3), tp
+        assert tuple(st.mlp.shape) == (2, 8, 3), tp
+
+
+def test_cache_manager_sizes_the_conv_pool_by_attention_tp(monkeypatch):
+    """The manager must hand the pool the ATTENTION TP, not the global one --
+    the same rule KVCacheManagerV2 already applies to the paged pool. Passing
+    mapping.tp_size under ADP would allocate quarter-width conv rows for
+    full-width convs, which shows up as a shape error deep in the conv kernel
+    rather than at load."""
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as cm
+    from tensorrt_llm._torch.models import modeling_inkling as mi
+
+    seen = {}
+
+    class _FakePool:
+        def __init__(self, pretrained_config, tp_size, max_batch, device, dtype):
+            seen["tp_size"] = tp_size
+
+    monkeypatch.setattr(cm.KVCacheManagerV2, "__init__", lambda self, *a, **k: None)
+    monkeypatch.setattr(mi, "InklingConvStateCache", _FakePool)
+    cfg = SimpleNamespace(torch_dtype=torch.bfloat16)
+
+    cm.InklingHybridCacheManager(
+        pretrained_config=cfg, mapping=_adp_mapping(True), max_batch_size=8
+    )
+    assert seen["tp_size"] == 1, "under ADP the conv pool must be full width"
+
+    cm.InklingHybridCacheManager(
+        pretrained_config=cfg, mapping=_adp_mapping(False), max_batch_size=8
+    )
+    assert seen["tp_size"] == 4, "without ADP the conv pool must keep the TP slice"
+
+
+def test_attention_never_sizes_a_tensor_by_the_unguarded_global_tp():
+    """Structural, because InklingAttention needs a backend and a real config to
+    construct, and the bug it guards is a silent shape divergence rather than an
+    exception.
+
+    Every tensor inside InklingAttention hangs off the head / kv-head split that
+    the base Attention already scoped to the attention TP (tp_size=1 under ADP,
+    see modules/attention.py). So a bare ``mapping.tp_size`` read here -- or a
+    hardcoded ``tp_shard=True`` -- means this module disagrees with the qkv/o
+    projections about how many heads the rank owns. Require every such site to
+    mention enable_attention_dp, which is the only thing that distinguishes the
+    two cases.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from tensorrt_llm._torch.models.modeling_inkling import InklingAttention
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(InklingAttention.__init__)))
+    body = tree.body[0].body
+
+    def mentions_adp(node):
+        return any(
+            isinstance(n, ast.Attribute) and n.attr == "enable_attention_dp" for n in ast.walk(node)
+        )
+
+    unguarded_tp, hardcoded_shard = [], []
+    for stmt in body:
+        guarded = mentions_adp(stmt)
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Attribute) and node.attr == "tp_size" and not guarded:
+                unguarded_tp.append(getattr(stmt, "lineno", "?"))
+            if (
+                isinstance(node, ast.keyword)
+                and node.arg == "tp_shard"
+                and isinstance(node.value, ast.Constant)
+                and node.value.value is True
+            ):
+                hardcoded_shard.append(getattr(stmt, "lineno", "?"))
+
+    assert not unguarded_tp, (
+        f"mapping.tp_size read without an enable_attention_dp guard at "
+        f"InklingAttention.__init__ line(s) {unguarded_tp}"
+    )
+    assert not hardcoded_shard, (
+        f"tp_shard=True hardcoded at InklingAttention.__init__ line(s) "
+        f"{hardcoded_shard}; it must follow the attention TP"
+    )
+
+
+def test_attention_cross_checks_its_head_count_against_the_base():
+    """The attention-TP rule is written in two places -- modules/attention.py and
+    here -- so __init__ asserts they agree. Without that, a change to how the
+    base scopes ADP would build r_proj and the short convs for a different head
+    count than qkv_proj, and the first symptom would be a wrong-shaped einsum
+    deep in the bias construction."""
+    import inspect
+
+    from tensorrt_llm._torch.models.modeling_inkling import InklingAttention
+
+    src = inspect.getsource(InklingAttention.__init__)
+    assert "assert self.num_heads == num_heads // tp_size" in src
+
+
+def test_fused_moe_prefers_reduce_scatter_over_the_reduce_results_all_reduce():
+    """Inkling builds its experts with reduce_results=True, which is required
+    under pure TP. Under ADP that all-reduce would be wrong (peers hold
+    different requests), and Inkling does NOT special-case it -- it relies on
+    FusedMoE preferring reduce-scatter when use_dp is set.
+
+    That is an upstream contract Inkling's correctness rests on, so pin it here:
+    if the dispatch ever stopped checking use_dp first, Inkling would go silently
+    wrong under ADP with no local change to blame."""
+    import ast
+    import inspect
+    import textwrap
+
+    from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+
+    src = textwrap.dedent(inspect.getsource(MoE.reducescatter_or_allreduce))
+    tree = ast.parse(src)
+    ifs = [n for n in ast.walk(tree) if isinstance(n, ast.If)]
+    use_dp_first = [
+        n
+        for n in ifs
+        if isinstance(n.test, ast.Attribute)
+        and n.test.attr == "use_dp"
+        and any(
+            isinstance(c, ast.Attribute) and c.attr == "reduce_results"
+            for c in ast.walk(ast.Module(body=n.orelse, type_ignores=[]))
+        )
+    ]
+    assert use_dp_first, (
+        "FusedMoE.reducescatter_or_allreduce no longer tests use_dp before "
+        "reduce_results; Inkling's reduce_results=True is only safe under ADP "
+        "because use_dp wins"
+    )
+
+
+_ADP_RANKS = 4
+
+
+def _tiny_attention(adp, layer_idx=0):
+    """A real InklingAttention on a miniature config; returns (config, module).
+
+    Small enough to build in a unit test, but every dimension the ADP rule
+    touches is still divisible by 4 ranks so the pure-TP arm really shards.
+    ``local_layer_ids=[0]`` pins layer 0 as a local (sliding-window) layer, so
+    which of the swa_* / plain fields apply is fixed rather than inherited from
+    whatever pattern a 2-layer config would default to.
+
+    Expected widths are derived from the config's own per-layer accessors, not
+    hardcoded: the claim under test is "full under ADP, 1/tp under TP", and
+    restating the geometry by hand would only add a second thing to get wrong.
+    """
+    from tensorrt_llm._torch.configs.inkling import InklingTextConfig
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_inkling import InklingAttention
+
+    cfg = InklingTextConfig(
+        hidden_size=64,
+        num_hidden_layers=2,
+        local_layer_ids=[0],
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        head_dim=8,
+        swa_num_attention_heads=8,
+        swa_num_key_value_heads=8,
+        swa_head_dim=8,
+        d_rel=4,
+    )
+    mc = ModelConfig(pretrained_config=cfg, mapping=_adp_mapping(adp))
+    return cfg, InklingAttention(mc, layer_idx)
+
+
+def _expected_widths(cfg, layer_idx=0):
+    """(full head count, full k/v channel count) for a layer, per the config."""
+    heads = cfg.layer_num_heads(layer_idx)
+    kv_dim = cfg.layer_num_kv_heads(layer_idx) * cfg.layer_head_dim(layer_idx)
+    # If these were not divisible the TP arm below would prove nothing.
+    assert heads % _ADP_RANKS == 0, heads
+    assert kv_dim % _ADP_RANKS == 0, kv_dim
+    assert (heads * cfg.d_rel) % _ADP_RANKS == 0, heads * cfg.d_rel
+    return heads, kv_dim
+
+
+def test_attention_keeps_every_head_and_channel_under_attention_dp(no_collectives):
+    """The whole point of ADP: this rank owns the full head set for its own
+    requests. r_proj, the k/v short convs and local_num_heads all hang off that
+    head split, so each must be full width -- if any one of them kept the global
+    1/tp slice it would disagree with the qkv projection the base already built
+    at full width, and the relative-bias einsum would be the first thing to
+    notice."""
+    cfg, attn = _tiny_attention(adp=True)
+    heads, kv_dim = _expected_widths(cfg)
+
+    assert attn.local_num_heads == heads  # every head, not heads/4
+    assert attn.num_heads == heads  # and the base agrees
+    assert attn.r_proj.tp_mode is None
+    assert tuple(attn.r_proj.weight.shape) == (heads * cfg.d_rel, cfg.hidden_size)
+    assert attn.k_sconv.channels == kv_dim == attn.k_sconv.channels_full
+    assert attn.v_sconv.channels == kv_dim == attn.v_sconv.channels_full
+
+
+def test_attention_still_shards_heads_and_channels_without_attention_dp(no_collectives):
+    """Regression guard: pure TP is what every Inkling accuracy run to date
+    measured, and the ADP change must not have moved it."""
+    from tensorrt_llm._torch.modules.linear import TensorParallelMode
+
+    cfg, attn = _tiny_attention(adp=False)
+    heads, kv_dim = _expected_widths(cfg)
+
+    assert attn.local_num_heads == heads // _ADP_RANKS
+    assert attn.num_heads == heads // _ADP_RANKS
+    assert attn.r_proj.tp_mode == TensorParallelMode.COLUMN
+    assert tuple(attn.r_proj.weight.shape) == (
+        heads * cfg.d_rel // _ADP_RANKS,
+        cfg.hidden_size,
+    )
+    assert attn.k_sconv.channels == kv_dim // _ADP_RANKS
+    assert attn.k_sconv.channels_full == kv_dim
