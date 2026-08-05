@@ -588,6 +588,70 @@ class TestNegativePromptMetadata:
         )
 
 
+class TestDefaultNegativePrompt:
+    """Video modes inherit the reference's default negative prompt; image modes do not.
+
+    cosmos-framework wires ``negative_prompt_file: neg_prompts.json`` into
+    ``defaults/{text2video,image2video,video2video,audio_image2video}`` and leaves it
+    unset for ``text2image``/``image2image``.
+    """
+
+    def test_video_default_serializes_like_the_reference(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.negative_prompt import (
+            COSMOS3_VIDEO_NEGATIVE_PROMPT,
+        )
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+            default_video_negative_prompt,
+        )
+
+        # The reference loads it as json.dumps(json.loads(...)); ensure_ascii and key
+        # order both matter, so round-tripping must be a no-op.
+        text = default_video_negative_prompt()
+        assert text == json.dumps(COSMOS3_VIDEO_NEGATIVE_PROMPT)
+        assert json.dumps(json.loads(text)) == text
+        assert "\\u2014" in text, "non-ASCII must be escaped, as the reference emits it"
+
+    def test_video_default_is_a_json_object_with_expected_shape(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+            default_video_negative_prompt,
+        )
+
+        data = json.loads(default_video_negative_prompt())
+        assert isinstance(data, dict)
+        for field in ("subjects", "background_setting", "cinematography"):
+            assert field in data
+
+    def test_image_default_is_empty(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+            COSMOS3_DEFAULT_NEGATIVE_PROMPT,
+        )
+
+        assert COSMOS3_DEFAULT_NEGATIVE_PROMPT == ""
+
+    def test_default_is_cached(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+            default_video_negative_prompt,
+        )
+
+        assert default_video_negative_prompt() is default_video_negative_prompt()
+
+    @pytest.mark.parametrize(
+        "output_type,expects_video_default",
+        [("video", True), ("image", False)],
+    )
+    def test_resolution_is_keyed_on_output_kind(self, output_type, expects_video_default):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+            default_negative_prompt,
+            default_video_negative_prompt,
+        )
+
+        resolved = default_negative_prompt(output_type)
+        if expects_video_default:
+            assert resolved == default_video_negative_prompt()
+        else:
+            assert resolved == ""
+
+
 @pytest.fixture(scope="class")
 def cosmos3_pipeline():
     checkpoint = _require_checkpoint()

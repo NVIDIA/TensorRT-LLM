@@ -1031,6 +1031,9 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
             with torch.no_grad():
                 result = pipeline.forward(
                     prompt=COSMOS3_LPIPS_PROMPT,
+                    # The goldens were generated against an empty uncond branch, so
+                    # pin it rather than inheriting the video-mode default.
+                    negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
                     height=COSMOS3_LPIPS_HEIGHT,
                     width=COSMOS3_LPIPS_WIDTH,
@@ -2457,6 +2460,9 @@ def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
+            # The goldens were generated against an empty uncond branch, so pin it
+            # here rather than inheriting the video-mode default negative prompt.
+            forward_kwargs.setdefault("negative_prompt", "")
             with torch.no_grad():
                 result = pipeline.forward(
                     seed=COSMOS3_EDGE_LPIPS_SEED,
@@ -2621,6 +2627,9 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
             with torch.no_grad():
                 result = pipeline.forward(
                     prompt=COSMOS3_I2V_4STEP_LPIPS_PROMPT,
+                    # The goldens were generated against an empty uncond branch, so
+                    # pin it rather than inheriting the video-mode default.
+                    negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
                     image=image_path,
                     height=COSMOS3_LPIPS_HEIGHT,
