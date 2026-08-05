@@ -353,6 +353,19 @@ def sample_from_logits_op(
     return sampling_from_probs_op(probs, seed=seed, offset=offset)
 
 
+@_compiler_disable
+def warmup_sampling_module() -> None:
+    """Build flashinfer's sampling kernels now instead of on first use.
+
+    flashinfer ships these kernels as source, so the first sampling call runs
+    nvcc inline (~90s with a cold cache). Doing that inside the executor loop
+    stalls the rank past the hang detector's threshold. Cheap no-op once built.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        return
+    flashinfer.sampling.get_sampling_module()
+
+
 @torch.compile(options={"max-autotune": True})
 def sampling_batch_spec_dec_one_model_for_rejection(
     logits: torch.Tensor,
