@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from pathlib import Path
 
@@ -61,6 +62,97 @@ def _use_native_wan_vae() -> bool:
     return True
 
 
+def _is_nvfp4_vae_ckpt(vae_dir: Path) -> bool:
+    """Return whether the VAE config declares ModelOpt NVFP4 quantization."""
+    config_path = vae_dir / "config.json"
+    if not config_path.exists():
+        return False
+    with open(config_path, encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    quantization_config = config.get("quantization_config")
+    return (
+        isinstance(quantization_config, dict) and quantization_config.get("quant_algo") == "NVFP4"
+    )
+
+
+def _load_nvfp4_wan_vae(checkpoint_dir: str, device: torch.device, dtype: torch.dtype) -> nn.Module:
+    """Load ModelOpt weights and replace their quantized Conv3d modules.
+
+    Quantized weights are first dequantized into the native state dict, then
+    requantized in the KTRSC layout consumed by the CuTe kernel. Consequently,
+    this path is accuracy-gated as a TensorRT-LLM implementation rather than
+    expected to preserve ModelOpt's original packed bytes.
+    """
+    from safetensors.torch import load_file
+
+    from .wan_vae import WanCausalConv3d, dequant_fp4_conv_weight, swap_wan_convs_to_fp4
+
+    vae_dir = Path(checkpoint_dir) / "vae"
+    wan_vae = WanVAE(WanVAEConfig.from_json_file(vae_dir / "config.json"))
+    raw_state_dict = load_file(str(vae_dir / "diffusion_pytorch_model.safetensors"))
+    conv_modules = {
+        name: module
+        for name, module in wan_vae.named_modules()
+        if isinstance(module, WanCausalConv3d)
+    }
+    quantized = {
+        key.removesuffix(".weight_scale") for key in raw_state_dict if key.endswith(".weight_scale")
+    }
+    unknown_modules = quantized - conv_modules.keys()
+    if unknown_modules:
+        raise ValueError(
+            f"NVFP4 checkpoint references unknown convolutions: {sorted(unknown_modules)}"
+        )
+
+    input_scales: dict[str, float] = {}
+    state_dict: dict[str, torch.Tensor] = {}
+    for key, value in raw_state_dict.items():
+        prefix = key.rsplit(".", 1)[0]
+        if prefix in quantized and key.endswith(
+            (".weight_scale", ".weight_scale_2", ".input_scale")
+        ):
+            if key.endswith(".input_scale"):
+                if value.numel() != 1:
+                    raise ValueError(f"{key} must contain one calibrated scale")
+                input_scales[prefix] = float(value.item())
+            continue
+        if prefix in quantized and key.endswith(".weight"):
+            module = conv_modules[prefix]
+            if module.kernel_size != (3, 3, 3):
+                raise ValueError(
+                    f"NVFP4 Wan VAE supports only 3x3x3 weights, got {prefix}: {module.kernel_size}"
+                )
+            block_scale_key = f"{prefix}.weight_scale"
+            global_scale_key = f"{prefix}.weight_scale_2"
+            if block_scale_key not in raw_state_dict or global_scale_key not in raw_state_dict:
+                raise ValueError(f"NVFP4 checkpoint is missing scales for {prefix}")
+            state_dict[key] = (
+                dequant_fp4_conv_weight(
+                    value,
+                    raw_state_dict[block_scale_key],
+                    raw_state_dict[global_scale_key],
+                    module.in_channels,
+                )
+                .reshape(-1, module.in_channels, 3, 3, 3)
+                .to(dtype)
+            )
+        else:
+            state_dict[key] = value
+    wan_vae.load_state_dict(state_dict, strict=True)
+    wan_vae = wan_vae.to(device=device, dtype=dtype).eval()
+    n, n_static = swap_wan_convs_to_fp4(wan_vae, input_scales, only_names=quantized)
+    if n != len(quantized):
+        raise ValueError(
+            f"NVFP4 checkpoint contains {len(quantized)} quantized convolutions, "
+            f"but only {n} are supported Wan residual convolutions"
+        )
+    logger.info(
+        f"Loaded NVFP4 Wan VAE: {len(quantized)} quantized convs; "
+        f"{n} run on the FP4 kernel ({n_static} static, {n - n_static} dynamic)."
+    )
+    return wan_vae
+
+
 def load_wan_vae(
     checkpoint_dir: str,
     device: torch.device,
@@ -74,6 +166,9 @@ def load_wan_vae(
         ).to(device)
 
     vae_dir = Path(checkpoint_dir) / "vae"
+    if _is_nvfp4_vae_ckpt(vae_dir):
+        return _load_nvfp4_wan_vae(checkpoint_dir, device, dtype)
+
     wan_vae = WanVAE(WanVAEConfig.from_json_file(vae_dir / "config.json"))
     state_dict = WeightLoader(components=PipelineComponent.VAE).load_weights(
         checkpoint_dir,
