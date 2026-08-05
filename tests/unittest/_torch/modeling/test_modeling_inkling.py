@@ -24,6 +24,7 @@ route/global scale, unpadded logits) can silently go missing.
 import json
 import os
 import struct
+from types import SimpleNamespace
 
 import pytest
 from utils.llm_data import llm_models_root
@@ -96,9 +97,7 @@ def test_model_defaults_pin_v2_and_disable_block_reuse():
     with ``has_initial_state=False`` -- a reused prefix would restart the
     convolutions from zeros while attention resumed from real history.
     """
-    from tensorrt_llm._torch.models.modeling_inkling import (
-        InklingForConditionalGeneration,
-    )
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForConditionalGeneration
 
     defaults = InklingForConditionalGeneration.get_model_defaults(None)
 
@@ -110,10 +109,8 @@ def test_block_reuse_default_departs_from_the_framework_default():
     """The framework enables block reuse by default, so the model default is
     load-bearing. If KvCacheConfig ever flips its default, this test still
     documents which direction Inkling needs."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForConditionalGeneration
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-    from tensorrt_llm._torch.models.modeling_inkling import (
-        InklingForConditionalGeneration,
-    )
 
     assert KvCacheConfig().enable_block_reuse is True
     defaults = InklingForConditionalGeneration.get_model_defaults(None)
@@ -220,3 +217,180 @@ def test_checkpoint_tensor_shapes_match_geometry(ckpt_config):
         tc.n_routed_experts + tc.n_shared_experts,
         hidden,
     ]
+
+
+# ---------------------------------------------------------------------------
+# InklingAttentionMetadata: the per-step decode publish
+# ---------------------------------------------------------------------------
+class _FakeKvManager:
+    """Minimal stand-in for KVCacheManagerV2's per-layer block-table API."""
+
+    def __init__(self, pp_layers, blocks_by_layer, max_blocks_per_seq=4):
+        self.pp_layers = pp_layers
+        self.max_blocks_per_seq = max_blocks_per_seq
+        self._blocks = blocks_by_layer
+        self.calls = []
+
+    def get_batch_cache_indices(self, request_ids, layer_idx):
+        self.calls.append((tuple(request_ids), layer_idx))
+        return self._blocks[layer_idx]
+
+
+def _ink_metadata(
+    num_contexts=0, request_ids=(7, 9), num_cached=(3, 130), pp_layers=(0, 1), max_blocks_per_seq=4
+):
+    """An InklingAttentionMetadata with prepare()'s inputs stubbed in.
+
+    Builds the object without running AttentionMetadata's dataclass __init__ so
+    the test stays CPU-only and independent of the KV-cache stack; only the
+    fields _prepare_inkling_decode reads are populated.
+    """
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.inkling_triton import InklingAttentionMetadata
+
+    md = object.__new__(InklingAttentionMetadata)
+    md.ink_num_gen = 0
+    md.ink_max_pages = None
+    md.ink_cap = 0
+    md.ink_seq_lens = None
+    md.ink_page_table = {}
+    md._ink_sl_host = None
+    md._ink_pt_host = None
+    md.is_cuda_graph = False
+    md.request_ids = list(request_ids)
+    md._num_contexts = num_contexts
+    md.kv_cache_params = SimpleNamespace(num_cached_tokens_per_seq=list(num_cached))
+    blocks = {
+        layer: [[layer * 10 + 1, -1, -1, -1], [layer * 10 + 2, layer * 10 + 3, -1, -1]]
+        for layer in pp_layers
+    }
+    md.kv_cache_manager = _FakeKvManager(list(pp_layers), blocks, max_blocks_per_seq)
+    md.seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
+    return md
+
+
+def test_metadata_publishes_total_kv_lengths_and_per_layer_page_table():
+    """seq_lens is num_cached + 1 and layer-independent; the page table is
+    per-layer because get_batch_cache_indices is per pool_id."""
+    md = _ink_metadata()
+
+    md._prepare_inkling_decode()
+
+    assert md.ink_num_gen == 2
+    assert md.ink_seq_lens[:2].tolist() == [4, 131]
+    # One block-table fetch per layer this rank owns, all on the generation ids.
+    assert md.kv_cache_manager.calls == [((7, 9), 0), ((7, 9), 1)]
+    assert md.ink_page_table[0][:2].tolist() == [[1, 0, 0, 0], [2, 3, 0, 0]]
+    assert md.ink_page_table[1][:2].tolist() == [[11, 0, 0, 0], [12, 13, 0, 0]]
+
+
+def test_metadata_skips_the_context_slice():
+    """Only generation rows get decode metadata; context rows run the prefill
+    kernel and are excluded by num_contexts."""
+    md = _ink_metadata(num_contexts=1, request_ids=(7, 9), num_cached=(0, 130))
+
+    md._prepare_inkling_decode()
+
+    assert md.ink_num_gen == 1
+    assert md.ink_seq_lens[:1].tolist() == [131]
+    assert md.kv_cache_manager.calls == [((9,), 0), ((9,), 1)]
+
+
+def test_metadata_reports_nothing_published_for_a_context_only_batch():
+    """A prefill-only step must not leave the previous step's page table
+    advertised as current -- that is what the old epoch counter guarded."""
+    md = _ink_metadata()
+    md._prepare_inkling_decode()
+    assert md.ink_num_gen == 2
+
+    md._num_contexts = 2  # same object, now a context-only batch
+    md._prepare_inkling_decode()
+
+    assert md.ink_num_gen == 0
+
+
+def test_metadata_refuses_to_grow_its_buffers_under_cuda_graph():
+    """Growth would strand the captured pointer, so it must raise rather than
+    silently reallocate."""
+    md = _ink_metadata()
+    md._prepare_inkling_decode()
+    md.is_cuda_graph = True
+    md.request_ids = [7, 9, 11, 13]
+    md.kv_cache_params = SimpleNamespace(num_cached_tokens_per_seq=[3, 130, 5, 5])
+
+    with pytest.raises(RuntimeError, match="CUDA graph"):
+        md._prepare_inkling_decode()
+
+
+def test_metadata_clamps_a_row_to_max_pages():
+    """A row longer than max_blocks_per_seq is truncated, never written past
+    the stable buffer's width."""
+    md = _ink_metadata(max_blocks_per_seq=2)
+    md.kv_cache_manager._blocks = {0: [[1, 2, 3, 4], [5, 6, 7, 8]], 1: [[1, 2, 3, 4], [5, 6, 7, 8]]}
+
+    md._prepare_inkling_decode()
+
+    assert md.ink_max_pages == 2
+    assert md.ink_page_table[0][:2].tolist() == [[1, 2], [5, 6]]
+
+
+def test_inkling_backend_is_registered_and_carries_the_metadata():
+    from tensorrt_llm._torch.attention_backend.inkling_triton import (
+        InklingAttentionMetadata,
+        InklingTritonAttention,
+    )
+    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+
+    assert get_attention_backend("INKLING") is InklingTritonAttention
+    assert InklingTritonAttention.Metadata is InklingAttentionMetadata
+
+
+def test_model_defaults_select_the_inkling_backend():
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForConditionalGeneration
+
+    assert InklingForConditionalGeneration.get_model_defaults(None)["attn_backend"] == "INKLING"
+
+
+def test_conv_state_manager_implements_the_capability_protocol():
+    """The CONV_STATE_MANAGER resource type must stand behind a capability
+    interface, not a model-specific branch, so a consumer can isinstance-test
+    it the way _prepare_mamba_metadata tests BaseMambaCacheManager."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingConvStateManager
+    from tensorrt_llm._torch.pyexecutor.conv_state_manager import BaseConvStateManager
+
+    assert issubclass(InklingConvStateManager, BaseConvStateManager)
+    # No abstract method left unimplemented -- an incomplete implementation
+    # would only surface at instantiation time on a GPU node otherwise.
+    assert not getattr(InklingConvStateManager, "__abstractmethods__", frozenset())
+
+
+def test_conv_state_protocol_is_not_the_mamba_one():
+    """Kept separate on purpose: BaseMambaCacheManager mandates get_ssm_states /
+    is_speculative / mamba_layer_cache, and Inkling has no selective-scan state
+    to back them with."""
+    from tensorrt_llm._torch.pyexecutor.conv_state_manager import BaseConvStateManager
+    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import BaseMambaCacheManager
+
+    assert not issubclass(BaseConvStateManager, BaseMambaCacheManager)
+    assert set(BaseConvStateManager.__abstractmethods__) == {
+        "get_conv_state_cache",
+        "write_conv_state_indices",
+        "free_conv_state",
+    }
+
+
+def test_attn_backend_override_fails_loudly():
+    """An attn_backend override silently removes the decode publish and the run
+    then dies inside CUDA-graph capture with a message that names neither
+    Inkling nor the setting. Catch it at load instead."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
+
+    check = InklingForCausalLM._assert_inkling_attn_backend
+    check(SimpleNamespace(attn_backend="INKLING"))  # no raise
+    check(SimpleNamespace(attn_backend="inkling"))  # case-insensitive
+    check(SimpleNamespace(attn_backend=None))  # nothing to check
+
+    for bad in ("TRTLLM", "FLASHINFER", "VANILLA"):
+        with pytest.raises(ValueError, match="attn_backend='INKLING'"):
+            check(SimpleNamespace(attn_backend=bad))

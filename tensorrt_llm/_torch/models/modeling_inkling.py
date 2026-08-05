@@ -79,6 +79,10 @@ from tensorrt_llm._torch.modules.linear import (
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+# Protocol only -- no BaseResourceManager / KV-cache import, so this stays free
+# of an import cycle back through pyexecutor at model-load time.
+from tensorrt_llm._torch.pyexecutor.conv_state_manager import BaseConvStateManager
 from tensorrt_llm._utils import prefer_pinned
 
 from ...inputs import (
@@ -280,7 +284,7 @@ class InklingConvStateCache:
                 self._free.append(slot)
 
 
-class InklingConvStateManager:
+class InklingConvStateManager(BaseConvStateManager):
     """Request-lifetime resource manager wrapping the short-conv state pool.
 
     Owns one :class:`InklingConvStateCache` and is registered in the executor's
@@ -294,11 +298,27 @@ class InklingConvStateManager:
     ids) and released in :meth:`free_resources` when a request completes --
     keyed on the same ``LlmRequest.py_request_id`` the KV cache and
     ``attn_metadata.request_ids`` use, so slot ownership stays in lock-step with
-    the KV cache. This is a plain duck-typed manager -- the ``ResourceManager``
-    container dispatches ``prepare_resources`` / ``free_resources`` /
-    ``update_resources`` via ``hasattr`` -- so it needs no
-    ``BaseResourceManager`` import at model-load time (and no import cycle
-    through ``pyexecutor``).
+    the KV cache. The ``ResourceManager`` container dispatches
+    ``prepare_resources`` / ``free_resources`` / ``update_resources`` via
+    ``hasattr``, so no ``BaseResourceManager`` import is needed at model-load
+    time (and no import cycle through ``pyexecutor``).
+
+    It implements :class:`BaseConvStateManager` so the new resource type has a
+    capability interface behind it rather than a model-specific branch: a
+    consumer can ``isinstance``-test the protocol the way
+    ``AttentionMetadata._prepare_mamba_metadata`` tests
+    ``BaseMambaCacheManager``, and any future short-conv model reuses it.
+
+    NOTE: this is deliberately still a manager *beside* the KV cache rather
+    than one folded into it (``class InklingHybridCacheManager(KVCacheManagerV2,
+    BaseConvStateManager)``, the shape ``CppMambaHybridCacheManager`` uses).
+    Folding it in would delete the CONV_STATE_MANAGER resource type and its
+    creator wiring, and -- more importantly -- would make it structurally
+    impossible for the pool and the KV cache to disagree about block reuse,
+    which is the bug ``get_model_defaults`` currently has to paper over by
+    defaulting ``enable_block_reuse`` off. That change alters the allocation
+    and lifetime path of both caches and needs the full accuracy gate, not the
+    smoke gate, so it is left as follow-up work.
     """
 
     def __init__(
@@ -342,10 +362,21 @@ class InklingConvStateManager:
     def free_resources(self, request):
         rid = getattr(request, "py_request_id", None)
         if rid is not None:
-            self.cache.free([rid])
+            self.free_conv_state([rid])
 
     def shutdown(self):
         pass
+
+    # ---- BaseConvStateManager capability protocol -----------------------------
+    def get_conv_state_cache(self) -> InklingConvStateCache:
+        return self.cache
+
+    def write_conv_state_indices(self, request_ids, is_cuda_graph: bool):
+        self.cache.write_state_indices(list(request_ids), is_cuda_graph)
+        return self.cache.state_indices
+
+    def free_conv_state(self, request_ids) -> None:
+        self.cache.free(list(request_ids))
 
     # ---- Model-facing eager entry point ---------------------------------------
     def prepare_conv_runtime(self, attn_metadata):
@@ -716,110 +747,6 @@ class InklingShortConv(nn.Module):
 # ----------------------------------------------------------------------------
 # Attention
 # ----------------------------------------------------------------------------
-class InklingDecodeMeta:
-    """Per-attention-layer STABLE GPU buffers for the generation-step decode
-    metadata, refreshed EAGERLY (before CUDA-graph capture/replay) so the
-    captured decode forward reads them with zero host->device copy.
-
-    The Inkling Triton decode kernel needs, per generation request: the total KV
-    length (``num_cached + 1``) and the physical page table. Building them from
-    host lists INSIDE ``model.forward`` (``torch.tensor(..., device=cuda)`` +
-    ``build_page_table``) raises ``Cannot copy between CPU and CUDA tensors
-    during CUDA graph capture``. This class holds the two tensors in
-    fixed-pointer GPU buffers and :meth:`refresh` overwrites their contents each
-    step (mirroring :class:`InklingConvStateCache`'s
-    ``state_indices`` publish and the base metadata's ``seq_lens_cuda`` in-place
-    ``copy_``). One instance per :class:`InklingAttention` because
-    ``KVCacheManagerV2.get_batch_cache_indices`` is per-layer (per pool_id /
-    index_scale).
-
-    ``page_table`` width is sized once to ``mgr.max_blocks_per_seq`` (the runtime
-    KV-config bound), so a real sequence never overflows it. The row capacity
-    grows elastically only when a batch oversubscribes it (the one-time KV-cache
-    estimation forward can), and NEVER under CUDA graph -- growth would strand the
-    captured pointer, so it raises loudly there instead.
-    """
-
-    def __init__(self, layer_idx: int):
-        self.layer_idx = layer_idx
-        self.max_pages: Optional[int] = None
-        self.cap = 0
-        self.seq_lens: Optional[torch.Tensor] = None  # [cap] int32 GPU total-KV
-        self.page_table: Optional[torch.Tensor] = None  # [cap, max_pages] int32
-        self._pt_host: Optional[torch.Tensor] = None  # reused pinned staging
-        # Publication epoch. ``prepare_inkling_attn_decode`` bumps the shared
-        # counter once per forward, so a layer whose ``refresh`` did not run this
-        # forward reports ``ready == False`` by construction rather than leaving
-        # a stale True behind. Bound by InklingForCausalLM after construction.
-        self._epoch: List[int] = [0]
-        self._published_epoch = -1
-
-    def bind_epoch(self, epoch: List[int]) -> None:
-        """Share the model's per-forward publication counter."""
-        self._epoch = epoch
-
-    @property
-    def ready(self) -> bool:
-        """True only when these buffers were published for the CURRENT forward.
-
-        The decode kernel reads ``seq_lens``/``page_table`` directly when this
-        is set, so it must never report a previous step's publication: the same
-        requests advance ``num_cached_tokens_per_seq`` every step, and a page
-        table one step out of date silently drops a newly allocated page.
-        """
-        return self._published_epoch == self._epoch[0]
-
-    def _ensure(self, num_gen: int, mgr, device, is_graph: bool) -> None:
-        if self.max_pages is None:
-            self.max_pages = max(1, int(mgr.max_blocks_per_seq))
-        if self.seq_lens is not None and num_gen <= self.cap:
-            return
-        if is_graph and self.seq_lens is not None:
-            raise RuntimeError(
-                f"InklingDecodeMeta(layer={self.layer_idx}) would grow its stable "
-                f"decode buffers during CUDA graph capture/replay (num_gen="
-                f"{num_gen} > cap={self.cap}); the buffers are sized to the "
-                f"scheduler batch, so this signals a capture-shape mismatch"
-            )
-        self.cap = max(num_gen, self.cap)
-        self.seq_lens = torch.ones(self.cap, dtype=torch.int32, device=device)
-        self.page_table = torch.zeros((self.cap, self.max_pages), dtype=torch.int32, device=device)
-
-    def refresh(self, mgr, gen_ids, sl_host, device, is_graph: bool) -> None:
-        """Publish this batch's generation decode metadata into the stable buffers.
-
-        ``sl_host`` is the total-KV length staging tensor, built once per forward
-        by :meth:`InklingForCausalLM.prepare_inkling_attn_decode` -- its contents
-        do not depend on the layer, so it is shared across all of them. Only the
-        page table is per-layer (``get_batch_cache_indices`` is per pool_id).
-        """
-        num_gen = int(sl_host.shape[0])
-        # Host-side block table for THIS layer (per-pool). Reading it here --
-        # eagerly, outside any captured region -- is what makes the copy legal.
-        block_ids = mgr.get_batch_cache_indices(gen_ids, self.layer_idx)
-        self._ensure(num_gen, mgr, device, is_graph)
-        # Reused pinned staging: this runs once per layer per decode step, so a
-        # fresh pinned allocation here would be 2x66 cudaHostAllocs per token.
-        if self._pt_host is None or self._pt_host.shape[0] < num_gen:
-            self._pt_host = torch.zeros(
-                (max(num_gen, self.cap), self.max_pages),
-                dtype=torch.int32,
-                pin_memory=prefer_pinned(),
-            )
-        pt_host = self._pt_host[:num_gen]
-        # Fill through the numpy view of the pinned buffer: one vectorized row
-        # assignment instead of a torch.tensor() per row.
-        pt_np = pt_host.numpy()
-        pt_np.fill(0)
-        for i, blocks in enumerate(block_ids):
-            valid = [b for b in map(int, blocks) if b >= 0][: self.max_pages]
-            if valid:
-                pt_np[i, : len(valid)] = valid
-        self.seq_lens[:num_gen].copy_(sl_host, non_blocking=True)
-        self.page_table[:num_gen].copy_(pt_host, non_blocking=True)
-        self._published_epoch = self._epoch[0]
-
-
 class InklingAttention(QKNormRoPEAttention):
     """RoPE-free attention with per-head q/k RMSNorm, k/v short-conv, and a
     learned relative-position bias applied as a Triton ``score_mod``.
@@ -955,8 +882,6 @@ class InklingAttention(QKNormRoPEAttention):
         self.local_num_heads = num_heads // tp_size
         # Stable GPU buffers for the CUDA-graph-safe runtime decode metadata,
         # refreshed eagerly (before capture/replay) by the model engine via
-        # InklingForCausalLM.prepare_inkling_attn_decode -> _decode_meta.refresh.
-        self._decode_meta = InklingDecodeMeta(layer_idx)
 
     def _project(self, hidden_states, conv_pool_kv=None, conv_rt=None):
         """Fused qkv projection -> split -> k/v short-conv -> per-head qk RMSNorm.
@@ -1091,6 +1016,7 @@ class InklingAttention(QKNormRoPEAttention):
                     k_cache,
                     v_cache,
                     page_size,
+                    attn_metadata,
                 )
             )
         return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
@@ -1145,13 +1071,14 @@ class InklingAttention(QKNormRoPEAttention):
         k_cache,
         v_cache,
         page_size,
+        attn_metadata,
     ):
         device = q.device
         # --- Runtime CUDA-graph-safe path. ---------------------------------
-        # When the model engine has eagerly published this batch's decode
-        # metadata into the layer's stable GPU buffers (``_decode_meta.ready``),
-        # the captured forward performs ZERO host->device copy: it reads the
-        # stable ``seq_lens``/``page_table`` buffers and persists the new token's
+        # ``InklingAttentionMetadata.prepare()`` published this batch's decode
+        # metadata into the metadata object's stable GPU buffers, so the
+        # captured forward performs ZERO host->device copy: it reads the
+        # stable ``ink_seq_lens``/``ink_page_table`` buffers and persists the new token's
         # K/V into the paged cache with an in-graph GPU scatter whose (page,
         # offset) indices are derived on-GPU from those buffers. This replaces the
         # host ``write_kv_cache_hnd`` loop + ``torch.tensor(..., device=cuda)``
@@ -1159,11 +1086,10 @@ class InklingAttention(QKNormRoPEAttention):
         # graph capture``. Padding rows carry their own (dummy) registered request
         # slots -- ``attn_metadata.request_ids`` is padded after ``prepare()`` --
         # so the scatter never corrupts a real request's page 0.
-        meta = self._decode_meta
-        if meta.ready:
-            num_req = q.shape[0]
-            sl = meta.seq_lens[:num_req]
-            pt = meta.page_table[:num_req]
+        num_req = q.shape[0]
+        if getattr(attn_metadata, "ink_num_gen", 0) == num_req:
+            sl = attn_metadata.ink_seq_lens[:num_req]
+            pt = attn_metadata.ink_page_table[cache_layer][:num_req]
             pos = (sl - 1).long()  # write slot = total_kv_len - 1 = num_cached
             page_row = torch.div(pos, page_size, rounding_mode="floor")
             offs = pos - page_row * page_size
@@ -1187,6 +1113,25 @@ class InklingAttention(QKNormRoPEAttention):
             )
         # Eager fallback (never captured): the decode metadata was not published,
         # so build it here from the host block table, like the context path.
+        #
+        # Under CUDA graph this path is ILLEGAL -- the torch.tensor() below is a
+        # host->device copy from unpinned memory -- and the error it raises names
+        # a tensor, not the cause. The realistic way to arrive here is an
+        # ``attn_backend`` override: get_model_defaults selects "INKLING" so that
+        # attn_metadata carries the decode publish, but an explicit
+        # ``attn_backend: TRTLLM`` in --extra_llm_api_options wins the model
+        # defaults deep-merge and silently takes it away. Say that instead.
+        if getattr(attn_metadata, "is_cuda_graph", False):
+            raise RuntimeError(
+                "Inkling decode metadata was not published for a CUDA-graph "
+                f"batch (ink_num_gen="
+                f"{getattr(attn_metadata, 'ink_num_gen', None)}, expected "
+                f"{num_req}); attn_metadata is "
+                f"{type(attn_metadata).__name__}, not InklingAttentionMetadata. "
+                "Inkling requires attn_backend='INKLING'; remove any "
+                "attn_backend override from --extra_llm_api_options / "
+                "LLM(attn_backend=...) and let the model default apply."
+            )
         num_req = len(request_ids)
         block_ids = mgr.get_batch_cache_indices(request_ids, cache_layer)
         for i in range(num_req):
@@ -1609,13 +1554,33 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
             hidden_size=config.hidden_size,
             vocab_size=config.unpadded_vocab_size,
         )
-        # Shared per-forward publication counter for the attention layers'
-        # decode metadata; see InklingDecodeMeta.ready.
-        self._decode_epoch = [0]
-        self._decode_sl_host: Optional[torch.Tensor] = None
-        for layer in self.model.layers:
-            layer.attn._decode_meta.bind_epoch(self._decode_epoch)
+        self._assert_inkling_attn_backend(model_config)
         self._apply_allreduce_strategy()
+
+    @staticmethod
+    def _assert_inkling_attn_backend(model_config) -> None:
+        """Fail at load if the Inkling attention backend was overridden.
+
+        ``get_model_defaults`` selects ``attn_backend='INKLING'`` because
+        ``InklingAttentionMetadata`` is what publishes the decode seq_lens and
+        page table into CUDA-graph-stable buffers. Model defaults are a
+        deep-merge in which an explicit user value wins, so an
+        ``attn_backend: TRTLLM`` left in ``--extra_llm_api_options`` -- a very
+        easy thing to carry over from another model's serve config -- silently
+        removes that publish. The run then dies deep in CUDA-graph capture with
+        "Cannot copy between CPU and CUDA tensors", which names neither Inkling
+        nor the setting responsible.
+        """
+        backend = getattr(model_config, "attn_backend", None)
+        if backend is not None and str(backend).upper() != "INKLING":
+            raise ValueError(
+                f"Inkling requires attn_backend='INKLING' (got {backend!r}). "
+                "The Triton decode kernel reads its per-step seq_lens and page "
+                "table from InklingAttentionMetadata, which only the INKLING "
+                "backend supplies. Remove the attn_backend override from "
+                "--extra_llm_api_options / LLM(attn_backend=...) so the model "
+                "default applies."
+            )
 
     def _apply_allreduce_strategy(self) -> None:
         """Keep Inkling's all-reduces off the NCCL_SYMMETRIC tactic.
@@ -1650,43 +1615,6 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
                 strategy=AllReduceStrategy.ONESHOT,
                 dtype=getattr(mod, "dtype", None),
             )
-
-    def prepare_inkling_attn_decode(self, attn_metadata) -> None:
-        """Eagerly refresh every attention layer's stable decode-metadata buffers
-        (total-KV seq_lens + per-layer page table) for this batch, BEFORE the
-        model engine captures/replays the decode CUDA graph. Called from
-        ``PyTorchModelEngine._prepare_tp_inputs`` alongside the short-conv pool
-        publish, so the captured ``model.forward`` decode path does no host->device
-        copy. Cheap and side-effect-free when there is no generation slice."""
-        # Bump first: every layer's `ready` now reports False until its refresh
-        # runs below, so an early return here cannot leave a previous step's
-        # seq_lens/page_table readable.
-        self._decode_epoch[0] += 1
-        request_ids = attn_metadata.request_ids
-        mgr = getattr(attn_metadata, "kv_cache_manager", None)
-        if request_ids is None or mgr is None:
-            return
-        num_contexts = attn_metadata.num_contexts
-        num_gen = len(request_ids) - num_contexts
-        if num_gen <= 0:
-            return
-        # Total-KV lengths are layer-independent: build them once per step here
-        # rather than once per layer inside refresh.
-        num_cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[num_contexts:]
-        if self._decode_sl_host is None or self._decode_sl_host.shape[0] < num_gen:
-            self._decode_sl_host = torch.empty(
-                num_gen, dtype=torch.int32, pin_memory=prefer_pinned()
-            )
-        sl_host = self._decode_sl_host[:num_gen]
-        sl_np = sl_host.numpy()
-        for i in range(num_gen):
-            sl_np[i] = int(num_cached[i]) + 1
-
-        device = self.model.embed_tokens.weight.device
-        gen_ids = request_ids[num_contexts:]
-        is_graph = bool(getattr(attn_metadata, "is_cuda_graph", False))
-        for layer in self.model.layers:
-            layer.attn._decode_meta.refresh(mgr, gen_ids, sl_host, device, is_graph)
 
     def forward(
         self,
@@ -1847,7 +1775,18 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         # cached and restored per block; a user who sets
         # ``enable_block_reuse`` explicitly still wins the deep-merge, so this
         # is a safe default rather than a hard block.
+        #
+        # ``attn_backend`` selects ``InklingAttentionMetadata``: the decode
+        # kernel's total-KV seq_lens and per-layer page table are per-step host
+        # state that must land in fixed-pointer GPU buffers before CUDA-graph
+        # capture, and ``AttentionMetadata.prepare()`` is the framework hook for
+        # exactly that. ``InklingTritonAttention`` subclasses the TRTLLM backend
+        # and changes nothing but the ``Metadata`` class, so this is not a
+        # different attention implementation -- Inkling's compute has always
+        # been in ``InklingAttention.forward``, which overrides the base module
+        # outright.
         return {
+            "attn_backend": "INKLING",
             "kv_cache_config": {
                 "use_kv_cache_manager_v2": True,
                 "enable_block_reuse": False,

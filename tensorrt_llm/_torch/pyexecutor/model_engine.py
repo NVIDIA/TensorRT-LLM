@@ -3804,14 +3804,9 @@ class PyTorchModelEngine(ModelEngine):
 
     def _maybe_prepare_inkling_runtime(self, inputs, attn_metadata,
                                        resource_manager):
-        """Eagerly publish Inkling's per-request runtime state into its STABLE
-        GPU buffers BEFORE CUDA-graph capture/replay, so the captured decode
-        forward performs no host->device copy:
-
-        * short-conv pool slots -> ``conv_cache``/``conv_rt`` (the pool's
-          ``state_indices`` buffer);
-        * attention decode metadata (total-KV seq_lens + per-layer page table)
-          -> each layer's ``InklingDecodeMeta`` buffers.
+        """Eagerly publish Inkling's short-conv pool slots into the pool's STABLE
+        ``state_indices`` GPU buffer BEFORE CUDA-graph capture/replay, so the
+        captured decode forward performs no host->device copy.
 
         This MUST run in both ``_prepare_tp_inputs`` (the KV-cache generation path
         used by graph capture AND every decode replay) and
@@ -3819,6 +3814,10 @@ class PyTorchModelEngine(ModelEngine):
         ``model.forward``) is what makes both graph-safe and refreshed every step;
         the model's in-forward fallbacks only cover eager, never-captured paths.
         No-op for non-Inkling models (gated on the registered conv-state manager).
+
+        The attention half of this publish (total-KV seq_lens + per-layer page
+        table) now lives in ``InklingAttentionMetadata.prepare()``, the
+        framework's documented pre-forward hook, and needs nothing here.
         """
         if resource_manager is None:
             return
@@ -3830,9 +3829,6 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata)
         inputs['conv_cache'] = conv_cache
         inputs['conv_rt'] = conv_rt
-        model = getattr(self.model, '_orig_mod', self.model)
-        if hasattr(model, 'prepare_inkling_attn_decode'):
-            model.prepare_inkling_attn_decode(attn_metadata)
 
     def _can_use_steady_gen_fast_prepare(
             self, scheduled_requests: ScheduledRequests,
