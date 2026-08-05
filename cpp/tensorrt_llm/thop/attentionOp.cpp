@@ -342,8 +342,9 @@ public:
 
     virtual ~RunnerBase() = default;
     virtual void prepare(AttentionOp& op) const = 0;
-    virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0) const
+    virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_context_tokens, int const max_context_q_len,
+        int const max_attention_window_size, int const num_gen_tokens, int const max_blocks_per_sequence,
+        int const ctx_total_kv_len = 0) const
         = 0;
     // typically, we use single qkv input, but for context MLA, we use separate qkv inputs
     virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
@@ -407,11 +408,12 @@ public:
         op.reserveSemaphoreArray(std::max(op.mNumHeads * max_num_requests, op.getMultiProcessorCount()));
     }
 
-    int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0) const override
+    int64_t getWorkspaceSize(AttentionOp const& op, int const num_context_tokens, int const max_context_q_len,
+        int const max_attention_window_size, int const num_gen_tokens, int const max_blocks_per_sequence,
+        int const ctx_total_kv_len = 0) const override
     {
         size_t const context_workspace_size = op.getWorkspaceSizeForContext(
-            op.mType, max_num_requests, op.mMaxContextLength, 0, num_tokens, ctx_total_kv_len);
+            op.mType, max_num_requests, max_context_q_len, 0, num_context_tokens, ctx_total_kv_len);
         size_t const generation_workspace_size = op.getWorkspaceSizeForGeneration(
             op.mType, max_num_requests, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
 
@@ -1335,6 +1337,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int32_t const num_generations = num_seqs - static_cast<int32_t>(num_contexts);
     int32_t const num_tokens = qkv_or_q.size(0);
     int32_t const num_gen_tokens = is_gen_only ? num_tokens : num_tokens - static_cast<int32_t>(num_ctx_tokens);
+    int32_t const num_context_tokens = num_contexts > 0 && !is_gen_only ? static_cast<int32_t>(num_ctx_tokens) : 0;
+    int32_t max_context_q_len = 0;
+    if (num_context_tokens > 0)
+    {
+        max_context_q_len = max_context_q_len_override.has_value()
+            ? static_cast<int32_t>(max_context_q_len_override.value())
+            : host_context_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
+    }
     auto const ctx_total_kv_len = host_total_kv_lens.index({0}).item<int32_t>();
     auto const gen_total_kv_len = host_total_kv_lens.index({1}).item<int32_t>();
 
@@ -1347,8 +1357,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
     int32_t const max_blocks_per_sequence
         = use_kv_cache && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
-    int64_t const workspace_size = runner->getWorkspaceSize(
-        *op, num_tokens, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, ctx_total_kv_len);
+    int64_t const workspace_size = runner->getWorkspaceSize(*op, num_context_tokens, max_context_q_len,
+        max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, ctx_total_kv_len);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     torch::Tensor workspace;
