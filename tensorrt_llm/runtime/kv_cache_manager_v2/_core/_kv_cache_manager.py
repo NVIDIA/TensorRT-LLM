@@ -400,13 +400,24 @@ class KVCacheManager:
         text_only: bool | None = None,
     ) -> _KVCache:
         """
-        reuse_scope: namespace to match before matching any tokens.
-        custom_priority_callback: takes block index and layer sliding window size, returns priority.
-        If priority returned is higher than existing priority for reused blocks, the block priority is updated.
-        expected_prompt_length: optional token count marking the prefill->generation
-            boundary; once history_length reaches it, subsequent capacity growth is
-            recorded as generation-phase allocation stats (defaults to len(input_tokens)).
-            Stats-only: does not affect allocation, reuse, or correctness.
+        Args:
+            reuse_scope: Namespace to match before matching any tokens.
+            input_tokens: Optional initial tokens used for reuse matching.
+            id: Optional cache identifier.
+            custom_priority_callback: Takes a block index and layer sliding-window
+                size and returns a priority. Reused blocks are updated when the
+                returned priority is higher than their existing priority.
+            expected_prompt_length: Optional token count marking the
+                prefill-to-generation boundary. Once history length reaches it,
+                subsequent capacity growth is recorded as generation-phase
+                allocation statistics. Defaults to the length of ``input_tokens``
+                and does not affect allocation, reuse, or correctness.
+            text_only: Optional per-cache override for the manager setting. ``True``
+                enables digest-free fast paths and requires all tokens to be text
+                token IDs; ``False`` permits digest tokens but is invalid when the
+                manager is configured with ``text_only=True``; ``None`` inherits
+                the manager setting.
+
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
         Returns None if suspended=False and we don't have enough resource.
