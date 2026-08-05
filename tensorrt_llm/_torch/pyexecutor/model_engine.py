@@ -1155,6 +1155,12 @@ class PyTorchModelEngine(ModelEngine):
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
+        # Ahead of the early returns below, since it holds regardless of why
+        # warmup is skipped: only the advanced-sampling CUDA graph capture pass
+        # exercises the non-greedy sampler, so with cuda_graph_config=None
+        # flashinfer's sampling kernels would be JIT-built mid-serving.
+        warmup_sampling_module()
+
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
@@ -1186,10 +1192,6 @@ class PyTorchModelEngine(ModelEngine):
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
         log_mem_snapshot("warmup/before_warmup")
-        # Only the advanced-sampling CUDA graph capture pass exercises the
-        # non-greedy sampler during warmup, so with cuda_graph_config=None
-        # flashinfer's sampling kernels would be JIT-built mid-serving.
-        warmup_sampling_module()
         if not is_enc_dec:
             self._run_attention_warmup(resource_manager, can_run_general_warmup)
 
