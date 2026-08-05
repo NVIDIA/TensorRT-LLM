@@ -383,21 +383,17 @@ class ModelConfig(Generic[TConfig]):
         return "CUTLASS"
 
     @staticmethod
-    def load_modelopt_quant_config(quant_config_file,
-                                   checkpoint_dir,
-                                   moe_backend,
-                                   hf_quant_config=None):
+    def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
+                                   moe_backend):
         with open(quant_config_file) as f:
             quant_config_dict = json.load(f)
         return ModelConfig._build_modelopt_quant_config(
             read_modelopt_quant_config(quant_config_dict), checkpoint_dir,
-            moe_backend, hf_quant_config)
+            moe_backend)
 
     @staticmethod
-    def _build_modelopt_quant_config(json_quant_configs,
-                                     checkpoint_dir,
-                                     moe_backend,
-                                     hf_quant_config=None):
+    def _build_modelopt_quant_config(json_quant_configs, checkpoint_dir,
+                                     moe_backend):
         """Build (quant_config, layer_quant_config) from a normalized modelopt 'quantization' inner dict.
 
         ``json_quant_configs`` should be a dict as produced by
@@ -421,15 +417,6 @@ class ModelConfig(Generic[TConfig]):
             quant_config.has_zero_point = json_quant_configs['has_zero_point']
         if 'pre_quant_scale' in json_quant_configs:
             quant_config.pre_quant_scale = json_quant_configs['pre_quant_scale']
-
-        if (quant_config.quant_algo == QuantAlgo.NVFP4
-                and hf_quant_config is not None and
-                hf_quant_config.get("quant_method") == "compressed-tensors"):
-            inline_quant_config = quant_config.model_copy(deep=True)
-            update_quant_config_from_compressed_tensors(inline_quant_config,
-                                                        hf_quant_config)
-            if inline_quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
-                quant_config = inline_quant_config
 
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
             json_extended_quant_configs: dict = {}
@@ -1173,11 +1160,7 @@ class ModelConfig(Generic[TConfig]):
                     cls._has_deepseek_v4_layer_only_modelopt_quant_config(
                         quant_config_file))
             quant_config, layer_quant_config = cls._build_modelopt_quant_config(
-                normalized,
-                checkpoint_dir,
-                moe_backend_hint,
-                hf_quant_config=getattr(pretrained_config,
-                                        "quantization_config", None))
+                normalized, checkpoint_dir, moe_backend_hint)
             hf_quant_config = getattr(pretrained_config, "quantization_config",
                                       None)
             if quant_config.quant_algo is None and hf_quant_config is not None:

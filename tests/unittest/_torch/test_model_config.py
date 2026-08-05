@@ -42,58 +42,6 @@ def make_pretrained_config(
     )
 
 
-def test_deepseek_v4_auto_backend_precedes_w4a16_sm121_override(monkeypatch):
-    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 121)
-
-    moe_backend = ModelConfig.resolve_moe_backend(
-        "AUTO",
-        "DeepseekV4ForCausalLM",
-        quant_config=QuantConfig(
-            quant_algo=QuantAlgo.W4A16_NVFP4,
-            group_size=16,
-        ),
-    )
-
-    assert moe_backend == "CUTLASS"
-
-
-def test_modelopt_nvfp4_uses_inline_w4a16_activation_semantics(tmp_path):
-    hf_quant_config = {
-        "quant_method": "compressed-tensors",
-        "format": "nvfp4-pack-quantized",
-        "ignore": ["mtp.layers"],
-        "config_groups": {
-            "group_0": {
-                "targets": ["Linear", "lm_head"],
-                "weights": {
-                    "type": "float",
-                    "num_bits": 4,
-                    "strategy": "tensor_group",
-                    "group_size": 16,
-                },
-                "input_activations": None,
-            },
-        },
-    }
-
-    quant_config, layer_quant_config = ModelConfig._build_modelopt_quant_config(
-        {
-            "quant_algo": "NVFP4",
-            "kv_cache_quant_algo": None,
-            "group_size": 16,
-            "exclude_modules": ["mtp*"],
-        },
-        str(tmp_path),
-        moe_backend="CUTLASS",
-        hf_quant_config=hf_quant_config,
-    )
-
-    assert quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
-    assert quant_config.group_size == 16
-    assert quant_config.exclude_modules == ["mtp.layers"]
-    assert layer_quant_config is None
-
-
 @pytest.mark.parametrize(
     "num_key_value_heads",
     [
