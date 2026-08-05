@@ -1989,10 +1989,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     raise ValueError(
                         "Beam search only supports returning the sampled logprob per token"
                     )
-            # early_stopping == TRUE (default) is served by the frozen-slot path
-            # (stopping once all beam slots hold finished beams is equivalent);
-            # the exhaustive modes by the candidate-beams-array path (see
-            # beam_search_sampling_batch_cba).
+            # Every early_stopping mode is served by the candidate-beams-array
+            # path (see beam_search_sampling_batch_cba); the mode only selects
+            # the done verdict computed there.
 
     @override
     @nvtx_range("setup_sampler_step")
@@ -2073,8 +2072,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if self._use_beam_search:
             beam_search_store = self.store.beam_search_store
             assert beam_search_store is not None
-            # Allocate the CBA tensors on the first exhaustive-early_stopping
-            # request; beam search with the default mode never needs them.
+            # Allocate the CBA tensors on the first beam-search request: every
+            # early_stopping mode runs on that path.
             if any(_request_uses_cba(request) for request in new_requests):
                 beam_search_store.ensure_cba()
             _prepare_beam_search(
