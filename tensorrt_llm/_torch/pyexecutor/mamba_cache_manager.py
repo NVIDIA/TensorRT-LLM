@@ -2627,6 +2627,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._mamba_layer_mask = list(mamba_layer_mask)
         self._use_replay_state_update = use_replay_state_update
+        self._use_gdn_cached_replay_all_layer_commit = (use_replay_state_update
+                                                        and conv_state_layout
+                                                        == "q_k_v")
+        self._gdn_cached_replay_state_descriptors: Optional[torch.Tensor] = None
+        self._gdn_cached_replay_state_strides: Optional[Tuple[int, int,
+                                                              int]] = None
         self.replay_step_width: Optional[int] = (
             spec_config.tokens_per_gen_step
             if spec_config is not None and use_replay_state_update else None)
@@ -2656,6 +2662,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if mamba_layer_mask[layer_idx]
         ]
         self.local_num_mamba_layers = len(self.mamba_pp_layers)
+        self._use_gdn_cached_replay_all_layer_commit = (
+            self._use_gdn_cached_replay_all_layer_commit
+            and self.local_num_mamba_layers > 0)
 
         if self.local_num_mamba_layers > 0:
             tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
@@ -2792,12 +2801,72 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     "KV cache budget or allocate a larger Mamba pool_ratio.")
             self._setup_states()
             self._setup_replay_buffers(spec_config)
+            if self._use_gdn_cached_replay_all_layer_commit:
+                state_layout = ("affine"
+                                if self._gdn_cached_replay_state_strides
+                                is not None else "indirect")
+                logger.info_once(
+                    "Configured GDN cached replay commit mode for V2: "
+                    "small-batch fused, large-batch all-layer; "
+                    f"state layout: {state_layout}",
+                    key="gdn_cached_replay_v2_commit_mode_fused",
+                )
         else:
             self.ssm_layer_group_id = None
             self._ssm_page_index_scale = 1
             self.all_ssm_states = []
             self.all_conv_states = []
             self._setup_replay_buffers(spec_config)
+
+    @property
+    def use_gdn_cached_replay_all_layer_commit(self) -> bool:
+        return getattr(self, "_use_gdn_cached_replay_all_layer_commit", False)
+
+    def _commit_gdn_cached_replay_history_layers(
+        self,
+        attn_metadata: "AttentionMetadata",
+        num_decodes: int,
+    ) -> None:
+        """Advance all V2 GDN checkpoints through their state views."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+            commit_gdn_cached_replay_history_layers)
+
+        if (not getattr(self, "_use_gdn_cached_replay_all_layer_commit", False)
+                or num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE):
+            return
+        if (not self.all_ssm_states
+                or (self._gdn_cached_replay_state_descriptors is None
+                    and self._gdn_cached_replay_state_strides is None)
+                or self.old_x is None or self.old_B is None
+                or self.old_dt is None or self.replay_history_size is None):
+            raise RuntimeError(
+                "GDN cached replay all-layer commit requires V2 replay state buffers."
+            )
+
+        mamba_metadata = attn_metadata.mamba_metadata
+        if mamba_metadata.replay_num_decodes != num_decodes:
+            raise RuntimeError(
+                "GDN replay metadata contains "
+                f"{mamba_metadata.replay_num_decodes} decode requests, "
+                f"but state update received {num_decodes}.")
+        state_strides = self._gdn_cached_replay_state_strides
+        commit_gdn_cached_replay_history_layers(
+            ssm_states=self.all_ssm_states[0],
+            ssm_state_descriptors=(self._gdn_cached_replay_state_descriptors),
+            ssm_state_num_layers=(state_strides[0]
+                                  if state_strides is not None else None),
+            ssm_state_layer_stride=(state_strides[1]
+                                    if state_strides is not None else None),
+            ssm_state_slot_stride=(state_strides[2]
+                                   if state_strides is not None else None),
+            old_u=self.old_x,
+            old_k=self.old_B,
+            old_G=self.old_dt,
+            replay_work_items=mamba_metadata.replay_work_items[:num_decodes],
+            n_writes=mamba_metadata.replay_n_writes,
+            history_size=self.replay_history_size,
+        )
 
     @staticmethod
     def get_cache_size_per_token(model_config,
@@ -3070,6 +3139,49 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                    self.conv_state_dtype, self.conv_state_shape)
             for local_layer_idx in local_layer_ids
         ]
+        if self._use_gdn_cached_replay_all_layer_commit:
+            expected_inner_strides = (
+                self.ssm_state_shape[1] * self.ssm_state_shape[2],
+                self.ssm_state_shape[2],
+                1,
+            )
+            reference = self.all_ssm_states[0]
+            for state in self.all_ssm_states:
+                if (state.dtype != reference.dtype
+                        or state.device != reference.device
+                        or list(state.shape[1:]) != self.ssm_state_shape
+                        or state.stride()[1:] != expected_inner_strides):
+                    raise RuntimeError(
+                        "GDN cached replay requires V2 SSM layers with matching "
+                        "dtype, device, shape, and dense inner dimensions.")
+            pointers = [state.data_ptr() for state in self.all_ssm_states]
+            slot_stride = reference.stride(0)
+            layer_stride_bytes = (pointers[1] -
+                                  pointers[0] if len(pointers) > 1 else 0)
+            has_affine_layout = (
+                layer_stride_bytes % reference.element_size() == 0 and all(
+                    state.stride(0) == slot_stride
+                    for state in self.all_ssm_states)
+                and all(pointer == pointers[0] + layer * layer_stride_bytes
+                        for layer, pointer in enumerate(pointers)))
+            if has_affine_layout:
+                self._gdn_cached_replay_state_strides = (
+                    len(pointers),
+                    layer_stride_bytes // reference.element_size(),
+                    slot_stride,
+                )
+            else:
+                logger.warning_once(
+                    "V2 GDN state views are not affine; using indirect replay "
+                    "checkpoint addressing",
+                    key="gdn_cached_replay_v2_indirect_state_layout",
+                )
+                self._gdn_cached_replay_state_descriptors = torch.tensor(
+                    [(state.data_ptr(), state.stride(0))
+                     for state in self.all_ssm_states],
+                    dtype=torch.int64,
+                    device=reference.device,
+                )
 
     def _setup_replay_buffers(self, spec_config) -> None:
         cache_size = 0
@@ -3292,6 +3404,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
         if self._use_replay_state_update:
+            self._commit_gdn_cached_replay_history_layers(
+                attn_metadata, num_gens)
             assert self._dummy_request_mask is not None
             is_dummy_request = self._dummy_request_mask[
                 num_contexts:num_contexts + num_gens]
@@ -3399,6 +3513,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 kv_cache.enable_swa_scratch_reuse = False
 
     def shutdown(self):
+        self._gdn_cached_replay_state_descriptors = None
+        self._gdn_cached_replay_state_strides = None
         self.all_ssm_states = []
         self.all_conv_states = []
         self.intermediate_ssm_states = None

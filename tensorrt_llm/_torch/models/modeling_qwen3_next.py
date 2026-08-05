@@ -57,8 +57,7 @@ from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import (AuxStreamType, EventType, create_lm_head_tp_mapping,
-                     is_gdn_replay_enabled)
+from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
@@ -1049,23 +1048,11 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Select the hybrid cache manager for the requested decode mode.
-
-        Cached GDN replay currently requires the contiguous V1 C++ state pool
-        for its all-layer commit. Other configurations use V2. An explicit
-        user setting still overrides this model default.
-        """
-        spec_config = llm_args.speculative_config
-        use_gdn_replay = (
-            is_gdn_replay_enabled() and spec_config is not None
-            and spec_config.spec_dec_mode.is_mtp_one_model()
-            and spec_config.tokens_per_gen_step <= 8
-            and getattr(spec_config, "eagle_choices", None) is None
-            and not getattr(spec_config, "use_dynamic_tree", False))
+        """Use V2 by default; explicit V1 selections remain supported."""
         return {
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": not use_gdn_replay,
+                "use_kv_cache_manager_v2": True,
             }
         }
 

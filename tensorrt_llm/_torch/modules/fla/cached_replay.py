@@ -392,6 +392,7 @@ def _cached_replay_kernel(
 @triton.jit
 def _cached_replay_layered_commit_kernel(
     h0_source,
+    h0_descriptors,
     old_u,
     old_k,
     old_G,
@@ -416,6 +417,7 @@ def _cached_replay_layered_commit_kernel(
     USE_L2_STATE_CACHE: tl.constexpr,
     USE_L2_STREAMING_INPUTS: tl.constexpr,
     USE_L2_SHARED_INPUTS: tl.constexpr,
+    USE_H0_DESCRIPTORS: tl.constexpr,
     PIPE_STAGES: tl.constexpr,
 ):
     """Advance every local GDN layer from one cached-history snapshot."""
@@ -486,14 +488,22 @@ def _cached_replay_layered_commit_kernel(
         b_Gh = tl.load(hG_base + o_hist, mask=is_hist, other=0.0).to(tl.float32)
         g_start = tl.load(hG_base + b_pnat - 1).to(tl.float32)
 
-        p_h0 = (
-            h0_source
-            + layer_i64 * pool_stride_layer
-            + slot * pool_stride_slot
-            + i_hv * V * K
-            + o_k[:, None]
-            + o_v[None, :] * K
-        )
+        if USE_H0_DESCRIPTORS:
+            descriptor = h0_descriptors + layer_i64 * 2
+            layer_h0 = tl.load(descriptor).to(tl.pointer_type(h0_source.type.element_ty))
+            layer_slot_stride = tl.load(descriptor + 1)
+            p_h0 = (
+                layer_h0 + slot * layer_slot_stride + i_hv * V * K + o_k[:, None] + o_v[None, :] * K
+            )
+        else:
+            p_h0 = (
+                h0_source
+                + layer_i64 * pool_stride_layer
+                + slot * pool_stride_slot
+                + i_hv * V * K
+                + o_k[:, None]
+                + o_v[None, :] * K
+            )
         if USE_L2_STATE_CACHE:
             b_h = tl.load(
                 p_h0,
@@ -526,6 +536,10 @@ def _cached_replay_layered_commit_kernel(
 def commit_gdn_cached_replay_history_layers(
     *,
     ssm_states: torch.Tensor,
+    ssm_state_descriptors: Optional[torch.Tensor] = None,
+    ssm_state_num_layers: Optional[int] = None,
+    ssm_state_layer_stride: Optional[int] = None,
+    ssm_state_slot_stride: Optional[int] = None,
     old_u: torch.Tensor,
     old_k: torch.Tensor,
     old_G: torch.Tensor,
@@ -538,7 +552,41 @@ def commit_gdn_cached_replay_history_layers(
     commit_pipeline_stages: Optional[int] = None,
 ) -> None:
     """Advance all local layer checkpoints from cached replay histories."""
-    num_layers, _, HV, V, K = ssm_states.shape
+    use_state_descriptors = ssm_state_descriptors is not None
+    state_stride_args = (
+        ssm_state_num_layers,
+        ssm_state_layer_stride,
+        ssm_state_slot_stride,
+    )
+    use_state_strides = any(value is not None for value in state_stride_args)
+    assert not (use_state_descriptors and use_state_strides)
+    if use_state_descriptors or use_state_strides:
+        assert ssm_states.ndim == 4
+        _, HV, V, K = ssm_states.shape
+        if use_state_descriptors:
+            assert ssm_state_descriptors is not None
+            assert ssm_state_descriptors.ndim == 2 and ssm_state_descriptors.shape[1] == 2
+            assert ssm_state_descriptors.dtype == torch.int64
+            assert ssm_state_descriptors.device == ssm_states.device
+            assert ssm_state_descriptors.is_contiguous()
+            num_layers = ssm_state_descriptors.shape[0]
+            pool_stride_layer = 0
+            pool_stride_slot = 0
+        else:
+            assert all(value is not None for value in state_stride_args)
+            assert ssm_state_num_layers is not None
+            assert ssm_state_layer_stride is not None
+            assert ssm_state_slot_stride is not None
+            num_layers = ssm_state_num_layers
+            pool_stride_layer = ssm_state_layer_stride
+            pool_stride_slot = ssm_state_slot_stride
+            assert num_layers > 0 and pool_stride_slot > 0
+            assert num_layers == 1 or pool_stride_layer != 0
+    else:
+        assert ssm_states.ndim == 5
+        num_layers, _, HV, V, K = ssm_states.shape
+        pool_stride_layer = ssm_states.stride(0)
+        pool_stride_slot = ssm_states.stride(1)
     assert old_u.ndim == 6 and old_k.ndim == 6 and old_G.ndim == 5
     H = old_k.shape[-2]
     assert old_u.shape[0] == num_layers and old_u.shape[-2:] == (HV, V)
@@ -601,13 +649,14 @@ def commit_gdn_cached_replay_history_layers(
     num_persistent = min(num_sms * persistent_waves, total_tiles)
     _cached_replay_layered_commit_kernel[(num_persistent,)](
         h0_source=ssm_states,
+        h0_descriptors=(ssm_state_descriptors if ssm_state_descriptors is not None else n_writes),
         old_u=old_u,
         old_k=old_k,
         old_G=old_G,
         replay_work_items=replay_work_items,
         n_writes=n_writes,
-        pool_stride_layer=ssm_states.stride(0),
-        pool_stride_slot=ssm_states.stride(1),
+        pool_stride_layer=pool_stride_layer,
+        pool_stride_slot=pool_stride_slot,
         old_u_stride_layer=old_u.stride(0),
         old_k_stride_layer=old_k.stride(0),
         old_G_stride_layer=old_G.stride(0),
@@ -625,6 +674,7 @@ def commit_gdn_cached_replay_history_layers(
         USE_L2_STATE_CACHE=use_large_workload_mapping,
         USE_L2_STREAMING_INPUTS=use_large_workload_mapping,
         USE_L2_SHARED_INPUTS=use_large_workload_mapping,
+        USE_H0_DESCRIPTORS=use_state_descriptors,
         PIPE_STAGES=commit_pipeline_stages,
         num_warps=commit_num_warps,
         num_stages=commit_pipeline_stages,
