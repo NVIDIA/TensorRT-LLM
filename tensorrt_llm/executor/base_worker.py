@@ -1127,6 +1127,19 @@ class AwaitResponseHelper:
             case _:
                 raise NotImplementedError
 
+    def process_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Apply engine callbacks and append deferred submission errors."""
+        responses = list(
+            filter(
+                lambda _: _,
+                [self.worker._engine_response_callback(r) for r in responses]))
+
+        while not self.temp_error_responses.empty():
+            responses.append(self.temp_error_responses.get())
+
+        return responses
+
     def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
         timeout = timeout or 0.1
@@ -1143,15 +1156,7 @@ class AwaitResponseHelper:
             # _await_any_response) is also a clear signal to broadcast
             # and stop the thread.
             return self._broadcast_event_loop_error(e)
-        # filter since The _engine_response_callback may return None
-        responses = list(
-            filter(
-                lambda _: _,
-                [self.worker._engine_response_callback(r) for r in responses]))
-
-        # append the error responses to the temp_error_responses
-        while not self.temp_error_responses.empty():
-            responses.append(self.temp_error_responses.get())
+        responses = self.process_responses(responses)
 
         with nvtx_range_debug(f"await_response-{len(responses)}",
                               color="red",
