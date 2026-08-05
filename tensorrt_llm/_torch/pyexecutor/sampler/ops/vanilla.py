@@ -386,36 +386,43 @@ class Fusions:
     # emitted. ``counts_cuda`` is flat ``[num_slots * max_beam_width, vocab_size]``;
     # beam ``b`` of slot ``s`` owns row ``s * max_beam_width + b``, which collapses to
     # plain slot indexing at ``max_beam_width == 1``. A single-beam engine never calls
-    # these ops -- it folds inside the penalty graph instead.
+    # this op -- it folds inside the penalty graph instead.
 
     @staticmethod
-    def reparent_occurrence_counts(
+    @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+    def _update_beam_occurrence_counts_impl(
         counts_cuda: torch.Tensor,
         active_cuda: torch.Tensor,
         has_previous_token_cuda: torch.Tensor,
         beam_slot_cuda: torch.Tensor,
+        new_tokens: torch.Tensor,
         predecessor_beams: torch.Tensor,
         seq_slots: torch.Tensor,
+        request_num_beams: torch.Tensor,
         max_beam_width: int,
     ) -> None:
-        """Move each beam's counts onto the beam it continues, in place.
+        """Re-parent every beam onto the beam it continues, then fold in its token.
 
-        Beam ``b`` of slot ``s`` continues the history of beam
-        ``predecessor_beams[s, b]``, so it must take over that beam's counts before
-        this step's token is folded in -- the torch counterpart of the C++
-        block-copy from ``penaltyWorkspacePrev[parentBeam]``.
+        Beam ``b`` of slot ``s`` takes over the counts of ``predecessor_beams[s, b]``
+        before this step's token is folded in. Slots that did not sample last step read
+        the identity permutation instead, gated by ``has_previous_token``; single-beam
+        slots on a beam engine are gated out by ``beam_slot_cuda``, since their
+        ``predecessor_beams`` row is never written.
 
-        Slots that did not sample last step have nothing to re-parent (their
-        ``predecessor_beams`` row is stale) and read the identity permutation
-        instead; the gate is the same ``has_previous_token`` latch that gates the
-        fold, so a slot can never be re-parented twice for one sampled token.
-        Single-beam slots sharing a beam engine are gated out the same way -- nothing
-        writes their ``predecessor_beams`` row, so it must not be believed.
+        ``armed`` gates per *slot* (``.unsqueeze(1)``), so beams past the current width are
+        re-parented too, from a clamped and possibly stale parent -- safe because nothing
+        reads such a row until the width grows to cover it, and growth re-parents it from a
+        beam that was valid last step. The gate is device-side, so this runs
+        unconditionally rather than pay a D2H sync.
 
-        ``index_select`` materializes the gather before ``index_copy_`` writes it
-        back, so the in-place update is safe even though beams share the tensor.
+        NB: ``fullgraph=True``, mutates ``counts_cuda`` in place, and every batch-varying
+        dim-0 argument must be marked dynamic by the caller -- an unmarked peer forces the
+        marked dims to specialize. Add such an argument only together with its
+        ``mark_dynamic`` in ``update_beam_occurrence_counts``.
         """
+        vocab = counts_cuda.size(-1)
         beam_ids = torch.arange(max_beam_width, device=counts_cuda.device)
+
         armed = (
             active_cuda[seq_slots] & has_previous_token_cuda[seq_slots] & beam_slot_cuda[seq_slots]
         ).unsqueeze(1)
@@ -431,22 +438,12 @@ class Fusions:
             counts_cuda.index_select(0, (base + src_beam).reshape(-1)),
         )
 
-    @staticmethod
-    @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
-    def _fold_beam_occurrence_counts_impl(
-        counts_cuda: torch.Tensor,
-        active_cuda: torch.Tensor,
-        has_previous_token_cuda: torch.Tensor,
-        new_tokens: torch.Tensor,
-        seq_slots: torch.Tensor,
-        request_num_beams: torch.Tensor,
-        max_beam_width: int,
-    ) -> None:
-        vocab = counts_cuda.size(-1)
-        beam_ids = torch.arange(max_beam_width, device=counts_cuda.device)
         # Same masked flat scatter as the single-beam fold, fanned out over the
         # beam axis: masked entries add 0 at counts[row, 0], so inactive, unarmed,
-        # out-of-width and padded-token (BEAM_SEARCH_PAD_TOKEN == -1) beams are no-ops.
+        # out-of-layout and padded-token beams are no-ops. A beam the previous step
+        # did not produce carries BEAM_SEARCH_PAD_TOKEN (-1), which the range check
+        # rejects -- that is what confines the fold to the beams that actually
+        # sampled, since ``request_num_beams`` is the (wider) row-layout width.
         previous_token = new_tokens[0, seq_slots, :].to(torch.int64)  # [R, max_beam_width]
         fold_ok = (
             (active_cuda[seq_slots] & has_previous_token_cuda[seq_slots]).unsqueeze(1)
@@ -454,7 +451,7 @@ class Fusions:
             & (previous_token >= 0)
             & (previous_token < vocab)
         )
-        rows = seq_slots.unsqueeze(1) * max_beam_width + beam_ids  # [R, max_beam_width]
+        rows = base + beam_ids  # [R, max_beam_width]
         flat_index = rows * vocab + torch.where(
             fold_ok, previous_token, previous_token.new_zeros(())
         )
@@ -479,10 +476,13 @@ class Fusions:
         Re-parents every beam onto the beam it continues, then folds in the token
         each beam sampled last step. Must run before anything reads the counts for
         this step, and before this step's sampling overwrites ``predecessor_beams``.
+        This wrapper only marks the batch-varying dims dynamic; the work is in
+        ``_update_beam_occurrence_counts_impl``.
 
         Also covers single-beam requests sharing a beam engine: ``beam_slot_cuda``
         turns their re-parent into the identity, and ``request_num_beams == 1``
-        confines their fold to beam 0.
+        confines their fold to beam 0. Context requests are likewise laid out at
+        one beam and read as such.
 
         Args:
             counts_cuda: ``int32[num_slots * max_beam_width, vocab_size]`` workspace.
@@ -492,36 +492,35 @@ class Fusions:
             predecessor_beams: ``int32[num_slots, max_beam_width]``, the parent beam
                 of each beam as written by the previous step's beam search.
             seq_slots: ``int64[R]`` slot per request.
-            request_num_beams: ``[R]`` incoming beam width per request; beams at or
-                past it are skipped.
+            request_num_beams: ``[R]`` row-layout beam width per request, i.e. the
+                static admission width the logits rows are laid out at (1 for a
+                context request), not the per-iteration width. Beams at or past it
+                are skipped; under a growing ``beam_width_array`` the beams between
+                the per-iteration and the layout width are skipped instead by their
+                BEAM_SEARCH_PAD_TOKEN.
         """
         if seq_slots.numel() == 0:
             return
-        Fusions.reparent_occurrence_counts(
+        # Batch-varying dim-0 tensors; mark every one, or an unmarked peer forces the
+        # marked dims to specialize (cf. apply_batched_occurrence_penalties). The other
+        # arguments keep dim 0 == num_slots (fixed), so they must NOT be marked.
+        torch._dynamo.mark_dynamic(seq_slots, 0)
+        torch._dynamo.mark_dynamic(request_num_beams, 0)
+        Fusions._update_beam_occurrence_counts_impl(
             counts_cuda,
             active_cuda,
             has_previous_token_cuda,
             beam_slot_cuda,
-            predecessor_beams,
-            seq_slots,
-            max_beam_width,
-        )
-        # Batch-varying dim-0 tensors; mark every one, or an unmarked peer forces the
-        # marked dims to specialize (cf. apply_batched_occurrence_penalties).
-        torch._dynamo.mark_dynamic(seq_slots, 0)
-        torch._dynamo.mark_dynamic(request_num_beams, 0)
-        Fusions._fold_beam_occurrence_counts_impl(
-            counts_cuda,
-            active_cuda,
-            has_previous_token_cuda,
             new_tokens,
+            predecessor_beams,
             seq_slots,
             request_num_beams,
             max_beam_width,
         )
 
-    # fullgraph=True is safe here: served model has fixed shapes and compiles ~2 graphs,
-    # well under the default limit (8)
+    # fullgraph=True is safe here: 4 cache entries per process against a default limit of 8
+    # -- the size-1 specialization of the dynamic dim, times the `prefix_seen_cuda` Optional
+    # flipping on first use. The beam parameters are per-engine constants and cost nothing.
     @staticmethod
     @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
     def _apply_occurrence_penalties_impl(
@@ -653,7 +652,9 @@ class Fusions:
             request_offsets / request_num_steps: ``[R]`` device tensors, already
                 staged by the caller. The owned spans must not overlap, but they need
                 not be ordered, and rows they skip are left bit-identical.
-            request_num_beams: ``[R]`` incoming beam width per request, so a row can be
+            request_num_beams: ``[R]`` row-layout beam width per request -- the static
+                admission width ModelEngine lays the rows out at, which under a growing
+                ``beam_width_array`` exceeds the per-iteration width -- so a row can be
                 mapped back to the beam that owns it. None on a single-beam engine.
             max_beam_width: the engine's beam width, the stride of the counts rows.
             fold_pending: whether to fold the device-pending token here. False on a beam

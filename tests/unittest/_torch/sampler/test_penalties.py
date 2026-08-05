@@ -513,7 +513,12 @@ class _BeamStep:
     armed: list[bool]
     """Whether the slot sampled last step -- the ``has_previous_token`` latch."""
     num_beams: list[int]
-    """Incoming beam width; beams at or past it are re-parented but never folded."""
+    """Row-layout beam width; beams at or past it are re-parented but never folded.
+
+    The sampler passes the static admission width here, so in production this only
+    drops the beams of a narrower request sharing the engine; a beam left behind by a
+    growing ``beam_width_array`` is dropped by its ``BEAM_PAD`` instead. The op's
+    contract is the same either way, so the scenarios exercise both gates."""
 
 
 @dataclass(frozen=True)
@@ -566,6 +571,18 @@ _BEAM_COUNT_SCENARIOS = [
             _BeamStep([[0, 1, 2, 3]], [[1, 1, 1, 1]], [True], [4]),
         ],
     ),
+    # Intermediate growth 2 -> 4: the previous step's map holds two valid entries and two
+    # stale ones in the same slot, and the new beams inherit from beam 1, whose history
+    # differs from beam 0's -- so a stale row that was not re-parented is detectable.
+    _BeamCountScenario(
+        name="vbws-growth-partial",
+        prompts={0: [3]},
+        steps=[
+            _BeamStep([[0, 0, 0, 0]], [[1, 2, BEAM_PAD, BEAM_PAD]], [True], [2]),
+            _BeamStep([[0, 1, 1, 1]], [[5, 6, 7, 8]], [True], [4]),
+            _BeamStep([[0, 1, 2, 3]], [[9, 9, 9, 9]], [True], [4]),
+        ],
+    ),
     # A beam whose predecessor already finished emits BEAM_SEARCH_PAD_TOKEN.
     _BeamCountScenario(
         name="pad-token",
@@ -586,9 +603,10 @@ _BEAM_COUNT_SCENARIOS = [
             _BeamStep([[0, 1, 2, 3]], [[6, 6, 6, 6]], [True], [4]),
         ],
     ),
-    # Beams at or past the incoming width are re-parented but never folded.
+    # Beams at or past the request's layout width are re-parented but never folded --
+    # a narrower request sharing a wider engine.
     _BeamCountScenario(
-        name="shrink-width",
+        name="narrow-request",
         prompts={0: [1]},
         steps=[
             _BeamStep([[0, 0, 0, 0]], [[2, 3, 4, 5]], [True], [4]),
@@ -608,7 +626,7 @@ def _beam_counts_reference(scenario: _BeamCountScenario) -> torch.Tensor:
     """Host replay of the per-beam occurrence counts.
 
     Mirrors the op's contract: on an armed slot every beam first takes over the
-    history of ``predecessor_beams[beam]``, then the beams below the incoming width
+    history of ``predecessor_beams[beam]``, then the beams below the layout width
     append the token they sampled. Unarmed slots are left alone.
     """
     slots = sorted(scenario.prompts)
