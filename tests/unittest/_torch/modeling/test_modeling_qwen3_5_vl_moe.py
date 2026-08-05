@@ -5,9 +5,9 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
 from typing import List, Optional
 
+import pytest
 import torch
 import transformers
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
@@ -28,6 +28,9 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_mamba_ssm_cache_dtype
 from tensorrt_llm.inputs import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -158,61 +161,37 @@ def test_qwen35_moe_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
     )
 
 
-def test_qwen35_moe_model_defaults_select_marlin_on_hopper(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("quant_algo", "sm_version", "use_marlin"),
+    [
+        pytest.param(QuantAlgo.NVFP4, 90, True, id="hopper-nvfp4"),
+        pytest.param(QuantAlgo.MIXED_PRECISION, 90, False, id="hopper-mixed-precision"),
+        pytest.param(QuantAlgo.NVFP4, 100, False, id="blackwell-nvfp4"),
+    ],
+)
+def test_qwen35_moe_model_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_algo: QuantAlgo,
+    sm_version: int,
+    use_marlin: bool,
+) -> None:
     monkeypatch.setattr(
         "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
-        lambda: 90,
+        lambda: sm_version,
     )
 
-    expected = {
-        "kv_cache_config": {
-            "enable_block_reuse": False,
-            "use_kv_cache_manager_v2": True,
-        },
-        "moe_config": {
-            "backend": "MARLIN",
-        },
-        "nvfp4_gemm_config": {
-            "allowed_backends": ["marlin"],
-        },
-    }
-    llm_args = SimpleNamespace(quant_config=SimpleNamespace(quant_algo=QuantAlgo.NVFP4))
-    assert Qwen3_5MoeForCausalLM.get_model_defaults(llm_args) == expected
-    assert Qwen3_5MoeVLModel.get_model_defaults(llm_args) == expected
+    expected_moe_backend = "MARLIN" if use_marlin else "AUTO"
+    expected_gemm_backends = ["marlin"] if use_marlin else ["cutlass", "cublaslt", "cuda_core"]
+    for model_cls in (Qwen3_5MoeForCausalLM, Qwen3_5MoeVLModel):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        llm_args.quant_config = QuantConfig(quant_algo=quant_algo)
+        defaults = model_cls.get_model_defaults(llm_args)
+        apply_model_defaults_to_llm_args(llm_args, defaults)
 
-
-def test_qwen35_moe_model_defaults_keep_non_nvfp4_backends(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
-        lambda: 90,
-    )
-
-    expected = {
-        "kv_cache_config": {
-            "enable_block_reuse": False,
-            "use_kv_cache_manager_v2": True,
-        }
-    }
-    llm_args = SimpleNamespace(quant_config=SimpleNamespace(quant_algo=QuantAlgo.FP8))
-    assert Qwen3_5MoeForCausalLM.get_model_defaults(llm_args) == expected
-    assert Qwen3_5MoeVLModel.get_model_defaults(llm_args) == expected
-
-
-def test_qwen35_moe_model_defaults_keep_blackwell_backends(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
-        lambda: 100,
-    )
-
-    expected = {
-        "kv_cache_config": {
-            "enable_block_reuse": False,
-            "use_kv_cache_manager_v2": True,
-        }
-    }
-    llm_args = SimpleNamespace(quant_config=SimpleNamespace(quant_algo=QuantAlgo.NVFP4))
-    assert Qwen3_5MoeForCausalLM.get_model_defaults(llm_args) == expected
-    assert Qwen3_5MoeVLModel.get_model_defaults(llm_args) == expected
+        assert llm_args.kv_cache_config.enable_block_reuse is False
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+        assert llm_args.moe_config.backend == expected_moe_backend
+        assert llm_args.nvfp4_gemm_config.allowed_backends == expected_gemm_backends
 
 
 def test_qwen35_moe_vl_placeholder_metadata_registered() -> None:
