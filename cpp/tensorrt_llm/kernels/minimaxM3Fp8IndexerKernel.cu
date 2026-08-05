@@ -75,7 +75,10 @@ __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __n
         auto const values = __bfloat1622float2(reinterpret_cast<__nv_bfloat162 const*>(&packed_input)[pair]);
         elements[pair * 2] = values.x;
         elements[pair * 2 + 1] = values.y;
-        sum_squares += values.x * values.x + values.y * values.y;
+        // Preserve the accumulation order used by fusedQKNormRopeKernel.  A
+        // reassociated pair sum can move a final BF16 value across an FP8 bin.
+        sum_squares += values.x * values.x;
+        sum_squares += values.y * values.y;
     }
 
     sum_squares = tensorrt_llm::common::warpReduceSum(sum_squares);
@@ -92,6 +95,10 @@ __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __n
     // Four elements per lane means the matching half is eight lanes away.
     __syncwarp();
     constexpr int kPairOffset = (kRotaryDim / 2) / kElemsPerThread;
+    // Keep the frequency calculation bitwise aligned with the shared fused
+    // QK-norm/RoPE kernel.  That kernel uses the fast base-2 intrinsics rather
+    // than powf, and the BF16-to-FP8 contract depends on the resulting rounding.
+    float const neg2_log2base_over_rd = -2.0F * __log2f(base) / static_cast<float>(kRotaryDim);
 #pragma unroll
     for (int i = 0; i < kElemsPerThread; ++i)
     {
@@ -105,7 +112,7 @@ __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __n
             }
             int const dim_idx = (dim * 2) % kRotaryDim;
             int const half_dim = dim_idx / 2;
-            float const frequency = powf(base, -2.0F * half_dim / static_cast<float>(kRotaryDim));
+            float const frequency = exp2f(static_cast<float>(half_dim) * neg2_log2base_over_rd);
             float sine;
             float cosine;
             __sincosf(static_cast<float>(position_ids[token_idx]) * frequency, &sine, &cosine);
