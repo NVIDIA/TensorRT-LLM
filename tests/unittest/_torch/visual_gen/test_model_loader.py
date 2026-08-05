@@ -199,6 +199,54 @@ def test_load_wan_pipeline_with_fp8_dynamic_quant(checkpoint_exists):
     assert found_fp8_linear, "No FP8 Linear modules found in transformer"
 
 
+def test_load_wan_pipeline_with_fp8_rowwise(checkpoint_exists):
+    """Test loading with FP8 row-wise (per-channel-per-token) dynamic quantization.
+
+    Verifies:
+    1. Config parses FP8_PER_CHANNEL_PER_TOKEN and sets dynamic_weight_quant=True
+    2. Linear weights are FP8 after loading
+    3. weight_scale is 1-D [out_features] — one scale per output row, not a scalar
+    """
+    if not checkpoint_exists:
+        pytest.skip("Checkpoint not available")
+
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen import PipelineLoader
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    args = VisualGenArgs(
+        model=CHECKPOINT_PATH,
+        quant_config={"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True},
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
+
+    assert pipeline.pipeline_config.dynamic_weight_quant is True
+
+    found_fp8_linear = False
+    for name, module in pipeline.transformer.named_modules():
+        if isinstance(module, Linear):
+            if hasattr(module, "weight") and module.weight is not None:
+                assert module.weight.dtype == torch.float8_e4m3fn, (
+                    f"Linear {name} weight dtype is {module.weight.dtype}, expected float8_e4m3fn"
+                )
+                assert hasattr(module, "weight_scale") and module.weight_scale is not None, (
+                    f"Linear {name} missing weight_scale"
+                )
+                # Per-channel: one scale per output neuron, not a scalar
+                assert module.weight_scale.dim() == 1, (
+                    f"Linear {name} weight_scale should be 1-D [out_features], "
+                    f"got shape {tuple(module.weight_scale.shape)}"
+                )
+                assert module.weight_scale.shape[0] == module.weight.shape[0], (
+                    f"Linear {name} weight_scale length {module.weight_scale.shape[0]} "
+                    f"!= out_features {module.weight.shape[0]}"
+                )
+                found_fp8_linear = True
+                break
+
+    assert found_fp8_linear, "No FP8 Linear modules found in transformer"
+
+
 def test_load_wan_pipeline_with_fp8_blockwise(checkpoint_exists):
     """Test loading with FP8 blockwise quantization using VisualGenArgs."""
     if not checkpoint_exists:
@@ -260,6 +308,15 @@ def test_visual_gen_args_to_quant_config():
     )
     qc, _, _, _ = parse(args.quant_config)
     assert qc.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+
+    # FP8 rowwise (per-token activations, per-channel weights)
+    args = VisualGenArgs(
+        model="/fake/path",
+        quant_config={"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True},
+    )
+    qc, _, dwq, _ = parse(args.quant_config)
+    assert qc.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+    assert dwq is True
 
     # NVFP4
     args = VisualGenArgs(
