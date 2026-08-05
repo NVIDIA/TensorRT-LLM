@@ -6521,6 +6521,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=True,
                                         dtype="fp8",
                                         mamba_ssm_cache_dtype="bfloat16")
         cuda_graph_config = CudaGraphConfig(enable_padding=True,

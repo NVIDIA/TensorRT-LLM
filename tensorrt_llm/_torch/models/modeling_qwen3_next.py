@@ -1067,11 +1067,7 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Use V2 for the hybrid state layout.
-
-        Block reuse remains opt-in because it also requires a recurrent-state
-        snapshot policy.
-        """
+        """Use V2 by default; explicit V1 selections remain supported."""
         return {
             "kv_cache_config": {
                 "enable_block_reuse": False,
