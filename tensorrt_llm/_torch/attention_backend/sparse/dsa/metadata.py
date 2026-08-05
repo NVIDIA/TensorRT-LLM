@@ -13,7 +13,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.modules.top_k import DecodeTopK, DecodeTopKPolicy
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -348,12 +348,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # use it there, drop this guard so the case is pre-compiled too.
         if self._indexer_compress_ratio > 1 and next_n > 1:
             return
-        decode_top_k = DecodeTopK(
+        top_k_module = TopK(
             int(top_k),
-            DecodeTopKPolicy.CUTE_DSL_PREFERRED,
+            decode_implementation=TopKImplementation.CUTE_DSL_PREFERRED,
             compress_ratio=self._indexer_compress_ratio,
         )
-        decode_top_k.prepare(
+        top_k_module.prepare(
             device=self.kv_lens_cuda.device,
             max_num_columns=int(self.get_indexer_max_seq_len()),
             next_n=next_n,

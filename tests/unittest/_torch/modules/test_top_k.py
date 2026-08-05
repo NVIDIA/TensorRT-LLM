@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the reusable sparse index-selection Top-K modules."""
+"""Tests for the reusable sparse index-selection Top-K module."""
 
 from contextlib import nullcontext
 from unittest.mock import Mock
@@ -9,12 +9,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules import top_k as top_k_module
-from tensorrt_llm._torch.modules.top_k import (
-    DecodeTopK,
-    DecodeTopKPolicy,
-    PrefillTopK,
-    PrefillTopKImplementation,
-)
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 
 
 def test_prefill_torch_masks_dirty_scores_and_pads_output() -> None:
@@ -29,11 +24,12 @@ def test_prefill_torch_masks_dirty_scores_and_pads_output() -> None:
     row_ends = torch.tensor([4, 3, 4], dtype=torch.int32)
     output = torch.full((3, 4), 77, dtype=torch.int32)
 
-    result = PrefillTopK(4, PrefillTopKImplementation.TORCH)(
+    result = TopK(4, prefill_implementation=TopKImplementation.TORCH)(
         scores,
-        row_starts,
-        row_ends,
         output,
+        is_prefill=True,
+        row_starts=row_starts,
+        row_ends=row_ends,
     )
 
     assert result is output
@@ -51,16 +47,49 @@ def test_decode_torch_uses_scan_lengths() -> None:
     scan_lengths = torch.tensor([3], dtype=torch.int32)
     output = torch.full((2, 4), 77, dtype=torch.int32)
 
-    result = DecodeTopK(4, DecodeTopKPolicy.TORCH, compress_ratio=4)(
+    result = TopK(
+        4,
+        decode_implementation=TopKImplementation.TORCH,
+        compress_ratio=4,
+    )(
         scores,
-        logical_lengths,
-        scan_lengths,
         output,
+        is_prefill=False,
+        sequence_lengths=logical_lengths,
+        scan_lengths=scan_lengths,
         next_n=2,
     )
 
     assert result is output
     assert output.tolist() == [[1, 0, -1, -1], [2, 1, 0, -1]]
+
+
+def test_one_module_dispatches_prefill_and_decode() -> None:
+    top_k = TopK(
+        1,
+        prefill_implementation=TopKImplementation.TORCH,
+        decode_implementation=TopKImplementation.TORCH,
+    )
+    scores = torch.tensor([[1.0, 3.0, 2.0]])
+    output = torch.empty(1, 1, dtype=torch.int32)
+
+    top_k(
+        scores,
+        output,
+        is_prefill=True,
+        row_starts=torch.tensor([1], dtype=torch.int32),
+        row_ends=torch.tensor([3], dtype=torch.int32),
+    )
+    assert output.item() == 0
+
+    top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=torch.tensor([3], dtype=torch.int32),
+        scan_lengths=torch.tensor([3], dtype=torch.int32),
+    )
+    assert output.item() == 1
 
 
 def test_cute_dsl_preferred_preserves_compressed_mtp_fallback(monkeypatch) -> None:
@@ -69,9 +98,9 @@ def test_cute_dsl_preferred_preserves_compressed_mtp_fallback(monkeypatch) -> No
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_indexer_topk_decode", cute_dsl)
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", trtllm)
 
-    top_k = DecodeTopK(
+    top_k = TopK(
         2,
-        DecodeTopKPolicy.CUTE_DSL_PREFERRED,
+        decode_implementation=TopKImplementation.CUTE_DSL_PREFERRED,
         compress_ratio=4,
     )
     logical_lengths = torch.tensor([16], dtype=torch.int32)
@@ -79,7 +108,14 @@ def test_cute_dsl_preferred_preserves_compressed_mtp_fallback(monkeypatch) -> No
 
     scores = torch.randn(1, 4)
     output = torch.empty(1, 2, dtype=torch.int32)
-    top_k(scores, logical_lengths, scan_lengths, output, next_n=1)
+    top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=logical_lengths,
+        scan_lengths=scan_lengths,
+        next_n=1,
+    )
     cute_dsl.assert_called_once_with(scores, scan_lengths, output, 2, 1)
     trtllm.assert_not_called()
 
@@ -90,9 +126,10 @@ def test_cute_dsl_preferred_preserves_compressed_mtp_fallback(monkeypatch) -> No
     radix_values = torch.empty(2, 10, 2)
     top_k(
         scores,
-        logical_lengths,
-        scan_lengths,
         output,
+        is_prefill=False,
+        sequence_lengths=logical_lengths,
+        scan_lengths=scan_lengths,
         next_n=2,
         radix_indices=radix_indices,
         radix_values=radix_values,
@@ -115,7 +152,11 @@ def test_cute_dsl_preferred_preserves_compressed_mtp_fallback(monkeypatch) -> No
 def test_gvr_routes_logical_lengths_and_workspace(monkeypatch) -> None:
     gvr = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
-    top_k = DecodeTopK(2, DecodeTopKPolicy.CUTE_DSL_GVR, compress_ratio=4)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        compress_ratio=4,
+    )
     scores = torch.randn(1, 8)
     logical_lengths = torch.tensor([32], dtype=torch.int32)
     scan_lengths = torch.tensor([8], dtype=torch.int32)
@@ -125,9 +166,10 @@ def test_gvr_routes_logical_lengths_and_workspace(monkeypatch) -> None:
 
     top_k(
         scores,
-        logical_lengths,
-        scan_lengths,
         output,
+        is_prefill=False,
+        sequence_lengths=logical_lengths,
+        scan_lengths=scan_lengths,
         next_n=1,
         prior_indices=prior,
         max_num_columns=8,
@@ -150,19 +192,23 @@ def test_gvr_routes_logical_lengths_and_workspace(monkeypatch) -> None:
 @pytest.mark.parametrize("top_k", [0, -1])
 def test_top_k_must_be_positive(top_k: int) -> None:
     with pytest.raises(ValueError, match="top_k must be positive"):
-        PrefillTopK(top_k, PrefillTopKImplementation.TORCH)
-    with pytest.raises(ValueError, match="top_k must be positive"):
-        DecodeTopK(top_k, DecodeTopKPolicy.TORCH)
+        TopK(top_k, prefill_implementation=TopKImplementation.TORCH)
+
+
+def test_top_k_requires_an_implementation() -> None:
+    with pytest.raises(ValueError, match="at least one Top-K implementation"):
+        TopK(1)
 
 
 def test_decode_validates_workspace_pairs() -> None:
-    top_k = DecodeTopK(2, DecodeTopKPolicy.TRTLLM)
+    top_k = TopK(2, decode_implementation=TopKImplementation.TRTLLM)
     with pytest.raises(ValueError, match="must be provided together"):
         top_k(
             torch.randn(1, 4),
-            torch.tensor([4], dtype=torch.int32),
-            torch.tensor([4], dtype=torch.int32),
             torch.empty(1, 2, dtype=torch.int32),
+            is_prefill=False,
+            sequence_lengths=torch.tensor([4], dtype=torch.int32),
+            scan_lengths=torch.tensor([4], dtype=torch.int32),
             next_n=1,
             radix_indices=torch.empty(1, 10, 2, dtype=torch.int32),
         )
@@ -174,7 +220,7 @@ def test_prepare_deduplicates_success_for_full_key(monkeypatch) -> None:
     monkeypatch.setattr(top_k_module, "_cuda_device", lambda _: torch.device("cuda:3"))
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
 
-    top_k = DecodeTopK(32, DecodeTopKPolicy.TRTLLM_HEURISTIC)
+    top_k = TopK(32, decode_implementation=TopKImplementation.TRTLLM_HEURISTIC)
     warmup = Mock()
     monkeypatch.setattr(top_k, "_warmup_trtllm_heuristic", warmup)
 
@@ -198,7 +244,7 @@ def test_prepare_does_not_cache_failure(monkeypatch) -> None:
     monkeypatch.setattr(top_k_module, "_cuda_device", lambda _: torch.device("cuda:0"))
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
 
-    top_k = DecodeTopK(16, DecodeTopKPolicy.TRTLLM_HEURISTIC)
+    top_k = TopK(16, decode_implementation=TopKImplementation.TRTLLM_HEURISTIC)
     warmup = Mock(side_effect=RuntimeError("warmup failed"))
     monkeypatch.setattr(top_k, "_warmup_trtllm_heuristic", warmup)
     prepare_args = dict(

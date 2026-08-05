@@ -56,12 +56,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
-from tensorrt_llm._torch.modules.top_k import (
-    DecodeTopK,
-    DecodeTopKPolicy,
-    PrefillTopK,
-    PrefillTopKImplementation,
-)
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
@@ -90,13 +85,10 @@ def has_deep_gemm():
 
 
 def _set_torch_top_k(indexer: Indexer) -> None:
-    indexer.prefill_top_k = PrefillTopK(
+    indexer.top_k = TopK(
         indexer.index_topk,
-        PrefillTopKImplementation.TORCH,
-    )
-    indexer.decode_top_k = DecodeTopK(
-        indexer.index_topk,
-        DecodeTopKPolicy.TORCH,
+        prefill_implementation=TopKImplementation.TORCH,
+        decode_implementation=TopKImplementation.TORCH,
         compress_ratio=indexer.compress_ratio,
     )
 
@@ -245,6 +237,23 @@ def test_indexer_post_load_weights_caches_fused_weight():
     assert torch.equal(indexer._fused_wk_wp_weight[:2], indexer.wk.weight.data)
     assert torch.equal(indexer._fused_wk_wp_weight[2:], indexer.weights_proj.weight.data)
     assert not hasattr(indexer, "_weights_transformed")
+
+
+@skip_pre_hopper
+def test_indexer_configures_one_top_k_module():
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=128,
+    )
+
+    indexer = create_indexer(sparse_config)
+
+    assert isinstance(indexer.top_k, TopK)
+    assert indexer.top_k.prefill_implementation == TopKImplementation.TRTLLM
+    assert indexer.top_k.decode_implementation == TopKImplementation.TRTLLM
+    assert not hasattr(indexer, "prefill_top_k")
+    assert not hasattr(indexer, "decode_top_k")
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):

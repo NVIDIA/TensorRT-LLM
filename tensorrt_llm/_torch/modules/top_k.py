@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Reusable index-selection Top-K modules for sparse inference paths."""
+"""Reusable index-selection Top-K module for sparse inference paths."""
 
 from __future__ import annotations
 
@@ -11,15 +11,8 @@ import torch
 import torch.nn as nn
 
 
-class PrefillTopKImplementation(str, Enum):
-    """Available segmented prefill Top-K implementations."""
-
-    TORCH = "torch"
-    TRTLLM = "trtllm"
-
-
-class DecodeTopKPolicy(str, Enum):
-    """Decode Top-K dispatch policies.
+class TopKImplementation(str, Enum):
+    """Top-K implementations for prefill and decode.
 
     ``CUTE_DSL_PREFERRED`` uses the CuTe DSL radix implementation when it
     supports the runtime shape and falls back to TRTLLM otherwise.
@@ -30,6 +23,12 @@ class DecodeTopKPolicy(str, Enum):
     TRTLLM_HEURISTIC = "trtllm_heuristic"
     CUTE_DSL_PREFERRED = "cute_dsl_preferred"
     CUTE_DSL_GVR = "cute_dsl_gvr"
+
+
+_PREFILL_IMPLEMENTATIONS = {
+    TopKImplementation.TORCH,
+    TopKImplementation.TRTLLM,
+}
 
 
 _PREPARE_LOCK = threading.Lock()
@@ -86,78 +85,42 @@ def _validate_lengths(
         )
 
 
-class PrefillTopK(nn.Module):
-    """Select row-local Top-K indices from segmented prefill scores."""
+def _require_tensor(tensor: torch.Tensor | None, name: str) -> torch.Tensor:
+    if tensor is None:
+        raise ValueError(f"{name} is required")
+    return tensor
 
-    def __init__(
-        self,
-        top_k: int,
-        implementation: PrefillTopKImplementation,
-    ) -> None:
-        super().__init__()
-        if top_k <= 0:
-            raise ValueError(f"top_k must be positive, got {top_k}")
-        self.top_k = top_k
-        self.implementation = PrefillTopKImplementation(implementation)
 
-    def prepare(self) -> None:
-        """Prepare the implementation for execution.
-
-        Segmented prefill implementations currently need no explicit warmup.
-        """
-
-    def forward(
-        self,
-        scores: torch.Tensor,
-        row_starts: torch.Tensor,
-        row_ends: torch.Tensor,
-        output_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Write row-local Top-K indices into ``output_indices``.
-
-        Args:
-            scores: Score matrix with shape ``[num_rows, num_columns]``.
-            row_starts: Inclusive valid-column starts with shape ``[num_rows]``.
-            row_ends: Exclusive valid-column ends with shape ``[num_rows]``.
-            output_indices: Caller-owned int32 output with shape
-                ``[num_rows, top_k]``.
-        """
-        _validate_output(scores, output_indices, self.top_k)
-        _validate_lengths(scores, row_starts, "row_starts", scores.shape[0])
-        _validate_lengths(scores, row_ends, "row_ends", scores.shape[0])
-
-        if self.implementation == PrefillTopKImplementation.TRTLLM:
-            torch.ops.trtllm.indexer_topk_prefill(
-                scores,
-                row_starts,
-                row_ends,
-                output_indices,
-                self.top_k,
-            )
-            return output_indices
-
-        output_indices.fill_(-1)
-        selected_count = min(self.top_k, scores.shape[1])
-        if selected_count == 0:
-            return output_indices
-        columns = torch.arange(scores.shape[1], device=scores.device).unsqueeze(0)
-        valid = (columns >= row_starts.unsqueeze(1)) & (columns < row_ends.unsqueeze(1))
-        selected = scores.masked_fill(~valid, float("-inf")).topk(selected_count, dim=-1).indices
-        selected_valid = torch.gather(valid, 1, selected)
-        selected = selected - row_starts.unsqueeze(1)
-        selected = selected.masked_fill(~selected_valid, -1)
-        output_indices[:, :selected_count].copy_(selected.to(torch.int32))
+def _forward_prefill_torch(
+    scores: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    output_indices: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    output_indices.fill_(-1)
+    selected_count = min(top_k, scores.shape[1])
+    if selected_count == 0:
         return output_indices
+    columns = torch.arange(scores.shape[1], device=scores.device).unsqueeze(0)
+    valid = (columns >= row_starts.unsqueeze(1)) & (columns < row_ends.unsqueeze(1))
+    selected = scores.masked_fill(~valid, float("-inf")).topk(selected_count, dim=-1).indices
+    selected_valid = torch.gather(valid, 1, selected)
+    selected = selected - row_starts.unsqueeze(1)
+    selected = selected.masked_fill(~selected_valid, -1)
+    output_indices[:, :selected_count].copy_(selected.to(torch.int32))
+    return output_indices
 
 
-class DecodeTopK(nn.Module):
-    """Select Top-K indices from decode scores using a fixed dispatch policy."""
+class TopK(nn.Module):
+    """Select Top-K indices for sparse prefill and decode paths."""
 
     def __init__(
         self,
         top_k: int,
-        policy: DecodeTopKPolicy,
         *,
+        prefill_implementation: TopKImplementation | None = None,
+        decode_implementation: TopKImplementation | None = None,
         compress_ratio: int = 1,
     ) -> None:
         super().__init__()
@@ -165,8 +128,24 @@ class DecodeTopK(nn.Module):
             raise ValueError(f"top_k must be positive, got {top_k}")
         if compress_ratio <= 0:
             raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+        if prefill_implementation is None and decode_implementation is None:
+            raise ValueError("at least one Top-K implementation must be configured")
         self.top_k = top_k
-        self.policy = DecodeTopKPolicy(policy)
+        self.prefill_implementation = (
+            TopKImplementation(prefill_implementation)
+            if prefill_implementation is not None
+            else None
+        )
+        if (
+            self.prefill_implementation is not None
+            and self.prefill_implementation not in _PREFILL_IMPLEMENTATIONS
+        ):
+            raise ValueError(
+                f"{self.prefill_implementation.value} is not supported for prefill Top-K"
+            )
+        self.decode_implementation = (
+            TopKImplementation(decode_implementation) if decode_implementation is not None else None
+        )
         self.compress_ratio = compress_ratio
 
     def prepare(
@@ -178,17 +157,20 @@ class DecodeTopK(nn.Module):
         input_dtype: torch.dtype,
         num_sms: int | None = None,
     ) -> None:
-        """Warm up static implementation state for one deployment shape."""
+        """Warm up decode implementation state for one deployment shape."""
+        implementation = self.decode_implementation
+        if implementation is None:
+            raise ValueError("decode Top-K is not configured")
         if max_num_columns <= 0 or next_n <= 0:
             return
-        if self.policy in (
-            DecodeTopKPolicy.TORCH,
-            DecodeTopKPolicy.TRTLLM,
-            DecodeTopKPolicy.CUTE_DSL_GVR,
+        if implementation in (
+            TopKImplementation.TORCH,
+            TopKImplementation.TRTLLM,
+            TopKImplementation.CUTE_DSL_GVR,
         ):
             return
         if (
-            self.policy == DecodeTopKPolicy.CUTE_DSL_PREFERRED
+            implementation == TopKImplementation.CUTE_DSL_PREFERRED
             and self.compress_ratio > 1
             and next_n > 1
         ):
@@ -196,7 +178,7 @@ class DecodeTopK(nn.Module):
 
         device = _cuda_device(device)
         key = (
-            self.policy,
+            implementation,
             device.index,
             input_dtype,
             self.top_k,
@@ -209,7 +191,7 @@ class DecodeTopK(nn.Module):
             if key in _PREPARED_DECODE_TOP_K:
                 return
             with torch.cuda.device(device):
-                if self.policy == DecodeTopKPolicy.TRTLLM_HEURISTIC:
+                if implementation == TopKImplementation.TRTLLM_HEURISTIC:
                     self._warmup_trtllm_heuristic(input_dtype)
                 else:
                     try:
@@ -261,11 +243,14 @@ class DecodeTopK(nn.Module):
     def forward(
         self,
         scores: torch.Tensor,
-        sequence_lengths: torch.Tensor,
-        scan_lengths: torch.Tensor,
         output_indices: torch.Tensor,
         *,
-        next_n: int,
+        is_prefill: bool,
+        row_starts: torch.Tensor | None = None,
+        row_ends: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None,
+        scan_lengths: torch.Tensor | None = None,
+        next_n: int = 1,
         prior_indices: torch.Tensor | None = None,
         heuristic_values: torch.Tensor | None = None,
         radix_indices: torch.Tensor | None = None,
@@ -273,12 +258,80 @@ class DecodeTopK(nn.Module):
         max_num_columns: int | None = None,
         row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Write decode Top-K indices into ``output_indices``.
+        """Write prefill or decode Top-K indices into ``output_indices``.
 
-        ``sequence_lengths`` are logical request KV lengths. ``scan_lengths``
-        are request lengths in the score-column coordinate system.
+        Prefill uses ``row_starts`` and ``row_ends``. Decode uses logical
+        ``sequence_lengths`` plus ``scan_lengths`` in score-column coordinates.
         """
         _validate_output(scores, output_indices, self.top_k)
+        if is_prefill:
+            return self._forward_prefill(
+                scores,
+                _require_tensor(row_starts, "row_starts"),
+                _require_tensor(row_ends, "row_ends"),
+                output_indices,
+            )
+        return self._forward_decode(
+            scores,
+            _require_tensor(sequence_lengths, "sequence_lengths"),
+            _require_tensor(scan_lengths, "scan_lengths"),
+            output_indices,
+            next_n=next_n,
+            prior_indices=prior_indices,
+            heuristic_values=heuristic_values,
+            radix_indices=radix_indices,
+            radix_values=radix_values,
+            max_num_columns=max_num_columns,
+            row_order=row_order,
+        )
+
+    def _forward_prefill(
+        self,
+        scores: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        output_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        implementation = self.prefill_implementation
+        if implementation is None:
+            raise ValueError("prefill Top-K is not configured")
+        _validate_lengths(scores, row_starts, "row_starts", scores.shape[0])
+        _validate_lengths(scores, row_ends, "row_ends", scores.shape[0])
+        if implementation == TopKImplementation.TORCH:
+            return _forward_prefill_torch(
+                scores,
+                row_starts,
+                row_ends,
+                output_indices,
+                self.top_k,
+            )
+        torch.ops.trtllm.indexer_topk_prefill(
+            scores,
+            row_starts,
+            row_ends,
+            output_indices,
+            self.top_k,
+        )
+        return output_indices
+
+    def _forward_decode(
+        self,
+        scores: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        scan_lengths: torch.Tensor,
+        output_indices: torch.Tensor,
+        *,
+        next_n: int,
+        prior_indices: torch.Tensor | None,
+        heuristic_values: torch.Tensor | None,
+        radix_indices: torch.Tensor | None,
+        radix_values: torch.Tensor | None,
+        max_num_columns: int | None,
+        row_order: torch.Tensor | None,
+    ) -> torch.Tensor:
+        implementation = self.decode_implementation
+        if implementation is None:
+            raise ValueError("decode Top-K is not configured")
         if next_n <= 0:
             raise ValueError(f"next_n must be positive, got {next_n}")
         if scores.shape[0] % next_n != 0:
@@ -295,19 +348,19 @@ class DecodeTopK(nn.Module):
         if (radix_indices is None) != (radix_values is None):
             raise ValueError("radix_indices and radix_values must be provided together")
 
-        if self.policy == DecodeTopKPolicy.TORCH:
-            return self._forward_torch(scores, scan_lengths, output_indices, next_n)
+        if implementation == TopKImplementation.TORCH:
+            return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
 
-        use_trtllm = self.policy in (
-            DecodeTopKPolicy.TRTLLM,
-            DecodeTopKPolicy.TRTLLM_HEURISTIC,
+        use_trtllm = implementation in (
+            TopKImplementation.TRTLLM,
+            TopKImplementation.TRTLLM_HEURISTIC,
         ) or (
-            self.policy == DecodeTopKPolicy.CUTE_DSL_PREFERRED
+            implementation == TopKImplementation.CUTE_DSL_PREFERRED
             and self.compress_ratio > 1
             and next_n > 1
         )
         if use_trtllm:
-            if self.policy == DecodeTopKPolicy.TRTLLM_HEURISTIC:
+            if implementation == TopKImplementation.TRTLLM_HEURISTIC:
                 if prior_indices is None or heuristic_values is None:
                     raise ValueError("TRTLLM_HEURISTIC requires prior_indices and heuristic_values")
             torch.ops.trtllm.indexer_topk_decode(
@@ -324,7 +377,7 @@ class DecodeTopK(nn.Module):
             )
             return output_indices
 
-        if self.policy == DecodeTopKPolicy.CUTE_DSL_PREFERRED:
+        if implementation == TopKImplementation.CUTE_DSL_PREFERRED:
             torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                 scores,
                 scan_lengths,
@@ -351,7 +404,7 @@ class DecodeTopK(nn.Module):
         )
         return output_indices
 
-    def _forward_torch(
+    def _forward_decode_torch(
         self,
         scores: torch.Tensor,
         scan_lengths: torch.Tensor,

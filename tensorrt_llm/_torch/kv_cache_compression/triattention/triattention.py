@@ -36,7 +36,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.logger import logger
 
 from ...distributed import allgather
-from ...modules.top_k import DecodeTopK, DecodeTopKPolicy
+from ...modules.top_k import TopK, TopKImplementation
 from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ...pyexecutor.llm_request import LlmRequestState
 from ...pyexecutor.resource_manager import KVCacheCompressionManager
@@ -635,9 +635,10 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         # The trailing 1 is next_n: decode scores one query token per request.
         self._selection_top_k(
             self._selection_scores_rows[:rows],
-            self._selection_row_lengths[:rows],
-            self._selection_row_lengths[:rows],
             self._provisional_rows[:rows],
+            is_prefill=False,
+            sequence_lengths=self._selection_row_lengths[:rows],
+            scan_lengths=self._selection_row_lengths[:rows],
             next_n=1,
         )
         settle_ties(
@@ -800,9 +801,9 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
 
     def _allocate_selection_buffers(self, device: torch.device, *, tp_size: int) -> None:
         """Allocate fixed manager-lifetime TopK inputs and outputs."""
-        self._selection_top_k = DecodeTopK(
+        self._selection_top_k = TopK(
             self.budget,
-            DecodeTopKPolicy.CUTE_DSL_PREFERRED,
+            decode_implementation=TopKImplementation.CUTE_DSL_PREFERRED,
         )
         request_capacity = self._request_capacity
         selection_width = self._selection_width_capacity

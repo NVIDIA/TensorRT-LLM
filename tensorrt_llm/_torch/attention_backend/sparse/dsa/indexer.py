@@ -25,12 +25,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
     maybe_execute_in_parallel,
 )
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
-from tensorrt_llm._torch.modules.top_k import (
-    DecodeTopK,
-    DecodeTopKPolicy,
-    PrefillTopK,
-    PrefillTopKImplementation,
-)
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.deep_gemm import (
@@ -642,30 +637,27 @@ class Indexer(nn.Module):
         )
         self.mtp_index_share = sparse_params.mtp_index_share
 
-        self.prefill_top_k = PrefillTopK(
-            self.index_topk,
-            PrefillTopKImplementation.TRTLLM,
-        )
         if self.use_cute_dsl_topk:
-            decode_top_k_policy = (
-                DecodeTopKPolicy.CUTE_DSL_GVR
+            decode_top_k_implementation = (
+                TopKImplementation.CUTE_DSL_GVR
                 if self._enable_heuristic_topk
-                else DecodeTopKPolicy.CUTE_DSL_PREFERRED
+                else TopKImplementation.CUTE_DSL_PREFERRED
             )
         elif self._enable_heuristic_topk:
-            decode_top_k_policy = DecodeTopKPolicy.TRTLLM_HEURISTIC
+            decode_top_k_implementation = TopKImplementation.TRTLLM_HEURISTIC
         else:
-            decode_top_k_policy = DecodeTopKPolicy.TRTLLM
-        self.decode_top_k = DecodeTopK(
+            decode_top_k_implementation = TopKImplementation.TRTLLM
+        self.top_k = TopK(
             self.index_topk,
-            decode_top_k_policy,
+            prefill_implementation=TopKImplementation.TRTLLM,
+            decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
         )
 
-        if decode_top_k_policy == DecodeTopKPolicy.TRTLLM_HEURISTIC and layer_idx == 0:
+        if decode_top_k_implementation == TopKImplementation.TRTLLM_HEURISTIC and layer_idx == 0:
             # Populate static caches inside the C++ dispatcher before CUDA
-            # Graph capture. DecodeTopK globally de-duplicates this warmup.
-            self.decode_top_k.prepare(
+            # Graph capture. TopK globally de-duplicates this warmup.
+            self.top_k.prepare(
                 device=torch.device("cuda", torch.cuda.current_device()),
                 max_num_columns=4096,
                 next_n=1,
@@ -1483,11 +1475,12 @@ class Indexer(nn.Module):
                             tile_q_scale,
                             clean_logits=False,
                         )
-                        self.prefill_top_k(
+                        self.top_k(
                             logits,
-                            chunk.cu_seqlen_ks[c0:c1],
-                            chunk.cu_seqlen_ke[c0:c1],
                             topk_indices_buffer[g0:g1, :],
+                            is_prefill=True,
+                            row_starts=chunk.cu_seqlen_ks[c0:c1],
+                            row_ends=chunk.cu_seqlen_ke[c0:c1],
                         )
 
                     if apply_q_split:
@@ -1521,11 +1514,12 @@ class Indexer(nn.Module):
                     ctx_q_scale,
                     clean_logits=False,
                 )
-                self.prefill_top_k(
+                self.top_k(
                     logits,
-                    cu_seqlen_ks,
-                    cu_seqlen_ke,
                     topk_indices_buffer[:num_ctx_tokens, :],
+                    is_prefill=True,
+                    row_starts=cu_seqlen_ks,
+                    row_ends=cu_seqlen_ke,
                 )
         elif has_prefill and metadata.skip_indexer_for_ctx_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
@@ -1748,11 +1742,12 @@ class Indexer(nn.Module):
                 if not metadata.use_cute_dsl_topk:
                     heuristic_values = metadata.heuristic_scratch_values[:num_gen_tokens]
 
-            self.decode_top_k(
+            self.top_k(
                 logits_decode,
-                gen_kv_lens_cuda,
-                scan_lengths,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
+                is_prefill=False,
+                sequence_lengths=gen_kv_lens_cuda,
+                scan_lengths=scan_lengths,
                 next_n=next_n,
                 prior_indices=prior_indices,
                 heuristic_values=heuristic_values,
