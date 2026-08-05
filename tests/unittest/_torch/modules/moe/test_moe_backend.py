@@ -52,6 +52,7 @@ from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
@@ -79,6 +80,20 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
+    valid_tactics = [
+        [8, 0],
+        [32, 4],
+        [16, 0],
+        [32, 0],
+    ]
+
+    assert _select_explicit_fallback_tactic(valid_tactics) == [32, 0]
+
+    with pytest.raises(RuntimeError, match="no valid fallback tactic"):
+        _select_explicit_fallback_tactic([])
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
