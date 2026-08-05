@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
@@ -36,6 +50,8 @@ from pydantic import (BaseModel, ConfigDict, Field, PositiveInt,
                       field_validator, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
+from tensorrt_llm.disaggregated_params import (
+    TransceiverLifecycleAdvertisement, _validate_lifecycle_identity_fields)
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
@@ -200,6 +216,19 @@ class DisaggregatedParams(OpenAIBaseModel):
     encoded_opaque_state: Optional[str] = None
     draft_tokens: Optional[List[int]] = None
     disagg_request_id: Optional[int] = None
+    logical_request_id: Optional[int] = Field(default=None, frozen=True)
+    prefill_artifact_id: Optional[str] = Field(default=None, frozen=True)
+    artifact_version: Optional[int] = Field(default=None, frozen=True)
+    handoff_attempt_uuid: Optional[str] = Field(default=None, frozen=True)
+    consumer_grant_id: Optional[str] = Field(default=None, frozen=True)
+    transfer_session_id: Optional[str] = Field(default=None, frozen=True)
+    generation_endpoint_name: Optional[str] = Field(default=None, frozen=True)
+    generation_endpoint_rank: Optional[int] = Field(default=None, frozen=True)
+    generation_endpoint_incarnation: Optional[str] = Field(default=None,
+                                                           frozen=True)
+    context_control_endpoint: Optional[str] = Field(default=None, frozen=True)
+    context_transceiver_lifecycle: Optional[
+        TransceiverLifecycleAdvertisement] = Field(default=None, frozen=True)
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
@@ -212,6 +241,35 @@ class DisaggregatedParams(OpenAIBaseModel):
     # Orchestrator -> context-worker instruction: return prompt_token_ids as a
     # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
     return_prompt_token_ids_b64: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_lifecycle_identity(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        lifecycle_advertisement = values.get("context_transceiver_lifecycle")
+        if lifecycle_advertisement is not None:
+            lifecycle_advertisement = (TransceiverLifecycleAdvertisement.
+                                       from_value(lifecycle_advertisement))
+            values = {
+                **values,
+                "context_transceiver_lifecycle": lifecycle_advertisement,
+            }
+        _validate_lifecycle_identity_fields(
+            logical_request_id=values.get("logical_request_id"),
+            prefill_artifact_id=values.get("prefill_artifact_id"),
+            artifact_version=values.get("artifact_version"),
+            handoff_attempt_uuid=values.get("handoff_attempt_uuid"),
+            consumer_grant_id=values.get("consumer_grant_id"),
+            transfer_session_id=values.get("transfer_session_id"),
+            generation_endpoint_name=values.get("generation_endpoint_name"),
+            generation_endpoint_rank=values.get("generation_endpoint_rank"),
+            generation_endpoint_incarnation=values.get(
+                "generation_endpoint_incarnation"),
+            context_control_endpoint=values.get("context_control_endpoint"),
+            context_transceiver_lifecycle=lifecycle_advertisement,
+        )
+        return values
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -1513,6 +1571,19 @@ def to_disaggregated_params(
             tllm_disagg_params.opaque_state),
         draft_tokens=tllm_disagg_params.draft_tokens,
         disagg_request_id=tllm_disagg_params.disagg_request_id,
+        logical_request_id=tllm_disagg_params.logical_request_id,
+        prefill_artifact_id=tllm_disagg_params.prefill_artifact_id,
+        artifact_version=tllm_disagg_params.artifact_version,
+        handoff_attempt_uuid=tllm_disagg_params.handoff_attempt_uuid,
+        consumer_grant_id=tllm_disagg_params.consumer_grant_id,
+        transfer_session_id=tllm_disagg_params.transfer_session_id,
+        generation_endpoint_name=tllm_disagg_params.generation_endpoint_name,
+        generation_endpoint_rank=tllm_disagg_params.generation_endpoint_rank,
+        generation_endpoint_incarnation=tllm_disagg_params.
+        generation_endpoint_incarnation,
+        context_control_endpoint=tllm_disagg_params.context_control_endpoint,
+        context_transceiver_lifecycle=tllm_disagg_params.
+        context_transceiver_lifecycle,
         ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
@@ -1538,6 +1609,19 @@ def to_llm_disaggregated_params(
             disaggregated_params.encoded_opaque_state),
         draft_tokens=disaggregated_params.draft_tokens,
         disagg_request_id=disaggregated_params.disagg_request_id,
+        logical_request_id=disaggregated_params.logical_request_id,
+        prefill_artifact_id=disaggregated_params.prefill_artifact_id,
+        artifact_version=disaggregated_params.artifact_version,
+        handoff_attempt_uuid=disaggregated_params.handoff_attempt_uuid,
+        consumer_grant_id=disaggregated_params.consumer_grant_id,
+        transfer_session_id=disaggregated_params.transfer_session_id,
+        generation_endpoint_name=disaggregated_params.generation_endpoint_name,
+        generation_endpoint_rank=disaggregated_params.generation_endpoint_rank,
+        generation_endpoint_incarnation=disaggregated_params.
+        generation_endpoint_incarnation,
+        context_control_endpoint=disaggregated_params.context_control_endpoint,
+        context_transceiver_lifecycle=disaggregated_params.
+        context_transceiver_lifecycle,
         ctx_dp_rank=disaggregated_params.ctx_dp_rank,
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,

@@ -110,6 +110,37 @@ class MockPyExecutor:
         return self.new_active_requests_queue_latency_ms
 
 
+def test_generation_safe_transfer_timeout_does_not_start_at_queue_admission(
+    monkeypatch,
+):
+    monotonic = Mock(return_value=123.0)
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    request = types.SimpleNamespace(
+        py_disagg_transfer_protocol_identity=object(),
+        py_kv_transfer_start_time=None,
+    )
+
+    PyExecutor._start_legacy_kv_transfer_timeout(request)
+
+    assert request.py_kv_transfer_start_time is None
+    monotonic.assert_not_called()
+
+
+def test_qualified_legacy_transfer_timeout_preserves_admission_time(
+    monkeypatch,
+):
+    monotonic = Mock(return_value=123.0)
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    request = types.SimpleNamespace(
+        py_disagg_transfer_protocol_identity=None,
+        py_kv_transfer_start_time=None,
+    )
+
+    PyExecutor._start_legacy_kv_transfer_timeout(request)
+
+    assert request.py_kv_transfer_start_time == 123.0
+
+
 @pytest.fixture
 def mock_dist():
     """Create a mock Distributed instance for testing."""
@@ -364,13 +395,12 @@ class TestDisaggTerminationGuard:
         _end_transfer_and_maybe_terminate must then terminate it exactly once
         when the transfer completes (force_terminate_ctx_for_partial_reuse=False)."""
         req = Mock()
-        executor = types.SimpleNamespace(
-            kv_cache_transceiver=Mock(),
-            active_requests=[],  # already removed by _handle_responses
-            async_transfer_manager=Mock(),
-            force_terminate_ctx_for_partial_reuse=False,
-            _terminate_request=Mock(),
-        )
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor.active_requests = []  # already removed by _handle_responses
+        executor.async_transfer_manager = Mock()
+        executor.force_terminate_ctx_for_partial_reuse = False
+        executor._terminate_request = Mock()
         executor.async_transfer_manager.end_transfer.return_value = True
 
         PyExecutor._end_transfer_and_maybe_terminate(executor, req)
@@ -383,13 +413,12 @@ class TestDisaggTerminationGuard:
         skip re-terminating it (force_terminate_ctx_for_partial_reuse=True) to
         avoid a double free_resources (nvbug/5961736)."""
         req = Mock()
-        executor = types.SimpleNamespace(
-            kv_cache_transceiver=Mock(),
-            active_requests=[],  # already removed + terminated by early path
-            async_transfer_manager=Mock(),
-            force_terminate_ctx_for_partial_reuse=True,
-            _terminate_request=Mock(),
-        )
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor.active_requests = []  # already removed + terminated by early path
+        executor.async_transfer_manager = Mock()
+        executor.force_terminate_ctx_for_partial_reuse = True
+        executor._terminate_request = Mock()
         executor.async_transfer_manager.end_transfer.return_value = True
 
         PyExecutor._end_transfer_and_maybe_terminate(executor, req)
@@ -636,6 +665,20 @@ class TestDisaggTransferIdleProgress:
 
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
+    def test_gen_transfer_status_polls_v1_sync_retirement(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor.kv_cache_transceiver.capabilities.return_value = types.SimpleNamespace(
+            protocol_version=1
+        )
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+
+        PyExecutor._check_disagg_gen_transfer_status(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+
     def test_polls_generation_transfer_when_admission_blocked(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
@@ -754,6 +797,50 @@ class TestDisaggTransferIdleProgress:
         executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
         assert executor._sync_disagg_transfer_made_progress
 
+    def test_v1_sync_receive_commits_only_after_full_local_batch_drain(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor.kv_cache_transceiver.capabilities.return_value = types.SimpleNamespace(
+            protocol_version=1
+        )
+        executor._check_cache_transfer_errors = Mock()
+        executor._sync_disagg_transfer_made_progress = False
+        requests = [
+            Mock(state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS),
+            Mock(state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS),
+        ]
+        call_order = []
+
+        def receive(request):
+            call_order.append(("receive", request))
+
+        def finalize(at_least_request_num):
+            assert call_order == [
+                ("receive", requests[0]),
+                ("receive", requests[1]),
+            ]
+            call_order.append(("finalize", at_least_request_num))
+            for request in requests:
+                request.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+
+        executor.kv_cache_transceiver.request_and_receive_sync.side_effect = receive
+        executor._check_disagg_gen_cache_transfer_status = Mock(side_effect=finalize)
+
+        PyExecutor._recv_disagg_gen_cache(executor, requests)
+
+        assert call_order == [
+            ("receive", requests[0]),
+            ("receive", requests[1]),
+            ("finalize", None),
+        ]
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(None)
+        executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
+        assert executor._sync_disagg_transfer_made_progress
+
     def test_sync_receive_drains_batch_before_rank_aligned_error_vote(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
@@ -812,6 +899,41 @@ class TestDisaggTransferIdleProgress:
             requests=[error_request],
             charge_budget=False,
         )
+
+    def test_sync_receive_exception_still_drains_batch_before_status_vote(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor.kv_cache_transceiver.capabilities.return_value = Mock(protocol_version=1)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_cache_transfer_errors = Mock()
+        executor._sync_disagg_transfer_made_progress = False
+        failed = Mock(
+            py_request_id=1,
+            state=LlmRequestState.DISAGG_GENERATION_INIT,
+        )
+        following = Mock(
+            py_request_id=2,
+            state=LlmRequestState.DISAGG_GENERATION_INIT,
+        )
+
+        def receive(req):
+            if req is failed:
+                raise RuntimeError("backend receive failed")
+            req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+
+        executor.kv_cache_transceiver.request_and_receive_sync.side_effect = receive
+
+        PyExecutor._recv_disagg_gen_cache(executor, [failed, following])
+
+        assert [
+            call.args[0]
+            for call in executor.kv_cache_transceiver.request_and_receive_sync.call_args_list
+        ] == [failed, following]
+        assert failed.state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert following.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(None)
+        executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
 
     def test_peer_cp_rank_enters_context_progress_poll(self):
         executor = object.__new__(PyExecutor)
@@ -946,6 +1068,45 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
         ("prepare", executor.active_requests),
         ("schedule", executor.active_requests, executor.inflight_req_ids),
     ]
+
+
+def test_pp_loop_flushes_handoff_after_transfer_progress(monkeypatch):
+    class StopAfterHandoffFlush(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    executor.dist = Mock(pp_rank=0, rank=0)
+    executor.device_id = 0
+    profiler = MagicMock()
+    profiler.__enter__.return_value = Mock()
+    executor._profiler = Mock(return_value=profiler)
+    executor.hang_detector = MagicMock()
+    executor.enable_iter_perf_stats = False
+    executor._handle_disagg_cache_errors_synced = Mock()
+    executor._fetch_and_activate_new_requests = Mock(return_value=[])
+    executor.is_shutdown = False
+    executor._handle_control_request = Mock()
+    executor.kv_cache_transceiver = Mock()
+    executor._check_disagg_ctx_schedulable_status = Mock()
+    executor._check_disagg_gen_transfer_status = Mock()
+    executor._pad_attention_dp_dummy_request = Mock()
+    scheduled_batch = Mock()
+    executor._pp_schedule_and_propagate = Mock(return_value=(scheduled_batch, [], 0, False))
+    executor._prepare_disagg_gen_init = Mock()
+    executor.active_requests = []
+    calls = Mock()
+    executor._check_disagg_transfer_progress_when_idle = calls.check_progress
+    executor._flush_pending_handoff_responses = Mock(side_effect=StopAfterHandoffFlush)
+
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT", Mock())
+
+    with pytest.raises(StopAfterHandoffFlush):
+        PyExecutor._executor_loop_pp(executor)
+
+    calls.check_progress.assert_called_once_with(0, [], False, [])
+    executor._flush_pending_handoff_responses.assert_called_once_with(rank_synchronous=True)
 
 
 def test_schedule_prepares_snapshot_points_before_scheduling():

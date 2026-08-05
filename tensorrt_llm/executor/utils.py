@@ -300,6 +300,14 @@ def is_llm_response(instance):
     return hasattr(instance, "has_error")
 
 
+def is_control_only_llm_response(instance) -> bool:
+    """Return whether an LLM response carries lifecycle control but no tokens."""
+    return (is_llm_response(instance)
+            and getattr(instance, "disagg_handoff_event", None) is not None
+            and getattr(instance, "result", None) is None
+            and not instance.has_error())
+
+
 def print_alive_threads():
     assert enable_llm_debug(
     ), "print_alive_threads must be called with enable_llm_debug() enabled"

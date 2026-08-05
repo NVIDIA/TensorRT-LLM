@@ -38,10 +38,13 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <atomic>
+#include <exception>
 #include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 
 namespace tc = tensorrt_llm::common;
@@ -56,6 +59,14 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 
 namespace
 {
+
+std::uint64_t nextAllocatorDomainId()
+{
+    static std::atomic<std::uint64_t> nextDomainId{1};
+    auto const domainId = nextDomainId.fetch_add(1, std::memory_order_relaxed);
+    TLLM_CHECK_WITH_INFO(domainId != 0, "KV-cache allocator domain ID exhausted");
+    return domainId;
+}
 
 //! \brief Get all blocks in a sequence by traversing backwards from the last block.
 //! \param lastBlock is a BlockPtr to the last block in the sequence to start traversal from
@@ -3010,6 +3021,126 @@ void BlockManager::pinBlocks(GenerationRequest& sequence)
     }
 }
 
+std::pair<std::vector<AllocationLeaseBlockDescriptor>, std::vector<BlockManager::AllocationLeaseBlockPin>>
+BlockManager::snapshotAndPinAllocation(
+    LlmRequest::RequestIdType requestId, SizeType32 beamWidth, AllocationLeaseSliceSpec const& sliceSpec)
+{
+    TLLM_CHECK_WITH_INFO(beamWidth > 0, "Allocation lease requires a positive beam width");
+    TLLM_CHECK_WITH_INFO(sliceSpec.firstBlockIndex >= 0, "Allocation lease first block index must be non-negative");
+    TLLM_CHECK_WITH_INFO(!sliceSpec.blockCount.has_value() || *sliceSpec.blockCount >= 0,
+        "Allocation lease block count must be non-negative");
+    TLLM_CHECK_WITH_INFO(!sliceSpec.windowSize.has_value()
+            || mWindowBlockManagers.find(*sliceSpec.windowSize) != mWindowBlockManagers.end(),
+        "Allocation lease window size %d is not managed by this allocator", sliceSpec.windowSize.value_or(0));
+
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree.getMutex());
+    std::vector<AllocationLeaseBlockDescriptor> descriptors;
+    std::vector<AllocationLeaseBlockPin> pins;
+    std::unordered_set<KVCacheBlock*> pinnedBlocks;
+
+    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    {
+        if (sliceSpec.windowSize.has_value() && *sliceSpec.windowSize != windowSize)
+        {
+            continue;
+        }
+
+        auto const sequenceIt = manager.mAllocatedBlocksPerSeq.find(requestId);
+        TLLM_CHECK_WITH_INFO(sequenceIt != manager.mAllocatedBlocksPerSeq.end(),
+            "Allocation lease request %lu is missing from window %d", requestId, windowSize);
+        auto const& allocatedBlocks = sequenceIt->second;
+        TLLM_CHECK_WITH_INFO(allocatedBlocks.size() % static_cast<std::size_t>(beamWidth) == 0,
+            "Allocation lease request %lu has an invalid flattened block count for beam width %d", requestId,
+            beamWidth);
+
+        auto const logicalBlockCount = static_cast<SizeType32>(allocatedBlocks.size() / beamWidth);
+        TLLM_CHECK_WITH_INFO(sliceSpec.firstBlockIndex <= logicalBlockCount,
+            "Allocation lease first block index %d exceeds request %lu block count %d for window %d",
+            sliceSpec.firstBlockIndex, requestId, logicalBlockCount, windowSize);
+        auto const selectedBlockCount = sliceSpec.blockCount.value_or(logicalBlockCount - sliceSpec.firstBlockIndex);
+        TLLM_CHECK_WITH_INFO(selectedBlockCount <= logicalBlockCount - sliceSpec.firstBlockIndex,
+            "Allocation lease block range [%d, %d) exceeds request %lu block count %d for window %d",
+            sliceSpec.firstBlockIndex, sliceSpec.firstBlockIndex + selectedBlockCount, requestId, logicalBlockCount,
+            windowSize);
+
+        auto const endBlockIndex = sliceSpec.firstBlockIndex + selectedBlockCount;
+        for (auto blockIndex = sliceSpec.firstBlockIndex; blockIndex < endBlockIndex; ++blockIndex)
+        {
+            for (SizeType32 beamIndex = 0; beamIndex < beamWidth; ++beamIndex)
+            {
+                auto const flattenedIndex = static_cast<std::size_t>(blockIndex * beamWidth + beamIndex);
+                auto const& block = allocatedBlocks.at(flattenedIndex);
+                if (block->isPlaceholder())
+                {
+                    continue;
+                }
+
+                TLLM_CHECK_WITH_INFO(block->isPrimary(),
+                    "Allocation lease request %lu block %d in window %d is not resident in the primary pool", requestId,
+                    block->getBlockId(), windowSize);
+                AllocationLeaseBlockDescriptor descriptor{windowSize, blockIndex, beamIndex, block->getBlockId(),
+                    block->getMemoryPoolBlockIndex(), block->isShared()};
+                descriptors.push_back(descriptor);
+                if (pinnedBlocks.insert(block.get()).second)
+                {
+                    pins.push_back(AllocationLeaseBlockPin{descriptor, block});
+                }
+            }
+        }
+    }
+
+    std::size_t numPinned = 0;
+    try
+    {
+        for (auto const& pin : pins)
+        {
+            mWindowBlockManagers.at(pin.descriptor.getWindowSize()).pinBlock(pin.block);
+            ++numPinned;
+        }
+    }
+    catch (...)
+    {
+        try
+        {
+            while (numPinned > 0)
+            {
+                --numPinned;
+                auto const& pin = pins[numPinned];
+                mWindowBlockManagers.at(pin.descriptor.getWindowSize()).unpinBlock(pin.block);
+            }
+        }
+        catch (...)
+        {
+            // The snapshot never becomes visible when pinning fails. If its
+            // rollback is incomplete, exact ownership is nevertheless
+            // ambiguous and continuing could permit allocator reuse.
+            std::terminate();
+        }
+        throw;
+    }
+
+    return {std::move(descriptors), std::move(pins)};
+}
+
+void BlockManager::unpinAllocation(std::vector<AllocationLeaseBlockPin> const& pins) noexcept
+{
+    try
+    {
+        std::lock_guard<std::recursive_mutex> lock(mLookupTree.getMutex());
+        for (auto pinIt = pins.rbegin(); pinIt != pins.rend(); ++pinIt)
+        {
+            mWindowBlockManagers.at(pinIt->descriptor.getWindowSize()).unpinBlock(pinIt->block);
+        }
+    }
+    catch (...)
+    {
+        // A partial unpin cannot be recovered without knowing which exact
+        // blocks are still protected. Continuing would permit allocator reuse
+        // under ambiguous ownership, so fail the endpoint closed.
+        std::terminate();
+    }
+}
+
 void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
     if (mWindowBlockManagers.empty())
@@ -3054,9 +3185,19 @@ void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto const requestId = sequence.getRequestId();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    // Shared beams repeat the same BlockPtr in mAllocatedBlocksPerSeq. One
+    // reference is sufficient to pin that physical block. The matching unpin
+    // operation must likewise provide that physical block ID only once.
+    std::unordered_set<KVCacheBlock*> pinnedBlocks;
+    pinnedBlocks.reserve(allocatedBlocks.size());
     for (auto& block : allocatedBlocks)
     {
-        pinBlock(block);
+        // Placeholders have no addressable pool slot or non-negative block ID,
+        // so they cannot produce a token accepted by unpinBlocksById.
+        if (!block->isPlaceholder() && pinnedBlocks.insert(block.get()).second)
+        {
+            block->incRefCount();
+        }
     }
 }
 
@@ -3068,14 +3209,34 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
         return;
     }
 
+    // Validate the complete operation before changing any refcount. Raw block
+    // IDs do not identify which refcount contribution is a pin token, so a
+    // duplicate could consume a live sequence or another owner's reference.
+    std::unordered_set<KVCacheBlock::IdType> seenBlockIds;
+    std::vector<BlockPtr> blocksToUnpin;
+    seenBlockIds.reserve(blockIds.size());
+    blocksToUnpin.reserve(blockIds.size());
     for (auto const& blockId : blockIds)
     {
         TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
             "Block id %d is out of range", blockId);
+        auto const inserted = seenBlockIds.insert(blockId).second;
+        TLLM_CHECK_WITH_INFO(inserted, "Duplicate block id %d in one unpin operation", blockId);
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
-            unpinBlock(block);
+            TLLM_CHECK_WITH_INFO(
+                block->hasRefs(), "Can't unpin block (id=%d) that is not allocated", static_cast<int>(blockId));
+            blocksToUnpin.push_back(block);
+        }
+    }
+
+    for (auto const& block : blocksToUnpin)
+    {
+        block->decRefCount();
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(block);
         }
     }
 }
@@ -3362,6 +3523,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
           poolConfigurations)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
+    , mAllocatorDomainId{nextAllocatorDomainId()}
 {
     // When num_layers < len(maxAttentionWindowVec), not all window sizes in the
     // repeating pattern are used. Update mMaxAttentionWindow to the actual
@@ -3377,6 +3539,9 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     TLLM_CHECK(mSinkBlockTokenLength % tokensPerBlock == 0);
     TLLM_LOG_DEBUG("KV cache block reuse is %s", mEnableBlockReuse ? "enabled" : "disabled");
     mSequences.reserve(maxNumSequences);
+    mSequenceAllocationGenerations.reserve(maxNumSequences);
+    mAllocationLeases.reserve(maxNumSequences);
+    mSettledAllocationLeaseTombstones.reserve(kMaxSettledAllocationLeaseTombstones);
 }
 
 KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
@@ -3398,8 +3563,37 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
 {
 }
 
+KVCacheManager::~KVCacheManager() noexcept
+{
+    std::lock_guard<std::mutex> lock(mAllocationLeasesMtx);
+    if (mAllocationLeases.empty())
+    {
+        return;
+    }
+
+    std::size_t outstandingBlockPinCount{0};
+    for (auto const& [_, lease] : mAllocationLeases)
+    {
+        outstandingBlockPinCount += lease.pins.size();
+    }
+    TLLM_LOG_ERROR(
+        "Refusing to destroy KVCacheManager with %zu allocator-owned leases retaining %zu exact block pins. "
+        "All protected accessors must be quiesced and their leases explicitly settled before manager destruction.",
+        mAllocationLeases.size(), outstandingBlockPinCount);
+    std::terminate();
+}
+
 void KVCacheManager::allocatePools(bool useUvm)
 {
+    // Re-allocation replaces the backing tensors and therefore invalidates
+    // every exported pool address. Hold the acquisition mutex for the whole
+    // operation so a lease cannot race the known-zero check.
+    std::lock_guard<std::mutex> leaseLock(mAllocationLeasesMtx);
+    TLLM_CHECK_WITH_INFO(!mAllocationLeaseShutdownStarted,
+        "Cannot allocate KV-cache pools after terminal allocator shutdown has started");
+    TLLM_CHECK_WITH_INFO(mAllocationLeases.empty(),
+        "Cannot allocate KV-cache pools while %zu allocator-owned leases retain exact block pins",
+        mAllocationLeases.size());
     mBlockManager.allocatePools(useUvm);
     auto const numPools = mBlockManager.getNumPools();
 
@@ -3484,6 +3678,17 @@ void KVCacheManager::allocatePools(bool useUvm)
 
 void KVCacheManager::releasePools()
 {
+    {
+        std::lock_guard<std::mutex> lock(mAllocationLeasesMtx);
+        mAllocationLeaseShutdownStarted = true;
+        TLLM_CHECK_WITH_INFO(mAllocationLeases.empty(),
+            "Cannot release KV-cache pools while %zu allocator-owned leases retain exact block pins",
+            mAllocationLeases.size());
+    }
+    // Pool teardown may synchronously drain transfer work. Do not hold the
+    // lease-registry mutex while waiting: a completion callback must be able
+    // to settle a pre-existing lease. The shutdown bit above closes the
+    // acquisition race before this drain begins.
     mBlockManager.releasePools();
 }
 
@@ -3864,26 +4069,66 @@ void KVCacheManager::addSequenceBatch(
 
     // --- Setup: create sequences, hold them (window-independent) ---
     std::vector<GenerationRequest*> sequences(n);
-
-    for (size_t i = 0; i < n; ++i)
+    size_t numInitialized = 0;
+    try
     {
-        auto const requestId = std::get<0>(requestInfos[i]);
-        auto const inputLength = std::get<1>(requestInfos[i]);
-        auto const beamWidth = std::get<2>(requestInfos[i]);
-        auto& llmRequest = llmRequests[i].get();
-
-        auto kvCacheRetentionConfig
-            = llmRequest.getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig());
-
-        auto const [seqIt, emplaceDone] = [&]
+        for (size_t i = 0; i < n; ++i)
         {
-            auto lck = std::scoped_lock(mSequencesMtx);
-            return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
-                mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
-        }();
-        TLLM_CHECK(emplaceDone);
+            auto const requestId = std::get<0>(requestInfos[i]);
+            auto const inputLength = std::get<1>(requestInfos[i]);
+            auto const beamWidth = std::get<2>(requestInfos[i]);
+            auto& llmRequest = llmRequests[i].get();
 
-        sequences[i] = &seqIt->second;
+            auto kvCacheRetentionConfig
+                = llmRequest.getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig());
+
+            auto const [seqIt, emplaceDone] = [&]
+            {
+                auto lck = std::scoped_lock(mSequencesMtx);
+                auto sequenceResult = mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
+                    mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
+                if (!sequenceResult.second)
+                {
+                    return sequenceResult;
+                }
+
+                try
+                {
+                    auto const allocationGeneration = mNextAllocationGeneration;
+                    TLLM_CHECK_WITH_INFO(allocationGeneration != 0, "KV-cache allocation generation exhausted");
+                    ++mNextAllocationGeneration;
+                    auto const [generationIt, generationInserted] = mSequenceAllocationGenerations.try_emplace(
+                        requestId, SequenceAllocationGeneration{allocationGeneration, false});
+                    (void) generationIt;
+                    TLLM_CHECK_WITH_INFO(
+                        generationInserted, "KV-cache request %lu already has a live allocation generation", requestId);
+                }
+                catch (...)
+                {
+                    mSequences.erase(sequenceResult.first);
+                    throw;
+                }
+                return sequenceResult;
+            }();
+            TLLM_CHECK(emplaceDone);
+
+            sequences[i] = &seqIt->second;
+            ++numInitialized;
+        }
+    }
+    catch (...)
+    {
+        // No blocks have been allocated during setup. Roll back every
+        // sequence/generation pair inserted by this batch before propagating
+        // an insertion or duplicate-request failure.
+        std::lock_guard<std::mutex> lock(mSequencesMtx);
+        for (size_t i = 0; i < numInitialized; ++i)
+        {
+            auto const requestId = std::get<0>(requestInfos[i]);
+            mSequenceAllocationGenerations.erase(requestId);
+            mSequences.erase(requestId);
+        }
+        throw;
     }
 
     // Track the minimum prepopulated length across all windows per sequence
@@ -3956,6 +4201,28 @@ void KVCacheManager::addSequenceBatch(
         llmRequest.updateReusedBlocksPerRequest(totalReusedDelta[i]);
         llmRequest.updateMissedBlocksPerRequest(totalMissedDelta[i]);
     }
+
+    // Publish allocation identities only after every selected window and
+    // request has finished initialization. Generation records were inserted
+    // transactionally with their sequences, so publication is a
+    // non-allocating visibility flip and cannot strand a live allocation
+    // because a second map insertion failed.
+    {
+        std::lock_guard<std::mutex> lock(mSequencesMtx);
+        for (size_t i = 0; i < n; ++i)
+        {
+            auto const requestId = std::get<0>(requestInfos[i]);
+            auto const generationIt = mSequenceAllocationGenerations.find(requestId);
+            TLLM_CHECK_WITH_INFO(generationIt != mSequenceAllocationGenerations.end(),
+                "KV-cache request %lu lost its allocation-generation record before publication", requestId);
+            TLLM_CHECK_WITH_INFO(!generationIt->second.published,
+                "KV-cache request %lu allocation generation was already published", requestId);
+        }
+        for (size_t i = 0; i < n; ++i)
+        {
+            mSequenceAllocationGenerations.at(std::get<0>(requestInfos[i])).published = true;
+        }
+    }
 }
 
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
@@ -4003,7 +4270,12 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     auto sequenceNode = [this, requestId]
     {
         std::scoped_lock lock(mSequencesMtx);
-        return mSequences.extract(requestId);
+        auto node = mSequences.extract(requestId);
+        if (!node.empty())
+        {
+            mSequenceAllocationGenerations.erase(requestId);
+        }
+        return node;
     }();
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
     if (!sequenceNode.empty())
@@ -4041,6 +4313,122 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
 {
     auto& sequence = getSequence(requestId);
     mBlockManager.pinBlocks(sequence);
+}
+
+std::optional<AllocationIdentity> KVCacheManager::getAllocationIdentity(RequestIdType requestId) const
+{
+    std::lock_guard<std::mutex> lock(mSequencesMtx);
+    if (mSequences.find(requestId) == mSequences.end())
+    {
+        return std::nullopt;
+    }
+    auto const generationIt = mSequenceAllocationGenerations.find(requestId);
+    if (generationIt == mSequenceAllocationGenerations.end() || !generationIt->second.published)
+    {
+        return std::nullopt;
+    }
+    return AllocationIdentity{mAllocatorDomainId, requestId, generationIt->second.generation};
+}
+
+std::optional<AllocationLeaseSnapshot> KVCacheManager::snapshotAndLease(
+    AllocationIdentity const& identity, AllocationLeaseSliceSpec const& sliceSpec)
+{
+    std::lock_guard<std::mutex> sequenceLock(mSequencesMtx);
+    auto const sequenceIt = mSequences.find(identity.requestId);
+    auto const generationIt = mSequenceAllocationGenerations.find(identity.requestId);
+    if (identity.allocatorDomainId != mAllocatorDomainId || sequenceIt == mSequences.end()
+        || generationIt == mSequenceAllocationGenerations.end() || !generationIt->second.published
+        || generationIt->second.generation != identity.allocationGeneration)
+    {
+        return std::nullopt;
+    }
+
+    std::lock_guard<std::mutex> leaseLock(mAllocationLeasesMtx);
+    if (mAllocationLeaseShutdownStarted)
+    {
+        return std::nullopt;
+    }
+
+    auto const leaseId = mNextAllocationLeaseId;
+    TLLM_CHECK_WITH_INFO(leaseId != 0, "KV-cache allocation lease ID exhausted");
+    ++mNextAllocationLeaseId;
+    auto [descriptors, pins]
+        = mBlockManager.snapshotAndPinAllocation(identity.requestId, sequenceIt->second.getBeamWidth(), sliceSpec);
+    AllocationLeaseSnapshot snapshot{leaseId, identity, std::move(descriptors)};
+    AllocationLeaseRecord record{identity, std::move(pins)};
+    try
+    {
+        auto const [leaseIt, inserted] = mAllocationLeases.emplace(leaseId, record);
+        (void) leaseIt;
+        TLLM_CHECK_WITH_INFO(inserted, "KV-cache allocation lease ID %lu is already active", leaseId);
+    }
+    catch (...)
+    {
+        mBlockManager.unpinAllocation(record.pins);
+        throw;
+    }
+    return snapshot;
+}
+
+AllocationLeaseSettlement KVCacheManager::settleAllocationLease(std::uint64_t leaseId,
+    AllocationIdentity const& identity, tensorrt_llm::batch_manager::PhysicalDisposition physicalDisposition)
+{
+    std::lock_guard<std::mutex> lock(mAllocationLeasesMtx);
+    auto leaseIt = mAllocationLeases.find(leaseId);
+    if (leaseIt == mAllocationLeases.end())
+    {
+        auto const tombstoneIt = mSettledAllocationLeaseTombstones.find(leaseId);
+        if (tombstoneIt == mSettledAllocationLeaseTombstones.end())
+        {
+            return AllocationLeaseSettlement::kNOT_FOUND;
+        }
+        return tombstoneIt->second == identity ? AllocationLeaseSettlement::kALREADY_RELEASED
+                                               : AllocationLeaseSettlement::kSTALE_GENERATION;
+    }
+    if (leaseIt->second.identity != identity)
+    {
+        return AllocationLeaseSettlement::kSTALE_GENERATION;
+    }
+    if (!tensorrt_llm::batch_manager::isReusable(physicalDisposition))
+    {
+        return AllocationLeaseSettlement::kNOT_QUIESCED;
+    }
+
+    auto const [tombstoneIt, tombstoneInserted] = mSettledAllocationLeaseTombstones.emplace(leaseId, identity);
+    (void) tombstoneIt;
+    TLLM_CHECK_WITH_INFO(tombstoneInserted, "KV-cache allocation lease ID %lu already has a tombstone", leaseId);
+    try
+    {
+        mSettledAllocationLeaseTombstoneOrder.push_back(leaseId);
+    }
+    catch (...)
+    {
+        mSettledAllocationLeaseTombstones.erase(leaseId);
+        throw;
+    }
+
+    mBlockManager.unpinAllocation(leaseIt->second.pins);
+    mAllocationLeases.erase(leaseIt);
+
+    if (mSettledAllocationLeaseTombstoneOrder.size() > kMaxSettledAllocationLeaseTombstones)
+    {
+        auto const expiredLeaseId = mSettledAllocationLeaseTombstoneOrder.front();
+        mSettledAllocationLeaseTombstoneOrder.pop_front();
+        mSettledAllocationLeaseTombstones.erase(expiredLeaseId);
+    }
+    return AllocationLeaseSettlement::kRELEASED;
+}
+
+AllocationLeaseAccounting KVCacheManager::getAllocationLeaseAccounting() const
+{
+    std::lock_guard<std::mutex> lock(mAllocationLeasesMtx);
+    std::uint64_t outstandingBlockPinCount{0};
+    for (auto const& [_, lease] : mAllocationLeases)
+    {
+        outstandingBlockPinCount += static_cast<std::uint64_t>(lease.pins.size());
+    }
+    return AllocationLeaseAccounting{static_cast<std::uint64_t>(mAllocationLeases.size()), outstandingBlockPinCount,
+        true, mAllocationLeaseShutdownStarted};
 }
 
 void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)

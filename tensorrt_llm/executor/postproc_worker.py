@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import traceback
 from collections import deque
@@ -15,7 +30,8 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
 from .postprocessor_hook import load_post_processor_hook
-from .utils import ErrorResponse, bucket_responses_by_frontend, is_llm_response
+from .utils import (ErrorResponse, bucket_responses_by_frontend,
+                    is_control_only_llm_response, is_llm_response)
 
 if TYPE_CHECKING:
     from ..disaggregated_params import DisaggregatedParams
@@ -225,6 +241,9 @@ class PostprocWorker:
             if isinstance(inp.rsp, ErrorResponse):
                 batch.append(inp.rsp)
                 self._records.pop(client_id, None)
+                return
+            if is_control_only_llm_response(inp.rsp):
+                batch.append(inp.rsp)
                 return
             try:
                 is_final = inp.rsp.result.is_final if is_llm_response(

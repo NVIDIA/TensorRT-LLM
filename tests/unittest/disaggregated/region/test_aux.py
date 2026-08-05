@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -58,6 +73,31 @@ def test_aux_buffer_alloc_and_free_slot():
     slot2 = buf.alloc_slot()
     assert isinstance(slot2, AuxSlot)
     buf.free_slot(slot2.id)
+
+
+def test_aux_buffer_reuse_has_a_new_allocation_generation():
+    buf = AuxBuffer(max_slot_num=1, beam_width=1, max_draft_len=8, device="cpu")
+    first = buf.alloc_slot(request_id=7)
+    buf.free_slot(first.id, first.identity)
+
+    second = buf.alloc_slot(request_id=7)
+
+    assert second.id == first.id
+    assert second.identity.allocator_domain_id == first.identity.allocator_domain_id
+    assert second.identity.allocation_generation > first.identity.allocation_generation
+
+
+def test_aux_buffer_stale_release_cannot_free_a_reused_slot():
+    buf = AuxBuffer(max_slot_num=1, beam_width=1, max_draft_len=8, device="cpu")
+    first = buf.alloc_slot(request_id=7)
+    buf.free_slot(first.id, first.identity)
+    second = buf.alloc_slot(request_id=8)
+
+    with pytest.raises(ValueError, match="stale auxiliary slot generation"):
+        buf.free_slot(second.id, first.identity)
+
+    assert buf.allocation_identity(second.id) == second.identity
+    buf.free_slot(second.id, second.identity)
 
 
 def test_aux_buffer_alloc_full_raises():

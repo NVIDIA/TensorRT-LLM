@@ -12,14 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+from uuid import UUID
+
 import pytest
+from fastapi import HTTPException
 
 from tensorrt_llm.serve.disagg_auth import (
     INTERNAL_DISAGG_AUTH_HEADER,
     build_internal_disagg_auth_headers,
+    build_internal_disagg_lifecycle_auth_headers,
     get_internal_disagg_auth_fields,
     request_requires_internal_disagg_auth,
+    validate_internal_disagg_lifecycle_request,
     validate_internal_disagg_request,
+)
+from tensorrt_llm.serve.disagg_lifecycle_control import (
+    CONTEXT_ARTIFACT_ABORT_PATH,
+    GENERATION_GRANT_ABORT_PATH,
+    ContextArtifactAbortRequest,
 )
 from tensorrt_llm.serve.openai_protocol import CompletionRequest, DisaggregatedParams
 from tensorrt_llm.serve.openai_server import OpenAIServer
@@ -59,11 +71,71 @@ def test_unprotected_request_does_not_require_internal_auth():
     validate_internal_disagg_request(None, request, {})
 
 
+def test_contextual_fields_alone_do_not_require_internal_auth():
+    request = _make_request()
+    request.disaggregated_params = request.disaggregated_params.model_copy(
+        update={"ctx_dp_rank": 0, "schedule_style": 0}
+    )
+
+    assert not request_requires_internal_disagg_auth(request)
+    assert build_internal_disagg_auth_headers(None, request) == {}
+
+
 def test_protected_fields_come_from_protocol_metadata():
     assert set(get_internal_disagg_auth_fields()) == {
-        "ctx_info_endpoint",
+        "artifact_version",
+        "consumer_grant_id",
+        "context_control_endpoint",
+        "context_transceiver_lifecycle",
         "encoded_opaque_state",
+        "ctx_info_endpoint",
+        "generation_endpoint_incarnation",
+        "generation_endpoint_name",
+        "generation_endpoint_rank",
+        "handoff_attempt_uuid",
+        "logical_request_id",
+        "prefill_artifact_id",
+        "transfer_session_id",
     }
+
+
+def test_lifecycle_identity_fields_require_internal_auth():
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only",
+            logical_request_id=17,
+            prefill_artifact_id=str(UUID(int=2)),
+            artifact_version=0,
+            handoff_attempt_uuid=str(UUID(int=3)),
+            consumer_grant_id=str(UUID(int=5)),
+            transfer_session_id=str(UUID(int=6)),
+            ctx_dp_rank=0,
+        ),
+    )
+
+    assert request_requires_internal_disagg_auth(request)
+    headers = build_internal_disagg_auth_headers("secret", request)
+    tampered = request.model_copy(
+        update={
+            "disaggregated_params": request.disaggregated_params.model_copy(
+                update={"artifact_version": 1}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_request("secret", tampered, headers)
+
+    tampered_context = request.model_copy(
+        update={
+            "disaggregated_params": request.disaggregated_params.model_copy(
+                update={"ctx_dp_rank": 1}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_request("secret", tampered_context, headers)
 
 
 @pytest.mark.parametrize(
@@ -192,3 +264,113 @@ def test_worker_rejects_protected_fields_without_cache_transceiver_config():
 
     with pytest.raises(ValueError, match="cache_transceiver_config"):
         server._validate_internal_disagg_request(request, raw_request=None)
+
+
+def _lifecycle_body() -> dict:
+    return {
+        "lifecycle_protocol_version": 1,
+        "logical_request_id": 17,
+        "consumer_grant_id": str(UUID(int=5)),
+    }
+
+
+def test_lifecycle_control_accepts_valid_auth_header():
+    body = _lifecycle_body()
+    headers = build_internal_disagg_lifecycle_auth_headers(
+        "secret",
+        CONTEXT_ARTIFACT_ABORT_PATH,
+        body,
+    )
+
+    validate_internal_disagg_lifecycle_request(
+        "secret",
+        CONTEXT_ARTIFACT_ABORT_PATH,
+        body,
+        headers,
+    )
+
+
+def test_lifecycle_control_without_key_warns_and_remains_compatible():
+    warning_message = (
+        "In a future release the requirement to use internal_request_auth_key will be enforced"
+    )
+    with pytest.warns(FutureWarning, match=warning_message):
+        headers = build_internal_disagg_lifecycle_auth_headers(
+            None,
+            CONTEXT_ARTIFACT_ABORT_PATH,
+            _lifecycle_body(),
+        )
+    with pytest.warns(FutureWarning, match=warning_message):
+        validate_internal_disagg_lifecycle_request(
+            None,
+            CONTEXT_ARTIFACT_ABORT_PATH,
+            _lifecycle_body(),
+            headers,
+        )
+
+
+def test_lifecycle_control_rejects_missing_or_tampered_auth():
+    body = _lifecycle_body()
+    headers = build_internal_disagg_lifecycle_auth_headers(
+        "secret",
+        CONTEXT_ARTIFACT_ABORT_PATH,
+        body,
+    )
+
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_lifecycle_request(
+            "secret",
+            CONTEXT_ARTIFACT_ABORT_PATH,
+            body,
+            {},
+        )
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_lifecycle_request(
+            "secret",
+            CONTEXT_ARTIFACT_ABORT_PATH,
+            {**body, "logical_request_id": 18},
+            headers,
+        )
+
+
+def test_lifecycle_control_signature_is_bound_to_route():
+    body = _lifecycle_body()
+    headers = build_internal_disagg_lifecycle_auth_headers(
+        "secret",
+        CONTEXT_ARTIFACT_ABORT_PATH,
+        body,
+    )
+
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_lifecycle_request(
+            "secret",
+            GENERATION_GRANT_ABORT_PATH,
+            body,
+            headers,
+        )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_handler_authenticates_before_state_mutation():
+    request = ContextArtifactAbortRequest(
+        lifecycle_protocol_version=1,
+        logical_request_id=17,
+        prefill_artifact_id=UUID(int=2),
+        artifact_version=0,
+        handoff_attempt_uuid=UUID(int=3),
+        consumer_grant_id=UUID(int=5),
+        transfer_session_id=UUID(int=6),
+        context_endpoint_incarnation=UUID(int=7),
+    )
+    server = object.__new__(OpenAIServer)
+    server._internal_disagg_auth_key = "secret"
+    server.disagg_lifecycle_control = MagicMock()
+
+    with pytest.raises(HTTPException) as error:
+        await server.abort_context_artifact(
+            request,
+            SimpleNamespace(headers={}),
+        )
+
+    assert error.value.status_code == 401
+    server.disagg_lifecycle_control.abort_context_artifact.assert_not_called()

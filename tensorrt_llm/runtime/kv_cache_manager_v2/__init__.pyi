@@ -67,6 +67,51 @@ Priority = NewType("Priority", int)
 PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
 
+# From _allocation_lease.py
+@dataclass(slots=True, frozen=True)
+class AllocationIdentity:
+    allocator_domain_id: str
+    request_id: int | None
+    allocation_generation: int
+
+@dataclass(slots=True, frozen=True)
+class AllocationRange:
+    layer_group_id: int
+    beam_index: int
+    block_begin: int
+    block_end: int
+    page_indices: tuple[int, ...]
+    ssm_page_index: int | None = None
+
+@dataclass(slots=True, frozen=True)
+class AllocationLeaseSnapshot:
+    lease_id: int
+    identity: AllocationIdentity
+    ranges: tuple[AllocationRange, ...]
+
+class AllocationReuseProof(str, enum.Enum):
+    NOT_EXPOSED = "NOT_EXPOSED"
+    ACTIVE = "ACTIVE"
+    QUIESCING = "QUIESCING"
+    QUIESCED_SUCCESS = "QUIESCED_SUCCESS"
+    QUIESCED_FAILURE = "QUIESCED_FAILURE"
+    IN_DOUBT = "IN_DOUBT"
+    @property
+    def is_reusable(self) -> bool: ...
+
+class LeaseSettlement(str, enum.Enum):
+    RELEASED = "RELEASED"
+    ALREADY_RELEASED = "ALREADY_RELEASED"
+    IN_DOUBT = "IN_DOUBT"
+    NOT_QUIESCED = "NOT_QUIESCED"
+    STALE_GENERATION = "STALE_GENERATION"
+    NOT_FOUND = "NOT_FOUND"
+
+class AllocationLeaseHandle:
+    @property
+    def snapshot(self) -> AllocationLeaseSnapshot: ...
+    def settle(self, proof: AllocationReuseProof) -> LeaseSettlement: ...
+
 # From _stats.py
 @dataclass(slots=True)
 class KVCacheStatsDelta:
@@ -318,12 +363,22 @@ class _KVCache:
         reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
+        allocation_generation: int,
+        expected_prompt_length: int | None = None,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
     ) -> None: ...
     @property
     def manager(self) -> "KVCacheManager": ...
+    @property
+    def allocation_identity(self) -> AllocationIdentity: ...
+    @property
+    def allocation_generation(self) -> int: ...
+    @property
+    def close_requested(self) -> bool: ...
+    @property
+    def close_pending(self) -> bool: ...
     @property
     def cuda_stream(self) -> CudaStream: ...
     @cuda_stream.setter
@@ -475,6 +530,22 @@ class KVCacheManager:
     ) -> None: ...
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
+    @property
+    def allocator_domain_id(self) -> str: ...
+    @property
+    def outstanding_allocation_lease_count(self) -> int: ...
+    def snapshot_and_lease(
+        self,
+        allocation: _KVCache,
+        layer_group_ids: Sequence[int] | None = None,
+        block_range: tuple[int, int] | None = None,
+    ) -> AllocationLeaseHandle: ...
+    def settle_allocation_lease(
+        self,
+        lease_id: int,
+        identity: AllocationIdentity,
+        proof: AllocationReuseProof,
+    ) -> LeaseSettlement: ...
     def clear_reusable_blocks(self) -> None: ...
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None

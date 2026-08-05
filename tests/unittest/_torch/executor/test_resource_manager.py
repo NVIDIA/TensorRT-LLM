@@ -17,7 +17,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, PeftCacheManager, _merge_kv_cache_pool_pointers,
+    KVCacheAllocationLease, KVCacheManager, PeftCacheManager,
+    _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -163,6 +164,48 @@ class TestKVCacheManagerPoolPointers(unittest.TestCase):
                             scale_pointers))
         finally:
             manager.shutdown()
+
+
+class TestKVCacheAllocationLeaseWrapper(unittest.TestCase):
+
+    def test_snapshot_revalidates_exact_allocation_generation(self):
+        manager = object.__new__(KVCacheManager)
+        manager.impl = MagicMock()
+        identity = MagicMock()
+        snapshot = MagicMock()
+        manager.impl.get_allocation_identity.return_value = identity
+        manager.impl.snapshot_and_lease.return_value = snapshot
+
+        lease = manager.snapshot_and_lease(41)
+
+        self.assertIsInstance(lease, KVCacheAllocationLease)
+        self.assertIs(lease.snapshot, snapshot)
+        manager.impl.get_allocation_identity.assert_called_once_with(41)
+        manager.impl.snapshot_and_lease.assert_called_once()
+        self.assertIs(manager.impl.snapshot_and_lease.call_args.args[0],
+                      identity)
+
+    def test_snapshot_rejects_missing_request_before_pinning(self):
+        manager = object.__new__(KVCacheManager)
+        manager.impl = MagicMock()
+        manager.impl.get_allocation_identity.return_value = None
+
+        with self.assertRaisesRegex(KeyError, "request 41"):
+            manager.snapshot_and_lease(41)
+
+        manager.impl.snapshot_and_lease.assert_not_called()
+
+    def test_settlement_never_rechecks_request_mapping(self):
+        manager = MagicMock()
+        snapshot = MagicMock(lease_id=7, identity=MagicMock())
+        lease = KVCacheAllocationLease(snapshot, manager)
+        disposition = MagicMock()
+
+        result = lease.settle(disposition)
+
+        self.assertIs(result, manager.settle_allocation_lease.return_value)
+        manager.settle_allocation_lease.assert_called_once_with(
+            7, snapshot.identity, disposition)
 
 
 class TestResourceManager(unittest.TestCase):

@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/batch_manager/transceiverLifecycleUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmDataType.h"
@@ -561,16 +562,19 @@ public:
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
     }
 
-    bool cancelRequest(LlmRequest const& llmRequest)
+    CancelResult cancelSession(LlmRequest const& llmRequest, std::string const& reason)
     {
         bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
         bool isCancelled = false;
         bool isCurrentRequest = false;
+        bool requestWasFound = false;
+        bool cancelledBeforeLocalSubmission = false;
         {
             std::scoped_lock lock(mSenderMutex);
             auto it = mReadyResponses.find(llmRequest.mRequestId);
             if (it != mReadyResponses.end())
             {
+                requestWasFound = true;
                 isCurrentRequest = mCurrentRequest.has_value() && mCurrentRequest.value() == llmRequest.mRequestId;
                 // The legacy path cannot interrupt a ready/active transfer, so
                 // preserve its false return until the opt-in is enabled.
@@ -588,6 +592,7 @@ public:
                                     "Context KV cache request cancelled before a peer was ready for request %zu",
                                     llmRequest.mRequestId)));
                         mReadyResponses.erase(it);
+                        cancelledBeforeLocalSubmission = true;
                     }
                 }
             }
@@ -598,6 +603,7 @@ public:
             auto flagIt = mInFlightCancelFlags.find(llmRequest.mRequestId);
             if (flagIt != mInFlightCancelFlags.end())
             {
+                requestWasFound = true;
                 flagIt->second->store(true, std::memory_order_relaxed);
                 isCancelled = true;
             }
@@ -610,7 +616,31 @@ public:
         {
             mSenderCv.notify_all();
         }
-        return isCancelled;
+        auto const observation = lifecycle_detail::classifyLegacyCancelObservation(
+            isCancelled, cancelledBeforeLocalSubmission, requestWasFound);
+        if (observation == lifecycle_detail::LegacyCancelObservation::kCANCELLED_WITHOUT_REUSE_PROOF)
+        {
+            return lifecycle_detail::makeLegacyCancelResult(observation,
+                "Context transfer was cancelled before local submission, but the legacy protocol cannot rule "
+                "out peer publication or request-id reuse: "
+                    + reason);
+        }
+        if (observation == lifecycle_detail::LegacyCancelObservation::kACTIVE_UNSUPPORTED)
+        {
+            return lifecycle_detail::makeLegacyCancelResult(
+                observation, "Cancellation is unsupported for the active context transfer: " + reason);
+        }
+        if (observation == lifecycle_detail::LegacyCancelObservation::kOWNER_NOT_FOUND)
+        {
+            return lifecycle_detail::makeLegacyCancelResult(observation,
+                "No context transfer owner was found and cancel-before-create tombstones are unsupported: " + reason);
+        }
+        return lifecycle_detail::makeLegacyCancelResult(observation, reason);
+    }
+
+    bool cancelRequest(LlmRequest const& llmRequest)
+    {
+        return lifecycle_detail::legacyCancellationAccepted(cancelSession(llmRequest, "legacy cancel_request"));
     }
 
     void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady)
@@ -1436,9 +1466,8 @@ public:
         connection->send(DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
     }
 
-    bool cancelRequest(LlmRequest const& llmRequest)
+    CancelResult cancelSession(LlmRequest const& llmRequest, std::string const& reason)
     {
-
         std::string processInfo = kDefaultProcessInfo;
         if (common::getEnvRequestKVCacheConcurrent())
         {
@@ -1447,7 +1476,9 @@ public:
             {
                 TLLM_LOG_WARNING("Cannot cancel request %zu: the request has no data-transceiver communication state",
                     llmRequest.mRequestId);
-                return false;
+                return lifecycle_detail::makeLegacyCancelResult(
+                    lifecycle_detail::LegacyCancelObservation::kOWNER_NOT_FOUND,
+                    "Generation request has no data-transceiver communication state: " + reason);
             }
             processInfo = commState->toString();
         }
@@ -1457,10 +1488,14 @@ public:
         {
             TLLM_LOG_WARNING("Cannot cancel request %zu: receive worker %s is not registered", llmRequest.mRequestId,
                 processInfo.c_str());
-            return false;
+            return lifecycle_detail::makeLegacyCancelResult(lifecycle_detail::LegacyCancelObservation::kOWNER_NOT_FOUND,
+                "Generation receive worker is not registered and cancel-before-create tombstones are unsupported: "
+                    + reason);
         }
 
         bool isCancelled = false;
+        bool cancelledBeforeLocalPublication = false;
+        bool requestWasFound = false;
         auto& asyncResource = resourceIt->second;
         std::optional<LlmRequest::RequestIdType> queuedCancelledReqId;
         {
@@ -1489,6 +1524,8 @@ public:
                 }
                 asyncResource->mRequestsQueue.erase(it);
                 isCancelled = true;
+                requestWasFound = true;
+                cancelledBeforeLocalPublication = true;
                 queuedCancelledReqId = llmRequest.mRequestId;
             }
         }
@@ -1505,13 +1542,31 @@ public:
             {
                 flagIt->second->store(true, std::memory_order_relaxed);
                 isCancelled = true;
+                requestWasFound = true;
             }
         }
-        if (!isCancelled)
+        auto const observation = lifecycle_detail::classifyLegacyCancelObservation(
+            isCancelled, cancelledBeforeLocalPublication, requestWasFound);
+        if (observation == lifecycle_detail::LegacyCancelObservation::kOWNER_NOT_FOUND)
         {
             TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            return lifecycle_detail::makeLegacyCancelResult(observation,
+                "No generation transfer owner was found and cancel-before-create tombstones are unsupported: "
+                    + reason);
         }
-        return isCancelled;
+        if (observation == lifecycle_detail::LegacyCancelObservation::kCANCELLED_WITHOUT_REUSE_PROOF)
+        {
+            return lifecycle_detail::makeLegacyCancelResult(observation,
+                "Generation transfer was removed before local publication, but the legacy protocol cannot rule out "
+                "request-id reuse: "
+                    + reason);
+        }
+        return lifecycle_detail::makeLegacyCancelResult(observation, reason);
+    }
+
+    bool cancelRequest(LlmRequest const& llmRequest)
+    {
+        return lifecycle_detail::legacyCancellationAccepted(cancelSession(llmRequest, "legacy cancel_request"));
     }
 
     enum class ReadySignalResult
@@ -1917,6 +1972,11 @@ bool CacheSender::cancelRequest(LlmRequest const& llmRequest)
     return mImpl->cancelRequest(llmRequest);
 }
 
+CancelResult CacheSender::cancelSession(LlmRequest const& llmRequest, std::string const& reason)
+{
+    return mImpl->cancelSession(llmRequest, reason);
+}
+
 void CacheSender::sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady)
 {
     mImpl->sendReadySignal(requestId, isReady);
@@ -1956,6 +2016,11 @@ void CacheReceiver::receiveSync(TransferSession& session)
 bool CacheReceiver::cancelRequest(LlmRequest const& llmRequest)
 {
     return mImpl->cancelRequest(llmRequest);
+}
+
+CancelResult CacheReceiver::cancelSession(LlmRequest const& llmRequest, std::string const& reason)
+{
+    return mImpl->cancelSession(llmRequest, reason);
 }
 
 bool CacheReceiver::receiveReadySignal(TransferSession& session)

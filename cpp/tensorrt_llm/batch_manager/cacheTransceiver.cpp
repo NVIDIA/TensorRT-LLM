@@ -46,6 +46,7 @@
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/batch_manager/transceiverLifecycleUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmDataType.h"
@@ -1680,6 +1681,51 @@ bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
         return mCacheReceiver->cancelRequest(*llmRequest);
     }
     return false;
+}
+
+TransceiverCapabilities CacheTransceiver::getLifecycleCapabilities() const
+{
+    TransceiverCapabilities capabilities;
+    capabilities.qualifiedLegacyMode = true;
+    capabilities.directTransfer = true;
+    capabilities.pipelineParallel = true;
+    capabilities.tensorParallel = true;
+    return capabilities;
+}
+
+CancelResult CacheTransceiver::cancelSession(std::shared_ptr<LlmRequest> llmRequest, std::string const& reason)
+{
+    if (llmRequest == nullptr)
+    {
+        return {LogicalDisposition::kNOT_FOUND, PhysicalDisposition::kIN_DOUBT, false,
+            "Cannot identify physical state for a null KV cache transfer request: " + reason};
+    }
+
+    CancelResult result;
+    if (llmRequest->isContextOnlyRequest())
+    {
+        result = mCacheSender->cancelSession(*llmRequest, reason);
+    }
+    else if (llmRequest->isGenerationOnlyRequest())
+    {
+        result = mCacheReceiver->cancelSession(*llmRequest, reason);
+    }
+    else
+    {
+        return {LogicalDisposition::kREJECTED, PhysicalDisposition::kIN_DOUBT, false,
+            "Request is neither context-only nor generation-only: " + reason};
+    }
+
+    if (hasPoisonedTransferBuffer())
+    {
+        result = lifecycle_detail::failClosedForPoisonedStorage(std::move(result));
+    }
+    return result;
+}
+
+ShutdownResult CacheTransceiver::shutdownLifecycle(std::chrono::milliseconds)
+{
+    return lifecycle_detail::makeLegacyShutdownResult(hasPoisonedTransferBuffer());
 }
 
 } // namespace tensorrt_llm::batch_manager

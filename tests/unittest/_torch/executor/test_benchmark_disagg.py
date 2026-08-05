@@ -1129,6 +1129,10 @@ class TestFailFastDuringBenchmarkFill:
     def test_stalled_fill_phase_kills_after_all_requests_fetched(self):
         """A fill phase with no fitting INIT requests is a deadlock."""
         ex = self._make_executor(fill_phase_active=True)
+        calls = Mock()
+        ex._check_disagg_transfer_progress_when_idle = calls.check_progress
+        ex._flush_pending_handoff_responses = calls.flush_handoff
+        ex._handle_errors = calls.handle_errors
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1136,7 +1140,12 @@ class TestFailFastDuringBenchmarkFill:
             "Fail-fast SHOULD fire during a stalled fill phase — "
             "otherwise the fill gate never opens"
         )
-        ex._handle_errors.assert_called_once()
+        assert [entry[0] for entry in calls.method_calls] == [
+            "check_progress",
+            "flush_handoff",
+            "handle_errors",
+        ]
+        calls.flush_handoff.assert_called_once_with(rank_synchronous=True)
 
     def test_healthy_fill_phase_does_not_kill(self):
         """During healthy fill, a fitting INIT request means progress exists."""

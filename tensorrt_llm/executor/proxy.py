@@ -45,9 +45,10 @@ from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (EngineDeadError, ErrorResponse, RequestError,
                     WorkerCommIpcAddrs, create_mpi_comm_session,
-                    get_spawn_proxy_process_env, is_llm_response,
-                    multi_frontend_request_addr, multi_frontend_result_addr,
-                    namespace_client_id, print_alive_threads)
+                    get_spawn_proxy_process_env, is_control_only_llm_response,
+                    is_llm_response, multi_frontend_request_addr,
+                    multi_frontend_result_addr, namespace_client_id,
+                    print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 from .worker_process_monitor import WorkerProcessIdentity, WorkerProcessMonitor
 
@@ -561,10 +562,10 @@ class GenerationExecutorProxy(GenerationExecutor):
 
             # FIXME: Add type annotations and make 'res' type more homogeneous (e.g.
             #        include PostprocWorker.Output in is_llm_response and unify is_final APIs).
-            if (is_llm_response(res) and res.result.is_final) or isinstance(
-                    res,
-                    ErrorResponse) or (isinstance(res, PostprocWorker.Output)
-                                       and res.is_final):
+            if (is_llm_response(res) and not is_control_only_llm_response(res)
+                    and res.result.is_final) or isinstance(
+                        res, ErrorResponse) or (isinstance(
+                            res, PostprocWorker.Output) and res.is_final):
                 self._results.pop(client_id, None)
 
         res = res if isinstance(res, list) else [res]
