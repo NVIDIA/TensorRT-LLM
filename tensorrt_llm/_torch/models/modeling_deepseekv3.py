@@ -1893,6 +1893,24 @@ class DeepseekV3Model(DecoderModel):
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
+    @classmethod
+    def get_preferred_transceiver_runtime(
+            cls,
+            pretrained_config: Any = None
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Preferred KV-cache transceiver runtime.
+
+        ``DeepseekV3ForCausalLM`` / ``DeepseekV32ForCausalLM`` / ``GlmMoeDsaForCausalLM``
+        (GLM 5.2) use MLA attention, which transfers a large latent KV that the Python
+        (v2) transceiver handles better in disaggregated serving. The Python transceiver
+        also supports GLM 5.2's per-layer masked DSA indexer k-cache pool (cross-layer
+        indexer sharing), so every checkpoint sharing this implementation prefers the
+        Python transceiver. Applied only when
+        ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
+        is always respected.
+        """
+        return "PYTHON"
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
         # Note: Currently the usage of mapping is all over the place making its usage brittle

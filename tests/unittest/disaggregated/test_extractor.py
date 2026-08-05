@@ -187,6 +187,190 @@ def test_build_page_table():
     manager.shutdown()
 
 
+def _make_v1_dsa_manager(
+    pp_size: int = 1,
+    pp_rank: int = 0,
+    indexer_k_cache_layer_mask=None,
+) -> KVCacheManager:
+    """V1 KVCacheManager with the DSA indexer K cache enabled (MLA-style).
+
+    ``indexer_k_cache_layer_mask`` is a global per-model ``list[bool]`` marking
+    the "full" indexer-owning layers (cross-layer indexer sharing, e.g. GLM
+    5.2); ``None`` keeps the dense layout where every layer owns an indexer row.
+    """
+    return KVCacheManager(
+        kv_cache_config=KvCacheConfig(
+            max_tokens=512,
+            enable_block_reuse=False,
+            event_buffer_max_size=0,
+        ),
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
+        num_layers=4,
+        num_kv_heads=1,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=256,
+        max_batch_size=2,
+        mapping=Mapping(world_size=pp_size, rank=pp_rank, tp_size=1, pp_size=pp_size),
+        dtype=DataType.HALF,
+        enable_indexer_k_cache=True,
+        indexer_k_cache_quant_block_size=128,
+        indexer_k_cache_index_head_dim=128,
+        indexer_k_cache_layer_mask=indexer_k_cache_layer_mask,
+    )
+
+
+def _byte_view(ptr: int, nbytes: int):
+    from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+
+    return convert_to_torch_tensor(TensorWrapper(int(ptr), DataType.INT8, [int(nbytes)]))
+
+
+@pytest.mark.cuda
+def test_v1_dsa_indexer_page_table_is_replicated_with_per_layer_entries():
+    manager = _make_v1_dsa_manager()
+    try:
+        page_table = build_page_table(manager)
+        lg = page_table.layer_groups[0]
+        assert len(lg.pool_views) == 2
+
+        kv_view, idx_view = lg.pool_views
+        assert kv_view.mapper_kind == MapperKind.INDEXED
+        assert idx_view.mapper_kind == MapperKind.REPLICATED
+        assert idx_view.pool_role == frozenset({"indexer_k"})
+
+        # One synthesized entry per LG layer, equal-sized, contiguous from 0.
+        assert get_unique_layers(idx_view) == get_unique_layers(kv_view)
+        idx_pool = get_physical_pool(page_table, 0, idx_view.pool_idx)
+        sizes = {int(entry["size"]) for entry in idx_view.buffer_entries}
+        assert len(sizes) == 1
+        per_layer = sizes.pop()
+        assert per_layer * len(idx_view.buffer_entries) == idx_pool.slot_bytes
+        offsets = sorted(int(entry["offset"]) for entry in idx_view.buffer_entries)
+        assert offsets == [i * per_layer for i in range(len(offsets))]
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.cuda
+def test_v1_dsa_masked_indexer_page_table_covers_owning_layers():
+    """The masked indexer view covers only the owning layers.
+
+    A per-layer indexer mask (cross-layer indexer sharing, e.g. GLM 5.2) gives
+    only the owning layers a pool row, so the REPLICATED indexer view covers
+    exactly that subset -- one entry per owning layer mapped to its packed row
+    -- instead of one entry per LG layer.
+    """
+    # Of the 4 layers, only local layers 0 and 2 own an indexer K cache row.
+    manager = _make_v1_dsa_manager(indexer_k_cache_layer_mask=[True, False, True, False])
+    try:
+        page_table = build_page_table(manager)
+        lg = page_table.layer_groups[0]
+        assert len(lg.pool_views) == 2
+        _, idx_view = lg.pool_views
+        assert idx_view.mapper_kind == MapperKind.REPLICATED
+        assert idx_view.pool_role == frozenset({"indexer_k"})
+
+        # Only the two owning layers appear -- a strict subset of the LG.
+        owning = sorted(int(e["local_layer_id"]) for e in idx_view.buffer_entries)
+        assert owning == [0, 2]
+
+        # The pool holds one row per owning layer; entries pack contiguously in
+        # owning (local-layer) order, so layer 0 -> row 0, layer 2 -> row 1.
+        idx_pool = get_physical_pool(page_table, 0, idx_view.pool_idx)
+        sizes = {int(e["size"]) for e in idx_view.buffer_entries}
+        assert len(sizes) == 1
+        per_layer = sizes.pop()
+        assert per_layer * len(idx_view.buffer_entries) == idx_pool.slot_bytes
+        offset_by_layer = {
+            int(e["local_layer_id"]): int(e["offset"]) for e in idx_view.buffer_entries
+        }
+        assert offset_by_layer == {0: 0, 2: per_layer}
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.cuda
+def test_v1_dsa_indexer_replicated_transfer_across_pp():
+    """PP1 ctx sends the DSA indexer K cache into two PP2 gen ranks.
+
+    Exercises the full python path on real V1 managers: page-table build,
+    role-set matching, ReplicatedMapper layer-strided offsets, and a
+    byte-level copy that must land each gen rank's layer subset at the
+    right offsets.
+    """
+    import torch
+
+    from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import ReplicatedMapper
+    from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+    from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+
+    ctx = _make_v1_dsa_manager()
+    gens = [_make_v1_dsa_manager(pp_size=2, pp_rank=r) for r in range(2)]
+    try:
+        ctx_extractor = KVRegionExtractorV1(ctx)
+        ctx_ri = RankInfo.from_kv_cache_manager("ctx", ctx, device_id=0)
+        registrar = PeerRegistrar(ctx_ri, ctx_extractor)
+
+        # Fill ctx indexer pool with position-dependent bytes; zero gen pools.
+        ctx_pool_tensor = ctx.impl.get_indexer_k_cache_pool()
+        flat = ctx_pool_tensor.view(torch.uint8).flatten()
+        flat.copy_(torch.arange(flat.numel(), dtype=torch.int64, device=flat.device) % 251)
+        for gen in gens:
+            gen.impl.get_indexer_k_cache_pool().view(torch.uint8).zero_()
+
+        block_ids = np.array([0, 2, 3], dtype=np.int64)
+        ctx_pt = ctx_extractor.page_table
+        idx_pool = get_physical_pool(ctx_pt, 0, 1)
+        layers_per_gen = 2
+        per_layer = idx_pool.slot_bytes // 4
+
+        for gen_pp_rank, gen in enumerate(gens):
+            gen_ri = RankInfo.from_kv_cache_manager("gen", gen, device_id=0)
+            registrar.register("gen", gen_ri.instance_rank, gen_ri)
+            mapping = registrar.get_pool_mapping(gen_ri)
+            # KV pool and indexer pool each match 1:1.
+            assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
+
+            mapper = registrar.get_kv_map(gen_ri, (0, 1), (0, 1))
+            assert isinstance(mapper, ReplicatedMapper)
+
+            gen_extractor = registrar.peer_extractor("gen", gen_ri.instance_rank)
+            pair = mapper.map(
+                ctx_extractor.extract(block_ids, layer_group_id=0, pool_idx=1),
+                gen_extractor.extract(block_ids, layer_group_id=0, pool_idx=1),
+            )
+            # This gen rank holds 2 of the 4 layers; the fragment is the
+            # contiguous 2-layer range at this PP stage's offset within
+            # the ctx slot.
+            assert pair.src.memory.bytes_per_region == layers_per_gen * per_layer
+            expected_src_off = gen_pp_rank * layers_per_gen * per_layer
+            base_ptrs = idx_pool.base_address + block_ids * idx_pool.slot_bytes
+            np.testing.assert_array_equal(pair.src.memory.ptrs, base_ptrs + expected_src_off)
+
+            # Emulate the transfer with raw byte copies, then verify content.
+            for src_ptr, dst_ptr in zip(pair.src.memory.ptrs, pair.dst.memory.ptrs):
+                _byte_view(dst_ptr, pair.dst.memory.bytes_per_region).copy_(
+                    _byte_view(src_ptr, pair.src.memory.bytes_per_region)
+                )
+
+            gen_pool_tensor = gen.impl.get_indexer_k_cache_pool()
+            gen_bytes = gen_pool_tensor.view(torch.uint8).reshape(gen_pool_tensor.shape[0], -1)
+            ctx_bytes = ctx_pool_tensor.view(torch.uint8).reshape(ctx_pool_tensor.shape[0], -1)
+            src_lo = gen_pp_rank * layers_per_gen * per_layer
+            src_hi = src_lo + layers_per_gen * per_layer
+            torch.testing.assert_close(
+                gen_bytes[block_ids],
+                ctx_bytes[block_ids, src_lo:src_hi],
+                rtol=0,
+                atol=0,
+            )
+    finally:
+        ctx.shutdown()
+        for gen in gens:
+            gen.shutdown()
+
+
 def test_layer_group_meta_serialization():
     import numpy as np
 

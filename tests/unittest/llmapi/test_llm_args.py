@@ -3385,3 +3385,46 @@ class TestTransceiverRuntimeAutoResolution:
         # An explicit backend bypasses the env vars entirely.
         assert CacheTransceiverConfig(
             backend="UCX")._resolve_default_backend() == ("UCX", None)
+
+
+class TestDeepseekTransceiverPreference:
+    """DeepseekV3ForCausalLM, DeepseekV32ForCausalLM, and GlmMoeDsaForCausalLM all prefer the Python KV-cache transceiver."""
+
+    @staticmethod
+    def _pretrained_config(architectures, model_type):
+        from transformers import PretrainedConfig
+        cfg = PretrainedConfig(architectures=architectures)
+        cfg.model_type = model_type
+        return cfg
+
+    @pytest.mark.parametrize("architectures,model_type", [
+        (["GlmMoeDsaForCausalLM"], "glm_moe_dsa"),
+        (["DeepseekV3ForCausalLM"], "deepseek_v3"),
+        (["DeepseekV32ForCausalLM"], "deepseek_v32"),
+    ])
+    def test_preference_per_architecture(self, architectures: list[str],
+                                         model_type: str) -> None:
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        cfg = self._pretrained_config(architectures, model_type)
+        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
+            cfg) == "PYTHON"
+
+    def test_prefers_python_without_config(self) -> None:
+        """Preference is unconditional without a pretrained config."""
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
+        ) == "PYTHON"
+
+    def test_deepseek_resolves_auto_to_python_on_nixl(self) -> None:
+        """DeepseekV3ForCausalLM on NIXL adopts the Python transceiver from 'auto'."""
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+        )
+        cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
+        _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
