@@ -33,6 +33,7 @@ l0_cpu:
   - unittest/executor/test_rpc.py
   - unittest/executor/test_multi_frontend_routing.py
   - unittest/executor/test_event_loop_error_broadcast.py
+  - unittest/executor/test_rpc_worker_mixin.py
   - unittest/executor/test_stats_serializer.py
   - unittest/inputs
   - unittest/llmapi/apps/test_chat_utils.py
