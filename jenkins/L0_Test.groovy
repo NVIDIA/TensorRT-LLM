@@ -67,6 +67,7 @@ LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
 // K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
 ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
+// Read-only artifactory pull credentials
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 
 // DLFW torch image
