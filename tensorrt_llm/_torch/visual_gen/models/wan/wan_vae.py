@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, fields
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import torch
 import torch.nn as nn
@@ -117,6 +118,7 @@ def _causal_conv_with_cache(
     x: torch.Tensor,
     feat_cache: list[torch.Tensor | str | None],
     feat_idx: list[int],
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a causal Conv3d while threading the trailing-frame cache.
 
@@ -139,7 +141,10 @@ def _causal_conv_with_cache(
             ],
             dim=2,
         )
-    x = conv(x, feat_cache[idx])
+    if residual is None:
+        x = conv(x, feat_cache[idx])
+    else:
+        x = conv(x, feat_cache[idx], residual=residual)
     feat_cache[idx] = cache_x
     feat_idx[0] += 1
     return x
@@ -388,6 +393,628 @@ class WanConv2d(nn.Conv2d):
         return _channels_last_2d_if_needed(x)
 
 
+# ---------------------------------------------------------------------------
+# NVFP4 (FP4 E2M1) causal Conv3d via the vendored Blackwell CuteDSL kernel.
+# All cutlass / kernel imports are lazy so the BF16 path carries no FP4 dependency.
+# Kernel ABI: input/filter NDHWC/NDHWC (C innermost), sfa UNswizzled, sfb via
+# cvt_sf_MKL_to_M32x4xrm_K4xrk_L, alpha = 1/(gx*gw). Input channels use 64-channel
+# alignment through 256 and 256-channel alignment above it; zero padding preserves
+# the convolution mathematically.
+# ---------------------------------------------------------------------------
+_FP4_FP8_MAX, _FP4_E2M1_MAX, _FP4_SF_VEC = 448.0, 6.0, 16
+_FP4_CONV_MMA_TILER = (256, 256)
+_FP4_CONV_PREFERRED_CLUSTER = (2, 1)
+_FP4_CONV_FALLBACK_CLUSTER = (2, 1)
+_FP4_CONV_USE_2CTA = True
+_FP4_E2M1_VALUES = (0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6)
+
+
+class _FP4PrequantizedWeight(TypedDict):
+    filter: Any
+    packed_weight: torch.Tensor
+    swizzled_block_scales: Any
+    global_scale: torch.Tensor
+    out_channels: int
+    in_channels: int
+    padded_out_channels: int
+    padded_in_channels: int
+    kernel_depth: int
+    kernel_height: int
+    kernel_width: int
+
+
+_fp4_compile_cache: dict[tuple[object, ...], Any] = {}
+
+
+def _round_up(value: int, alignment: int) -> int:
+    if value <= 0:
+        raise ValueError(f"Channel count must be positive, got {value}")
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _fp4_align_input_channels(channels: int) -> int:
+    """Pad input channels to a layout supported by the FP4 scale-factor path."""
+    return _round_up(channels, 64 if channels <= 256 else 256)
+
+
+def _fp4_align_output_channels(channels: int) -> int:
+    """Pad output channels for BF16 vector alignment and large-channel tiling."""
+    return _round_up(channels, 8 if channels <= 128 else 256)
+
+
+@lru_cache(maxsize=1)
+def _fp4_imports() -> tuple[Any, ...]:
+    import cuda.bindings.driver as cudadrv
+    import cutlass
+    import cutlass.torch as cutlass_torch
+    from cutlass.cute.runtime import from_dlpack
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_blockscaled_implicit_gemm_fprop import (
+        compile_conv,
+        compute_zpq,
+        cvt_sf_MKL_to_M32x4xrm_K4xrk_L,
+    )
+
+    return (
+        cutlass,
+        cutlass_torch,
+        cudadrv,
+        from_dlpack,
+        compile_conv,
+        compute_zpq,
+        cvt_sf_MKL_to_M32x4xrm_K4xrk_L,
+    )
+
+
+def _fp4_prequant_weight(weight: torch.Tensor) -> _FP4PrequantizedWeight:
+    """Quantize an OIDHW BF16 weight into the kernel's packed KTRSC layout."""
+    if not weight.is_cuda or weight.dtype is not torch.bfloat16:
+        raise ValueError("FP4 Conv3d weights must be CUDA bfloat16 tensors")
+    if weight.ndim != 5:
+        raise ValueError(f"FP4 Conv3d weight must be 5D, got shape {tuple(weight.shape)}")
+
+    cutlass, cutlass_torch, _, from_dlpack, _, _, cvt_sf = _fp4_imports()
+    output_channels, input_channels, depth, height, width = weight.shape
+    padded_output_channels = _fp4_align_output_channels(output_channels)
+    padded_input_channels = _fp4_align_input_channels(input_channels)
+    if padded_output_channels != output_channels or padded_input_channels != input_channels:
+        padded_weight = weight.new_zeros(
+            (padded_output_channels, padded_input_channels, depth, height, width)
+        )
+        padded_weight[:output_channels, :input_channels] = weight
+        weight = padded_weight
+
+    flattened_channels = padded_input_channels * depth * height * width
+    weight_global_scale = (
+        _FP4_FP8_MAX * _FP4_E2M1_MAX / weight.abs().amax().float().clamp(min=1e-8)
+    ).reshape(1)
+    physical_weight = (
+        weight.permute(0, 2, 3, 4, 1)
+        .contiguous()
+        .reshape(padded_output_channels, flattened_channels)
+    )
+    packed_weight, weight_block_scales = torch.ops.trtllm.fp4_quantize(
+        physical_weight,
+        weight_global_scale,
+        _FP4_SF_VEC,
+        False,
+        False,
+    )
+    filt = from_dlpack(
+        packed_weight.view(
+            padded_output_channels,
+            depth,
+            height,
+            width,
+            padded_input_channels // 2,
+        ).view(torch.float4_e2m1fn_x2),
+        assumed_align=16,
+    ).mark_layout_dynamic(leading_dim=4)
+
+    # Convert linear weight block scales to the MMA-swizzled SFB layout.
+    sf_k = (flattened_channels + _FP4_SF_VEC - 1) // _FP4_SF_VEC
+    mma_shape = (1, (padded_output_channels + 127) // 128, (sf_k + 3) // 4, 32, 4, 4)
+    ref = torch.zeros((1, padded_output_channels, sf_k), dtype=torch.float32)
+    ref[0] = (
+        weight_block_scales.reshape(padded_output_channels, -1)[:, :sf_k]
+        .view(torch.float8_e4m3fn)
+        .float()
+        .cpu()
+    )
+    ref = ref.permute(1, 2, 0).contiguous()
+    mma = cutlass_torch.create_and_permute_torch_tensor(
+        mma_shape,
+        torch.float32,
+        permute_order=(3, 4, 1, 5, 2, 0),
+        init_type=cutlass_torch.TensorInitType.SKIP,
+    )
+    cvt_sf(from_dlpack(ref), from_dlpack(mma))
+    mma = mma.to(weight.device)
+    sfb, _sk = cutlass_torch.cute_tensor_like(
+        mma.cpu(), cutlass.Float8E4M3FN, is_dynamic_layout=True, assumed_align=16
+    )
+    sfb = cutlass_torch.convert_cute_tensor(mma, sfb, cutlass.Float8E4M3FN, is_dynamic_layout=True)
+    return {
+        "filter": filt,
+        "packed_weight": packed_weight,
+        "swizzled_block_scales": sfb,
+        "global_scale": weight_global_scale,
+        "out_channels": output_channels,
+        "in_channels": input_channels,
+        "padded_out_channels": padded_output_channels,
+        "padded_in_channels": padded_input_channels,
+        "kernel_depth": depth,
+        "kernel_height": height,
+        "kernel_width": width,
+    }
+
+
+def _fp4_conv_run(
+    x: torch.Tensor,
+    pq: _FP4PrequantizedWeight,
+    stride: tuple[int, int, int],
+    pad: tuple[int, int, int],
+    dil: tuple[int, int, int],
+    gs_static: torch.Tensor | None = None,
+    mma: tuple[int, int] = _FP4_CONV_MMA_TILER,
+    fuse_silu: bool = False,
+    fuse_norm_gamma: torch.Tensor | None = None,
+    fuse_norm_scale: float | None = None,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run FP4 Conv3d with pre-padded BF16 input and an optional fused epilogue.
+
+    ``x`` is logical NCDHW and already has causal time padding. ``bias`` is
+    physical O and ``residual`` is physical NZPQO. ``pad`` is
+    ``(depth, height, width)`` order and the result is logical NODHW.
+    ``fuse_silu``: ``x`` is the *pre-SiLU* activation and SiLU is applied fused with the
+    NVFP4 quantization (single pass), removing the standalone SiLU write + quantize read.
+    ``fuse_norm_gamma``/``fuse_norm_scale``: if given, ``x`` is instead the *pre-RMSNorm*
+    activation and WanRMSNorm (channel-wise L2 * ``scale`` * gamma) + SiLU are both fused
+    into the quantize. Requires ``gs_static``. RMSNorm(0)=SiLU(0)=0 so the causal time-pad
+    and in-channel zero-pad stay exact (gamma is pre-padded to Cp with 0).
+    """
+    if not x.is_cuda:
+        raise ValueError("FP4 Conv3d requires a CUDA input")
+    if torch.cuda.get_device_capability(x.device)[0] < 10:
+        raise ValueError("FP4 Conv3d requires a Blackwell-class GPU")
+    if x.dtype is not torch.bfloat16:
+        raise ValueError(f"FP4 Conv3d requires a bfloat16 input, got {x.dtype}")
+    if gs_static is not None and (
+        gs_static.numel() != 1
+        or gs_static.dtype is not torch.float32
+        or gs_static.device != x.device
+    ):
+        raise ValueError("Static FP4 input scale must be one float32 value on the input device")
+    if fuse_norm_gamma is not None and fuse_norm_scale is None:
+        raise ValueError("Fused RMSNorm requires fuse_norm_scale")
+    if (fuse_silu or fuse_norm_gamma is not None) and gs_static is None:
+        raise ValueError("Fused FP4 input preparation requires a calibrated input scale")
+
+    cutlass, _, cudadrv, from_dlpack, compile_conv, compute_zpq, _ = _fp4_imports()
+    Oc = pq["out_channels"]
+    C = pq["in_channels"]
+    Op = pq["padded_out_channels"]
+    Cp = pq["padded_in_channels"]
+    T = pq["kernel_depth"]
+    R = pq["kernel_height"]
+    S = pq["kernel_width"]
+    N, Cx, D, H, Wd = x.shape
+    if Cx != C:
+        raise ValueError(f"FP4 Conv3d expected {C} input channels, got {Cx}")
+    if Cp != Cx:  # zero-pad in-channels to a kernel-valid count
+        x = torch.cat([x, x.new_zeros((N, Cp - Cx, D, H, Wd))], dim=1)
+    Z, P, Q = compute_zpq((D, H, Wd), (T, R, S), stride, pad, pad, dil)
+    M = N * D * H * Wd
+    Xp = x.permute(0, 2, 3, 4, 1).contiguous().reshape(M, Cp)
+    if fuse_norm_gamma is not None:
+        from .fp4_fused_quant import rmsnorm_silu_nvfp4_quant
+
+        gs = gs_static  # static path only; calibrated on the SiLU(RMSNorm) output
+        xq, x_sf = rmsnorm_silu_nvfp4_quant(Xp, gs, fuse_norm_gamma, fuse_norm_scale)
+    elif fuse_silu:
+        from .fp4_fused_quant import silu_nvfp4_quant
+
+        gs = gs_static  # static path only; calibrated on the SiLU output
+        xq, x_sf = silu_nvfp4_quant(Xp, gs)
+    else:
+        gs = (
+            gs_static
+            if gs_static is not None
+            else ((_FP4_FP8_MAX * _FP4_E2M1_MAX) / Xp.abs().amax().float().clamp(min=1e-8)).reshape(
+                1
+            )
+        )
+        xq, x_sf = torch.ops.trtllm.fp4_quantize(Xp, gs, _FP4_SF_VEC, False, False)
+    inp = from_dlpack(
+        xq.view(N, D, H, Wd, Cp // 2).view(torch.float4_e2m1fn_x2), assumed_align=16
+    ).mark_layout_dynamic(leading_dim=4)
+    sf_ka = (Cp + _FP4_SF_VEC - 1) // _FP4_SF_VEC
+    if sf_ka % 4 != 0:
+        raise ValueError(f"FP4 Conv3d requires a four-aligned SFA K dimension, got {sf_ka}")
+    sfa = from_dlpack(x_sf.reshape(M, sf_ka, 1).view(torch.float8_e4m3fn), assumed_align=16)
+    out = torch.empty((N, Z, P, Q, Op), dtype=torch.bfloat16, device=x.device)
+    out_ct = from_dlpack(out, assumed_align=16).mark_layout_dynamic(leading_dim=4)
+    if bias is not None:
+        if bias.ndim != 1 or bias.numel() != Op:
+            raise ValueError(f"FP4 Conv bias must have shape ({Op},), got {tuple(bias.shape)}")
+        if bias.dtype is not torch.bfloat16 or bias.device != x.device:
+            raise ValueError("FP4 Conv bias must be bfloat16 and on the input device")
+        bias_ct = from_dlpack(bias.contiguous(), assumed_align=16)
+    else:
+        bias_ct = None
+    if residual is not None:
+        expected_shape = (N, Z, P, Q, Op)
+        if residual.shape != expected_shape:
+            raise ValueError(
+                f"FP4 Conv residual must have shape {expected_shape}, got {tuple(residual.shape)}"
+            )
+        if residual.dtype != torch.bfloat16:
+            raise ValueError(f"FP4 Conv residual must be bfloat16, got {residual.dtype}")
+        if residual.device != x.device:
+            raise ValueError("FP4 Conv residual must be on the input device")
+        residual_ct = from_dlpack(residual.contiguous(), assumed_align=16).mark_layout_dynamic(
+            leading_dim=4
+        )
+        beta = 1.0
+    else:
+        residual_ct = None
+        beta = 0.0
+    alpha = from_dlpack(((1.0 / pq["global_scale"]) / gs).to(torch.float32), assumed_align=4)
+    stream = cudadrv.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+    key = (
+        x.device.index,
+        Cp,
+        Op,
+        N,
+        D,
+        H,
+        Wd,
+        Z,
+        P,
+        Q,
+        tuple(stride),
+        tuple(pad),
+        tuple(dil),
+        mma,
+        _FP4_CONV_PREFERRED_CLUSTER,
+        _FP4_CONV_FALLBACK_CLUSTER,
+        _FP4_CONV_USE_2CTA,
+        bias_ct is not None,
+        residual_ct is not None,
+        beta,
+    )
+    fn = _fp4_compile_cache.get(key)
+    if fn is None:
+        fn = compile_conv(
+            (N, Cp, D, H, Wd),
+            (Op, T, R, S),
+            inp,
+            pq["filter"],
+            out_ct,
+            cutlass.Float32,
+            sfa,
+            pq["swizzled_block_scales"],
+            None,
+            alpha,
+            None,
+            bias_ct,
+            residual_ct,
+            beta,
+            _FP4_SF_VEC,
+            mma_tiler=mma,
+            preferred_cluster_shape_mn=_FP4_CONV_PREFERRED_CLUSTER,
+            fallback_cluster_shape_mn=_FP4_CONV_FALLBACK_CLUSTER,
+            use_2cta_instrs=_FP4_CONV_USE_2CTA,
+            upper_padding_dhw=pad,
+            lower_padding_dhw=pad,
+            stride_dhw=stride,
+            dilation_dhw=dil,
+        )
+        _fp4_compile_cache[key] = fn
+    fn(
+        inp,
+        pq["filter"],
+        out_ct,
+        sfa,
+        pq["swizzled_block_scales"],
+        alpha,
+        None,
+        None,
+        bias_ct,
+        residual_ct,
+        *[cutlass.Int32(v) for v in (*pad, *pad, *stride, *dil)],
+        stream,
+    )
+    y = out.permute(0, 4, 1, 2, 3)  # [N,Op,Z,P,Q]
+    return y[:, :Oc] if Op != Oc else y  # drop padded out-channels
+
+
+class NVFP4WanCausalConv3d(WanCausalConv3d):
+    """Causal Conv3d whose 3x3x3 convolution runs on the NVFP4 Blackwell CuteDSL kernel.
+
+    Weight is pre-quantized once (lazily on first forward). ``input_scale`` (the ModelOpt
+    calibrated divisor-form scale) enables STATIC activation quant; otherwise dynamic.
+    """
+
+    def __init__(
+        self,
+        base: WanCausalConv3d,
+        input_scale: float | None = None,
+        absorb_silu: bool = False,
+        absorb_norm: bool = False,
+        norm_gamma: torch.Tensor | None = None,
+        norm_scale: float | None = None,
+    ) -> None:
+        supported_geometry = (
+            base.kernel_size == (3, 3, 3)
+            and base.stride == (1, 1, 1)
+            and base.dilation == (1, 1, 1)
+            and base.groups == 1
+            and base.padding == (0, 1, 1)
+        )
+        if not supported_geometry:
+            raise ValueError(
+                "NVFP4WanCausalConv3d supports only dense stride-1 3x3x3 Wan convolutions"
+            )
+
+        super().__init__(base.in_channels, base.out_channels, 3, stride=1, padding=1)
+        self.load_state_dict(base.state_dict())
+        self._fp4_pq: _FP4PrequantizedWeight | None = None
+        self._fp4_static_gs: torch.Tensor | None = None
+        self._fp4_bias: torch.Tensor | None = None
+        self._gamma_cp: torch.Tensor | None = None
+        if input_scale is not None and float(input_scale) > 0:
+            self._fp4_static_gs_val = 1.0 / float(input_scale)
+        else:
+            self._fp4_static_gs_val = None
+        # Absorb the residual block's preceding SiLU (tier A) or RMSNorm+SiLU (tier B) into the
+        # activation quantize (fused, single pass). Only on the static path (fixed calibrated
+        # ``gs``); dynamic convs keep the un-fused path (block still applies norm/SiLU).
+        static = self._fp4_static_gs_val is not None
+        self._absorb_norm = (
+            bool(absorb_norm) and static and norm_gamma is not None and norm_scale is not None
+        )
+        # Tier B implies tier A (SiLU is also fused); tier A alone otherwise.
+        self._absorb_silu = self._absorb_norm or (bool(absorb_silu) and static)
+        self.register_buffer("_norm_gamma", norm_gamma, persistent=False)
+        self._norm_scale = float(norm_scale) if norm_scale is not None else None
+
+    def _initialize_fp4_parameters(self) -> None:
+        if self._fp4_pq is not None:
+            return
+
+        self._fp4_pq = _fp4_prequant_weight(self.weight.detach())
+        if self._fp4_static_gs_val is not None:
+            self._fp4_static_gs = torch.tensor(
+                [self._fp4_static_gs_val],
+                dtype=torch.float32,
+                device=self.weight.device,
+            )
+        if self._absorb_norm:
+            assert self._norm_gamma is not None
+            padded_channels = self._fp4_pq["padded_in_channels"]
+            gamma = self._norm_gamma.reshape(-1).to(device=self.weight.device, dtype=torch.float32)
+            if gamma.numel() < padded_channels:
+                gamma = F.pad(gamma, (0, padded_channels - gamma.numel()))
+            self._gamma_cp = gamma.contiguous()
+        if self.bias is not None:
+            padded_channels = self._fp4_pq["padded_out_channels"]
+            bias = self.bias.detach()
+            if bias.numel() < padded_channels:
+                bias = F.pad(bias, (0, padded_channels - bias.numel()))
+            self._fp4_bias = bias.contiguous()
+
+    def _reset_fp4_parameters(self) -> None:
+        """Discard tensors derived from parameters or bound to device pointers."""
+        self._fp4_pq = None
+        self._fp4_static_gs = None
+        self._fp4_bias = None
+        self._gamma_cp = None
+
+    def _apply(self, fn, recurse: bool = True):
+        module = super()._apply(fn, recurse)
+        self._reset_fp4_parameters()
+        return module
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._reset_fp4_parameters()
+
+    @property
+    def absorbs_silu(self) -> bool:
+        return self._absorb_silu
+
+    @property
+    def absorbs_norm(self) -> bool:
+        return self._absorb_norm
+
+    @property
+    def supports_residual_fusion(self) -> bool:
+        return True
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache_x: torch.Tensor | None = None,
+        *,
+        spatial_padding: tuple[int, int] | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        self._initialize_fp4_parameters()
+        assert self._fp4_pq is not None
+        # When ``_absorb_silu`` (or ``_absorb_norm``), ``x`` is the pre-SiLU (or pre-norm)
+        # activation; SiLU(0)=0 and RMSNorm(0)=0 keep the causal time-pad and in-channel
+        # zero-pad exact under fusion.
+        x = _channels_last_3d_if_needed(x)
+        padding = list(self._padding)
+        if cache_x is not None and self._padding[4] > 0:
+            cache_x = _to_device_if_needed(cache_x, x.device)
+            cache_x = _channels_last_3d_if_needed(cache_x)
+            x = torch.cat([cache_x, x], dim=2)
+            padding[4] -= cache_x.shape[2]
+        if any(padding):
+            x = F.pad(x, padding)
+        x = _channels_last_3d_if_needed(x)
+        if spatial_padding is None:
+            spatial_padding = self.padding[1:]
+        residual_physical = None
+        if residual is not None:
+            residual = _channels_last_3d_if_needed(residual)
+            output_channels = self._fp4_pq["out_channels"]
+            padded_output_channels = self._fp4_pq["padded_out_channels"]
+            if residual.shape[1] != output_channels:
+                raise ValueError(
+                    f"FP4 residual expected {output_channels} channels, got {residual.shape[1]}"
+                )
+            if output_channels < padded_output_channels:
+                residual = F.pad(
+                    residual, (0, 0, 0, 0, 0, 0, 0, padded_output_channels - output_channels)
+                )
+            # A channels-last NCDHW tensor is physically NDHWC, so this permute
+            # is normally a zero-copy view. ``contiguous`` also covers padded
+            # output channels and non-standard callers before entering CuTe.
+            residual_physical = residual.permute(0, 2, 3, 4, 1).contiguous()
+        y = _fp4_conv_run(
+            x,
+            self._fp4_pq,
+            self.stride,
+            (0, *spatial_padding),
+            self.dilation,
+            gs_static=self._fp4_static_gs,
+            fuse_silu=self._absorb_silu,
+            fuse_norm_gamma=self._gamma_cp if self._absorb_norm else None,
+            fuse_norm_scale=self._norm_scale if self._absorb_norm else None,
+            bias=self._fp4_bias,
+            residual=residual_physical,
+        )
+        return _channels_last_3d_if_needed(y)
+
+
+def dequant_fp4_conv_weight(
+    packed_weight: torch.Tensor,
+    block_scales: torch.Tensor,
+    global_scale: torch.Tensor,
+    input_channels: int,
+) -> torch.Tensor:
+    """Dequantize a packed ModelOpt NVFP4 3x3x3 convolution weight."""
+    if input_channels <= 0:
+        raise ValueError(f"input_channels must be positive, got {input_channels}")
+    if packed_weight.ndim < 2 or packed_weight.dtype != torch.uint8:
+        raise ValueError("Packed FP4 convolution weights must be a uint8 tensor with rank >= 2")
+    if global_scale.numel() != 1:
+        raise ValueError("FP4 weight global scale must contain one value")
+    if block_scales.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"FP4 weight block scales must be E4M3, got {block_scales.dtype}")
+
+    output_channels = packed_weight.shape[0]
+    e2m1_values = packed_weight.new_tensor(_FP4_E2M1_VALUES, dtype=torch.float32)
+    low_nibbles = (packed_weight & 0xF).long()
+    high_nibbles = ((packed_weight >> 4) & 0xF).long()
+    values = torch.stack(
+        [e2m1_values[low_nibbles], e2m1_values[high_nibbles]],
+        dim=-1,
+    ).reshape(output_channels, -1)
+    padded_elements = values.shape[1]
+    if padded_elements % _FP4_SF_VEC != 0:
+        raise ValueError(
+            f"Packed FP4 weight width must be divisible by {_FP4_SF_VEC}, got {padded_elements}"
+        )
+    expected_elements = input_channels * 27
+    if padded_elements != expected_elements:
+        raise ValueError(
+            f"Expected {expected_elements} packed FP4 values for a 3x3x3 weight, "
+            f"got {padded_elements}"
+        )
+    expected_block_scales = output_channels * padded_elements // _FP4_SF_VEC
+    if block_scales.numel() != expected_block_scales:
+        raise ValueError(
+            f"Expected {expected_block_scales} FP4 weight block scales, got {block_scales.numel()}"
+        )
+    block_scales = block_scales.reshape(
+        output_channels,
+        padded_elements // _FP4_SF_VEC,
+    )
+    values = (
+        values.reshape(output_channels, padded_elements // _FP4_SF_VEC, _FP4_SF_VEC)
+        * block_scales.float().unsqueeze(-1)
+        * global_scale.float()
+    ).reshape(
+        output_channels,
+        padded_elements,
+    )
+    return values[:, : input_channels * 27]
+
+
+def swap_wan_convs_to_fp4(
+    vae: nn.Module,
+    input_scales: dict[str, float] | None = None,
+    only_names: set[str] | None = None,
+) -> tuple[int, int]:
+    """Replace selected residual-block convolutions with the NVFP4 implementation.
+
+    Args:
+        vae: Native Wan VAE containing the convolutions to replace.
+        input_scales: Calibrated ModelOpt input scales keyed by module name.
+        only_names: Optional set of checkpoint module names that are quantized.
+
+    Returns:
+        The total number of replacements and the number with static input scales.
+    """
+    input_scales = input_scales or {}
+
+    # Calibrated static convs absorb the preceding SiLU, and RMSNorm when its
+    # unbiased form is structurally compatible. Dynamic convs retain the
+    # standalone operations because their activation scale is data-dependent.
+    norm_attr = {"conv1": "norm1", "conv2": "norm2"}
+    replaced = static = 0
+    for name, module in vae.named_modules():
+        if isinstance(module, WanResidualBlock):
+            for attr in ("conv1", "conv2"):
+                conv = getattr(module, attr)
+                if isinstance(conv, WanCausalConv3d) and not isinstance(conv, NVFP4WanCausalConv3d):
+                    conv_name = f"{name}.{attr}"
+                    if only_names is not None and conv_name not in only_names:
+                        continue
+                    input_scale = input_scales.get(conv_name)
+                    gamma = scale = None
+                    norm = getattr(module, norm_attr[attr], None)
+                    if isinstance(norm, WanRMSNorm) and not isinstance(norm.bias, nn.Parameter):
+                        gamma = norm.gamma.detach().reshape(-1)
+                        scale = norm.scale
+                    replacement = NVFP4WanCausalConv3d(
+                        conv,
+                        input_scale=input_scale,
+                        absorb_silu=True,
+                        absorb_norm=True,
+                        norm_gamma=gamma,
+                        norm_scale=scale,
+                    ).to(conv.weight.device, conv.weight.dtype)
+                    replacement.train(conv.training)
+                    setattr(module, attr, replacement)
+                    replaced += 1
+                    static += int(input_scale is not None)
+    return replaced, static
+
+
 class WanRMSNorm(nn.Module):
     def __init__(
         self,
@@ -543,21 +1170,49 @@ class WanResidualBlock(nn.Module):
             raise ValueError("feat_idx is required when feat_cache is provided")
 
         residual = self.conv_shortcut(x)
-        x = self.nonlinearity(self.norm1(x))
+        # conv1/conv2 may fuse SiLU (tier A: pass pre-SiLU=post-norm) or RMSNorm+SiLU (tier B:
+        # pass raw pre-norm) into their NVFP4 quantize. Both commute with the causal cat+pad
+        # (SiLU(0)=RMSNorm(0)=0), so feat_cache holds the pre-fused-op activation.
+        if getattr(self.conv1, "absorbs_norm", False):
+            pass  # conv1 applies norm1 + SiLU
+        elif getattr(self.conv1, "absorbs_silu", False):
+            x = self.norm1(x)  # conv1 applies SiLU
+        else:
+            x = self.nonlinearity(self.norm1(x))
 
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv1, x, feat_cache, feat_idx)
         else:
             x = self.conv1(x)
 
-        x = self.dropout(self.nonlinearity(self.norm2(x)))
-
-        if feat_cache is not None and feat_idx is not None:
-            x = _causal_conv_with_cache(self.conv2, x, feat_cache, feat_idx)
+        if getattr(self.conv2, "absorbs_norm", False):
+            h = x  # conv2 applies norm2 + SiLU
+        elif getattr(self.conv2, "absorbs_silu", False):
+            h = self.norm2(x)  # conv2 applies SiLU
         else:
-            x = self.conv2(x)
+            h = self.nonlinearity(self.norm2(x))
+        x = self.dropout(h)
 
-        return _channels_last_3d_if_needed(x + residual)
+        # Only Conv2 feeds the block residual add. A parallel wrapper advertises
+        # support only when Conv2 emits the rank-local extent directly.
+        fuse_residual = getattr(self.conv2, "supports_residual_fusion", False)
+        if feat_cache is not None and feat_idx is not None:
+            x = _causal_conv_with_cache(
+                self.conv2,
+                x,
+                feat_cache,
+                feat_idx,
+                residual=residual if fuse_residual else None,
+            )
+        else:
+            if fuse_residual:
+                x = self.conv2(x, residual=residual)
+            else:
+                x = self.conv2(x)
+
+        if not fuse_residual:
+            x = x + residual
+        return _channels_last_3d_if_needed(x)
 
 
 class WanAttentionBlock(nn.Module):
