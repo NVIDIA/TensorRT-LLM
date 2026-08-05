@@ -1166,7 +1166,7 @@ class TestFailFastDuringBenchmarkFill:
         ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
         ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
         ex._check_disagg_transfer_progress_when_idle.assert_called_once_with(
-            0, [admitted_req], False, False
+            0, [admitted_req], False, False, False
         )
         ex._handle_errors.assert_not_called()
 

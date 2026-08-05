@@ -155,6 +155,11 @@ _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
+# Per-rank status bits combined (OR across ranks) when deciding how to poll
+# disaggregated generation KV-transfer progress before a forward step.
+DISAGG_GEN_NEED_TRANSFER_PROGRESS = 1
+DISAGG_GEN_HAS_FORWARD_WORK = 2
+
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
     """Return whether an ACK is ready without blocking on recv."""
@@ -2595,7 +2600,8 @@ class PyExecutor:
                         for req in self.active_requests)
                     self._check_disagg_transfer_progress_when_idle(
                         num_fitting_reqs, fitting_disagg_gen_init_requests,
-                        wait_for_disagg_gen_transfer_progress, all_gen_first)
+                        wait_for_disagg_gen_transfer_progress, all_gen_first,
+                        scheduled_batch.batch_size > 0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -3493,10 +3499,15 @@ class PyExecutor:
             return self.dist.tp_allgather(local_status)
         return [local_status]
 
-    def _sync_disagg_gen_status_entry(self, local_need_check: bool) -> int:
+    def _sync_disagg_gen_progress_state(self, local_state: int) -> int:
+        """OR the per-rank disagg gen progress status bits across all ranks.
+
+        BOR is supported by both backends here: MPI object-mode reduction
+        applies Python ``|``, and torch routes CPU scalars to gloo.
+        """
         if self._dist_size(self.dist, "world_size") > 1:
-            return self.dist.allreduce(int(local_need_check), op=ReduceOp.MAX)
-        return int(local_need_check)
+            return self.dist.allreduce(local_state, op=ReduceOp.BOR)
+        return local_state
 
     def _sync_disagg_ctx_status_entry(self, local_need_check: bool) -> int:
         if self._dist_size(self.dist, "cp_size") > 1:
@@ -3509,8 +3520,22 @@ class PyExecutor:
     def _check_disagg_transfer_progress_when_idle(
             self, num_fitting_reqs: int,
             fitting_disagg_gen_init_requests: List[LlmRequest],
-            wait_for_disagg_gen_transfer_progress: bool,
-            all_gen_first: bool) -> None:
+            wait_for_disagg_gen_transfer_progress: bool, all_gen_first: bool,
+            has_forward_work: bool) -> None:
+        """Poll disagg KV-transfer progress between scheduling and forward.
+
+        All ranks branch on the same OR-combined global state, so every rank
+        passes the same ``at_least_request_num`` to the consensus collectives
+        inside ``check_gen_transfer_status``.
+
+        ``has_forward_work`` reflects the final scheduled batch and is the
+        authoritative work signal; ``num_fitting_reqs`` carries
+        scheduler-specific semantics and post-scheduling adjustments can make
+        the two diverge on one rank (e.g. the MixedMamba disagg WAR in
+        ``_schedule``). Whenever any rank can run forward, progress is reaped
+        non-blockingly; the bounded blocking poll is reserved for the globally
+        idle case.
+        """
         local_need_check = (num_fitting_reqs == 0
                             and not fitting_disagg_gen_init_requests)
 
@@ -3523,14 +3548,24 @@ class PyExecutor:
         local_need_gen_check = (local_need_check
                                 and wait_for_disagg_gen_transfer_progress)
 
-        any_need_gen_check = self._sync_disagg_gen_status_entry(
-            local_need_gen_check)
-        if any_need_gen_check > 0:
-            if local_need_gen_check:
-                logger.debug(
-                    "Waiting for generation KV cache transfer progress to "
-                    "free disagg admission budget")
-            self._check_disagg_gen_cache_transfer_status(1)
+        local_state = (DISAGG_GEN_NEED_TRANSFER_PROGRESS if local_need_gen_check
+                       else 0) | (DISAGG_GEN_HAS_FORWARD_WORK
+                                  if has_forward_work else 0)
+        global_state = self._sync_disagg_gen_progress_state(local_state)
+        if global_state & DISAGG_GEN_NEED_TRANSFER_PROGRESS:
+            if global_state & DISAGG_GEN_HAS_FORWARD_WORK:
+                # Some rank has a scheduled batch. Blocking cannot add the
+                # awaited transfers to the already-fixed batch and would stall
+                # decode on every lockstepped rank; reap without blocking.
+                self._check_disagg_gen_cache_transfer_status(0)
+            else:
+                # Globally idle: keep the bounded blocking poll so the loop
+                # does not busy-spin while admission stays blocked.
+                if local_need_gen_check:
+                    logger.debug(
+                        "Waiting for generation KV cache transfer progress to "
+                        "free disagg admission budget")
+                self._check_disagg_gen_cache_transfer_status(1)
             return
 
         any_need_check = self._sync_disagg_ctx_status_entry(local_need_check)
@@ -3700,7 +3735,8 @@ class PyExecutor:
                 for req in self.active_requests)
             self._check_disagg_transfer_progress_when_idle(
                 num_fitting_reqs, admitted_disagg_gen_init_requests,
-                wait_for_disagg_gen_transfer_progress, all_gen_first)
+                wait_for_disagg_gen_transfer_progress, all_gen_first,
+                scheduled_batch.batch_size > 0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the

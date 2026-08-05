@@ -26,7 +26,12 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.py_executor import (
+    DISAGG_GEN_HAS_FORWARD_WORK,
+    DISAGG_GEN_NEED_TRANSFER_PROGRESS,
+    DisaggTransferAdmissionController,
+    PyExecutor,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
@@ -636,7 +641,8 @@ class TestDisaggTransferIdleProgress:
 
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
-    def test_polls_generation_transfer_when_admission_blocked(self):
+    def test_polls_generation_transfer_when_admission_blocked_and_idle(self):
+        """Single rank, admission blocked, nothing to forward: bounded poll."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
@@ -648,15 +654,42 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            has_forward_work=False,
         )
 
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
 
-    def test_peer_rank_enters_bounded_progress_poll(self):
+    def test_same_rank_progress_need_with_forward_work_reaps_nonblocking(self):
+        """NEED and WORK can coexist on one rank when a post-scheduling
+        adjustment shrinks num_fitting_reqs below the final batch (e.g. the
+        MixedMamba disagg WAR in _schedule filters context requests but keeps
+        generation requests). The rank can forward, so it must not block."""
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=True,
+            all_gen_first=False,
+            has_forward_work=True,
+        )
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+
+    def test_peer_backpressure_with_forward_work_reaps_nonblocking(self):
+        """A rank with a scheduled batch must not be dragged into the bounded
+        poll by a peer rank's admission backpressure."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
-        executor.dist.allreduce.return_value = 1
+        executor.dist.allreduce.return_value = (
+            DISAGG_GEN_NEED_TRANSFER_PROGRESS | DISAGG_GEN_HAS_FORWARD_WORK
+        )
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -666,11 +699,35 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            has_forward_work=True,
+        )
+
+        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor.dist.allreduce.assert_called_once_with(
+            DISAGG_GEN_HAS_FORWARD_WORK, op=ReduceOp.BOR
+        )
+
+    def test_peer_backpressure_with_all_ranks_idle_enters_bounded_poll(self):
+        """When no rank can run forward, the bounded blocking poll survives."""
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
+        executor.dist.allreduce.return_value = DISAGG_GEN_NEED_TRANSFER_PROGRESS
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=1,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+            has_forward_work=False,
         )
 
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
-        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
+        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.BOR)
 
     def test_falls_back_to_context_transfer_when_not_generation_blocked(self):
         executor = object.__new__(PyExecutor)
@@ -684,6 +741,7 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=False,
             all_gen_first=False,
+            has_forward_work=False,
         )
 
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
@@ -703,6 +761,7 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            has_forward_work=False,
         )
 
         executor.dist.allreduce.assert_not_called()
@@ -724,6 +783,7 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=True,
             all_gen_first=False,
+            has_forward_work=False,
         )
 
         executor.dist.allreduce.assert_not_called()
@@ -816,7 +876,7 @@ class TestDisaggTransferIdleProgress:
     def test_peer_cp_rank_enters_context_progress_poll(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
-        executor.dist.allreduce.return_value = 0
+        executor.dist.allreduce.return_value = DISAGG_GEN_HAS_FORWARD_WORK
         executor.dist.tp_cp_allgather.return_value = [0, 1, 0, 0]
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
@@ -827,6 +887,7 @@ class TestDisaggTransferIdleProgress:
             fitting_disagg_gen_init_requests=[],
             wait_for_disagg_gen_transfer_progress=False,
             all_gen_first=False,
+            has_forward_work=True,
         )
 
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
