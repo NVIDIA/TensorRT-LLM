@@ -76,6 +76,9 @@ class UtilsSamplingParams:
     min_p: Optional[float] = None
     beam_width_in: Optional[int] = None
     beam_width_out: Optional[int] = None
+    # Rows the forward path allocated per request (static admission width).
+    # Equals beam_width_in unless the request uses a variable beam width array.
+    row_stride: Optional[int] = None
     top_p_decay: Optional[float] = None
     top_p_min: Optional[float] = None
     top_p_reset_ids: Optional[int] = None
@@ -169,6 +172,9 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     top_p_reset_ids = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_p_reset_ids))
     beam_width_out = _get_beam_width_out(request)
     beam_width_in = _get_beam_width_in(request)
+    # ModelEngine lays generation rows out at the static admission width; see
+    # the row_stride note in _beam_step_preprocess.
+    row_stride = 1 if request.is_context_init_state else request.py_beam_width
     use_beam_search = _get_max_beam_width(request) > 1
     length_penalty = _unwrap_singleton(cast(Optional[list[float]], sampling_config.length_penalty))
     beam_search_diversity_rate = _unwrap_singleton(
@@ -183,6 +189,7 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
         min_p=min_p,
         beam_width_in=beam_width_in,
         beam_width_out=beam_width_out,
+        row_stride=row_stride,
         use_beam_search=use_beam_search,
         top_p_decay=top_p_decay,
         top_p_min=top_p_min,
