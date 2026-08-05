@@ -480,7 +480,6 @@ def test_zero_runtime_draft_speculation_after_final_token_reuse(
     speculative_config = Eagle3DecodingConfig(
         max_draft_len=1,
         speculative_model=EAGLE3_MODEL,
-        eagle3_one_model=True,
         # Batch size one drafts one token. Larger batches use the implicit
         # zero-draft schedule entry and therefore exercise this stage's gate.
         draft_len_schedule={1: 1},
