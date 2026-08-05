@@ -140,6 +140,25 @@ class BlockReusePolicy(StrEnum):
     PER_CONVERSATION = "per_conversation"
 
 
+# Number of per-request SWA scratch-range lines emitted at debug level before
+# the manager goes quiet. Enough to eyeball compute_scratch_range on real
+# prompts without flooding a long run.
+_SWA_SCRATCH_DEBUG_LOG_LIMIT = 32
+
+
+def _summarize_ints(values: Sequence[int]) -> str:
+    """Compact "5" / "5 x8" / "5,4096 x7" rendering for a BatchDesc column."""
+    if not values:
+        return "-"
+    runs: List[Tuple[int, int]] = []
+    for v in values:
+        if runs and runs[-1][0] == v:
+            runs[-1] = (v, runs[-1][1] + 1)
+        else:
+            runs.append((v, 1))
+    return ",".join(f"{v}" if n == 1 else f"{v} x{n}" for v, n in runs)
+
+
 def _request_conversation_id(request: LlmRequest) -> Optional[str]:
     if request.is_dummy_request:
         return None
@@ -802,6 +821,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
+        # Budget for the per-request scratch-range debug lines emitted by
+        # _copy_scratch_metadata_to_device. Bounded so a debug-level run does
+        # not turn into one log line per context request forever.
+        self._scratch_debug_budget = _SWA_SCRATCH_DEBUG_LOG_LIMIT
+        self._per_layer_flat_validated = False
         block_reuse_config = kv_cache_config.block_reuse_config
         self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
         self.num_local_layers = len(self.pp_layers)
@@ -1177,6 +1201,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._prepare_page_table_tensor(index_mapper_capacity)
 
         self._log_kv_cache_pool_lifecycle_mapping()
+        self._log_swa_scratch_summary()
 
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         """Return the roles represented by the two page-table index lanes.
@@ -1529,6 +1554,105 @@ class KVCacheManagerV2(BaseResourceManager):
         for entry in entries:
             logger.info(entry)
 
+    @property
+    def has_swa_layers(self) -> bool:
+        """True when at least one layer uses a real sliding window.
+
+        This is the predicate SWA scratch reuse cares about, and it mirrors
+        ``compute_scratch_range``'s own guard (a lifecycle with
+        ``window_size is None`` never yields a scratch range). It is
+        deliberately *not* ``is_vswa``: windows equal to ``max_seq_len`` are
+        normalized to ``None``, so a pure-SWA model (every layer windowed) has
+        ``is_vswa == False`` while benefiting the most from scratch reuse --
+        one lifecycle holds all N windowed layers, so the shared-slot fraction
+        1/N is maximal.
+        """
+        return any(w is not None and w > 0 for w in self.max_attention_window_vec)
+
+    def _swa_scratch_counterfactual_config(self) -> SwaScratchReuseConfig:
+        """The scratch config that is (or would be) in force. Pure sizing input."""
+        return SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
+
+    def _log_swa_scratch_summary(self) -> None:
+        """Report what SWA scratch reuse saves (or would save) on this engine.
+
+        ``_compute_slots_for_batch`` is a pure function of the registered batch
+        shapes, so both sides of the comparison are computable at startup with
+        no GPU work and no workload knowledge. Emitting both makes the feature
+        observable: today enabling scratch only makes ``iter_alloc_new_blocks``
+        drop, with no attribution.
+        """
+        swa_lc_ids = _introspection.swa_life_cycle_ids(self.impl)
+        enabled = self.enable_swa_scratch_reuse
+        if not swa_lc_ids:
+            if enabled:
+                logger.warning(
+                    f"{type(self).__name__}: kv_cache_config.enable_swa_scratch_reuse is "
+                    "enabled but no attention lifecycle has a sliding window "
+                    f"(max_attention_window_vec={self.max_attention_window_vec}); "
+                    "scratch reuse will do nothing."
+                )
+            return
+
+        layers_per_lc: Dict[int, int] = defaultdict(int)
+        window_per_lc: Dict[int, Optional[int]] = {}
+        for layer in self.kv_cache_manager_py_config.layers:
+            lc_id = int(self.impl.get_layer_group_id(layer.layer_id))
+            layers_per_lc[lc_id] += 1
+            window_per_lc[lc_id] = layer.sliding_window_size
+
+        constraints = self.kv_cache_manager_py_config.constraints or []
+        tpb = self.tokens_per_block
+        scratch_config = self._swa_scratch_counterfactual_config()
+
+        logger.info(
+            f"{type(self).__name__} SWA scratch reuse: {'ENABLED' if enabled else 'DISABLED'}"
+        )
+        for lc_id in swa_lc_ids:
+            num_layers = layers_per_lc.get(lc_id, 0)
+            frac = f"1/{num_layers}" if num_layers else "?"
+            logger.info(
+                f"  pool_group={_introspection.pool_group_index(self.impl, lc_id)}  "
+                f"window={window_per_lc.get(lc_id)}  swa_layers={num_layers}  "
+                f"frac_max~={frac}"
+            )
+
+        any_saving = False
+        for idx, batch in enumerate(constraints):
+            without = _introspection.compute_slots_for_batch(self.impl, batch, tpb, None)
+            with_scratch = _introspection.compute_slots_for_batch(
+                self.impl, batch, tpb, scratch_config
+            )
+            capacities = [kv.capacity for kv in batch.kv_caches]
+            histories = [kv.history_length for kv in batch.kv_caches]
+            shape = (
+                f"{len(batch.kv_caches)} req(s), capacity={_summarize_ints(capacities)}, "
+                f"history={_summarize_ints(histories)}"
+            )
+            logger.info(f"  constraint[{idx}] ({shape}):")
+            for pg_idx, (no_s, yes_s) in enumerate(zip(without, with_scratch)):
+                delta = ""
+                if no_s > 0 and yes_s != no_s:
+                    delta = f"   ({(yes_s - no_s) * 100 // no_s}%)"
+                    any_saving = True
+                logger.info(
+                    f"    pool_group={pg_idx}  slots without scratch: {no_s}    "
+                    f"with scratch: {yes_s}{delta}"
+                )
+
+        if constraints and not any_saving:
+            message = (
+                f"{type(self).__name__}: SWA scratch reuse changes no slot count for any "
+                "registered batch shape. Every constraint is decode-shaped or its scratch "
+                "range is empty, so scratch reuse is inert on this configuration "
+                f"(max_num_tokens={self.max_num_tokens}, tokens_per_block={tpb}, "
+                f"windows={[window_per_lc.get(lc) for lc in swa_lc_ids]})."
+            )
+            if enabled:
+                logger.warning(message)
+            else:
+                logger.debug(message)
+
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         pool_ids = torch.empty(
             self.num_attention_op_pools,
@@ -1666,6 +1790,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 if desc is None:
                     continue
                 slot_ids = desc.slot_ids
+                if self._scratch_debug_budget > 0:
+                    self._scratch_debug_budget -= 1
+                    kv_cache = self.kv_cache_map[request_id]
+                    logger.debug(
+                        f"SWA scratch: request={request_id} pool={pool_id} "
+                        f"history_length={kv_cache.history_length} "
+                        f"capacity={kv_cache.capacity} "
+                        f"scratch_range=[{int(desc.range.beg)}, {int(desc.range.end)}) "
+                        f"num_scratch_slots={len(slot_ids)}"
+                    )
                 if len(slot_ids) > self._max_scratch_slots:
                     raise RuntimeError(
                         f"Scratch slot count {len(slot_ids)} exceeds staging capacity "
@@ -1797,19 +1931,16 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 )
 
-                # General and chunked-prefill warmup uses one fresh context request
-                # at the per-iteration token budget.
-                if self.max_num_tokens is not None:
-                    constraints.append(
-                        BatchDesc(
-                            [
-                                KVCacheDesc(
-                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
-                                    history_length=0,
-                                )
-                            ]
-                        )
-                    )
+            # General and chunked-prefill warmup runs one iteration at the
+            # per-iteration token budget. Every input here is engine
+            # configuration -- no workload knowledge -- and warmup exercises
+            # exactly this shape, so the constraint is registered regardless of
+            # whether avg_seq_len was supplied. Without it, a model that does
+            # not set avg_seq_len gets no prefill BatchDesc at all: the SWA pool
+            # is then sized from swa_floor_blocks alone (only ~window-sized,
+            # silently below the real prefill requirement) and SWA scratch reuse
+            # has no prefill shape to shrink.
+            constraints.extend(self._prefill_constraints())
 
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -1882,6 +2013,29 @@ class KVCacheManagerV2(BaseResourceManager):
         """Customize the general cache config for a specialized cache manager."""
         return config
 
+    def _prefill_constraints(self) -> List[BatchDesc]:
+        """Batch shapes the engine must be able to run during prefill.
+
+        One fresh context request at the per-iteration token budget. Note this
+        models the budget as a single request; when ``max_num_tokens`` exceeds
+        ``max_seq_len`` the real iteration is several shorter requests, which
+        needs *more* windowed slots than modelled here. That stays a
+        conservative under-count rather than an over-provision, and refining it
+        is a separate sizing change.
+        """
+        if self.max_num_tokens is None:
+            return []
+        return [
+            BatchDesc(
+                [
+                    KVCacheDesc(
+                        capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                        history_length=0,
+                    )
+                ]
+            )
+        ]
+
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
         """Return the configured typical sequence length, if any."""
         return kv_cache_config.avg_seq_len
@@ -1942,17 +2096,107 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return self.impl.get_page_index_upper_bound(0, Role.KEY)
 
-    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def _page_index_upper_bound(self, local_layer_idx: int, index_mode: PageIndexMode) -> int:
+        """Page-index extent for a layer under the given addressing mode.
+
+        ``get_page_index_upper_bound`` is SHARED-shaped: it subtracts the
+        layer's sub-page offset because the base pointer already skipped it.
+        PER_LAYER bases at the pool group, so the layer offset is addressable
+        and must be added back.
+        """
+        upper = self.impl.get_page_index_upper_bound(local_layer_idx, Role.KEY)
+        if index_mode == PageIndexMode.SHARED:
+            return upper
+        return upper + int(
+            self.impl.get_page_index_converter(local_layer_idx, Role.KEY).layer_offset
+        )
+
+    def _validate_per_layer_kv_adjacency(self) -> None:
+        """Check the layout assumptions PER_LAYER page indices rely on.
+
+        A FlashInfer-style page table carries *one* index per block plus a
+        ``kv_factor`` axis, so it can only address K and V if V sits exactly one
+        sub-page after K and K starts on a ``kv_factor`` boundary. The
+        AttentionOp path needs neither property (it carries separate K and V
+        indices), so this is checked only where it is relied upon. Under scratch
+        rotation the index becomes ``(offset + layer_offset) % scale``, which
+        preserves both properties only when ``scale`` and the per-block scratch
+        stride are multiples of ``kv_factor``.
+        """
+        if self._per_layer_flat_validated:
+            return
+        self._per_layer_flat_validated = True
+        if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
+            # kv_factor == 1: one sub-page per block, so there is no K/V pairing
+            # to preserve and every index divides through unchanged.
+            return
+        for local_layer_idx in range(self.num_local_layers):
+            layer_id = LayerId(local_layer_idx)
+            conv_k = self.impl.get_page_index_converter(layer_id, Role.KEY)
+            conv_v = self.impl.get_page_index_converter(layer_id, Role.VALUE)
+            problems = []
+            if int(conv_v.layer_offset) != int(conv_k.layer_offset) + 1:
+                problems.append(
+                    f"V sub-page {int(conv_v.layer_offset)} is not adjacent to K "
+                    f"{int(conv_k.layer_offset)}"
+                )
+            if int(conv_k.layer_offset) % self.kv_factor != 0:
+                problems.append(
+                    f"K sub-page {int(conv_k.layer_offset)} is not {self.kv_factor}-aligned"
+                )
+            if int(conv_k.scale) % self.kv_factor != 0:
+                problems.append(f"slot scale {int(conv_k.scale)} is not {self.kv_factor}-aligned")
+            if int(conv_k.scratch_pages_per_block) % self.kv_factor != 0:
+                problems.append(
+                    f"scratch stride {int(conv_k.scratch_pages_per_block)} is not "
+                    f"{self.kv_factor}-aligned"
+                )
+            if conv_k.expansion != 1 or conv_v.expansion != 1:
+                problems.append("expanded page indices are not supported")
+            if problems:
+                raise NotImplementedError(
+                    f"SWA scratch reuse cannot produce a flat per-layer page table for local "
+                    f"layer {local_layer_idx}: {'; '.join(problems)}. Set "
+                    "kv_cache_config.enable_swa_scratch_reuse=False, or use an attention "
+                    "backend that consumes copy_batch_block_offsets (which carries separate "
+                    "K and V indices)."
+                )
+
+    def get_buffers(
+        self,
+        layer_idx: int,
+        kv_layout: str = "NHD",
+        index_mode: PageIndexMode = PageIndexMode.SHARED,
+    ) -> Optional[torch.Tensor]:
+        """Wrap this layer's KV pages as a tensor addressable by page index.
+
+        ``index_mode`` selects the addressing contract, and must match the mode
+        used to build the page indices handed to the kernel:
+
+        - ``SHARED``: base pointer is this layer's own sub-page, so the index
+          carries no layer offset. This is the historical behavior.
+        - ``PER_LAYER``: base pointer is the pool-group base and the index
+          carries the layer offset. Required whenever SWA scratch reuse is
+          active, because a scratch block's sub-page position rotates with the
+          block position and therefore cannot be folded into a fixed pointer.
+        """
         layer_offset = self.layer_offsets[layer_idx]
-        addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
+        addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, index_mode)
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            addr_value = self.impl.get_mem_pool_base_address(
-                layer_offset, Role.VALUE, PageIndexMode.SHARED
-            )
             page_size_key = self.impl.get_page_stride(layer_offset, Role.KEY)
             page_size_value = self.impl.get_page_stride(layer_offset, Role.VALUE)
-
-            assert addr_key + page_size_value == addr_value and page_size_key == page_size_value
+            if index_mode == PageIndexMode.SHARED:
+                addr_value = self.impl.get_mem_pool_base_address(
+                    layer_offset, Role.VALUE, index_mode
+                )
+                assert addr_key + page_size_value == addr_value and page_size_key == page_size_value
+            else:
+                # PER_LAYER shares one base pointer for both roles; K/V are
+                # distinguished by the layer offset carried in the index. The
+                # kv_factor axis of this tensor still assumes V sits one
+                # sub-page after K, which _validate_per_layer_kv_adjacency
+                # checks up front.
+                assert page_size_key == page_size_value
 
         assert kv_layout in ["NHD", "HND"], f"Unsupported kv_layout: {kv_layout}"
 
@@ -1965,7 +2209,7 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_head_dim = self.head_dim_per_layer[layer_offset]
         if kv_layout == "NHD":
             shape = [
-                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) // self.kv_factor,
+                self._page_index_upper_bound(layer_offset, index_mode) // self.kv_factor,
                 self.kv_factor,
                 self.tokens_per_block,
                 self.num_kv_heads_per_layer[layer_offset],
@@ -1973,7 +2217,7 @@ class KVCacheManagerV2(BaseResourceManager):
             ]
         else:
             shape = [
-                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) // self.kv_factor,
+                self._page_index_upper_bound(layer_offset, index_mode) // self.kv_factor,
                 self.kv_factor,
                 self.num_kv_heads_per_layer[layer_offset],
                 self.tokens_per_block,
@@ -3030,6 +3274,20 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
+        # This flat view maps BAD_PAGE_INDEX to block 0. A scratch block holds no
+        # per-block page, so its base page index *is* BAD_PAGE_INDEX and would be
+        # silently rewritten to block 0 -- the consumer (flash_mla) would then read
+        # the wrong KV. Per-layer scratch slot ids only travel through
+        # copy_batch_block_offsets, so fail loudly instead.
+        if self.enable_swa_scratch_reuse:
+            for request_id in request_ids:
+                if self.kv_cache_map[request_id].has_scratch_slots:
+                    raise RuntimeError(
+                        f"get_block_ids_per_seq() is not compatible with SWA scratch "
+                        f"reuse: request {request_id} holds scratch slots whose per-layer "
+                        "page ids are not representable in a flat block-id table. Set "
+                        "kv_cache_config.enable_swa_scratch_reuse=False for this backend."
+                    )
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
         block_ids_per_seq_tensors = [
             torch.tensor(
@@ -3348,7 +3606,65 @@ class KVCacheManagerV2(BaseResourceManager):
         # get_batch_cache_indices.
         valid = out != BAD_PAGE_INDEX
         np.copyto(out, out * scale // div_factor, where=valid)
+
+        if self.enable_swa_scratch_reuse and layer_idx is not None:
+            self._apply_scratch_to_flat_indices(
+                out, request_ids, num_blocks, layer_idx, pool_id, scale, div_factor
+            )
         return out_tensor
+
+    def _apply_scratch_to_flat_indices(
+        self,
+        out: "np.ndarray",
+        request_ids: List[int],
+        num_blocks: List[int],
+        layer_idx: int,
+        pool_id: int,
+        scale: int,
+        div_factor: int,
+    ) -> None:
+        """Overwrite scratch blocks in a flat page table with PER_LAYER indices.
+
+        A scratch block holds no per-block page, so the base-index transform
+        above left it at BAD_PAGE_INDEX. Its real address is a rotating
+        sub-page inside a shared slot -- the same arithmetic
+        ``_copy_swa_block_offsets_with_scratch_compiled`` performs on device for
+        the AttentionOp path, applied here on the host for one layer.
+
+        Non-scratch blocks also gain ``layer_offset``, because the caller is
+        addressing the pool-group base (PER_LAYER), not this layer's sub-page.
+        """
+        # Checked lazily: only a flat page table needs K/V adjacency, so
+        # backends that consume copy_batch_block_offsets are never subjected
+        # to this restriction.
+        self._validate_per_layer_kv_adjacency()
+        converter = self.impl.get_page_index_converter(self.layer_offsets[layer_idx], Role.KEY)
+        layer_offset = int(converter.layer_offset)
+        scratch_pages = int(converter.scratch_pages_per_block)
+        offset = 0
+        for req_id, n in zip(request_ids, num_blocks):
+            desc = self.kv_cache_map[req_id].get_scratch_desc(pool_id)
+            if desc is None:
+                # Non-scratch request: only the layer offset is missing.
+                out[offset : offset + n] = np.where(
+                    out[offset : offset + n] != BAD_PAGE_INDEX,
+                    out[offset : offset + n] + layer_offset // div_factor,
+                    BAD_PAGE_INDEX,
+                )
+                offset += n
+                continue
+            beg, end = int(desc.range.beg), int(desc.range.end)
+            slot_ids = desc.slot_ids
+            for ordinal in range(n):
+                pos = offset + ordinal
+                if beg <= ordinal < end:
+                    total = (ordinal - beg) * scratch_pages
+                    slot_id = int(slot_ids[total // scale])
+                    sub = (total % scale + layer_offset) % scale
+                    out[pos] = (slot_id * scale + sub) // div_factor
+                elif out[pos] != BAD_PAGE_INDEX:
+                    out[pos] += layer_offset // div_factor
+            offset += n
 
     def get_cache_bytes_per_token(self) -> int:
         data_roles = [Role.KEY]

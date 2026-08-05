@@ -89,6 +89,11 @@ struct KVCacheIterationStatsDelta
     int64_t iterIntraDeviceCopyBytes = 0;
     int64_t iterHostDroppedBlocks = 0;
     int64_t iterHostDroppedBytes = 0;
+    // SWA scratch reuse: blocks served from shared scratch sub-pages this iteration, and the
+    // scratch slots those blocks actually consumed. Scratch blocks are excluded from iterAlloc*
+    // by design, so these two counters are the only attribution for the saving.
+    int64_t iterScratchBlocks = 0;
+    int64_t iterScratchSlots = 0;
 
     void add(KVCacheIterationStatsDelta const& other) noexcept
     {
@@ -107,6 +112,8 @@ struct KVCacheIterationStatsDelta
         iterIntraDeviceCopyBytes += other.iterIntraDeviceCopyBytes;
         iterHostDroppedBlocks += other.iterHostDroppedBlocks;
         iterHostDroppedBytes += other.iterHostDroppedBytes;
+        iterScratchBlocks += other.iterScratchBlocks;
+        iterScratchSlots += other.iterScratchSlots;
     }
 
     void subtract(KVCacheIterationStatsDelta const& other) noexcept
@@ -126,6 +133,8 @@ struct KVCacheIterationStatsDelta
         iterIntraDeviceCopyBytes -= other.iterIntraDeviceCopyBytes;
         iterHostDroppedBlocks -= other.iterHostDroppedBlocks;
         iterHostDroppedBytes -= other.iterHostDroppedBytes;
+        iterScratchBlocks -= other.iterScratchBlocks;
+        iterScratchSlots -= other.iterScratchSlots;
     }
 
     void clear() noexcept
@@ -144,7 +153,8 @@ struct KVCacheIterationStatsDelta
             && iterFullReusedBlocks == 0 && iterPartialReusedBlocks == 0 && iterMissedBlocks == 0
             && iterGenAllocBlocks == 0 && iterOnboardBlocks == 0 && iterOnboardBytes == 0 && iterOffloadBlocks == 0
             && iterOffloadBytes == 0 && iterIntraDeviceCopyBlocks == 0 && iterIntraDeviceCopyBytes == 0
-            && iterHostDroppedBlocks == 0 && iterHostDroppedBytes == 0;
+            && iterHostDroppedBlocks == 0 && iterHostDroppedBytes == 0 && iterScratchBlocks == 0
+            && iterScratchSlots == 0;
     }
 
     [[nodiscard]] double iterCacheHitRate() const noexcept
@@ -168,7 +178,8 @@ struct KVCacheIterationStatsDelta
             && iterIntraDeviceCopyBlocks == other.iterIntraDeviceCopyBlocks
             && iterIntraDeviceCopyBytes == other.iterIntraDeviceCopyBytes
             && iterHostDroppedBlocks == other.iterHostDroppedBlocks
-            && iterHostDroppedBytes == other.iterHostDroppedBytes;
+            && iterHostDroppedBytes == other.iterHostDroppedBytes && iterScratchBlocks == other.iterScratchBlocks
+            && iterScratchSlots == other.iterScratchSlots;
     }
 };
 

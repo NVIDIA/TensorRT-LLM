@@ -136,7 +136,14 @@ def test_pool_ratio_overrides_constraints() -> None:
     assert config.constraints == []
 
 
-def test_default_uses_allocator_fallback() -> None:
+def test_prefill_constraint_registered_without_avg_seq_len() -> None:
+    """The chunked-prefill constraint must not be gated behind avg_seq_len.
+
+    Regression lock: when this constraint is missing, StorageManager falls back
+    to a DECODE-shaped BatchDesc whose scratch range is provably empty, so SWA
+    scratch reuse is inert for every model that does not set avg_seq_len, and
+    the SWA pool is sized from swa_floor_blocks alone.
+    """
     config = _make_cache_config_for_test(
         KvCacheConfig(host_cache_size=0),
         max_batch_size=3,
@@ -146,7 +153,31 @@ def test_default_uses_allocator_fallback() -> None:
     )
 
     assert config.initial_pool_ratio is None
+    # typical_step stays opt-in: it needs avg_seq_len, which is workload knowledge.
     assert config.typical_step is None
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])]
+
+
+def test_prefill_constraint_includes_extra_kv_tokens() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0),
+        max_batch_size=3,
+        max_seq_len=1024,
+        max_num_tokens=2048,
+        num_extra_kv_tokens=4,
+    )
+
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2052, history_length=0)])]
+
+
+def test_no_prefill_constraint_without_max_num_tokens() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0),
+        max_batch_size=3,
+        max_seq_len=1024,
+        max_num_tokens=None,
+    )
+
     assert config.constraints == []
 
 

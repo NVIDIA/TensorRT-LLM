@@ -276,6 +276,21 @@ class Gemma3TextModel(DecoderModel):
 class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                                                 Gemma3TextConfig]):
 
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        """Gemma3 interleaves sliding_attention and full_attention layers.
+
+        Every windowed layer writes KV for the whole prefill chunk but only the
+        last `sliding_window` tokens are ever read back, so SWA scratch reuse
+        hands the out-of-window portion shared sub-pages instead of dedicated
+        pages. It is a no-op on the V1 KV cache manager.
+        """
+        return {
+            "kv_cache_config": {
+                "enable_swa_scratch_reuse": True,
+            }
+        }
+
     def __init__(
         self,
         model_config: ModelConfig[Gemma3TextConfig],

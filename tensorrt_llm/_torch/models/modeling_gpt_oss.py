@@ -553,6 +553,21 @@ class Transformer(DecoderModel):
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
     @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        """GPT-OSS alternates sliding-window and full-attention layers.
+
+        Every windowed layer writes KV for the whole prefill chunk but only the
+        last `sliding_window` tokens are ever read back, so SWA scratch reuse
+        hands the out-of-window portion shared sub-pages instead of dedicated
+        pages. It is a no-op on the V1 KV cache manager.
+        """
+        return {
+            "kv_cache_config": {
+                "enable_swa_scratch_reuse": True,
+            }
+        }
+
+    @classmethod
     def get_preferred_transceiver_runtime(
         cls,
         pretrained_config: Any = None,

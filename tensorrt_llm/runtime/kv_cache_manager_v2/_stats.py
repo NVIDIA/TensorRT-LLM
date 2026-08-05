@@ -69,6 +69,13 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
     # _storage_manager._prepare_free_slots when is_last_level(lvl).
     iter_host_dropped_blocks: int = 0
     iter_host_dropped_bytes: int = 0
+    # SWA scratch reuse: blocks served from shared scratch sub-pages this
+    # iteration, and the scratch slots those blocks actually consumed. Scratch
+    # blocks are excluded from iter_alloc_* by design (they take no per-request
+    # KV page), so without these two counters enabling scratch just makes
+    # iter_alloc_new_blocks drop with no attribution.
+    iter_scratch_blocks: int = 0
+    iter_scratch_slots: int = 0
 
     @property
     def iter_cache_hit_rate(self) -> float:

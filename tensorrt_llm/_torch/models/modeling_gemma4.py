@@ -1256,9 +1256,17 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         FlashInfer backend is required for hybrid attention (per-layer
         head_dim 256/512 with VSWA), trtllm-gen cubin dispatch, and
         bidirectional attention masks for multimodal tokens.
+
+        Gemma4 interleaves sliding and global attention, so SWA scratch reuse
+        gives the windowed layers shared sub-pages for the prefill blocks that
+        are already out of window. FlashInfer addresses those through the
+        PER_LAYER page-index path; it is a no-op on the V1 KV cache manager.
         """
         return {
             "attn_backend": "FLASHINFER",
+            "kv_cache_config": {
+                "enable_swa_scratch_reuse": True,
+            },
         }
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
