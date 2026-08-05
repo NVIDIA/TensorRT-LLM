@@ -477,6 +477,10 @@ class TestCosmos3TransformerCheckpoint:
 # --- CPU-only coverage: checkpoint config schema compatibility ---
 
 
+# Distinguishes "attribute absent" from "attribute present and None".
+_OMITTED = object()
+
+
 class TestConfigCompatDefaults:
     """Newer diffusers conversions omit fields older ones carried explicitly."""
 
@@ -506,10 +510,15 @@ class TestConfigCompatDefaults:
         apply_pretrained_config_compat_defaults(config)
         assert vars(config) == snapshot
 
-    @pytest.mark.parametrize("rope_scaling", [None, {}], ids=["absent", "empty"])
-    def test_rope_type_tolerates_missing_rope_scaling(self, rope_scaling):
+    @pytest.mark.parametrize("rope_scaling", [_OMITTED, None, {}], ids=["omitted", "none", "empty"])
+    def test_rope_type_tolerates_missing_rope_scaling(self, rope_scaling: object) -> None:
         """``rope_axes_dim`` alone is a supported shape, so reading ``rope_type``
-        must not fail before ``resolve_rope_axes_dim`` gets to honour it."""
+        must not fail before ``resolve_rope_axes_dim`` gets to honour it.
+
+        ``omitted`` leaves the attribute off entirely, which is the case the
+        ``getattr(..., None)`` guard exists for; ``none``/``empty`` only reach the
+        ``or {}`` half.
+        """
         from tensorrt_llm._torch.visual_gen.models.cosmos3 import transformer_cosmos3 as tf
 
         config = SimpleNamespace(
@@ -518,8 +527,10 @@ class TestConfigCompatDefaults:
             rope_axes_dim=[4, 2, 2],
             rope_theta=10000.0,
             max_position_embeddings=128,
-            rope_scaling=rope_scaling,
         )
+        if rope_scaling is not _OMITTED:
+            config.rope_scaling = rope_scaling
+        assert hasattr(config, "rope_scaling") is (rope_scaling is not _OMITTED)
         apply_pretrained_config_compat_defaults(config)
         # Construct for real: the point is that __init__ reaches the resolver
         # instead of raising AttributeError on the missing block.
