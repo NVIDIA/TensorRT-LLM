@@ -13,19 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import fcntl
 import os
-import tempfile
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from mpi4py.futures import server
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi import mpi_session
 
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
 _FLASHINFER_CUBIN_ENV = "FLASHINFER_CUBIN_DIR"
+_FLASHINFER_ISOLATION_ENV = "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS"
 pytestmark = pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
 
 
@@ -34,30 +35,55 @@ def _worker_flashinfer_env() -> tuple[str | None, str | None]:
     return (os.environ.get(_FLASHINFER_WORKSPACE_ENV), os.environ.get(_FLASHINFER_CUBIN_ENV))
 
 
-def _run_worker_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+def _run_worker_bootstrap(monkeypatch: pytest.MonkeyPatch, workspace_root: Path) -> None:
+    from mpi4py.futures import server
+
+    monkeypatch.setattr(sys, "argv", ["-c", str(workspace_root)])
     monkeypatch.setattr(server, "main", lambda: None)
     exec(mpi_session._FLASHINFER_WORKER_BOOTSTRAP, {})
 
 
-def test_worker_bootstrap_uses_rank_and_pid(
+def test_worker_bootstrap_reuses_rank_workspace_and_releases_lock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
-    workspace = tmp_path / f"trtllm-flashinfer-0-{os.getpid()}"
-    prefixes = []
+    monkeypatch.delenv(_FLASHINFER_CUBIN_ENV, raising=False)
 
-    def fake_mkdtemp(prefix: str) -> str:
-        prefixes.append(prefix)
-        return str(workspace)
-
-    monkeypatch.setattr(tempfile, "mkdtemp", fake_mkdtemp)
-
-    _run_worker_bootstrap(monkeypatch)
+    _run_worker_bootstrap(monkeypatch, tmp_path)
 
     rank = mpi_session.mpi4py.MPI.COMM_WORLD.Get_rank()
-    assert prefixes == [f"trtllm-flashinfer-{rank}-{os.getpid()}-"]
+    workspace = tmp_path / f"rank-{rank}"
     assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(workspace)
-    assert not workspace.exists()
+    assert workspace.is_dir()
+    assert os.environ[_FLASHINFER_CUBIN_ENV] == str(
+        Path.home() / ".cache" / "flashinfer" / "cubins"
+    )
+
+    with (workspace / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+    monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV)
+    _run_worker_bootstrap(monkeypatch, tmp_path)
+
+    assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(workspace)
+
+
+def test_worker_bootstrap_uses_unlocked_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
+    rank = mpi_session.mpi4py.MPI.COMM_WORLD.Get_rank()
+    world_size = mpi_session.mpi4py.MPI.COMM_WORLD.Get_size()
+    occupied_workspace = tmp_path / f"rank-{rank}"
+    occupied_workspace.mkdir()
+
+    with (occupied_workspace / ".lock").open("a") as occupied_lock:
+        fcntl.flock(occupied_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _run_worker_bootstrap(monkeypatch, tmp_path)
+        fcntl.flock(occupied_lock, fcntl.LOCK_UN)
+
+    assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(tmp_path / f"rank-{rank + world_size}")
 
 
 def test_worker_bootstrap_preserves_explicit_workspace(
@@ -66,7 +92,7 @@ def test_worker_bootstrap_preserves_explicit_workspace(
     explicit_workspace = tmp_path / "explicit"
     monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, str(explicit_workspace))
 
-    _run_worker_bootstrap(monkeypatch)
+    _run_worker_bootstrap(monkeypatch, tmp_path)
 
     assert os.environ[_FLASHINFER_WORKSPACE_ENV] == str(explicit_workspace)
 
@@ -75,7 +101,15 @@ def test_worker_bootstrap_preserves_explicit_workspace(
     "n_workers, env_overrides, expected",
     [
         (1, {}, None),
-        (4, {}, ["-c", mpi_session._FLASHINFER_WORKER_BOOTSTRAP]),
+        (
+            4,
+            {},
+            [
+                "-c",
+                mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
+                mpi_session._FLASHINFER_WORKSPACE_ROOT,
+            ],
+        ),
         (4, {"TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS": "0"}, None),
         (4, {_FLASHINFER_WORKSPACE_ENV: "/explicit"}, None),
     ],
@@ -86,6 +120,12 @@ def test_mpi_pool_configures_worker_bootstrap(
     env_overrides: dict[str, str],
     expected: list[str] | None,
 ) -> None:
+    for name in (
+        _FLASHINFER_WORKSPACE_ENV,
+        _FLASHINFER_CUBIN_ENV,
+        _FLASHINFER_ISOLATION_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
     captured: dict[str, object] = {}
 
     class FakeMpiPoolExecutor:
@@ -105,8 +145,6 @@ def test_mpi_pool_configures_worker_bootstrap(
     env = captured["env"]
     assert isinstance(env, dict)
     assert all(env[key] == value for key, value in env_overrides.items())
-    if expected:
-        assert env[_FLASHINFER_CUBIN_ENV].endswith("/.cache/flashinfer/cubins")
 
 
 def test_mpi_pool_shares_cubins_but_isolates_workspaces(
@@ -114,6 +152,8 @@ def test_mpi_pool_shares_cubins_but_isolates_workspaces(
 ) -> None:
     monkeypatch.delenv(_FLASHINFER_WORKSPACE_ENV, raising=False)
     monkeypatch.setenv(_FLASHINFER_CUBIN_ENV, str(tmp_path / "cubins"))
+    workspace_root = tmp_path / "workspaces"
+    monkeypatch.setattr(mpi_session, "_FLASHINFER_WORKSPACE_ROOT", str(workspace_root))
     session = mpi_session.MpiPoolSession(n_workers=2)
     try:
         worker_envs = session.submit_sync(_worker_flashinfer_env)
@@ -122,6 +162,8 @@ def test_mpi_pool_shares_cubins_but_isolates_workspaces(
 
     workspaces = {workspace for workspace, _ in worker_envs}
     assert len(workspaces) == 2
+    assert all(Path(workspace).is_dir() for workspace in workspaces)
+    assert all(Path(workspace).parent == workspace_root for workspace in workspaces)
     assert all(cubin == str(tmp_path / "cubins") for _, cubin in worker_envs)
 
 

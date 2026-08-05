@@ -31,15 +31,55 @@ if ENABLE_MULTI_DEVICE:
 
 T = TypeVar("T")
 
-_FLASHINFER_WORKER_BOOTSTRAP = (
-    "import os,shutil,tempfile;"
-    "from mpi4py import MPI;"
-    "workspace=tempfile.mkdtemp("
-    "prefix=f'trtllm-flashinfer-{MPI.COMM_WORLD.Get_rank()}-{os.getpid()}-');"
-    "os.environ.setdefault('FLASHINFER_WORKSPACE_BASE',workspace);"
-    "from mpi4py.futures.server import main\n"
-    "try:main()\n"
-    "finally:shutil.rmtree(workspace,ignore_errors=True)")
+_FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
+_FLASHINFER_WORKER_BOOTSTRAP = """
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+from mpi4py import MPI
+
+workspace_lock = None
+if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
+    workspace_root = Path(sys.argv[1]).expanduser()
+
+    rank = MPI.COMM_WORLD.Get_rank()
+    slot = rank
+    slot_stride = MPI.COMM_WORLD.Get_size()
+    # Reuse the rank's cache when possible. Concurrent pools with the same
+    # rank skip locked slots in world-size strides, keeping every worker apart.
+    while True:
+        workspace = workspace_root / f"rank-{slot}"
+        workspace.mkdir(parents=True, exist_ok=True)
+        workspace_lock = (workspace / ".lock").open("a")
+        try:
+            fcntl.flock(workspace_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            workspace_lock.close()
+            slot += slot_stride
+
+    # Preserve FlashInfer 0.6.15's default cubin cache before changing its
+    # workspace base. Importing flashinfer.jit.env here would initialize all
+    # of its workspace constants before the isolated base is configured.
+    os.environ.setdefault(
+        "FLASHINFER_CUBIN_DIR",
+        str(Path.home() / ".cache" / "flashinfer" / "cubins"),
+    )
+    os.environ["FLASHINFER_WORKSPACE_BASE"] = str(workspace)
+
+from mpi4py.futures.server import main
+
+# Hold the lock for the server's lifetime. The kernel also releases it when a
+# worker exits abnormally, so a later launch can safely reuse the cache slot.
+try:
+    main()
+finally:
+    if workspace_lock is not None:
+        fcntl.flock(workspace_lock, fcntl.LOCK_UN)
+        workspace_lock.close()
+"""
 
 
 class MPINodeState:
@@ -451,14 +491,9 @@ class MpiPoolSession(MpiSession):
         isolate_workspace = (self.n_workers > 1 and env.get(
             "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
                              and "FLASHINFER_WORKSPACE_BASE" not in env)
-        if isolate_workspace:
-            # Keep downloaded cubins shared; only generated JIT sources race.
-            env.setdefault(
-                "FLASHINFER_CUBIN_DIR",
-                os.path.join(os.path.expanduser("~"), ".cache", "flashinfer",
-                             "cubins"))
-        python_args = (["-c", _FLASHINFER_WORKER_BOOTSTRAP]
-                       if isolate_workspace else None)
+        python_args = ([
+            "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
+        ] if isolate_workspace else None)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env,
