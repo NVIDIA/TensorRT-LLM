@@ -12,8 +12,9 @@ from typing import Any, Callable, Optional
 import torch
 from cuda.bindings import runtime as rt
 
+from tensorrt_llm._utils import CUASSERT
+
 from ...utils import make_weak_ref
-from .cuda_utils import check_cuda_errors
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ def get_current_replay_token() -> Optional[int]:
 
 
 def _capture_status(stream_ptr: int) -> rt.cudaStreamCaptureStatus:
-    status, *_ = check_cuda_errors(rt.cudaStreamGetCaptureInfo(stream_ptr))
+    status, *_ = CUASSERT(rt.cudaStreamGetCaptureInfo(stream_ptr))
     return status
 
 
