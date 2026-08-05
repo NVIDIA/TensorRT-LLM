@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Unit tests for sparse attention with TrtllmAttention backend.
+"""Unit tests for sparse attention with the ``TrtllmAttention`` backend.
+
+The ``mqa_gqa`` sparse parameters below exercise the internal token-sparse
+TRTLLM-Gen kernel directly. They are intentionally a test stub, not a public
+``SparseAttentionConfig`` algorithm.
 """
 
 import math
@@ -46,20 +49,26 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, Trtllm
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
+from tensorrt_llm._utils import is_sm_100f, str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 ATOL = 2e-2
 RTOL = 2e-2
 
+requires_sparse_mqa_gqa = pytest.mark.skipif(
+    not is_sm_100f(getSMVersion()),
+    reason="Sparse MQA/GQA requires an SM100-family GPU (SM100 or SM103)",
+)
+
 
 @dataclass(kw_only=True, frozen=False)
 class SparseScenario:
     """Base configuration for sparse attention tests.
 
-    NOTE: SparseMqaGqa trtllm-gen cubins are currently only available for BF16.
-    FP16 cubins have not been generated yet, so tests default to BF16.
+    Sparse MQA/GQA uses the TRTLLM-Gen NVRTC path on current main. BF16 is the
+    default for the broad scenario coverage; a focused matrix below also
+    covers FP16 and every supported equal QK/V head dimension.
     """
 
     dtype: torch.dtype = torch.bfloat16
@@ -958,7 +967,7 @@ def _build_reference_kv_cache(
     return k_cache_ref, v_cache_ref
 
 
-@pytest.mark.skipif(getSMVersion() < 100, reason="Sparse MQA/GQA requires SM100 (Blackwell)")
+@requires_sparse_mqa_gqa
 @pytest.mark.parametrize(
     "s",
     [
@@ -1022,7 +1031,7 @@ def test_context_sparse_kv(s: SparseContextScenario):
     kv_cache_manager.shutdown()
 
 
-@pytest.mark.skipif(getSMVersion() < 100, reason="Sparse MQA/GQA requires SM100 (Blackwell)")
+@requires_sparse_mqa_gqa
 @pytest.mark.parametrize(
     "s",
     [
@@ -1058,6 +1067,28 @@ def test_context_sparse_kv(s: SparseContextScenario):
             past_kv_lens=(128, 256),
             num_pages=16,
         ),
+        SparseGenerationScenario(
+            num_heads=8,
+            num_kv_heads=4,
+            batch_size=2,
+            past_kv_lens=(128, 256),
+            num_pages=16,
+        ),
+        # Maximum supported query-head group size
+        SparseGenerationScenario(
+            num_heads=32,
+            num_kv_heads=1,
+            batch_size=1,
+            past_kv_lens=(128,),
+            num_pages=8,
+        ),
+        SparseGenerationScenario(
+            num_heads=64,
+            num_kv_heads=2,
+            batch_size=1,
+            past_kv_lens=(128,),
+            num_pages=8,
+        ),
         # topk: minimum (4), topk exceeding some past_kv_lens
         SparseGenerationScenario(
             batch_size=1,
@@ -1092,6 +1123,9 @@ def test_context_sparse_kv(s: SparseContextScenario):
         "batch3_var_kv",
         "mqa_8q1kv",
         "gqa_16q4kv",
+        "gqa_8q4kv",
+        "mqa_group32_boundary",
+        "gqa_group32_boundary",
         "topk4_min",
         "topk128_exceeds_some",
         "batch8_varied",
@@ -1100,6 +1134,11 @@ def test_context_sparse_kv(s: SparseContextScenario):
 )
 def test_generation_sparse_attention(s: SparseGenerationScenario):
     """Test generation phase with sparse attention computation."""
+    _run_generation_sparse_attention(s)
+
+
+def _run_generation_sparse_attention(s: SparseGenerationScenario):
+    """Run a generation scenario and compare the sparse kernel with PyTorch."""
     (
         device,
         q,
@@ -1111,27 +1150,79 @@ def test_generation_sparse_attention(s: SparseGenerationScenario):
         metadata,
         attention,
     ) = _setup_generation_test(s)
+    try:
+        k_cache_ref, v_cache_ref = _build_reference_kv_cache(
+            kv_cache_manager, request_ids, s, device, s.dtype
+        )
+        ref_sparse_output = reference_generation_sparse_attention(
+            q, k_cache_ref, v_cache_ref, k_new, v_new, sparse_attn_indices, s
+        )
 
-    k_cache_ref, v_cache_ref = _build_reference_kv_cache(
-        kv_cache_manager, request_ids, s, device, s.dtype
+        qkv = torch.cat([q, k_new, v_new], dim=1)
+        output = attention.forward(qkv, None, None, metadata)
+
+        expected_shape = (s.num_generations, s.num_heads * s.head_dim)
+        assert output.shape == expected_shape, f"Shape mismatch: {output.shape} vs {expected_shape}"
+        assert torch.isfinite(output).all(), "Output contains non-finite values"
+
+        torch.testing.assert_close(output, ref_sparse_output, atol=ATOL, rtol=RTOL)
+        print(f"Generation sparse attention test passed: {s}")
+    finally:
+        kv_cache_manager.shutdown()
+
+
+@requires_sparse_mqa_gqa
+@pytest.mark.parametrize("num_kv_heads", [1, 4], ids=["mqa", "gqa_2to1"])
+@pytest.mark.parametrize(
+    ("dtype", "head_dim"),
+    [
+        (torch.bfloat16, 64),
+        (torch.bfloat16, 80),
+        (torch.bfloat16, 128),
+        (torch.bfloat16, 256),
+        (torch.float16, 64),
+        (torch.float16, 80),
+        (torch.float16, 128),
+        (torch.float16, 256),
+    ],
+    ids=[
+        "bf16_h64",
+        "bf16_h80",
+        "bf16_h128",
+        "bf16_h256",
+        "fp16_h64",
+        "fp16_h80",
+        "fp16_h128",
+        "fp16_h256",
+    ],
+)
+def test_generation_sparse_mqa_gqa_kernel_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    num_kv_heads: int,
+    dtype: torch.dtype,
+    head_dim: int,
+):
+    """Cover every supported head dimension and both supported input dtypes.
+
+    Each KV head owns one token-index list. All query heads in its MQA/GQA
+    group share that list, which is the layout expected by the kernel.
+    """
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    scenario = SparseGenerationScenario(
+        dtype=dtype,
+        kvcache_dtype=dtype,
+        num_heads=8,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        batch_size=1,
+        past_kv_lens=(64,),
+        num_pages=4,
+        num_sparse_topk=32,
     )
-    ref_sparse_output = reference_generation_sparse_attention(
-        q, k_cache_ref, v_cache_ref, k_new, v_new, sparse_attn_indices, s
-    )
-
-    qkv = torch.cat([q, k_new, v_new], dim=1)
-    output = attention.forward(qkv, None, None, metadata)
-
-    expected_shape = (s.num_generations, s.num_heads * s.head_dim)
-    assert output.shape == expected_shape, f"Shape mismatch: {output.shape} vs {expected_shape}"
-    assert torch.isfinite(output).all(), "Output contains non-finite values"
-
-    torch.testing.assert_close(output, ref_sparse_output, atol=ATOL, rtol=RTOL)
-    print(f"Generation sparse attention test passed: {s}")
-    kv_cache_manager.shutdown()
+    _run_generation_sparse_attention(scenario)
 
 
-@pytest.mark.skipif(getSMVersion() < 100, reason="Sparse MQA/GQA requires SM100 (Blackwell)")
+@requires_sparse_mqa_gqa
 @pytest.mark.parametrize(
     "s",
     [
