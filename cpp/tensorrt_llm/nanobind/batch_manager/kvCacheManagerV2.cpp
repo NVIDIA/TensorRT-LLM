@@ -1638,7 +1638,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::vector<kv::BatchDesc> constraints, std::optional<kv::BatchDesc> typicalStep,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly)
+                bool textOnly, bool enablePartialCommit)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1661,6 +1661,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->commitMinSnapshot = commitMinSnapshot;
                 cfg->enableStats = enableStats;
                 cfg->textOnly = textOnly;
+                cfg->enablePartialCommit = enablePartialCommit;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1670,13 +1671,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("reuse_match_backoff") = 0, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
             nb::arg("typical_step") = std::nullopt, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
-            nb::arg("enable_stats") = true, nb::arg("text_only") = false)
+            nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
         .def_rw("max_util_for_resume", &kv::KVCacheManagerConfig::maxUtilForResume)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
+        .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,
@@ -1827,7 +1829,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 self.setCapacity(cap);
             })
         .def_prop_ro("tokens_per_block", &kv::KvCache::tokensPerBlock)
-        .def_prop_ro("beam_width", [](kv::KvCache const& self) { return self.beamWidth().value(); })
+        .def_prop_rw(
+            "beam_width", [](kv::KvCache const& self) { return self.beamWidth().value(); },
+            [](kv::KvCache& self, int beamWidth) { self.setBeamWidth(kv::BeamIndex{beamWidth}); })
         .def_prop_rw(
             "cuda_stream",
             [](kv::KvCache const& self) -> intptr_t { return reinterpret_cast<intptr_t>(self.cudaStream()); },
@@ -2481,6 +2485,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)
         .def_prop_ro("enable_partial_match", &kv::KvCacheManager::enablePartialMatch)
+        .def_prop_ro("enable_partial_commit", &kv::KvCacheManager::enablePartialCommit)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KvCacheManager::isSwaScratchReuseEnabled)
         .def(
             "supports_index_mode",
