@@ -26,6 +26,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace
@@ -105,6 +107,32 @@ TEST(DigestPoolTest, CopyDigestTokenClonesSlot)
         EXPECT_EQ(copy.digest(), bytes);
     }
     EXPECT_EQ(detail::digestPoolLiveCount(), baseline); // both slots freed
+}
+
+// Moving transfers ownership without cloning or double-freeing a digest slot.
+TEST(DigestPoolTest, MoveTransfersSlotWithoutCloning)
+{
+    size_t const baseline = detail::digestPoolLiveCount();
+    Digest const bytes = makeDigest(std::byte{0x33});
+    Digest const other = makeDigest(std::byte{0x77});
+    {
+        TokenIdExt source(bytes);
+        EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 1);
+
+        TokenIdExt moved(std::move(source));
+        EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 1);
+        EXPECT_EQ(source.raw(), TokenIdExt::kBadToken);
+        EXPECT_EQ(moved.digest(), bytes);
+        EXPECT_THROW((void) (source == moved), std::out_of_range);
+
+        TokenIdExt target(other);
+        EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 2);
+        target = std::move(moved);
+        EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 1);
+        EXPECT_EQ(moved.raw(), TokenIdExt::kBadToken);
+        EXPECT_EQ(target.digest(), bytes);
+    }
+    EXPECT_EQ(detail::digestPoolLiveCount(), baseline);
 }
 
 // clone-on-copy: the copy owns an independent slot; destroying the original

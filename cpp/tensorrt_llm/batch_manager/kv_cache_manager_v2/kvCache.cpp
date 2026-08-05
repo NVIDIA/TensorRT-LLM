@@ -1906,7 +1906,7 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
     if (numCommittedTokens() == 0)
         return nullptr;
 
-    auto const match = mManager->matchReuse(mReuseScope, toSpan(mCommittedTokens));
+    auto const match = mManager->matchReuse(mReuseScope, toSpan(mCommittedTokens), textOnly());
     if (match.numTokens != numCommittedTokens() || match.blocks.empty())
         return nullptr;
 

@@ -307,13 +307,15 @@ class _KVCache:
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
-    ):
+    ) -> None:
+        # Keep a partially constructed cache inert if validation fails.
+        self.__rawref__ = rawref.NULL
+        self._status = self.Status.CLOSED
         self.id = id
         self._manager = manager
         self._reuse_scope = reuse_scope
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
-        self._status = self.Status.SUSPENDED
         self._beam_width = BeamIndex(1)
         self._expected_prompt_length = (
             max(expected_prompt_length, 0) if expected_prompt_length is not None else None
@@ -346,7 +348,7 @@ class _KVCache:
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
         )
         self._pending_stats = _PendingStats()
-        self.__rawref__ = rawref.NULL
+        self._status = self.Status.SUSPENDED
         if reuse_match is not None:
             self._setup_for_reuse(reuse_match)
         self._refresh_generation_alloc_ready()

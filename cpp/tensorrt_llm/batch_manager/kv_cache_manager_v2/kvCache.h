@@ -579,7 +579,7 @@ private:
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
     std::vector<TokenIdExt> mCommittedTokens;
-    // Per-sequence text-only override; nullopt means inherit the manager config default.
+    // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;

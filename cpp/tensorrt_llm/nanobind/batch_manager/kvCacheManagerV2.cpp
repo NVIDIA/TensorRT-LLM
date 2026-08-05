@@ -552,7 +552,13 @@ public:
 
     ~EventManagerTestBlock()
     {
-        close();
+        try
+        {
+            close();
+        }
+        catch (...)
+        {
+        }
     }
 
     void close()
@@ -2170,8 +2176,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "gen_multimodal_cache_key_tokens",
         [](int idOffset, nb::bytes multiModalDataDigest, int numTokens, int tokenOffset)
         {
+            auto const digestSize = nb::len(multiModalDataDigest);
+            if (digestSize != kv::kDIGEST_LEN)
+            {
+                throw std::invalid_argument("multi_modal_data_digest must have length kDIGEST_LEN");
+            }
             auto const* first = reinterpret_cast<uint8_t const*>(multiModalDataDigest.c_str());
-            std::vector<uint8_t> digest(first, first + nb::len(multiModalDataDigest));
+            std::vector<uint8_t> digest(first, first + digestSize);
             return tokenList(kv::genMultimodalCacheKeyTokens(idOffset, digest, numTokens, tokenOffset));
         },
         nb::arg("id_offset"), nb::arg("multi_modal_data_digest"), nb::arg("num_tokens"), nb::arg("token_offset") = 0);

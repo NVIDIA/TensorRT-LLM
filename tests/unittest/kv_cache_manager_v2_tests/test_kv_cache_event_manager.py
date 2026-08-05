@@ -1142,7 +1142,9 @@ def test_v2_kv_cache_event_manager_readds_life_cycle_emits_stored_event(
     assert events[0]["data"]["block_hashes"] == [block_hash]
 
 
-def test_v2_kv_cache_event_manager_omits_partial_life_cycle_coverage(real_block_factory):
+def test_v2_kv_cache_event_manager_serializes_only_fully_covered_life_cycle_tokens(
+    real_block_factory,
+):
     event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
     make_block = real_block_factory(event_manager, num_life_cycles=2)
     block = make_block([1, 2], [2, 1])

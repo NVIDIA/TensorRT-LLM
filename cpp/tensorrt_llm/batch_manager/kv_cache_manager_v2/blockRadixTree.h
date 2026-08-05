@@ -328,11 +328,10 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
 
     // Reclaim every page held by this block: null each page's back-pointer and, for
     // DROPPABLE pages still scheduled for eviction, remove them from the eviction
-    // controller (releasing their storage slots). Idempotent. Must run during tree
-    // teardown (removeSubtree) rather than being deferred to ~Block(), so page
-    // reclamation does not depend on this Block's destruction timing — an external
-    // reference can keep a Block alive past StorageManager teardown, after which
-    // page->manager would be dangling. Mirrors Python's Block._release_pages().
+    // controller (releasing their storage slots). Idempotent. Cleanup is normally
+    // deferred to ~Block(): an orphan block may remain referenced by a live KvCache,
+    // and every KvCache must close before StorageManager teardown. Mirrors Python's
+    // Block._release_pages().
     void releasePages();
 
 private:
@@ -377,7 +376,7 @@ public:
     ReuseMatch match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest = false,
         bool enablePartialMatch = false) const;
 
-    // Clear all cached pages. ~Block() handles excludeFromEviction for DROPPABLE pages.
+    // Detach all cached blocks. ~Block() releases pages when the last owner drops a block.
     void clear();
 
     int tokensPerBlock() const noexcept

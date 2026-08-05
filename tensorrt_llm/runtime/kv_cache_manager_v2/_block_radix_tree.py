@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from itertools import chain
 import hashlib
 import itertools
 from array import array
+from itertools import chain
 from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, TypeVar, cast
 
 from . import rawref
@@ -32,6 +32,11 @@ if TYPE_CHECKING:
 BlockKey = bytes
 TokenBlock = list[TokenIdExt]
 
+_SHA256_DIGEST_SIZE = hashlib.sha256().digest_size
+_UINT_ITEM_SIZE = array("I").itemsize
+if _UINT_ITEM_SIZE != 4:
+    raise RuntimeError("Hasher requires a platform with 4-byte unsigned ints")
+
 
 # id_offset is usually vocab_size. Backend-neutral (depends only on _common); the
 # C++ backend exposes a native gen_multimodal_cache_key_tokens via nanobind instead.
@@ -42,6 +47,8 @@ def gen_multimodal_cache_key_tokens(
 
     Item-local token 0 carries the content digest; later offsets use deterministic IDs above the vocab.
     """
+    if len(multi_modal_data_digest) != _SHA256_DIGEST_SIZE:
+        raise ValueError(f"multi_modal_data_digest must have length {_SHA256_DIGEST_SIZE}")
     assert num_tokens > 0
     assert token_offset >= 0
     return [
@@ -65,7 +72,7 @@ class Hasher:
     __slots__ = "_hasher"
     _hasher: "hashlib._Hash"
 
-    def __init__(self, data: int | bytes | None | Sequence[int | bytes] = None) -> None:
+    def __init__(self, data: int | bytes | Sequence[int | bytes] | None = None) -> None:
         self._hasher = hashlib.sha256()
         if data is not None:
             self.update(data)
@@ -455,11 +462,9 @@ class Block:
         Idempotent: afterwards ``storage`` holds no pages, so it is safe to call again
         from ``__del__``.
 
-        This must run during radix-tree teardown (``remove_subtree``/``clear``) rather
-        than being deferred to ``__del__``, so that page reclamation does not depend on
-        this ``Block`` object's destruction timing. An external reference can keep the
-        ``Block`` alive past ``StorageManager`` teardown, after which ``page.manager``
-        would be a dangling reference.
+        Cleanup is normally deferred to ``__del__``. An orphan block may remain
+        referenced by a live ``_KVCache`` and retain its pages until that cache closes;
+        every cache must close before ``StorageManager`` teardown.
         """
         for lc_idx in typed_range(self.num_life_cycles):
             page = self.get_page(lc_idx)
@@ -618,7 +623,7 @@ class BlockRadixTree:
     def clear(self) -> None:
         # taking O(1) space
         # remove leaf blocks one by one, in post-order
-        # ~Block() / __del__() handles page cleanup.
+        # Block.__del__() handles page cleanup when the last owner releases each block.
         # detach_next() auto-prunes empty RootBlocks from the tree.
         while self.next:
             root = next(iter(self.next.values()))
