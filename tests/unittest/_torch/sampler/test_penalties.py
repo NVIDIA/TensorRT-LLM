@@ -566,6 +566,18 @@ _BEAM_COUNT_SCENARIOS = [
             _BeamStep([[0, 1, 2, 3]], [[1, 1, 1, 1]], [True], [4]),
         ],
     ),
+    # Intermediate growth 2 -> 4: the previous step's map holds two valid entries and two
+    # stale ones in the same slot, and the new beams inherit from beam 1, whose history
+    # differs from beam 0's -- so a stale row that was not re-parented is detectable.
+    _BeamCountScenario(
+        name="vbws-growth-partial",
+        prompts={0: [3]},
+        steps=[
+            _BeamStep([[0, 0, 0, 0]], [[1, 2, BEAM_PAD, BEAM_PAD]], [True], [2]),
+            _BeamStep([[0, 1, 1, 1]], [[5, 6, 7, 8]], [True], [4]),
+            _BeamStep([[0, 1, 2, 3]], [[9, 9, 9, 9]], [True], [4]),
+        ],
+    ),
     # A beam whose predecessor already finished emits BEAM_SEARCH_PAD_TOKEN.
     _BeamCountScenario(
         name="pad-token",

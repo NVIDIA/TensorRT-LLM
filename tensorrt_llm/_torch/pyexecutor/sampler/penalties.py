@@ -107,6 +107,8 @@ class PenaltyStore:
     # ``stage_request_metadata`` so the hot path does not allocate per step.
     request_offsets_cuda: torch.Tensor | None = None
     request_num_steps_cuda: torch.Tensor | None = None
+    request_num_beams_cuda: torch.Tensor | None = None
+    """Stays None on a single-beam engine, which never stages a beam width."""
 
     @classmethod
     def create(
@@ -166,13 +168,21 @@ class PenaltyStore:
                 )
 
     def stage_request_metadata(
-        self, request_offsets_host: torch.Tensor, request_num_steps_host: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        request_offsets_host: torch.Tensor,
+        request_num_steps_host: torch.Tensor,
+        request_num_beams_host: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Copy this step's ``[R]`` request metadata into persistent device buffers.
 
-        The host tensors are already pinned by the caller, so each step costs two
-        small async H2D copies into a reused allocation rather than two fresh
-        device tensors. Returned views are only valid until the next call.
+        The host tensors are already pinned by the caller, so each step costs a couple
+        of small async H2D copies into a reused allocation rather than fresh device
+        tensors. Returned views are only valid until the next call.
+
+        All three buffers are ``[R]`` and grow together under one capacity check.
+        ``request_num_beams_host`` is omitted on a single-beam engine, which then gets
+        ``None`` back and allocates no third buffer; a beam engine must pass it on every
+        call, including the first, or the buffer is never allocated.
         """
         num_requests = request_offsets_host.numel()
         with torch.inference_mode(False):
@@ -187,12 +197,24 @@ class PenaltyStore:
                 self.request_num_steps_cuda = torch.empty(
                     capacity, dtype=request_num_steps_host.dtype, device=self.device
                 )
+                self.request_num_beams_cuda = (
+                    torch.empty(capacity, dtype=request_num_beams_host.dtype, device=self.device)
+                    if request_num_beams_host is not None
+                    else None
+                )
         assert self.request_num_steps_cuda is not None
         offsets = self.request_offsets_cuda[:num_requests]
         num_steps = self.request_num_steps_cuda[:num_requests]
         offsets.copy_(request_offsets_host, non_blocking=True)
         num_steps.copy_(request_num_steps_host, non_blocking=True)
-        return offsets, num_steps
+        if request_num_beams_host is None:
+            return offsets, num_steps, None
+        assert self.request_num_beams_cuda is not None, (
+            "a beam engine must stage request_num_beams from its first call onwards"
+        )
+        num_beams = self.request_num_beams_cuda[:num_requests]
+        num_beams.copy_(request_num_beams_host, non_blocking=True)
+        return offsets, num_steps, num_beams
 
 
 class PenaltyHandler:
@@ -328,7 +350,7 @@ class PenaltyHandler:
         store.presence_cuda.index_copy_(0, slots_cuda, params_cuda[1])
         store.frequency_cuda.index_copy_(0, slots_cuda, params_cuda[2])
         store.active_cuda.index_fill_(0, slots_cuda, True)
-        if any(self._new_beam_slot):
+        if self._max_beam_width > 1:
             store.beam_slot_cuda.index_copy_(
                 0,
                 slots_cuda,
@@ -512,15 +534,24 @@ class PenaltyHandler:
         for request, state in active_requests:
             self._initialize_workspace(request, state, logits.size(-1))
 
-        num_beams_cuda: torch.Tensor | None = None
         if self._max_beam_width > 1:
-            # Re-parent and fold up front. On a single-beam engine the fold stays fused
-            # into the packed graph below; here it cannot, because re-parenting has to
-            # happen first and it is not expressible inside that graph.
             assert request_num_beams is not None and predecessor_beams is not None, (
                 "beam search requires request_num_beams and predecessor_beams"
             )
-            num_beams_cuda = request_num_beams.to(self._device, non_blocking=True)
+            num_beams_host = request_num_beams
+        else:
+            # Left None so the packed pass specializes to its single-beam graph.
+            num_beams_host = None
+
+        # Staged ahead of both consumers, since the views last only until the next call.
+        request_offsets_cuda, request_num_steps_cuda, num_beams_cuda = store.stage_request_metadata(
+            request_offsets, request_num_steps, num_beams_host
+        )
+
+        if num_beams_cuda is not None:
+            # Re-parent and fold up front. On a single-beam engine the fold stays fused
+            # into the packed graph below; here it cannot, because re-parenting has to
+            # happen first and it is not expressible inside that graph.
             Fusions.update_beam_occurrence_counts(
                 counts_cuda,
                 store.active_cuda,
@@ -532,10 +563,6 @@ class PenaltyHandler:
                 num_beams_cuda,
                 self._max_beam_width,
             )
-
-        request_offsets_cuda, request_num_steps_cuda = store.stage_request_metadata(
-            request_offsets, request_num_steps
-        )
         Fusions.apply_batched_occurrence_penalties(
             logits,
             counts_cuda,
