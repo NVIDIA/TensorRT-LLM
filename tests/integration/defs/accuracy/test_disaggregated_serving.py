@@ -559,7 +559,8 @@ def run_parallel_test(model_name: str,
                       gen_instances: int,
                       test_sets: List[LlmapiAccuracyTestHarness],
                       ctx_model: str = None,
-                      gen_model: str = None):
+                      gen_model: str = None,
+                      cache_transceiver_backend: str = "DEFAULT"):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
     total_gen_gpus = gen_tp * gen_pp * gen_instances
     if total_ctx_gpus + total_gen_gpus > get_device_count():
@@ -577,7 +578,7 @@ def run_parallel_test(model_name: str,
         "disable_overlap_scheduler": True,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
-            "backend": "DEFAULT",
+            "backend": cache_transceiver_backend,
             "max_tokens_in_buffer": 4096
         }
     }
@@ -587,7 +588,7 @@ def run_parallel_test(model_name: str,
         "disable_overlap_scheduler": True,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
-            "backend": "DEFAULT",
+            "backend": cache_transceiver_backend,
             "max_tokens_in_buffer": 4096
         }
     }
@@ -617,6 +618,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
+    # Literal NIXL bypasses the harness's legacy UCX fallback. Omitting the
+    # runtime then exercises Llama's automatic preference for Python V2.
+
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("ctx_disable_overlap_scheduler", [False, True])
@@ -633,7 +637,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         ctx_server_config["cache_transceiver_config"] = {
-            "backend": "DEFAULT",
+            "backend": "NIXL",
             "max_tokens_in_buffer": 4096
         }
         gen_server_config = {
@@ -643,7 +647,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         gen_server_config["cache_transceiver_config"] = {
-            "backend": "DEFAULT",
+            "backend": "NIXL",
             "max_tokens_in_buffer": 4096
         }
         disaggregated_server_config = {
@@ -771,7 +775,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -780,7 +784,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -822,7 +826,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_num_tokens": 13393 * 2,
             "max_batch_size": 1,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             },
             "cuda_graph_config": None,
@@ -837,7 +841,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_num_tokens": 13393 * 2,
             "max_batch_size": 16,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             },
             "cuda_graph_config": None,
@@ -923,14 +927,14 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -972,7 +976,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -985,7 +989,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -1018,7 +1022,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                  gen_tp=tp,
                                  ctx_instances=1,
                                  gen_instances=1,
-                                 test_sets=[get_accuracy_task(testset)])
+                                 test_sets=[get_accuracy_task(testset)],
+                                 cache_transceiver_backend="NIXL")
 
     @parametrize_with_ids("ctx_pp", [2, 4])
     @parametrize_with_ids("gen_tp", [1, 2])
@@ -1035,7 +1040,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                  gen_tp=gen_tp,
                                  ctx_instances=1,
                                  gen_instances=1,
-                                 test_sets=[get_accuracy_task(testset)])
+                                 test_sets=[get_accuracy_task(testset)],
+                                 cache_transceiver_backend="NIXL")
 
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_multi_instance(self, testset):
@@ -1047,7 +1053,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                  gen_tp=1,
                                  ctx_instances=2,
                                  gen_instances=2,
-                                 test_sets=[get_accuracy_task(testset)])
+                                 test_sets=[get_accuracy_task(testset)],
+                                 cache_transceiver_backend="NIXL")
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
@@ -1465,6 +1472,9 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
+    # Literal NIXL bypasses the harness's legacy UCX fallback. Omitting the
+    # runtime then exercises Gemma's automatic preference for Python V2.
+
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("block_reuse", [False, True])
     @skip_pre_hopper
@@ -1474,7 +1484,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -1482,7 +1492,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": False,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             }
         }
