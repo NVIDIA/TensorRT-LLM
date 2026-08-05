@@ -28,6 +28,7 @@ from typing import Tuple
 
 import torch
 
+_cute_import_error: Exception | None = None
 try:
     import cuda.bindings.driver as _cuda
     import cutlass.cute as cute
@@ -38,7 +39,7 @@ try:
     )
 
     CUTE_AVAILABLE = True
-except (ImportError, OSError, AttributeError):
+except (ImportError, OSError, AttributeError) as error:
     # The VSA CuTe kernel is optional. Besides missing packages, tolerate binary
     # and API version skew so an unavailable VSA backend does not break unrelated
     # VisualGen paths such as the Wan VAE.
@@ -47,6 +48,7 @@ except (ImportError, OSError, AttributeError):
     from_dlpack = None
     VideoSparseAttentionForward = None
     CUTE_AVAILABLE = False
+    _cute_import_error = error
 
 
 __all__ = [
@@ -109,8 +111,8 @@ def block_sparse_attn_from_indices_cute(
     if not CUTE_AVAILABLE:
         raise RuntimeError(
             "block_sparse_attn_from_indices_cute called but cuda.bindings or "
-            "cutlass-dsl is not importable."
-        )
+            f"cutlass-dsl is not importable: {_cute_import_error}"
+        ) from _cute_import_error
 
     num_q_blk = variable_block_sizes.shape[0]
     if num_q_blk > VideoSparseAttentionForward.MAX_INDICES:
