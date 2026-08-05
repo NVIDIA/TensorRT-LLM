@@ -40,6 +40,12 @@ from pathlib import Path
 
 import pytest
 
+# The L0 CPU-Generic stages run `pytest -m cpu_only`, and their conftest only
+# collects files containing the literal string "pytest.mark.cpu_only"; without
+# this marker every test here is deselected and pytest exits 5 (no tests
+# collected), which the test_unittests_v2 wrapper reports as a failure.
+pytestmark = pytest.mark.cpu_only
+
 try:
     import cutlass  # noqa: F401
     import flashinfer.gdn_kernels  # noqa: F401
