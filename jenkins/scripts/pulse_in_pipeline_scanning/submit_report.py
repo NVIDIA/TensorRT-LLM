@@ -32,9 +32,9 @@ def safe(value, default=None):
 def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -> tuple[dict, dict]:
     """Call triage agent for untriaged risk_docs; persist ticket records.
 
-    Returns (new_tickets, permissiveness) where:
+    Returns (new_tickets, license_info) where:
     - new_tickets: {pkg: ticket_url}
-    - permissiveness: {pkg: is_permissive} from the agent (None if agent had no opinion)
+    - license_info: {pkg: {"is_permissive": bool|None, "corrected_license": str|None}}
     """
     if not risk_docs:
         return {}, {}
@@ -54,10 +54,10 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
         if pkg and url:
             new_tickets[pkg] = url
     license_ticket = ticket_refs.get("license")
-    permissiveness = {}
+    license_info = {}
     if license_ticket and license_ticket.get("ticket_url"):
         url = license_ticket["ticket_url"]
-        permissiveness = license_ticket.get("permissiveness", {})
+        license_info = license_ticket.get("license_info", {})
         for pkg in license_ticket.get("dependencies") or []:
             new_tickets[pkg.get("name")] = url
     if new_tickets:
@@ -76,7 +76,7 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
                 if doc.get("s_package_name") in new_tickets
             ],
         )
-    return new_tickets, permissiveness
+    return new_tickets, license_info
 
 
 def submit_source_code_vulns(
@@ -153,10 +153,12 @@ def submit_source_code_licenses(
     build_metadata: BuildMetadata,
     start_datetime: datetime,
     license_check_token: str,
-) -> list | None:
+) -> tuple[list, dict] | None:
     """Triage untriaged source-code license risks, save all docs to ES, return untriaged risks.
 
-    Returns None if the SBOM file is missing.
+    Returns None if the SBOM file is missing, otherwise (risks_to_report, license_info) where
+    license_info maps package name to agent-resolved metadata (corrected_license,
+    is_permissive, is_nvidia_proprietary).
     """
     SCAN_TYPE = "source_code_license"
     triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
@@ -226,21 +228,18 @@ def submit_source_code_licenses(
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
 
+        license_info: dict = {}
         if risks_to_report:
-            new_tickets, permissiveness = _run_triage(
+            new_tickets, license_info = _run_triage(
                 risks_to_report, SCAN_TYPE, build_metadata["ref"], ts
             )
             for doc in sbom_documents:
-                if doc["s_package_name"] in new_tickets:
-                    doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
-            # Only drop packages the agent explicitly confirmed as permissive.
-            # Packages not sent to the agent (known non-permissive licenses) are kept as-is.
-            agent_permissive = {pkg for pkg, perm in permissiveness.items() if perm is True}
-            if agent_permissive:
-                risks_to_report = [
-                    doc for doc in risks_to_report if doc["s_package_name"] not in agent_permissive
-                ]
-
+                pkg = doc["s_package_name"]
+                if pkg in new_tickets:
+                    doc["s_ticket_url"] = new_tickets[pkg]
+                info = license_info.get(pkg, {})
+                if info.get("corrected_license"):
+                    doc["s_corrected_license"] = info["corrected_license"]
         if sbom_documents:
             _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
             if sbom_errors:
@@ -254,7 +253,7 @@ def submit_source_code_licenses(
         )
         return None
 
-    return risks_to_report
+    return risks_to_report, license_info
 
 
 def submit_container_vulns(
@@ -329,8 +328,12 @@ def submit_container_licenses(
     build_metadata: BuildMetadata,
     start_datetime: datetime,
     license_check_token: str,
-) -> list:
-    """Triage untriaged container license risks, save all docs to ES, return untriaged risks."""
+) -> tuple[list, dict]:
+    """Triage untriaged container license risks, save all docs to ES, return untriaged risks.
+
+    Returns (risks_to_report, license_info) where license_info maps package name to
+    agent-resolved metadata (corrected_license, is_permissive, is_nvidia_proprietary).
+    """
     SCAN_TYPE = "container_license"
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
@@ -391,21 +394,18 @@ def submit_container_licenses(
             risks_to_report.append(doc)
         docs.append(doc)
 
+    license_info: dict = {}
     if risks_to_report:
-        new_tickets, permissiveness = _run_triage(
+        new_tickets, license_info = _run_triage(
             risks_to_report, SCAN_TYPE, build_metadata["ref"], ts
         )
         for doc in docs:
-            if doc["s_package_name"] in new_tickets:
-                doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
-        # Only drop packages the agent explicitly confirmed as permissive.
-        # Packages not sent to the agent (known non-permissive licenses) are kept as-is.
-        agent_permissive = {pkg for pkg, perm in permissiveness.items() if perm is True}
-        if agent_permissive:
-            risks_to_report = [
-                doc for doc in risks_to_report if doc["s_package_name"] not in agent_permissive
-            ]
-
+            pkg = doc["s_package_name"]
+            if pkg in new_tickets:
+                doc["s_ticket_url"] = new_tickets[pkg]
+            info = license_info.get(pkg, {})
+            if info.get("corrected_license"):
+                doc["s_corrected_license"] = info["corrected_license"]
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
         if errors:
@@ -415,4 +415,4 @@ def submit_container_licenses(
     else:
         print(f"No non-permissive licenses in {release_image}.", file=sys.stderr)
 
-    return risks_to_report
+    return risks_to_report, license_info

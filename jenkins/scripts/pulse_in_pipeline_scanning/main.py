@@ -68,15 +68,20 @@ SUBMIT_KWARG = {
 }
 
 
-def _license_docs_to_entries(docs: list, scan_type: str) -> list:
+def _license_docs_to_entries(docs: list, scan_type: str, license_info: dict | None = None) -> list:
     """Convert ES risk docs to output entries with dependency_name, license, is_permissive."""
+    license_info = license_info or {}
     entries = []
     for doc in docs:
+        pkg = doc.get("s_package_name", "unknown")
+        info = license_info.get(pkg, {})
         entries.append(
             {
-                "dependency_name": doc.get("s_package_name", "unknown"),
+                "dependency_name": pkg,
                 "license": doc.get("s_license_ids") or "Unknown",
+                "corrected_license": doc.get("s_corrected_license") or "",
                 "is_permissive": doc.get("is_permissive", False),
+                "is_nvidia_proprietary": info.get("is_nvidia_proprietary"),
                 "scan_type": scan_type,
             }
         )
@@ -96,16 +101,19 @@ def process_result():
             if len(source_vulns) > 0:
                 RISKY_DEPENDENCIES.append(f"{len(source_vulns)} new source code vulnerability")
 
-        source_licenses = submit_source_code_licenses(
+        source_result = submit_source_code_licenses(
             os.path.join(args.report_directory, "source_code/sbom.json"),
             **SUBMIT_KWARG,
             license_check_token=LICENSE_CHECK_TOKEN,
         )
-        if source_licenses is None:
+        if source_result is None:
             if args.scan_mode != "release":
                 RISKY_DEPENDENCIES.append("source code SBOM not found")
         else:
-            source_entries = _license_docs_to_entries(source_licenses, "source_code")
+            source_licenses, source_license_info = source_result
+            source_entries = _license_docs_to_entries(
+                source_licenses, "source_code", source_license_info
+            )
             detected_licenses.extend(source_entries)
             non_permissive = [e for e in source_entries if not e["is_permissive"]]
             if non_permissive:
@@ -131,14 +139,14 @@ def process_result():
             if count_container_vulns > 0:
                 RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
 
-        amd64_container_licenses = submit_container_licenses(
+        amd64_container_licenses, amd64_license_info = submit_container_licenses(
             os.path.join(args.report_directory, "release_amd64/licenses.json"),
             os.path.join(args.report_directory, "base_amd64/licenses.json"),
             "amd64",
             **SUBMIT_KWARG,
             license_check_token=LICENSE_CHECK_TOKEN,
         )
-        arm64_container_licenses = submit_container_licenses(
+        arm64_container_licenses, arm64_license_info = submit_container_licenses(
             os.path.join(args.report_directory, "release_arm64/licenses.json"),
             os.path.join(args.report_directory, "base_arm64/licenses.json"),
             "arm64",
@@ -146,8 +154,10 @@ def process_result():
             license_check_token=LICENSE_CHECK_TOKEN,
         )
         container_license_entries = _license_docs_to_entries(
-            amd64_container_licenses, "container_amd64"
-        ) + _license_docs_to_entries(arm64_container_licenses, "container_arm64")
+            amd64_container_licenses, "container_amd64", amd64_license_info
+        ) + _license_docs_to_entries(
+            arm64_container_licenses, "container_arm64", arm64_license_info
+        )
         detected_licenses.extend(container_license_entries)
         non_permissive_container = [e for e in container_license_entries if not e["is_permissive"]]
         if non_permissive_container:

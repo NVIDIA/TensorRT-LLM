@@ -65,22 +65,17 @@ def format_risks_for_agent(vuln_docs: list, license_docs: list) -> list:
         if key not in seen:
             seen.add(key)
             items.append(item)
-    _UNKNOWN = {"", "unknown license", "unknown"}
     for doc in license_docs:
-        lics = doc.get("s_license_ids", "")
-        if lics.lower() in _UNKNOWN or all(
-            lic.strip().lower() in _UNKNOWN for lic in lics.split(",")
-        ):
-            item = _license_doc_to_agent_item(doc)
-            key = (
-                item["dependency_name"],
-                item["current_version"],
-                item["action_type"],
-                item.get("container"),
-            )
-            if key not in seen:
-                seen.add(key)
-                items.append(item)
+        item = _license_doc_to_agent_item(doc)
+        key = (
+            item["dependency_name"],
+            item["current_version"],
+            item["action_type"],
+            item.get("container"),
+        )
+        if key not in seen:
+            seen.add(key)
+            items.append(item)
     return items[:MAX_TRIAGE_ITEMS]
 
 
@@ -130,11 +125,19 @@ def extract_ticket_refs(agent_response: dict) -> dict:
     if license_ticket and license_ticket.get("link"):
         link = license_ticket["link"]
         deps = license_ticket.get("dependencies") or []
-        permissiveness = {dep["name"]: dep.get("is_permissive") for dep in deps if dep.get("name")}
+        license_info = {
+            dep["name"]: {
+                "is_permissive": dep.get("is_permissive"),
+                "corrected_license": dep.get("corrected_license"),
+                "is_nvidia_proprietary": dep.get("is_nvidia_proprietary"),
+            }
+            for dep in deps
+            if dep.get("name")
+        }
         refs["license"] = {
             "ticket_url": link,
             "dependencies": deps,
-            "permissiveness": permissiveness,
+            "license_info": license_info,
             "status": "CREATED",
         }
 
