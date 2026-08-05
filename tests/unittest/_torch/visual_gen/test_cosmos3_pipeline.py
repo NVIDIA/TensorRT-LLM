@@ -408,10 +408,13 @@ class TestFormatPromptWithMetadataJson:
         data = json.loads(result)
         assert data["prompt"] == "A foundry pour"
         assert data["subjects"] == []
-        assert data["duration"] == "7.9s"
-        assert data["fps"] == 24
-        assert data["resolution"] == {"W": 1280, "H": 720}
-        assert data["aspect_ratio"] == "9,16"
+        # Reference semantics: integer-truncated seconds, float fps, H before W,
+        # and the aspect-ratio *bucket* rather than the exact reduced ratio.
+        assert data["duration"] == "7s"
+        assert data["fps"] == 24.0
+        assert data["resolution"] == {"H": 720, "W": 1280}
+        assert data["aspect_ratio"] == "16,9"
+        assert '"resolution": {"H": 720, "W": 1280}' in result
 
     def test_overwrites_existing_metadata_fields(self, cosmos3_format_pipeline):
         prompt = json.dumps(
@@ -424,10 +427,10 @@ class TestFormatPromptWithMetadataJson:
             }
         )
         data = json.loads(_format_prompt_with_metadata(cosmos3_format_pipeline, prompt))
-        assert data["duration"] == "7.9s"
-        assert data["fps"] == 24
-        assert data["resolution"] == {"W": 1280, "H": 720}
-        assert data["aspect_ratio"] == "9,16"
+        assert data["duration"] == "7s"
+        assert data["fps"] == 24.0
+        assert data["resolution"] == {"H": 720, "W": 1280}
+        assert data["aspect_ratio"] == "16,9"
 
     def test_single_frame_skips_duration_by_default(self, cosmos3_format_pipeline):
         prompt = json.dumps({"prompt": "still life"})
@@ -452,7 +455,54 @@ class TestFormatPromptWithMetadataJson:
                 force_duration_template=True,
             )
         )
-        assert data["duration"] == "0.0s"
+        assert data["duration"] == "0s"
+
+    def test_still_drops_stale_duration_and_fps(self, cosmos3_format_pipeline):
+        """A caller's JSON may already declare a duration; a still must not keep it."""
+        prompt = json.dumps({"prompt": "still life", "duration": "7s", "fps": 24.0})
+        data = json.loads(
+            _format_prompt_with_metadata(
+                cosmos3_format_pipeline,
+                prompt,
+                num_frames=1,
+                resolution_template=COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
+            )
+        )
+        assert "duration" not in data
+        assert "fps" not in data
+
+    def test_non_ascii_is_escaped(self, cosmos3_format_pipeline):
+        """The reference serializes with the json default (``ensure_ascii=True``)."""
+        result = _format_prompt_with_metadata(
+            cosmos3_format_pipeline, json.dumps({"prompt": "moiré — artifacts"})
+        )
+        assert "\\u00e9" in result and "\\u2014" in result
+        assert "é" not in result and "—" not in result
+
+    @pytest.mark.parametrize(
+        "height,width,bucket",
+        [
+            (480, 832, "16,9"),
+            (832, 480, "9,16"),
+            (640, 640, "1,1"),
+            (544, 736, "4,3"),
+            (736, 544, "3,4"),
+            (720, 1280, "16,9"),
+            (1024, 1024, "1,1"),
+        ],
+    )
+    def test_aspect_ratio_maps_to_reference_bucket(
+        self, cosmos3_format_pipeline, height, width, bucket
+    ):
+        data = json.loads(
+            _format_prompt_with_metadata(
+                cosmos3_format_pipeline,
+                json.dumps({"prompt": "test"}),
+                height=height,
+                width=width,
+            )
+        )
+        assert data["aspect_ratio"] == bucket
 
     def test_non_integer_fps_preserved(self, cosmos3_format_pipeline):
         prompt = json.dumps({"prompt": "test"})
