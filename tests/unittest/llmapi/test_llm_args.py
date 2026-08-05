@@ -719,8 +719,7 @@ def test_KvCacheConfig_declaration():
                            pool_ratio=[0.25, 0.75],
                            avg_seq_len=2048,
                            block_reuse_config=BlockReuseConfig(
-                               block_reuse_policy="per_request",
-                               max_num_turns=2),
+                               policy="per_request", max_num_turns=2),
                            attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
@@ -739,7 +738,7 @@ def test_KvCacheConfig_declaration():
     assert config.kv_cache_event_hash_algo == "v2_sha256_64"
     assert config.pool_ratio == [0.25, 0.75]
     assert config.avg_seq_len == 2048
-    assert config.block_reuse_config.block_reuse_policy == "per_request"
+    assert config.block_reuse_config.policy == "per_request"
     assert config.block_reuse_config.max_num_turns == 2
     assert config.mamba_state_config.periodic_snapshot_interval == 0
     assert config.mamba_state_config.additional_snapshot_offsets_from_start == [
@@ -763,12 +762,21 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
-    assert (BlockReuseConfig(block_reuse_policy="per_conversation").
-            block_reuse_policy == "per_conversation")
+    assert BlockReuseConfig(
+        policy="per_conversation").policy == "per_conversation"
     with pytest.raises(ValidationError):
-        BlockReuseConfig(block_reuse_policy="invalid")
+        BlockReuseConfig(policy="invalid")
     with pytest.raises(ValidationError):
         BlockReuseConfig(max_num_turns=0)
+
+
+@pytest.mark.cpu_only
+def test_BlockReuseConfig_reports_renamed_policy_field():
+    with pytest.raises(ValidationError, match="block_reuse_config\\.policy"):
+        KvCacheConfig.model_validate(
+            {"block_reuse_config": {
+                "block_reuse_policy": "per_request"
+            }})
 
 
 @pytest.mark.cpu_only
@@ -855,8 +863,7 @@ def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
                         lambda message: warnings_seen.append(message))
 
     config = KvCacheConfig(
-        block_reuse_config=BlockReuseConfig(
-            block_reuse_policy="per_conversation"),
+        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=64,
             additional_snapshot_offsets_from_end=[0],
@@ -867,13 +874,12 @@ def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
     assert config.mamba_state_config.additional_snapshot_offsets_from_end == [0]
     assert len(warnings_seen) == 1
     assert "periodic_snapshot_interval=64" in warnings_seen[0]
-    assert ("block_reuse_config.block_reuse_policy=per_conversation"
-            in warnings_seen[0])
+    assert ("block_reuse_config.policy=per_conversation" in warnings_seen[0])
     assert "setting it to 0" in warnings_seen[0]
 
     warnings_seen.clear()
     KvCacheConfig(block_reuse_config=BlockReuseConfig(
-        block_reuse_policy="per_conversation"))
+        policy="per_conversation"))
     assert warnings_seen == []
 
 
@@ -3530,7 +3536,7 @@ class TestMambaSnapshotConfigResolution:
             (
                 KvCacheConfig(
                     block_reuse_config=BlockReuseConfig(
-                        block_reuse_policy="per_conversation"),
+                        policy="per_conversation"),
                     mamba_state_config=MambaStateConfig(
                         periodic_snapshot_interval=64),
                     use_kv_cache_manager_v2=True,
