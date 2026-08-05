@@ -366,11 +366,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             if is_action
             else resolved(req.params.guidance_scale, "guidance_scale")
         )
-        # frame_rate keeps a materialised video default (the serve layer derives
-        # num_frames from seconds x frame_rate), so action has to drop it here
-        # instead: an incoming 24.0 is indistinguishable from a caller who chose
-        # 24, and the embodiment preset (bridge 5, av 10) would never win.
-        frame_rate = None if is_action else req.params.frame_rate
+        # frame_rate cannot stay None in the pipeline defaults the way the four
+        # above do: the serve layer derives num_frames from seconds x frame_rate
+        # before the pipeline sees the request. So for action, "unset" survives
+        # only as "still equal to what the executor materialized" — any other
+        # value is the caller's own and outranks the embodiment preset.
+        frame_rate = req.params.frame_rate
+        if is_action and frame_rate == self.default_generation_params.get("frame_rate"):
+            frame_rate = None
         video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
 
         return self.forward(
@@ -1060,7 +1063,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             raise ValueError(
                 "Cosmos3 video-to-video generation is supported only for video outputs."
             )
-        is_v2v = video is not None and not is_t2i
+        # Action reads its reference through the same `video` bytes, but it is
+        # not V2V: the reference is an observation, not a clip to continue. Left
+        # in, an action request's prompt would depend on whether the caller
+        # passed the same frame as an image or as a one-frame clip.
+        is_v2v = video is not None and not is_t2i and not do_action
         if use_system_prompt is None:
             # V2V always wants it; otherwise the checkpoint declares the default.
             use_system_prompt = is_v2v or self.default_use_system_prompt

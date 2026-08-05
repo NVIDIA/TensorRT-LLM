@@ -404,6 +404,13 @@ class TestInferModeResolution:
         got = self._captured_forward_kwargs(_bare_pipeline(), _fake_request("video"))
         assert got["frame_rate"] == COSMOS3_720P_PARAMS["frame_rate"]
 
+    def test_action_keeps_an_explicit_frame_rate(self):
+        """Dropping the materialised default is what lets the embodiment preset
+        win; dropping a caller's own value would make it unsettable."""
+        req = _fake_request("video", frame_rate=30.0, extra_params={"action_mode": "policy"})
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        assert got["frame_rate"] == 30.0
+
     def test_distilled_merged_defaults_pass_through(self):
         req = _fake_request("image", num_inference_steps=4, guidance_scale=1.0)
         got = self._captured_forward_kwargs(_bare_pipeline(sampling=_distilled_policy()), req)
