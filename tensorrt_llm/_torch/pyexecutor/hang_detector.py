@@ -91,7 +91,13 @@ class HangDetector:
     def __init__(
         self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
     ):
-        self.timeout = timeout if timeout is not None else 300
+        # TLLM_HANG_DETECTION_TIMEOUT: diagnostic override. Debugging a device
+        # fault with CUDA_DEVICE_WAITS_ON_EXCEPTION needs the frozen GPU state
+        # to outlive this watchdog, whose hard-kill would otherwise destroy the
+        # very state the debugger is attached to.
+        if timeout is None:
+            timeout = int(os.environ.get("TLLM_HANG_DETECTION_TIMEOUT", "300"))
+        self.timeout = timeout
         assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
         self.task = None
