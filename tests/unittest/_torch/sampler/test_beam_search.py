@@ -292,31 +292,6 @@ def validate_output(output: GenerationResult, input_prompt: list[int],
                              len(input_prompt), beam_idx)
 
 
-def validate_disagg_output(output: GenerationResult, input_prompt: list[int],
-                           sampling_params: SamplingParams) -> None:
-    """Validate disagg beam output without requiring full-run cache history."""
-    check_context_logits(output, sampling_params)
-    assert len(output.outputs) == sampling_params.n
-    expected_outputs = get_expected_outputs(
-        input_prompt[-1], num_iterations=sampling_params.max_tokens)
-
-    for beam_idx, beam_output in enumerate(output.outputs):
-        assert beam_output.finish_reason == "length"
-        check_generation_logits(beam_output, sampling_params, valid_tokens=None)
-        check_logprobs(beam_output, sampling_params, valid_tokens=None)
-        expected_token_ids = expected_outputs.outputs[beam_idx].tolist()
-        assert beam_output.token_ids == expected_token_ids, (
-            f"expected {expected_token_ids} token ids, "
-            f"got {beam_output.token_ids}")
-
-        assert beam_output.additional_generation_outputs is not None
-        cache_indirection = beam_output.additional_generation_outputs[
-            "cache_indirection"]
-        assert cache_indirection is not None
-        assert cache_indirection.shape[1] == sampling_params.best_of
-        assert cache_indirection.shape[0] == sampling_params.max_tokens - 1
-
-
 def validate_outputs(llm: LLM, input_prompts: list[list[int]],
                      sampling_params: SamplingParams,
                      monkeypatch: pytest.MonkeyPatch,
@@ -380,56 +355,6 @@ def validate_outputs(llm: LLM, input_prompts: list[list[int]],
     ) == num_prompts, f"expected {num_prompts} outputs, but got {len(outputs)}"
     for output_idx, output in enumerate(outputs):
         validate_output(output, input_prompts[output_idx], sampling_params)
-
-
-def validate_disagg_outputs(ctx_llm: LLM,
-                            gen_llm: LLM,
-                            input_prompts: list[list[int]],
-                            sampling_params: SamplingParams,
-                            request_id_base: int = 0) -> None:
-    """Run context-only then generation-only beam search and validate outputs."""
-
-    ctx_disagg_params = [
-        DisaggregatedParams(request_type="context_only",
-                            disagg_request_id=1000 + request_id_base + idx)
-        for idx in range(len(input_prompts))
-    ]
-    ctx_outputs = ctx_llm.generate(
-        deepcopy(input_prompts),
-        sampling_params=deepcopy(sampling_params),
-        disaggregated_params=ctx_disagg_params,
-        use_tqdm=False,
-    )
-    assert isinstance(ctx_outputs, list)
-    assert len(ctx_outputs) == len(input_prompts)
-
-    gen_disagg_params = []
-    for ctx_output in ctx_outputs:
-        disagg_params = ctx_output.disaggregated_params
-        assert disagg_params is not None
-        assert disagg_params.first_gen_tokens is not None
-        assert disagg_params.first_gen_log_probs is not None
-        assert len(disagg_params.first_gen_tokens) == sampling_params.best_of
-        assert len(disagg_params.first_gen_log_probs) == sampling_params.best_of
-        disagg_params.request_type = "generation_only"
-        gen_disagg_params.append(disagg_params)
-
-    gen_outputs = gen_llm.generate(
-        deepcopy(input_prompts),
-        sampling_params=deepcopy(sampling_params),
-        disaggregated_params=gen_disagg_params,
-        use_tqdm=False,
-    )
-    assert isinstance(gen_outputs, list)
-    assert len(gen_outputs) == len(input_prompts)
-    for output_idx, output in enumerate(gen_outputs):
-        validate_disagg_output(output, input_prompts[output_idx],
-                               sampling_params)
-
-
-###########################################################################
-# End to end tests
-###########################################################################
 
 
 @pytest.mark.parametrize("return_log_probs", [True, False])
@@ -497,10 +422,18 @@ def test_beam_search_disagg_e2e(
     input_prompts,
     model_kwargs: dict[str, Any],
 ) -> None:
-    if model_kwargs["sampler_type"] != "TorchSampler":
-        pytest.skip(
-            "Disaggregated beam score handoff is implemented for TorchSampler")
+    """Beam search must be rejected under disaggregated serving.
 
+    Every early_stopping mode keeps a pool of finished candidates, which the
+    context server can already populate on its first step. That pool is not
+    part of the handoff -- ContextPhaseParams carries only the first generated
+    tokens -- and is cleared on the generation side, so a completion found
+    during the context phase would be silently dropped. This holds for both
+    samplers: TorchSampler serves every mode from the candidate-beams-array
+    path, and the C++ decoder behind TRTLLMSampler maintains the pool
+    unconditionally. Rejected at admission until the handoff carries the pool
+    (TRTLLM-14792).
+    """
     sampling_params = SamplingParams(
         max_tokens=fixed_params["max_tokens"],
         n=fixed_params["max_beam_width"],
@@ -508,7 +441,6 @@ def test_beam_search_disagg_e2e(
         use_beam_search=True,
         end_id=-1,
         include_stop_str_in_output=True,
-        additional_model_outputs=["cache_indirection"],
     )
 
     disagg_kwargs = deepcopy(model_kwargs)
@@ -527,38 +459,22 @@ def test_beam_search_disagg_e2e(
         ),
     )
 
-    partial_reuse_prompts = [[1, 2, 3], [1, 5, 6]]
-
-    ctx_llm = _build_llm(fixed_params, partial_reuse_prompts, disagg_kwargs)
-    gen_llm = _build_llm(fixed_params, partial_reuse_prompts, disagg_kwargs)
+    prompts = [[1, 2, 3]]
+    ctx_llm = _build_llm(fixed_params, prompts, disagg_kwargs)
     try:
-        with ctx_llm, gen_llm:
-            validate_disagg_outputs(ctx_llm,
-                                    gen_llm,
-                                    partial_reuse_prompts[:1],
-                                    sampling_params,
-                                    request_id_base=0)
-            validate_disagg_outputs(ctx_llm,
-                                    gen_llm,
-                                    partial_reuse_prompts[1:],
-                                    sampling_params,
-                                    request_id_base=100)
-
-            # The exhaustive early_stopping modes keep a pool of finished
-            # candidates that the context server can already populate, but
-            # that pool is not part of the handoff and is cleared on the
-            # generation side -- a completion found during the context phase
-            # would be dropped. The combination is rejected at admission
-            # until the handoff carries the pool (TRTLLM-14792).
-            for early_stopping in (0, 2):
-                exhaustive_params = deepcopy(sampling_params)
-                exhaustive_params.early_stopping = early_stopping
+        with ctx_llm:
+            # Every mode is rejected, including the default (early_stopping
+            # unset, i.e. True).
+            for early_stopping in (None, 0, 1, 2):
+                params = deepcopy(sampling_params)
+                if early_stopping is not None:
+                    params.early_stopping = early_stopping
                 with pytest.raises(RequestError,
                                    match=".*not supported with disaggregated"
                                    " serving.*"):
                     _ = ctx_llm.generate(
-                        deepcopy(partial_reuse_prompts[:1]),
-                        sampling_params=exhaustive_params,
+                        deepcopy(prompts),
+                        sampling_params=params,
                         disaggregated_params=[
                             DisaggregatedParams(request_type="context_only",
                                                 disagg_request_id=200)
@@ -567,7 +483,6 @@ def test_beam_search_disagg_e2e(
                     )
     finally:
         ctx_llm.shutdown()
-        gen_llm.shutdown()
 
 
 @pytest.mark.parametrize("beam_width", [10])
@@ -2047,6 +1962,40 @@ def test_vbws_cpp_formula_matches_past_array_end():
             request, False) == beam_width_array[-1]
 
 
+@pytest.mark.parametrize(
+    "beam_width_array, accepted",
+    [
+        ([2, 3, 4], True),
+        ([4, 4, 4], True),
+        ([2, 2, 4], True),
+        ([4, 3, 2], False),
+        ([2, 4, 3], False),
+    ],
+)
+def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
+                                                  accepted: bool):
+    """Only non-decreasing beam_width_array values are supported.
+
+    The documented VBWS semantics only cover widening (see getBeamWidthByIter
+    in llmRequest.h), and both samplers depend on it: a step writes the leading
+    beam_width_out rows of the beam state while finalize reads py_beam_width
+    (the array maximum) of them, so a narrowing array would return beams whose
+    ancestry and cumulative log-probs are left over from an earlier, wider
+    step. Reject at admission instead of emitting silently stale beams.
+    """
+
+    # Mirrors the check in PyExecutor._validate_request.
+    def is_accepted(array: list[int]) -> bool:
+        return not any(b < a for a, b in zip(array, array[1:]))
+
+    assert is_accepted(beam_width_array) == accepted
+
+    request = _vbws_request(beam_width_array)
+    # The request itself is still constructible; admission is what rejects it,
+    # and py_beam_width is the array maximum either way.
+    assert request.py_beam_width == max(beam_width_array)
+
+
 def test_vbws_uniform_array_matches_fixed_width():
     """A constant beam_width_array must behave exactly like a fixed width."""
     max_beam_width = 4
@@ -2374,16 +2323,19 @@ class TestBeamSearchStepFromStrategies:
                 2, 2, 2, torch.ones(1), None, None)
 
     @pytest.mark.parametrize(
-        "early_stopping, expected_cls",
+        "early_stopping",
         [
-            (BeamSearchEarlyStop.TRUE, _StrategyImpls.RegularBeamSearchStep),
-            (BeamSearchEarlyStop.FALSE, _StrategyImpls.CBABeamSearchStep),
-            (BeamSearchEarlyStop.NEVER, _StrategyImpls.CBABeamSearchStep),
+            BeamSearchEarlyStop.TRUE,
+            BeamSearchEarlyStop.FALSE,
+            BeamSearchEarlyStop.NEVER,
         ],
     )
     @staticmethod
     @_kernel_test
-    def test_from_strategies_builds_concrete_impl(early_stopping, expected_cls):
+    def test_from_strategies_builds_concrete_impl(early_stopping):
+        # Every stopping mode runs on the candidate-beams-array step; the mode
+        # only selects the done verdict computed inside it.
+        expected_cls = _StrategyImpls.CBABeamSearchStep
         strategies = [_beam_strategy(early_stopping=early_stopping)]
         impl = expected_cls.from_strategies(strategies,
                                             cuda_device=torch.device("cuda"))
