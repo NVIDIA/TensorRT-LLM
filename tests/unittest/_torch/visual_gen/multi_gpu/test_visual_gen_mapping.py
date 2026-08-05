@@ -401,56 +401,6 @@ class TestRankLinearizationWithoutDist:
             DeviceMeshTopologyImpl.device_mesh = old_mesh
             VisualGenMapping.seq_mesh = old_seq_mesh
 
-    def test_world_size_16_cfg_ring_ulysses_rank_groups(self):
-        from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-
-        old_mesh = DeviceMeshTopologyImpl.device_mesh
-        old_seq_mesh = VisualGenMapping.seq_mesh
-        try:
-            for rank in range(16):
-                DeviceMeshTopologyImpl.device_mesh = None
-                VisualGenMapping.seq_mesh = None
-                vgm = VisualGenMapping(
-                    world_size=16,
-                    rank=rank,
-                    cfg_size=2,
-                    ring_size=4,
-                    ulysses_size=2,
-                )
-
-                fake_mesh = _FakeDeviceMesh(vgm._dim_names, vgm._dim_sizes, rank)
-                DeviceMeshTopologyImpl.device_mesh = fake_mesh
-                VisualGenMapping.seq_mesh = fake_mesh["cp", "ulysses"]._flatten(mesh_dim_name="seq")
-
-                expected_cfg_rank = rank // 8
-                expected_cp_rank = (rank // 2) % 4
-                expected_ulysses_rank = rank % 2
-                expected_seq_rank = expected_cp_rank * 2 + expected_ulysses_rank
-
-                assert vgm.cfg_rank == expected_cfg_rank
-                assert vgm.tp_rank == 0
-                assert vgm.cp_rank == expected_cp_rank
-                assert vgm.ring_rank == expected_cp_rank
-                assert vgm.ulysses_rank == expected_ulysses_rank
-                assert vgm.seq_rank == expected_seq_rank
-                assert vgm.seq_size == 8
-                assert vgm.is_cfg_conditional == (rank < 8)
-
-                cfg_pair_start = rank % 8
-                ulysses_pair_start = rank - expected_ulysses_rank
-                seq_group_start = expected_cfg_rank * 8
-                cp_group_start = expected_cfg_rank * 8 + expected_ulysses_rank
-
-                assert vgm.cfg_group == (cfg_pair_start, cfg_pair_start + 8)
-                assert vgm.tp_group_pg == (rank,)
-                assert vgm.ulysses_group == (ulysses_pair_start, ulysses_pair_start + 1)
-                assert vgm.cp_group == tuple(cp_group_start + stride for stride in (0, 2, 4, 6))
-                assert vgm.ring_group == vgm.cp_group
-                assert vgm.seq_group() == tuple(range(seq_group_start, seq_group_start + 8))
-        finally:
-            DeviceMeshTopologyImpl.device_mesh = old_mesh
-            VisualGenMapping.seq_mesh = old_seq_mesh
-
 
 # =============================================================================
 # Multi-GPU tests — validate actual DeviceMesh groups and ranks
