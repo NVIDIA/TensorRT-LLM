@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._ipc_utils import IpcMemory
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
@@ -72,6 +73,20 @@ def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
         )
         allreduce_workspaces[mapping] = (ipc_buffers, workspace)
     return allreduce_workspaces[mapping][1]
+
+
+def allreduce_workspace_has_ipc(mapping: Mapping) -> bool:
+    """Whether the workspace returned by get_allreduce_workspace holds real IPC buffers.
+
+    cudaDeviceCanAccessPeer can report P2P support on systems where CUDA IPC handles
+    still cannot be imported. In that case the workspace pointers are null and only
+    NCCL can be used. get_allreduce_workspace must have been called first.
+    """
+    allreduce_workspaces = getattr(_thread_local,
+                                   f'allreduce_workspaces_{mapping.pp_rank}')
+    ipc_buffers = allreduce_workspaces[mapping][0]
+    return all(buffer.open_ipc for buffer in ipc_buffers
+               if isinstance(buffer, IpcMemory))
 
 
 def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
@@ -783,12 +798,21 @@ class AllReduce(nn.Module):
             # Note: SYMM_MEM now also needs workspace for fallback scenarios (fused ops, etc.)
             # Only UB doesn't need workspace
             if self.strategy != AllReduceStrategy.UB:
-                if self.strategy == AllReduceStrategy.LOWPRECISION:
-                    allocate_low_presicion_allreduce_workspace(self.mapping)
                 if self.strategy not in (AllReduceStrategy.UB,
                                          AllReduceStrategy.NCCL,
                                          AllReduceStrategy.NCCL_SYMMETRIC):
                     self.workspace = get_allreduce_workspace(self.mapping)
+                    # Every custom all-reduce kernel reads the peers' IPC buffers. When
+                    # CUDA IPC is unavailable those pointers are null, so NCCL is the
+                    # only strategy that can run. See allreduce_workspace_has_ipc.
+                    if not allreduce_workspace_has_ipc(self.mapping):
+                        logger.warning(
+                            "CUDA IPC is unavailable, falling back from "
+                            f"{self.strategy.name} to NCCL allreduce.")
+                        self.strategy = AllReduceStrategy.NCCL
+                        self.workspace = None
+                if self.strategy == AllReduceStrategy.LOWPRECISION:
+                    allocate_low_presicion_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL if using AUTO or MNNVL strategy
             if self.strategy in (AllReduceStrategy.AUTO,
