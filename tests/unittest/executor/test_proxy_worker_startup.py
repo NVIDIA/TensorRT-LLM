@@ -619,3 +619,73 @@ def test_subordinate_disarms_after_construction():
         "block_subordinates() forever and would report for the life of the job"
     )
     assert all(lineno < ready_send for lineno in subordinate_only)
+
+
+# ---------------------------------------------------------------------------
+# The ready signal can fail to arrive. That is the one case where the worker
+# must NOT disarm its stall watchdog: the proxy is still blocked, looking for
+# a signal that will never come, and the per-rank stall reports are the only
+# remaining evidence of it.
+# ---------------------------------------------------------------------------
+def _ready_delivery_block(src: str) -> ast.If:
+    """The `if ready_delivered:` block inside worker_main, from source.
+
+    Read from the AST rather than executed: reaching this line for real needs
+    a constructed worker, MPI ranks and an engine. The property under test is
+    a control-flow one -- which branch sets the event -- and that is exactly
+    what the AST shows.
+    """
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "ready_delivered"
+        ):
+            return node
+    raise AssertionError("no `if ready_delivered:` branch found in worker_main")
+
+
+def _sets_init_done(body) -> bool:
+    for node in body:
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr == "set"
+                and isinstance(sub.func.value, ast.Name)
+                and sub.func.value.id == "worker_init_done"
+            ):
+                return True
+    return False
+
+
+def test_watchdog_is_disarmed_only_when_the_ready_signal_was_delivered():
+    src = pathlib.Path(worker_module.__file__).read_text()
+    branch = _ready_delivery_block(src)
+
+    assert _sets_init_done(branch.body), (
+        "the success path must disarm the watchdog -- otherwise every healthy "
+        "startup keeps dumping stacks for the life of the process"
+    )
+    assert not _sets_init_done(branch.orelse), (
+        "the failure path must NOT disarm the watchdog: the proxy is still "
+        "waiting for a ready signal that never arrived, and disarming removes "
+        "the last thing reporting that"
+    )
+
+
+def test_failed_ready_delivery_is_logged_at_error():
+    """A warning is not enough: this leaves the proxy hung."""
+    src = pathlib.Path(worker_module.__file__).read_text()
+    branch = _ready_delivery_block(src)
+    levels = {
+        sub.func.attr
+        for node in branch.orelse
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Call)
+        and isinstance(sub.func, ast.Attribute)
+        and isinstance(sub.func.value, ast.Name)
+        and sub.func.value.id == "logger"
+    }
+    assert "error" in levels, f"expected logger.error on this path, saw {levels}"

@@ -700,7 +700,7 @@ def is_flashinfer_gdn_supported_arch(sm_version=None):
     return sm_version in (90, 100, 103)
 
 
-def print_all_stacks(log=None):
+def print_all_stacks(log: Optional[Callable[[str], None]] = None) -> None:
     """Print stack traces for all threads
 
     Args:

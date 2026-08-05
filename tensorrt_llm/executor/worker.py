@@ -430,13 +430,29 @@ def worker_main(
 
                 # Send ready signal with confirmation
                 ready_msg = (ready_signal, None, worker_process_identities)
-                if not worker_init_status_queue.notify_with_retry(ready_msg):
-                    logger.warning(
-                        "Failed to deliver ready signal to proxy, continuing anyway"
-                    )
-                # The proxy's startup wait ends here (or has been given up on);
-                # either way this rank has nothing more to contribute to it.
-                worker_init_done.set()
+                ready_delivered = worker_init_status_queue.notify_with_retry(
+                    ready_msg)
+                if ready_delivered:
+                    # The proxy's startup wait has ended, so this rank has
+                    # nothing more to contribute to it.
+                    worker_init_done.set()
+                else:
+                    # Do NOT disarm here. Delivery failing is the one case
+                    # where the proxy is still blocked in its startup wait
+                    # with no idea why -- it is looking for a ready signal
+                    # that will never arrive. Disarming would remove the last
+                    # remaining source of information about that, leaving a
+                    # silent hang: this rank healthy and serving, the proxy
+                    # waiting forever, and nothing reporting either fact.
+                    # Leaving the watchdog armed keeps the per-rank stall
+                    # reports coming, which is exactly the diagnostic this PR
+                    # exists to provide.
+                    logger.error(
+                        "Failed to deliver the ready signal to the proxy. This "
+                        "rank is initialized and will continue serving, but the "
+                        "proxy may still be waiting for a signal it will never "
+                        "receive; leaving the init stall watchdog armed so the "
+                        "condition keeps being reported.")
                 if resource_governor_queue is not None:
                     # Swap rank 0 to the proxy IPC queue after construction.
                     # The resource-governor flag is already enabled on all
