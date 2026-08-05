@@ -10,6 +10,7 @@ by the SM100 integration accuracy test.
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import MsaSparseGqaFmha
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
@@ -223,3 +224,63 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed():
     assert not index_k_strided.is_contiguous()
     assert index_k_strided.stride(0) == coalescing_scale * page_size * head_dim
     assert torch.equal(strided_scores, packed_scores)
+
+
+@pytest.mark.parametrize("sparse", [True, False], ids=["sparse_path", "dense_path"])
+def test_msa_fmha_forward_falls_back_to_eager_plan_when_decode_plan_is_none(monkeypatch, sparse):
+    import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as fmha_mod
+
+    eager_gqa_plan = ("eager", "gqa", "plan")
+    eager_dense_plan = ("eager", "dense", "plan")
+
+    captured = {}
+
+    def fake_run_msa_paged_gqa(attn, q, k, v, metadata, output, *, kv_block_indexes, plan):
+        captured["plan"] = plan
+        captured["kv_block_indexes"] = kv_block_indexes
+
+    monkeypatch.setattr(fmha_mod, "run_msa_paged_gqa", fake_run_msa_paged_gqa)
+
+    class FakeSparsePrediction:
+        sparse_attn_indices = torch.tensor([[0, 1]], dtype=torch.int32) if sparse else None
+
+    class FakeForwardArgs:
+        output = torch.zeros(1)
+        sparse_prediction = FakeSparsePrediction()
+
+    class FakeMetadata:
+        msa_decode_gqa_plan = None
+        msa_decode_dense_plan = None
+        msa_eager_gqa_plan = eager_gqa_plan
+        msa_eager_dense_plan = eager_dense_plan
+
+    class FakeAttn:
+        layer_idx = 0
+        num_heads = 4
+        head_dim = 128
+        q_scaling = 1.0
+
+    class _TestableMsaSparseGqaFmha(MsaSparseGqaFmha):
+        def __init__(self, attn_obj):
+            self._fake_attn = attn_obj
+
+        @property
+        def attn(self):
+            return self._fake_attn
+
+    fmha = _TestableMsaSparseGqaFmha(FakeAttn())
+
+    fmha.forward(
+        q=torch.zeros(1, 512),
+        k=None,
+        v=None,
+        metadata=FakeMetadata(),
+        forward_args=FakeForwardArgs(),
+    )
+
+    if sparse:
+        assert captured["plan"] is eager_gqa_plan
+        assert captured["kv_block_indexes"] is not None
+    else:
+        assert captured["plan"] is eager_dense_plan
+        assert captured["kv_block_indexes"] is None
