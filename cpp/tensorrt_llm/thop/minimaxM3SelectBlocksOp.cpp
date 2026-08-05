@@ -27,6 +27,15 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
+//! Select the highest-scoring MiniMax-M3 MSA blocks for each query and KV head.
+//!
+//! @param scores Float32 CUDA tensor shaped [num_kv_heads, num_blocks, total_queries]. Strided tensors are supported.
+//! @param nValidBlocks Contiguous int32 CUDA tensor shaped [total_queries], on the same device as scores.
+//! @param topK Number of blocks to select. The operator currently requires topK == 16.
+//! @param initBlocks Number of initial blocks forced into the selection.
+//! @param localBlocks Number of blocks immediately preceding each query's valid-block boundary forced into selection.
+//! @return Int32 CUDA tensor shaped [total_queries, num_kv_heads, 16]. Valid block IDs are ascending, followed by -1
+//! padding when fewer than 16 valid blocks exist.
 torch::Tensor minimaxM3SelectBlocks(torch::Tensor const& scores, torch::Tensor const& nValidBlocks, int64_t topK,
     int64_t initBlocks, int64_t localBlocks)
 {
@@ -63,7 +72,7 @@ torch::Tensor minimaxM3SelectBlocks(torch::Tensor const& scores, torch::Tensor c
         "minimax_m3_select_blocks forcing ranges exceed int32 range");
 
     c10::cuda::CUDAGuard const deviceGuard{scores.device()};
-    auto output = torch::empty({scores.size(2), scores.size(0), topK}, scores.options().dtype(torch::kInt32));
+    auto const output = torch::empty({scores.size(2), scores.size(0), topK}, scores.options().dtype(torch::kInt32));
     auto const stream = at::cuda::getCurrentCUDAStream(scores.get_device());
     tensorrt_llm::kernels::invokeMinimaxM3SelectBlocks(scores.data_ptr<float>(), scores.stride(0), scores.stride(1),
         scores.stride(2), nValidBlocks.data_ptr<int32_t>(), output.data_ptr<int32_t>(),
