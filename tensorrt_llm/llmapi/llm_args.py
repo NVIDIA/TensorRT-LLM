@@ -252,11 +252,41 @@ class BaseCudaGraphConfig(StrictBaseModel):
         return batch_sizes
 
 
+class EncDecEncoderCudaGraphConfig(StrictBaseModel):
+    """CUDA-graph capture of the encoder step for encoder-decoder models.
+
+    Applies only to models whose encoder consumes fixed-shape per-request
+    feature tensors (e.g. Whisper's 30 s-padded waveform), where the graph
+    key degenerates to the encoder batch size. Token-driven encoders
+    (BART/T5) are not captured. Each captured batch size holds its own
+    static input buffer and graph pool memory; unseen batch sizes fall back
+    to eager.
+    """
+
+    batch_sizes: Optional[List[int]] = Field(
+        default=None,
+        description=(
+            "Encoder batch sizes to capture. None derives powers of two capped "
+            "by both max_batch_size and max_num_tokens // encoder_output_len "
+            "(the scheduler's encoder-batch bound)."),
+        status="prototype",
+    )
+
+
 class DecodeCudaGraphConfig(BaseCudaGraphConfig):
     """CUDA graph configuration for decode requests."""
 
     mode: Literal["decode"] = Field(
         default="decode", description="CUDA graph configuration mode.")
+
+    encoder: Optional[EncDecEncoderCudaGraphConfig] = Field(
+        default=None,
+        description=(
+            "Opt-in CUDA-graph capture of the encoder step for encoder-decoder "
+            "models with fixed-shape feature encoders (e.g. Whisper). None "
+            "(default) keeps the encoder step eager."),
+        status="prototype",
+    )
 
     @staticmethod
     def _merge_schedule_keys(batch_sizes: List[int],
