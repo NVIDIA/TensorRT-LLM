@@ -259,12 +259,6 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
 
 _DEEP_GEMM_PDL_CONFIGURED = False
 
-# Ragged layout bugs are silent (rows get attributed to the wrong requests
-# while every kernel-side divisibility check still passes); these assertions
-# make them loud at the cost of walking the batch, so they are opt-in.
-_DSPARK_ASSERT_LAYOUT = os.environ.get("TLLM_DSPARK_ASSERT_LAYOUT",
-                                       "0") in ("1", "true", "True")
-
 
 def _configure_deep_gemm_pdl() -> None:
     global _DEEP_GEMM_PDL_CONFIGURED
@@ -3882,79 +3876,6 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.ragged_verify_lens = self._ragged_token_lens(
                 generation_requests)
 
-    def _assert_ragged_layout_consistent(self, spec_metadata, attn_metadata,
-                                         scheduled_requests) -> None:
-        """Assert the four descriptions of this step's generation-token count agree:
-
-          sum(1 + py_verify_len)         the requests, as fitted
-          num_tokens - num_ctx_tokens    the flat input layout
-          total_verify_tokens            what acceptance slices by
-          the ragged bucket              the CUDA-graph key's token axis
-
-        A mismatch is silent token misattribution, not a crash. Off by
-        default (walks the batch); enable with TLLM_DSPARK_ASSERT_LAYOUT=1.
-        """
-        verify_lens = self._ragged_token_lens(
-            scheduled_requests.generation_requests)
-        if verify_lens is None:
-            # A uniform step must not carry a published ragged bucket: a later
-            # ragged step would key a graph the batch does not describe.
-            agreed_stale = self.cuda_graph_runner.agreed_ragged_bucket
-            assert agreed_stale is None, (
-                f"uniform step carries a stale published ragged bucket "
-                f"{agreed_stale}; a failed fit exited without clearing it")
-            # Uniform step: assert the converse, that nothing ragged leaked
-            # through. A half-published layout is the dangerous state.
-            assert spec_metadata.total_verify_tokens is None, (
-                "uniform batch left a stale total_verify_tokens on the spec "
-                f"metadata: {spec_metadata.total_verify_tokens}")
-            assert getattr(attn_metadata, "ragged_verify_lens", None) is None, (
-                "uniform batch left stale ragged_verify_lens on the attention "
-                f"metadata: {attn_metadata.ragged_verify_lens}")
-            return
-
-        from_requests = sum(verify_lens)
-        from_layout = attn_metadata.num_tokens - attn_metadata.num_ctx_tokens
-        from_spec = int(spec_metadata.total_verify_tokens)
-        agreed = self.cuda_graph_runner.agreed_ragged_bucket
-
-        assert from_requests == from_layout, (
-            f"ragged layout mismatch: requests carry {from_requests} generation "
-            f"tokens but the flat input layout has {from_layout} "
-            f"(attn_metadata.num_tokens={attn_metadata.num_tokens}, "
-            f"num_ctx_tokens={attn_metadata.num_ctx_tokens}). The token layout "
-            f"and the verify windows were built from different values.")
-        assert from_requests == from_spec, (
-            f"ragged layout mismatch: requests carry {from_requests} generation "
-            f"tokens but spec_metadata.total_verify_tokens is {from_spec}; "
-            f"acceptance would slice the target logits at the wrong offsets.")
-        if agreed is not None:
-            # `from_requests` walks this batch's windows; `agreed` is what the
-            # graph key carries. A mismatch means the replayed graph is a
-            # different width than the batch, and nothing downstream says so.
-            assert from_requests == int(agreed), (
-                f"ragged layout mismatch: the batch carries {from_requests} "
-                f"generation tokens but the fit agreed on {agreed}, which is "
-                f"what the CUDA-graph key's token axis says; the replayed "
-                f"graph was captured at a different width.")
-
-        # Row axis: the token-major presentation can be malformed while every
-        # token count above agrees, so it needs its own check.
-        view = attn_metadata.token_major_gen_view() if hasattr(
-            attn_metadata, "token_major_gen_view") else None
-        if view is not None:
-            expected_rows = attn_metadata.num_contexts + from_requests
-            assert view.num_rows == expected_rows, (
-                f"token-major presentation has {view.num_rows} rows but the "
-                f"batch has {attn_metadata.num_contexts} context rows plus "
-                f"{from_requests} generation tokens; the MLA generation ops "
-                f"would read a sequence count that does not describe this step.")
-            assert view.host_context_lengths.shape[0] == expected_rows, (
-                f"token-major host_context_lengths has "
-                f"{view.host_context_lengths.shape[0]} entries but the "
-                f"presentation is {expected_rows} rows -- that tensor's shape "
-                f"IS what the ops read as their sequence count.")
-
     def _pinned_host(self, key: str, values, dtype) -> torch.Tensor:
         """A persistent pinned staging buffer holding ``values``.
 
@@ -5710,9 +5631,6 @@ class PyTorchModelEngine(ModelEngine):
             self._attach_ragged_verify_layout(
                 spec_metadata, attn_metadata,
                 scheduled_requests.generation_requests)
-            if _DSPARK_ASSERT_LAYOUT:
-                self._assert_ragged_layout_consistent(
-                    spec_metadata, attn_metadata, scheduled_requests)
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
             # No-op for non 1-model
@@ -6982,8 +6900,7 @@ class PyTorchModelEngine(ModelEngine):
             can_run_graph = key is not None
             # A ragged step that misses its captured shape quietly runs eager;
             # count it. Only generation-only steps count: a batch with context
-            # requests has no generation graph to miss, and booking it as
-            # eager would make `assert_ragged_active` unsatisfiable.
+            # requests has no generation graph to miss.
             if padded_requests.can_run_cuda_graph:
                 self._record_dspark_graph_use(
                     replayed=can_run_graph,

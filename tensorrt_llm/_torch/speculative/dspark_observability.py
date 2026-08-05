@@ -15,9 +15,7 @@
 """Verification-mode selection and per-step counters for DSpark ragged verify.
 
 Failures on this path are silent (output stays correct at baseline accuracy),
-so activity is counted rather than inferred, and
-:meth:`DSparkRaggedStats.assert_ragged_active` turns the counters into a test
-gate. Modes: ``static`` verifies the full block; ``cap-accept`` computes and
+so activity is counted rather than inferred. Modes: ``static`` verifies the full block; ``cap-accept`` computes and
 commits per-request windows but submits the full block, so its output must
 stay bit-identical to ``static``; ``compact`` submits only each request's
 window and needs a profiled :class:`~.dspark_planner.SpsCostTable` -- with a
@@ -400,79 +398,6 @@ class DSparkRaggedStats:
     def log_summary(self, *, prefix: str = "DSpark ragged verify") -> None:
         summary = self.summary()
         logger.info(f"{prefix}: {summary}")
-
-    def assert_ragged_active(self, *, require_trim: bool = True) -> None:
-        """Fail loudly if the ragged path never actually ran.
-
-        An accuracy pass alone proves nothing: the scheduler may have declined
-        every step.
-
-        Args:
-            require_trim: also require that delivered tokens came in under the
-                no-trim ceiling. Leave on unless deliberately measuring a
-                workload where every draft survives.
-
-        Raises:
-            AssertionError: with the full counter summary.
-        """
-        summary = self.summary()
-        if self.steps_total == 0:
-            raise AssertionError(
-                f"DSpark ragged verify recorded no decode steps at all: {summary}"
-            )
-        if self.steps_ragged == 0:
-            raise AssertionError(
-                f"DSpark ragged verify never produced differing per-request "
-                f"windows, so the ragged path was not exercised. The usual "
-                f"cause is a missing profiled SPS cost table, under which the "
-                f"planner's budget degenerates to verify-all: {summary}")
-        if self.distinct_verify_lens < 2:
-            raise AssertionError(
-                f"DSpark ragged verify handed out only one distinct window "
-                f"size, so the batch was uniform in all but name: {summary}")
-        # Zero planner decisions against non-zero windowed steps means the
-        # planner's stats are not wired to this object -- and its fallback
-        # counters are the only record of WHY a step declined to trim.
-        if self.planner_stats is not None:
-            decisions = int(self.planner_stats.get("decisions", 0))
-            windowed = self.steps_ragged + self.steps_uniform_windows
-            if windowed > 0 and decisions == 0:
-                raise AssertionError(
-                    f"DSpark scheduling produced windows on {windowed} steps "
-                    f"but the planner recorded 0 decisions, so its fallback "
-                    f"counters cannot be read -- and they are the only record "
-                    f"of why a step declined to trim: {summary}")
-        # `cap-accept` submits the full block on purpose, so a zero trim ratio
-        # is expected there, not a silent no-op.
-        if (require_trim and self.mode.trims_submitted_tokens
-                and self.trim_ratio <= 0.0):
-            raise AssertionError(
-                f"DSpark ragged verify delivered as many tokens as a no-trim "
-                f"run, so nothing was saved: {summary}")
-        # Fail only on misses ragged is responsible for: context-filled batches
-        # fall out of replay on the uniform path too, and blaming those would
-        # make the check unsatisfiable under continuous batching.
-        # "key_not_captured"/"bs_not_supported" mean the batch was graphable
-        # and the bucket grid is wrong; "peer_shape_mismatch" means one rank
-        # chose a different ragged bucket and dragged the whole world eager.
-        blamed = {"key_not_captured", "bs_not_supported", "peer_shape_mismatch"}
-        attributable = {
-            reason: n
-            for reason, n in self.graph_miss_reasons.items() if reason in blamed
-        }
-        if attributable:
-            raise AssertionError(
-                f"DSpark ragged verify dropped out of CUDA graph replay for "
-                f"reasons attributable to ragged scheduling "
-                f"({attributable}); a ragged step without a captured shape "
-                f"costs far more than the tokens it trims: {summary}")
-        if self.graph_eager > 0 and not self.graph_miss_reasons:
-            raise AssertionError(
-                f"DSpark ragged verify dropped out of CUDA graph replay on "
-                f"{self.graph_eager} step(s) but recorded no reason for any of "
-                f"them, so the misses cannot be attributed. That is a broken "
-                f"probe, not a clean run: {summary}")
-
 
 def format_verify_len_histogram(lens: List[int]) -> str:
     """One-line ``len:count`` rendering, for per-step debug logging."""

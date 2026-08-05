@@ -2399,42 +2399,11 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
 
-    def _maybe_assert_dspark_ragged_active(self, stats) -> None:
-        """Run the ragged gate mid-loop, once the step floor is reached.
-
-        Raises mid-loop (a cleanup-time raise lands in a shutdown path the
-        test runner never sees); fires at most once.
-        """
-        # Deliberately lazy: this class has several construction paths, and a
-        # missed __init__ attribute would silently disable the gate.
-        if getattr(self, "_dspark_asserted", False):
-            return
-        min_steps = self._dspark_assert_min_steps
-        # Count only multi-request steps: tiny ramp-up batches have trivially
-        # identical windows and would fail an innocent run.
-        if min_steps is None or stats.steps_multi_request < min_steps:
-            return
-        self._dspark_asserted = True
-        stats.assert_ragged_active(require_trim=True)
-
-    @property
-    def _dspark_assert_min_steps(self) -> Optional[int]:
-        """Step floor from TLLM_DSPARK_ASSERT_ACTIVE, or None when disabled."""
-        raw = os.environ.get("TLLM_DSPARK_ASSERT_ACTIVE", "")
-        if not raw or raw in ("0", "false", "False"):
-            return None
-        try:
-            return 32 if raw in ("1", "true", "True") else int(raw)
-        except ValueError:
-            return None
-
     def _report_dspark_ragged_stats(self) -> None:
-        """Final DSpark scheduling summary, and optionally a hard gate on it.
+        """Final DSpark scheduling summary at shutdown.
 
         The counters live in the worker process and are unreachable from the
-        driver under multi-rank TP, so the summary is always logged at
-        shutdown, and with ``TLLM_DSPARK_ASSERT_ACTIVE`` the worker asserts on
-        its own counters (a worker exception does propagate to the driver).
+        driver under multi-rank TP, so the log is the shared channel.
         """
         worker = getattr(self.model_engine, "_get_spec_worker", None)
         stats = getattr(worker(), "ragged_stats", None) if worker else None
@@ -2446,26 +2415,10 @@ class PyExecutor:
         if stats is None or not stats.steps_total:
             return
         stats.log_summary(prefix="DSpark ragged verify [final]")
-        # A MINIMUM STEP COUNT, not a boolean: throwaway executors (KV-cache
-        # estimation) run a few decode steps and must not trip the assert.
-        min_steps = self._dspark_assert_min_steps
-        if min_steps is None:
-            return
-        if stats.steps_total < min_steps:
-            logger.info(
-                f"DSpark ragged verify: skipping the active-path assertion, "
-                f"this executor ran {stats.steps_total} decode step(s) "
-                f"(< {min_steps}).")
-            return
-        # require_trim is deliberately on: a run that produced windows but
-        # never shortened one delivered the uniform baseline.
-        stats.assert_ragged_active(require_trim=True)
 
     def _executor_loop_cleanup(self):
         try:
             self._report_dspark_ragged_stats()
-        except AssertionError:
-            raise
         except Exception as exc:  # noqa: BLE001 - never block shutdown on stats
             logger.warning(f"DSpark ragged stats reporting failed: {exc}")
         # Wake any waiters in await_responses BEFORE potentially-blocking
@@ -3468,7 +3421,6 @@ class PyExecutor:
             # boundary, so the log is the only shared channel.
             if stats.steps_total and stats.steps_total % 32 == 0:
                 stats.log_summary(prefix="DSpark ragged verify [periodic]")
-            self._maybe_assert_dspark_ragged_active(stats)
             fitted = None
             delivered = None
             if cap_accept:

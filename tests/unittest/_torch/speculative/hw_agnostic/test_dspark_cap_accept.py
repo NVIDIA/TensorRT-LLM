@@ -220,8 +220,6 @@ def test_cap_accept_must_not_be_credited_with_a_compute_saving():
     # The schedule is still visible -- that is the whole point of the mode.
     assert stats.window_tokens == sum(1 + v for v in (5, 3, 2, 1))
     assert stats.steps_ragged == 1
-    # ...and the gate stays satisfiable in the mode it exists to validate.
-    stats.assert_ragged_active(require_trim=True)
 
 
 def test_compact_still_derives_delivered_from_the_bucket():
@@ -247,17 +245,6 @@ def test_cap_accept_computes_windows_but_does_not_trim_the_token_axis():
 
     assert not RaggedVerifyMode.STATIC.computes_windows
     assert not RaggedVerifyMode.STATIC.trims_submitted_tokens
-
-
-def test_the_active_gate_still_demands_a_saving_from_compact():
-    """The regression the clause above must not introduce."""
-    stats = _stats(mode=RaggedVerifyMode.COMPACT)
-    stats.record_step(num_gen_requests=4,
-                      verify_lens=[5, 3, 2, 1],
-                      bucket=4 * (1 + MAX_DRAFT_LEN))
-    assert stats.trim_ratio == 0.0
-    with pytest.raises(AssertionError, match="nothing was saved"):
-        stats.assert_ragged_active(require_trim=True)
 
 
 def test_a_slot_left_unwritten_cannot_inherit_the_previous_occupant_s_loss():

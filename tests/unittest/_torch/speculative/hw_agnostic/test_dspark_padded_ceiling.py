@@ -10,10 +10,7 @@ maximum row count *across attention-DP ranks*; ``ceiling_tokens`` booked
 ``num_gen_requests * (1 + block)`` over this rank's real, unpadded requests. Two
 different row bases in one ratio.
 
-The gate reads that ratio: ``assert_ragged_active`` fires on ``trim_ratio <= 0``
-with the message "delivered as many tokens as a no-trim run, so nothing was
-saved" -- the opposite of what a negative value means, so the defect also
-misdiagnoses itself.
+A wrong ratio silently misreports the feature's saving in every summary.
 """
 
 import pytest
