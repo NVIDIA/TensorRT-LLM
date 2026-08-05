@@ -374,7 +374,8 @@ def warmup_sampling_module() -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning(
             "flashinfer sampling module prewarm failed; it will be built "
-            f"lazily on first use. {type(e).__name__}: {e}")
+            f"lazily on first use. {type(e).__name__}: {e}"
+        )
 
 
 @torch.compile(options={"max-autotune": True})
