@@ -24,7 +24,9 @@ A workspace with no IPC buffers because P2P was never there (inter-node TP) is n
 failure though, and must not change the strategy, or MNNVL never gets selected.
 
 The CUDA runtime and the collectives are stubbed, so no multi-GPU and no MPI needed.
-`test_lamport_skipped` needs one GPU, the workspace helper allocates device tensors.
+This directory runs in the CPU-only l0_cpu stage since #16498, so everything here has
+to pass with zero GPUs.  `test_lamport_skipped` is the exception and skips there: the
+workspace helper it drives allocates device tensors.
 
     pytest tests/unittest/_torch/distributed/test_ipc_memory_fallback.py -v
 """
@@ -39,6 +41,21 @@ from tensorrt_llm import _ipc_utils
 from tensorrt_llm._ipc_utils import IpcMemory
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
+
+
+def _has_allreduce_op() -> bool:
+    """Whether the trtllm custom ops are registered in this build."""
+    try:
+        return torch.ops.trtllm.allreduce is not None
+    except Exception:
+        return False
+
+
+# AllReduce.__init__ resolves torch.ops.trtllm.allreduce before any of the logic
+# under test, so these skip rather than error on a build without the extension.
+requires_allreduce_op = pytest.mark.skipif(
+    not _has_allreduce_op(), reason="trtllm allreduce custom op not registered"
+)
 
 TP_SIZE = 2
 
@@ -248,6 +265,7 @@ def _build_allreduce(mapping, strategy, ipc_failed):
         return ops.AllReduce(mapping=mapping, strategy=strategy, dtype=torch.bfloat16)
 
 
+@requires_allreduce_op
 def test_mnnvl_kept_without_p2p(mapping):
     # Regression guard: an inter-node workspace holds no IPC buffers, but that must
     # not rewrite the strategy, otherwise MNNVL is never constructed on NVLink
@@ -258,6 +276,7 @@ def test_mnnvl_kept_without_p2p(mapping):
     assert allreduce.mnnvl_allreduce is not None
 
 
+@requires_allreduce_op
 def test_downgrade_to_nccl(mapping):
     allreduce = _build_allreduce(mapping, AllReduceStrategy.ONESHOT, ipc_failed=True)
 
@@ -266,6 +285,7 @@ def test_downgrade_to_nccl(mapping):
     assert allreduce.mnnvl_allreduce is None
 
 
+@requires_allreduce_op
 def test_moe_allreduce_raises(mapping):
     # MoEAllReduce has no NCCL path: it must fail with an actionable message rather
     # than dereference the null peer pointers inside the kernel.
