@@ -646,7 +646,6 @@
    "disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_empty_batch[DeepSeek-V3-Lite-bf16]": 190.4600707070707,
    "disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]": 128.8671616161616,
    "disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]": 121.09470707070707,
-   "disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python[DeepSeek-V3-Lite-fp8]": 118.99839393939394,
    "disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]": 99.04030303030302,
    "disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu[DeepSeek-V3-Lite-fp8]": 136.5389226006192,
    "disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[TinyLlama-1.1B-Chat-v1.0]": 72.53091237113402,
