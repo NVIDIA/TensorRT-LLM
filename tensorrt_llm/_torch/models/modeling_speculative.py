@@ -1911,21 +1911,28 @@ def get_draft_model(model_config, draft_config, lm_head, model):
             return DFlashLagunaForCausalLM(draft_config)
         return DFlashForCausalLM(draft_config)
     elif spec_dec_mode.is_dspark():
+        # Lazy import to avoid a cycle (modeling_dspark -> modeling_deepseekv4 ->
+        # modeling_speculative).
+        from .modeling_dspark import (DSparkForCausalLM, Qwen3DSparkForCausalLM,
+                                      count_dspark_stages,
+                                      validate_dspark_eplb_layer_base)
+
         # DeepSpec-released dense drafters (e.g. dspark_qwen3_8b_block7) are
         # separate checkpoints that declare their own architecture; the
         # DeepSeek-V4 drafter lives in the target checkpoint's mtp.* namespace.
         draft_arches = getattr(draft_config.pretrained_config, "architectures",
                                None) or []
+        # The drafter's own ModelConfig carries spec_config=None (no recursive
+        # spec-dec), so the validated speculative-config values are passed in
+        # explicitly here.
         if any("Qwen3DSpark" in arch for arch in draft_arches):
-            from .modeling_dspark_qwen3 import Qwen3DSparkForCausalLM
             return Qwen3DSparkForCausalLM(
-                draft_config, block_size=model_config.spec_config.block_size)
-        # Lazy import to avoid a cycle (modeling_dspark -> modeling_deepseekv4 ->
-        # modeling_speculative). The DSpark draft reuses the target's aux streams.
-        # The draft stage count (n_mtp_layers) is not in the HF config, so derive
-        # it from the checkpoint's mtp.* namespace.
-        from .modeling_dspark import (DSparkForCausalLM, count_dspark_stages,
-                                      validate_dspark_eplb_layer_base)
+                draft_config,
+                block_size=model_config.spec_config.block_size,
+                mask_token_id=model_config.spec_config.mask_token_id)
+        # The DSpark draft reuses the target's aux streams. The draft stage
+        # count (n_mtp_layers) is not in the HF config, so derive it from the
+        # checkpoint's mtp.* namespace.
         num_stages = count_dspark_stages(
             model_config.spec_config.speculative_model)
         validate_dspark_eplb_layer_base(model_config, draft_config)
@@ -1934,6 +1941,7 @@ def get_draft_model(model_config, draft_config, lm_head, model):
             getattr(model, "aux_stream_dict", None),
             num_stages=num_stages,
             block_size=model_config.spec_config.block_size,
+            mask_token_id=model_config.spec_config.mask_token_id,
         )
     elif spec_dec_mode.is_draft_target_one_model():
         # Keep the draft LM head vocab-sharded so greedy draft sampling uses the

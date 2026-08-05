@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Golden tests for the Qwen3 DSpark drafter (modeling_dspark_qwen3.py).
+"""Golden tests for the Qwen3 DSpark drafter (modeling_dspark.py).
 
 The reference implementation below is a line-for-line torch-only port of the
 DeepSpec ``Qwen3DSparkModel`` inference path
@@ -35,7 +35,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.models.modeling_dspark_qwen3 import Qwen3DSparkDraftModel, _apply_rope
+from tensorrt_llm._torch.models.modeling_dspark import Qwen3DSparkDraftModel, _apply_rope
 
 VOCAB = 97
 HID = 32
@@ -113,7 +113,10 @@ def _rand_weights(gen):
 
 
 def _build_model(weights):
-    model = Qwen3DSparkDraftModel(_make_config())
+    # Construct under a device context like the model loader does; load_weights
+    # then follows the modules (params and the RoPE buffers) onto that device.
+    with torch.device("cuda" if torch.cuda.is_available() else "cpu"):
+        model = Qwen3DSparkDraftModel(_make_config())
     model.load_weights(weights)
     device = model.fc.weight.device
     embed = torch.nn.Embedding(VOCAB, HID)
@@ -142,8 +145,11 @@ class _Ref:
         t = torch.arange(MAX_POS, device=device, dtype=torch.float32)
         emb = torch.cat([torch.outer(t, inv)] * 2, dim=-1)
         self.cos, self.sin = emb.cos(), emb.sin()
-        # per-request context stream: [T, HID] projected hiddens, in order
+        # per-request context stream: [T, HID] projected hiddens, in order,
+        # starting at absolute position ``first_pos`` (non-zero when the target
+        # skipped a KV-cache-reused prefix, so no context exists below it).
         self.ctx_x = torch.zeros(0, HID, dtype=DTYPE, device=device)
+        self.first_pos = 0
 
     def _norm(self, x, wname):
         wt = self.w[wname]
@@ -159,13 +165,13 @@ class _Ref:
         self.ctx_x = torch.cat([self.ctx_x, x.to(DTYPE)], dim=0)
 
     def draft(self, bonus_id, start_pos):
-        assert self.ctx_x.shape[0] == start_pos
+        assert self.ctx_x.shape[0] == start_pos - self.first_pos
         w = self.w
         ids = torch.full((BLOCK,), MASK_ID, dtype=torch.long, device=self.device)
         ids[0] = bonus_id
         h = F.embedding(ids, w["embed_tokens.weight"])  # [B, HID]
         pos_q = start_pos + torch.arange(BLOCK, device=self.device)
-        pos_c = torch.arange(start_pos, device=self.device)
+        pos_c = torch.arange(self.first_pos, start_pos, device=self.device)
         for i in range(N_LAYERS):
             p = f"layers.{i}."
             x = self._norm(h, p + "input_layernorm.weight")
@@ -282,6 +288,45 @@ def test_worker_protocol_golden(setup):
             f"step {step}: draft tokens diverge from reference"
         )
         bonus_val = (bonus_val * 7 + 3) % VOCAB
+
+
+def test_prefix_reuse_masks_unseeded_rows(setup):
+    """KV-cache prefix reuse: only the uncached suffix reaches the drafter.
+
+    The worker seeds the ring for the positions the target actually processed,
+    so the rows below the first seeded position hold nothing. The draft must
+    attend to the seeded rows only — treating the whole ``0..start_pos`` range
+    as live would mix all-zero K/V rows into the softmax.
+    """
+    weights, model, device = setup
+    gen = torch.Generator().manual_seed(33)
+    win = model._attn_params["window_size"]
+    kv_windows = torch.zeros(
+        1, model.num_stages, win, model._attn_params["head_dim"], dtype=DTYPE, device=device
+    )
+
+    reused, suffix = 5, 4  # positions 0..4 came from the KV cache; 5..8 ran
+    seeded = _rand_hidden(gen, suffix).to(device)
+    positions = torch.arange(reused, reused + suffix, device=device) + 1
+    model.write_context_windows(seeded, positions, kv_windows[0])
+
+    ref = _Ref(weights, device)
+    ref.first_pos = reused
+    ref.append_ctx(seeded)
+
+    start_pos = reused + suffix
+    bonus = torch.tensor([41], device=device)
+    got_toks, _, got_logits = model.forward_batched(
+        seeded[-1:].reshape(1, -1),
+        bonus,
+        torch.tensor([start_pos], device=device),
+        kv_windows=kv_windows,
+        slots=torch.tensor([0], device=device),
+        return_logits=True,
+    )
+    exp_toks, exp_logits = ref.draft(bonus[0], start_pos)
+    torch.testing.assert_close(got_logits[0].float(), exp_logits.float(), atol=0.05, rtol=0.05)
+    assert torch.equal(got_toks[0].long().cpu(), exp_toks.long().cpu())
 
 
 def test_batched_matches_eager_singletons(setup):
