@@ -476,6 +476,68 @@ class TestFormatPromptWithMetadataJson:
         assert data["resolution"] == {"W": 1280, "H": 720}
 
 
+class TestNegativePromptMetadata:
+    """The negative prompt takes the sentence-append path even when it is JSON.
+
+    cosmos-framework applies its plain-text formatter to the negative prompt
+    unconditionally and reserves JSON field injection for the positive prompt, so
+    a JSON negative prompt must keep its serialized form and gain the sentences
+    after it -- not grow ``duration``/``fps``/``resolution`` keys inside it.
+    """
+
+    NEGATIVE = json.dumps({"subjects": [{"description": "Blurry, poorly defined subjects."}]})
+
+    def _negative(self, pipeline, **kwargs):
+        """Format a negative prompt the way ``forward`` does."""
+        return pipeline._apply_metadata_templates(
+            self.NEGATIVE,
+            height=HEIGHT,
+            width=WIDTH,
+            num_frames=189,
+            frame_rate=FRAME_RATE,
+            duration_template=COSMOS3_DURATION_TEMPLATE,
+            resolution_template=COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+            **kwargs,
+        )
+
+    def test_json_negative_keeps_object_and_appends_sentences(self, cosmos3_format_pipeline):
+        result = self._negative(cosmos3_format_pipeline)
+        assert result.startswith(self.NEGATIVE.rstrip("."))
+        assert result.endswith("This video is of 720x1280 resolution.")
+        assert "7.9 seconds long" in result
+
+    def test_json_negative_gains_no_injected_fields(self, cosmos3_format_pipeline):
+        result = self._negative(cosmos3_format_pipeline)
+        # The metadata must live outside the object, so the result stops being
+        # parseable JSON and the object itself is untouched.
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(result)
+        for field in ("duration", "fps", "resolution", "aspect_ratio"):
+            assert f'"{field}"' not in result
+
+    def test_matches_reference_sentence_append(self, cosmos3_format_pipeline):
+        """Byte-for-byte against cosmos-framework's ``_format_prompt_with_template``."""
+        expected = (
+            self.NEGATIVE.strip().rstrip(".")
+            + ". "
+            + COSMOS3_DURATION_TEMPLATE.format(duration=189 / FRAME_RATE, fps=FRAME_RATE)
+        )
+        expected = (
+            expected.strip().rstrip(".")
+            + ". "
+            + COSMOS3_DEFAULT_RESOLUTION_TEMPLATE.format(height=HEIGHT, width=WIDTH)
+        )
+        assert self._negative(cosmos3_format_pipeline) == expected.lstrip(".").strip()
+
+    def test_positive_json_still_injects_fields(self, cosmos3_format_pipeline):
+        """The positive branch keeps field injection -- the two paths differ by design."""
+        data = json.loads(_format_prompt_with_metadata(cosmos3_format_pipeline, self.NEGATIVE))
+        assert data["resolution"] == {"W": 1280, "H": 720}
+        assert self._negative(cosmos3_format_pipeline) != _format_prompt_with_metadata(
+            cosmos3_format_pipeline, self.NEGATIVE
+        )
+
+
 @pytest.fixture(scope="class")
 def cosmos3_pipeline():
     checkpoint = _require_checkpoint()

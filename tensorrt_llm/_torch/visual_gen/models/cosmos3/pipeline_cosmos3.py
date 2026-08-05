@@ -539,10 +539,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         resolution_template: Optional[str] = COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
         force_duration_template: bool = False,
     ) -> str:
-        """Append duration and resolution metadata to a plain-text prompt.
+        """Append duration and resolution metadata as sentences.
 
         ``duration_template`` / ``resolution_template`` of ``None`` disables that
-        template.  JSON prompts are handled by ``_format_prompt_with_metadata``.
+        template.  A JSON positive prompt instead gets the metadata injected as
+        object fields by ``_format_prompt_with_metadata``; negative prompts always
+        come here, matching the reference, so a JSON negative prompt keeps its
+        serialized form and gains the sentences after it.
         """
         parts: List[str] = []
         head = prompt.rstrip(".").strip()
@@ -1158,7 +1161,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # Negative prompt: mirror positive metadata (cosmos-framework CLI default
         # when ``negative_prompt_keep_metadata`` promotes mode to ``same``).
-        negative_prompt = self._format_prompt_with_metadata(
+        # Always the plain-text templates, never the JSON field injection the
+        # positive branch uses: the reference appends these sentences to the
+        # negative prompt whether or not it is a JSON object, so a JSON negative
+        # prompt ends up as the serialized object followed by the sentences.
+        negative_prompt = self._apply_metadata_templates(
             negative_prompt,
             height=height,
             width=width,
