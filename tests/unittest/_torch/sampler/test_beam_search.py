@@ -2371,7 +2371,7 @@ class TestBeamSearchStepFromStrategies:
             # Deliberately instantiating the abstract base: that is what this
             # test pins, so mypy's (correct) complaint is expected here.
             _StrategyImpls.BeamSearchStep(  # type: ignore[abstract]
-                2, 2, torch.ones(1), None, None)
+                2, 2, 2, torch.ones(1), None, None)
 
     @pytest.mark.parametrize(
         "early_stopping, expected_cls",
