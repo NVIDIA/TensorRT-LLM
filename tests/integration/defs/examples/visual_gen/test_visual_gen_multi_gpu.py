@@ -16,6 +16,7 @@
 
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _save_lpips_video_mp4,
     _skip_if_missing,
 )
+from defs.trt_test_alternative import popen
 
 
 def _parallel_config(**kwargs):
@@ -82,6 +84,7 @@ WAN22_LPIPS_TP_VARIANTS = [
 WAN22_LPIPS_MULTINODE_WORLD_SIZE = 16
 WAN22_LPIPS_MULTINODE_NODES = 2
 WAN22_LPIPS_MULTINODE_GPUS_PER_NODE = 8
+# Keep this topology aligned with its 16-rank mapping unit test.
 WAN22_LPIPS_MULTINODE_PARALLEL = {
     "cfg_size": 2,
     "attn2d_size": (2, 2),
@@ -218,8 +221,7 @@ def _trtllm_launch_wrapper_world_size():
 
 
 def _multinode_subprocess_timeout():
-    # Default below the QA pipeline's outer --timeout=3600s so the inner srun
-    # timeout (with captured output) fires before pytest-timeout kills the test.
+    # Leave headroom for the outer 3600-second pytest timeout.
     return int(os.environ.get("TRTLLM_VISUAL_GEN_MULTINODE_TIMEOUT", "3300"))
 
 
@@ -254,8 +256,7 @@ def _ensure_slurm_external_launch_env():
     os.environ["MASTER_ADDR"] = _resolve_slurm_master_addr()
     os.environ.setdefault("MASTER_PORT", _default_master_port())
 
-    # Force VisualGen to exercise its SLURM detection branch even when the
-    # surrounding CI wrapper leaves torchrun-like variables behind.
+    # Prefer SLURM ranks over inherited torchrun variables.
     for var in ("RANK", "WORLD_SIZE", "LOCAL_RANK"):
         os.environ.pop(var, None)
 
@@ -274,12 +275,7 @@ def _run_wan22_multinode_slurm_rank(request, tmp_path):
         )
 
     if rank == 0:
-        # Only rank 0 encodes the generated video, and only it needs the media
-        # deps. Installing here (not parent-side) is required: each srun step
-        # gets a fresh container from the image, so the parent's apt-get never
-        # reaches the ranks. Keeping it rank-0-only also avoids 16 tasks racing
-        # the same apt lock; the other ranks simply block in
-        # dist.init_process_group meanwhile.
+        # Each srun rank gets a fresh container; rank 0 installs deps to avoid apt-lock races.
         request.getfixturevalue("_visual_gen_deps")
 
     _ensure_slurm_external_launch_env()
@@ -348,10 +344,7 @@ def _run_wan22_multinode_slurm_rank(request, tmp_path):
             _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
     finally:
         if visual_gen is not None:
-            # shutdown() joins rank 0's in-client worker thread with a 2s
-            # timeout and then drops the executor reference, so grab the
-            # thread first: 16-rank dist teardown outlasts 2s and would
-            # otherwise trip pytest-threadleak.
+            # Capture before shutdown drops the executor; its 2s join is too short here.
             worker_thread = getattr(visual_gen.executor, "_ext_worker_thread", None)
             visual_gen.shutdown()
             if worker_thread is not None and worker_thread.is_alive():
@@ -381,9 +374,7 @@ def _run_wan22_multinode_slurm_parent():
     if shutil.which("srun") is None:
         pytest.skip("srun is required for the VisualGen multi-node LPIPS case")
 
-    # Pre-check the checkpoint here so a missing model skips the parent honestly,
-    # instead of letting every srun rank skip and the parent report a false pass
-    # (an all-skipped pytest run still exits 0).
+    # Avoid treating an all-skipped child run as a pass.
     _skip_if_missing(
         _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
         "Wan 2.2 checkpoint",
@@ -416,16 +407,16 @@ def _run_wan22_multinode_slurm_parent():
         nodeid,
     ]
     try:
-        result = subprocess.run(
+        with popen(
             cmd,
             cwd=Path(__file__).resolve().parents[5],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            check=False,
-            timeout=_multinode_subprocess_timeout(),
-        )
+        ) as proc:
+            output, _ = proc.communicate(timeout=_multinode_subprocess_timeout())
+            returncode = proc.returncode
     except subprocess.TimeoutExpired as exc:
         output = exc.output or ""
         pytest.fail(
@@ -433,20 +424,26 @@ def _run_wan22_multinode_slurm_parent():
             f"{exc.timeout} seconds:\n{output}"
         )
 
-    if result.returncode != 0:
+    if returncode != 0:
         pytest.fail(
-            "VisualGen multi-node SLURM subprocess failed with "
-            f"exit code {result.returncode}:\n{result.stdout}"
+            f"VisualGen multi-node SLURM subprocess failed with exit code {returncode}:\n{output}"
         )
 
-    # Guard against a false pass: an all-skipped/empty pytest run also exits 0.
-    # The parent has already validated every precondition, so once srun launches
-    # all ranks must actually pass; any skip or empty collection is a real defect.
-    output = result.stdout or ""
-    if "passed" not in output or "skipped" in output or "no tests ran" in output:
+    # Validate rank-prefixed pytest summaries, not incidental log text.
+    summary_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    rank_summaries = sorted(
+        (int(rank), int(count), outcome)
+        for rank, count, outcome in re.findall(
+            r"(?m)^\s*(\d+):\s+(?:=+\s*)?(\d+)\s+(passed|skipped)\b",
+            summary_output,
+        )
+    )
+    expected_summaries = [(rank, 1, "passed") for rank in range(WAN22_LPIPS_MULTINODE_WORLD_SIZE)]
+    if rank_summaries != expected_summaries:
         pytest.fail(
             "VisualGen multi-node SLURM run exited 0 but did not actually execute "
-            "(expected all ranks to pass with no skips):\n"
+            "(expected exactly one passing pytest summary for every rank):\n"
+            f"observed summaries: {rank_summaries}\n"
             f"{output}"
         )
 
@@ -551,6 +548,4 @@ def test_wan22_t2v_multinode_slurm_lpips_against_golden(request, tmp_path):
     if os.environ.get(_MULTINODE_SLURM_CHILD_ENV):
         pytest.skip("VisualGen SLURM child was not launched with SLURM rank env")
 
-    # Media deps are installed by rank 0 inside the srun step, not here: the
-    # parent only shells out to srun and never encodes a video.
     _run_wan22_multinode_slurm_parent()
