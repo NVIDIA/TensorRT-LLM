@@ -553,6 +553,12 @@ class SamplingParams:
                     if config_eos:
                         self.end_id = config_eos[0]
                         for stop_token in config_eos[1:]:
+                            # Skip the primary EOS: a config listing it twice
+                            # (e.g. [7, 7, 8]) would otherwise put 7 in both
+                            # end_id and stop_token_ids. The generation_config
+                            # path below applies the same condition.
+                            if stop_token == self.end_id:
+                                continue
                             if self.stop_token_ids is None:
                                 self.stop_token_ids = []
                             if stop_token not in self.stop_token_ids:

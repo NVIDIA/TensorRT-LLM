@@ -393,6 +393,25 @@ def test_setup_model_config_eos_list_sets_end_id_and_stop_tokens():
     assert params.stop_token_ids == [8, 9]
 
 
+def test_setup_model_config_eos_list_excludes_a_repeated_primary_eos():
+    """A config listing the primary EOS twice must not put it in both places.
+
+    eos_token_id=[7, 7, 8] made 7 both end_id and a stop token. The
+    generation_config path already skipped self.end_id; this one did not.
+    """
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), _FakeConfig(eos_token_id=[7, 7, 8]), None)
+    assert params.end_id == 7
+    assert params.stop_token_ids == [8]
+
+
+def test_setup_model_config_eos_list_of_one_leaves_no_stop_tokens():
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), _FakeConfig(eos_token_id=[7]), None)
+    assert params.end_id == 7
+    assert not params.stop_token_ids
+
+
 def test_setup_explicit_end_id_is_not_overridden():
     params = SamplingParams(end_id=42)
     params._setup(_FakeTokenizer(eos_token_id=2), _FakeConfig(eos_token_id=200006), None)
