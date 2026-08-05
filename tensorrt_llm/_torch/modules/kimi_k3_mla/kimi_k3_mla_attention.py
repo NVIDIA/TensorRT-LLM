@@ -18,8 +18,9 @@ from ....functional import PositionEmbeddingType
 from ...attention_backend import AttentionMetadata, TrtllmAttention
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
+from ...pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from ..linear import Linear, TensorParallelMode
-from ..mla import MLA
+from ..mla import MLA, maybe_bcg_mla_custom_op_inplace
 
 
 def _meta_safe_cast_dtype(module, dtype):
@@ -187,7 +188,8 @@ class KimiK3MLAAttention(MLA):
         # K3 calls forward_impl() directly to insert its output gate before
         # the base row-parallel o_proj. The original executor metadata remains
         # intact, so MLA performs its native mixed context/generation split.
-        self.register_to_config = False
+        # ``register_to_config`` is left as set by the base ``MLA``: it gates
+        # the breakable-CUDA-graph eager-on-graph attention op.
 
         self.use_output_gate = use_output_gate
 
@@ -240,10 +242,25 @@ class KimiK3MLAAttention(MLA):
         # and it routes through the sparse hooks when they are installed. The
         # dense path this module uses is element 0.
         attn_outputs = self._create_outputs(hidden_states, attn_metadata)
-        super().forward_impl(
-            None,
-            hidden_states,
-            attn_metadata,
-            attn_output=attn_outputs,
-        )
+        if self.register_to_config and is_in_breakable_cuda_graph():
+            # Breakable prefill CUDA graph: run the metadata-dependent MLA
+            # attention eagerly between captured segments, writing into the
+            # graph-allocated ``attn_output``. The output gate + row-parallel
+            # o_proj below stay on-graph.
+            maybe_bcg_mla_custom_op_inplace(
+                hidden_states,
+                None,
+                self.layer_idx_str,
+                attn_outputs[0],
+                None,
+                None,
+                None,
+            )
+        else:
+            super().forward_impl(
+                None,
+                hidden_states,
+                attn_metadata,
+                attn_output=attn_outputs,
+            )
         return self._apply_output_gate_and_o_proj(hidden_states, attn_outputs[0])
