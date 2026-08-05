@@ -37,20 +37,28 @@ def _load_test_unittests_module(monkeypatch: pytest.MonkeyPatch) -> types.Module
 
 
 def test_loader_restores_stub_modules_after_context() -> None:
-    original_defs = sys.modules.pop("defs", None)
-    original_conftest = sys.modules.pop("defs.conftest", None)
+    original_defs = sys.modules.get("defs")
+    original_conftest = sys.modules.get("defs.conftest")
+    sentinel_defs = types.ModuleType("defs")
+    sentinel_conftest = types.ModuleType("defs.conftest")
+    sys.modules["defs"] = sentinel_defs
+    sys.modules["defs.conftest"] = sentinel_conftest
     try:
         with pytest.MonkeyPatch.context() as monkeypatch:
             _load_test_unittests_module(monkeypatch)
-            assert "defs" in sys.modules
-            assert "defs.conftest" in sys.modules
+            assert sys.modules["defs"] is not sentinel_defs
+            assert sys.modules["defs.conftest"] is not sentinel_conftest
 
-        assert "defs" not in sys.modules
-        assert "defs.conftest" not in sys.modules
+        assert sys.modules["defs"] is sentinel_defs
+        assert sys.modules["defs.conftest"] is sentinel_conftest
     finally:
-        if original_defs is not None:
+        if original_defs is None:
+            sys.modules.pop("defs", None)
+        else:
             sys.modules["defs"] = original_defs
-        if original_conftest is not None:
+        if original_conftest is None:
+            sys.modules.pop("defs.conftest", None)
+        else:
             sys.modules["defs.conftest"] = original_conftest
 
 
