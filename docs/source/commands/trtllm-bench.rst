@@ -1,7 +1,7 @@
 trtllm-bench
 ===========================
 
-trtllm-bench is a comprehensive benchmarking tool for TensorRT LLM engines. It provides subcommands for different benchmarking scenarios:
+trtllm-bench is a comprehensive benchmarking tool for TensorRT LLM engines. It provides subcommands for different benchmarking scenarios.
 
 .. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-config-flag-alias
