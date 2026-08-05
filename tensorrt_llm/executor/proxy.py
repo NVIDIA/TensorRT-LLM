@@ -30,12 +30,22 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
-from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
-                                  RemoteMpiCommSessionClient,
-                                  validate_session_world_size)
+from ..llmapi.mpi_session import (
+    MpiCommSession,
+    MpiPoolSession,
+    MpiSession,
+    RemoteMpiCommSessionClient,
+    validate_session_world_size,
+)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
-from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            enable_llm_debug, logger_debug, print_colored)
+from ..llmapi.utils import (
+    AsyncQueue,
+    ManagedThread,
+    _SyncQueue,
+    enable_llm_debug,
+    logger_debug,
+    print_colored,
+)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
@@ -43,11 +53,19 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
-from .utils import (EngineDeadError, ErrorResponse, RequestError,
-                    WorkerCommIpcAddrs, create_mpi_comm_session,
-                    get_spawn_proxy_process_env, is_llm_response,
-                    multi_frontend_request_addr, multi_frontend_result_addr,
-                    namespace_client_id, print_alive_threads)
+from .utils import (
+    EngineDeadError,
+    ErrorResponse,
+    RequestError,
+    WorkerCommIpcAddrs,
+    create_mpi_comm_session,
+    get_spawn_proxy_process_env,
+    is_llm_response,
+    multi_frontend_request_addr,
+    multi_frontend_result_addr,
+    namespace_client_id,
+    print_alive_threads,
+)
 from .worker import GenerationExecutorWorker, worker_main
 from .worker_process_monitor import WorkerProcessIdentity, WorkerProcessMonitor
 
@@ -811,12 +829,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             print_alive_threads()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
+        """Low-level API to the executor. Return a "future" GenerationResult
+        which can be waited.
+        Forwards the request to the workers through the request queue.
         """
-            Low-level API to the executor. Return a "future" GenerationResult
-            which can be waited.
-            Forwards the request to the workers through the request queue.
-        """
-
         # Sticky fast-fail: don't accept new work once the engine is known dead.
         if self._engine_dead or self._fatal_error is not None:
             raise EngineDeadError(self._fatal_error)
@@ -946,6 +962,25 @@ class GenerationExecutorProxy(GenerationExecutor):
             return params if isinstance(params, dict) else {}
         except RPCError as e:
             logger.warning(f"Error fetching disaggregated params via RPC: {e}")
+            return {}
+
+    def get_effective_llm_args(self) -> dict:
+        """Get the effective llm_args from the worker runtime via RPC.
+
+        The worker may have disabled runtime features (e.g. chunked prefill)
+        by mutating its copy of ``llm_args`` during engine creation. Fetching
+        the effective values keeps the main-process ``LLM.args`` (and the
+        frontend validations that read it) in sync with the runtime.
+        """
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get effective llm_args")
+            return {}
+        try:
+            llm_args = self.rpc_client.get_effective_llm_args().remote()
+            return llm_args if isinstance(llm_args, dict) else {}
+        except RPCError as e:
+            logger.warning(f"Error fetching effective llm_args via RPC: {e}")
             return {}
 
     def get_data_transceiver_state(self) -> bytes:

@@ -11,8 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
-                    Optional, Union)
+from typing import TYPE_CHECKING, AsyncIterable, Dict, Generator, List, Optional, Union
 
 import numpy as np
 import torch
@@ -26,19 +25,20 @@ from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
-from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
-                                  need_spawn_mpi_workers)
+from ..llmapi.mpi_session import MpiSession, external_mpi_comm_available, need_spawn_mpi_workers
 from ..llmapi.tokenizer import TokenizerBase
-from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
-                            enable_worker_single_process_for_tp1, logger_debug,
-                            print_colored)
-from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
-                               SamplingParams)
+from ..llmapi.utils import (
+    AsyncQueue,
+    enable_llm_debug,
+    enable_worker_single_process_for_tp1,
+    logger_debug,
+    print_colored,
+)
+from ..sampling_params import BatchedLogitsProcessor, LogprobParams, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
-from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
-                      PromptAdapterRequest)
+from .request import DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
@@ -278,7 +278,7 @@ class GenerationExecutor(ABC):
                 self._iter_kv_events_result.mark_undone()
 
     def _handle_background_error(self, error: Optional[Exception | str] = None):
-        """ Process the errors from the threads or processes.
+        """Process the errors from the threads or processes.
         NOTE: This should be called in the main thread.
         """
         if error is not None:
@@ -401,6 +401,7 @@ class GenerationExecutor(ABC):
 
         Args:
             timeout (float): Max wait time in seconds when retrieving stats from queue.
+
         Returns:
             List[dict]: A list of runtime stats as dict.
         """
@@ -441,6 +442,7 @@ class GenerationExecutor(ABC):
 
         Args:
             timeout (float): Max wait time in seconds when retrieving stats from queue.
+
         Returns:
             List[dict]: A list of runtime events as dict.
         """
@@ -454,6 +456,7 @@ class GenerationExecutor(ABC):
 
         Args:
             timeout (float): Max wait time in seconds when retrieving stats from queue.
+
         Returns:
             IterationResult: An async iterable object containing runtime events.
         """
@@ -463,6 +466,9 @@ class GenerationExecutor(ABC):
         return self._iter_kv_events_result
 
     def get_disaggregated_params(self) -> dict:
+        return {}
+
+    def get_effective_llm_args(self) -> dict:
         return {}
 
     def get_cache_transceiver(self) -> Optional["KvCacheTransceiver"]:
@@ -479,7 +485,7 @@ class GenerationExecutor(ABC):
         is_llm_executor: bool,
         tp_size: int,
     ):
-        logger.warning(f"Orchestrator is creating Ray executor")
+        logger.warning("Orchestrator is creating Ray executor")
         from .ray_executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
@@ -498,7 +504,7 @@ class GenerationExecutor(ABC):
     ):
         """Create RPC-based executor (GenerationExecutorRpcProxy)."""
         from .rpc_proxy import GenerationExecutorRpcProxy
-        logger.warning(f"Orchestrator is creating RPC executor")
+        logger.warning("Orchestrator is creating RPC executor")
         return GenerationExecutorRpcProxy(
             worker_kwargs,
             model_world_size=model_world_size,
@@ -521,7 +527,7 @@ class GenerationExecutor(ABC):
             use_worker: If True, creates GenerationExecutorWorker (single process).
                        If False, creates GenerationExecutorProxy (multi-process with IPC).
         """
-        logger.warning(f"Orchestrator is creating IPC executor")
+        logger.warning("Orchestrator is creating IPC executor")
         if use_worker:
             from .worker import GenerationExecutorWorker
             return GenerationExecutorWorker(**worker_kwargs,

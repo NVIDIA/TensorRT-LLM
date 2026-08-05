@@ -16,15 +16,29 @@
 
 When ``create_py_executor`` decides to disable chunked prefill via the
 FlashInfer-Star gate or the MLA SM gate, the user-facing
-``llm_args.enable_chunked_prefill`` flag must also be flipped to ``False`` so
-that ``LLM._check_arguments`` (llmapi/llm.py:1017) reads the effective state
-and runs the per-request prompt-length validation.
+``llm_args.enable_chunked_prefill`` flag must also be flipped to ``False``.
+The flip happens on the worker's own copy of ``llm_args``, so the tests below
+cover the full chain that keeps the main process in sync:
+
+1. the worker-side gate flips ``llm_args.enable_chunked_prefill``;
+2. ``BaseWorker.get_effective_llm_args`` exposes the mutated field;
+3. the executor proxies fetch it via RPC;
+4. ``LLM._sync_effective_llm_args`` patches the frontend ``LLM.args`` so
+   ``LLM._check_arguments`` runs the per-request prompt-length validation,
+   without rejecting cache-hit requests under kv-cache block reuse.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+
+import pytest
 
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
+from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -266,3 +280,126 @@ def test_supported_path_preserves_llm_args_chunked_prefill(monkeypatch):
         enable_chunked_prefill=True,
     )
     assert llm_args_chunked_prefill is True
+
+
+def _make_worker(llm_args=None):
+    """A minimal worker-like object exposing the worker-side getter."""
+    worker = SimpleNamespace(llm_args=llm_args)
+    worker.get_effective_llm_args = MethodType(BaseWorker.get_effective_llm_args, worker)
+    return worker
+
+
+def test_worker_get_effective_llm_args_exposes_mutated_field():
+    """The worker-side getter must report the post-engine-creation value of
+    enable_chunked_prefill, and stay a no-op without llm_args."""
+    llm_args = _make_llm_args(enable_chunked_prefill=False)
+    assert _make_worker(llm_args).get_effective_llm_args() == {"enable_chunked_prefill": False}
+
+    llm_args = _make_llm_args(enable_chunked_prefill=True)
+    assert _make_worker(llm_args).get_effective_llm_args() == {"enable_chunked_prefill": True}
+
+    assert _make_worker(None).get_effective_llm_args() == {}
+
+
+def _make_proxy(rpc_client):
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.rpc_client = rpc_client
+    return proxy
+
+
+def _make_rpc_proxy(rpc_client):
+    proxy = object.__new__(GenerationExecutorRpcProxy)
+    proxy.rpc_client = rpc_client
+    return proxy
+
+
+def test_proxy_get_effective_llm_args_fetches_via_rpc():
+    """Both proxy flavors must fetch the effective llm_args from the worker
+    via RPC and fall back to {} when the client is unavailable."""
+    rpc_client = SimpleNamespace(
+        get_effective_llm_args=lambda: SimpleNamespace(
+            remote=lambda: {"enable_chunked_prefill": False}
+        )
+    )
+
+    assert _make_proxy(rpc_client).get_effective_llm_args() == {"enable_chunked_prefill": False}
+    assert _make_rpc_proxy(rpc_client).get_effective_llm_args() == {"enable_chunked_prefill": False}
+
+    assert _make_proxy(None).get_effective_llm_args() == {}
+    assert _make_rpc_proxy(None).get_effective_llm_args() == {}
+
+
+def test_ray_executor_get_effective_llm_args_fetches_via_rpc():
+    """The Ray executor must fetch the effective llm_args from the worker
+    via RPC like the other proxied executors."""
+    pytest.importorskip("ray")
+    from tensorrt_llm.executor.ray_executor import RayExecutor
+
+    proxy = object.__new__(RayExecutor)
+    proxy.rpc_client = SimpleNamespace(
+        get_effective_llm_args=lambda: SimpleNamespace(
+            remote=lambda: {"enable_chunked_prefill": False}
+        )
+    )
+    assert proxy.get_effective_llm_args() == {"enable_chunked_prefill": False}
+
+
+def test_llm_syncs_effective_llm_args_from_executor():
+    """LLM._sync_effective_llm_args must patch the frontend LLM.args with the
+    effective value reported by the (proxied) executor, so that frontend-side
+    validation reads the same state as the worker runtime."""
+    llm = LLM.__new__(LLM)
+    llm.args = SimpleNamespace(backend="pytorch", enable_chunked_prefill=True)
+    llm._executor = SimpleNamespace(
+        get_effective_llm_args=lambda: {"enable_chunked_prefill": False}
+    )
+
+    llm._sync_effective_llm_args()
+
+    assert llm.args.enable_chunked_prefill is False
+
+
+def test_llm_sync_is_noop_without_pytorch_backend():
+    """The sync must not touch non-PyTorch backends (e.g. AutoDeploy)."""
+    llm = LLM.__new__(LLM)
+    llm.args = SimpleNamespace(backend="_autodeploy", enable_chunked_prefill=True)
+    llm._executor = SimpleNamespace(
+        get_effective_llm_args=lambda: {"enable_chunked_prefill": False}
+    )
+
+    llm._sync_effective_llm_args()
+
+    assert llm.args.enable_chunked_prefill is True
+
+
+def _make_frontend_llm(*, enable_chunked_prefill, enable_block_reuse):
+    llm = LLM.__new__(LLM)
+    llm.args = SimpleNamespace(
+        backend="pytorch",
+        enable_chunked_prefill=enable_chunked_prefill,
+        max_num_tokens=128,
+        kv_cache_config=SimpleNamespace(enable_block_reuse=enable_block_reuse),
+        parallel_config=SimpleNamespace(cp_size=1),
+    )
+    return llm
+
+
+def test_check_arguments_rejects_oversize_without_block_reuse():
+    """With block reuse disabled and chunked prefill off, an oversized
+    request must be rejected up front."""
+    llm = _make_frontend_llm(enable_chunked_prefill=False, enable_block_reuse=False)
+    with pytest.raises(RequestError):
+        llm._check_arguments(
+            prompt_len=200, query_len=0, sampling_params=SimpleNamespace(), is_gen_only=False
+        )
+
+
+def test_check_arguments_allows_oversize_with_block_reuse():
+    """With block reuse enabled, the scheduler subtracts estimated reusable
+    prefix tokens from the prompt length, so the frontend must not reject a
+    cache-hit request that exceeds max_num_tokens in raw length (e.g. MLA on
+    SM121: block reuse on, chunked prefill disabled)."""
+    llm = _make_frontend_llm(enable_chunked_prefill=False, enable_block_reuse=True)
+    llm._check_arguments(
+        prompt_len=200, query_len=0, sampling_params=SimpleNamespace(), is_gen_only=False
+    )
