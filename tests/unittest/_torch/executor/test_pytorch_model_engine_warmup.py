@@ -259,6 +259,26 @@ class TestWarmupCleanup(unittest.TestCase):
             calls.count("empty_cache"), 0, f"Helix CP should skip all warmup cleanup; got {calls}"
         )
 
+    def test_warmup_stage_metrics_are_recorded(self):
+        model_engine, resource_manager = _build_engine_and_resource_manager()
+        _run_warmup_tracked(model_engine, resource_manager)
+
+        expected_metrics = {
+            "attention_warmup_seconds",
+            "general_warmup_seconds",
+            "autotuner_warmup_seconds",
+            "mamba_hybrid_warmup_seconds",
+            "cuda_graph_warmup_seconds",
+            "cuda_graph_capture_seconds",
+            "dg_paged_mqa_warmup_seconds",
+            "cute_dsl_radix_topk_warmup_seconds",
+            "memory_pool_prepopulation_seconds",
+            "kv_cache_cleanup_seconds",
+            "total_warmup_seconds",
+        }
+        self.assertEqual(expected_metrics, model_engine.metrics.keys())
+        self.assertTrue(all(value >= 0 for value in model_engine.metrics.values()))
+
 
 if __name__ == "__main__":
     unittest.main()

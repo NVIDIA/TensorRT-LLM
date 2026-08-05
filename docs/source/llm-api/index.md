@@ -50,9 +50,9 @@ llm = LLM(model=<local_path_to_model>)
 
 ## Startup Metrics
 
-For the PyTorch backend, the beta `LLM.startup_metrics` property reports weight-loading timings from
-worker rank 0. Values are wall-clock seconds. The property returns an empty dictionary when the
-backend does not provide startup metrics.
+For the PyTorch backend, the beta `LLM.startup_metrics` property reports executor construction,
+model-engine warmup, and weight-loading timings from worker rank 0. Values are wall-clock seconds.
+The property returns an empty dictionary when the backend does not provide startup metrics.
 
 ```python
 llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
@@ -63,6 +63,18 @@ A typical result has the following structure:
 
 ```json
 {
+  "executor": {
+    "total_executor_creation_seconds": 12.341,
+    "model_engine_creation_seconds": 5.241,
+    "final_kv_cache_creation_seconds": 0.421,
+    "final_py_executor_creation_seconds": 4.317
+  },
+  "final_model_engine": {
+    "total_warmup_seconds": 4.217,
+    "attention_warmup_seconds": 0.301,
+    "autotuner_warmup_seconds": 1.732,
+    "cuda_graph_capture_seconds": 1.105
+  },
   "model_loader": {
     "total_model_loading_seconds":  1.971,
     "checkpoint_preparation_seconds": 1.177,
@@ -71,6 +83,35 @@ A typical result has the following structure:
   }
 }
 ```
+
+The `executor` object contains the timed scopes in `create_py_executor()`. When KV cache capacity
+estimation creates a temporary executor before constructing the final executor,
+`initial_model_engine` contains the warmup metrics from the temporary pass and
+`final_model_engine` contains the warmup metrics from the final pass. Without estimation, only
+`final_model_engine` appears. The model-engine dictionaries are promoted alongside `executor` in
+the startup metrics payload so callers do not need to traverse another nesting level. Legacy
+two-model speculative decoding can likewise produce `initial_draft_model_engine` and
+`final_draft_model_engine`.
+
+Executor scope names describe the constructed component rather than the internal memory-category
+enum. The initial KV cache and PyExecutor scopes are temporary resources used for KV cache capacity
+estimation; their final counterparts are the resources retained for serving.
+
+| Executor metric | Scope |
+|-----------------|-------|
+| `model_engine_creation_seconds` | Construct and load the main model engine. |
+| `draft_model_engine_creation_seconds` | Construct and load the separate draft model engine, when used. |
+| `guided_decoder_creation_seconds` | Construct guided-decoding resources. |
+| `sampler_creation_seconds` | Construct the sampler. |
+| `initial_kv_cache_creation_seconds` | Construct the temporary KV cache used to estimate final capacity. |
+| `final_kv_cache_creation_seconds` | Construct the final KV cache retained for serving. |
+| `speculative_decoding_resource_manager_creation_seconds` | Construct speculative-decoding resource managers. |
+| `speculative_drafter_creation_seconds` | Construct the speculative drafter. |
+| `initial_py_executor_creation_seconds_for_kv_cache_estimation` | Construct and warm up the temporary PyExecutor used during KV cache capacity estimation. |
+| `kv_cache_capacity_configuration_seconds` | Determine final KV cache capacity from the temporary executor and available memory. |
+| `final_py_executor_creation_seconds` | Construct and warm up the final PyExecutor retained for serving. |
+| `worker_start_seconds` | Start the final executor worker. |
+| `total_executor_creation_seconds` | Complete `create_py_executor()` call, including all applicable scopes above. |
 
 The `model_loader` object contains timings for the main LLM weights. If a draft model is used,
 additional field `draft_checkpoint_preparation_seconds` and `draft_weight_population_seconds` will appear.

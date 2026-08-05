@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -23,10 +24,34 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, ContextChunkingPolicy
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
+    ContextChunkingPolicy,
+    ExecutorMemoryType,
+)
 from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_executor_creation_stage_metric_names_are_descriptive():
+    assert py_executor_creator._ExecutorMemoryMonitor.creation_stage_metric_names == {
+        ExecutorMemoryType.SAMPLER: "sampler_creation_seconds",
+        ExecutorMemoryType.DRAFTER: "speculative_drafter_creation_seconds",
+        ExecutorMemoryType.GUIDED_DECODER: "guided_decoder_creation_seconds",
+        ExecutorMemoryType.SPEC_RESOURCES: (
+            "speculative_decoding_resource_manager_creation_seconds"
+        ),
+        ExecutorMemoryType.INIT_KV_CACHE: "initial_kv_cache_creation_seconds",
+        ExecutorMemoryType.INIT_EXTRA_RESOURCES: (
+            "initial_py_executor_creation_seconds_for_kv_cache_estimation"
+        ),
+        ExecutorMemoryType.MODEL_EXTRA: "kv_cache_capacity_configuration_seconds",
+        ExecutorMemoryType.EXTRA_RESOURCES: "final_py_executor_creation_seconds",
+        ExecutorMemoryType.KV_CACHE: "final_kv_cache_creation_seconds",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN: "model_engine_creation_seconds",
+        ExecutorMemoryType.MODEL_ENGINE_DRAFT: "draft_model_engine_creation_seconds",
+    }
 
 
 class _DummyCalibrator:
@@ -78,6 +103,7 @@ class _DummyPyExecutor:
         """
         self.resource_manager = _DummyResourceManager(resources)
         self.model_engine = model_engine
+        self.metrics = {}
         self.peft_cache_config = peft_cache_config
         self.execution_stream = execution_stream
         self.started = False
@@ -138,6 +164,7 @@ class _DummyModelEngine:
             max_seq_len: Effective sequence length reported by the model engine.
         """
         self.attn_runtime_features = attn_runtime_features
+        self.metrics = {}
         self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
         self.sparse_attention_config = None
@@ -331,6 +358,54 @@ def _run_create_py_executor(
         py_executor.model_engine.attn_runtime_features.cache_reuse,
         py_executor.model_engine.attn_runtime_features.chunked_prefill,
     )
+
+
+def test_move_model_engine_metrics_moves_and_clears():
+    py_executor = SimpleNamespace(metrics={})
+    model_engine = SimpleNamespace(metrics={"total_warmup_seconds": 2.5})
+    draft_model_engine = SimpleNamespace(metrics={"total_warmup_seconds": 1.5})
+
+    py_executor_creator._move_model_engine_metrics(
+        py_executor, model_engine, "initial", draft_model_engine
+    )
+    model_engine.metrics["total_warmup_seconds"] = 3.5
+    draft_model_engine.metrics["total_warmup_seconds"] = 2.0
+    py_executor_creator._move_model_engine_metrics(
+        py_executor, model_engine, "final", draft_model_engine
+    )
+
+    assert py_executor.metrics == {
+        "initial_model_engine": {"total_warmup_seconds": 2.5},
+        "initial_draft_model_engine": {"total_warmup_seconds": 1.5},
+        "final_model_engine": {"total_warmup_seconds": 3.5},
+        "final_draft_model_engine": {"total_warmup_seconds": 2.0},
+    }
+    assert model_engine.metrics == {}
+    assert draft_model_engine.metrics == {}
+
+
+def test_total_executor_creation_metric_finishes_on_error(monkeypatch):
+    captured_metrics = None
+
+    @contextmanager
+    def _timing_metric(metric_name, metrics):
+        nonlocal captured_metrics
+        captured_metrics = metrics
+        try:
+            yield
+        finally:
+            metrics[metric_name] = 1.5
+
+    def _raise_during_creation(**kwargs):
+        raise RuntimeError("creation failed")
+
+    monkeypatch.setattr(py_executor_creator, "timing_metric", _timing_metric)
+    monkeypatch.setattr(py_executor_creator, "_create_py_executor", _raise_during_creation)
+
+    with pytest.raises(RuntimeError, match="creation failed"):
+        py_executor_creator.create_py_executor(SimpleNamespace())
+
+    assert captured_metrics == {"total_executor_creation_seconds": 1.5}
 
 
 def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):
