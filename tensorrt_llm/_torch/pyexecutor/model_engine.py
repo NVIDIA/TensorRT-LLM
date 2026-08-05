@@ -4140,6 +4140,17 @@ class PyTorchModelEngine(ModelEngine):
         cache = getattr(self, "_pinned_host_cache", None)
         if cache is None:
             cache = self._pinned_host_cache = {}
+            self._pinned_host_events = {}
+        # WAR guard, the counterpart of the use-after-free this helper fixed:
+        # a persistent buffer can be REWRITTEN while its previous non_blocking
+        # H2D is still queued behind an in-flight forward, so the device copies
+        # this step's values into last step's consumer. Callers record the
+        # key's event via _pinned_host_record after enqueuing the copy; waiting
+        # here closes the window, and in the steady state the event completed
+        # long ago so this costs nothing.
+        evt = self._pinned_host_events.get(key)
+        if evt is not None:
+            evt.synchronize()
         buf = cache.get(key)
         if buf is None or buf.numel() < len(values) or buf.dtype != dtype:
             buf = torch.empty(max(len(values), 1),
@@ -4150,6 +4161,21 @@ class PyTorchModelEngine(ModelEngine):
         if values:
             view.copy_(torch.tensor(values, dtype=dtype))
         return view
+
+    def _pinned_host_record(self, *keys: str) -> None:
+        """Mark the H2D copies from these staging buffers as enqueued.
+
+        Call after the non_blocking copy that reads a `_pinned_host` view.
+        Skipped during graph capture (the staging copies are eager on every
+        step, including graph steps; only the one-time capture pass is not).
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+        for key in keys:
+            evt = self._pinned_host_events.get(key)
+            if evt is None:
+                evt = self._pinned_host_events[key] = torch.cuda.Event()
+            evt.record()
 
     def _attach_accept_caps(self, spec_metadata, generation_requests) -> None:
         """Publish ``cap-accept`` ceilings, without touching the layout.
@@ -4198,6 +4224,7 @@ class PyTorchModelEngine(ModelEngine):
                                           [1 + int(cap) for cap in caps],
                                           torch.int32),
                         non_blocking=True)
+        self._pinned_host_record("accept_caps")
         spec_metadata.accept_caps = caps_view
         spec_metadata.accept_cap_trim = self.accept_cap_trim_cuda
 
@@ -4233,6 +4260,7 @@ class PyTorchModelEngine(ModelEngine):
         lens_view.copy_(self._pinned_host("ragged_verify_lens", token_lens,
                                           torch.int32),
                         non_blocking=True)
+        self._pinned_host_record("ragged_verify_lens")
         indptr_view = self.ragged_qo_indptr_cuda[:n + 1]
         indptr_view.copy_(build_qo_indptr(lens_view), non_blocking=True)
         spec_metadata.verify_lens = lens_view
@@ -4254,10 +4282,13 @@ class PyTorchModelEngine(ModelEngine):
         verifies the same number of positions.
         """
         rows, cols = ragged_gather_index_lists(slots, counts)
-        return (self._pinned_host("gather_rows", rows,
-                                  torch.long).to('cuda', non_blocking=True),
-                self._pinned_host("gather_cols", cols,
-                                  torch.long).to('cuda', non_blocking=True))
+        rows_dev = self._pinned_host("gather_rows", rows,
+                                     torch.long).to('cuda', non_blocking=True)
+        self._pinned_host_record("gather_rows")
+        cols_dev = self._pinned_host("gather_cols", cols,
+                                     torch.long).to('cuda', non_blocking=True)
+        self._pinned_host_record("gather_cols")
+        return (rows_dev, cols_dev)
 
     def _update_target_input_tensors(
             self,
@@ -5553,6 +5584,18 @@ class PyTorchModelEngine(ModelEngine):
                     previous_kv_len_offsets = (
                         new_tokens_lens_device[previous_slots] -
                         tokens_per_previous_request)
+                    # The gather above reads the sampler's slot-indexed store;
+                    # a slot the sampler has not (yet) written for the previous
+                    # step yields a stale or uninitialized count, and the
+                    # captured kv_lens correction then walks the KV append past
+                    # the request's allocated blocks (the ragged IMA). The
+                    # physically possible range is tight -- accepted tokens
+                    # minus this request's window -- so clamp to it; a clamped
+                    # value is at worst one window of KV length, never an OOB
+                    # address.
+                    previous_kv_len_offsets = previous_kv_len_offsets.clamp_(
+                        min=-int(self.runtime_draft_len + 1),
+                        max=int(self.runtime_draft_len + 1))
                 else:
                     kv_len_offsets_device = (new_tokens_lens_device -
                                              runtime_tokens_per_gen_step)
