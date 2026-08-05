@@ -26,6 +26,78 @@
 namespace fused_fma_kernels
 {
 
+__device__ __forceinline__ unsigned long long bitcastF32x2ToU64(float2 value)
+{
+    union
+    {
+        float2 f;
+        unsigned long long u;
+    } bits{value};
+
+    return bits.u;
+}
+
+__device__ __forceinline__ float2 bitcastU64ToF32x2(unsigned long long value)
+{
+    union
+    {
+        unsigned long long u;
+        float2 f;
+    } bits{value};
+
+    return bits.f;
+}
+
+__device__ __forceinline__ float2 addF32x2(float2 lhs, float2 rhs)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    unsigned long long packed;
+    asm("add.rn.ftz.f32x2 %0, %1, %2;" : "=l"(packed) : "l"(bitcastF32x2ToU64(lhs)), "l"(bitcastF32x2ToU64(rhs)));
+    return bitcastU64ToF32x2(packed);
+#else
+    return make_float2(lhs.x + rhs.x, lhs.y + rhs.y);
+#endif
+}
+
+__device__ __forceinline__ float2 mulF32x2(float lhs, float2 rhs)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    unsigned long long packed;
+    float2 const lhs2 = make_float2(lhs, lhs);
+    asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(packed) : "l"(bitcastF32x2ToU64(lhs2)), "l"(bitcastF32x2ToU64(rhs)));
+    return bitcastU64ToF32x2(packed);
+#else
+    return make_float2(lhs * rhs.x, lhs * rhs.y);
+#endif
+}
+
+__device__ __forceinline__ float2 fmaF32x2(float lhs, float2 rhs, float2 acc)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    unsigned long long packed;
+    float2 const lhs2 = make_float2(lhs, lhs);
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
+        : "=l"(packed)
+        : "l"(bitcastF32x2ToU64(lhs2)), "l"(bitcastF32x2ToU64(rhs)), "l"(bitcastF32x2ToU64(acc)));
+    return bitcastU64ToF32x2(packed);
+#else
+    return make_float2(fmaf(lhs, rhs.x, acc.x), fmaf(lhs, rhs.y, acc.y));
+#endif
+}
+
+__device__ __forceinline__ float2 fmaF32x2(float2 lhs, float2 rhs, float2 acc)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    unsigned long long packed;
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
+        : "=l"(packed)
+        : "l"(bitcastF32x2ToU64(lhs)), "l"(bitcastF32x2ToU64(rhs)), "l"(bitcastF32x2ToU64(acc)));
+    return bitcastU64ToF32x2(packed);
+#else
+    return make_float2(fmaf(lhs.x, rhs.x, acc.x), fmaf(lhs.y, rhs.y, acc.y));
+#endif
+}
+
 // ===================================================================
 // Fused K-split pmap+GEMM FMA: new_r is NEVER materialized to HBM.  Each CTA
 // scans one HIDDEN-slice inline: for each h in its slice it loads residual[j,h]
@@ -70,6 +142,8 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
                                                       : ((NUM_K_SPLITS == 1 || NUM_K_SPLITS == 2) ? 8
                                                               : (NUM_K_SPLITS == 4)               ? 4
                                                                                                   : 2);
+    constexpr bool PACK_PMAP_F32X2 = X_NUM_SPLITS > 1 && N_PER_BLOCK > 1;
+    constexpr bool PACK_GEMM_F32X2 = X_NUM_SPLITS > 1 && N_PER_BLOCK == 3;
     static_assert(BF16_VEC == 2 || BF16_VEC == 4 || BF16_VEC == 8, "BF16_VEC must be 2, 4, or 8");
 
     int const token = blockIdx.x;
@@ -107,9 +181,13 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
         pm[j] = s_post[j];
 
     float acc[N_PER_BLOCK];
+    float2 acc2[N_PER_BLOCK];
 #pragma unroll
     for (int n = 0; n < N_PER_BLOCK; n++)
+    {
         acc[n] = 0.0f;
+        acc2[n] = make_float2(0.0f, 0.0f);
+    }
     float sqr = 0.0f;
 
     long long const tok_res = static_cast<long long>(token) * HC_MULT * hidden_size;
@@ -118,7 +196,7 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
     for (int h = h_start + tid * BF16_VEC; h < h_end; h += BLOCK_SIZE * BF16_VEC)
     {
         // Reduce split-major O_b partials before pmap.
-        float xf[BF16_VEC] = {};
+        float2 xf2[BF16_VEC / 2];
 #pragma unroll
         for (int xs = 0; xs < X_NUM_SPLITS; ++xs)
         {
@@ -132,8 +210,10 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
                 for (int v = 0; v < 4; v++)
                 {
                     float2 f = __bfloat1622float2(xp[v]);
-                    xf[2 * v + 0] += f.x;
-                    xf[2 * v + 1] += f.y;
+                    if (xs == 0)
+                        xf2[v] = f;
+                    else
+                        xf2[v] = addF32x2(xf2[v], f);
                 }
             }
             else if constexpr (BF16_VEC == 4)
@@ -144,8 +224,10 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
                 for (int v = 0; v < 2; v++)
                 {
                     float2 f = __bfloat1622float2(xp[v]);
-                    xf[2 * v + 0] += f.x;
-                    xf[2 * v + 1] += f.y;
+                    if (xs == 0)
+                        xf2[v] = f;
+                    else
+                        xf2[v] = addF32x2(xf2[v], f);
                 }
             }
             else
@@ -153,62 +235,118 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
                 unsigned x_raw = *reinterpret_cast<unsigned const*>(&x_in[tok_x + h]);
                 __nv_bfloat162 xp = *reinterpret_cast<__nv_bfloat162 const*>(&x_raw);
                 float2 f = __bfloat1622float2(xp);
-                xf[0] += f.x;
-                xf[1] += f.y;
+                if (xs == 0)
+                    xf2[0] = f;
+                else
+                    xf2[0] = addF32x2(xf2[0], f);
             }
         }
 
-        // Seed new_r[j, v] = pm[j] * x[v] for all j
-        float new_r[HC_MULT][BF16_VEC];
-#pragma unroll
-        for (int j = 0; j < HC_MULT; j++)
-#pragma unroll
-            for (int v = 0; v < BF16_VEC; v++)
-                new_r[j][v] = pm[j] * xf[v];
-
-// Add Σ_k comb[k,j] * r[k, v] — FULL HC sum (all k ∈ [0, HC_MULT))
-#pragma unroll
-        for (int k = 0; k < HC_MULT; k++)
+        union NewResidual
         {
-            float rf_k[BF16_VEC];
-            __nv_bfloat16 const* r_ptr = &residual_in[tok_res + k * hidden_size + h];
-            if constexpr (BF16_VEC == 8)
-            {
-                uint4 r_raw = *reinterpret_cast<uint4 const*>(r_ptr);
-                __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&r_raw);
+            float scalar[HC_MULT][BF16_VEC];
+            float2 packed[HC_MULT][BF16_VEC / 2];
+        } new_r;
+
+        if constexpr (PACK_PMAP_F32X2)
+        {
+            // Pack independent adjacent lanes without changing per-lane FP32
+            // operation order. AutoTuner remains responsible for choosing TN
+            // at each M bucket.
 #pragma unroll
-                for (int v = 0; v < 4; v++)
-                {
-                    float2 f = __bfloat1622float2(rp[v]);
-                    rf_k[2 * v + 0] = f.x;
-                    rf_k[2 * v + 1] = f.y;
-                }
-            }
-            else if constexpr (BF16_VEC == 4)
-            {
-                uint2 r_raw = *reinterpret_cast<uint2 const*>(r_ptr);
-                __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&r_raw);
+            for (int j = 0; j < HC_MULT; j++)
 #pragma unroll
-                for (int v = 0; v < 2; v++)
+                for (int v = 0; v < BF16_VEC / 2; v++)
+                    new_r.packed[j][v] = mulF32x2(pm[j], xf2[v]);
+
+#pragma unroll
+            for (int k = 0; k < HC_MULT; k++)
+            {
+                float2 rf_k[BF16_VEC / 2];
+                __nv_bfloat16 const* r_ptr = &residual_in[tok_res + k * hidden_size + h];
+                if constexpr (BF16_VEC == 8)
                 {
-                    float2 f = __bfloat1622float2(rp[v]);
-                    rf_k[2 * v + 0] = f.x;
-                    rf_k[2 * v + 1] = f.y;
+                    uint4 r_raw = *reinterpret_cast<uint4 const*>(r_ptr);
+                    __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&r_raw);
+#pragma unroll
+                    for (int v = 0; v < 4; v++)
+                        rf_k[v] = __bfloat1622float2(rp[v]);
                 }
+                else if constexpr (BF16_VEC == 4)
+                {
+                    uint2 r_raw = *reinterpret_cast<uint2 const*>(r_ptr);
+                    __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&r_raw);
+#pragma unroll
+                    for (int v = 0; v < 2; v++)
+                        rf_k[v] = __bfloat1622float2(rp[v]);
+                }
+                else
+                {
+                    unsigned r_raw = *reinterpret_cast<unsigned const*>(r_ptr);
+                    __nv_bfloat162 rp = *reinterpret_cast<__nv_bfloat162 const*>(&r_raw);
+                    rf_k[0] = __bfloat1622float2(rp);
+                }
+#pragma unroll
+                for (int j = 0; j < HC_MULT; j++)
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC / 2; v++)
+                    {
+                        new_r.packed[j][v] = fmaF32x2(s_comb[k][j], rf_k[v], new_r.packed[j][v]);
+                    }
             }
-            else
-            { // BF16_VEC == 2
-                unsigned r_raw = *reinterpret_cast<unsigned const*>(r_ptr);
-                __nv_bfloat162 rp = *reinterpret_cast<__nv_bfloat162 const*>(&r_raw);
-                float2 f = __bfloat1622float2(rp);
-                rf_k[0] = f.x;
-                rf_k[1] = f.y;
-            }
+        }
+        else
+        {
+            float const* xf = reinterpret_cast<float const*>(xf2);
 #pragma unroll
             for (int j = 0; j < HC_MULT; j++)
 #pragma unroll
                 for (int v = 0; v < BF16_VEC; v++)
-                    new_r[j][v] = fmaf(s_comb[k][j], rf_k[v], new_r[j][v]);
+                    new_r.scalar[j][v] = pm[j] * xf[v];
+
+#pragma unroll
+            for (int k = 0; k < HC_MULT; k++)
+            {
+                float rf_k[BF16_VEC];
+                __nv_bfloat16 const* r_ptr = &residual_in[tok_res + k * hidden_size + h];
+                if constexpr (BF16_VEC == 8)
+                {
+                    uint4 r_raw = *reinterpret_cast<uint4 const*>(r_ptr);
+                    __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&r_raw);
+#pragma unroll
+                    for (int v = 0; v < 4; v++)
+                    {
+                        float2 f = __bfloat1622float2(rp[v]);
+                        rf_k[2 * v] = f.x;
+                        rf_k[2 * v + 1] = f.y;
+                    }
+                }
+                else if constexpr (BF16_VEC == 4)
+                {
+                    uint2 r_raw = *reinterpret_cast<uint2 const*>(r_ptr);
+                    __nv_bfloat162 const* rp = reinterpret_cast<__nv_bfloat162 const*>(&r_raw);
+#pragma unroll
+                    for (int v = 0; v < 2; v++)
+                    {
+                        float2 f = __bfloat1622float2(rp[v]);
+                        rf_k[2 * v] = f.x;
+                        rf_k[2 * v + 1] = f.y;
+                    }
+                }
+                else
+                {
+                    unsigned r_raw = *reinterpret_cast<unsigned const*>(r_ptr);
+                    __nv_bfloat162 rp = *reinterpret_cast<__nv_bfloat162 const*>(&r_raw);
+                    float2 f = __bfloat1622float2(rp);
+                    rf_k[0] = f.x;
+                    rf_k[1] = f.y;
+                }
+#pragma unroll
+                for (int j = 0; j < HC_MULT; j++)
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+                        new_r.scalar[j][v] = fmaf(s_comb[k][j], rf_k[v], new_r.scalar[j][v]);
+            }
         }
 
         if (do_sqr)
@@ -217,7 +355,7 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
             for (int j = 0; j < HC_MULT; j++)
 #pragma unroll
                 for (int v = 0; v < BF16_VEC; v++)
-                    sqr = fmaf(new_r[j][v], new_r[j][v], sqr);
+                    sqr = fmaf(new_r.scalar[j][v], new_r.scalar[j][v], sqr);
         }
 
         // Optional: emit the post-mapped residual to HBM (bf16) for downstream
@@ -238,7 +376,8 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
                         __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
 #pragma unroll
                         for (int v = 0; v < 4; v++)
-                            pairs[v] = __float22bfloat162_rn(make_float2(new_r[j][2 * v], new_r[j][2 * v + 1]));
+                            pairs[v] = __float22bfloat162_rn(
+                                make_float2(new_r.scalar[j][2 * v], new_r.scalar[j][2 * v + 1]));
                         *reinterpret_cast<uint4*>(o_ptr) = packed;
                     }
                     else if constexpr (BF16_VEC == 4)
@@ -247,20 +386,22 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
                         __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
 #pragma unroll
                         for (int v = 0; v < 2; v++)
-                            pairs[v] = __float22bfloat162_rn(make_float2(new_r[j][2 * v], new_r[j][2 * v + 1]));
+                            pairs[v] = __float22bfloat162_rn(
+                                make_float2(new_r.scalar[j][2 * v], new_r.scalar[j][2 * v + 1]));
                         *reinterpret_cast<uint2*>(o_ptr) = packed;
                     }
                     else
                     { // BF16_VEC == 2
-                        __nv_bfloat162 packed = __float22bfloat162_rn(make_float2(new_r[j][0], new_r[j][1]));
+                        __nv_bfloat162 packed
+                            = __float22bfloat162_rn(make_float2(new_r.scalar[j][0], new_r.scalar[j][1]));
                         *reinterpret_cast<unsigned*>(o_ptr) = *reinterpret_cast<unsigned*>(&packed);
                     }
                 }
             }
         }
 
-// GEMM partial: for each n, contract over ALL HC j and this h-slice.
-// W_T layout: W_T[n, K=HC_MULT*hidden_size], inner dim packed as (j, h).
+        // GEMM partial: for each n, contract over ALL HC j and this h-slice.
+        // W_T layout: W_T[n, K=HC_MULT*hidden_size], inner dim packed as (j, h).
 #pragma unroll
         for (int n = 0; n < N_PER_BLOCK; n++)
         {
@@ -268,50 +409,56 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
             for (int j = 0; j < HC_MULT; j++)
             {
                 long long const w_base = static_cast<long long>(n_start + n) * K + j * hidden_size + h;
-                float w[BF16_VEC];
+
+                union WeightVector
+                {
+                    float scalar[BF16_VEC];
+                    float2 packed[BF16_VEC / 2];
+                } w;
+
                 if constexpr (BF16_VEC == 8)
                 {
-                    float w0, w1, w2, w3, w4, w5, w6, w7;
                     asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
-                                 : "=f"(w0), "=f"(w1), "=f"(w2), "=f"(w3)
+                                 : "=f"(w.scalar[0]), "=f"(w.scalar[1]), "=f"(w.scalar[2]), "=f"(w.scalar[3])
                                  : "l"(W_T + w_base));
                     asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
-                                 : "=f"(w4), "=f"(w5), "=f"(w6), "=f"(w7)
+                                 : "=f"(w.scalar[4]), "=f"(w.scalar[5]), "=f"(w.scalar[6]), "=f"(w.scalar[7])
                                  : "l"(W_T + w_base + 4));
-                    w[0] = w0;
-                    w[1] = w1;
-                    w[2] = w2;
-                    w[3] = w3;
-                    w[4] = w4;
-                    w[5] = w5;
-                    w[6] = w6;
-                    w[7] = w7;
                 }
                 else if constexpr (BF16_VEC == 4)
                 {
-                    float w0, w1, w2, w3;
                     asm volatile("ld.global.L1::evict_last.v4.f32 {%0, %1, %2, %3}, [%4];"
-                                 : "=f"(w0), "=f"(w1), "=f"(w2), "=f"(w3)
+                                 : "=f"(w.scalar[0]), "=f"(w.scalar[1]), "=f"(w.scalar[2]), "=f"(w.scalar[3])
                                  : "l"(W_T + w_base));
-                    w[0] = w0;
-                    w[1] = w1;
-                    w[2] = w2;
-                    w[3] = w3;
                 }
                 else
-                { // BF16_VEC == 2
-                    float w0, w1;
+                {
                     asm volatile("ld.global.L1::evict_last.v2.f32 {%0, %1}, [%2];"
-                                 : "=f"(w0), "=f"(w1)
+                                 : "=f"(w.scalar[0]), "=f"(w.scalar[1])
                                  : "l"(W_T + w_base));
-                    w[0] = w0;
-                    w[1] = w1;
                 }
+
+                if constexpr (PACK_GEMM_F32X2)
+                {
 #pragma unroll
-                for (int v = 0; v < BF16_VEC; v++)
-                    acc[n] = fmaf(new_r[j][v], w[v], acc[n]);
+                    for (int v = 0; v < BF16_VEC / 2; v++)
+                        acc2[n] = fmaF32x2(new_r.packed[j][v], w.packed[v], acc2[n]);
+                }
+                else
+                {
+#pragma unroll
+                    for (int v = 0; v < BF16_VEC; v++)
+                        acc[n] = fmaf(new_r.scalar[j][v], w.scalar[v], acc[n]);
+                }
             }
         }
+    }
+
+    if constexpr (PACK_GEMM_F32X2)
+    {
+#pragma unroll
+        for (int n = 0; n < N_PER_BLOCK; n++)
+            acc[n] = acc2[n].x + acc2[n].y;
     }
 
     constexpr int COLS_PER_GROUP = NUM_WARPS;

@@ -596,6 +596,12 @@ _FUSED_HC_SPLIT_X_FMA_TN_KS = (
 # for hidden=7168 (h_tiles=112): 7, 14, 28, 56, 112. _fused_hc_mma_ks_supported
 # filters per (hidden, ks) — entries that don't divide h_tiles drop out.
 _FUSED_HC_HALF_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112)
+# XSplit=2 serves generation M<=128 and supports the full MMA ladder so it can
+# retain the same high-KS occupancy ridge as the unsplit path. XSplit=4 remains
+# available for explicit O_b override/rollback coverage, but default dispatch
+# skips it because the complete O_b + mHC chain is slower than XSplit=2.
+_FUSED_HC_SPLIT2_MMA_KS = _FUSED_HC_HALF_MMA_KS
+_FUSED_HC_SPLIT4_MMA_KS = (1, 2, 4, 8, 16)
 # Tactics for Path D (all-in-one MMA): (num_k_splits,). No bigfuse_bs — the
 # bigfuse runs inline inside the single kernel and uses fixed parameters.
 _FUSED_HC_ALL_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112)
@@ -625,9 +631,13 @@ def _fused_hc_mma_ks_options(hidden_size: int) -> tuple[int, ...]:
     return tuple(ks for ks in _FUSED_HC_HALF_MMA_KS if _fused_hc_mma_ks_supported(hidden_size, ks))
 
 
-def _fused_hc_target_mma_ks(hidden_size: int, M: int) -> int | None:
+def _fused_hc_target_mma_ks(hidden_size: int, M: int, x_num_splits: int = 1) -> int | None:
     """Pick the measured splitK ridge for the MMA fused_hc paths."""
     valid = _fused_hc_mma_ks_options(hidden_size)
+    if x_num_splits == 2:
+        valid = tuple(ks for ks in valid if ks in _FUSED_HC_SPLIT2_MMA_KS)
+    elif x_num_splits == 4:
+        valid = tuple(ks for ks in valid if ks in _FUSED_HC_SPLIT4_MMA_KS)
     if not valid:
         return None
     m_tiles = max(1, (M + 63) // 64)
@@ -756,10 +766,14 @@ _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
 
 def _mhc_gen_split4_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
     del max_num_tokens
-    return (1, 2, 4, 8, 16)
+    return (1, 2, 3, 4, 6, 8, 16)
 
 
 def _mhc_map_split4_tuning_bucket(num_tokens: int) -> int:
+    if num_tokens == 3:
+        return 3
+    if 4 < num_tokens <= 6:
+        return 6
     return min(1 << max(0, (num_tokens - 1).bit_length()), 16)
 
 
@@ -908,7 +922,7 @@ class MhcFusedHcRunner(TunableRunner):
                     add(("fused_half_fma", tn, ks, bs, 1))
 
         if mma_ok and M >= 32:
-            ks = _fused_hc_target_mma_ks(self.hidden_size, M)
+            ks = _fused_hc_target_mma_ks(self.hidden_size, M, x_num_splits)
             if ks is not None:
                 m_tiles = (M + 63) // 64
                 if m_tiles * ks <= 148 * 4:
@@ -1149,12 +1163,11 @@ def mhc_fused_hc(
 
     best_tactic = None
     if tuner.is_tuning_mode:
-        # Engine warmup is context-only, so explicitly populate the generation
-        # split contracts. The actual kernel tactic for each contract remains
-        # entirely AutoTuner-selected.
-        tuning_contracts = [(4, min(B, 16))]
-        if B > 16:
-            tuning_contracts.append((2, min(B, 128)))
+        # Engine warmup is context-only, so explicitly populate the production
+        # generation split contract. Split-4 remains supported when presented
+        # by an explicit O_b override, but is not prewarmed by default because
+        # the complete O_b + mHC chain is slower than split-2.
+        tuning_contracts = [(2, min(B, 128))]
         if B > 128:
             tuning_contracts.append((1, B))
         if (x_num_splits, B) not in tuning_contracts:

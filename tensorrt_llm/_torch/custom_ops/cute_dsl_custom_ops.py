@@ -4339,12 +4339,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _SCALE_BLOCK_K = 128
         _SCALES_PER_WORD = 4
         _PACKED_SCALE_K = _SCALE_BLOCK_K * _SCALES_PER_WORD
-        _SPLIT_K4_MAX_M = 16
         _SPLIT_K2_MAX_M = 128
 
         # Candidate pools contain structurally distinct, production-validated
         # kernels. Runtime AutoTuner profiling, rather than an M-based table,
         # selects the winner for every token bucket and GPU SKU.
+        # SK4 remains supported for explicit override/rollback coverage, but
+        # production AutoTuner dispatch intentionally skips it: O_b + mHC
+        # chain measurements show SK2 is faster throughout the small-M range.
         _SPLIT_K4_TACTICS = (
             ((128, 32), (1, 1), True, None, False, False),
             ((128, 32), (1, 1), True, None, True, False),
@@ -4399,8 +4401,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
             if env_split:
                 num_splits = env_split
-            elif 0 < num_tokens <= CuteDSLFp8SplitKGemmRunner._SPLIT_K4_MAX_M:
-                num_splits = 4
             else:
                 num_splits = (2 if 0 < num_tokens <=
                               CuteDSLFp8SplitKGemmRunner._SPLIT_K2_MAX_M else 1)
@@ -4691,13 +4691,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         best_tactic = None
         if tuner.is_tuning_mode:
             # The engine's autotuner warmup is context-only and normally sees
-            # split-1. Explicitly tune the smaller split-output contracts that
-            # generation can reach. Each representative contract expands through
-            # its TuningConfig to every mapped M bucket (all SK4/SK2 buckets and
-            # the relevant SK1 prefix), so runtime lookups never fall back.
-            warmup_contracts = [(4, min(m, runner._SPLIT_K4_MAX_M))]
-            if m > runner._SPLIT_K4_MAX_M:
-                warmup_contracts.append((2, min(m, runner._SPLIT_K2_MAX_M)))
+            # split-1. Explicitly tune the production generation contract. SK4
+            # remains supported when forced, but is not prewarmed by default
+            # because the O_b + mHC chain is slower than SK2 at small M.
+            warmup_contracts = [(2, min(m, runner._SPLIT_K2_MAX_M))]
             if m > runner._SPLIT_K2_MAX_M:
                 warmup_contracts.append((1, m))
             if (num_splits, m) not in warmup_contracts:

@@ -556,6 +556,25 @@ def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
     assert supported_by_hidden_size[8192] == set()
 
 
+@pytest.mark.parametrize(
+    "hidden_size,m,x_num_splits,expected_ks",
+    [
+        (7168, 32, 2, 112),
+        (7168, 64, 2, 112),
+        (7168, 128, 2, 56),
+        (7168, 32, 4, 16),
+        (4096, 32, 2, 64),
+        (4096, 128, 2, 64),
+    ],
+)
+def test_mhc_fused_hc_split_x_mma_target_ks(
+    hidden_size: int, m: int, x_num_splits: int, expected_ks: int
+):
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_target_mma_ks
+
+    assert _fused_hc_target_mma_ks(hidden_size, m, x_num_splits) == expected_ks
+
+
 @pytest.mark.parametrize("x_num_splits", [1, 2, 4])
 def test_mhc_fused_hc_tuning_config_tracks_residual_m(x_num_splits: int):
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
@@ -568,6 +587,33 @@ def test_mhc_fused_hc_tuning_config_tracks_residual_m(x_num_splits: int):
     assert config.constraint_specs[0].infer_shape(inferred_shapes) == x_num_splits * 37
     assert config.constraint_specs[1].infer_shape(inferred_shapes) == 37
     assert config.constraint_specs[2].infer_shape(inferred_shapes) == 37
+
+
+def test_mhc_fused_hc_split4_tuning_buckets_cover_wave_crossover():
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
+        _mhc_gen_split4_tuning_buckets,
+        _mhc_map_split4_tuning_bucket,
+    )
+
+    assert _mhc_gen_split4_tuning_buckets(16) == (1, 2, 3, 4, 6, 8, 16)
+    assert tuple(_mhc_map_split4_tuning_bucket(m) for m in range(1, 17)) == (
+        1,
+        2,
+        3,
+        4,
+        6,
+        6,
+        8,
+        8,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+    )
 
 
 @pytest.mark.parametrize("x_num_splits", [2, 4])
@@ -598,6 +644,8 @@ def test_mhc_fused_hc_split_inputs_exclude_unsupported_all_in_one_tactics(
 
     assert tactics
     assert all(tactic[0] in ("fused_half_mma", "fused_half_fma") for tactic in tactics)
+    mma_ks = {tactic[2] for tactic in tactics if tactic[0] == "fused_half_mma"}
+    assert mma_ks == ({112} if x_num_splits == 2 else {16})
 
 
 @pytest.mark.parametrize("n", [128, 2048])

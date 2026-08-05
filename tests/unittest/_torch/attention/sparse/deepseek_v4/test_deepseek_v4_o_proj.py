@@ -95,7 +95,7 @@ def test_dsv4_fused_oproj_requires_split_output_consumer(
 
 @pytest.mark.parametrize(
     ("num_tokens", "expected_split"),
-    [(1, 4), (16, 4), (32, 2), (64, 2), (96, 2), (128, 2), (160, 1), (16384, 1)],
+    [(1, 2), (16, 2), (32, 2), (64, 2), (96, 2), (128, 2), (160, 1), (16384, 1)],
 )
 def test_select_dsv4_ob_split_k_auto_policy(
     num_tokens: int, expected_split: int, monkeypatch: pytest.MonkeyPatch
@@ -505,7 +505,7 @@ def test_dsv4_ob_split_k_one_uses_cute_dsl_and_caches_weight_scale(
     assert calls[0][3] is transformed_scale
 
 
-@pytest.mark.parametrize(("m", "expected_split"), [(1, 4), (32, 2), (64, 2), (128, 2), (160, 1)])
+@pytest.mark.parametrize(("m", "expected_split"), [(1, 2), (32, 2), (64, 2), (128, 2), (160, 1)])
 def test_dsv4_ob_auto_split_uses_cute_dsl(
     m: int, expected_split: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -583,18 +583,14 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
         sfa = torch.as_strided(sfa_storage, (num_tokens, packed_k), (1, aligned_m))
         return torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb)
 
-    # Context-only engine warmup must autotune and compile every generation
-    # output contract before capture begins.
+    # Context-only engine warmup must autotune and compile every production
+    # generation output contract before capture begins. SK4 is still supported
+    # through the explicit override tests above, but default warmup skips it.
     with autotune():
         run(256)
     compiled_kernels = len(runner.kernel_cache)
     assert compiled_kernels == sum(
-        len(tactics)
-        for tactics in (
-            runner._SPLIT_K1_TACTICS,
-            runner._SPLIT_K2_TACTICS,
-            runner._SPLIT_K4_TACTICS,
-        )
+        len(tactics) for tactics in (runner._SPLIT_K1_TACTICS, runner._SPLIT_K2_TACTICS)
     )
 
     def fail_compile(*args, **kwargs):
@@ -622,7 +618,7 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
         )
     assert len(runner.kernel_cache) == compiled_kernels
     assert [(m, split) for m, split, _ in runtime_tactics] == [
-        (1, 4),
+        (1, 2),
         (37, 2),
         (128, 2),
         (256, 1),

@@ -331,8 +331,30 @@ static FusedRoutFn pickFhcXSplitKs(uint32_t ks)
     case 4: return fhcXSplitInstanceIfSupported<Hidden, 4, XS>();
     case 8: return fhcXSplitInstanceIfSupported<Hidden, 8, XS>();
     case 16: return fhcXSplitInstanceIfSupported<Hidden, 16, XS>();
-    default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u for split x", ks); return nullptr;
+    default: break;
     }
+
+    // XSplit=2 is the production path for M=32..128.  Keep its split-K
+    // coverage aligned with the unsplit dispatcher so those buckets retain
+    // the high-KS wave occupancy.  XSplit=4 is used only for M<=16, where the
+    // FMA path wins, so avoid instantiating unused high-KS variants for it.
+    if constexpr (XS == 2)
+    {
+        switch (ks)
+        {
+        case 7: return fhcXSplitInstanceIfSupported<Hidden, 7, XS>();
+        case 14: return fhcXSplitInstanceIfSupported<Hidden, 14, XS>();
+        case 28: return fhcXSplitInstanceIfSupported<Hidden, 28, XS>();
+        case 32: return fhcXSplitInstanceIfSupported<Hidden, 32, XS>();
+        case 56: return fhcXSplitInstanceIfSupported<Hidden, 56, XS>();
+        case 64: return fhcXSplitInstanceIfSupported<Hidden, 64, XS>();
+        case 112: return fhcXSplitInstanceIfSupported<Hidden, 112, XS>();
+        default: break;
+        }
+    }
+
+    TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u for x split=%u", ks, XS);
+    return nullptr;
 }
 
 template <uint32_t Hidden>
