@@ -1690,17 +1690,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     continue;
                 }
-                kv::SharedPtr<kv::CommittedPage> page;
-                if (coverage < static_cast<int>(block->tokens.size()))
-                {
-                    page = kv::makeShared<kv::SsmCommittedPage>(
-                        &manager.storage(), block, lifeCycle, kv::kGpuLevel, kv::kPriorityDefault, coverage);
-                }
-                else
-                {
-                    page = kv::makeShared<kv::CommittedPage>(
-                        &manager.storage(), block, lifeCycle, kv::kGpuLevel, kv::kPriorityDefault);
-                }
+                auto page = kv::makeShared<kv::CommittedPage>(
+                    &manager.storage(), block, lifeCycle, kv::kGpuLevel, coverage, kv::kPriorityDefault);
                 page->setSlot(slots[lifeCycle].front());
                 block->storage[lifeCycle] = page.get();
                 pages.push_back(std::move(page));
@@ -1852,10 +1843,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                             continue;
                         }
                         int const slotId = page->slotId().value();
-                        int numTokensInBlock = -1;
-                        if (auto* ssm = dynamic_cast<kv::SsmCommittedPage*>(page))
-                            numTokensInBlock = ssm->numTokensInBlock;
-                        pages.emplace_back(std::make_pair(slotId, numTokensInBlock));
+                        pages.emplace_back(std::make_pair(slotId, page->numTokensInBlock));
                     }
                 });
             return std::make_tuple(numTokens, std::move(pages));

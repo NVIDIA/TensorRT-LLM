@@ -61,7 +61,7 @@ def make_test_block(
     from . import rawref
     from ._block_radix_tree import ReuseScope, _add_or_get_existing
     from ._common import GPU_LEVEL, PRIORITY_DEFAULT
-    from ._page import CommittedPage, SsmCommittedPage
+    from ._page import CommittedPage
 
     token_list = list(tokens)
     if not token_list:
@@ -88,19 +88,14 @@ def make_test_block(
     for life_cycle, coverage in enumerate(coverage_per_lc):
         if coverage == 0:
             continue
-        page_type = SsmCommittedPage if coverage < len(token_list) else CommittedPage
-        page_args = (
+        page = CommittedPage(
             manager._storage,
             block,
             life_cycle,
             GPU_LEVEL,
             slots[life_cycle].pop(),
+            coverage,
             PRIORITY_DEFAULT,
-        )
-        page = (
-            page_type(*page_args, coverage)
-            if page_type is SsmCommittedPage
-            else page_type(*page_args)
         )
         block.storage[life_cycle] = rawref.ref(page)
         pages.append(page)
