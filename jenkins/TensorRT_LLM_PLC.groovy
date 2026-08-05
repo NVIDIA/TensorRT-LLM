@@ -370,6 +370,7 @@ def processScanResults(ref) {
                     """, returnStdout: true).trim()
                 }
                 def result = new JsonSlurper().parseText(output)
+                echo "Scan result: ${result}"
                 if (result.status == "unstable") {
                     echo "New risks detected: ${result.detail}"
                     if (result.needs_manual_review) {
