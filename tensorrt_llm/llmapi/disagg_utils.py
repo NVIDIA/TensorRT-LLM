@@ -31,6 +31,13 @@ def validate_config_bool(value: Any, field_name: str) -> bool:
         f"{field_name} must be a boolean, got {type(value).__name__}")
 
 
+def validate_config_non_negative_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"{field_name} must be a non-negative integer, got {value!r}")
+    return value
+
+
 def _validate_internal_request_auth_key(value: Optional[str]) -> Optional[str]:
     if value is not None and (not isinstance(value, str) or not value):
         raise ValueError("internal_request_auth_key must be a non-empty string")
@@ -153,6 +160,11 @@ class DisaggServerConfig():
     # fleet delegates to it; when absent, num_workers>1 starts an implicit in-process
     # coordinator and num_workers==1 runs a single self-contained server.
     disagg_coordinator_url: Optional[str] = None
+    # HTTP keep-alive timeout (seconds) of the uvicorn listeners: the
+    # client-facing one, plus the coordinator's when it runs in-process.
+    # Raise it (e.g. 3600) when clients hold large idle connection pools and hit
+    # "Connection reset by peer" on a reused connection.
+    server_keep_alive_timeout: int = 10
     internal_request_auth_key: Optional[str] = None
 
 
@@ -243,6 +255,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        gen_tokids_ctxbytes: bool = False,
                        num_workers: int = 1,
                        disagg_coordinator_url: Optional[str] = None,
+                       server_keep_alive_timeout: int = 10,
                        internal_request_auth_key: Optional[str] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
@@ -313,6 +326,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.num_workers = num_workers
     config.disagg_coordinator_url = disagg_coordinator_url
+    config.server_keep_alive_timeout = validate_config_non_negative_int(
+        server_keep_alive_timeout, "server_keep_alive_timeout")
     config.internal_request_auth_key = internal_request_auth_key
     return config
 

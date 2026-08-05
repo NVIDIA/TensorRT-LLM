@@ -109,12 +109,16 @@ class MnnvlMemory:
         if not MnnvlMemory.initialized:
             # use a dummy torch CUDA tensor to trigger CUDA context initialization
             _ = torch.empty(1, device="cuda")
-            # ensure nvml is initialized.
-            try:
-                pynvml.nvmlDeviceGetCount()
-            except pynvml.NVMLError_Uninitialized:
-                pynvml.nvmlInit()
+            MnnvlMemory._ensure_nvml_initialized()
             MnnvlMemory.initialized = True
+
+    @staticmethod
+    def _ensure_nvml_initialized() -> None:
+        """Initialize NVML when it has not already been initialized."""
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
 
     @classmethod
     def get_comm(cls, mapping: Mapping):
@@ -390,12 +394,8 @@ class MnnvlMemory:
     @staticmethod
     @functools.cache
     def support_nvlink(dev_id: int, need_all_up: bool = True):
-        # ensure nvml is initialized; do not rely on other modules having
-        # initialized it as an import side effect.
-        try:
-            pynvml.nvmlDeviceGetCount()
-        except pynvml.NVMLError_Uninitialized:
-            pynvml.nvmlInit()
+        # Do not rely on other modules having initialized NVML as an import side effect.
+        MnnvlMemory._ensure_nvml_initialized()
         handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
         link_count = pynvml.NVML_NVLINK_MAX_LINKS
         active_links = 0
@@ -418,6 +418,48 @@ class MnnvlMemory:
         )
 
     @staticmethod
+    @functools.cache
+    def _is_pcie_nvl_sku(dev_id: int) -> bool:
+        """Return whether visible H100/H200 GPUs form PCIe-connected NVLink islands."""
+        # H100/H200 NVL PCIe SKUs bond GPUs into local NVLink islands joined
+        # only through PCIe/SYS. Per-device NVLink state therefore cannot
+        # distinguish them from an NVSwitch fabric.
+        device_name = torch.cuda.get_device_name(dev_id).upper()
+        # NVML may report SYSTEM between peers on later NVSwitch platforms, so
+        # use this fallback only for the affected Hopper SKUs.
+        if not any(sku in device_name for sku in ("H100", "H200")):
+            return False
+
+        if " NVL" in device_name:
+            return True
+
+        try:
+            MnnvlMemory._ensure_nvml_initialized()
+            self_handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+            for peer_id in range(pynvml.nvmlDeviceGetCount()):
+                if peer_id == dev_id:
+                    continue
+                peer_handle = pynvml.nvmlDeviceGetHandleByIndex(peer_id)
+                if (
+                    pynvml.nvmlDeviceGetTopologyCommonAncestor(self_handle, peer_handle)
+                    == pynvml.NVML_TOPOLOGY_SYSTEM
+                ):
+                    # SYSTEM is only a distance classification. A dual-socket
+                    # HGX can still provide NVLink P2P to such a peer through
+                    # NVSwitch. Split islands instead have local NVLink but no
+                    # NVLink P2P path to the SYSTEM peer.
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        self_handle,
+                        peer_handle,
+                        pynvml.NVML_P2P_CAPS_INDEX_NVLINK,
+                    )
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                        return MnnvlMemory.support_nvlink(dev_id, need_all_up=False)
+        except pynvml.NVMLError:
+            return False
+        return False
+
+    @staticmethod
     def supports_mnnvl() -> bool:
         # TODO:
         # We check if it has all NVLink up now.
@@ -429,6 +471,8 @@ class MnnvlMemory:
         if get_sm_version() in (120, 121):
             return False
         dev_id = torch.cuda.current_device()
+        if MnnvlMemory._is_pcie_nvl_sku(dev_id):
+            return False
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(dev_id, True)
         return support_nvlink_and_all_up
 

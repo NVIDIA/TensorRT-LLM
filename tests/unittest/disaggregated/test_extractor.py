@@ -344,6 +344,7 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp():
             gen.shutdown()
 
 
+@pytest.mark.cpu_only
 def test_layer_group_meta_serialization():
     import numpy as np
 
@@ -581,6 +582,7 @@ def test_v2_builder_validates_role_mapper_declaration():
     assert views[0].mapper_kind == MapperKind.INDEXED
 
 
+@pytest.mark.cpu_only
 def test_mamba_layer_group_serialization():
     from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup, PhysicalPool
 
@@ -740,6 +742,7 @@ def test_legacy_mamba_registration_uses_layer_major_pools():
     ]
 
 
+@pytest.mark.cpu_only
 def test_mixed_page_table_serialization():
     import numpy as np
 

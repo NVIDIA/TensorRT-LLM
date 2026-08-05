@@ -24,6 +24,8 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_rank_info_construction():
     ri = RankInfo(
