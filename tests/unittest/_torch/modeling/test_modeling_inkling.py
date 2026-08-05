@@ -51,17 +51,17 @@ GLOBAL_LAYERS = [5, 11, 17, 23, 29, 35, 41, 47, 53, 59, 65]
 LOCAL_LAYER_IDS = [n for n in range(66) if n not in GLOBAL_LAYERS]
 
 
-def _index(ckpt: str) -> dict:
+def _index(ckpt: str) -> dict[str, str]:
     with open(os.path.join(ckpt, "model.safetensors.index.json")) as f:
         return json.load(f)["weight_map"]
 
 
-def _exclude_modules(ckpt: str) -> set:
+def _exclude_modules(ckpt: str) -> set[str]:
     with open(os.path.join(ckpt, "hf_quant_config.json")) as f:
         return set(json.load(f)["quantization"].get("exclude_modules", []))
 
 
-def _safetensors_shape(ckpt: str, key: str):
+def _safetensors_shape(ckpt: str, key: str) -> tuple[list[int], str]:
     """Read one tensor's shape/dtype from its shard header (no tensor data)."""
     shard = _index(ckpt)[key]
     with open(os.path.join(ckpt, shard), "rb") as fh:
@@ -632,20 +632,72 @@ def test_model_forward_sources_the_counts_from_attn_metadata():
 # ---------------------------------------------------------------------------
 # Phase 1: expert parallelism
 # ---------------------------------------------------------------------------
-def _ep_model_config(ep_size, n_routed=256):
+def _ep_model_config(ep_size, n_routed=256, world_size=4, use_cuda_graph=True):
+    """Mapping derives moe_tp_size = world_size // moe_ep_size, so the stub
+    must too -- the guard bounds moe_tp_size, not ep_size directly, and only
+    when CUDA graphs are on."""
     return SimpleNamespace(
-        mapping=SimpleNamespace(moe_ep_size=ep_size, moe_tp_size=1),
+        mapping=SimpleNamespace(moe_ep_size=ep_size, moe_tp_size=max(1, world_size // ep_size)),
+        use_cuda_graph=use_cuda_graph,
         pretrained_config=SimpleNamespace(text_config=SimpleNamespace(n_routed_experts=n_routed)),
     )
 
 
-@pytest.mark.parametrize("ep_size", [1, 2, 4, 8, 16, 32, 64, 128, 256])
-def test_expert_parallel_accepts_every_divisor_of_256(ep_size):
-    """256 routed experts divide evenly by every power of two, which is the
-    whole practical range."""
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_expert_parallel_accepts_the_measured_layouts(ep_size):
+    """On 4 GPUs these are the layouts actually run: both reproduce the TP-only
+    GSM8K result per item (acc 0.9667, zero score flips)."""
     from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
 
     InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(ep_size))
+
+
+def test_expert_parallel_rejects_whole_width_experts_under_cuda_graph():
+    """ep_size 4 on 4 GPUs leaves moe_tp_size 1, which segfaults during
+    CUDA-graph capture -- after the model and KV cache are up, with no Python
+    traceback. Refuse that combination rather than hand the user an
+    unexplained SIGSEGV."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
+
+    with pytest.raises(ValueError, match="CUDA-graph capture"):
+        InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(4))
+
+
+def test_expert_parallel_allows_whole_width_experts_without_cuda_graph():
+    """Measured working: ep_size 4 with cuda_graph off reproduces the TP-only
+    GSM8K result per item (acc 0.9667, zero score flips). The guard must not
+    remove a usable layout -- only the combination that crashes."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
+
+    InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(4, use_cuda_graph=False))
+
+
+def test_expert_parallel_error_points_at_the_working_configuration():
+    """A guard that only says no costs the user a debugging cycle. The message
+    must name both escapes: disable CUDA graphs, or halve ep_size."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
+
+    with pytest.raises(ValueError) as excinfo:
+        InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(4))
+
+    msg = str(excinfo.value)
+    assert "cuda_graph_config=None" in msg
+    assert "moe_expert_parallel_size <= 2" in msg
+
+
+def test_expert_parallel_ceiling_says_it_is_measured_not_theoretical():
+    """The bound is an observed limit. The message must say what was measured,
+    so the next person knows it can be raised rather than that EP is
+    impossible."""
+    import inspect
+
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
+
+    src = inspect.getsource(InklingForCausalLM._assert_inkling_moe_parallel)
+    assert "Measured" in src and "SIGSEGV" in src
+    # And it must not re-assert the ruled-out cause: changing max_batch_size /
+    # max_num_tokens did not move the crash, so it is not the expert GEMM shape.
+    assert "rules out the" in src
 
 
 @pytest.mark.parametrize("ep_size", [3, 5, 6, 7, 24])

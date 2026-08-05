@@ -1542,6 +1542,43 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
                 f"expert-slot bookkeeping instead of here. Pick a divisor of "
                 f"{num_experts}."
             )
+        # Measured, not theoretical. On 4 GPUs, against the golden GSM8K run:
+        #
+        #   ep 1 / 2, cuda_graph on   acc 0.9667, zero score flips
+        #   ep 4,     cuda_graph OFF  acc 0.9667, zero score flips
+        #   ep 4,     cuda_graph on   SIGSEGV in warmup, all four ranks
+        #
+        # So the expert split itself is sound at every size tried, including
+        # moe_tp_size 1 -- pure EP reproduces the TP-only result per item. What
+        # breaks is ep_size 4 together with CUDA-graph capture; changing
+        # max_batch_size / max_num_tokens does not move it, which rules out the
+        # expert GEMM shape. Root cause not yet found.
+        #
+        # Ruled out by experiment, so nobody repeats them:
+        #   * the expert GEMM shape -- varying max_batch_size / max_num_tokens
+        #     does not move the crash
+        #   * the ONESHOT all-reduce pin that works around the captured
+        #     symmetric-all-reduce defect -- letting the framework pick the
+        #     strategy (AUTO) instead still crashes, so the two are unrelated
+        #   * MoE workspaces not being re-allocated between
+        #     MoERunner.clear_all_workspaces() and capture -- enabling the
+        #     autotuner, which re-allocates them, still crashes
+        #   * alltoall -- CutlassFusedMoE.enable_alltoall is always False, so
+        #     ep 2 and ep 4 use the same collective path
+        #
+        # Reject only the combination that was observed to crash, and point at
+        # the configuration that works, rather than removing a usable layout.
+        moe_tp_size = getattr(mapping, "moe_tp_size", None)
+        use_cuda_graph = getattr(model_config, "use_cuda_graph", False)
+        if moe_tp_size is not None and moe_tp_size < 2 and use_cuda_graph:
+            raise ValueError(
+                f"moe_expert_parallel_size={ep_size} leaves moe_tp_size="
+                f"{moe_tp_size}, which segfaults during CUDA-graph capture "
+                f"for Inkling. The same layout runs correctly with CUDA "
+                f"graphs disabled (cuda_graph_config=None), reproducing the "
+                f"TP-only accuracy per item. Either disable CUDA graphs or "
+                f"use moe_expert_parallel_size <= {max(1, ep_size // 2)}."
+            )
 
     def _apply_allreduce_strategy(self) -> None:
         """Keep Inkling's all-reduces off the NCCL_SYMMETRIC tactic.
