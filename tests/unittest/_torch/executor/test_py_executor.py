@@ -27,8 +27,8 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import (
-    DISAGG_GEN_HAS_FORWARD_WORK,
-    DISAGG_GEN_NEED_TRANSFER_PROGRESS,
+    _DISAGG_GEN_HAS_FORWARD_WORK,
+    _DISAGG_GEN_NEED_TRANSFER_PROGRESS,
     DisaggTransferAdmissionController,
     PyExecutor,
 )
@@ -688,7 +688,7 @@ class TestDisaggTransferIdleProgress:
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
         executor.dist.allreduce.return_value = (
-            DISAGG_GEN_NEED_TRANSFER_PROGRESS | DISAGG_GEN_HAS_FORWARD_WORK
+            _DISAGG_GEN_NEED_TRANSFER_PROGRESS | _DISAGG_GEN_HAS_FORWARD_WORK
         )
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
@@ -705,14 +705,14 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
         executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
         executor.dist.allreduce.assert_called_once_with(
-            DISAGG_GEN_HAS_FORWARD_WORK, op=ReduceOp.BOR
+            _DISAGG_GEN_HAS_FORWARD_WORK, op=ReduceOp.BOR
         )
 
     def test_peer_backpressure_with_all_ranks_idle_enters_bounded_poll(self):
         """When no rank can run forward, the bounded blocking poll survives."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
-        executor.dist.allreduce.return_value = DISAGG_GEN_NEED_TRANSFER_PROGRESS
+        executor.dist.allreduce.return_value = _DISAGG_GEN_NEED_TRANSFER_PROGRESS
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -876,7 +876,7 @@ class TestDisaggTransferIdleProgress:
     def test_peer_cp_rank_enters_context_progress_poll(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
-        executor.dist.allreduce.return_value = DISAGG_GEN_HAS_FORWARD_WORK
+        executor.dist.allreduce.return_value = _DISAGG_GEN_HAS_FORWARD_WORK
         executor.dist.tp_cp_allgather.return_value = [0, 1, 0, 0]
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()

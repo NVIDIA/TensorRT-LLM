@@ -157,8 +157,8 @@ _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
 # Per-rank status bits combined (OR across ranks) when deciding how to poll
 # disaggregated generation KV-transfer progress before a forward step.
-DISAGG_GEN_NEED_TRANSFER_PROGRESS = 1
-DISAGG_GEN_HAS_FORWARD_WORK = 2
+_DISAGG_GEN_NEED_TRANSFER_PROGRESS = 1
+_DISAGG_GEN_HAS_FORWARD_WORK = 2
 
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
@@ -3548,12 +3548,12 @@ class PyExecutor:
         local_need_gen_check = (local_need_check
                                 and wait_for_disagg_gen_transfer_progress)
 
-        local_state = (DISAGG_GEN_NEED_TRANSFER_PROGRESS if local_need_gen_check
-                       else 0) | (DISAGG_GEN_HAS_FORWARD_WORK
-                                  if has_forward_work else 0)
+        local_state = (
+            _DISAGG_GEN_NEED_TRANSFER_PROGRESS if local_need_gen_check else
+            0) | (_DISAGG_GEN_HAS_FORWARD_WORK if has_forward_work else 0)
         global_state = self._sync_disagg_gen_progress_state(local_state)
-        if global_state & DISAGG_GEN_NEED_TRANSFER_PROGRESS:
-            if global_state & DISAGG_GEN_HAS_FORWARD_WORK:
+        if global_state & _DISAGG_GEN_NEED_TRANSFER_PROGRESS:
+            if global_state & _DISAGG_GEN_HAS_FORWARD_WORK:
                 # Some rank has a scheduled batch. Blocking cannot add the
                 # awaited transfers to the already-fixed batch and would stall
                 # decode on every lockstepped rank; reap without blocking.
