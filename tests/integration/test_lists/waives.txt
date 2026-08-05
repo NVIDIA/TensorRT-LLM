@@ -431,6 +431,8 @@ unittest/auto_deploy/multigpu/smoke/test_ad_allreduce_strategies.py::test_allred
 unittest/auto_deploy/multigpu/smoke/test_ad_allreduce_strategies.py::test_allreduce_strategies[ONESHOT] SKIP (https://nvbugs/6517839)
 unittest/auto_deploy/multigpu/smoke/test_ad_allreduce_strategies.py::test_allreduce_strategies[SYMM_MEM] SKIP (https://nvbugs/6517839)
 unittest/auto_deploy/multigpu/smoke/test_ad_allreduce_strategies.py::test_allreduce_strategies[TWOSHOT] SKIP (https://nvbugs/6517839)
+unittest/auto_deploy/singlegpu/custom_ops/moe/test_trtllm_moe.py SKIP (https://nvbugs/6564714)
+unittest/auto_deploy/singlegpu/transformations/library/test_moe_fusion.py SKIP (https://nvbugs/6564714)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6517836)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_write_transfer_gpu_tensor SKIP (https://nvbugs/6517836)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_write_transfer_multiple_chunks SKIP (https://nvbugs/6517836)
