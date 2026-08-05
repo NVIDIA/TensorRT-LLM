@@ -638,7 +638,14 @@ class KvCacheCreator:
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
-            if self._max_beam_width is not None and self._max_beam_width > 1:
+            python_v2_backend = (os.environ.get(
+                "TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python")
+            # Encoder-decoder cross KV remains request-scoped (beam width 1),
+            # and V2 does not yet replicate its beam-0 row into decoder beams.
+            encoder_decoder = getattr(model_config, "is_encoder_decoder", False)
+            if (self._max_beam_width is not None and self._max_beam_width > 1
+                    and (python_v2_backend or encoder_decoder
+                         or is_hybrid_linear(config))):
                 incompat.append("max_beam_width > 1")
             sparse_attn_config = model_config.sparse_attention_config
             if (sparse_attn_config is not None
@@ -669,8 +676,7 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
                         f"{incompat_str}; CppMambaHybridCacheManager does not "
-                        "provide a compatible fallback. Use max_beam_width=1 "
-                        "and disable the KV connector.")
+                        "provide a compatible fallback.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.

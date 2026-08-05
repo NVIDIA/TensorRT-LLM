@@ -170,16 +170,25 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
         BlockOrdinal staleEnd = staleRange.end;
         auto scratchRange = _getScratchRange(lc);
 
-        // Sink blocks: [0, staleBeg)
+        // Sink blocks: [0, staleBeg). Full prompt blocks intentionally keep
+        // only beam 0 after generation beam expansion.
         for (BlockOrdinal ord{0}; ord < staleBeg; ++ord)
-            for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
-                result.push_back({ord, bi, lcId});
+        {
+            auto const& block = mBlocks[ord];
+            for (BeamIndex bi{0}; bi < block.pages.size(); ++bi)
+            {
+                bool const isNull = blockPageIsNull(block.pages[bi][lcId]);
+                TLLM_CHECK_DEBUG(!isNull);
+                if (!isNull)
+                    result.push_back({ord, bi, lcId});
+            }
+        }
 
         // Window blocks: [staleEnd, numBlocks) — skip scratch blocks.
         for (BlockOrdinal ord{staleEnd}; ord < mBlocks.size(); ++ord)
         {
             auto& block = mBlocks[ord];
-            for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
+            for (BeamIndex bi{0}; bi < block.pages.size(); ++bi)
             {
                 bool isScratch = scratchRange.contains(ord);
                 TLLM_CHECK_DEBUG(isScratch == blockPageIsNull(block.pages[bi][lcId]));
@@ -1327,21 +1336,24 @@ void KvCache::_increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength)
         sb.pages.resize(mBeamWidth);
         for (auto& row : sb.pages)
             row.resize(numLc); // default-constructs to monostate
-        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+        for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
         {
-            // SSM pages live in mSsmBlocks, not in _blocks.
-            if (ssmLcId.has_value() && lc == *ssmLcId)
-                continue;
+            for (LifeCycleId lc{0}; lc < numLc; ++lc)
+            {
+                // SSM pages live in mSsmBlocks, not in _blocks.
+                if (ssmLcId.has_value() && lc == *ssmLcId)
+                    continue;
 
-            auto [staleBeg, staleEnd] = staleRanges[lc];
-            if (staleBeg <= ord && ord < staleEnd)
-                continue; // stale block for this lc — no page allocated
+                auto [staleBeg, staleEnd] = staleRanges[lc];
+                if (staleBeg <= ord && ord < staleEnd)
+                    continue; // stale block for this lc — no page allocated
 
-            size_t si = slotCounters[lc]++;
-            auto& slot = allSlots[lc][si];
-            auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, kDefaultBeamIndex);
-            page->setSlot(slot);
-            sb.pages[kDefaultBeamIndex][lc] = page->lock(*this, kDefaultBeamIndex, ord, lc);
+                size_t si = slotCounters[lc]++;
+                auto& slot = allSlots[lc][si];
+                auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, bi);
+                page->setSlot(slot);
+                sb.pages[bi][lc] = page->lock(*this, bi, ord, lc);
+            }
         }
         mBlocks.push_back(std::move(sb));
     }
@@ -1365,6 +1377,175 @@ void KvCache::_decreaseCapacity(BlockOrdinal newNumBlocks)
         mBlocks.pop_back();
     }
     _resizePageIndexBuffers(newNumBlocks);
+}
+
+void KvCache::setBeamWidth(BeamIndex beamWidth)
+{
+    if (beamWidth < BeamIndex{1})
+        throw std::invalid_argument("beam_width must be positive");
+    if (beamWidth == mBeamWidth)
+        return;
+    if (mStatus == Status::CLOSED)
+        throw LogicError("Cannot change beam_width after close()");
+    if (mManager->enablePartialCommit())
+        throw AssertionError("beam_width changes are not supported with partial commit");
+
+    if (beamWidth < mBeamWidth)
+    {
+        auto scope = recordEventScope();
+        for (auto& block : mBlocks)
+            _truncateBlockBeams(block, beamWidth);
+        mSsmBlocks.resize(beamWidth);
+        mBasePageIndices.resize(beamWidth);
+    }
+    else
+    {
+        _appendBeams(mBeamWidth, beamWidth);
+    }
+    mBeamWidth = beamWidth;
+    TLLM_CHECK_DEBUG(_checkSanity());
+}
+
+void KvCache::_truncateBlockBeams(SeqBlock& block, BeamIndex beamWidth)
+{
+    if (block.pages.size() <= beamWidth)
+        return;
+    BeamBlockPages removed;
+    while (block.pages.size() > beamWidth)
+    {
+        removed.push_back(std::move(block.pages.back()));
+        block.pages.pop_back();
+    }
+    // Destroy removed locks only after the owning block no longer exposes
+    // their beam rows. UncommittedPage::~UncommittedPage() validates this.
+}
+
+void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
+{
+    TLLM_CHECK_DEBUG(oldBeamWidth == mBeamWidth && oldBeamWidth < newBeamWidth);
+    if (mStatus != Status::ACTIVE)
+    {
+        bool const hasSsmPages = std::any_of(mSsmBlocks.begin(), mSsmBlocks.end(),
+            [](auto const& beamBlock) {
+                return std::any_of(
+                    beamBlock.begin(), beamBlock.end(), [](auto const& bp) { return !blockPageIsNull(bp); });
+            });
+        if (!mBlocks.empty() || hasSsmPages)
+        {
+            throw LogicError("Changing beam_width on a suspended non-empty KV cache is not supported");
+        }
+    }
+
+    auto& storage = mManager->storage();
+    LifeCycleId const numLc = storage.numLifeCycles();
+    int const numNewBeams = newBeamWidth - oldBeamWidth;
+    int const promptLength = mExpectedPromptLength.value_or(0);
+    BlockOrdinal const firstGenerationBlock{promptLength / mTokensPerBlock};
+
+    TypedVec<LifeCycleId, SlotCount> slotCounts(numLc, 0);
+    for (BlockOrdinal ordinal = firstGenerationBlock; ordinal < mBlocks.size(); ++ordinal)
+    {
+        auto const& block = mBlocks[ordinal];
+        // Committed blocks are canonicalized to beam 0 and shared through
+        // cache indirection, even if the prompt-length hint is conservative.
+        if (block.isCommitted())
+            continue;
+        auto const& sourceBeamBlock = block.pages[kDefaultBeamIndex];
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+        {
+            if (!blockPageIsNull(sourceBeamBlock[lc]))
+                slotCounts[lc] += numNewBeams;
+        }
+    }
+
+    auto const ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    if (ssmLcId.has_value() && !blockPageIsNull(mSsmBlocks[kDefaultBeamIndex][*ssmLcId]))
+        slotCounts[*ssmLcId] += numNewBeams;
+
+    MigrationRecorder const migrationRecorder
+        = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
+              CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
+    DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
+    { _recordDroppedPages(pages, cacheLevel); };
+    auto newSlots = storage.newGpuSlots(slotCounts, migrationRecorder, dropRecorder);
+
+    // Page-index rows must exist before locking the copied pages because lock()
+    // immediately publishes the page index through updateBasePageIndex().
+    for (BeamIndex bi = oldBeamWidth; bi < newBeamWidth; ++bi)
+    {
+        LifeCyclePageIndexBuffers pageIndices(numLc);
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+            pageIndices[lc] = std::vector<int>(mBlocks.stdSize(), kBadPageIndex.value());
+        mBasePageIndices.push_back(std::move(pageIndices));
+    }
+
+    std::vector<CachedCudaEvent const*> readyEvents;
+    for (auto const& lcSlots : newSlots)
+        for (auto const& slot : lcSlots)
+            readyEvents.push_back(&slot.readyEvent);
+    if (!readyEvents.empty())
+        streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), readyEvents);
+
+    auto copyPage = [&](SharedPtr<Page> const& sourcePage, Slot& slot, BlockOrdinal ordinal, LifeCycleId lc,
+                        BeamIndex beamIdx) -> BlockPage
+    {
+        TLLM_CHECK_DEBUG(sourcePage && sourcePage->cacheLevel == kHotLevel);
+        storage.copySlotData(lc, kHotLevel, kHotLevel, slot.slotId(), sourcePage->slotId(), cudaStream());
+
+        KVCacheIterationStatsDelta iterationStats;
+        iterationStats.iterIntraDeviceCopyBlocks = 1;
+        iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(storage, kHotLevel, lc);
+        _recordDirectIterationStats(lc, iterationStats);
+
+        auto page = makeShared<UncommittedPage>(*this, ordinal, lc, kHotLevel, beamIdx);
+        page->setSlot(slot);
+        return page->lock(*this, beamIdx, ordinal, lc, /*skipWait=*/true);
+    };
+
+    for (BlockOrdinal ordinal = firstGenerationBlock; ordinal < mBlocks.size(); ++ordinal)
+    {
+        auto& block = mBlocks[ordinal];
+        if (block.isCommitted())
+            continue;
+        for (BeamIndex beamIdx = oldBeamWidth; beamIdx < newBeamWidth; ++beamIdx)
+        {
+            LifeCycleBlockPages newBeamBlock(numLc);
+            for (LifeCycleId lc{0}; lc < numLc; ++lc)
+            {
+                auto const& source = block.pages[kDefaultBeamIndex][lc];
+                if (blockPageIsNull(source))
+                    continue;
+                auto& slot = newSlots[lc].back();
+                newBeamBlock[lc] = copyPage(blockPageGetPage(source), slot, ordinal, lc, beamIdx);
+                newSlots[lc].pop_back();
+                if (_shouldRecordStats())
+                {
+                    bool const changed = mPendingStats.recordAllocationRange(lc, ordinal, ordinal + 1,
+                        /*beamWidth=*/1, /*countAsMissed=*/false, /*countAsGeneration=*/true);
+                    if (changed)
+                        mManager->markStatsDirty(id);
+                }
+            }
+            block.pages.push_back(std::move(newBeamBlock));
+        }
+    }
+
+    SharedPtr<Page> sourceSsmPage;
+    if (ssmLcId.has_value())
+        sourceSsmPage = blockPageGetPage(mSsmBlocks[kDefaultBeamIndex][*ssmLcId]);
+    for (BeamIndex beamIdx = oldBeamWidth; beamIdx < newBeamWidth; ++beamIdx)
+    {
+        LifeCycleBlockPages newSsmBlock(numLc);
+        if (sourceSsmPage)
+        {
+            auto& slot = newSlots[*ssmLcId].back();
+            newSsmBlock[*ssmLcId] = copyPage(sourceSsmPage, slot, kBadBlockOrdinal, *ssmLcId, beamIdx);
+            newSlots[*ssmLcId].pop_back();
+        }
+        mSsmBlocks.push_back(std::move(newSsmBlock));
+    }
+
+    TLLM_CHECK_DEBUG(std::all_of(newSlots.begin(), newSlots.end(), [](auto const& slots) { return slots.empty(); }));
 }
 
 HalfOpenRange<BlockOrdinal> KvCache::_getStaleRange(int historyLength, LifeCycle const& lc) const
@@ -1487,7 +1668,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     TLLM_CHECK_DEBUG(ord == mNumCommittedBlocks);
 
     auto& sb = mBlocks.at(BlockOrdinal{ord});
-    TLLM_CHECK_DEBUG_WITH_INFO(sb.pages.size() == BeamIndex{1}, "Must have 1 beam only");
 
     // Build token block — always slice up to tokens_per_block; is_full tells us
     // whether we got a full block's worth.  Mirrors Python's:
@@ -1553,7 +1733,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             else
                 sb.pages[kDefaultBeamIndex][lc] = committed->hold();
         }
-        TLLM_CHECK_DEBUG(_getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
         ++mNumCommittedBlocks;
         if (newBlock->eventSink)
         {
@@ -1642,7 +1821,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         }
         // Don't clear SSM storage on rebase — the existing block may have a valid snapshot.
         sb.treeBlock = newBlock;
-        TLLM_CHECK_DEBUG(_getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
         ++mNumCommittedBlocks;
         didCommit = true;
     }
@@ -1651,6 +1829,14 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         // Can't commit and can't reuse existing block. Just stop committing.
         mCommitState = CommitState::VIRTUAL_STOP;
     }
+
+    if (sb.treeBlock && sb.pages.size() > BeamIndex{1})
+    {
+        // A committed reusable block is canonicalized to beam 0. Other beams
+        // are divergent generation alternatives and must be released.
+        _truncateBlockBeams(sb, BeamIndex{1});
+    }
+    TLLM_CHECK_DEBUG(!didCommit || _getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
 
     if (didCommit && commitSsm)
     {
@@ -1701,8 +1887,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 void KvCache::commit(TokenSpan tokens, bool isEnd)
 {
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
-    if (mBeamWidth != BeamIndex{1})
-        throw LogicError("Not implemented yet for beam search");
     if (tokens.size() == 0)
     {
         if (isEnd)
@@ -1762,12 +1946,12 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
         if (hasPartialSnapshot && mCommitState == CommitState::ALLOWED)
         {
             BlockOrdinal const partialOrdinal{newNumFullBlocks};
-            if (isEnd)
+            if (isEnd && mManager->enablePartialCommit())
             {
                 _commitBlock(newNumFullBlocks, /*isLast=*/true, /*commitSsm=*/ssmLcId.has_value(),
                     /*moveSsm=*/ssmLcId.has_value());
             }
-            else
+            else if (!isEnd)
             {
                 _snapshotPartialBlockToTree(partialOrdinal, /*commitSsm=*/ssmLcId.has_value());
             }
@@ -1795,7 +1979,7 @@ void KvCache::stopCommitting()
     TLLM_CHECK_DEBUG(mCommitState == CommitState::ALLOWED);
 
     int tokensLeft = static_cast<int>(mCommittedTokens.size()) - mNumCommittedBlocks * mTokensPerBlock;
-    if (tokensLeft > 0)
+    if (tokensLeft > 0 && mManager->enablePartialCommit())
     {
         TLLM_CHECK_DEBUG(BlockOrdinal{mNumCommittedBlocks} < mBlocks.size());
         auto scope = recordEventScope();
@@ -2351,7 +2535,9 @@ std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex 
     result.reserve(mBlocks.stdSize());
     for (auto const& sb : mBlocks)
     {
-        auto const& pg = blockPageGetPage(sb.pages[beamIdx][lgId]);
+        SharedPtr<Page> pg;
+        if (beamIdx < sb.pages.size())
+            pg = blockPageGetPage(sb.pages[beamIdx][lgId]);
         if (!pg)
         {
             if (!validOnly)
