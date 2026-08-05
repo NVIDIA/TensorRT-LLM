@@ -216,11 +216,20 @@ def extract_inkling_content(text: str) -> str:
     (kept). Concatenates all content-text runs and returns them stripped.
 
     Requires the generation to be detokenized with ``skip_special_tokens=False``
-    so the channel markers are present. If no Inkling markers are found (e.g.
-    special tokens were skipped, or a non-Inkling model), the input is returned
-    unchanged so behavior for every other model/benchmark is untouched.
+    so the channel markers are present. If NO Inkling control token at all is
+    found (special tokens were skipped, or a non-Inkling model), the input is
+    returned unchanged so behavior for every other model/benchmark is
+    untouched.
+
+    The passthrough test is deliberately over the whole control-token set, not
+    just the two channel markers. Output that carries only framing -- a
+    ``<|message_model|>`` header with no later ``<|content_text|>``, or a
+    generation truncated right after the header -- has no visible channel, and
+    ``InklingReasoningParser`` drops it. Testing only the channel markers
+    returned such text verbatim, so the evaluator scored raw special tokens, or
+    text sitting outside any visible block, as if it were the answer.
     """
-    if _INK_CONTENT_TEXT not in text and _INK_CONTENT_THINKING not in text:
+    if _INK_CONTROL_RE.search(text) is None:
         return text
 
     content_parts: list[str] = []

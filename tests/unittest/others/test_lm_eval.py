@@ -1665,6 +1665,34 @@ def test_inkling_non_text_control_closes_content():
     assert extract_inkling_content(f"{_CT}Answer<|content_image|>not visible{_EM}") == "Answer"
 
 
+def test_inkling_framing_only_output_is_not_passed_through():
+    """A header with no visible channel must yield nothing, not raw tokens.
+
+    The passthrough test used to look only for the two channel markers, so
+    output that carried framing but never opened a content block was returned
+    verbatim and the evaluator scored raw special tokens -- or text sitting
+    outside any visible block -- as the answer. InklingReasoningParser treats
+    this as framing and drops it, so this must too.
+    """
+    assert extract_inkling_content(f"{_MM}raw leak 42") == ""
+
+
+def test_inkling_truncated_after_header_is_not_passed_through():
+    """Same failure with nothing after the header at all."""
+    assert extract_inkling_content(_MM) == ""
+    assert extract_inkling_content(f"{_MM}{_CES}") == ""
+
+
+def test_inkling_passthrough_still_applies_without_any_control_token():
+    """Passthrough for non-Inkling output is unchanged.
+
+    Text carrying no Inkling control token at all is returned verbatim, so
+    every other model and benchmark is untouched by the wider test.
+    """
+    for text in ("The answer is 42.", "", "<|not_an_inkling_token|>x"):
+        assert extract_inkling_content(text) == text
+
+
 def test_inkling_mmmu_answer_extraction_uses_visible_content_only():
     """MMMU extraction must ignore numbers/options from Inkling reasoning."""
     text = f"{_CTH}wrong trail says answer is (D){_EM}{_MM}{_CT}The answer is (B).{_EM}{_CES}"
