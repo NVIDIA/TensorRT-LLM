@@ -15,9 +15,16 @@ l0_cpu:
   - unittest/_torch/distributed
   - unittest/_torch/executor
   - unittest/_torch/lora
+  - unittest/_torch/memory
+  - unittest/_torch/modeling
+  - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
+  - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
+  - unittest/_torch/test_model_config.py
+  - unittest/bindings
+  - unittest/disaggregated
   - unittest/executor/test_base_worker.py ISOLATION
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_ipc.py
@@ -44,4 +51,10 @@ l0_cpu:
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_utils.py
-  - unittest/others/test_http_utils_fail_fast.py
+  - unittest/metrics/test_collector.py
+  - unittest/models/test_quant_config_utils.py
+  - unittest/others
+  - unittest/quantization/test_mode.py
+  - unittest/scripts
+  - unittest/tools
+  - unittest/utils/test_logger.py

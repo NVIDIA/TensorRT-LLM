@@ -14,7 +14,11 @@
 # limitations under the License.
 import unittest
 
+import pytest
+
 from tensorrt_llm.quantization import QuantMode
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestQuantMode(unittest.TestCase):
