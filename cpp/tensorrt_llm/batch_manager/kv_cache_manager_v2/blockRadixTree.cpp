@@ -438,7 +438,13 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     // curr when its last shared_ptr is dropped.
     Block* curr
         = pruneStart && pruneStart->type() == NodeBase::Type::kBLOCK ? static_cast<Block*>(pruneStart) : nullptr;
-    while (curr && curr->next.empty() && curr->storage.at(lcIdx) == nullptr)
+    // Only detach blocks with no live page in ANY life cycle: a childless tip
+    // that lost this life cycle's page may still hold live pages of other life
+    // cycles; detaching it would orphan the committed chain of an in-flight
+    // sequence.
+    while (curr && curr->next.empty() && curr->storage.at(lcIdx) == nullptr
+        && std::all_of(curr->storage.begin(), curr->storage.end(),
+            [](CommittedPage const* page) { return page == nullptr; }))
     {
         NodeBase* prevNode = curr->prev;
         BlockKey const currKey = curr->key;
