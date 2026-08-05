@@ -325,14 +325,21 @@ def test_running_max_is_monotone():
     assert running_max([1.0, 3.0, 2.0, 2.5, 9.0]) == [1.0, 3.0, 3.0, 3.0, 9.0]
 
 
-def test_compress_keeps_only_real_risers():
+def test_compress_keeps_risers_and_closes_their_shelves():
+    """A shelf must survive as a breakpoint PAIR under the interp consumer.
+
+    Keeping only [16, 64] would turn the measured flat 16..48 into one long
+    rising segment: mid-shelf totals get billed part of the riser -- the
+    over-trim mirror of the floor-lookup bug. The shelf's last point (48)
+    rides along so interpolation stays flat where the hardware was flat.
+    """
     tokens = [16, 32, 48, 64, 80]
     times = [1.0, 1.002, 1.004, 2.0, 2.001]
     kept_tokens, kept_times = compress_to_risers(
         tokens, times, min_riser_ms=0.02, max_breakpoints=8
     )
-    assert kept_tokens == [16, 64]
-    assert kept_times == [1.0, 2.0]
+    assert kept_tokens == [16, 48, 64]
+    assert kept_times == [1.0, 1.004, 2.0]
 
 
 def test_compress_drops_the_shallowest_risers_first():
@@ -455,9 +462,14 @@ def test_refuses_a_curve_that_only_moves_by_noise():
 # (2.5%), yet the step only gets 2.5% more expensive while the acceptance yield
 # given up between those tiers is ~36% at p=0.9. The argmax therefore never
 # leaves max_tier -- non-flat and inert at the same time.
+#
+# The shelf is ENCODED as a breakpoint pair: under the interpolating consumer
+# a bare [0, 160] would ramp from 2.0 to 2.5 across the whole range, dropping
+# the ladder spread below the noise floor and turning this fixture into the
+# flat-noise case instead of the inert one it exists to pin.
 INERT_PAYLOAD = {
-    "token_counts": [0, 160],
-    "step_time_ms": [2.0, 2.5],
+    "token_counts": [0, 159, 160],
+    "step_time_ms": [2.0, 2.0, 2.5],
     "fixed_overhead_ms": 18.0,
     "batch_sizes": [32],
     "batch_overhead_ms": [0.0],
@@ -600,9 +612,10 @@ def test_probe_uses_the_bonus_token_convention():
     payload = {
         # Priced so that tier 5 (M = 8*6 = 48) is expensive and tier 3
         # (M = 8*4 = 32) is cheap. Under the wrong bs*L convention tier 5 would
-        # be M = 40 and land on the cheap shelf instead.
-        "token_counts": [0, 44],
-        "step_time_ms": [1.0, 50.0],
+        # be M = 40 and land on the cheap shelf instead. The shelf is a
+        # breakpoint pair so the interpolating consumer keeps it flat.
+        "token_counts": [0, 43, 44],
+        "step_time_ms": [1.0, 1.0, 50.0],
         "fixed_overhead_ms": 0.0,
         "batch_sizes": [8],
         "batch_overhead_ms": [0.0],

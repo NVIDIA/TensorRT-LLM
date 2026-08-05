@@ -170,6 +170,7 @@ import os
 import random
 import statistics
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -707,15 +708,19 @@ def compress_to_risers(
     min_riser_ms: float,
     max_breakpoints: int,
 ) -> Tuple[List[int], List[float]]:
-    """Collapse a sampled curve into the staircase it is approximating.
+    """Collapse a sampled curve into shelf-and-riser breakpoints.
 
-    ``SpsCostTable`` looks up by floor and interpolates nothing, so every
-    breakpoint claims "a new kernel wave starts here". Shipping one breakpoint
-    per *sample* instead of one per *riser* asserts risers that do not exist,
-    and (if the dead ``derive_verify_len_tiers`` path is ever revived) explodes
-    the tier count so the truncation drops the real shelf edges.
+    ``SpsCostTable`` interpolates between breakpoints, so what a table CLAIMS
+    is entirely in which points it keeps: dropping a shelf's interior is fine
+    (interpolation across equal values is still flat), but dropping a shelf's
+    LAST point turns the measured shelf into one long rising segment and
+    over-bills every mid-shelf total by up to the riser height -- the
+    over-trim mirror of the floor-lookup bug. So each kept riser is preceded
+    by the last point of the shelf it rises from: shelves survive as
+    breakpoint pairs, exactly the encoding the planner tests use for
+    "genuinely flat".
 
-    A point is kept only when it clears the previous kept shelf by
+    A riser is kept only when it clears the previous kept shelf by
     ``min_riser_ms``. The threshold is **absolute**, not relative to ``theta``:
     ``theta`` is normalized to approach zero at ``M = 0``, so at the low end a
     fraction of a millisecond of noise is a large *relative* move and a relative
@@ -734,6 +739,11 @@ def compress_to_risers(
     kept = [0]
     for index in range(1, len(token_counts)):
         if step_times[index] - step_times[kept[-1]] > float(min_riser_ms):
+            # Close the shelf we are leaving before recording the riser, so
+            # interpolation stays flat across it instead of ramping from the
+            # shelf's first sample to the riser top.
+            if index - 1 != kept[-1]:
+                kept.append(index - 1)
             kept.append(index)
 
     limit = max(int(max_breakpoints), 2)
@@ -1013,6 +1023,15 @@ class SweepConfig:
     max_seq_len: int = 4096
     max_num_tokens: int = 8192
     kv_cache_fraction: float = 0.5
+    #: Fitted STS temperatures. Not used to decide anything while the pin is on;
+    #: it is what lets ``enable_ragged_verify`` pass validation without the cost
+    #: table this tool exists to produce.
+    sts_path: Optional[str] = None
+    #: Any non-flat cost table. See the note at its use site: with a one-rung
+    #: ladder its values cannot affect the result, only its presence.
+    seed_table_path: Optional[str] = None
+    #: Restore the original sweep geometry; see the note in _build_llm.
+    block_follows_verify_len: bool = False
     attn_backend: str = "TRTLLM"
     disable_overlap_scheduler: bool = False
     #: On by default because the deployment being profiled runs with it on, and
@@ -1023,6 +1042,9 @@ class SweepConfig:
     #: How long the post-cell stats drain waits for the tail records to arrive
     #: over IPC before it decides the queue is empty.
     stats_timeout_s: float = 5.0
+    #: Mid-cell poll interval. Short enough that ~1000 rows cannot accumulate
+    #: between polls (at dp_size=8 that is 125 iterations, i.e. a few seconds).
+    stats_poll_s: float = 2.0
     token_id_range: Tuple[int, int] = (1000, 10000)
     seed: int = 1234
     extra_llm_api_options: Dict[str, object] = field(default_factory=dict)
@@ -1032,7 +1054,8 @@ class SweepConfig:
         """Independent scheduling domains, i.e. rows per iteration in the stats."""
         return int(self.tp_size) if self.enable_attention_dp else 1
 
-    def max_tokens_for(self, verify_len: int) -> int:
+    def max_tokens_for(self, verify_len: int,
+                       batch_size: Optional[int] = None) -> int:
         """Output-token budget that guarantees the cell reaches its step count.
 
         With acceptance pinned every step commits exactly one token, so the
@@ -1040,9 +1063,27 @@ class SweepConfig:
         ``verify_len + 1``, so the budget is scaled to keep the lower bound on
         steps at the target -- at the price of running up to that factor longer
         when acceptance turns out to be poor.
+
+        ``batch_size`` adds the *admission ramp*, and without it no large cell
+        can ever yield a sample. A cell is only counted while all ``dp_size``
+        ranks hold exactly ``batch_size`` generating requests, so the request
+        admitted first must still be alive when the last one is admitted.
+        Measured on job 2561986 (bs=256, input_len=1024): the scheduler admits
+        roughly one context request per iteration per rank, so the ramp is
+        ~``batch_size`` iterations, while the budget was 85 -- the first
+        requests died ~170 iterations before the last arrived, concurrency
+        plateaued at 11 of 256, and every one of the 8 repeats kept nothing.
+        bs<=128 escaped only because its ramp fit inside the same 85.
+
+        The ramp is bounded below by prefill tokens / ``max_num_tokens``, but
+        that bound was off by ~60x here, so use the observed one-per-iteration
+        rate instead: it is the conservative direction, and overshooting costs
+        run time while undershooting costs the entire cell.
         """
         target_steps = int(self.warmup_steps) + int(self.measure_steps)
         budget = target_steps + max(target_steps // 4, 16)
+        if batch_size is not None:
+            budget += int(batch_size)
         return budget if self.pin_acceptance else budget * (int(verify_len) + 1)
 
     def validate(self) -> None:
@@ -1054,7 +1095,8 @@ class SweepConfig:
         # A request that hits max_seq_len is evicted mid-cell, so the batch
         # drains and the steady window shrinks -- which surfaces much later as a
         # confusing "not enough steady samples".
-        longest = self.input_len + max(self.max_tokens_for(v) for v in self.verify_lens)
+        longest = self.input_len + max(
+            self.max_tokens_for(v, b) for v in self.verify_lens for b in self.batch_sizes)
         if longest > self.max_seq_len:
             raise SweepGeometryError(
                 f"a request would reach {longest} tokens (input {self.input_len} + "
@@ -1109,7 +1151,15 @@ def _prepare_environment(config: SweepConfig) -> None:
     Set before the LLM is constructed because the worker processes inherit the
     environment at spawn and read these once.
     """
-    os.environ[RAGGED_VERIFY_MODE_ENV] = RaggedVerifyMode.STATIC.value
+    # COMPACT, not STATIC. Under STATIC the token axis is bs*(max_draft_len+1)
+    # and the only way to vary M is to rebuild with a shorter block -- which
+    # also shortens the DRAFT pass, so the measured difference between two
+    # cells mixes "verified fewer tokens" with "drafted fewer tokens". The
+    # deployed path drafts the full block every step and varies only the verify
+    # window, so a table built that way over-states what trimming buys. COMPACT
+    # plus the per-engine pin below holds the draft at max_draft_len and moves
+    # only the axis the planner actually controls.
+    os.environ[RAGGED_VERIFY_MODE_ENV] = RaggedVerifyMode.COMPACT.value
     if config.pin_acceptance:
         from .interface import FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR
 
@@ -1121,19 +1171,94 @@ def _build_llm(config: SweepConfig, verify_len: int):
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import CudaGraphConfig, DSparkDecodingConfig, KvCacheConfig
 
+    # Held at the checkpoint's trained block for EVERY cell. Sweeping it (which
+    # this did) makes the draft pass shrink along with the verify window, and
+    # the two costs are then inseparable in the fitted theta(M). The previous
+    # K-sweep on this hardware put the draft pass at ~17 ms and the marginal
+    # verify token at ~0 -- so a table that lets draft cost leak into theta(M)
+    # would attribute the draft saving to trimming and predict a benefit the
+    # deployment cannot collect. The verify window is moved by the pin below.
+    # The window is pinned by BOTH the env override and the ladder, and the
+    # env var is SET here, never popped.
+    #
+    # Set, because the workers are spawned by srun with the job environment: a
+    # job-wide pin reaches ranks 1..N-1 regardless of what this process does to
+    # its own env, so popping it here strips rank 0 alone. A rank-0 planner
+    # with no pin and no cost table falls back to uniform while its peers run
+    # pinned -- a rank-divergent shape under attention-DP. With one verify
+    # length per sweep process the pin always equals the ladder rung below, so
+    # it can never be rejected either.
+    #
+    # (An earlier revision popped it and relied on the one-rung ladder alone,
+    # citing a "pin skips the padding reservation" theory for the Repeat.cu
+    # assert. That theory was wrong -- the assert reproduced with no pin at
+    # all; the actual cause was the CUDA-graph key returning the PREDICTED
+    # bucket rather than the batch's measured token total, fixed in
+    # cuda_graph_runner._ragged_verify_bucket. And the one-rung ladder was
+    # never one rung anyway: the llm_args validator appends max_draft_len, so
+    # under a constant block [L] is really [L, block]. With a seed table
+    # present the planner argmax'd its way to the block on 93-95% of steps
+    # while the samples file recorded M = bs*(L+1) as if L had run -- twelve
+    # cells, eight mislabelled, and the fit dutifully concluded q ~ 0.)
+    from .dspark_verify import FORCE_VERIFY_LEN_ENV
+
+    # LAUNCH-MODE CAVEAT: this mutation reaches ranks 1..N-1 only when the
+    # workers are spawned AFTER it (MPI-spawn path). On a pre-spawned world
+    # (srun / trtllm-llmapi-launch) already-running ranks keep the previous
+    # value, the per-L pin diverges across ranks, and cells measure a shape
+    # their label does not describe. assert_swept_shape refuses such a sweep
+    # downstream (verify_len_hist vs the nominal L), which is why it gates the
+    # fit rather than merely warning.
+    os.environ[FORCE_VERIFY_LEN_ENV] = str(int(verify_len))
+    # Which knob moves M.
+    #
+    # constant block (default): the block stays at the checkpoint's trained
+    # length for every cell and only the verify window moves, which is exactly
+    # what the deployment does. It is the right experiment -- but it makes the
+    # whole batch run with max(verify_len) < block_size, and the ragged packing
+    # currently asserts in that regime (Repeat.cu output_size vs sum(repeats)).
+    #
+    # block follows verify_len: the original design. Never produces
+    # max(lens) < block, so it runs today, at the price of shrinking the DRAFT
+    # pass along with the window -- theta(M) then absorbs a per-L draft term.
+    # That term is recoverable rather than fatal: with several batch sizes the
+    # same M is reached at different L (M=192 from bs=32/L=5 and bs=64/L=2), and
+    # those shared points separate a token cost from an L cost. See
+    # tmp/dspark_build/verdict_theta.py.
+    block = int(verify_len) if config.block_follows_verify_len else int(config.max_draft_len)
     spec_config = DSparkDecodingConfig(
-        max_draft_len=int(verify_len),
-        # DSparkWorker asserts draft_model.block_size == max_draft_len, so the
-        # block has to move with the swept length rather than stay at the
-        # checkpoint's trained value.
-        block_size=int(verify_len),
+        max_draft_len=block,
+        block_size=block,
         speculative_model=config.speculative_model,
         enable_confidence_scheduling=bool(config.enable_confidence_scheduling),
+        # Both required together: the validator rejects confidence scheduling
+        # without ragged verification (there are only two states -- schedule per
+        # request, or verify the full block). The profiler had only the first
+        # and could not construct its own engine at all; it failed 1:36 into
+        # every two-node sweep. And ragged in turn demands a profiled artifact,
+        # which is circular for the tool that produces one -- an STS path is the
+        # non-circular way to satisfy it, and the pin makes the planner's own
+        # choice irrelevant here anyway.
+        enable_ragged_verify=bool(config.enable_confidence_scheduling),
+        confidence_sts_path=config.sts_path,
+        # Only has to be non-flat and present: with one rung the planner's
+        # choice is already determined, so the table's VALUES cannot influence
+        # this measurement -- it exists to get past the flat-cost fallback,
+        # which would otherwise return None and put every step back on the
+        # uniform path at M = bs*(block+1).
+        confidence_sps_table_path=config.seed_table_path,
         # A single tier keeps the captured-graph count identical to an
         # unscheduled run (one graph per batch size) while still exercising the
         # confidence head, which is part of the deployment's per-step cost. It
         # also makes the planner's choice a no-op: max_tier == max_draft_len, so
         # the step shape is pinned no matter what the confidence snapshot says.
+        # The pin decides the length; the ladder only has to CONTAIN it, or the
+        # planner would return a length with no captured graph and every step
+        # would fall back to eager -- which is not the cost being tabulated.
+        # One rung: the planner's argmax has a single legal answer, so the step
+        # shape is pinned no matter what the confidence snapshot says, while
+        # every downstream path (bucket choice, padding reservation, graph
+        # selection) runs exactly as it does in production.
         confidence_verify_len_tiers=(
             [int(verify_len)] if config.enable_confidence_scheduling else None
         ),
@@ -1182,7 +1307,7 @@ def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int) -> 
     sampling_params = SamplingParams(
         # Every request must outlive the whole window so the batch never drains
         # mid-measurement and shrinks the shape being profiled.
-        max_tokens=config.max_tokens_for(verify_len),
+        max_tokens=config.max_tokens_for(verify_len, batch_size),
         ignore_eos=True,
         # No detokenization: it is postprocessing work that would show up in the
         # host step time without being part of what the planner is choosing.
@@ -1199,19 +1324,67 @@ def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int) -> 
     ]
 
     futures = [llm.generate_async(prompt, sampling_params) for prompt in prompts]
+
+    # Drained WHILE the cell runs, not once at the end. Only ~1000 stats rows
+    # survive to a single drain -- 125 iterations at dp_size=8 -- and the
+    # scheduler admits roughly one context request per iteration, so a cell
+    # spends ~batch_size iterations ramping up and just as many draining. At
+    # bs>=128 the whole retained window therefore lands inside the drain: every
+    # step it contains has 0..11 generating requests, none has `batch_size`,
+    # and the cell reports "kept nothing" while the plateau it was measuring
+    # scrolled out of the buffer unseen (jobs 2561986, 2563525).
+    #
+    # The hazard this replaces is real but narrower than the old comment
+    # claimed: `IterationResult` latches done when its queue runs dry, so an
+    # empty read ends collection. Polling only while requests are still
+    # outstanding keeps the queue fed; the count of empty reads is reported so a
+    # cell that lost its tail this way is visible rather than merely short.
+    rows: List[dict] = []
+    drain_error: List[BaseException] = []
+    stop = threading.Event()
+
+    def _drain() -> None:
+        while not stop.is_set():
+            try:
+                rows.extend(list(llm.get_stats(timeout=config.stats_poll_s) or []))
+            except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+                drain_error.append(exc)
+                return
+            stop.wait(config.stats_poll_s)
+
+    # A daemon drainer, NOT a poll loop that owns the exit condition. Making the
+    # main thread wait on `future.finished` while draining hung the sweep: the
+    # loop span silently, the log stopped growing, and the stall watchdog killed
+    # the job at exactly 15 minutes with no cell produced. The main thread here
+    # blocks on future.result() exactly as it did before this change, so
+    # termination is unaffected by anything the drainer does.
+    # stats_poll_s <= 0 disables the mid-cell drain: the control arm for "does
+    # the profiler perturb what it measures". The cell then relies on the single
+    # post-cell drain, which only sees the last ~1000 rows -- fine for small
+    # batches whose whole cell fits in that window, useless above bs~64. That is
+    # exactly why this is a control and not an option.
+    drainer = None
+    if float(config.stats_poll_s) > 0:
+        drainer = threading.Thread(target=_drain, name="dspark-sps-drain",
+                                   daemon=True)
+        drainer.start()
     try:
         for future in futures:
             future.result()
     finally:
+        stop.set()
+        if drainer is not None:
+            drainer.join(timeout=max(5.0, 3.0 * config.stats_poll_s))
         for future in futures:
             if not future.finished:
                 future.abort()
-    # Drained exactly once, after the cell has finished. `IterationResult`
-    # latches itself done the first time its queue runs dry and is only reset
-    # when new requests are submitted, so polling mid-cell would silently
-    # discard every step after the first empty read. The timeout is the wait for
-    # the last few records to cross the IPC boundary, not a poll interval.
-    rows: List[dict] = list(llm.get_stats(timeout=config.stats_timeout_s) or [])
+    if drain_error:
+        print(f"[dspark-sps]   bs={batch_size} L={verify_len}: mid-cell drain "
+              f"stopped early ({type(drain_error[0]).__name__}: "
+              f"{drain_error[0]}); the cell may be short",
+              file=sys.stderr)
+    # Final drain for whatever crossed the IPC boundary after the last poll.
+    rows.extend(list(llm.get_stats(timeout=config.stats_timeout_s) or []))
 
     aligned = aligned_steps_from_stats(
         rows, expected_ranks=config.dp_size, timing_key=config.timing_key
@@ -1248,8 +1421,10 @@ def run_sweep(config: SweepConfig) -> List[StepSample]:
     samples: List[StepSample] = []
     for verify_len in sorted(config.verify_lens):
         print(
-            f"[dspark-sps] building engine for verify_len={verify_len} "
-            f"(block_size={verify_len}) ...",
+            f"[dspark-sps] building engine: block_size="
+            f"{verify_len if config.block_follows_verify_len else config.max_draft_len}"
+            f"{' (follows L)' if config.block_follows_verify_len else ' (constant)'}"
+            f", verify window {verify_len} -> M = bs*{verify_len + 1} ...",
             file=sys.stderr,
         )
         llm = _build_llm(config, verify_len)
@@ -1368,6 +1543,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "Each value costs one engine build.",
     )
     sweep.add_argument("--input-len", type=int, default=1024, help="Prompt length in tokens.")
+    sweep.add_argument("--block-follows-verify-len", action="store_true",
+                       help="Shrink the drafted block with the verify window "
+                            "(the original geometry). Avoids the "
+                            "max(lens)<block_size packing assert at the price "
+                            "of a per-L draft term in theta(M).")
+    sweep.add_argument("--stats-poll-s", type=float, default=2.0,
+                       help="Mid-cell stats drain interval. <=0 disables it, "
+                            "which is the control arm for measuring whether the "
+                            "drain perturbs the step time it records.")
+    sweep.add_argument("--seed-table", default=None,
+                       help="Any non-flat cost table. With a one-rung ladder "
+                            "its values cannot affect the measurement; without "
+                            "one the planner falls back to uniform and every "
+                            "cell is measured at the full block.")
+    sweep.add_argument("--sts-path", default=None,
+                       help="Fitted STS temperatures. Required with confidence "
+                            "scheduling: ragged verification will not validate "
+                            "without either this or the cost table being built.")
     sweep.add_argument("--warmup-steps", type=int, default=16)
     sweep.add_argument("--measure-steps", type=int, default=64)
     sweep.add_argument("--min-samples", type=int, default=16)
@@ -1474,6 +1667,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             enable_attention_dp=args.enable_attention_dp,
             max_draft_len=args.max_draft_len,
             input_len=args.input_len,
+            sts_path=args.sts_path,
+            seed_table_path=args.seed_table,
+            stats_poll_s=float(args.stats_poll_s),
+            block_follows_verify_len=bool(args.block_follows_verify_len),
             warmup_steps=args.warmup_steps,
             measure_steps=args.measure_steps,
             repeats=args.repeats,
@@ -1531,6 +1728,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "modal_batch_size": reference_bs,
             "warmup_steps_discarded": int(args.warmup_steps),
             "statistic": "median",
+            # The engine fingerprint the loader verifies (check_table_fingerprint).
+            # Attached only when this process ran the sweep itself: an offline
+            # --fit-only refit of merged sample files cannot vouch for the
+            # engine those samples came from, and an unfingerprinted table
+            # loads with a warning rather than a false claim.
+            **({"engine": {
+                "tp": int(args.tp_size),
+                "ep": int(args.ep_size or 0),
+                "attention_dp": bool(args.enable_attention_dp),
+                "block": block_size,
+                "max_batch_size": max(_int_list(args.batch_sizes)),
+                "geometry": ("block_follows_verify_len"
+                             if getattr(args, "block_follows_verify_len", False)
+                             else "constant_block"),
+            }} if not getattr(args, "samples_in", None) else {}),
             **provenance,
         },
     )

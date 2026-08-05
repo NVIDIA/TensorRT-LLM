@@ -152,13 +152,18 @@ def test_greedy_first_descent_would_be_wrong():
     shelf's optimum is almost 3x better.
     """
     bs = 4
-    # One riser just past the floor (bs*(min_len+1) = 8 tokens), then a long
-    # shelf out to the end of the range. The fixed overhead is spelled out
-    # rather than assumed: it is part of what makes the first shelf's Theta
-    # look competitive, and it is no longer a hidden constant in the planner.
-    table = SpsCostTable(token_counts=(0, 10), step_time_ms=(1.0, 3.0), fixed_overhead_ms=1.0)
-    # Uniformly high confidence: every extra candidate adds nearly a full token,
-    # so tau grows ~7x across the range while cost only doubles.
+    # A steep measured segment right past the floor (bs*(min_len+1) = 8
+    # tokens), then a nearly-flat one out to the end of the range. Under
+    # interpolation the kink between segment slopes is what makes Theta
+    # non-unimodal: the first candidates buy tokens on the steep slope and
+    # Theta drops, then the flat segment makes every further token nearly
+    # free and Theta climbs past the starting point.
+    table = SpsCostTable(token_counts=(0, 8, 9, 40),
+                         step_time_ms=(0.5, 0.5, 4.0, 4.2),
+                         fixed_overhead_ms=1.0)
+    # Uniformly high confidence: every extra candidate adds nearly a full
+    # token, so tau grows ~7x across the range while cost less than doubles
+    # past the wall.
     surv = np.cumprod(np.full((bs, BLOCK), 0.995), axis=1)
     n_star = compute_verify_token_budget(survival=surv, num_gen_requests=bs, cost_table=table)
 
@@ -172,8 +177,8 @@ def test_greedy_first_descent_would_be_wrong():
         greedy += 1
 
     assert theta(n_star) >= theta(greedy)
-    assert n_star > greedy, "expected the staircase to defeat a first-descent scan"
-    assert theta(n_star) > 2 * theta(greedy), "the gap should be large, not marginal"
+    assert n_star > greedy, "expected the cost kink to defeat a first-descent scan"
+    assert theta(n_star) > 1.5 * theta(greedy), "the gap should be large, not marginal"
 
 
 def test_flat_cost_table_degenerates_to_verify_all():
@@ -204,11 +209,23 @@ def test_budget_is_zero_for_empty_batch():
     )
 
 
-def test_cost_table_is_a_staircase_not_an_interpolation():
+def test_cost_table_interpolates_between_breakpoints():
+    """The consumer contract is clamped linear interpolation, not a floor.
+
+    The floor variant this replaces billed every total below the next
+    breakpoint at the previous breakpoint's price. On the sparse live table
+    (points at 768 and 1536) that priced a 1512-token full block at the 768
+    price -- the planner's cost ratio collapsed below the survival ratio and
+    it bought the full block on ~95% of decisions. Flatness between points is
+    a claim about the hardware; if a table wants a shelf, it must MEASURE the
+    shelf (two breakpoints with equal values), not have the consumer assume it.
+    """
     table = SpsCostTable(token_counts=(0, 100), step_time_ms=(1.0, 5.0))
-    # Everything below the next breakpoint costs the same as the shelf it is on.
-    assert table.step_time(1) == table.step_time(99)
-    assert table.step_time(100) > table.step_time(99)
+    assert table.step_time(99) > table.step_time(1)
+    assert table.step_time(50) == pytest.approx(3.0)
+    # A measured shelf stays flat under interpolation.
+    shelf = SpsCostTable(token_counts=(0, 99, 100), step_time_ms=(1.0, 1.0, 5.0))
+    assert shelf.step_time(1) == shelf.step_time(99)
     # Above the last breakpoint we clamp rather than extrapolate.
     assert table.step_time(10_000) == table.step_time(100)
 
@@ -374,9 +391,15 @@ def test_derived_tiers_lose_nothing_versus_continuous_k():
     an exhaustive search over *every* length.
     """
     rng = np.random.default_rng(11)
+    # The shelves are ENCODED, breakpoint pairs with equal values: under the
+    # interpolating consumer, flatness between points is only real when the
+    # table measured it. (Assuming it -- the old floor lookup -- is what
+    # priced a 1512-token step at the 768-token price on the live table and
+    # disabled trimming outright; the theorem below is conditional on genuine
+    # shelves and this encoding is what "genuine" means now.)
     table = SpsCostTable(
-        token_counts=(0, 12, 30, 48, 90, 160),
-        step_time_ms=(2.0, 2.4, 3.9, 4.0, 7.5, 12.0),
+        token_counts=(0, 11, 12, 29, 30, 47, 48, 89, 90, 159, 160),
+        step_time_ms=(2.0, 2.0, 2.4, 2.4, 3.9, 3.9, 4.0, 4.0, 7.5, 7.5, 12.0),
     )
     for bs in (3, 8, 16, 31):
         surv = np.cumprod(rng.uniform(0.5, 0.995, size=(bs, BLOCK)), axis=1)

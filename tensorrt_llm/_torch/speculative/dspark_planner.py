@@ -36,8 +36,8 @@ shelf and leaves most of the win behind. Both SGLang and vLLM PR #47808 scan the
 whole curve; so do we, and :mod:`tests` pins it against a brute-force scan.
 
 **Cost is per step, not per token.** ``SpsCostTable`` therefore stores measured
-step time against the *total* verified token count, and interpolates nothing
-across a riser.
+step time against the *total* verified token count, interpolated between
+breakpoints (see the class docstring for why the old floor lookup was wrong).
 
 **Total verified tokens includes the bonus position.** A request that verifies
 ``L`` drafted positions submits ``L + 1`` tokens to the target -- the bonus
@@ -61,14 +61,17 @@ device) is deliberate -- a device-side budget would have to be copied back
 before the batch could be shaped, which is exactly the sync we are avoiding.
 """
 
-import bisect
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 import numpy as np
 
+from ...logger import logger
+
 __all__ = [
     "SpsCostTable",
+    "check_table_fingerprint",
     "compute_verify_token_budget",
     "budget_argmax_over_uniform_lens",
     "derive_verify_len_tiers",
@@ -99,9 +102,9 @@ class SpsCostTable:
             already inside ``step_time_ms``. Defaults to 0.0 on the assumption
             that a profiled table measured whole steps; set it only when the
             table isolates the verify term.
-        batch_sizes / batch_overhead_ms: optional ``alpha(bs)`` staircase -- the
-            batch-size-dependent, *non-trimmable* part of the step (the draft
-            pass, weight movement). Looked up by floor on ``batch_sizes``.
+        batch_sizes / batch_overhead_ms: optional ``alpha(bs)`` breakpoints --
+            the batch-size-dependent, *non-trimmable* part of the step (the
+            draft pass, weight movement). Interpolated on ``batch_sizes``.
 
     Getting the non-trimmable terms wrong is not harmless. The planner maximizes
     ``tau / T``, a ratio, so ``bias + alpha(bs)`` does not cancel: understating
@@ -110,11 +113,18 @@ class SpsCostTable:
     of milliseconds while ``theta(M)`` is a few, so a hardcoded guess here would
     dominate the decision.
 
-    Lookup is a floor (staircase) lookup, never an interpolation: between two
-    measured points the cost is genuinely flat until a new kernel wave starts,
-    and smoothing that away is what makes a planner over-spend right before a
-    riser. Queries above the largest breakpoint clamp to the last entry, and the
-    caller is expected to bound the budget so this does not happen silently.
+    Lookup is a clamped LINEAR INTERPOLATION between breakpoints, matching the
+    additive-table consumer this was ported from (SGLang's
+    ``_additive_step_time_tensor``). A floor lookup here is wrong on a sparse
+    table: it bills every total below the next breakpoint at the previous
+    breakpoint's price, making tokens look free right before a riser, and the
+    argmax then over-spends -- measured live as the planner buying the full
+    block on ~95% of decisions because its cost ratio between tiers collapsed
+    below the survival ratio (see test_dspark_cost_interpolation for the
+    pinned numbers). A table that wants a flat shelf must MEASURE the shelf:
+    two breakpoints with equal values. Queries outside the measured range
+    clamp to the end values; the caller is expected to bound the budget so the
+    high clamp does not happen silently.
     """
 
     token_counts: Sequence[int]
@@ -133,8 +143,8 @@ class SpsCostTable:
             raise ValueError("SpsCostTable requires at least one measured point")
         if any(b <= a for a, b in zip(self.token_counts, self.token_counts[1:])):
             raise ValueError("token_counts must be strictly increasing")
-        if any(t <= 0.0 for t in self.step_time_ms):
-            raise ValueError("step_time_ms entries must be positive")
+        if any(not math.isfinite(t) or t <= 0.0 for t in self.step_time_ms):
+            raise ValueError("step_time_ms entries must be positive and finite")
         if self.fixed_overhead_ms < 0.0:
             raise ValueError("fixed_overhead_ms must be >= 0")
         if len(self.batch_sizes) != len(self.batch_overhead_ms):
@@ -144,36 +154,32 @@ class SpsCostTable:
             )
         if any(b <= a for a, b in zip(self.batch_sizes, self.batch_sizes[1:])):
             raise ValueError("batch_sizes must be strictly increasing")
-        if any(t < 0.0 for t in self.batch_overhead_ms):
-            raise ValueError("batch_overhead_ms entries must be >= 0")
+        if any(not math.isfinite(t) or t < 0.0 for t in self.batch_overhead_ms):
+            raise ValueError("batch_overhead_ms entries must be >= 0 and finite")
 
     def batch_overhead(self, num_requests: int) -> float:
         """``alpha(num_requests)`` -- 0.0 when the table has no batch axis."""
         if not self.batch_sizes:
             return 0.0
-        idx = bisect.bisect_right(self.batch_sizes, int(num_requests)) - 1
-        idx = min(max(idx, 0), len(self.batch_overhead_ms) - 1)
-        return float(self.batch_overhead_ms[idx])
+        return float(
+            np.interp(
+                float(num_requests),
+                np.asarray(self.batch_sizes, dtype=np.float64),
+                np.asarray(self.batch_overhead_ms, dtype=np.float64),
+            ))
 
     def step_time(self, num_tokens: int, num_requests: int = 0) -> float:
         """``bias + alpha(num_requests) + theta(num_tokens)``, in ms."""
-        idx = bisect.bisect_right(self.token_counts, int(num_tokens)) - 1
-        idx = min(max(idx, 0), len(self.step_time_ms) - 1)
-        return (
-            float(self.step_time_ms[idx])
-            + self.fixed_overhead_ms
-            + self.batch_overhead(num_requests)
-        )
+        return float(self.step_times(np.asarray([int(num_tokens)]), num_requests)[0])
 
     def step_times(self, num_tokens: np.ndarray, num_requests: int = 0) -> np.ndarray:
         """Vectorized :meth:`step_time` over a token-count array."""
-        counts = np.asarray(self.token_counts)
-        idx = np.clip(np.searchsorted(counts, num_tokens, side="right") - 1, 0, len(counts) - 1)
-        return (
-            np.asarray(self.step_time_ms, dtype=np.float64)[idx]
-            + self.fixed_overhead_ms
-            + self.batch_overhead(num_requests)
+        theta = np.interp(
+            np.asarray(num_tokens, dtype=np.float64),
+            np.asarray(self.token_counts, dtype=np.float64),
+            np.asarray(self.step_time_ms, dtype=np.float64),
         )
+        return theta + self.fixed_overhead_ms + self.batch_overhead(num_requests)
 
     @classmethod
     def flat(cls, step_time_ms: float = 1.0) -> "SpsCostTable":
@@ -197,6 +203,59 @@ class SpsCostTable:
         return len(set(self.step_time_ms)) <= 1
 
 
+def check_table_fingerprint(*, payload: dict, live: dict) -> None:
+    """Refuse a cost table profiled on a different engine than this one.
+
+    The table's numbers are only meaningful for the engine configuration they
+    were measured on: the same (bs=64, M=384) cell measured 49.5 ms on a
+    max_batch_size=256 engine and 61.0 ms on a max_batch_size=64 engine -- 23%
+    apart against a 0.04-1.2% run-to-run noise floor -- and a table taken on
+    CUTLASS MoE kernels was nearly loaded to plan MegaMoE steps. Neither
+    mistake produces an error anywhere downstream; the planner just trims to
+    the wrong economics.
+
+    Only the keys PRESENT in both dicts are compared, so a table may carry
+    facts the consumer cannot see (image hash, geometry) for humans to check,
+    and an old table with no fingerprint loads with a warning rather than
+    breaking existing deployments.
+    """
+    fp = (payload.get("_meta") or {}).get("engine") or payload.get("engine")
+    if not fp:
+        logger.warning(
+            "DSpark cost table carries no engine fingerprint; cannot verify it "
+            "was profiled on this configuration. Tables are engine-specific "
+            "(same cell measured 23%% apart across two configs) -- regenerate "
+            "with a current profiler to get load-time checking.")
+        return
+    def _facts_differ(a, b) -> bool:
+        try:
+            return float(a) != float(b)
+        except (TypeError, ValueError):
+            return str(a).upper() != str(b).upper()
+
+    mismatched = {
+        key: (fp[key], live[key])
+        for key in sorted(set(fp) & set(live))
+        if _facts_differ(fp[key], live[key])
+    }
+    if mismatched:
+        detail = ", ".join(f"{k}: table={a!r} engine={b!r}"
+                           for k, (a, b) in mismatched.items())
+        raise ValueError(
+            f"DSpark cost table was profiled on a different engine "
+            f"configuration ({detail}). Its step times do not describe this "
+            f"engine, so the planner would trim to the wrong economics. "
+            f"Re-profile on this configuration, or remove "
+            f"confidence_sps_table_path to run without trimming.")
+    unchecked = sorted(set(fp) - set(live))
+    if unchecked:
+        logger.info(
+            f"DSpark cost table fingerprint: verified "
+            f"{sorted(set(fp) & set(live))}; not verifiable at this site "
+            f"(check manually): "
+            + ", ".join(f"{k}={fp[k]!r}" for k in unchecked))
+
+
 def compute_verify_token_budget(
     *,
     survival: np.ndarray,
@@ -204,6 +263,7 @@ def compute_verify_token_budget(
     cost_table: SpsCostTable,
     min_verify_len: int = 1,
     max_verify_len: Optional[int] = None,
+    allowed_lens: Optional[Sequence[int]] = None,
 ) -> int:
     """Return the batch-wide verify-token budget (tokens *above* the floor).
 
@@ -216,10 +276,25 @@ def compute_verify_token_budget(
         cost_table: measured step cost; see :class:`SpsCostTable`.
         min_verify_len / max_verify_len: per-request bounds, mirroring
             :class:`~.dspark_schedule.DSparkScheduleConfig`.
+        allowed_lens: restrict the answer to budgets that a tier in this ladder
+            can actually realise, i.e. ``n in {bs*(t - min_verify_len)}``. Pass
+            it whenever the result will be executed, and omit it only to ask
+            what an unconstrained scheduler would have wanted.
+
+            The unrestricted answer is not runnable. The captured graphs are
+            ``bs*(t+1)`` tokens for ``t`` in the ladder
+            (``model_engine.ragged_verify_token_buckets``), and any other total
+            is rounded UP to one of them -- so a budget chosen strictly inside a
+            cost shelf, which is the only reason to choose one, is pushed back
+            over the riser it was avoiding. The planner would then buy tokens
+            priced on the cheap shelf and run on the expensive one. Realising a
+            fine budget honestly would need a graph per token count, which is
+            tens of MB of metadata each, taken out of KV cache.
 
     Returns:
         ``n`` maximizing ``tau(n) / step_cost(floor_tokens + n)``, in ``[0, N]``
-        where ``N`` is the number of schedulable candidates.
+        where ``N`` is the number of schedulable candidates -- restricted to the
+        tier-aligned indices when ``allowed_lens`` is given.
     """
     if survival.ndim != 2:
         raise ValueError(f"survival must be [bs, K], got shape {survival.shape}")
@@ -249,7 +324,24 @@ def compute_verify_token_budget(
     floor_tokens = total_verify_tokens(bs, min_verify_len)
     tokens = floor_tokens + np.arange(tau.size)
     theta = tau / cost_table.step_times(tokens, num_gen_requests)
-    return int(np.argmax(theta))
+    if allowed_lens is None:
+        return int(np.argmax(theta))
+    # Tier-aligned: same theta curve, evaluated only where the executor can
+    # land. tokens(n) at n = bs*(t - min_verify_len) is bs*(min+1) + bs*(t-min)
+    # = bs*(t+1), which is exactly total_verify_tokens(bs, t) -- the same cost
+    # grid budget_argmax_over_uniform_lens uses. The only thing that changes is
+    # the numerator: tau here is the sum of the top n survivals, which is what
+    # schedule_verify_lens_topk actually collects, rather than the sum of a
+    # uniform column, which nothing executes.
+    idx = sorted({
+        int(bs) * (int(t) - int(min_verify_len))
+        for t in allowed_lens
+        if int(min_verify_len) <= int(t) <= cap
+    })
+    idx = [n for n in idx if 0 <= n < theta.size]
+    if not idx:
+        return 0
+    return int(max(idx, key=lambda n: theta[n]))
 
 
 def derive_verify_len_tiers(
@@ -263,7 +355,8 @@ def derive_verify_len_tiers(
     """Derive the verify lengths worth capturing a CUDA graph for.
 
     Restricting K to a handful of captured values sounds like it must cost
-    something versus a freely-chosen K. **At a fixed batch size it does not**:
+    something versus a freely-chosen K. **At a fixed batch size, on a table
+    with genuine shelves, it does not**:
 
         Within one cost shelf the step time is constant while ``tau`` strictly
         increases with each admitted token, so ``Theta = tau / cost`` is strictly
@@ -271,6 +364,15 @@ def derive_verify_len_tiers(
         shelf's *right edge* -- never in its interior. For that batch size, a
         tier set of the shelf right edges contains the continuous optimum
         exactly.
+
+    Since the consumer became an interpolation, "shelf" means a measured flat
+    segment (adjacent breakpoints with equal values), not the gap between two
+    sparse samples. On a table whose segments genuinely rise -- like the live
+    GB300 one -- the optimum can sit inside a segment and the right-edge set
+    is a slope-change heuristic rather than an exact cover; the residual loss
+    has to be measured. (The old floor consumer made every gap LOOK like a
+    shelf, which both made this theorem vacuously "exact" and priced a
+    1512-token step at the 768-token price, disabling trimming entirely.)
 
     **The zero-loss property does not survive across batch sizes.** The cost
     shelves live in token space, so a shelf's right edge in *length* space is
