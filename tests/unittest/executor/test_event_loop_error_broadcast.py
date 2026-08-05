@@ -18,9 +18,6 @@ import pytest
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper
 from tensorrt_llm.executor.utils import ErrorResponse
 
-# CI's CPU stages select tests with ``-m "cpu_only and not disabled"``; without
-# this marker the whole file is deselected and pytest exits 5 (no tests ran),
-# which the runner reports as a failure. These are pure stub-based unit tests.
 pytestmark = pytest.mark.cpu_only
 
 

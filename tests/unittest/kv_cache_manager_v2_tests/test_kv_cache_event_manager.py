@@ -87,7 +87,8 @@ _USING_CPP_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").l
 
 
 class _FakePage:
-    def __init__(self, cache_level=_DEFAULT_CACHE_LEVEL, priority=0):
+    def __init__(self, num_tokens_in_block, cache_level=_DEFAULT_CACHE_LEVEL, priority=0):
+        self.num_tokens_in_block = num_tokens_in_block
         self.cache_level = cache_level
         self.priority = priority
 
@@ -118,7 +119,11 @@ class _FakeBlock:
         self.tokens = tokens
         self.prev = prev or _FakeRootBlock()
         self.ordinal = getattr(self.prev, "ordinal", -1) + 1
-        self.storage = [_FakePageRef(_FakePage()) for _ in range(num_life_cycles)]
+        self.storage = [_FakePageRef(_FakePage(len(tokens))) for _ in range(num_life_cycles)]
+
+    def get_page(self, lc_idx):
+        page_ref = self.storage[lc_idx]
+        return None if page_ref is None else page_ref()
 
 
 with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
@@ -1131,6 +1136,21 @@ def test_v2_kv_cache_event_manager_readds_life_cycle_emits_stored_event():
     assert events[0]["layer_group_id"] == 0
     assert events[0]["data"]["block_hashes"] == ["abcf"]
     assert "layer_groups" not in events[0]["data"]
+
+
+def test_v2_kv_cache_event_manager_omits_partial_life_cycle_coverage():
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    block = _FakeBlock(b"\xab\xd3", [1, 2], num_life_cycles=2)
+    block.storage[1] = _FakePageRef(_FakePage(num_tokens_in_block=1))
+
+    event_manager.add_stored_block_event_from_block(block)
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["layer_group_id"] for event in events] == [0]
+    assert [token["token_id"] for token in events[0]["data"]["blocks"][0]["tokens"]] == [1, 2]
+
+    event_manager.add_stored_life_cycle_event_from_block(block, 1)
+    assert _flush_serialized_events(event_manager) == []
 
 
 def test_v2_kv_cache_event_manager_reemits_stored_after_all_life_cycles_were_removed():

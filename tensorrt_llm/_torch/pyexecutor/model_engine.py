@@ -27,7 +27,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
                                             strip_mm_data_for_generation)
-from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
+                                          BaseMultimodalInputProcessor,
                                           create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -1511,6 +1512,17 @@ class PyTorchModelEngine(ModelEngine):
         else:
             logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Ctx kernels")
 
+        model_type = getattr(self.model.model_config.pretrained_config,
+                             "model_type", None)
+        if can_run_general_warmup and model_type in ("kimi_k3", "kimi_linear"):
+            # Kimi's one-token context takes the NT < 4 FLA fallback and does
+            # not compile the optimized single-sequence K123 variant. A
+            # non-aligned five-chunk context enters the pure K123 path.
+            _KIMI_KDA_PREFILL_WARMUP_TOKENS = 257
+            logger.info("Adding Kimi KDA pure-prefill warmup with "
+                        f"{_KIMI_KDA_PREFILL_WARMUP_TOKENS} context tokens")
+            warmup_requests_configs.append((_KIMI_KDA_PREFILL_WARMUP_TOKENS, 0))
+
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(
                 resource_manager,
@@ -2624,13 +2636,23 @@ class PyTorchModelEngine(ModelEngine):
         Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
         by inheriting `MultimodalEncoderMixin`, and the engine drives the construction
         so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
-        than being hardcoded inside each encoder's ``__init__``.
+        than being hardcoded inside each encoder's `__init__`. The optional
+        per-segment capacity combines the encoder token budget with the input
+        processor's largest supported item.
         """
+        max_seq_len = self.encoder_max_num_tokens
+        if isinstance(self.input_processor, BaseMultimodalDummyInputsBuilder):
+            max_tokens_per_item = (
+                self.input_processor.get_mm_max_tokens_per_item())
+            max_seq_len = max(max_seq_len,
+                              max(max_tokens_per_item.values(), default=0))
+
         for module in self.model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
                     max_num_requests=self.encoder_batch_size,
                     max_num_tokens=self.encoder_max_num_tokens)
+                module.set_attn_max_seq_len(max_seq_len)
 
     def _set_up_spec_metadata(
             self,
