@@ -116,6 +116,211 @@ Corollary: `commit 4f81cc5534` ("Gate the eager-ragged path off until its IMA is
 understood") does **not** make the branch safe. Its stated justification is
 wrong. Keep the gate or drop it on its own merits, but do not rely on it.
 
+### Root cause (best-evidenced theory; coarse-guard fix in validation 2026-08-04)
+
+GPU coredump-on-exception (`COREDUMP=1` in the runner) ended the guessing that
+§6 used to recommend compute-sanitizer for. Three independent runs produced
+corefiles naming the same kernel:
+`applyMLARopeAndAssignQKVKernelGeneration<bf16, 256, 448, 64, KVBlockArray>`,
+Warp MMU Fault, and disassembly at the trigger PC shows the faulting
+instruction is the 128-bit **KV-cache store** (`STG.E.128`) whose address is
+computed from a block offset — i.e. the kernel was handed a block table / KV
+extent pair that points outside mapped memory.
+
+The mechanism is a **write-after-read race on persistent pinned staging**: the
+base class already fixed exactly this bug for `kv_cache_block_offsets` (nvbug
+6293536 — see the long comment in `resource_manager.py
+copy_batch_block_offsets` and `_stage_block_offsets_for_copy`): under the
+overlap scheduler the CPU runs an iteration ahead, so an in-place refill of a
+pinned host buffer can clobber the source of the previous iteration's
+still-queued `non_blocking=True` H2D. The base class's fix was to snapshot into
+a fresh pinned buffer per copy. **`dsa.py` re-introduces the unfixed pattern
+wholesale**: `prepare_for_mla_rope_append` (four indptr buffers — direct
+inputs of the faulting rope kernel), `prepare_for_indexer_k_cache`
+(`host_indexer_k_cache_block_offsets`), `prepare_for_indices_conversion`
+(`host_req_idx_per_token`), `kv_lens_expanded_host`, and the ragged row maps.
+Ragged is what turns the latent race into an MMU fault: uniform decode's
+next-step values differ by +1 token, but ragged verify's per-row extents and
+row→request mapping change shape step to step, so a one-step-stale mix of
+extents and block table walks off the allocated blocks.
+
+Two narrower fixes failed before the mechanism was fully mapped: per-buffer
+events on the ragged row maps only (fault persisted — the indptr staging was
+still exposed), and skipping the copies during graph capture (a no-op:
+`_forward_step` is captured on **pre-built inputs**, `prepare()` never runs
+inside the capture region — verified at `model_engine.py:7322`, the captured
+body is `_preprocess_inputs` + `model_forward` only).
+
+The fix has two layers, because the racy buffers have two different *writers*:
+
+1. **Buffers rewritten inside `prepare()`** (the DSA indptr/indexer/row-map
+   staging): one coarse guard in `DSAtrtllmAttentionMetadata.prepare` —
+   synchronize on an event recorded at the end of the previous `prepare()`
+   before any pinned buffer is rewritten, record it after this step's copies
+   are enqueued. Steady-state cost is zero. Trap discovered while validating:
+   `DeepseekV4TrtllmAttentionMetadata` overrode `prepare()` and skipped
+   straight to the grandparent, silently bypassing the guard — the V4 override
+   is now `_prepare_impl` so the wrapper covers it. Any future subclass must
+   override `_prepare_impl`, never `prepare`.
+2. **`host_kv_cache_block_offsets` under KVCacheManagerV2** (the run config
+   uses `use_kv_cache_manager_v2=True`): its rows are live page-index buffers
+   the allocator rewrites at *scheduling* time — outside any prepare-level
+   fence — while the previous step's H2D from the same buffer can still be
+   queued behind an in-flight forward. Neither of V2's two copy branches had
+   V1's nvbug-6293536 snapshot fix. A prepare-scope guard provably does not
+   cover this: a run with layer-1 alone (fix5) still faulted at step ≥64.
+   Fixed by `_stage_host_block_offsets_for_copy` in `kv_cache_manager_v2.py`
+   — snapshot to a fresh pinned buffer per copy, V1 parity. This is the layer
+   that matches the coredump: the block table is what the faulting store's
+   address is computed from, and ragged trimming is what makes roster churn
+   (block free/reassign at scheduling time) frequent enough to hit the window.
+
+Validation note: default-gated runs now die at step ~67 on the runner's own
+activity gate (`trim_ratio` ≈ −0.02) because the `4f81cc5534` gate declines
+eager-ragged on no-graph steps — a config artifact, not the IMA. Use
+`EAGER_RAGGED=1` runs for validation; they exercise BOTH eager-ragged and
+graph-ragged (bucketed) steps in one run.
+
+### 2026-08-04 ~07:00 — the tripwire verdict: VALUE corruption, confirmed live
+
+The two staging-fix layers above were *necessary but not sufficient*: with both
+in, 4 identical runs gave 1 pass / 3 faults. The remaining hypothesis space was
+split by a zero-sync device tripwire (`TLLM_DSPARK_VALIDATE_ROWS`,
+`torch._assert_async` on the exact (extent, block id) pair the rope KV-append
+computes its store address from — placed after the prepare-time gather and
+inside the capture body after the extent rebuild) run under
+`CUDA_DEVICE_WAITS_ON_EXCEPTION`:
+
+**The tripwire FIRED** (`CUDA_EXCEPTION_12, Warp Assert` in
+`_assert_async_cuda_kernel`, frozen live on the faulting rank) — the value
+pair is out of bounds *before* the rope kernel consumes it. This kills the
+VMM/page-mapping family (suspend/resume, free-vs-replay unmap) outright and
+reduces the problem to: **who writes a bad extent or block id, between two
+validated points**. The launch-blocking algebra had already excluded
+deterministic value bugs and graph-internal races (a replay is ONE launch —
+CUDA_LAUNCH_BLOCKING does not serialize inside it, yet 79 bucketed steps
+passed under it), so the writer is a host-side actor racing in-flight device
+work on ragged-only row state.
+
+Forensics protocol that finally worked (traps everywhere else):
+- Attach from the host via `enroot exec <pid> cuda-gdb -p <pid>` — a sibling
+  pyxis container cannot ptrace, the host has no cuda-gdb, and gdb through
+  `/proc/<pid>/root` cannot map the target's libraries.
+- NEVER wrap an attached cuda-gdb in `timeout` — killing it mid-handshake
+  kills the frozen inferior (lost one scene to this).
+- Do not `p *(@parameter ...)` on the assert kernel — cuda-gdb 13.2 crashes
+  (out_of_range in print_cuda_exception_string) and the crash cascade tears
+  the run down.
+- The faulting rank is named by the peers' `timed out waiting for completion
+  flag from rank R` printfs, which flush minutes after the freeze.
+
+The tripwire now also STASHES (site, rows, bad row, extent, block id, bound,
+capacity, ok, req idx, kv_len) into a plain-cudaMalloc int64[10] whose address
+is logged at allocation (`DSPARK VALIDATE debug buffer @ 0x…`) — after a
+freeze, `x/10gd <addr>` in the attached debugger reads the verdict directly.
+site 1 = prepare-time gather produced the bad pair (bad inputs from the host
+side); site 2 = it appeared only at the in-graph rebuild (a concurrent writer
+touched row state between prepare and replay).
+
+### 2026-08-04 ~09:15 — ROOT CAUSE, read off two frozen scenes
+
+Two independent stash readouts, identical signature:
+
+| scene | bucket | row | ext | block id | req | kv_lens_cuda | drift vs allocation |
+|---|---|---|---|---|---|---|---|
+| i / rank6 | 256 | 60 | 1221 | −1 | 10 | 1226 | ≈ +70 |
+| j / rank2 | 96 | 36 | 926 | −1 | 6 | 931 | ≈ +35 |
+
+Both **site 2** with a clean site 1 in the same step. Since both sites use the
+same formula on the same table, site1-clean + site2-trip forces one
+conclusion: `kv_lens_cuda[slot]` moved between the prepare H2D reset and the
+in-graph rebuild — and the only mutation in that interval is the captured
+overlap correction `kv_lens_cuda += previous_kv_lens_offsets_cuda`. Its legal
+values are bounded by one verify window (≤7); the observed drift is tens of
+tokens.
+
+The unbounded source: `previous_kv_lens_offsets` is built as
+`new_tokens_lens_device[previous_slots] − tokens_per_previous_request`
+(`model_engine.py`, ragged branch), and `new_tokens_lens` is the **spec
+sampler's slot-indexed store, allocated with `torch.empty`** and rewritten
+each step only for the slots actually sampled. A slot the sampler never wrote
+reads as arbitrary bytes; one garbage offset pushes the device KV length past
+the host's block allocation, the in-graph extent rebuild follows it, and the
+rope KV-append store walks into a −1 block entry → unmapped address → Warp
+MMU Fault.
+
+Every historical constraint checks out: **uniform never faults** because a
+stable roster rewrites every slot every step (even a stale read is bounded);
+**ragged faults** because trimming churns completions and the fault window
+(step ~64–90) is exactly when batch concurrency reaches new peaks, i.e. when
+slots are read before their first write; **CUDA_LAUNCH_BLOCKING passes**
+because it serializes the sampler's store writes ahead of the next step's
+staging gather; the staging-fix layers never touched it because the offsets
+gather is device-side, not a pinned-host copy.
+
+Fix (`sampler.py int_tensor` + `model_engine.py` ragged offsets):
+1. Slot-indexed sampler stores are **zeros, not empty** — an unwritten slot
+   reads 0.
+2. The ragged offsets gather is **clamped to ±(window)** — a stale value is
+   then at worst one window of KV length, never an out-of-bounds address.
+
+Note the residual: a *stale-but-clamped* offset is still a small KV-length
+error on roster-churn steps (silent, bounded). The clean long-term fix is an
+explicit ordering guarantee (event) between the sampler's store writes and
+the next step's previous-batch gather; not attempted yet — measure first.
+
+### 2026-08-04 ~16:30 — THE ROOT CAUSE, self-described by the stamp tripwire
+
+The kv-lens-drift reading above was a *symptom* misread (the apparent drift
+was a stale row→request map gathering the new roster's kv_lens). The final
+mechanism, caught by a prepare-tick/staged-tick stamp pair raising on the
+step itself:
+
+```
+DSpark ragged staleness: prepare tick 559, staged tick 558, skip reason None
+```
+
+`skip reason None` = the token-major staging chain was NEVER INVOKED that
+step: `_ragged_token_lens` returned None (a generation request without a
+window), so `_attach_ragged_verify_layout` set `ragged_verify_lens = None`
+and prepare skipped every row-map/table refresh — while the graph key still
+carried the fit's `agreed_ragged_bucket`, so the step REPLAYED a
+ragged-bucket graph over the PREVIOUS ragged step's row state: stale
+row→request mapping, stale extents, stale per-row block tables. Wherever the
+retired roster's allocation was shorter than a current extent, the rope
+KV-append read a −1 block entry and stored to an unmapped address.
+
+`_ragged_verify_bucket`'s docstring always promised "None unless *every*
+generation request carries a window"; the code returned the published bucket
+without checking. **Fix: make the code match the docstring** — a step whose
+windows and bucket disagree derives the uniform key or falls back to eager
+(`no_captured_shape`), never a ragged replay it staged no rows for.
+
+Why every earlier observation fit a race: the divergence between the fit's
+bucket and the requests' windows is timing/roster dependent (planner or peer
+declining after the fit, completions between fit and key derivation), so the
+fault was intermittent, followed the first captured buckets by a few dozen
+steps, never touched uniform (no bucket key), and vanished under
+CUDA_LAUNCH_BLOCKING's pacing. Every WAR/staging fix left it untouched
+because nothing was racing — the replay was reading last step's rows by
+design once the staging chain was skipped.
+
+First validation (fix11_a): **131 steps, zero IMA/hang/tripwire**, ragged
+fully active (`steps_ragged` 38, `trim_ratio` 0.5375, 527 replays), the
+consistency decline fired only 6 times (`no_captured_shape: 6`). GSM8K
+95.944 vs the 96.0 gate — within one σ (≈0.54 at n=1319) of the historical
+96.1–96.4 band; two more samples running to separate noise from a real
+regression (suspect list if real: the offsets clamp, the trim-schedule
+shift from declined steps).
+
+The investigation scaffolding (zero-sync device tripwire + forensic stash,
+prepare/staged tick stamps, instance markers, pre-replay staleness assert)
+was stripped from the tree once the fix was validated — this document and
+`tmp/autopsy_recipe.md` (frozen-scene attach protocol, kernel param-space
+offsets, the never-wrap-cuda-gdb-in-timeout rule) are the durable record.
+Rebuilding any piece takes an hour with this doc; keeping them all in-tree
+was judged not worth the noise.
+
 ### Reproduce
 
 ```bash
@@ -233,17 +438,18 @@ rank is untried and is the obvious next move.
 
 ## 6. Next steps
 
-1. **Re-derive the candidate list** from "ragged trimming is unsafe", not "eager
-   is unsafe". The sharpest surviving constraint is `compact_eagerfull`: with
-   every window at `max_draft_len` the step is semantically identical to static,
-   yet it faults — so the trigger is that `is_ragged_verify` is True, not what
-   the windows contain. Audit every `is_ragged_verify` consumer. Two remain
-   unexamined: `refresh_token_major_block_table` (a 4-D `index_select` that has
-   produced a device-side out-of-bounds before) and the four branches in
-   `sparse_attn_indexer`.
-2. **Single-rank compute-sanitizer.** It names the kernel and the address; that
-   ends the guessing. Everything else in this section is another hypothesis.
-3. Only after the IMA: #19 (budget quantisation, the largest measured gap),
+1. **Validate the coarse prepare() guard** (§3 root cause) — a gated and an
+   eager run with `COREDUMP=1`. A pass means both complete ≥128 steps with
+   non-zero `steps_ragged` and no new corefile; do not accept anything less.
+2. If it still faults: the corefile names the kernel again. The remaining
+   unguarded staging is then *outside* `prepare()` — sweep `model_engine.py`
+   and `py_executor.py` for persistent pinned buffers with `non_blocking=True`
+   consumers (the `_pinned_host` sites are already event-guarded).
+3. After the pass: replace the coarse guard's protection of the worst offenders
+   with the base class's snapshot idiom where profiling justifies it, drop the
+   dead capture-skip conditionals, re-evaluate the `4f81cc5534` gate, and clean
+   up the ~34 corefiles (keep one as evidence).
+4. Only after the IMA: #19 (budget quantisation, the largest measured gap),
    then #11 and #20.
 
 ### Do not
@@ -260,16 +466,14 @@ rank is untried and is the obvious next move.
 
 ## 7. Unpushed work
 
-`origin/confidence_head` is at `f033e3cf5b`. Three local commits, none
-end-to-end verified:
+`origin/confidence_head` is at `d36c9b4757`. Two local commits plus the
+coarse-guard working tree, none end-to-end verified yet:
 
 | commit | what | note |
 |---|---|---|
-| `59e2d47b41` | clear the ragged pad window when the fit is skipped | correct on its own merits |
-| `4f81cc5534` | gate the eager-ragged path off | **stated justification is now known wrong** (§3) |
-| `cdc4538616` | row-map staleness assertion | hypothesis it tested is falsified; assertion is cheap and may still be worth keeping |
-
-Also uncommitted: `dsa.py` carries the capture-skip fix for that assertion.
+| `0bb36c11b6` | event-guard the ragged row-map staging + `_pinned_host` sites | did **not** stop the fault alone, but closes real WAR holes; keep |
+| `9bc5dec76c` | skip staging copies during capture | **no-op** — `prepare()` never runs inside the capture region (§3); fold into cleanup |
+| *(uncommitted)* | coarse WAR guard around all of `DSAtrtllmAttentionMetadata.prepare` | the actual fix candidate, in validation |
 
 Two fixes worth keeping regardless of the IMA, already in the above:
 `_pinned_host` (persistent staging buffers — PyTorch does not extend an async
