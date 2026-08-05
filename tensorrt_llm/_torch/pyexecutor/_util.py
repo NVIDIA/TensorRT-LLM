@@ -103,7 +103,7 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
         # a separate ResourceManager is what lets the pool reach the model
         # through attn_metadata.kv_cache_manager and be released by the same
         # free_resources call that frees the request's KV blocks.
-        from .conv_state_manager import InklingHybridCacheManager
+        from ..attention_backend.inkling import InklingHybridCacheManager
         return InklingHybridCacheManager
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 

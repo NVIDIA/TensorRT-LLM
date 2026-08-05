@@ -23,7 +23,7 @@ Architecture summary:
   * RoPE-free attention with per-head q/k RMSNorm and score scale ``1/head_dim``.
   * Learned relative-position bias (``RelLogitsProj``), added pre-softmax as a
     ``score_mod`` inside the Inkling Triton attention kernels (prefill + paged
-    decode); see ``attention_backend/inkling_triton.py``.
+    decode); see ``attention_backend/inkling/``.
   * Hybrid layers: 55 local sliding-window (win=512, 16 kv-heads) + 11 global
     full-causal (8 kv-heads). Global layers apply log-scaling tau (a no-op below
     128k tokens, still implemented for correctness).
@@ -50,7 +50,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.attention_backend import AttentionMetadata
-from tensorrt_llm._torch.attention_backend.inkling_triton import (
+from tensorrt_llm._torch.attention_backend.inkling import (
     build_page_table,
     inkling_decode_attention,
     inkling_prefill_attention,
@@ -625,7 +625,7 @@ class InklingAttention(QKNormRoPEAttention):
     per-head q/k RMSNorm (``skip_rope=True`` gives qk-norm without RoPE), and
     owns the extra ``r`` projection, the k/v short convolutions, and the
     relative-logit projection. The attention *compute* itself runs through the
-    Inkling Triton attention path (``attention_backend/inkling_triton.py``)
+    Inkling Triton attention path (``attention_backend/inkling/``)
     rather than the base backend, because Inkling's learned relative bias is a
     per-(query,head,relative-distance) additive ``score_mod`` that no fused,
     CUDA-graph-safe TensorRT-LLM backend exposes:

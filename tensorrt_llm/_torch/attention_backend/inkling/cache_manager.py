@@ -12,79 +12,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Capability protocol for per-request short-convolution state.
+"""Inkling's KV cache manager: paged KV plus the short-conv state pool.
 
-A model whose layers carry a short causal convolution needs the previous
-``kernel_size - 1`` pre-conv inputs per request, across decode steps. That is
-per-request state with the KV cache's lifetime, so the cache manager is where
-it belongs -- the same conclusion ``BaseMambaCacheManager`` reached for mamba
-conv/SSM state.
+Lives with the model's attention package rather than under ``pyexecutor``,
+matching ``sparse/minimax_m3/cache_manager.py``. Nothing about it is installed
+into shared framework directories: ``_util`` selects this class the same way it
+selects ``MiniMaxM3KVCacheManagerV2``, and ``InklingAttentionMetadata``
+type-tests it directly.
 
-This is a separate protocol from ``BaseMambaCacheManager`` on purpose. That one
-mandates ``get_ssm_states``, ``is_speculative`` and ``mamba_layer_cache``; a
-model with convolutions but no selective-scan state would have to stub all
-three, and a consumer that type-tested for it would be asserting something
-untrue. Two capabilities, two protocols.
+There is deliberately no ``BaseConvStateManager`` protocol. Per-request
+short-conv state is NOT new -- ``BaseMambaCacheManager`` already declares
+``get_conv_states(layer_idx)`` and nemotron_h / qwen3_next / qwen3_5 implement
+it -- but that protocol also mandates ``get_ssm_states``, ``is_speculative``,
+``mamba_layer_cache`` and replay metadata, none of which Inkling can back, and
+its one-tensor-per-layer accessor cannot express Inkling's four convs per layer
+at two different widths (k/v follow the TP-sharded kv split; the post-attention
+and post-MLP convs run replicated on the full residual stream).
 
-Consumers should test the capability, not the model:
-
-    if isinstance(attn_metadata.kv_cache_manager, BaseConvStateManager):
-        ...
-
-which is the shape ``AttentionMetadata._prepare_mamba_metadata`` already uses,
-so any manager that implements this protocol works without another branch.
+A parallel protocol was tried and removed: both of its useful methods returned
+Inkling's own pool and runtime types, so it abstracted nothing while putting an
+Inkling-specific file under ``pyexecutor``. If a second short-conv model ever
+appears, widen the framework's existing hook rather than inventing another one
+beside it.
 """
-
-from abc import ABC, abstractmethod
-from typing import Any, Sequence
 
 import torch
 
-from .kv_cache_manager_v2 import KVCacheManagerV2
+from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
 
-class BaseConvStateManager(ABC):
-    """Per-request short-conv state carried with the KV-cache request lifetime.
-
-    Implementations are expected to be cache managers (``is-a`` KVCacheManager
-    or KVCacheManagerV2), so request admission, per-request row allocation and
-    release all follow the KV cache rather than running beside it. That is the
-    point of the protocol: a pool that lives outside the cache manager can
-    disagree with it about block reuse or request lifetime, and nothing forces
-    the two views back into agreement.
-    """
-
-    @abstractmethod
-    def get_conv_state_cache(self) -> Any:
-        """The pool object the model's convolutions read and update in place.
-
-        Returned rather than exposed per layer because the fused
-        ``causal_conv1d_*`` ops mutate the buffers at the per-request slot
-        indices, so the model needs the pool itself, not a copy.
-        """
-
-    @abstractmethod
-    def prepare_conv_runtime(self, attn_metadata):
-        """Publish this batch's pool rows and return ``(pool, runtime)``.
-
-        Must write the resolved rows into a STABLE device buffer: a captured
-        CUDA graph aliases that pointer, so a fresh allocation per step would
-        strand the capture. Must run from the pre-forward metadata hook, never
-        from inside a captured ``model.forward``, so every replay reads the
-        current batch's rows rather than the capture-time ones.
-        """
-
-    @abstractmethod
-    def free_conv_state(self, request_ids: Sequence[int]) -> None:
-        """Release the pool rows owned by ``request_ids``.
-
-        Called from the manager's own ``free_resources`` so a conv row cannot
-        outlive the KV blocks of the same request -- a leaked row is later
-        reused, with stale state, by whatever request next takes that slot.
-        """
-
-
-class InklingHybridCacheManager(KVCacheManagerV2, BaseConvStateManager):
+class InklingHybridCacheManager(KVCacheManagerV2):
     """Paged KV (V2, per-layer geometry) + the short-conv state pool.
 
     The pool used to be a separate ResourceManager registered under its own
@@ -114,7 +71,7 @@ class InklingHybridCacheManager(KVCacheManagerV2, BaseConvStateManager):
         # Imported here, not at module scope: modeling_inkling imports from
         # _torch.attention_backend and _torch.modules, and a top-level import
         # would close a cycle back through pyexecutor at model-load time.
-        from ..models.modeling_inkling import InklingConvStateCache
+        from ...models.modeling_inkling import InklingConvStateCache
 
         pretrained_config = kwargs["pretrained_config"]
         mapping = kwargs["mapping"]
@@ -138,12 +95,9 @@ class InklingHybridCacheManager(KVCacheManagerV2, BaseConvStateManager):
             conv_dtype,
         )
 
-    # ---- BaseConvStateManager -------------------------------------------------
-    def get_conv_state_cache(self):
-        return self._conv_cache
-
+    # ---- model-facing -----------------------------------------------------
     def prepare_conv_runtime(self, attn_metadata):
-        from ..models.modeling_inkling import InklingConvRuntime
+        from ...models.modeling_inkling import InklingConvRuntime
 
         return self._conv_cache, InklingConvRuntime.build(attn_metadata, self._conv_cache)
 

@@ -251,7 +251,7 @@ def _ink_metadata(
     """
     import torch
 
-    from tensorrt_llm._torch.attention_backend.inkling_triton import InklingAttentionMetadata
+    from tensorrt_llm._torch.attention_backend.inkling import InklingAttentionMetadata
 
     md = object.__new__(InklingAttentionMetadata)
     md.ink_num_gen = 0
@@ -342,7 +342,7 @@ def test_metadata_clamps_a_row_to_max_pages():
 
 
 def test_inkling_backend_is_registered_and_carries_the_metadata():
-    from tensorrt_llm._torch.attention_backend.inkling_triton import (
+    from tensorrt_llm._torch.attention_backend.inkling import (
         InklingAttentionMetadata,
         InklingTritonAttention,
     )
@@ -367,37 +367,6 @@ def test_model_defaults_select_the_inkling_backend():
     from tensorrt_llm._torch.models.modeling_inkling import InklingForConditionalGeneration
 
     assert InklingForConditionalGeneration.get_model_defaults(None)["attn_backend"] == "INKLING"
-
-
-def test_conv_state_manager_implements_the_capability_protocol():
-    """The pool stands behind a capability interface, not a model-specific
-    branch, so a consumer can isinstance-test it the way
-    _prepare_mamba_metadata tests BaseMambaCacheManager."""
-    from tensorrt_llm._torch.pyexecutor.conv_state_manager import (
-        BaseConvStateManager,
-        InklingHybridCacheManager,
-    )
-
-    assert issubclass(InklingHybridCacheManager, BaseConvStateManager)
-    # No abstract method left unimplemented -- an incomplete implementation
-    # would only surface at instantiation time on a GPU node otherwise.
-    assert not getattr(InklingHybridCacheManager, "__abstractmethods__", frozenset())
-
-
-def test_conv_state_protocol_is_not_the_mamba_one():
-    """Kept separate on purpose: BaseMambaCacheManager mandates get_ssm_states /
-    is_speculative / mamba_layer_cache, and Inkling has no selective-scan state
-    to back them with."""
-    from tensorrt_llm._torch.pyexecutor.conv_state_manager import BaseConvStateManager
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import BaseMambaCacheManager
-
-    assert not issubclass(BaseConvStateManager, BaseMambaCacheManager)
-    assert set(BaseConvStateManager.__abstractmethods__) == {
-        "get_conv_state_cache",
-        "prepare_conv_runtime",
-        "free_conv_state",
-    }
-
 
 def test_attn_backend_override_fails_loudly():
     """An attn_backend override silently removes the decode publish and the run
@@ -443,14 +412,10 @@ def test_conv_pool_is_owned_by_the_kv_cache_manager():
     """The pool must be part of the cache manager, not a resource manager beside
     it: that is what frees the conv row with the request's KV blocks and lets
     the model reach it through attn_metadata.kv_cache_manager."""
-    from tensorrt_llm._torch.pyexecutor.conv_state_manager import (
-        BaseConvStateManager,
-        InklingHybridCacheManager,
-    )
+    from tensorrt_llm._torch.attention_backend.inkling import InklingHybridCacheManager
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
     assert issubclass(InklingHybridCacheManager, KVCacheManagerV2)
-    assert issubclass(InklingHybridCacheManager, BaseConvStateManager)
     assert not getattr(InklingHybridCacheManager, "__abstractmethods__", frozenset())
     # free_resources must be overridden, or conv rows outlive their KV blocks.
     assert InklingHybridCacheManager.free_resources is not KVCacheManagerV2.free_resources
@@ -465,53 +430,11 @@ def test_conv_state_resource_type_is_gone():
 
 def test_inkling_selects_the_hybrid_cache_manager():
     from tensorrt_llm._torch.pyexecutor._util import _non_hybrid_kv_cache_manager_cls
-    from tensorrt_llm._torch.pyexecutor.conv_state_manager import InklingHybridCacheManager
+    from tensorrt_llm._torch.attention_backend.inkling import InklingHybridCacheManager
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
     cfg = SimpleNamespace(model_type="inkling_text")
     assert _non_hybrid_kv_cache_manager_cls(cfg, KvCacheConfig()) is (InklingHybridCacheManager)
-
-
-def test_metadata_publishes_the_conv_runtime_from_the_manager():
-    """prepare() must take the pool off the cache manager via the capability
-    protocol, so the publish stays outside the captured forward."""
-    from tensorrt_llm._torch.pyexecutor.conv_state_manager import BaseConvStateManager
-
-    class _FakeConvManager(_FakeKvManager, BaseConvStateManager):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self.prepared = 0
-
-        def get_conv_state_cache(self):
-            return "POOL"
-
-        def prepare_conv_runtime(self, attn_metadata):
-            self.prepared += 1
-            return "POOL", "RUNTIME"
-
-        def free_conv_state(self, request_ids):
-            pass
-
-    md = _ink_metadata()
-    md.kv_cache_manager = _FakeConvManager(
-        md.kv_cache_manager.pp_layers, md.kv_cache_manager._blocks
-    )
-
-    md._prepare_inkling_conv()
-
-    assert md.kv_cache_manager.prepared == 1
-    assert (md.ink_conv_cache, md.ink_conv_rt) == ("POOL", "RUNTIME")
-
-
-def test_metadata_leaves_conv_state_empty_without_the_capability():
-    """A plain KV manager must not get a conv publish -- other models keep the
-    stateless path and pay nothing."""
-    md = _ink_metadata()
-
-    md._prepare_inkling_conv()
-
-    assert md.ink_conv_cache is None and md.ink_conv_rt is None
-
 
 def test_conv_pool_dtype_is_a_torch_dtype_not_the_kv_cache_dtype():
     """_create_kv_cache_manager passes dtype= as the KV cache dtype, a C++
@@ -520,7 +443,7 @@ def test_conv_pool_dtype_is_a_torch_dtype_not_the_kv_cache_dtype():
     conv pool must take its dtype from the model config instead."""
     import torch
 
-    from tensorrt_llm._torch.pyexecutor import conv_state_manager as csm
+    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as csm
 
     src = inspect.getsource(csm.InklingHybridCacheManager.__init__)
     code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
@@ -536,3 +459,125 @@ def test_conv_pool_dtype_is_a_torch_dtype_not_the_kv_cache_dtype():
         if not isinstance(resolved, torch.dtype):
             resolved = torch.bfloat16
         assert resolved is expected
+
+
+def test_inkling_attention_lives_in_its_own_package_not_under_sparse():
+    """Layout follows sparse/minimax_m3 -- kernels, metadata, backend and cache
+    manager in separate modules -- but NOT under sparse/.
+
+    sparse/ is gated on sparse_attention_config / SparseParams and its
+    machinery assumes only part of the KV is scored. Inkling's attention is
+    dense: full causal on global layers, a 512-token sliding window on local
+    ones, with a learned relative-bias score_mod.
+    """
+    import importlib
+
+    pkg = importlib.import_module("tensorrt_llm._torch.attention_backend.inkling")
+    for mod in ("kernels", "metadata", "backend", "cache_manager"):
+        importlib.import_module(f"tensorrt_llm._torch.attention_backend.inkling.{mod}")
+    for sym in ("InklingAttentionMetadata", "InklingTritonAttention",
+                "InklingHybridCacheManager", "inkling_prefill_attention",
+                "inkling_decode_attention"):
+        assert hasattr(pkg, sym), sym
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(
+            "tensorrt_llm._torch.attention_backend.sparse.inkling")
+
+
+def test_no_conv_state_protocol_and_no_inkling_file_in_pyexecutor():
+    """The pool needs no abstract protocol and pyexecutor needs no Inkling file.
+
+    A protocol here would have exactly one implementation, and both of its
+    useful methods return Inkling's own pool and runtime types, so it would
+    abstract nothing while planting an Inkling-specific module in a shared
+    framework directory -- the very thing this work removed from
+    model_engine.py, resource_manager.py and py_executor_creator.py.
+    """
+    import importlib
+    import pathlib
+
+    import tensorrt_llm._torch.pyexecutor as pyexec
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("tensorrt_llm._torch.pyexecutor.conv_state_manager")
+
+    root = pathlib.Path(pyexec.__file__).parent
+    offenders = [f.name for f in root.glob("*.py")
+                 if "InklingHybridCacheManager" in f.read_text()
+                 and f.name != "_util.py"]
+    assert not offenders, offenders
+
+
+def test_metadata_type_tests_the_concrete_manager():
+    """prepare() must react to Inkling's own manager, and to nothing else."""
+    from tensorrt_llm._torch.attention_backend.inkling import InklingHybridCacheManager
+
+    class _FakeConvManager(_FakeKvManager, InklingHybridCacheManager):
+        def __init__(self, *a, **kw):
+            _FakeKvManager.__init__(self, *a, **kw)
+            self.prepared = 0
+
+        def prepare_conv_runtime(self, attn_metadata):
+            self.prepared += 1
+            return "POOL", "RUNTIME"
+
+    md = _ink_metadata()
+    md.kv_cache_manager = _FakeConvManager(
+        md.kv_cache_manager.pp_layers, md.kv_cache_manager._blocks)
+
+    md._prepare_inkling_conv()
+
+    assert md.kv_cache_manager.prepared == 1
+    assert (md.ink_conv_cache, md.ink_conv_rt) == ("POOL", "RUNTIME")
+
+
+def test_metadata_ignores_a_plain_kv_manager():
+    """A non-Inkling manager gets no conv publish -- other models pay nothing."""
+    md = _ink_metadata()
+
+    md._prepare_inkling_conv()
+
+    assert md.ink_conv_cache is None and md.ink_conv_rt is None
+
+
+def test_every_deferred_import_in_the_inkling_package_resolves():
+    """Deferred (function-body) imports must resolve, including their level.
+
+    This is the check py_compile and plain module-import tests cannot do.
+    cache_manager.py holds two ``from ...models.modeling_inkling import ...``
+    inside method bodies -- written that way on purpose, to keep a module-level
+    cycle back through pyexecutor from forming. Moving the file one directory
+    deeper silently changed what ``..`` resolved to, and nothing caught it
+    until a GPU run died with ModuleNotFoundError during KV-cache creation,
+    because neither import executes until the manager is instantiated.
+
+    Resolve every relative import in the package against the real module tree.
+    """
+    import ast
+    import importlib.util
+    import pathlib
+
+    import tensorrt_llm
+
+    root = pathlib.Path(tensorrt_llm.__file__).parent
+    pkg_dir = root / "_torch" / "attention_backend" / "inkling"
+    assert pkg_dir.is_dir(), pkg_dir
+
+    unresolved = []
+    checked = 0
+    for path in sorted(pkg_dir.rglob("*.py")):
+        module = ".".join(
+            path.relative_to(root.parent).with_suffix("").parts)
+        package = module.rsplit(".", 1)[0]
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.ImportFrom) or not node.level:
+                continue
+            checked += 1
+            target = importlib.util.resolve_name(
+                "." * node.level + (node.module or ""), package)
+            if importlib.util.find_spec(target) is None:
+                unresolved.append(f"{path.name}:{node.lineno} -> {target}")
+
+    assert checked >= 10, f"expected to inspect the package's imports, saw {checked}"
+    assert not unresolved, unresolved

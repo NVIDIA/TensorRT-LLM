@@ -34,7 +34,7 @@ def get_attention_backend(
         # and stales the golden manifest, and "INKLING" is never user-supplied
         # anyway -- Inkling's get_model_defaults selects it, and an explicit
         # override is rejected at load.
-        from .inkling_triton import InklingTritonAttention
+        from .inkling import InklingTritonAttention
         return InklingTritonAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
