@@ -2018,40 +2018,33 @@ def test_vbws_beam_width_by_iter_clamps_past_array_end():
             for_next_iteration=True) == beam_width_array[-1]
 
 
-def test_vbws_cpp_formula_reads_past_array_end():
-    """Document why LlmRequest.get_beam_width_by_iter overrides the binding.
+def test_vbws_cpp_formula_matches_past_array_end():
+    """The C++ and Python clamps must agree once decoding outruns the array.
 
-    The C++ implementation clamps the iteration index with the global
-    kMaxBeamWidthArrayLength rather than the actual array length, so once
-    decoding runs longer than the user's array it reads out of bounds and
-    returns arbitrary values (observed: 0, 32, 849 for a 3-entry array).
-    Values of 0 are particularly bad -- a zero beam width is not a valid
-    decoding state. TRTLLMSampler calls into C++ directly and is therefore
-    still affected; this test pins the divergence so the override is not
-    dropped as redundant.
+    The C++ implementation used to clamp the iteration index with the global
+    kMaxBeamWidthArrayLength rather than the actual array length, so it read
+    out of bounds and returned arbitrary widths (observed: 0, 32, 849 for a
+    3-entry array). That starved the request in the C++ micro-batch scheduler
+    and hung decoding; it is fixed in llmRequest.cpp. TRTLLMSampler and the
+    scheduler call into C++ directly, so pin the agreement here -- a failure
+    means the two clamps have drifted apart again.
     """
     beam_width_array = [2, 3, 4]
     request = _vbws_request(beam_width_array)
 
-    # Within the array both agree.
-    for iteration in range(len(beam_width_array) + 1):
+    for iteration in range(len(beam_width_array) + 8):
         request.decoding_iter = iteration
         assert (request.get_beam_width_by_iter() ==
                 CppLlmRequest.get_beam_width_by_iter(request, False))
+        assert (request.get_beam_width_by_iter(
+            for_next_iteration=True) == CppLlmRequest.get_beam_width_by_iter(
+                request, True))
 
-    # Past the end the C++ formula diverges, and can even yield 0.
-    diverged = False
-    for iteration in range(
-            len(beam_width_array) + 1,
-            len(beam_width_array) + 8):
+    # Past the end both must hold the last entry rather than read past it.
+    for iteration in range(len(beam_width_array), len(beam_width_array) + 8):
         request.decoding_iter = iteration
-        assert request.get_beam_width_by_iter() == beam_width_array[-1]
-        if CppLlmRequest.get_beam_width_by_iter(request,
-                                                False) != beam_width_array[-1]:
-            diverged = True
-    assert diverged, (
-        "C++ get_beam_width_by_iter no longer reads past the end of the "
-        "array; the Python override may now be redundant.")
+        assert CppLlmRequest.get_beam_width_by_iter(
+            request, False) == beam_width_array[-1]
 
 
 def test_vbws_uniform_array_matches_fixed_width():
@@ -2066,6 +2059,27 @@ def test_vbws_uniform_array_matches_fixed_width():
         assert vbws.get_beam_width_by_iter(
             for_next_iteration=True) == fixed.get_beam_width_by_iter(
                 for_next_iteration=True)
+
+
+def test_vbws_dummy_requests_excluded_from_width_check():
+    """Every kind of dummy must be excluded from the mixed-width guard.
+
+    ModelEngine rejects a generation batch whose requests report different
+    per-iteration beam widths, but dummy requests carry no user request and are
+    built at their own width -- CUDA-graph padding at the engine width,
+    attention-DP and warmup dummies at width one. Filtering only CUDA-graph
+    dummies let an attention-DP dummy abort an otherwise valid beam-search
+    batch, so the guard filters on `is_dummy`; pin that it covers all three
+    flags.
+    """
+    for flag in ("is_cuda_graph_dummy", "is_attention_dp_dummy",
+                 "is_dummy_request"):
+        request = _vbws_request([2, 3, 4])
+        assert not request.is_dummy, f"{flag}: unset request must not be dummy"
+        setattr(request, flag, True)
+        assert request.is_dummy, (
+            f"{flag} is not covered by is_dummy, so such requests would reach "
+            "the mixed-beam-width check in ModelEngine and abort the batch")
 
 
 def test_create_beam_history():
