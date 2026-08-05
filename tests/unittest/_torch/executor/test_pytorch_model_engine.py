@@ -238,7 +238,11 @@ def _make_forward_only_engine(
     )
     engine.spec_metadata = spec_metadata
     engine._set_up_spec_metadata = Mock(return_value=spec_metadata)
-    engine._prepare_inputs = Mock(return_value=({"prepared": True}, None))
+    prepared_inputs = {
+        "prepared": True,
+        "input_ids": torch.zeros(2, dtype=torch.int32),
+    }
+    engine._prepare_inputs = Mock(return_value=(prepared_inputs, None))
     outputs = {"logits": object()}
     engine._forward_step = Mock(return_value=outputs)
     engine._execute_logit_post_processors = Mock()
@@ -681,7 +685,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         prepare_args = engine._prepare_inputs.call_args.args
         self.assertIs(prepare_args[0], graph_batch)
         self.assertEqual(prepare_args[-1], frozenset({1}))
-        runner.replay.assert_called_once_with(key, {"prepared": True})
+        prepared_inputs = engine._prepare_inputs.return_value[0]
+        runner.replay.assert_called_once_with(key, prepared_inputs)
         engine._forward_step.assert_not_called()
         engine._execute_logit_post_processors.assert_called_once_with(
             batch, outputs)
@@ -755,7 +760,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertEqual(
             semantic_attn_metadata.update_spec_dec_param.call_args.
             kwargs["num_contexts"], 1)
-        runner.replay.assert_called_once_with(key, {"prepared": True})
+        prepared_inputs = engine._prepare_inputs.return_value[0]
+        runner.replay.assert_called_once_with(key, prepared_inputs)
 
     def test_zero_runtime_draft_speculation_graph_miss_is_semantic_eager(
             self) -> None:
@@ -836,7 +842,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         prepare_args = engine._prepare_inputs.call_args.args
         self.assertIs(prepare_args[0], graph_batch)
         self.assertEqual(prepare_args[-1], frozenset({context.py_request_id}))
-        runner.replay.assert_called_once_with(key, {"prepared": True})
+        prepared_inputs = engine._prepare_inputs.return_value[0]
+        runner.replay.assert_called_once_with(key, prepared_inputs)
 
     def test_multimodal_graph_miss_preserves_semantic_payload(self) -> None:
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(None)
