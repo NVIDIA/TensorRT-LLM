@@ -117,12 +117,23 @@ l0_dgx_b200:
       orchestrator: ray
   tests:
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
-    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part0"
-    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part1"
-    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part2"
-    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part3"
-    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part4"
-    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part5"
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_fp8[Qwen3/Qwen3-8B-Qwen3/Qwen3-8B-FP8]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_fp8[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B-FP8]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_fp8[Qwen3/Qwen3-8B-Qwen3/Qwen3-8B-FP8]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_fp8[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B-FP8]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_nvfp4[auto-Qwen3/Qwen3-30B-A3B]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_nvfp4[auto-Qwen3/Qwen3-8B]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_nvfp4[fp8-Qwen3/Qwen3-30B-A3B]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_nvfp4[fp8-Qwen3/Qwen3-8B]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[auto-Qwen3/Qwen3-30B-A3B]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[auto-Qwen3/Qwen3-8B]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[fp8-Qwen3/Qwen3-30B-A3B]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[fp8-Qwen3/Qwen3-8B]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_nemotron_h
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_qwen35_35b_bf16
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_qwen35_35b_bf16
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_qwen35_35b_fp8
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_qwen35_35b_fp8
     - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
     - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp2pp2-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
     - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
