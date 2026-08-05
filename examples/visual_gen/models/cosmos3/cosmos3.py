@@ -340,8 +340,6 @@ def main():
     params = visual_gen.default_params
     if image_path is not None:
         params.image = image_path
-    if args.action_mode is not None and args.video_path is not None:
-        params.image = args.video_path
 
     negative_prompt_path = _resolve_path(args.negative_prompt)
     if args.negative_prompt is not None:

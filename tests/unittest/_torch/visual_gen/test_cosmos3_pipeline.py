@@ -801,6 +801,30 @@ class TestCosmos3V2V:
 
         assert rebuilt == [("video", 10.0, False), ("audio", 10.0, False)]
 
+    def test_apply_flow_shift_rebuilds_every_stream_scheduler(self):
+        """Action denoises in the same loop as video, on its own scheduler
+        instance, so a request that shifts the schedule must move all of them."""
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        rebuilt = []
+
+        class FakeSampling:
+            def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
+                rebuilt.append((scheduler.name, target, use_karras_sigmas))
+                return scheduler
+
+        pipeline.sampling = FakeSampling()
+        pipeline.scheduler = SimpleNamespace(name="video")
+        pipeline.audio_scheduler = SimpleNamespace(name="audio")
+        pipeline.action_scheduler = SimpleNamespace(name="action")
+
+        pipeline._apply_flow_shift(10.0, use_karras_sigmas=False)
+
+        assert rebuilt == [
+            ("video", 10.0, False),
+            ("audio", 10.0, False),
+            ("action", 10.0, False),
+        ]
+
     def test_image_and_video_rejected(self, cosmos3_pipeline):
         with pytest.raises(ValueError, match="not both image and video"):
             _run_forward(
@@ -989,6 +1013,53 @@ class TestCosmos3Action:
                 action_chunk_size=NUM_FRAMES,
                 video=_V2V_FIXTURE_MP4.read_bytes(),
             )
+
+    def test_out_of_range_domain_id_rejected_before_decode(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        with pytest.raises(ValueError, match=r"domain_id must be in \[0, \d+\)"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=_make_test_image(),
+                height=self.ACTION_HEIGHT,
+                width=self.ACTION_WIDTH,
+                num_frames=self.ACTION_FRAMES,
+                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                action_mode="policy",
+                domain_id=10_000,
+                raw_action_dim=self.RAW_ACTION_DIM,
+                action_chunk_size=self.ACTION_CHUNK,
+            )
+
+    def test_first_frame_failure_is_synchronized(self, cosmos3_pipeline, monkeypatch):
+        """Every rank decodes its own reference. A failure on one rank has to
+        reach the others before the transformer's collectives, or the job hangs."""
+        _require_action_pipeline(cosmos3_pipeline)
+        from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3
+
+        seen = []
+        real = pipeline_cosmos3.synchronize_media_prepare_status
+
+        def spy(error):
+            seen.append(error)
+            return real(error)
+
+        monkeypatch.setattr(pipeline_cosmos3, "synchronize_media_prepare_status", spy)
+
+        with pytest.raises(Exception):
+            _run_forward(
+                cosmos3_pipeline,
+                image="/nonexistent/action_reference_frame.png",
+                height=self.ACTION_HEIGHT,
+                width=self.ACTION_WIDTH,
+                num_frames=self.ACTION_FRAMES,
+                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                action_mode="policy",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+                action_chunk_size=self.ACTION_CHUNK,
+            )
+
+        assert seen and isinstance(seen[0], Exception)
 
     def test_action_and_audio_rejected(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)

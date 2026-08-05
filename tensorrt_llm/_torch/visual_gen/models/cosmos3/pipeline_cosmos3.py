@@ -316,19 +316,25 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def _apply_flow_shift(
         self, target_shift: Optional[float], *, use_karras_sigmas: Optional[bool] = None
     ) -> None:
-        """Rebuild both stream schedulers for the requested sampling knobs.
+        """Rebuild every stream scheduler for the requested sampling knobs.
 
-        Video and audio denoise in lockstep in one loop, so a mode that
-        rebuilds only the video scheduler leaves audio on the checkpoint's
-        sigmas and the two streams step on different schedules.
+        Video, audio and action denoise in lockstep in one loop, so a mode that
+        rebuilds only the video scheduler leaves the side streams on the
+        checkpoint's sigmas and the streams step on different schedules.
         """
         self.scheduler = self.sampling.set_flow_shift(
             self.scheduler, target_shift, use_karras_sigmas=use_karras_sigmas
         )
-        if getattr(self, "audio_scheduler", None) is not None:
-            self.audio_scheduler = self.sampling.set_flow_shift(
-                self.audio_scheduler, target_shift, use_karras_sigmas=use_karras_sigmas
-            )
+        for stream in ("audio_scheduler", "action_scheduler"):
+            scheduler = getattr(self, stream, None)
+            if scheduler is not None:
+                setattr(
+                    self,
+                    stream,
+                    self.sampling.set_flow_shift(
+                        scheduler, target_shift, use_karras_sigmas=use_karras_sigmas
+                    ),
+                )
 
     def infer(self, req):
         extra_params = req.params.extra_params or {}
@@ -341,15 +347,30 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         def resolved(value, field_name):
             return value if value is not None else mode_params[field_name]
 
-        # Action sizes its canvas from the resolution bucket and the reference
-        # frame's aspect (resolve_action_size), so leaving height/width unset
-        # here is what lets forward() do that; filling them from the video
-        # table would pin every action request to 720p.
+        # Action resolves every one of these itself, from the embodiment preset
+        # and COSMOS3_ACTION_PARAMS: the canvas from the resolution bucket, the
+        # frame rate from the robot, and steps/guidance from the action recipe.
+        # Filling them from the video table here would leave forward()'s
+        # fallbacks dead and silently run action at 720p, 35 steps, guidance 6
+        # (CFG on, double the work) and 24 fps.
         is_action = extra_params.get("action_mode") is not None
         height = req.params.height if is_action else resolved(req.params.height, "height")
         width = req.params.width if is_action else resolved(req.params.width, "width")
-        num_inference_steps = resolved(req.params.num_inference_steps, "num_inference_steps")
-        guidance_scale = resolved(req.params.guidance_scale, "guidance_scale")
+        num_inference_steps = (
+            req.params.num_inference_steps
+            if is_action
+            else resolved(req.params.num_inference_steps, "num_inference_steps")
+        )
+        guidance_scale = (
+            req.params.guidance_scale
+            if is_action
+            else resolved(req.params.guidance_scale, "guidance_scale")
+        )
+        # frame_rate keeps a materialised video default (the serve layer derives
+        # num_frames from seconds x frame_rate), so action has to drop it here
+        # instead: an incoming 24.0 is indistinguishable from a caller who chose
+        # 24, and the embodiment preset (bridge 5, av 10) would never win.
+        frame_rate = None if is_action else req.params.frame_rate
         video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
 
         return self.forward(
@@ -363,7 +384,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             guidance_scale=guidance_scale,
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
-            frame_rate=req.params.frame_rate,
+            frame_rate=frame_rate,
             use_duration_template=extra_params.get(
                 "use_duration_template",
                 COSMOS3_EXTRA_SPECS["use_duration_template"].default,
@@ -1162,11 +1183,24 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # Header probe for video bytes, direct measure for an image: the
             # canvas is the bucket closest to the source's shape, so the size
             # has to be known before anything is decoded at it.
-            action_source_h, action_source_w = action_reference_size(
-                action_mode=normalized_action_mode,
-                image=image,
-                video=video,
-            )
+            #
+            # This is the first per-rank read of the reference, so it converges
+            # like the decode below: a missing file or an unreachable URL on one
+            # rank must not leave the others walking into the collectives.
+            probe_error: Optional[Exception] = None
+            try:
+                if image is not None and not isinstance(image, PIL.Image.Image):
+                    # Resolve once: the bundled prompts point at https frames,
+                    # and the probe and the conditioning frame both read it.
+                    image = pil_to_rgb(image)
+                action_source_h, action_source_w = action_reference_size(
+                    action_mode=normalized_action_mode,
+                    image=image,
+                    video=video,
+                )
+            except Exception as exc:
+                probe_error = exc
+            synchronize_media_prepare_status(probe_error)
             height, width = resolve_action_size(
                 height, width, action_source_h, action_source_w, action_resolution
             )
@@ -1318,6 +1352,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 domain_name=domain_name,
                 require_explicit=True,
             )
+            num_domains = getattr(self.transformer, "num_embodiment_domains", None)
+            if num_domains is not None and not 0 <= action_domain_id < num_domains:
+                raise ValueError(
+                    f"Cosmos3 action domain_id must be in [0, {num_domains}), "
+                    f"got {action_domain_id}."
+                )
             action_frame_offset = action_start_frame_offset(
                 normalized_action_mode, action_chunk_size, num_frames
             )
@@ -1362,19 +1402,26 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 # transformer's collectives so a failure cannot hang the job.
                 synchronize_media_prepare_status(prepare_error)
             else:
-                image_tensor = self._preprocess_action_first_frame(image, video, height, width)
-                if image_tensor.ndim == 4:
-                    video_tensor = (
-                        image_tensor.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
+                prepare_error = None
+                try:
+                    image_tensor = self._preprocess_action_first_frame(image, video, height, width)
+                    if image_tensor.ndim == 4:
+                        video_tensor = (
+                            image_tensor.unsqueeze(2)
+                            .expand(-1, -1, num_frames, -1, -1)
+                            .contiguous()
+                        )
+                    else:
+                        video_tensor = image_tensor
+                    latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
+                        video_tensor,
+                        normalized_action_mode,
+                        num_frames,
+                        generator,
                     )
-                else:
-                    video_tensor = image_tensor
-                latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
-                    video_tensor,
-                    normalized_action_mode,
-                    num_frames,
-                    generator,
-                )
+                except Exception as exc:
+                    prepare_error = exc
+                synchronize_media_prepare_status(prepare_error)
                 image_latent = None
 
             (

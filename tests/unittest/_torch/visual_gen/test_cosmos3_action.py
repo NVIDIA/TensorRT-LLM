@@ -26,6 +26,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     normalize_action_resolution,
     prepare_action_latents,
     resolve_action_size,
+    resolve_domain_id,
     resolve_raw_action_dim,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
@@ -250,6 +251,25 @@ class TestActionReferenceSize:
         # inverse_dynamics conditions on the clip, so an image is not a source.
         with pytest.raises(ValueError, match="requires an image or video"):
             action_reference_size(action_mode="inverse_dynamics", image=str(image_path), video=None)
+
+    def test_https_reference_goes_through_the_repo_loader(self, monkeypatch):
+        """Bundled action prompts point at https:// frames, so a bare
+        PIL.Image.open(path) would fail on every one of them."""
+        import tensorrt_llm.inputs.utils as inputs_utils
+
+        requested = []
+
+        def fake_load_image(source, format="pt", device="cpu"):
+            requested.append((source, format))
+            return PIL.Image.new("RGB", (640, 480), "blue")
+
+        monkeypatch.setattr(inputs_utils, "load_image", fake_load_image)
+        assert action_reference_size(
+            action_mode="policy",
+            image="https://example.invalid/frame.png",
+            video=None,
+        ) == (480, 640)
+        assert requested == [("https://example.invalid/frame.png", "pil")]
 
     def test_video_bytes_probe_the_container_header(self, monkeypatch):
         """Bytes are measured from the header, never by decoding a frame."""
@@ -609,3 +629,25 @@ class TestPrepareActionLatents:
                 dtype=torch.float32,
                 action_input=[[0.0, 1.0], [2.0, 3.0]],
             )
+
+
+class TestResolveDomainId:
+    """domain_id wins, but a caller that contradicts itself is a real mistake:
+    the wrong embodiment yields a fluent trajectory in another robot's dialect."""
+
+    def test_agreeing_pair_is_accepted(self):
+        assert resolve_domain_id(domain_id=7, domain_name="bridge_orig_lerobot") == 7
+
+    def test_contradicting_pair_raises(self):
+        with pytest.raises(ValueError, match="contradicts domain_name"):
+            resolve_domain_id(domain_id=20, domain_name="bridge_orig_lerobot")
+
+    def test_unlisted_name_leaves_domain_id_authoritative(self):
+        assert resolve_domain_id(domain_id=31, domain_name="some-new-robot") == 31
+
+    def test_name_alone_still_resolves(self):
+        assert resolve_domain_id(domain_name="fractal") == 20
+
+    def test_negative_domain_id_raises(self):
+        with pytest.raises(ValueError, match="must be non-negative"):
+            resolve_domain_id(domain_id=-1)

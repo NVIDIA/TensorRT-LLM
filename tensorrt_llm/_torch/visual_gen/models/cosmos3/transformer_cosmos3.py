@@ -235,6 +235,20 @@ class DomainAwareLinear(nn.Module):
         self.fc.to(self.dtype)
         self.bias.to(self.dtype)
 
+    def validate_domain_ids(self, domain_id: torch.Tensor) -> None:
+        """Range-check the ids. Reads a device tensor, so call once per request.
+
+        Out-of-range ids index ``nn.Embedding`` out of bounds, which on GPU is a
+        device-side assert with no useful message; this turns it into a real
+        error. Kept out of forward() because the ``if`` on a device predicate is
+        a blocking sync, and forward() runs twice on every denoise step.
+        """
+        if torch.any((domain_id < 0) | (domain_id >= self.num_domains)):
+            raise ValueError(
+                f"Cosmos3 action domain_id must be in [0, {self.num_domains}), "
+                f"got {domain_id.tolist()}."
+            )
+
     def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
         if domain_id.ndim == 0:
             domain_id = domain_id.unsqueeze(0)
@@ -243,11 +257,6 @@ class DomainAwareLinear(nn.Module):
             raise ValueError(
                 "Cosmos3 action domain_id batch size must match action batch: "
                 f"tokens={x.shape[0]}, domain_id={domain_id.shape[0]}."
-            )
-        if torch.any((domain_id < 0) | (domain_id >= self.num_domains)):
-            raise ValueError(
-                f"Cosmos3 action domain_id must be in [0, {self.num_domains}), "
-                f"got {domain_id.tolist()}."
             )
 
         weight = self.fc(domain_id).view(domain_id.shape[0], self.input_size, self.output_size)
@@ -927,6 +936,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.domain_ids_validated = False
 
         self.__post_init__()
 
@@ -1155,6 +1165,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
     def reset_cache(self):
         self.cached_kv = None
         self.cached_freqs_gen = None
+        self.domain_ids_validated = False
 
     def forward(
         self,
@@ -1289,6 +1300,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 action_domain_ids_tensor = torch.zeros(
                     action_latents.shape[0], dtype=torch.long, device=action_latents.device
                 )
+            if not self.domain_ids_validated:
+                # Once per request, alongside the other first-step host work.
+                self.action_proj_in.validate_domain_ids(
+                    action_domain_ids_tensor.to(dtype=torch.long).reshape(-1)
+                )
+                self.domain_ids_validated = True
             T_action = action_latents.shape[1]
             hidden_action = self.action_proj_in(
                 self.pack_action(action_latents), action_domain_ids_tensor

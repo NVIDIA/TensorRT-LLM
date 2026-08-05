@@ -247,6 +247,17 @@ def resolve_domain_id(
         resolved = int(domain_id)
         if resolved < 0:
             raise ValueError(f"Cosmos3 domain_id must be non-negative, got {resolved}.")
+        # domain_id wins so unlisted embodiments stay reachable, but a caller
+        # that passes both and disagrees would otherwise silently get a
+        # trajectory in a different robot's dialect.
+        if domain_name is not None and str(domain_name).strip():
+            key = str(domain_name).strip().lower()
+            named_id = EMBODIMENT_TO_DOMAIN_ID.get(key)
+            if named_id is not None and named_id != resolved:
+                raise ValueError(
+                    f"Cosmos3 domain_id={resolved} contradicts domain_name={domain_name!r}, "
+                    f"which maps to domain_id={named_id}. Pass only one, or make them agree."
+                )
         return resolved
 
     if domain_name is None or str(domain_name).strip() == "":
@@ -380,7 +391,11 @@ ACTION_VIDEO_EXTENSIONS = frozenset({".mp4", ".avi"})
 
 def pil_to_rgb(value: Any) -> PIL.Image.Image:
     if isinstance(value, (str, Path)):
-        return PIL.Image.open(Path(value)).convert("RGB")
+        # load_image, not PIL.Image.open: the bundled action prompts carry
+        # https:// frame references, and it also handles file:// and data: URIs.
+        from tensorrt_llm.inputs.utils import load_image
+
+        return load_image(str(value), format="pil").convert("RGB")
     if isinstance(value, PIL.Image.Image):
         return value.convert("RGB")
     raise TypeError(

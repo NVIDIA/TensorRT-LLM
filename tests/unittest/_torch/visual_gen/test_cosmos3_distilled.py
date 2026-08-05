@@ -389,6 +389,21 @@ class TestInferModeResolution:
         assert got["num_inference_steps"] == 20
         assert got["width"] == COSMOS3_T2I_PARAMS["width"]
 
+    def test_action_keeps_every_mode_field_unset(self):
+        """Action resolves its own canvas, steps, guidance and frame rate from
+        the embodiment preset. Filling them from the video table here would run
+        every action request at 720p, 35 steps and guidance 6 (CFG on)."""
+        req = _fake_request("video", extra_params={"action_mode": "policy"})
+        got = self._captured_forward_kwargs(_bare_pipeline(), req)
+        for field in ("height", "width", "num_inference_steps", "guidance_scale", "frame_rate"):
+            assert got[field] is None, field
+
+    def test_video_keeps_its_materialised_frame_rate(self):
+        """Only action drops it: the serve layer derives num_frames from
+        seconds x frame_rate, so the video default has to stay materialised."""
+        got = self._captured_forward_kwargs(_bare_pipeline(), _fake_request("video"))
+        assert got["frame_rate"] == COSMOS3_720P_PARAMS["frame_rate"]
+
     def test_distilled_merged_defaults_pass_through(self):
         req = _fake_request("image", num_inference_steps=4, guidance_scale=1.0)
         got = self._captured_forward_kwargs(_bare_pipeline(sampling=_distilled_policy()), req)

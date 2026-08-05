@@ -481,6 +481,47 @@ class TestCosmos3Action:
         _assert_finite_output(out.action, torch.Size([1, self.T_ACTION, model.action_dim]))
 
     @pytest.mark.high_cuda_memory
+    def test_domain_ids_validated_once_per_request(self, action_model_config):
+        """The range check reads a device tensor, so it is a blocking sync. It
+        belongs on the first step of a request, not on every denoise step."""
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([7], dtype=torch.long, device=DEVICE)
+
+        calls = []
+        real_validate = model.action_proj_in.validate_domain_ids
+        model.action_proj_in.validate_domain_ids = lambda ids: (
+            calls.append(ids),
+            real_validate(ids),
+        )[1]
+
+        def run_step():
+            with torch.inference_mode():
+                model(
+                    hidden_states=hs,
+                    timestep=ts / _NUM_TRAIN_TIMESTEPS,
+                    raw_timestep=ts,
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    video_shape=video_shape,
+                    fps=24.0,
+                    action_latents=action_latents,
+                    action_domain_ids=domain_ids,
+                )
+
+        run_step()
+        run_step()
+        assert len(calls) == 1
+
+        model.reset_cache()
+        run_step()
+        assert len(calls) == 2
+
+    @pytest.mark.high_cuda_memory
     def test_forward_with_action_domain_id_out_of_range_raises(self, action_model_config):
         cfg = action_model_config.pretrained_config
         model = _build_random_weight_model(action_model_config)
