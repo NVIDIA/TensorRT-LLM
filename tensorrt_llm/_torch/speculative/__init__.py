@@ -15,7 +15,7 @@ from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
 from .spec_sampler_base import (SampleStateSpec, SampleStateTensorsSpec,
-                                SpecSamplerBase)
+                                SpecSampler, SpecSamplerBase)
 from .spec_tree_manager import SpecTreeManager
 from .suffix_automaton import SuffixAutomatonManager
 from .utils import (get_draft_kv_cache_manager, get_num_extra_kv_tokens,
@@ -49,6 +49,7 @@ __all__ = [
     "SaveHiddenStatesResourceManager",
     "SaveHiddenStatesSpecMetadata",
     "SpecMetadata",
+    "SpecSampler",
     "SpecSamplerBase",
     "SpecWorkerBase",
     "get_draft_kv_cache_manager",

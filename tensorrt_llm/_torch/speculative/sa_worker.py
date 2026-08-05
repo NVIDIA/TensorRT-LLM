@@ -32,9 +32,8 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
-from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecMetadata, SpecWorkerBase
-from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
+from .spec_sampler_base import SpecSampler
 from .suffix_automaton import SuffixAutomatonManager
 
 if TYPE_CHECKING:
@@ -336,18 +335,5 @@ class SAWorker(SpecWorkerBase):
         return draft_tokens  # [batch_size, max_draft_len] GPU tensor
 
 
-class SASampler(SpecSamplerBase):
-    """
-    Sampler for SA that extracts GPU results to CPU after graph replay.
-
-    Uses SpecSamplerBase with default behavior (draft_len + 1 storage,
-    adds dummy draft tokens for context requests).
-    """
-
-    SampleState = SampleStateSpec
-
-    def __init__(self, args: TorchSampler.Args, *, max_draft_len: int):
-        super().__init__(args, draft_len=max_draft_len)
-
-    def is_generation_model(self) -> bool:
-        return True
+# Alias for backwards compatibility -- see SpecSampler.
+SASampler = SpecSampler

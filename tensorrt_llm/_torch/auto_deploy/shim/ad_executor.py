@@ -48,7 +48,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     SimpleScheduler,
 )
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler
+from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
 from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
 from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, MultimodalConfig, SamplerType
@@ -1113,7 +1113,7 @@ def instantiate_sampler(
             max_beam_width=ad_config.max_beam_width,
             disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
         )
-        return Eagle3OneModelSampler(sampler_args)
+        return SpecSampler(sampler_args)
 
     sampler_type = ad_config.sampler_type
     if sampler_type == SamplerType.auto:

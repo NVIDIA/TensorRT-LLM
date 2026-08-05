@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Base class for speculative decoding samplers.
+Sampler for one-model speculative decoding.
 
-This module provides a common base class for MTPSampler, SASampler, and
-Eagle3OneModelSampler.
+Every one-model speculative mode (MTP, Eagle3, SA, DraftTarget, PARD, DFlash,
+DSpark) shares a single sampler: the worker's fused kernel already performs
+drafting, target verification and acceptance, so the sampler only scatters that
+output into slot-indexed buffers, starts the async D2H copy, and updates
+requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
 from dataclasses import dataclass
@@ -57,19 +60,19 @@ class SampleStateSpec(SampleState):
     host: SampleStateTensorsSpec
 
 
-class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
+class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     """
-    Base class for speculative decoding samplers (MTP, NGram, Eagle3, SA).
+    Sampler for all one-model speculative decoding modes.
 
-    Provides common functionality:
-    - Pre-allocated GPU storage buffers
+    Provides:
+    - Pre-allocated, slot-indexed GPU storage buffers
     - Async GPU->CPU copy in sample_async
     - Request state updates in update_requests
 
-    Subclasses can customize behavior by overriding:
-    - _get_max_tokens(): How to calculate max_tokens for storage
-    - _get_draft_tokens_storage_size(): Size of next_draft_tokens tensor
-    - _add_dummy_draft_tokens(): Whether to add dummy drafts for context requests
+    This class carries no per-mode behavior. ``args.max_total_draft_tokens`` is
+    ``spec_config.tokens_per_gen_step - 1`` (see ``create_torch_sampler_args``),
+    i.e. the target's per-step input width minus one, which is exactly the
+    draft length every mode used to compute for itself.
     """
 
     SampleState = SampleStateSpec
@@ -108,67 +111,44 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
 
-    def __init__(self, args: TorchSampler.Args, *, draft_len: int):
+    def __init__(self, args: TorchSampler.Args):
         """
         Initialize the speculative sampler.
 
         Args:
             args: TorchSampler.Args with max_num_sequences, max_seq_len, etc.
-            draft_len: Maximum number of draft tokens per iteration.
         """
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
-        self.draft_len = draft_len
         self.max_seq_len = args.max_seq_len
+        # Wire width minus one: the number of draft slots the target verifies
+        # per step. Linear modes set max_total_draft_tokens == max_draft_len;
+        # tree modes set it to the total node count; PARD sets it to 2K-1
+        # because it also feeds mask tokens through the target.
+        self.draft_len = args.max_total_draft_tokens
 
         seq_slots = args.max_num_sequences
-        max_tokens = self._get_max_tokens(args, draft_len)
-        max_new_tokens = self._get_max_new_tokens(args, draft_len)
-        draft_tokens_size = self._get_draft_tokens_storage_size(args, draft_len)
         self.max_beam_width = args.max_beam_width
         assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
+        # new_tokens holds only the accepted path, whose depth is bounded by
+        # max_draft_len + 1 (one root-to-leaf path, plus the golden token), so
+        # it could be narrower than the wire width for static trees and PARD.
+        # It is deliberately sized to the wire width here: sample_async
+        # truncates the worker output to the store width, so narrowing it would
+        # depend on the worker packing accepted tokens at the front. The
+        # over-allocation is a few hundred KB of int32 and buys that
+        # independence.
         self.store = self.Store(
-            new_tokens=int_tensor((max_new_tokens, seq_slots, self.max_beam_width)),
-            next_new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
-            next_draft_tokens=int_tensor((seq_slots, draft_tokens_size)),
+            new_tokens=int_tensor(
+                (args.max_total_draft_tokens + 1, seq_slots, self.max_beam_width)
+            ),
+            next_new_tokens=int_tensor(
+                (args.max_total_draft_tokens + 1, seq_slots, self.max_beam_width)
+            ),
+            next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots,)),
         )
-
-    def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """
-        Calculate max_tokens for storage allocation.
-
-        Override in subclasses if needed. Default: draft_len + 1.
-        MTP uses args.max_total_draft_tokens + 1 for tree-based speculation.
-        """
-        return draft_len + 1
-
-    def _get_max_new_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """Max depth of accepted token path for new_tokens buffer.
-
-        Defaults to _get_max_tokens (same size as next_new_tokens).
-        Override when accepted path depth differs from total draft tokens,
-        e.g. dynamic tree where max_draft_len < max_total_draft_tokens.
-        """
-        return self._get_max_tokens(args, draft_len)
-
-    def _get_draft_tokens_storage_size(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """
-        Calculate storage size for next_draft_tokens tensor.
-
-        Override in subclasses if needed. Default: draft_len.
-        MTP uses args.max_total_draft_tokens for tree-based speculation.
-        """
-        return draft_len
-
-    def _add_dummy_draft_tokens(self) -> bool:
-        """
-        Whether to add dummy draft tokens for context requests.
-
-        Override in subclasses. Default: True (needed for KV cache preparation).
-        """
-        return True
 
     def _request_common_handling(
         self,
@@ -272,8 +252,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len = o_next_draft_tokens.shape[1]
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
-        # Use actual store buffer dimensions (which may differ from draft_len
-        # when _get_max_new_tokens is overridden, e.g. dynamic tree mode).
+        # The worker output width tracks runtime_draft_len, which dynamic draft
+        # length shrinks below the statically allocated store width.
         new_tokens_width = self.store.new_tokens.shape[0]
         next_new_tokens_width = self.store.next_new_tokens.shape[0]
         draft_tokens_width = self.store.next_draft_tokens.shape[1]
@@ -317,9 +297,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         sampler_event = self._record_sampler_event()
 
         # Add dummy draft tokens to context requests for KV cache preparation
-        if self._add_dummy_draft_tokens():
-            for request in finished_context_requests:
-                request.py_draft_tokens = [1] * self.draft_len
+        for request in finished_context_requests:
+            request.py_draft_tokens = [1] * self.draft_len
 
         return SampleStateSpec(
             requests=sampling_requests,
@@ -328,3 +307,9 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
         )
+
+
+# Backwards-compatible alias. The class used to be an abstract base with one
+# subclass per speculative mode; the subclasses differed only in buffer sizing
+# and are now folded into SpecSampler itself.
+SpecSamplerBase = SpecSampler
