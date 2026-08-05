@@ -84,6 +84,16 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     # Models with per-layer head_dim / num_kv_heads (e.g. Gemma4 hybrid
     # attention, or Inkling's local 16 / global 8 KV-head split) require
     # KVCacheManagerV2 for per-layer buffer sizes.
+    #
+    # The identity tests are a BACKSTOP, not the main path: Inkling and Gemma4
+    # both declare use_kv_cache_manager_v2 in get_model_defaults, which is what
+    # normally sets the flag read on the first line. They are kept because this
+    # runs before the model is instantiated -- the KV cache is sized to decide
+    # how much memory the model may have -- so a user who explicitly passes
+    # use_kv_cache_manager_v2=False would otherwise get V1 and a mis-sized
+    # per-layer pool. Requiring V2 here and raising in
+    # _fallback_if_unsupported_kv_cache_manager_v2 is what turns that into a
+    # loud failure instead of wrong outputs.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
                 or is_gemma4_hybrid(config) or is_inkling(config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager

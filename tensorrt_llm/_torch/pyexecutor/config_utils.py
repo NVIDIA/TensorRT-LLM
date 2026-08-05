@@ -31,7 +31,23 @@ def is_inkling(config):
     per-layer ``num_kv_heads`` geometry that only ``KVCacheManagerV2`` allocates.
     Accepts either the top-level ``inkling_mm_model`` config (runtime model
     registration) or the ``inkling_text`` sub-config (the text tower the KV cache
-    is actually sized from)."""
+    is actually sized from).
+
+    Three callers, with three different intents -- worth keeping straight when
+    auditing whether any of them can become a model hook instead:
+
+    * ``_util._non_hybrid_kv_cache_manager_cls`` -- pick KVCacheManagerV2. Runs
+      BEFORE the model is instantiated (the KV cache is sized to decide how much
+      memory the model may have), so it cannot ask the model class and must key
+      off the checkpoint config. ``get_model_defaults`` declares the same thing
+      for every launch path, but cannot be the mechanism here.
+    * ``_util._fallback_if_unsupported_kv_cache_manager_v2`` -- refuse to
+      silently downgrade to V1 when a V2-incompatible feature is on. Same
+      identity test, opposite direction: it must fire even though the model
+      asked for V2.
+    * ``_util.get_cache_size_per_token`` -- route KV sizing through
+      ``text_config``. Not a capability question at all, just where the decoder
+      geometry lives in a multimodal config."""
     model_type = getattr(config, "model_type", None)
     if model_type in ("inkling_mm_model", "inkling_text"):
         return True
