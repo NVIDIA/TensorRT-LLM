@@ -120,6 +120,7 @@ from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, create_moe
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from ..pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -1525,6 +1526,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 mapping=model_config.mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
                 aux_stream=aux_stream,
+                model_config=model_config,
             )
         else:
             # Forward only the KV-cache quantization to the MLA attention
@@ -1749,12 +1751,16 @@ class KimiLinearModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
 
-        num_tokens = attn_metadata.num_tokens
-        assert hidden_states.shape[0] == num_tokens, (
-            f"Kimi K3 does not support padded batches "
-            f"(got {hidden_states.shape[0]} rows, metadata says {num_tokens} "
-            "tokens); disable CUDA graphs and the overlap scheduler."
-        )
+        # Graph-disabled warmups still inherit the runner's padded token
+        # bucket. Eager KDA/MLA attention returns only real tokens, so trim the
+        # input too and keep the attention-residual stack at the same shape.
+        # BCG and generation CUDA graphs retain their static padded tensors:
+        # their attention cores consume only the ``num_tokens`` real prefix and
+        # the causal-LM wrapper slices logits back before sampling.
+        if attn_metadata.padded_num_tokens is not None and not (
+            attn_metadata.is_cuda_graph or is_in_breakable_cuda_graph()
+        ):
+            hidden_states = hidden_states[: attn_metadata.num_tokens]
 
         block_residual = hidden_states.new_empty(
             self.num_attn_res_snapshots,

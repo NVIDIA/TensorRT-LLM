@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from typing import List, Optional, Tuple
 
 import torch
@@ -27,6 +28,9 @@ from torch import nn
 
 from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
+from ...model_config import ModelConfig
+from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
+from ...utils import get_model_extra_attrs
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
 from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
@@ -77,6 +81,36 @@ def _kda_expand_fla_conv_cache(conv_state: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.pad(conv_state, (1, 0))
 
 
+def _extract_kda_extra_attrs(layer_idx: str):
+    """Resolve the live attention metadata and KDA module for ``layer_idx``."""
+    extra_attrs = get_model_extra_attrs()
+    assert extra_attrs is not None, "Model extra attrs is not set"
+
+    metadata_ref = extra_attrs.get("attention_metadata")
+    assert metadata_ref is not None, "Attention metadata is not set"
+    metadata = metadata_ref()
+    assert isinstance(metadata, AttentionMetadata), "Metadata must be AttentionMetadata"
+
+    kda_layers = extra_attrs.get("kda_layers")
+    assert kda_layers is not None, "KDA layer registry is not set"
+    kda_layer_ref = kda_layers.get(layer_idx)
+    assert kda_layer_ref is not None, f"Cannot find KDA layer for layer {layer_idx}"
+    kda_layer = kda_layer_ref()
+    assert isinstance(kda_layer, KimiKDALinearAttention), (
+        "KDA layer must be KimiKDALinearAttention"
+    )
+    return metadata, kda_layer
+
+
+def kda_core_inplace(hidden_states: torch.Tensor, layer_idx: str, output: torch.Tensor) -> None:
+    """Run the metadata-dependent KDA core and write it into ``output``."""
+    metadata, kda_layer = _extract_kda_extra_attrs(layer_idx)
+    kda_layer.forward(hidden_states, metadata, output=output)
+
+
+maybe_bcg_kda_core_inplace = eager_on_graph(kda_core_inplace)
+
+
 class KimiKDALinearAttention(nn.Module):
     """Production Kimi K3 KDA module with direct cache-pool ownership."""
 
@@ -87,6 +121,7 @@ class KimiKDALinearAttention(nn.Module):
         mapping=None,
         allreduce_strategy=AllReduceStrategy.AUTO,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        model_config: Optional[ModelConfig] = None,
     ) -> None:
         super().__init__()
         lin = cfg.linear_attn_config
@@ -199,6 +234,17 @@ class KimiKDALinearAttention(nn.Module):
         self._packed_conv_weight: Optional[torch.Tensor] = None
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
 
+        self.register_to_config = False
+        self.layer_idx_str = str(layer_idx)
+        if model_config is not None:
+            kda_layers = model_config.extra_attrs.setdefault("kda_layers", {})
+            suffix = 0
+            while self.layer_idx_str in kda_layers:
+                self.layer_idx_str = f"{layer_idx}_{suffix}"
+                suffix += 1
+            kda_layers[self.layer_idx_str] = weakref.ref(self)
+            self.register_to_config = True
+
     def finalize_decode_weights(self) -> None:
         """Build fused projection weights and decode constants after weight load.
 
@@ -293,17 +339,32 @@ class KimiKDALinearAttention(nn.Module):
             self._bfa_proj_weight = bfa_weight
 
     def forward(
-        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
-    ) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """``hidden_states``: flattened ``[num_tokens, hidden]`` (ctx tokens
         first, then one token per generation request)."""
+        if output is None and self.register_to_config and is_in_breakable_cuda_graph():
+            core = hidden_states.new_empty(
+                (hidden_states.shape[0], self.num_heads, self.head_dim),
+                dtype=torch.bfloat16,
+            )
+            maybe_bcg_kda_core_inplace(hidden_states, self.layer_idx_str, core)
+            out = self.o_proj(core.view(hidden_states.shape[0], self.proj_size))
+            if self._o_allreduce is not None:
+                out = self._o_allreduce(out)
+            return out
+
         mamba_metadata = attn_metadata.mamba_metadata
         num_prefills = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
+        num_tokens = attn_metadata.num_tokens
         batch_size = attn_metadata.seq_lens.shape[0]
         state_indices = mamba_metadata.state_indices[:batch_size]
         cu_seqlens = mamba_metadata.query_start_loc_long[: num_prefills + 1]
-        num_generations = batch_size - num_prefills
+        num_decodes = batch_size - num_prefills
 
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W - 1] bf16
@@ -311,36 +372,38 @@ class KimiKDALinearAttention(nn.Module):
 
         outputs: List[torch.Tensor] = []
         if num_prefills > 0:
-            outputs.append(
-                self.forward_prefill(
-                    hidden_states[:num_ctx_tokens],
-                    cu_seqlens,
-                    mamba_metadata,
-                    num_prefills,
+            prefill_out = self.forward_prefill(
+                hidden_states[:num_ctx_tokens],
+                cu_seqlens,
+                mamba_metadata,
+                num_prefills,
+                conv_pool,
+                ssm_pool,
+                state_indices[:num_prefills],
+                layer_cache,
+                output=output[:num_ctx_tokens] if output is not None else None,
+            )
+            if output is None:
+                outputs.append(prefill_out)
+        if num_decodes > 0:
+            decode_rows = num_tokens - num_ctx_tokens
+            if decode_rows == num_decodes:
+                decode_out = self.forward_decode(
+                    hidden_states[num_ctx_tokens:num_tokens],
                     conv_pool,
                     ssm_pool,
-                    state_indices[:num_prefills],
+                    state_indices[num_prefills:],
+                    mamba_metadata,
                     layer_cache,
+                    ssm_state_indices=(
+                        mamba_metadata.state_indices[num_prefills:batch_size]
+                        if self._use_indexed_ssm_pool
+                        else None
+                    ),
+                    output=output[num_ctx_tokens:num_tokens] if output is not None else None,
                 )
-            )
-        if num_generations > 0:
-            num_gen_tokens = hidden_states.shape[0] - num_ctx_tokens
-            if num_gen_tokens == num_generations:
-                outputs.append(
-                    self.forward_decode(
-                        hidden_states[num_ctx_tokens:],
-                        conv_pool,
-                        ssm_pool,
-                        state_indices[num_prefills:],
-                        mamba_metadata,
-                        layer_cache,
-                        ssm_state_indices=(
-                            mamba_metadata.state_indices[num_prefills:batch_size]
-                            if self._use_indexed_ssm_pool
-                            else None
-                        ),
-                    )
-                )
+                if output is None:
+                    outputs.append(decode_out)
             else:
                 # Speculative verification: each generation request carries
                 # 1 + draft_len tokens (drafts are padded to the static max,
@@ -348,19 +411,26 @@ class KimiKDALinearAttention(nn.Module):
                 # SpeculativeState scratch buffers — never the live pools —
                 # and kv_cache_manager.update_mamba_states() promotes the
                 # accepted step after sampling.
-                assert num_gen_tokens % num_generations == 0, (
-                    f"ragged generation batch: {num_gen_tokens} tokens for {num_generations} requests"
+                if output is not None:
+                    raise NotImplementedError(
+                        "Breakable CUDA graph KDA does not support speculative "
+                        "verification batches yet"
+                    )
+                assert decode_rows % num_decodes == 0, (
+                    f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
                 )
                 outputs.append(
                     self.forward_verify(
-                        hidden_states[num_ctx_tokens:],
-                        num_gen_tokens // num_generations,
+                        hidden_states[num_ctx_tokens:num_tokens],
+                        decode_rows // num_decodes,
                         layer_cache,
                         conv_pool,
                         ssm_pool,
                         state_indices[num_prefills:],
                     )
                 )
+        if output is not None:
+            return None
         out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
         if self._o_allreduce is not None:
             # Head-sharded TP: every rank ran its head shard on the same
@@ -394,7 +464,8 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         layer_cache=None,
-    ) -> torch.Tensor:
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         chunk_indices = getattr(mamba_metadata, "kda_chunk_indices", None)
         varlen_is_aligned = getattr(mamba_metadata, "kda_varlen_is_aligned", None)
         single_sequence_length = getattr(mamba_metadata, "kda_single_sequence_length", None)
@@ -508,6 +579,10 @@ class KimiKDALinearAttention(nn.Module):
         # are zero for a fresh request, so the tail columns are unused).
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
+        if output is not None:
+            gated = self._output_gate(x, o, onorm_g)
+            output.copy_(gated.reshape(output.shape))
+            return None
         return self._output_gate_and_proj(x, o, onorm_g)
 
     def forward_decode(
@@ -519,7 +594,8 @@ class KimiKDALinearAttention(nn.Module):
         mamba_metadata=None,
         layer_cache=None,
         ssm_state_indices=None,
-    ) -> torch.Tensor:
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Plain T=1 decode, fast path.
 
         Calls ``trtllm::kda_decode`` directly with kernel-native layouts
@@ -557,11 +633,43 @@ class KimiKDALinearAttention(nn.Module):
                 slot_indices,
                 layer_cache,
                 ssm_state_indices,
+                output,
             )
         d = self.proj_size
         hd = self.head_dim
         H = self.num_heads
         B = x2d.shape[0]
+        W = self.conv_size
+
+        # Allocated once at the pool slot count and never reallocated:
+        # captured CUDA graphs retain this pointer.
+        buf = self._cs_dense
+        if buf is None:
+            if torch.cuda.is_current_stream_capturing():
+                return self.forward_decode_fallback(
+                    x2d,
+                    conv_pool,
+                    ssm_pool,
+                    slot_indices,
+                    layer_cache,
+                    ssm_state_indices,
+                    output,
+                )
+            buf = torch.empty(
+                3,
+                max(conv_pool.shape[0], B),
+                d,
+                W - 1,
+                dtype=torch.bfloat16,
+                device=x2d.device,
+            )
+            self._cs_dense = buf
+        else:
+            assert buf.shape[1] >= B, (
+                f"KDA decode staging buffer holds {buf.shape[1]} rows but the "
+                f"decode batch is {B}; reallocating would corrupt previously "
+                f"captured CUDA graphs"
+            )
 
         # kda_decode writes its [B, 1, H, hd] result into this buffer. It is
         # sized to the pool slot count on the first decode and never
@@ -645,12 +753,26 @@ class KimiKDALinearAttention(nn.Module):
         # committed conv window in sync with the plain-decode advance.
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
+        if output is not None:
+            output.copy_(o.view(B, H, hd))
+            return None
         return self.o_proj(o.view(B, d))
 
     def forward_decode_fallback(
-        self, x2d, conv_pool, ssm_pool, slot_indices, layer_cache=None, ssm_state_indices=None
-    ) -> torch.Tensor:
+        self,
+        x2d,
+        conv_pool,
+        ssm_pool,
+        slot_indices,
+        layer_cache=None,
+        ssm_state_indices=None,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Portable or unfused decode with the production pool contract."""
+        if output is not None:
+            raise NotImplementedError(
+                "Breakable CUDA graph KDA requires the optimized decode kernel"
+            )
         from einops import rearrange
 
         d = self.proj_size
@@ -1063,7 +1185,7 @@ class KimiKDALinearAttention(nn.Module):
         o = torch.cat(step_outputs, dim=1)  # [B, T, H, V]
         return self._output_gate_and_proj(x, o, onorm_g)
 
-    def _output_gate_and_proj(
+    def _output_gate(
         self, x: torch.Tensor, o: torch.Tensor, onorm_g: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if onorm_g is not None:
@@ -1080,4 +1202,10 @@ class KimiKDALinearAttention(nn.Module):
             self.o_norm.eps,
             gate_activation="sigmoid",
         )
+        return o
+
+    def _output_gate_and_proj(
+        self, x: torch.Tensor, o: torch.Tensor, onorm_g: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        o = self._output_gate(x, o, onorm_g)
         return self.o_proj(o.reshape(-1, self.proj_size))
