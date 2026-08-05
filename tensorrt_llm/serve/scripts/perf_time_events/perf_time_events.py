@@ -13,21 +13,45 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Perf Time Events aggregator.
+"""Perf Time Events aggregator (per-event long -> wide compiler).
 
-Stitches the per-rank ``time_events_rank{N}_pid{P}.jsonl`` files written live by
-the executor (gated by ``TRTLLM_PERF_TIME_EVENTS_PATH``) together with the
-disaggregation KV-transfer CSVs (``TRTLLM_KVCACHE_TIME_OUTPUT_PATH``) into a
-single combined JSON. It also computes a few DERIVED signals (inter-step /
-inter-chunk gaps, per-iteration starvation) and can optionally emit the same
-interactive HTML timeline as the ``time_breakdown`` tool.
+Every process that participates in an end-to-end perf timeline appends **one
+JSONL line per lifecycle event** (flushed as the event happens) to its own
+per-rank / per-process file:
 
-This module is intentionally torch-free and stdlib-only for the parse/merge/JSON
-path; ``plotly``/``numpy`` are pulled in lazily (via the sibling
-``time_breakdown`` package) only when ``--html`` is requested. The
-``--agg-jsonl`` latency aggregation (mean/P50/P99 of the lifecycle intervals)
-is likewise pure stdlib -- it does NOT import ``time_breakdown``/``numpy``, so
-the offline aggregate runs anywhere, not just inside the torch container.
+* worker (ctx/gen ``PyExecutor`` ranks) -> ``time_events_rank{N}_pid{P}.jsonl``
+  (``TRTLLM_PERF_TIME_EVENTS_PATH``); each line is a flat envelope
+  ``{"role","event","request_id","ctx_request_id","rank","t","pid"}`` where
+  ``role in {ctx, gen}``.
+* disagg router -> ``disagg_router_pid{P}.jsonl``
+  (``TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH``); same envelope with ``role=router``,
+  ``request_id`` a router-local sequence, plus ``disagg_request_id`` /
+  ``ctx_server`` / ``gen_server`` provenance.
+* benchmark client -> ``client_pid{P}.jsonl``
+  (``TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH``); this one stays a COMPOUND
+  one-record-per-request dump (``source=client``) -- it is a post-hoc batch
+  write, not subject to hangs, and keeps the vLLM ttft/e2e path intact.
+
+This compiler reads all of the above (plus the KV-transfer CSVs) and pivots the
+per-event worker + router lines **long -> wide**: it groups events by
+``request_id``, joins ctx <-> gen <-> router on ``ctx_request_id``, dedups TP
+ranks by ``(role, request_id)``, and emits **one combined record per request**
+carrying every event timestamp plus the derived intra-domain spans. A request
+that hung emits its *partial* record (events that never fired are simply
+absent, not zero) -- which is the whole point of the per-event redesign:
+the last stamp written localizes the stall.
+
+Two output shapes:
+
+* ``--events-jsonl combined_time_events.jsonl`` (new primary): one line per
+  request, ``{ctx_request_id, gen_request_id, <event>: t, ..., spans: {...}}``.
+* ``-o`` combined JSON + ``-a/--agg-jsonl`` latency aggregate: unchanged in
+  spirit; the aggregate reuses the same span/stat machinery.
+
+This module is intentionally torch-free and stdlib-only for the
+parse/merge/JSON path; ``plotly``/``numpy`` are pulled in lazily (via the
+sibling ``time_breakdown`` package) only when ``--html`` is requested over a
+``--perf-json`` dump.
 """
 
 import argparse
@@ -37,7 +61,7 @@ import json
 import math
 import os
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -62,6 +86,37 @@ _NATIVE_TASK_HEADER = [
 # Gen-side summary rows: {instance}_{rank}_gen_transfer_summary.csv
 _GEN_SUMMARY_HEADER = ["timestamp", "RequestID", "gen_side_transfer_time(ms)", "kv_cache_size"]
 
+# ---------------------------------------------------------------------------
+# Per-event schema constants
+# ---------------------------------------------------------------------------
+
+# Worker lifecycle events, per role. Every worker line is one of these; the
+# offline pivot flattens them into one wide record per (role, request_id) and
+# joins ctx <-> gen on ctx_request_id. GEN carries the gen-init lifecycle only
+# (decode requests record no time events, by design).
+_CTX_EVENTS = ("ctx_arrival", "ctx_first_scheduled", "ctx_first_token", "ctx_ready_sent")
+_GEN_EVENTS = (
+    "gen_arrival",
+    "gen_init_scheduled",
+    "gen_kv_transfer_start",
+    "gen_kv_transfer_end",
+    "gen_first_scheduled",
+    "gen_first_token",
+    "gen_last_token",
+)
+
+# Router event name -> pivoted field name. The pivoted router record exposes the
+# ``*_time`` field names that _ROUTER_METRICS differences.
+_ROUTER_EVENT_TO_FIELD = {
+    "arrival": "arrival_time",
+    "ctx_dispatch": "ctx_dispatch_time",
+    "gen_dispatch": "gen_dispatch_time",
+    "first_token": "first_token_time",
+    "resp_done": "resp_done_time",
+}
+# Router provenance fields carried through the pivot (first non-null wins).
+_ROUTER_PROVENANCE = ("disagg_request_id", "ctx_server", "gen_server")
+
 
 def _iter_jsonl(path: str):
     """Yield parsed JSON objects from a .jsonl file, skipping blank/bad lines."""
@@ -77,64 +132,130 @@ def _iter_jsonl(path: str):
 
 
 def parse_event_dir(event_dir: str) -> List[Dict[str, Any]]:
-    """Parse per-rank ``time_events_*.jsonl`` files into a list of records.
+    """Parse per-rank ``time_events_*.jsonl`` files into a flat list of EVENTS.
 
-    Each record is one finished request as written by
-    ``PerfMetricsManager.maybe_write_request_events`` -- it already carries
-    top-level ``request_id`` + ``time_breakdown_metrics`` (the shape
-    ``time_breakdown``'s ``parse_request`` reads directly), plus ``rank`` and an
-    optional disagg ``ctx_request_id``.
-
-    Records are returned in a stable order (sorted by file then line) so repeated
-    runs produce identical output.
+    Each line is now **one lifecycle event** (the flat envelope
+    ``{role, event, request_id, ctx_request_id, rank, t, pid}``), not one
+    finished request. The list is returned in a stable order (sorted by file
+    then line) so the TP-rank dedup below is deterministic -- lexical filename
+    sort makes ``time_events_rank0_*`` the canonical first-seen copy.
     """
-    records: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
     files = sorted(glob.glob(os.path.join(event_dir, "time_events_*.jsonl")))
     for path in files:
         for obj in _iter_jsonl(path):
             if isinstance(obj, dict):
-                records.append(obj)
-    return records
+                events.append(obj)
+    return events
+
+
+def _pivot_worker_events(
+    events: List[Dict[str, Any]],
+) -> "tuple[List[Dict[str, Any]], List[Dict[str, Any]]]":
+    """Pivot flat worker events long -> wide into per-(role, request_id) records.
+
+    A tensor-parallel worker writes the SAME ``request_id`` once per rank (tp4
+    gen -> 4 near-identical copies with lockstep timings). Grouping by
+    ``request_id`` collapses the ranks; first-seen ``t`` wins per event name
+    (``parse_event_dir`` sorts by filename so rank0 is canonical), so ``n`` is
+    the number of logical requests, never inflated by the TP degree.
+
+    Returns ``(ctx_records, gen_records)`` where each record is
+    ``{"request_id", "ctx_request_id", <event_name>: t, ...}`` -- only events
+    that actually fired are present (a hung request keeps its partial set).
+    """
+    ctx_groups: Dict[Any, Dict[str, Any]] = {}
+    gen_groups: Dict[Any, Dict[str, Any]] = {}
+    for e in events:
+        role = e.get("role")
+        if role == "ctx":
+            groups, allowed = ctx_groups, _CTX_EVENTS
+        elif role == "gen":
+            groups, allowed = gen_groups, _GEN_EVENTS
+        else:
+            continue
+        event = e.get("event")
+        if event not in allowed:
+            continue
+        rid = e.get("request_id")
+        g = groups.get(rid)
+        if g is None:
+            g = {"request_id": rid, "ctx_request_id": None}
+            groups[rid] = g
+        cid = e.get("ctx_request_id")
+        if g["ctx_request_id"] is None and cid is not None:
+            g["ctx_request_id"] = cid
+        # First-seen wins (rank0 canonical); ignore later ranks' copies.
+        if event not in g:
+            g[event] = e.get("t")
+    return list(ctx_groups.values()), list(gen_groups.values())
 
 
 def parse_router_dir(router_dir: str) -> Dict[str, Any]:
-    """Parse disagg-router ``disagg_router_*.jsonl`` files, keyed by ctx id.
+    """Parse disagg-router ``disagg_router_*.jsonl`` (per-event) -> keyed by ctx id.
 
-    Each record is one finished request as written by
-    ``RawRequestResponseHooks._maybe_write_router_event`` -- it carries the
-    router dispatch timeline (arrival / ctx_dispatch / gen_dispatch / first_token
-    / resp_done, all steady-clock seconds) plus both join ids
-    (``ctx_request_id`` -- the cross-process key shared with the worker per-rank
-    files -- and the router's own ``disagg_request_id``).
+    Each line is one router lifecycle event (``arrival`` / ``ctx_dispatch`` /
+    ``gen_dispatch`` / ``first_token`` / ``resp_done``). A single request's
+    lines are stitched by ``(pid, request_id)`` -- ``request_id`` is the
+    router-local sequence, unique within a process -- then pivoted into one wide
+    record exposing the ``*_time`` fields ``_ROUTER_METRICS`` differences. The
+    cross-process join key ``ctx_request_id`` is resolved as the first non-null
+    value seen across the request's lines (it is assigned during the ctx
+    round-trip, so ``arrival`` / ``ctx_dispatch`` precede it and are null).
 
-    Returns a dict keyed by ``str(ctx_request_id)`` (each mapping to a single
-    router record ``dict``) so worker records join in O(1), plus one reserved
-    key ``"_no_ctx"`` -> ``List[dict]`` holding every record that CANNOT be
-    joined on ``ctx_request_id``:
+    Returns a dict keyed by ``str(ctx_request_id)`` (each -> a single pivoted
+    router record ``dict``) plus one reserved key ``"_no_ctx"`` ->
+    ``List[dict]`` holding every record that CANNOT be joined on
+    ``ctx_request_id``:
 
-    * records with no ``ctx_request_id`` (the gen-only / no-ctx path), and
+    * records whose resolved ``ctx_request_id`` is null (the gen-only / no-ctx
+      path), and
     * records whose ``ctx_request_id`` is ambiguous because more than one
-      distinct request reported it. This happens on the gen-only benchmark
-      path, where the service hardcodes ``ctx_request_id=1`` for every request
-      (``TRTLLM_DISAGG_BENCHMARK_GEN_ONLY``); keeping such a key joinable would
+      distinct request (``(pid, request_id)`` group) reported it. This happens
+      on the gen-only benchmark path, where the service hardcodes
+      ``ctx_request_id=1`` for every request; keeping such a key joinable would
       false-attach one surviving router row to every worker record, so those
       records are made non-joinable and surfaced as leftovers instead.
 
     (Return type is ``Dict[str, Any]`` because the ``"_no_ctx"`` value is a list
     while every other value is a single record dict.)
     """
-    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    no_ctx: List[Dict[str, Any]] = []
+    # Group per-event lines by (pid, router-local request_id).
+    raw: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
     files = sorted(glob.glob(os.path.join(router_dir, "disagg_router_*.jsonl")))
     for path in files:
         for obj in _iter_jsonl(path):
             if not isinstance(obj, dict):
                 continue
-            ctx_id = obj.get("ctx_request_id")
-            if ctx_id is None:
-                no_ctx.append(obj)
-            else:
-                grouped[str(ctx_id)].append(obj)
+            raw[(obj.get("pid"), obj.get("request_id"))].append(obj)
+
+    # Pivot each request's lines into one wide record.
+    pivoted: List[Dict[str, Any]] = []
+    for _key, rows in raw.items():
+        rec: Dict[str, Any] = {"ctx_request_id": None}
+        for prov in _ROUTER_PROVENANCE:
+            rec[prov] = None
+        for row in rows:
+            field = _ROUTER_EVENT_TO_FIELD.get(row.get("event"))
+            if field is not None and field not in rec:
+                rec[field] = row.get("t")
+            cid = row.get("ctx_request_id")
+            if rec["ctx_request_id"] is None and cid is not None:
+                rec["ctx_request_id"] = cid
+            for prov in _ROUTER_PROVENANCE:
+                if rec[prov] is None and row.get(prov) is not None:
+                    rec[prov] = row.get(prov)
+        pivoted.append(rec)
+
+    # Bucket by ctx id, detecting the ambiguous / no-ctx cases.
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    no_ctx: List[Dict[str, Any]] = []
+    for rec in pivoted:
+        cid = rec.get("ctx_request_id")
+        if cid is None:
+            no_ctx.append(rec)
+        else:
+            grouped[str(cid)].append(rec)
 
     by_ctx: Dict[str, Any] = {}
     for ctx_id, rows in grouped.items():
@@ -158,9 +279,10 @@ def parse_router_dir(router_dir: str) -> Dict[str, Any]:
 def parse_client_dir(client_dir: str) -> List[Dict[str, Any]]:
     """Parse benchmark-client ``client_*.jsonl`` files into a flat list.
 
-    Each record is one request's client send timeline (process-local monotonic
-    ``send_time`` + wall-clock ``send_wall_time`` anchor) as written by
-    ``benchmark_serving._maybe_write_client_time_events``. The client has no
+    Unlike the worker / router files, the client file stays a COMPOUND
+    one-record-per-request dump (``source=client``) written post-hoc by
+    ``benchmark_serving._maybe_write_client_time_events``: it is not subject to
+    hangs and preserves the self-contained vLLM ttft/e2e view. The client has no
     shared request id and a different clock epoch from the server, so these are
     surfaced as a STANDALONE timeline (not joined to worker/router records);
     ``send_wall_time`` is the only cross-process alignment handle and is
@@ -262,24 +384,6 @@ def parse_kv_csv_dir(kv_csv_dir: str) -> Dict[str, Any]:
     }
 
 
-def _derive_gaps(metrics: List[Dict[str, Any]]) -> List[Optional[float]]:
-    """Compute idle gaps between consecutive forward passes.
-
-    Gap (seconds) between each entry's forward_start and the previous entry's
-    forward_end. First entry -> None.
-    """
-    gaps: List[Optional[float]] = []
-    prev_end = None
-    for m in metrics:
-        start = m.get("forward_start_time")
-        if prev_end is not None and start is not None:
-            gaps.append(start - prev_end)
-        else:
-            gaps.append(None)
-        prev_end = m.get("forward_end_time", prev_end)
-    return gaps
-
-
 # ===========================================================================
 # Latency aggregation (--agg-jsonl): mean / P50 / P99 of the lifecycle
 # intervals between time events. Pure stdlib -- no numpy / no time_breakdown.
@@ -288,11 +392,11 @@ def _derive_gaps(metrics: List[Dict[str, Any]]) -> List[Optional[float]]:
 # Clock domains (empirically confirmed on a GB200 disagg gpt-oss run):
 #   Domain A = {disagg router, gen worker}   ~46790 s steady-clock epoch
 #   Domain B = {ctx worker, benchmark client} ~217445 s steady-clock epoch
-# Cross-domain subtraction is invalid. Every metric below differences two
-# timestamps from the SAME timeline/worker (clock_safe=True), except the two
-# canonical disagg spans that straddle A<->B (clock_safe=False). TRT-LLM's
-# globalSteadyClockOffset is NOT applied to these JSONL timestamps, so no
-# cross-domain correction is assumed.
+# Cross-domain subtraction is invalid. Every worker/router span below differences
+# two timestamps from the SAME record (one worker rank, or one router request),
+# so all are clock_safe. The 12 canonical cross-worker spans (Group 1) come only
+# from an aggregated --perf-json dump that TRT-LLM has already offset-corrected;
+# the two that straddle A<->B are marked clock_safe=False.
 #
 # The 12 canonical spans mirror time_breakdown.TimingMetricsConfig verbatim
 # (name, start_field, end_field). They are hardcoded rather than imported so
@@ -351,7 +455,7 @@ _CANONICAL_METRICS = [
     ),
 ]
 
-# Router dispatch chain -- all fields live on ONE disagg_router record
+# Router dispatch chain -- all fields live on ONE pivoted router record
 # (Domain A), so every span is clock_safe.
 _ROUTER_METRICS = [
     # (name, start_field, end_field)
@@ -360,6 +464,21 @@ _ROUTER_METRICS = [
     ("router:ctx_dispatch->gen_dispatch", "ctx_dispatch_time", "gen_dispatch_time"),
     ("router:gen_dispatch->first_token", "gen_dispatch_time", "first_token_time"),
     ("router:first_token->resp_done", "first_token_time", "resp_done_time"),
+]
+
+# Custom worker spans, now sourced from the pivoted per-event worker records
+# (long->wide) rather than request_timing_metrics / step_metrics. Each span
+# differences two stamps on the SAME worker record, so all are clock_safe.
+#   (name, role, start_event, end_event)
+# ``ctx:forward_start->sampler_end`` (old) is intentionally DROPPED: the
+# per-chunk device events were removed with the decode series, so there is no
+# per-event source for it. ``gen:kv_transfer_start->end`` now populates from the
+# #11/#12 Python stamps -- the durability win, and no longer 0.0-on-sync.
+_WORKER_EVENT_METRICS = [
+    ("ctx:arrival->first_scheduled", "ctx", "ctx_arrival", "ctx_first_scheduled"),
+    ("gen:arrival->first_scheduled", "gen", "gen_arrival", "gen_first_scheduled"),
+    ("gen:kv_transfer_start->end", "gen", "gen_kv_transfer_start", "gen_kv_transfer_end"),
+    ("gen:first_token->last_token", "gen", "gen_first_token", "gen_last_token"),
 ]
 
 
@@ -401,86 +520,35 @@ def _duration(start: Optional[float], end: Optional[float]) -> float:
 def _nz(value: Optional[float]) -> Optional[float]:
     """Treat a 0.0 timestamp as "not recorded" (None).
 
-    KV-transfer setters on the synchronous disagg receive path are deferred
-    (see ticket #15871), so gen kv_cache_transfer_start/end land as 0.0;
-    mapping them to None makes the span fall out as not_recorded instead of a
-    bogus end-0.0 interval.
+    Retained for the ``--perf-json`` canonical path, whose KV-transfer setters on
+    the synchronous disagg receive path are deferred (ticket #15871) and land as
+    0.0. The per-event worker stamps never carry 0.0 (an event that did not fire
+    is simply absent), so this is not needed on the event-dir path.
     """
     return value if value else None
 
 
-def _infer_role(rec: Dict[str, Any]) -> str:
-    """Classify a worker record as 'ctx' or 'gen'.
+def _span_or_none(start: Optional[float], end: Optional[float]) -> Optional[float]:
+    """Positive interval in seconds, or None when either endpoint is absent.
 
-    Discriminators (verified against real GB200 capture):
-      * gen decode emits multi-step ``step_metrics`` -> gen.
-      * gen carries a nonzero ``kv_cache_size`` in request_timing_metrics
-        (ctx side reports 0) -> gen.
-      * ctx prefill emits ``ctx_chunk_metrics`` / ``ctx_gpu_forward_time`` -> ctx.
-    NOTE: ``kv_cache_transfer_start`` is NOT a usable signal -- the ctx side
-    stamps it (nonzero) while the gen side leaves it 0.0 on the sync path, so
-    it points the wrong way.
+    Unlike ``_duration`` (which returns 0.0 for the "not measured" case so the
+    aggregator can filter it), the combined per-request record OMITS a span when
+    it cannot be computed -- a hung request's later spans are absent, never a
+    misleading 0.0.
     """
-    tbm = rec.get("time_breakdown_metrics") or {}
-    if tbm.get("step_metrics"):
-        return "gen"
-    rtm = rec.get("request_timing_metrics") or {}
-    if rtm.get("kv_cache_size"):
-        return "gen"
-    if tbm.get("ctx_chunk_metrics") or "ctx_gpu_forward_time" in tbm:
-        return "ctx"
-    return "unknown"
-
-
-def _dedup_records_by_role(records: List[Dict[str, Any]], role: str) -> List[Dict[str, Any]]:
-    """One record per logical request for the given role.
-
-    A tensor-parallel worker writes the SAME request once per rank (e.g. tp4
-    gen -> 4 near-identical copies), and request_timing_metrics / step_metrics
-    are lockstep-identical across ranks. Treating rank copies as independent
-    samples would inflate ``n`` up to (#ranks)x and fake precision. First-seen
-    wins; parse_event_dir sorts by filename so rank0's copy is canonical and
-    the result is deterministic.
-    """
-    seen = set()
-    out: List[Dict[str, Any]] = []
-    for rec in records:
-        if _infer_role(rec) != role:
-            continue
-        rid = rec.get("request_id")
-        key = rid if rid is not None else id(rec)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(rec)
-    return out
-
-
-def _reduce_step_itls(rec: Dict[str, Any]) -> List[float]:
-    """Inter-token latencies (seconds) from a gen record's per-step stream.
-
-    Sorted consecutive diffs of ``token_time``, keeping only positive gaps.
-    Empty when fewer than 2 tokens. This is the ENGINE-side inter-token time
-    (excludes network/detok), a server-side proxy for client ITL.
-    """
-    sm = (rec.get("time_breakdown_metrics") or {}).get("step_metrics") or []
-    tts = sorted(s.get("token_time") for s in sm if s.get("token_time") is not None)
-    gaps: List[float] = []
-    for i in range(1, len(tts)):
-        d = tts[i] - tts[i - 1]
-        if d > 0:
-            gaps.append(d)
-    return gaps
+    d = _duration(start, end)
+    return d if d else None
 
 
 def _extract_canonical_fields(rec: Dict[str, Any]) -> Dict[str, float]:
     """Flatten the canonical lifecycle timestamps from a ``/perf_metrics`` record.
 
     Mirrors time_breakdown.RequestDataParser.parse_request over the aggregated
-    ``--perf-json`` shape. Per-rank worker records lack the nested
-    ``ctx_perf_metrics``/``gen_perf_metrics`` containers, so every field
-    defaults to NaN and the 12 canonical rows read as not_recorded on a pure
-    ``--event-dir`` capture.
+    ``--perf-json`` shape. This is the ONLY consumer of the nested
+    ``ctx_perf_metrics`` / ``gen_perf_metrics`` containers; the per-event
+    ``--event-dir`` path never produces them, so the 12 canonical rows read as
+    not_recorded on a pure event-dir capture (the worker spans in
+    ``_WORKER_EVENT_METRICS`` cover the event-dir case instead).
     """
     nan = float("nan")
     ctx_perf = rec.get("ctx_perf_metrics")
@@ -550,15 +618,115 @@ def _stats_row(
     }
 
 
-class PerfTimeEventsMerger:
-    """Merge per-rank time-event records with KV-transfer CSVs.
+def _joinable_ctx_ids(
+    ctx_records: List[Dict[str, Any]],
+    gen_records: List[Dict[str, Any]],
+) -> set:
+    """ctx_request_ids that map 1:1 across roles (safe to merge ctx <-> gen).
 
-    The per-rank event dir is the primary input; a ``/perf_metrics`` JSON dump
-    (aggregated single-server runs) may be supplied additionally / instead.
+    A ctx id shared by more than one ctx record OR more than one gen record is
+    ambiguous -- the gen-only benchmark hardcodes ``ctx_request_id=1`` for every
+    request, so merging on it would collapse every gen request into one. Such
+    ids are excluded here; their records stay standalone (and, like the router's
+    ``_no_ctx`` bucket, never cross-join).
+    """
+    ctx_counts = Counter(
+        str(r["ctx_request_id"]) for r in ctx_records if r.get("ctx_request_id") is not None
+    )
+    gen_counts = Counter(
+        str(r["ctx_request_id"]) for r in gen_records if r.get("ctx_request_id") is not None
+    )
+    ids = set(ctx_counts) | set(gen_counts)
+    return {i for i in ids if ctx_counts.get(i, 0) <= 1 and gen_counts.get(i, 0) <= 1}
+
+
+def _combined_record(
+    ctx_request_id: Any,
+    ctx_rec: Optional[Dict[str, Any]],
+    gen_rec: Optional[Dict[str, Any]],
+    router_rec: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Assemble ONE wide per-request record from its (partial) event sources.
+
+    Raw event stamps are copied through only when present -- a request that hung
+    keeps exactly the stamps it reached, nothing back-filled. ``spans`` carries
+    the derived intra-domain durations (seconds); only spans whose two endpoints
+    both fired are included. Cross-host spans (ctx<->gen, router<->worker) are
+    deliberately omitted: the two live in different steady-clock epochs, so their
+    absolute difference is meaningless (see the clock-domain note above).
+    """
+    rec: Dict[str, Any] = {"ctx_request_id": ctx_request_id}
+    if gen_rec is not None:
+        rec["gen_request_id"] = gen_rec.get("request_id")
+    if ctx_rec is not None:
+        rec["ctx_worker_request_id"] = ctx_rec.get("request_id")
+
+    # Raw stamps, flattened; only what fired.
+    if router_rec is not None:
+        for field in _ROUTER_EVENT_TO_FIELD.values():
+            if router_rec.get(field) is not None:
+                rec[f"router_{field}"] = router_rec[field]
+        for prov in _ROUTER_PROVENANCE:
+            if router_rec.get(prov) is not None:
+                rec[prov] = router_rec[prov]
+    if ctx_rec is not None:
+        for ev in _CTX_EVENTS:
+            if ctx_rec.get(ev) is not None:
+                rec[ev] = ctx_rec[ev]
+    if gen_rec is not None:
+        for ev in _GEN_EVENTS:
+            if gen_rec.get(ev) is not None:
+                rec[ev] = gen_rec[ev]
+
+    spans: Dict[str, float] = {}
+
+    def add(name: str, start_field: str, end_field: str) -> None:
+        v = _span_or_none(rec.get(start_field), rec.get(end_field))
+        if v is not None:
+            spans[name] = round(v, 6)
+
+    # Router (all same record / host).
+    if router_rec is not None:
+        add("router:arrival->ctx_dispatch", "router_arrival_time", "router_ctx_dispatch_time")
+        add("router:arrival->gen_dispatch", "router_arrival_time", "router_gen_dispatch_time")
+        add("router:ctx_dispatch->gen_dispatch", "router_ctx_dispatch_time",
+            "router_gen_dispatch_time")
+        add("router:gen_dispatch->first_token", "router_gen_dispatch_time", "router_first_token_time")
+        add("router:first_token->resp_done", "router_first_token_time", "router_resp_done_time")
+    # ctx worker.
+    add("ctx:arrival->first_scheduled", "ctx_arrival", "ctx_first_scheduled")
+    add("ctx:first_scheduled->first_token", "ctx_first_scheduled", "ctx_first_token")
+    add("ctx:first_token->ready_sent", "ctx_first_token", "ctx_ready_sent")
+    # gen worker.
+    add("gen:arrival->init_scheduled", "gen_arrival", "gen_init_scheduled")
+    add("gen:init_scheduled->kv_transfer_start", "gen_init_scheduled", "gen_kv_transfer_start")
+    add("gen:kv_transfer_start->end", "gen_kv_transfer_start", "gen_kv_transfer_end")
+    add("gen:kv_transfer_end->first_scheduled", "gen_kv_transfer_end", "gen_first_scheduled")
+    add("gen:first_scheduled->first_token", "gen_first_scheduled", "gen_first_token")
+    add("gen:first_token->last_token", "gen_first_token", "gen_last_token")
+
+    if spans:
+        rec["spans"] = spans
+    return rec
+
+
+class PerfTimeEventsMerger:
+    """Compile per-event worker + router logs (+ client + KV CSVs) into one
+    combined per-request timeline.
+
+    The per-event worker/router dirs are the primary input; a ``/perf_metrics``
+    JSON dump (aggregated single-server runs) may be supplied additionally /
+    instead and feeds only the canonical 12-span group.
     """
 
     def __init__(self):
+        # Combined, pivoted per-request records (the primary long->wide output).
         self.records: List[Dict[str, Any]] = []
+        # Pivoted per-role worker records (feed the custom worker spans).
+        self.ctx_records: List[Dict[str, Any]] = []
+        self.gen_records: List[Dict[str, Any]] = []
+        # Aggregated /perf_metrics dumps (feed the canonical 12 + --html).
+        self.perf_json_records: List[Dict[str, Any]] = []
         self.kv: Dict[str, Any] = {"task_events": {}, "gen_summary": {}, "cpp_events": {}}
         self.unjoined_kv_events: Dict[str, Any] = {}
         self.match_stats: Dict[str, int] = {}
@@ -576,16 +744,15 @@ class PerfTimeEventsMerger:
         router_dir: Optional[str] = None,
         client_dir: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        records: List[Dict[str, Any]] = []
         if event_dir:
-            records.extend(parse_event_dir(event_dir))
+            self.ctx_records, self.gen_records = _pivot_worker_events(parse_event_dir(event_dir))
         if perf_json:
             with open(perf_json, "r") as f:
                 data = json.load(f)
             if isinstance(data, list):
-                records.extend(data)
+                self.perf_json_records.extend(data)
             elif isinstance(data, dict):
-                records.append(data)
+                self.perf_json_records.append(data)
 
         if kv_csv_dir:
             self.kv = parse_kv_csv_dir(kv_csv_dir)
@@ -594,22 +761,63 @@ class PerfTimeEventsMerger:
         if client_dir:
             self.client_events = parse_client_dir(client_dir)
 
-        task_events = self.kv.get("task_events", {})
-        gen_summary = self.kv.get("gen_summary", {})
-        cpp_events = self.kv.get("cpp_events", {})
-        # Router records keyed by ctx id; "_no_ctx" holds the gen-only path list.
         router_by_ctx = {k: v for k, v in self.router_events.items() if k != "_no_ctx"}
         matched_router_ctx = set()
 
+        # ---- Assemble combined records (long -> wide) --------------------
+        joinable = _joinable_ctx_ids(self.ctx_records, self.gen_records)
+        ctx_by_cid = {
+            str(r["ctx_request_id"]): r
+            for r in self.ctx_records
+            if r.get("ctx_request_id") is not None and str(r["ctx_request_id"]) in joinable
+        }
+        gen_by_cid = {
+            str(r["ctx_request_id"]): r
+            for r in self.gen_records
+            if r.get("ctx_request_id") is not None and str(r["ctx_request_id"]) in joinable
+        }
+        used_ctx_rids: set = set()
+        used_gen_rids: set = set()
+        combined: List[Dict[str, Any]] = []
+        for cid in sorted(set(ctx_by_cid) | set(gen_by_cid)):
+            ctx_rec = ctx_by_cid.get(cid)
+            gen_rec = gen_by_cid.get(cid)
+            router_rec = router_by_ctx.get(cid)
+            if router_rec is not None:
+                matched_router_ctx.add(cid)
+            # Restore the raw (non-str) ctx id for output when available.
+            raw_cid = (gen_rec or ctx_rec).get("ctx_request_id")
+            combined.append(_combined_record(raw_cid, ctx_rec, gen_rec, router_rec))
+            if ctx_rec is not None:
+                used_ctx_rids.add(ctx_rec["request_id"])
+            if gen_rec is not None:
+                used_gen_rids.add(gen_rec["request_id"])
+        # Standalone (non-joinable) records: gen-only path, or null/ambiguous ctx
+        # id. These never attach a router record (consistent with "_no_ctx").
+        for gen_rec in self.gen_records:
+            if gen_rec["request_id"] in used_gen_rids:
+                continue
+            combined.append(
+                _combined_record(gen_rec.get("ctx_request_id"), None, gen_rec, None)
+            )
+        for ctx_rec in self.ctx_records:
+            if ctx_rec["request_id"] in used_ctx_rids:
+                continue
+            combined.append(
+                _combined_record(ctx_rec.get("ctx_request_id"), ctx_rec, None, None)
+            )
+
+        # ---- KV-transfer join onto the combined records ------------------
+        task_events = self.kv.get("task_events", {})
+        gen_summary = self.kv.get("gen_summary", {})
+        cpp_events = self.kv.get("cpp_events", {})
         matched_rids = set()
-        for rec in records:
-            # Resolve every id this record could join on.
+        for rec in combined:
             rids = []
-            for key in ("request_id", "ctx_request_id"):
+            for key in ("gen_request_id", "ctx_worker_request_id", "ctx_request_id"):
                 val = rec.get(key)
                 if val is not None:
                     rids.append(str(val))
-
             joined_tasks: List[Dict[str, Any]] = []
             joined_summary = None
             joined_cpp: List[Dict[str, Any]] = []
@@ -623,7 +831,6 @@ class PerfTimeEventsMerger:
                 if rid in cpp_events:
                     joined_cpp.extend(cpp_events[rid])
                     matched_rids.add(rid)
-
             if joined_tasks:
                 rec["kv_transfer_events"] = joined_tasks
             if joined_summary is not None:
@@ -631,70 +838,9 @@ class PerfTimeEventsMerger:
             if joined_cpp:
                 rec["kv_cpp_events"] = joined_cpp
 
-            # Router dispatch join -- STRICTLY on ctx_request_id, the only key
-            # the router and the worker per-rank files genuinely share. An
-            # earlier version also tried the worker-local request_id, which can
-            # false-join to an unrelated router record whose ctx id numerically
-            # equals this record's request_id. Ambiguous/duplicate ctx ids were
-            # already dropped from router_by_ctx by parse_router_dir.
-            router_rec = None
-            ctx_rid = rec.get("ctx_request_id")
-            if ctx_rid is not None:
-                ctx_rid = str(ctx_rid)
-                router_rec = router_by_ctx.get(ctx_rid)
-                if router_rec is not None:
-                    matched_router_ctx.add(ctx_rid)
-            if router_rec is not None:
-                rec["router_dispatch"] = router_rec
+        self.records = combined
 
-            # DERIVED signals.
-            tbm = rec.get("time_breakdown_metrics") or {}
-            step_metrics = tbm.get("step_metrics") or []
-            ctx_chunk_metrics = tbm.get("ctx_chunk_metrics") or []
-            derived: Dict[str, Any] = {}
-            if step_metrics:
-                derived["inter_step_gaps"] = _derive_gaps(step_metrics)
-            if ctx_chunk_metrics:
-                derived["inter_chunk_gaps"] = _derive_gaps(ctx_chunk_metrics)
-            # Per-iteration starvation from the extended batch-context fields.
-            starved = []
-            for m in step_metrics:
-                if "num_capacity_fitting" in m and "num_scheduled" in m:
-                    starved.append(m["num_capacity_fitting"] - m["num_scheduled"])
-            if starved:
-                derived["starved"] = starved
-
-            # Cross-process lifecycle spans (steady-clock seconds), when the
-            # request-level timing scalars are present (serve path forces
-            # return_perf_metrics on under TRTLLM_PERF_TIME_EVENTS_PATH).
-            rtm = rec.get("request_timing_metrics") or {}
-            arrival = rtm.get("arrival_time")
-            first_sched = rtm.get("first_scheduled_time")
-            first_tok = rtm.get("first_token_time")
-            last_tok = rtm.get("last_token_time")
-            if arrival is not None and first_sched is not None:
-                derived["arrival_to_first_schedule"] = first_sched - arrival
-            if first_sched is not None and first_tok is not None:
-                derived["schedule_to_first_token"] = first_tok - first_sched
-            if first_tok is not None and last_tok is not None:
-                derived["decode_duration"] = last_tok - first_tok
-            # Router-side dispatch waits (steady-clock, same epoch as the worker).
-            if router_rec is not None:
-                r_arr = router_rec.get("arrival_time")
-                r_ctx = router_rec.get("ctx_dispatch_time")
-                r_gen = router_rec.get("gen_dispatch_time")
-                if r_arr is not None and r_ctx is not None:
-                    derived["router_arrival_to_ctx_dispatch"] = r_ctx - r_arr
-                if r_ctx is not None and r_gen is not None:
-                    derived["router_ctx_to_gen_dispatch"] = r_gen - r_ctx
-                # Router arrival -> worker arrival: dispatch + network to the
-                # worker (both steady-clock). Only meaningful when both present.
-                if r_arr is not None and arrival is not None:
-                    derived["router_to_worker_arrival"] = arrival - r_arr
-            if derived:
-                rec["derived"] = derived
-
-        # Report KV rows that never joined to a request record.
+        # ---- Unjoined reporting ------------------------------------------
         unjoined_tasks = {rid: rows for rid, rows in task_events.items() if rid not in matched_rids}
         unjoined_summary = {rid: row for rid, row in gen_summary.items() if rid not in matched_rids}
         unjoined_cpp = {rid: rows for rid, rows in cpp_events.items() if rid not in matched_rids}
@@ -704,26 +850,22 @@ class PerfTimeEventsMerger:
             "cpp_events": unjoined_cpp,
         }
 
-        # Router records that never joined a request record: the ctx-keyed
-        # leftovers plus every gen-only ("_no_ctx") record (which by construction
-        # cannot join on ctx_request_id).
         unjoined_router = [
             row for ctx_id, row in router_by_ctx.items() if ctx_id not in matched_router_ctx
         ]
         unjoined_router.extend(self.router_events.get("_no_ctx", []))
         self.unjoined_router_events = unjoined_router
 
-        # Count UNIQUE rids across the three structures: the same rid routinely
-        # appears in both task_events and gen_summary (send tasks + gen summary
-        # for one request), so summing the dict lengths would double-count it
-        # and report a spurious sub-100% match rate.
         all_kv_rids = set(task_events) | set(gen_summary) | set(cpp_events)
         total_kv = len(all_kv_rids)
         matched_kv = len(matched_rids)
         total_router = len(router_by_ctx)
         matched_router = len(matched_router_ctx)
         self.match_stats = {
-            "num_records": len(records),
+            "num_records": len(self.records),
+            "num_ctx_records": len(self.ctx_records),
+            "num_gen_records": len(self.gen_records),
+            "num_perf_json_records": len(self.perf_json_records),
             "total_kv_rids": total_kv,
             "matched_kv_rids": matched_kv,
             "total_router_ctx": total_router,
@@ -747,13 +889,13 @@ class PerfTimeEventsMerger:
                     f"rows reported under 'unjoined_router_events'"
                 )
 
-        self.records = records
-        return records
+        return self.records
 
     def write(self, output_path: str) -> None:
         """Write the combined JSON (records + unjoined KV/router + client + stats)."""
         payload = {
             "records": self.records,
+            "perf_json_records": self.perf_json_records,
             "unjoined_kv_events": self.unjoined_kv_events,
             "unjoined_router_events": self.unjoined_router_events,
             # Client send timeline: standalone (no shared key/clock), not joined.
@@ -764,16 +906,41 @@ class PerfTimeEventsMerger:
             json.dump(payload, f, indent=2, default=str)
         print(f"Wrote combined perf time events to {output_path} ({len(self.records)} records)")
 
+    def write_events_jsonl(self, path: str) -> None:
+        """Write the combined per-request timeline as JSONL (the primary output).
+
+        One JSON object per line -- one request -- carrying every event
+        timestamp that fired plus the derived intra-domain ``spans``. A request
+        that hung is still present with its partial set of stamps (later events
+        absent, never zero), so the last stamp on the line localizes the stall.
+        Ordered by ctx_request_id then gen_request_id for stable output.
+        """
+        def _sort_key(rec: Dict[str, Any]):
+            cid = rec.get("ctx_request_id")
+            gid = rec.get("gen_request_id")
+            return (str(cid) if cid is not None else "", str(gid) if gid is not None else "")
+
+        with open(path, "w") as f:
+            for rec in sorted(self.records, key=_sort_key):
+                f.write(json.dumps(rec, default=str) + "\n")
+        print(f"Wrote combined time-events JSONL ({len(self.records)} requests) to {path}")
+
     def write_html(self, html_path: str) -> None:
         """Render the interactive HTML timeline by reusing time_breakdown.
 
-        Imported lazily so the merge/JSON path stays dependency-light.
+        Operates on the aggregated ``--perf-json`` records (the only shape
+        ``time_breakdown``'s parser understands); the per-event combined records
+        are not fed here. Imported lazily so the merge/JSON path stays
+        dependency-light.
         """
         from ..time_breakdown.time_breakdown import RequestTimeBreakdown
 
+        if not self.perf_json_records:
+            print("WARNING: --html needs --perf-json records; none loaded, skipping HTML.")
+            return
         analyzer = RequestTimeBreakdown()
         timing_data = []
-        for i, rec in enumerate(self.records):
+        for i, rec in enumerate(self.perf_json_records):
             timing_data.append(analyzer.parser.parse_request(rec, i))
             for metric in analyzer.config.metrics:
                 duration = metric.calculate_duration(timing_data[-1])
@@ -785,23 +952,20 @@ class PerfTimeEventsMerger:
         """Summarize every lifecycle interval as mean / P50 / P99 across requests.
 
         Also emits min / max / n. Returns one row dict per metric, in stable
-        order: the 12 canonical time_breakdown spans, the router dispatch
-        chain, the custom worker spans, then the vLLM-named views. Pure stdlib.
+        order: the 12 canonical time_breakdown spans (from --perf-json), the
+        router dispatch chain, the custom worker spans (from the pivoted
+        per-event records), then the vLLM-named client views. Pure stdlib.
 
-        Rank duplication: a tensor-parallel worker writes each request once per
-        rank with lockstep-identical timings, so all worker-derived groups
-        dedup by (role, request_id) first -- otherwise ``n`` inflates by the
-        TP degree and fakes precision. Router/client rows are already unique
-        per request (router keyed by ctx id; client deduped by response_id).
+        Rank duplication is already collapsed by ``_pivot_worker_events`` (one
+        record per logical request), and router rows are unique per request
+        (keyed by ctx id); the client rows dedup by response_id here.
         """
         rows: List[Dict[str, Any]] = []
 
         # ---- Group 1: canonical 12 (from aggregated /perf_metrics records) ----
-        # Dedup records by request_id (role-agnostic: a /perf_metrics entry is
-        # one request); flatten each once.
         seen_ids = set()
         canon_recs = []
-        for rec in self.records:
+        for rec in self.perf_json_records:
             rid = rec.get("request_id")
             key = rid if rid is not None else id(rec)
             if key in seen_ids:
@@ -813,61 +977,27 @@ class PerfTimeEventsMerger:
             rows.append(_stats_row(name, source, clock_safe, samples))
 
         # ---- Group 2a: router dispatch chain ----
-        # Iterate the ctx-keyed events (naturally deduped) plus the _no_ctx
-        # gen-only bucket.
         router_recs = [v for k, v in self.router_events.items() if k != "_no_ctx"]
         router_recs.extend(self.router_events.get("_no_ctx", []))
         for name, sf, ef in _ROUTER_METRICS:
             samples = [_duration(r.get(sf), r.get(ef)) for r in router_recs]
             rows.append(_stats_row(name, "router", True, samples))
 
-        # ---- Group 2b: custom worker spans ----
-        ctx_recs = _dedup_records_by_role(self.records, "ctx")
-        gen_recs = _dedup_records_by_role(self.records, "gen")
+        # ---- Group 2b: custom worker spans (from pivoted per-event records) ----
+        by_role = {"ctx": self.ctx_records, "gen": self.gen_records}
+        for name, role, start_ev, end_ev in _WORKER_EVENT_METRICS:
+            recs = by_role[role]
+            samples = [_duration(r.get(start_ev), r.get(end_ev)) for r in recs]
+            rows.append(_stats_row(name, f"{role}_worker", True, samples))
 
-        # ctx prefill compute: first chunk forward_start -> last chunk sample_end.
-        # rtm-gated to skip the warmup record (no request_timing_metrics).
-        ctx_fwd_samples = []
-        for rec in ctx_recs:
-            if not rec.get("request_timing_metrics"):
-                continue
-            ccm = (rec.get("time_breakdown_metrics") or {}).get("ctx_chunk_metrics") or []
-            if not ccm:
-                continue
-            ctx_fwd_samples.append(
-                _duration(ccm[0].get("forward_start_time"), ccm[-1].get("sample_end_time"))
-            )
-        rows.append(
-            _stats_row("ctx:forward_start->sampler_end", "ctx_worker", True, ctx_fwd_samples)
-        )
-
-        # gen KV-transfer span: 0.0 setters on the sync receive path -> _nz maps
-        # them to None so the row falls out as not_recorded (ticket #15871).
-        kv_samples = []
-        for rec in gen_recs:
-            rtm = rec.get("request_timing_metrics") or {}
-            kv_samples.append(
-                _duration(
-                    _nz(rtm.get("kv_cache_transfer_start")), _nz(rtm.get("kv_cache_transfer_end"))
-                )
-            )
-        rows.append(_stats_row("gen:kv_transfer_start->end", "gen_worker", True, kv_samples))
-
-        # arrival -> first_scheduled, per role (queue wait on each worker).
-        for role, recs in (("ctx", ctx_recs), ("gen", gen_recs)):
-            samples = []
-            for rec in recs:
-                rtm = rec.get("request_timing_metrics") or {}
-                samples.append(_duration(rtm.get("arrival_time"), rtm.get("first_scheduled_time")))
-            rows.append(
-                _stats_row(f"{role}:arrival->first_scheduled", f"{role}_worker", True, samples)
-            )
-
-        # ---- Group 3: vLLM-named views ----
-        # ttft / e2e: one value per successful client request, stats across
-        # requests. Dedup by response_id (client_index fallback).
+        # ---- Group 3: vLLM-named client views ----
+        # ttft / e2e / tpot: one value per successful client request, stats
+        # across requests. Dedup by response_id (client_index fallback).
+        # tpot is the client-observed per-output-token time (latency-ttft over
+        # the tokens after the first) -- the engine-side per-step ITL series was
+        # dropped with the decode series, so this client view replaces it.
         seen_resp = set()
-        ttfts, e2es = [], []
+        ttfts, e2es, tpots = [], [], []
         for c in self.client_events:
             if c.get("success") is False:
                 continue
@@ -876,24 +1006,20 @@ class PerfTimeEventsMerger:
             if key in seen_resp:
                 continue
             seen_resp.add(key)
-            if c.get("ttft") is not None:
-                ttfts.append(c["ttft"])
-            if c.get("latency") is not None:
-                e2es.append(c["latency"])
+            ttft = c.get("ttft")
+            latency = c.get("latency")
+            out_toks = c.get("output_tokens")
+            if ttft is not None:
+                ttfts.append(ttft)
+            if latency is not None:
+                e2es.append(latency)
+            if (latency is not None and ttft is not None and out_toks is not None
+                    and out_toks > 1):
+                tpots.append((latency - ttft) / (out_toks - 1))
         # Client fields are ALREADY in seconds -> scale to ms like the rest.
         rows.append(_stats_row("vllm:ttft", "client", True, ttfts))
         rows.append(_stats_row("vllm:e2e", "client", True, e2es))
-
-        # tpot: per-request mean inter-token latency (engine-side proxy), stats
-        # across requests. itl: pooled across every inter-token gap.
-        tpot_samples, itl_pool = [], []
-        for rec in gen_recs:
-            gaps = _reduce_step_itls(rec)
-            if gaps:
-                tpot_samples.append(statistics.mean(gaps))
-                itl_pool.extend(gaps)
-        rows.append(_stats_row("vllm:tpot", "gen_worker", True, tpot_samples))
-        rows.append(_stats_row("vllm:itl", "gen_worker", True, itl_pool))
+        rows.append(_stats_row("vllm:tpot", "client", True, tpots))
 
         return rows
 
@@ -913,8 +1039,8 @@ class PerfTimeEventsMerger:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Merge per-rank perf time-event files (+ KV-transfer CSVs) "
-        "into a single combined JSON / HTML."
+        description="Compile per-rank / per-process perf time-event logs "
+        "(+ KV-transfer CSVs) into one combined per-request timeline."
     )
     parser.add_argument(
         "--event-dir",
@@ -944,7 +1070,8 @@ def main():
     parser.add_argument(
         "--perf-json",
         default=None,
-        help="Optional /perf_metrics JSON dump to merge (aggregated runs).",
+        help="Optional /perf_metrics JSON dump to merge (aggregated runs); "
+        "feeds the canonical 12-span group and --html.",
     )
     parser.add_argument(
         "-o",
@@ -953,11 +1080,21 @@ def main():
         help="Output combined JSON path.",
     )
     parser.add_argument(
+        "--events-jsonl",
+        default=None,
+        const="combined_time_events.jsonl",
+        nargs="?",
+        help="Emit the combined per-request timeline as JSONL -- one line per "
+        "request with every event timestamp + derived spans (a hung request "
+        "keeps its partial line). Optional path (default: "
+        "combined_time_events.jsonl).",
+    )
+    parser.add_argument(
         "--html",
         default=None,
         const="perf_time_events.timeline.html",
         nargs="?",
-        help="Also emit an HTML timeline (optional path).",
+        help="Also emit an HTML timeline from --perf-json records (optional path).",
     )
     parser.add_argument(
         "-a",
@@ -988,6 +1125,8 @@ def main():
         client_dir=args.client_dir,
     )
     merger.write(args.output)
+    if args.events_jsonl:
+        merger.write_events_jsonl(args.events_jsonl)
     if args.html:
         merger.write_html(args.html)
     if args.agg_jsonl:

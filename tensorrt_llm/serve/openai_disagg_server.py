@@ -15,6 +15,7 @@
 
 # yapf: disable
 import asyncio
+import itertools
 import signal
 import socket
 import traceback
@@ -47,7 +48,8 @@ from tensorrt_llm.serve.openai_protocol import (
     UCompletionResponse, ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.perf_time_events_writer import (ROUTER_EVENTS_PATH_ENV,
-                                                        make_env_writer)
+                                                        make_env_writer,
+                                                        make_event_record)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import Router
@@ -62,11 +64,22 @@ _LOG_CONTROL_CHARACTERS = {
 
 # Per-process router dispatch-timeline writer. Inert unless
 # TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH names an output directory; then each router
-# process appends one JSONL record per finished request into
-# ``disagg_router_pid{P}.jsonl`` (off the event loop, on a daemon thread). The
-# record's steady-clock stamps share the server clock with the worker's per-rank
-# ``time_events_*.jsonl``; the offline aggregator joins them on ``ctx_request_id``.
+# process appends ONE JSONL line PER LIFECYCLE EVENT (arrival / ctx_dispatch /
+# gen_dispatch / first_token / resp_done) into ``disagg_router_pid{P}.jsonl`` as
+# each event happens (off the event loop, on a daemon thread). Emitting per-event
+# -- rather than one compound record at completion -- is what lets a request that
+# never completes (KV-transfer / fill-gate livelock, HangDetector MPI_Abort) still
+# leave its partial router timeline on disk. Each line's steady-clock ``t`` shares
+# the server clock with the worker per-rank ``time_events_*.jsonl``; the offline
+# compiler joins router<->worker lines on ``ctx_request_id``.
 _ROUTER_EVENTS_WRITER = make_env_writer(ROUTER_EVENTS_PATH_ENV, "disagg_router")
+
+# Router-local per-request sequence, used only to stitch a single request's own
+# router lines together before the cross-process ``ctx_request_id`` join key is
+# known (it is assigned during the ctx round-trip, so ``arrival`` / ``ctx_dispatch``
+# precede it). Paired with each line's ``pid`` it is unique within a router
+# process. Incremented once per ``RawRequestResponseHooks`` instance.
+_ROUTER_REQ_SEQ = itertools.count()
 
 
 class RawRequestResponseHooks(ResponseHooks):
@@ -79,15 +92,50 @@ class RawRequestResponseHooks(ResponseHooks):
         self.ctx_dispatch_time = 0
         self.gen_dispatch_time = 0
         self.perf_metrics_collector = perf_metrics_collector
+        # Router-local grouping handle for this request's own event lines.
+        self._router_seq = next(_ROUTER_REQ_SEQ)
+        # Emit the router-side arrival line immediately, so even a request that
+        # later hangs before dispatch still records that the router saw it.
+        self._emit_router_event("arrival", request=None,
+                                t=self.request_arrival_time)
+
+    def _emit_router_event(self, event: str, request: UCompletionRequest = None,
+                           t: Optional[float] = None):
+        """Append one router-role time-event line (best-effort, per event).
+
+        No-op unless TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH is set. ``ctx_request_id``
+        (the cross-process join key with the per-rank worker files) is filled in
+        as soon as the ctx round-trip attaches it; it is ``None`` on the earliest
+        lines and on the gen-only / no-ctx path. ``t`` defaults to now (router
+        holds the steady clock and passes it in, so this module stays torch-free).
+        """
+        if not _ROUTER_EVENTS_WRITER.enabled:
+            return
+        disagg_params = getattr(request, "disaggregated_params", None)
+        ctx_request_id = getattr(disagg_params, "ctx_request_id", None)
+        disagg_request_id = getattr(disagg_params, "disagg_request_id", None)
+        _ROUTER_EVENTS_WRITER.write(make_event_record(
+            "router",
+            event,
+            request_id=self._router_seq,
+            ctx_request_id=ctx_request_id,
+            rank=0,
+            t=get_steady_clock_now_in_seconds() if t is None else t,
+            disagg_request_id=disagg_request_id,
+            ctx_server=self.ctx_server or None,
+            gen_server=self.gen_server or None,
+        ))
 
     def on_req_begin(self, request: UCompletionRequest):
         self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
 
     def on_ctx_dispatch(self, request: UCompletionRequest):
         self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
+        self._emit_router_event("ctx_dispatch", request, t=self.ctx_dispatch_time)
 
     def on_gen_dispatch(self, request: UCompletionRequest):
         self.gen_dispatch_time = get_steady_clock_now_in_seconds()
+        self._emit_router_event("gen_dispatch", request, t=self.gen_dispatch_time)
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
@@ -95,8 +143,11 @@ class RawRequestResponseHooks(ResponseHooks):
     def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
+        self._emit_router_event("first_token", request,
+                                t=self.server_first_token_time)
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
+        self.gen_server = gen_server
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
             task = asyncio.create_task(
@@ -112,35 +163,7 @@ class RawRequestResponseHooks(ResponseHooks):
             background_tasks = self.perf_metrics_collector._background_tasks
             background_tasks.add(task)
             task.add_done_callback(background_tasks.discard)
-        self._maybe_write_router_event(gen_server, request)
-
-    def _maybe_write_router_event(self, gen_server: str, request: UCompletionRequest):
-        """Emit one dispatch-timeline JSONL record for this request (best-effort).
-
-        No-op unless TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH is set. Keyed on BOTH the
-        router's ``disagg_request_id`` (its own dispatch timeline) and the
-        worker-assigned ``ctx_request_id`` (cross-process join key with the
-        per-rank worker files). ``ctx_request_id`` is only known after the ctx
-        round-trip; it is ``None`` on the gen-only / no-ctx path.
-        """
-        if not _ROUTER_EVENTS_WRITER.enabled:
-            return
-        disagg_params = getattr(request, "disaggregated_params", None)
-        ctx_request_id = getattr(disagg_params, "ctx_request_id", None)
-        disagg_request_id = getattr(disagg_params, "disagg_request_id", None)
-        _ROUTER_EVENTS_WRITER.write({
-            "source": "disagg_router",
-            "ctx_request_id": ctx_request_id,
-            "disagg_request_id": disagg_request_id,
-            "ctx_server": self.ctx_server,
-            "gen_server": gen_server,
-            # steady-clock seconds, shared with the worker per-rank files.
-            "arrival_time": self.request_arrival_time,
-            "ctx_dispatch_time": self.ctx_dispatch_time or None,
-            "gen_dispatch_time": self.gen_dispatch_time or None,
-            "first_token_time": self.server_first_token_time or None,
-            "resp_done_time": get_steady_clock_now_in_seconds(),
-        })
+        self._emit_router_event("resp_done", request)
 
 
 class OpenAIDisaggServer:

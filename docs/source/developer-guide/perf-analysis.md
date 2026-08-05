@@ -26,9 +26,14 @@ Toggling the CUDA profiler runtime API on and off:
 
 For scheduling / gen-bubble debugging on the PyTorch workflow, TensorRT LLM can
 capture a per-request timeline directly from inside the executor and write it
-**live, one file per rank** — no HTTP `/perf_metrics` scrape and no server
-teardown race. This is driven by a single environment variable that also
-enriches the timeline with per-iteration batch context:
+**live, one line per event, flushed as each event happens** — no HTTP
+`/perf_metrics` scrape and no server teardown race. Because every event is
+appended the instant it fires, a request that **never completes** (a KV-transfer
+timeout livelock at iter 0, a fill-gate livelock, a HangDetector `MPI_Abort` at
+300 s) still leaves its *partial* timeline on disk, and the last line it wrote
+localizes exactly where it wedged. Only the **gen-init request's lifecycle** is
+recorded — per-decode-step events are deliberately not emitted, so the volume is
+a handful of lines per request rather than a dense per-step series.
 
 ```bash
 # Set on every worker (both ctx and gen servers for a disaggregated run).
@@ -44,72 +49,81 @@ export TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH=/tmp/perf_events_client
 ```
 
 Setting `TRTLLM_PERF_TIME_EVENTS_PATH` (to an output **directory**, symmetric
-with `TRTLLM_KVCACHE_TIME_OUTPUT_PATH`) does three things:
+with `TRTLLM_KVCACHE_TIME_OUTPUT_PATH`) does two things:
 
 * **Force-enables capture** regardless of `return_perf_metrics` / `LLM` args, so
   you do not have to thread the flag through the benchmark client.
-* Records **extended per-iteration batch context** on each per-iteration metric
-  entry: `iter_counter`, `iter_batch_size`, `num_ctx_requests`,
-  `num_gen_requests`, `context_token_number`, `generation_token_number`, the
-  per-request `req_context_token_number` / `req_generation_token_number`, and the
-  per-iteration starvation counters `num_capacity_fitting` / `num_scheduled`.
 * Starts a **daemon writer thread per rank** that drains an in-process queue and
-  appends to `time_events_rank{N}_pid{P}.jsonl`. The executor loop only builds a
-  dict and does a non-blocking `queue.put_nowait`, so capture stays off the
-  critical path (no file I/O on the loop thread).
+  appends flat event lines to `time_events_rank{N}_pid{P}.jsonl`. The executor
+  loop only builds a small dict and does a non-blocking `queue.put_nowait`
+  (drop-on-full), so capture stays off the critical path (no file I/O on the loop
+  thread).
 
-Each JSONL record is `{request_id, rank, ctx_request_id, time_breakdown_metrics}`
-— the same `time_breakdown_metrics` shape the `time_breakdown` tool consumes.
+Every worker and router line is one flat envelope, identical across roles:
 
-On the serve / disaggregated path (where the entrypoint force-sets
-`return_perf_metrics` under the env), the record additionally carries a
-`request_timing_metrics` sub-dict with the C++ `RequestPerfMetrics` lifecycle
-scalars keyed by their stable enum names: `arrival_time`, `first_scheduled_time`,
-`first_token_time`, `last_token_time`, `kv_cache_transfer_start`,
-`kv_cache_transfer_end`, `kv_cache_size`. These are steady-clock seconds and give
-the request's arrival → first-schedule (admission) → first-token → last-token
-lifecycle. Enrichment is best-effort: on a raw LLM-API run without perf metrics
-the key is simply absent (never a crash).
+```json
+{"role": "gen", "event": "gen_first_token", "request_id": 42,
+ "ctx_request_id": "abc", "rank": 3, "t": 12345.678, "pid": 12345}
+```
 
-**Known limitations (Python-only capture):**
+`role` ∈ `{router, ctx, gen, client}`; `event` is the lifecycle event name;
+`request_id` joins the TP ranks of one worker request (worker) or is the
+router-local sequence (router); `ctx_request_id` is the cross-process join key;
+`rank` is the global worker rank (router/client use `0`); `t` is `steady_clock`
+seconds (the same clock the C++ `/perf_metrics` scalars use); `pid` is the
+emitting process.
 
-* **Starvation is a per-iteration count**, not per-request attribution — the
-  Python scheduler exposes only `num_fitting_reqs`.
-* **Pipeline parallelism**: the PP executor loop does not record the extended
-  fields, so batch-context keys are absent under PP.
+The captured events are:
+
+* **ctx worker** (`role=ctx`): `ctx_arrival`, `ctx_first_scheduled`,
+  `ctx_first_token`, `ctx_ready_sent`.
+* **gen worker** (`role=gen`, gen-init lifecycle only): `gen_arrival`,
+  `gen_init_scheduled`, `gen_kv_transfer_start`, `gen_kv_transfer_end`,
+  `gen_first_scheduled`, `gen_first_token`, `gen_last_token`.
+* **router** (`role=router`): `arrival`, `ctx_dispatch`, `gen_dispatch`,
+  `first_token`, `resp_done` (router lines also carry `disagg_request_id` /
+  `ctx_server` / `gen_server` provenance).
+
+**Known limitations:**
+
+* **Two clock domains.** The steady clocks split into domain A = {router, gen
+  worker} and domain B = {ctx worker, client}, which are not NTP-aligned to each
+  other, so a cross-domain subtraction (e.g. ctx → gen relay) is invalid off the
+  raw event lines. The offline compiler therefore derives only *within-domain*
+  spans from the events; the 12 canonical cross-worker spans come only from an
+  offset-corrected aggregated `/perf_metrics` dump (`--perf-json`).
 * **ctx ⇄ gen correlation** across the two disaggregated servers relies on the
-  request's disaggregated `ctx_request_id` when exposed; otherwise the ctx-side
-  and gen-side records live in separate per-rank files.
+  request's disaggregated `ctx_request_id`. The gen-only benchmark path hardcodes
+  `ctx_request_id=1`, so a `ctx_request_id` shared by more than one request is
+  treated as **non-joinable** rather than false-attached.
 
 **Extending the timeline beyond the workers (router + client).** The two env
 vars above capture the two processes the executor never sees, so the timeline can
 span client-send → router-dispatch → worker-execute:
 
 * `TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH` — set on the **disaggregated router**
-  (the `trtllm-serve disaggregated` uvicorn process). Each request writes one
-  `disagg_router_pid{P}.jsonl` record with the router's steady-clock stamps:
-  `arrival_time`, `ctx_dispatch_time` (dispatch to the CTX worker),
-  `gen_dispatch_time` (dispatch to the Gen worker), `first_token_time`,
-  `resp_done_time`, plus `ctx_server` / `gen_server` and the join key
-  `ctx_request_id` (known only after the CTX round-trip; gen-only requests have
-  none and are collected separately). The router's clock shares the workers'
-  steady-clock epoch, so router-vs-worker spans are directly comparable.
+  (the `trtllm-serve disaggregated` uvicorn process). Each router event writes one
+  flat line to `disagg_router_pid{P}.jsonl` (`arrival` / `ctx_dispatch` /
+  `gen_dispatch` / `first_token` / `resp_done`), stamped on the router's steady
+  clock and keyed by `ctx_request_id` when known (gen-only requests have none and
+  are collected separately).
 * `TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH` — set on the **benchmark client**
-  (`benchmark_serving.py`). Each request writes one `client_pid{P}.jsonl` record:
-  `send_time` / `first_token_time` / `completion_time` (process-local
-  `time.perf_counter`), `ttft`, `latency`, and `send_wall_time` (`time.time`).
-  The client is torch-free and its `response_id` is a fresh UUID, **not** a
-  worker join key — so the client timeline is **standalone**, aligned to the rest
-  only through the wall-clock anchor. It is emitted verbatim in the combined
-  JSON's `client_events`, never joined onto a request record.
+  (`benchmark_serving.py`). The client writes **one compound `client_pid{P}.jsonl`
+  record per request** (send / first-token / completion times + `ttft` /
+  `latency` / `output_tokens`), not per-event lines: a post-hoc batch write, immune
+  to server-side hangs, preserving the vLLM `ttft` / `e2e` / `tpot` path. It shares
+  no request id or clock epoch with the server, so the client timeline is
+  **standalone** — surfaced verbatim, never joined onto a request record.
 
 Both the router and the client stay torch-free (they must — see the GPU-free
-import contract), so they use a stdlib-only writer with an `atexit` flush rather
-than the worker's daemon-thread writer.
+import contract), so they use the same stdlib-only writer as the workers
+(`tensorrt_llm/serve/perf_time_events_writer.py`); they already hold the steady
+clock and pass `t` in, so the writer never imports it.
 
-**Optional offline aggregator.** To stitch the per-rank files (plus the KV CSVs,
-the router file, and the client file) into one combined JSON — and, optionally,
-the interactive HTML timeline — run:
+**Offline compiler (long → wide).** To stitch the per-rank event files (plus the
+KV CSVs, the router file, and the client file) into **one combined record per
+request** — and, optionally, a latency aggregate and the interactive HTML
+timeline — run:
 
 ```bash
 python -m tensorrt_llm.serve.scripts.perf_time_events \
@@ -117,34 +131,35 @@ python -m tensorrt_llm.serve.scripts.perf_time_events \
     --kv-csv-dir /tmp/kv_csv \
     --router-dir /tmp/perf_events_router \
     --client-dir /tmp/perf_events_client \
+    --events-jsonl /tmp/perf_events/combined_time_events.jsonl \
     -o /tmp/perf_events/combined.json \
-    --html /tmp/perf_events/timeline.html
+    -a /tmp/perf_events/agg.jsonl
 ```
 
-The four input flags default to their respective env vars
+The input flags default to their respective env vars
 (`--event-dir` → `$TRTLLM_PERF_TIME_EVENTS_PATH`, `--kv-csv-dir` →
 `$TRTLLM_KVCACHE_TIME_OUTPUT_PATH`, `--router-dir` →
 `$TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH`, `--client-dir` →
 `$TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH`); any one input is sufficient. The
-aggregator:
+compiler:
 
-* joins KV-transfer rows by request id (`unique_rid` for the native transceiver;
-  `RequestID` for C++), reporting unmatched rows under `unjoined_kv_events`;
-* joins the router record onto each worker record by `ctx_request_id`, exposing
-  it as `router_dispatch` and deriving the cross-process spans
-  `router_arrival_to_ctx_dispatch`, `router_ctx_to_gen_dispatch`, and
-  `router_to_worker_arrival`; unmatched router rows (including gen-only records
-  with no `ctx_request_id`) surface under `unjoined_router_events`;
-* derives the worker-side request-lifecycle spans `arrival_to_first_schedule`,
-  `schedule_to_first_token`, and `decode_duration` from `request_timing_metrics`
-  when present;
-* carries the client records through untouched under `client_events` (standalone,
-  as noted above);
-* computes derived `inter_step_gaps` / `inter_chunk_gaps` and per-iteration
-  `starved` counts, and emits a match-rate warning for each join.
+* groups events by `request_id`, dedups the TP ranks (first-seen wins, `rank0`
+  canonical by filename sort), and joins ctx ⇄ gen ⇄ router on `ctx_request_id`;
+* pivots long → wide into **`--events-jsonl combined_time_events.jsonl`** (the
+  primary output): one line per request carrying every event timestamp that fired
+  plus the derived **within-domain** spans. A hung request emits its **partial**
+  record — events that never fired are absent, not zero;
+* joins KV-transfer rows by request id, reporting unmatched rows under
+  `unjoined_kv_events`; unmatched router rows (including gen-only records whose
+  `ctx_request_id` is ambiguous) surface under `unjoined_router_events`;
+* carries the client records through untouched (standalone, as noted above);
+* emits an optional `-a/--agg-jsonl` latency aggregate — 24 rows of
+  mean / P50 / P99 (the 12 canonical spans from `--perf-json`, 5 router spans, 4
+  worker-event spans, and the 3 vLLM client metrics `ttft` / `e2e` / `tpot`).
 
 It is a convenience over the per-rank files, not the load-bearing capture path;
-only the `--html` path pulls in `plotly`. See [Introduction to KV Cache
+only the `--html` path pulls in `plotly` (and it needs `--perf-json` for the
+cross-worker lifecycle spans). See [Introduction to KV Cache
 Transmission](./kv-transfer.md) for the KV cache transfer CSVs it consumes.
 
 

@@ -18,6 +18,8 @@ import torch
 from strenum import StrEnum
 
 from tensorrt_llm.llmapi import DisaggScheduleStyle
+from tensorrt_llm.serve.perf_time_events_writer import (emit_event,
+                                                        set_worker_rank)
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 try:
@@ -74,8 +76,7 @@ from .kv_cache_transceiver import (KvCacheTransceiver,
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length,
-                          get_effective_draft_token_length)
+                          get_draft_token_length)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -553,6 +554,10 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
+        # Pin the global rank into the process-global perf time-event writer so
+        # every emit_event() from this worker lands in time_events_rank{N}_*.jsonl.
+        # Inert unless TRTLLM_PERF_TIME_EVENTS_PATH is set.
+        set_worker_rank(self.global_rank)
         # Store the execution stream for decoder/model forward operations.
         # This stream is used for proper synchronization with
         # KVCacheTransferManager. execution_stream can be provided by
@@ -571,18 +576,6 @@ class PyExecutor:
         self.peft_cache_config = peft_cache_config
 
         self.iter_counter = 0
-        # Num capacity-fitting requests from the last _schedule() call, stashed
-        # so the extended perf time-events path can report per-iteration
-        # starvation (capacity-fit but not micro-batch scheduled).
-        self._last_num_fitting_reqs = None
-        # Steady-clock time (seconds) at which the last _schedule() returned,
-        # i.e. the scheduler-admission timestamp shared by every request in that
-        # iteration's micro-batch. Populated only when capture_extended is on.
-        self._last_schedule_time = None
-        # Steady-clock time (seconds) at which the capacity scheduler admitted
-        # this round's fitting set, stamped inside SimpleScheduler before the
-        # micro-batch stage. Populated only when capture_extended is on.
-        self._last_capacity_admit_time = None
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
@@ -619,13 +612,6 @@ class PyExecutor:
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
-        # Extended perf time-events: let the scheduler stamp the capacity-admit
-        # time each round (per-request capacity-scheduler admission event). Gated
-        # on capture_extended so the base scheduling path is untouched. Guarded
-        # by hasattr so non-SimpleScheduler implementations are unaffected.
-        if self.perf_manager.capture_extended and hasattr(
-                self.scheduler, "capture_admit_time"):
-            self.scheduler.capture_admit_time = True
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
@@ -1125,10 +1111,11 @@ class PyExecutor:
             if response:
                 response.result.cached_tokens = request.cached_tokens
                 self._maybe_attach_ctx_usage(request, response)
-                # Per-rank live time-events write (no-op unless capture_extended;
-                # gated on final-only time_breakdown_metrics inside the method).
-                self.perf_manager.maybe_write_request_events(
-                    response, self.global_rank, _disagg_ctx_request_id(request))
+                # Time-event: the ctx worker's fast-transfer completion path also
+                # creates the (first-token) response here -- stamp ctx_first_token.
+                # First-fire guarded, so it dedups against the _handle_responses
+                # site; inert unless TRTLLM_PERF_TIME_EVENTS_PATH is set.
+                self._emit_ctx_first_token(request)
                 # Buffer the response instead of enqueueing immediately.
                 # With ADP, _enqueue_responses does a tp_gather collective.
                 # Calling it here would deadlock because only the owning DP
@@ -1495,10 +1482,6 @@ class PyExecutor:
             logger.error("Hang detected, shutting down immediately.")
             return
         self.worker_thread.join()
-        # Flush + stop the per-rank perf time-events writer thread (no-op when
-        # the writer was never started). Safe here: the worker loop has joined,
-        # so no more events will be enqueued.
-        self.perf_manager.close()
         if self.dist.pp_size > 1:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
@@ -1906,104 +1889,6 @@ class PyExecutor:
             num_gen_kv_tokens=num_gen_kv_tokens,
             num_paused_requests=num_paused_requests,
         )
-
-    def _compute_iter_batch_context(self,
-                                    scheduled_batch: ScheduledRequests,
-                                    num_fitting_reqs=None,
-                                    schedule_time=None,
-                                    capacity_admit_time=None) -> dict:
-        """Build the per-iteration batch-context dict for extended perf events.
-
-        Shared by every request scheduled this iteration; merged into each
-        request's per-iteration metric dict by
-        ``PerfMetricsManager.append_step_metrics``. Only called when
-        ``perf_manager.capture_extended`` is on, so it never runs on the base
-        timing path.
-
-        ``num_fitting_reqs`` is the capacity-fit count from ``_schedule()``;
-        when given, the dict also reports per-iteration starvation
-        (``num_capacity_fitting`` vs ``num_scheduled``). Per-request starvation
-        attribution is not possible in Python (``_schedule`` returns only the
-        count), so this is a per-iteration count by design.
-
-        ``schedule_time`` is the steady-clock time (seconds) at which
-        ``_schedule()`` returned this iteration's micro-batch -- the
-        scheduler-admission timestamp. It is emitted as ``scheduled_time`` so
-        every admitted request's per-chunk / per-step metric entry carries a
-        distinct admission event (chunked-prefill chunks and decode steps each
-        get their own), and the gap ``forward_start_time - scheduled_time``
-        exposes admission-to-execution latency.
-
-        ``capacity_admit_time`` is the steady-clock time (same clock) at which
-        the capacity scheduler admitted this round's fitting set, stamped inside
-        ``SimpleScheduler`` before micro-batch scheduling. Emitted as
-        ``capacity_scheduled_time``; the gap
-        ``scheduled_time - capacity_scheduled_time`` isolates the micro-batch
-        scheduling stage. Omitted when the active scheduler does not expose it.
-        """
-        # Exclude attention-DP / CUDA-graph padding (dummy) requests from every
-        # count below: they are not real work, and counting them would inflate
-        # exactly the batch-size / starvation numbers this feature exists to
-        # expose. Matches the sibling collectors (_collect_scheduled_batch_stats)
-        # and the acceptance-length aggregation, which both skip is_dummy.
-        ctx_requests = [
-            req for req in scheduled_batch.context_requests
-            if not self._is_stats_dummy_request(req)
-        ]
-        gen_requests = [
-            req for req in scheduled_batch.generation_requests
-            if not self._is_stats_dummy_request(req)
-        ]
-        num_ctx_requests = len(ctx_requests)
-        num_gen_requests = len(gen_requests)
-        iter_batch_size = num_ctx_requests + num_gen_requests
-
-        context_token_number = 0
-        for req in ctx_requests:
-            try:
-                context_token_number += req.context_chunk_size
-            except RuntimeError:
-                last_chunk = getattr(req, "py_last_context_chunk", None)
-                if last_chunk is not None and last_chunk[0] is not None:
-                    context_token_number += last_chunk[1] - last_chunk[0]
-
-        # Tokens emitted by gen requests this step (1 target + effective
-        # speculative draft each). Uses the shared effective-draft-length helper
-        # so this batch total and the per-request req_generation_token_number
-        # (perf_metrics_manager.append_step_metrics) count draft tokens
-        # identically -- both exclude trailing padding zeros.
-        generation_token_number = 0
-        for req in gen_requests:
-            generation_token_number += 1 + get_effective_draft_token_length(req)
-
-        ctx = {
-            "iter_counter": self.iter_counter,
-            "iter_batch_size": iter_batch_size,
-            "num_ctx_requests": num_ctx_requests,
-            "num_gen_requests": num_gen_requests,
-            "context_token_number": context_token_number,
-            "generation_token_number": generation_token_number,
-        }
-        if num_fitting_reqs is not None:
-            # Starvation: capacity-fit requests that were not micro-batch
-            # scheduled this iteration (per-iteration count, not per-request).
-            # num_scheduled mirrors iter_batch_size (dummies excluded) so the
-            # derived num_capacity_fitting - num_scheduled gap is not skewed by
-            # padding requests.
-            ctx["num_capacity_fitting"] = num_fitting_reqs
-            ctx["num_scheduled"] = iter_batch_size
-        if schedule_time is not None:
-            # Scheduler-admission timestamp for this iteration's micro-batch.
-            ctx["scheduled_time"] = schedule_time
-        if capacity_admit_time is not None:
-            # Capacity-scheduler admission timestamp for this round (stamped
-            # before micro-batch scheduling). Rides onto every admitted
-            # request's per-chunk / per-step entry, so each prefill chunk and
-            # decode step carries a distinct capacity-admission event. The gap
-            # `scheduled_time - capacity_scheduled_time` isolates the
-            # micro-batch scheduling stage.
-            ctx["capacity_scheduled_time"] = capacity_admit_time
-        return ctx
 
     def _populate_req_stats(
             self, finished_requests: List[LlmRequest],
@@ -3813,25 +3698,6 @@ class PyExecutor:
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
-        # Stash for the extended perf time-events path (per-iteration starvation).
-        self._last_num_fitting_reqs = num_fitting_reqs
-        # Stamp the scheduler-admission time once per iteration for the extended
-        # perf time-events path. This is the moment _schedule() returned the
-        # micro-batch for this iteration, i.e. when every request in
-        # scheduled_batch was admitted by the capacity + micro-batch schedulers.
-        # It rides the shared iter_batch_context, so it lands on each admitted
-        # request's per-chunk / per-step metric entry (a distinct per-request
-        # admission event for chunked prefill and for every decode step).
-        if self.perf_manager.capture_extended:
-            self._last_schedule_time = get_steady_clock_now_in_seconds()
-            # Capacity-scheduler admission time for this round, stamped inside
-            # SimpleScheduler right after the capacity stage (before micro-batch
-            # scheduling). Same clock as _last_schedule_time above, so the gap
-            # `scheduled_time - capacity_scheduled_time` isolates the micro-batch
-            # stage. None on schedulers that don't expose it (e.g. PP local
-            # scheduler / non-SimpleScheduler), in which case the key is omitted.
-            self._last_capacity_admit_time = getattr(
-                self.scheduler, "_last_capacity_admit_time", None)
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
@@ -4288,13 +4154,6 @@ class PyExecutor:
                             scheduled_batch, batch_outputs)
 
                     if self.perf_manager.enabled:
-                        iter_ctx = (self._compute_iter_batch_context(
-                            scheduled_batch,
-                            self._last_num_fitting_reqs,
-                            schedule_time=self._last_schedule_time,
-                            capacity_admit_time=self._last_capacity_admit_time)
-                                    if self.perf_manager.capture_extended else
-                                    None)
                         self.perf_manager.save_timing_to_requests(
                             scheduled_batch.all_requests(),
                             gpu_forward_start,
@@ -4303,8 +4162,7 @@ class PyExecutor:
                             fwd_timing.start_time,
                             fwd_timing.end_time,
                             sample_timing.start_time,
-                            sample_timing.end_time,
-                            iter_batch_context=iter_ctx)
+                            sample_timing.end_time)
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
@@ -4890,13 +4748,6 @@ class PyExecutor:
 
                 if can_queue:
                     if self.perf_manager.enabled:
-                        iter_ctx = (self._compute_iter_batch_context(
-                            scheduled_batch,
-                            self._last_num_fitting_reqs,
-                            schedule_time=self._last_schedule_time,
-                            capacity_admit_time=self._last_capacity_admit_time)
-                                    if self.perf_manager.capture_extended else
-                                    None)
                         self.perf_manager.save_timing_to_requests(
                             scheduled_batch.all_requests(),
                             gpu_forward_start,
@@ -4905,8 +4756,7 @@ class PyExecutor:
                             fwd_timing.start_time,
                             fwd_timing.end_time,
                             sample_timing.start_time,
-                            sample_timing.end_time,
-                            iter_batch_context=iter_ctx)
+                            sample_timing.end_time)
 
                     self.previous_batch = BatchState(
                         scheduled_requests=scheduled_batch,
@@ -5322,6 +5172,19 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+
+        # Time-event: request arrival on this worker. A request is fetched from
+        # the waiting queue exactly once, so no first-fire guard is needed. Role
+        # keys the disagg worker (gen server sees generation-only requests, ctx
+        # server sees the rest). Inert unless TRTLLM_PERF_TIME_EVENTS_PATH is set.
+        for request in validated_requests:
+            if request.return_perf_metrics:
+                role = ("gen" if request.is_generation_only_request()
+                        else "ctx")
+                emit_event(role, f"{role}_arrival",
+                           request_id=request.request_id,
+                           ctx_request_id=_disagg_ctx_request_id(request))
+
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -6050,6 +5913,18 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
+                # Time-event #12: gen-init KV-cache transfer completed. This is
+                # the unified sync+async convergence point -- both transfer
+                # branches reach TRANS_COMPLETE and flip to GENERATION_IN_PROGRESS
+                # here exactly once per gen-init request, so it needs no separate
+                # per-branch stamp. Emit before the state flip. Guard is belt-and-
+                # suspenders (the state flip already makes this one-shot).
+                if (req.return_perf_metrics
+                        and not getattr(req, "py_te_gen_kv_transfer_end", False)):
+                    req.py_te_gen_kv_transfer_end = True
+                    emit_event("gen", "gen_kv_transfer_end",
+                               request_id=req.request_id,
+                               ctx_request_id=_disagg_ctx_request_id(req))
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 if self.kv_cache_transceiver is not None:
@@ -6202,6 +6077,65 @@ class PyExecutor:
             return False
         return getattr(disagg_params, 'first_gen_logits', None) is not None
 
+    def _emit_ctx_first_token(self, req: LlmRequest) -> None:
+        """Time-event: ctx worker finished prefill (produced the first token).
+
+        Emitted when a context-only request's response is created (both the
+        ``_handle_responses`` and fast-transfer paths reach it); first-fire
+        guarded so only one line lands. Inert unless capture is enabled.
+        """
+        if (req.return_perf_metrics
+                and not getattr(req, "py_te_ctx_first_token", False)):
+            req.py_te_ctx_first_token = True
+            emit_event("ctx", "ctx_first_token",
+                       request_id=req.request_id,
+                       ctx_request_id=_disagg_ctx_request_id(req))
+
+    def _emit_gen_last_token(self, req: LlmRequest) -> None:
+        """Time-event: gen worker produced this request's final decode token.
+
+        Emitted once when a generation-only request finishes. First-fire guarded
+        (termination makes it one-shot anyway). Inert unless capture is enabled.
+        """
+        if (req.return_perf_metrics
+                and not getattr(req, "py_te_gen_last_token", False)):
+            req.py_te_gen_last_token = True
+            emit_event("gen", "gen_last_token",
+                       request_id=req.request_id,
+                       ctx_request_id=_disagg_ctx_request_id(req))
+
+    def _emit_gen_first_token(self, req: LlmRequest) -> None:
+        """Time-event: gen worker produced this request's first decode token.
+
+        Reached from both the standard (:meth:`_handle_first_token_response`)
+        and early-emit (:meth:`_emit_first_token_responses`) paths, which both
+        key on ``py_decoding_iter == 1``; first-fire guarded so only one line is
+        written regardless of which path (or both) runs. Inert unless capture is
+        enabled.
+        """
+        if (req.return_perf_metrics
+                and not getattr(req, "py_te_gen_first_token", False)):
+            req.py_te_gen_first_token = True
+            emit_event("gen", "gen_first_token",
+                       request_id=req.request_id,
+                       ctx_request_id=_disagg_ctx_request_id(req))
+
+    def _emit_gen_kv_transfer_start(self, req: LlmRequest) -> None:
+        """Time-event #11: gen-init request begins pulling its KV cache.
+
+        Stamped in Python at the request/receive site (both sync and async
+        transfer branches) because the C++ setter lands 0.0 on the synchronous
+        disagg path (ticket #15871). First-fire guarded: a request that stays in
+        DISAGG_GENERATION_INIT re-enters ``_recv_disagg_gen_cache`` on later
+        passes. Inert unless TRTLLM_PERF_TIME_EVENTS_PATH is set.
+        """
+        if (req.return_perf_metrics
+                and not getattr(req, "py_te_gen_kv_transfer_start", False)):
+            req.py_te_gen_kv_transfer_start = True
+            emit_event("gen", "gen_kv_transfer_start",
+                       request_id=req.request_id,
+                       ctx_request_id=_disagg_ctx_request_id(req))
+
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
@@ -6217,6 +6151,7 @@ class PyExecutor:
             # batch. Drain all synchronous receives even after one fails so no
             # prepared request is left in DISAGG_GENERATION_INIT.
             for req in new_gen_reqs:
+                self._emit_gen_kv_transfer_start(req)
                 self.kv_cache_transceiver.request_and_receive_sync(req)
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
                     self._sync_disagg_transfer_made_progress = True
@@ -6224,6 +6159,7 @@ class PyExecutor:
             return
 
         for req in new_gen_reqs:
+            self._emit_gen_kv_transfer_start(req)
             self.kv_cache_transceiver.request_and_receive_async(req)
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
@@ -6265,6 +6201,16 @@ class PyExecutor:
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
+
+                    # Time-event: ctx worker has sent the "KV ready" signal to
+                    # the gen worker. Fires once per ctx-only request when its
+                    # prefill finishes. Inert unless capture is enabled.
+                    if (req.return_perf_metrics
+                            and not getattr(req, "py_te_ctx_ready_sent", False)):
+                        req.py_te_ctx_ready_sent = True
+                        emit_event("ctx", "ctx_ready_sent",
+                                   request_id=req.request_id,
+                                   ctx_request_id=_disagg_ctx_request_id(req))
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
@@ -6877,6 +6823,7 @@ class PyExecutor:
         new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
+                self._emit_gen_first_token(req)
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
@@ -6923,6 +6870,8 @@ class PyExecutor:
             # early-emitted response is never final.
             if request.is_finished:
                 continue
+
+            self._emit_gen_first_token(request)
 
             logger.debug(
                 f'Send first token response for request {request.py_request_id}'
@@ -7056,11 +7005,17 @@ class PyExecutor:
                     self._maybe_attach_ctx_usage(request, response)
                     response.result.per_pos_drafted = request.py_per_pos_drafted
                     response.result.per_pos_accepted = request.py_per_pos_accepted
-                    # Per-rank live time-events write (no-op unless capture_extended;
-                    # gated on final-only time_breakdown_metrics inside the method).
-                    self.perf_manager.maybe_write_request_events(
-                        response, self.global_rank,
-                        _disagg_ctx_request_id(request))
+                    # Time-events: terminal per-request stamps (replace the retired
+                    # completion-gated compound writer). Both helpers are first-fire
+                    # guarded and inert unless TRTLLM_PERF_TIME_EVENTS_PATH is set.
+                    # A generation-only request that just finished stamps its final
+                    # decode token; a context request's response creation is its
+                    # prefill first token (dedups with the fast-transfer site).
+                    if request.is_generation_only_request():
+                        if request_done:
+                            self._emit_gen_last_token(request)
+                    else:
+                        self._emit_ctx_first_token(request)
                     new_responses.append((req_id, response))
 
             if request_done:

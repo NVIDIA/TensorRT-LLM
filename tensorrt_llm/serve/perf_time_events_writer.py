@@ -14,31 +14,46 @@
 # limitations under the License.
 """Stdlib-only per-process JSONL event writer for the perf-time-events feature.
 
-The PyExecutor worker writes its own per-rank ``time_events_rank{N}_pid{P}.jsonl``
-files from inside ``perf_metrics_manager.PerfMetricsManager`` (which imports
-``torch``). The two OTHER processes that participate in an end-to-end perf
-timeline -- the disaggregated **router/orchestrator** (``OpenAIDisaggServer``,
-uvicorn) and the **benchmark client** (``benchmark_serving`` load generator) --
-must stay torch-free (see ``tests/unittest/others/test_import_gpu_free.py``), so
-they cannot reuse that class. This module gives them the same off-hot-path writer
-shape with a stdlib-only footprint (``json`` / ``os`` / ``queue`` / ``threading``
-/ ``atexit``).
+Every process that participates in an end-to-end perf timeline appends
+**one JSONL line per lifecycle event** (flushed as the event happens) to its own
+file, so a request that never completes -- a KV-transfer / fill-gate livelock, a
+HangDetector ``MPI_Abort`` at 300 s -- still leaves its partial timeline on disk.
+An offline compiler joins the per-process files into one combined per-request
+JSONL.
 
-Design mirrors the worker writer: the caller's thread only does a dict build plus
-a non-blocking :meth:`queue.Queue.put_nowait`; a lazily-started daemon thread does
-the actual ``json.dumps`` + write + flush. Neither the router nor the client has a
-single deterministic ``shutdown()`` choke point, so an :mod:`atexit` hook flushes
-and joins the writer on interpreter exit.
+Three kinds of process share this writer:
 
-Both env vars name an output **directory** (symmetric with the worker's
-``TRTLLM_PERF_TIME_EVENTS_PATH`` and the KV logger's
-``TRTLLM_KVCACHE_TIME_OUTPUT_PATH``):
+* **worker** (``PyExecutor`` ctx/gen ranks) -- emits ``ctx_*`` / ``gen_*`` events
+  via :func:`emit_event`, keyed on ``TRTLLM_PERF_TIME_EVENTS_PATH``, one file per
+  rank (``time_events_rank{N}_pid{P}.jsonl``). This process already imports
+  ``torch``, so it is the only place the steady clock is imported (lazily, in
+  :func:`_lazy_steady_clock_now`).
+* **router/orchestrator** (``OpenAIDisaggServer``, uvicorn) -- emits ``router``
+  events, keyed on ``TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH``.
+* **benchmark client** (``benchmark_serving`` load generator) -- emits ``client``
+  events, keyed on ``TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH``.
 
-* ``TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH`` -- disagg router dispatch timeline.
-* ``TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH`` -- benchmark client send timeline.
+The router and client MUST stay torch-free (see
+``tests/unittest/others/test_import_gpu_free.py``); they already hold the steady
+clock (``responses_utils.get_steady_clock_now_in_seconds``) and pass ``t`` in, so
+this module never imports it at top level -- the sole steady-clock import lives
+inside :func:`_lazy_steady_clock_now`, reached only from :func:`emit_event` when a
+worker leaves ``t`` unset while capture is enabled.
 
-Files are named ``{prefix}_pid{P}.jsonl`` so multiple processes on a shared
-filesystem never collide.
+Design: the caller's thread only builds a dict and does a non-blocking
+:meth:`queue.Queue.put_nowait`; a lazily-started daemon thread does the actual
+``json.dumps`` + write + flush. No process has a single deterministic
+``shutdown()`` choke point, so an :mod:`atexit` hook flushes and joins the writer
+on interpreter exit.
+
+All three env vars name an output **directory** (symmetric with the KV logger's
+``TRTLLM_KVCACHE_TIME_OUTPUT_PATH``). Files are named ``{prefix}_pid{P}.jsonl`` so
+multiple processes on a shared filesystem never collide.
+
+The flat per-event record schema (identical across all roles) is built by
+:func:`make_event_record`:
+``{"role", "event", "request_id", "ctx_request_id", "rank", "t", "pid", **extra}``
+where ``role in {router, ctx, gen, client}`` and ``t`` is steady-clock seconds.
 """
 
 import atexit
@@ -56,6 +71,10 @@ _WRITER_STOP = object()
 ROUTER_EVENTS_PATH_ENV = "TRTLLM_PERF_TIME_EVENTS_ROUTER_PATH"
 # Env var naming the benchmark-client send-timeline output directory.
 CLIENT_EVENTS_PATH_ENV = "TRTLLM_PERF_TIME_EVENTS_CLIENT_PATH"
+# Env var naming the worker (ctx/gen) per-rank output directory. Shared with the
+# executor's ``PerfMetricsManager`` capture switch; when set it force-enables the
+# whole capture path (independent of ``LlmArgs.return_perf_metrics``).
+WORKER_EVENTS_PATH_ENV = "TRTLLM_PERF_TIME_EVENTS_PATH"
 
 
 class JsonlEventWriter:
@@ -193,3 +212,143 @@ def make_env_writer(env_var: str, filename_prefix: str) -> JsonlEventWriter:
     var is unset/empty, so callers never branch on the env themselves.
     """
     return JsonlEventWriter(os.getenv(env_var, ""), filename_prefix)
+
+
+# ---------------------------------------------------------------------------
+# Flat per-event record + role-keyed emit helpers
+# ---------------------------------------------------------------------------
+
+
+def make_event_record(
+    role: str,
+    event: str,
+    request_id=None,
+    ctx_request_id=None,
+    rank: Optional[int] = None,
+    t: Optional[float] = None,
+    **extra,
+) -> dict:
+    """Build one flat per-event record.
+
+    The envelope is identical across every role so the offline compiler can pivot
+    a mixed stream long->wide with no role-specific parsing:
+
+    ``{"role", "event", "request_id", "ctx_request_id", "rank", "t", "pid"}``
+
+    ``extra`` carries role-specific provenance (e.g. the client's ``prompt_len``
+    / ``output_tokens`` on ``client_send``, or the router's server names); the
+    compiler ignores keys it does not model. ``t`` is steady-clock seconds; pass
+    it in from a caller that already holds the clock (router / client) -- this
+    builder never imports it.
+    """
+    record = {
+        "role": role,
+        "event": event,
+        "request_id": request_id,
+        "ctx_request_id": ctx_request_id,
+        "rank": rank,
+        "t": t,
+        "pid": os.getpid(),
+    }
+    if extra:
+        record.update(extra)
+    return record
+
+
+# Process-global worker writer, built lazily on the first worker ``emit_event`` so
+# importing this module (router / client / tests) never touches the worker env
+# var or the steady clock. ``set_worker_rank`` fixes the per-rank filename.
+_WORKER_WRITER: Optional[JsonlEventWriter] = None
+_WORKER_RANK: int = 0
+_WORKER_LOCK = threading.Lock()
+
+
+def set_worker_rank(rank: int) -> None:
+    """Pin the global rank used in this worker's ``time_events_rank{N}`` filename.
+
+    Call once from the executor before the first :func:`emit_event`. Safe to call
+    repeatedly with the same value; a change after the writer thread has opened
+    its file has no effect on the already-open path (rank is fixed at open time),
+    so only the value seen at first emit matters.
+    """
+    global _WORKER_RANK
+    _WORKER_RANK = int(rank)
+
+
+def _get_worker_writer() -> JsonlEventWriter:
+    """Return the process-global worker writer, building it once (thread-safe).
+
+    Keyed on ``TRTLLM_PERF_TIME_EVENTS_PATH``; inert (a no-op writer) when unset,
+    so :func:`emit_event` costs a dict build + drop when capture is off.
+    """
+    global _WORKER_WRITER
+    writer = _WORKER_WRITER
+    if writer is not None:
+        return writer
+    with _WORKER_LOCK:
+        if _WORKER_WRITER is None:
+            _WORKER_WRITER = JsonlEventWriter(
+                os.getenv(WORKER_EVENTS_PATH_ENV, ""),
+                f"time_events_rank{_WORKER_RANK}",
+            )
+        return _WORKER_WRITER
+
+
+def _lazy_steady_clock_now() -> float:
+    """Return steady-clock seconds, importing the binding lazily.
+
+    The steady clock lives in ``tensorrt_llm.bindings`` (the torch/CUDA
+    extension), so importing it at module scope would break the torch-free
+    contract for the router / client. This is only ever reached from a WORKER
+    process (which already holds ``torch``) when a caller omits ``t`` while
+    capture is enabled -- router / client always pass ``t`` in.
+    """
+    from tensorrt_llm.serve.responses_utils import \
+        get_steady_clock_now_in_seconds
+    return get_steady_clock_now_in_seconds()
+
+
+def emit_event(
+    role: str,
+    event: str,
+    request_id=None,
+    ctx_request_id=None,
+    rank: Optional[int] = None,
+    t: Optional[float] = None,
+    **extra,
+) -> None:
+    """Emit one worker (``ctx`` / ``gen``) time-event line; no-op when inert.
+
+    This is the entry point for worker-side call sites that hold no
+    ``PerfMetricsManager`` handle (``seq_slot_manager``, ``native/transfer``,
+    ``py_executor``). It:
+
+    * short-circuits before building anything when
+      ``TRTLLM_PERF_TIME_EVENTS_PATH`` is unset (the writer is inert), so an
+      un-instrumented run pays only the ``enabled`` check;
+    * defaults ``rank`` to the pinned worker rank and ``t`` to the steady clock
+      (lazy import, worker-only);
+    * enqueues off the hot path (``put_nowait``, drop-on-full).
+
+    Router and client use ``make_env_writer`` + ``JsonlEventWriter.write`` with
+    :func:`make_event_record` directly (they pass their own ``t`` and stay
+    torch-free); this helper is worker-specific.
+    """
+    writer = _get_worker_writer()
+    if not writer.enabled:
+        return
+    if t is None:
+        t = _lazy_steady_clock_now()
+    if rank is None:
+        rank = _WORKER_RANK
+    writer.write(
+        make_event_record(
+            role,
+            event,
+            request_id=request_id,
+            ctx_request_id=ctx_request_id,
+            rank=rank,
+            t=t,
+            **extra,
+        )
+    )
