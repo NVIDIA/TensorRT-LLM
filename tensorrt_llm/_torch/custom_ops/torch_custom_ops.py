@@ -2241,8 +2241,7 @@ class AllReduceRunner(TunableRunner):
         # scanning unrelated custom-op and profile entries in the full cache.
         for bucket in tuning_buckets:
             bucket_input_shapes = list(input_shapes)
-            bucket_input_shapes[0] = torch.Size(
-                (bucket, *input_shapes[0][1:]))
+            bucket_input_shapes[0] = torch.Size((bucket, *input_shapes[0][1:]))
             cache_key = cache.get_cache_key(
                 custom_op,
                 self,
