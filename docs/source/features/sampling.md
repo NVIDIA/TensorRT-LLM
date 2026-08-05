@@ -123,7 +123,10 @@ modes.
 * The sampling is controlled via `SamplingParams`.
 
 * By default (`temperature = top_p = top_k = None`), greedy sampling is used
-  (unless min-p or top-p decay is active, see below).
+  (unless min-p or top-p decay is active, see below). With
+  `generation_config='auto'`, values explicitly specified in the model's
+  `generation_config.json` take the place of these defaults; see
+  [Model generation config defaults](#model-generation-config-defaults).
 
 * If either `temperature = 0`, `top_p = 0`, `top_k = 1`, and/or `min_p = 1`, is specified,
   sampling is greedy, irrespective of the values of the remaining parameters.
