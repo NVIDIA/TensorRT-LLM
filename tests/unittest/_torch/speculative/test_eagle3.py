@@ -788,9 +788,6 @@ def test_multi_eagle3():
             pass
 
 
-
-
-
 @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                          ids=["no_dynamic_tree", "dynamic_tree"])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
