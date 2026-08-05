@@ -149,7 +149,7 @@ def test_cute_dsl_preferred_preserves_compressed_mtp_fallback(monkeypatch) -> No
     )
 
 
-def test_gvr_routes_logical_lengths_and_workspace(monkeypatch) -> None:
+def test_gvr_owns_prior_state_and_updates_it(monkeypatch) -> None:
     gvr = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
     top_k = TopK(
@@ -162,7 +162,17 @@ def test_gvr_routes_logical_lengths_and_workspace(monkeypatch) -> None:
     scan_lengths = torch.tensor([8], dtype=torch.int32)
     output = torch.empty(1, 2, dtype=torch.int32)
     prior = torch.zeros(1, 2, dtype=torch.int32)
-    row_order = torch.zeros(1, dtype=torch.int32)
+    top_k.prepare(
+        device=torch.device("cpu"),
+        max_num_columns=8,
+        next_n=1,
+        input_dtype=torch.float32,
+        num_sms=16,
+        max_num_requests=1,
+    )
+    assert top_k._prior_indices is not None
+    top_k._prior_indices.copy_(prior)
+    gvr.side_effect = lambda *args, **kwargs: output.copy_(torch.tensor([[5, 3]]))
 
     top_k(
         scores,
@@ -171,22 +181,75 @@ def test_gvr_routes_logical_lengths_and_workspace(monkeypatch) -> None:
         sequence_lengths=logical_lengths,
         scan_lengths=scan_lengths,
         next_n=1,
-        prior_indices=prior,
         max_num_columns=8,
-        row_order=row_order,
     )
 
-    gvr.assert_called_once_with(
-        scores,
-        prior,
-        logical_lengths,
-        output,
-        2,
-        next_n=1,
-        compress_ratio=4,
-        max_seq_len=8,
-        order_row=row_order,
+    args, kwargs = gvr.call_args
+    assert args[0] is scores
+    assert args[1].data_ptr() == top_k._prior_indices.data_ptr()
+    assert args[2] is logical_lengths
+    assert args[3] is output
+    assert args[4] == 2
+    assert kwargs == {
+        "next_n": 1,
+        "compress_ratio": 4,
+        "max_seq_len": 8,
+        "order_row": None,
+    }
+    assert top_k._prior_indices.tolist() == [[5, 3]]
+
+
+def test_gvr_prepares_row_order_at_threshold(monkeypatch) -> None:
+    gvr = Mock(side_effect=lambda *args, **kwargs: args[3].zero_())
+    monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    num_sms = 4
+    next_n = 2
+    lengths = torch.tensor([4, 1, 8, 2], dtype=torch.int32)
+    top_k.prepare(
+        device=torch.device("cpu"),
+        max_num_columns=8,
+        next_n=next_n,
+        input_dtype=torch.float32,
+        num_sms=num_sms,
+        max_num_requests=lengths.shape[0],
     )
+
+    top_k(
+        torch.randn(lengths.shape[0] * next_n, 8),
+        torch.empty(lengths.shape[0] * next_n, 2, dtype=torch.int32),
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        next_n=next_n,
+        max_num_columns=8,
+    )
+
+    row_order = gvr.call_args.kwargs["order_row"]
+    assert row_order is not None
+    assert row_order.tolist() == [2, 0, 3, 1]
+
+
+def test_seed_from_prefill_uses_last_request_rows() -> None:
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    top_k.prepare(
+        device=torch.device("cpu"),
+        max_num_columns=8,
+        next_n=1,
+        input_dtype=torch.float32,
+        num_sms=4,
+        max_num_requests=4,
+    )
+    prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32)
+
+    top_k.seed_from_prefill(
+        prefill_indices,
+        torch.tensor([2, 1], dtype=torch.int32),
+        request_offset=1,
+    )
+
+    assert top_k._prior_indices is not None
+    assert top_k._prior_indices.tolist() == [[0, 0], [2, 3], [4, 5], [0, 0]]
 
 
 @pytest.mark.parametrize("top_k", [0, -1])

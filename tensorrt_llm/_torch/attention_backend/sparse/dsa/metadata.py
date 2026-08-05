@@ -161,7 +161,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.use_cute_dsl_topk = (
             sparse_metadata_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
         )
-        self.kv_lens_row_reorder = None
         capture_graph = self.is_cuda_graph
         # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
         # metadata params carry the model-specific compression ratios.
@@ -477,23 +476,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True
                 )
-        self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
-
-    def _compute_kv_lens_row_reorder(self):
-        """Prepare longest-job-first row order for GVR top-k."""
-        next_n = 1 + self.max_draft_tokens
-        if (
-            self.enable_heuristic_topk
-            and self.use_cute_dsl_topk
-            and self.num_generations * next_n >= 2 * self.num_sms
-        ):
-            gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
-            order = torch.argsort(gen_kv_lens, descending=True).to(torch.int32)
-            self.kv_lens_row_reorder_buffer[: self.num_generations].copy_(order)
-            self.kv_lens_row_reorder = self.kv_lens_row_reorder_buffer[: self.num_generations]
-        else:
-            self.kv_lens_row_reorder = None
 
     def update_for_spec_dec(self):
         super().update_for_spec_dec()
@@ -786,45 +769,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device="cpu",
                 pin_memory=prefer_pinned(),
             )
-        # Per-layer persistent buffers for heuristic TopK pre_idx.
-        # Indexed by [local_layer_idx, generation_position, :].
-        # The graph captures reads/writes on these stable-address buffers;
-        # each replay's write becomes the next replay's read (feedback loop).
         self.enable_heuristic_topk = (
             sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
         )
-        if self.enable_heuristic_topk:
-            num_local_layers = self.kv_cache_manager.num_local_layers
-            self.heuristic_prev_topk = self.get_empty(
+        if self.enable_heuristic_topk and not self.use_cute_dsl_topk:
+            # Shared C++ heuristic scratch; per-layer history lives in TopK.
+            max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
+            self.heuristic_scratch_values = self.get_empty(
                 self.cuda_graph_buffers,
-                (num_local_layers, self.max_num_sequences, self.num_sparse_topk),
-                cache_name="heuristic_prev_topk",
-                dtype=torch.int32,
+                (max_gen_tokens, self.num_sparse_topk),
+                cache_name="heuristic_scratch_values",
+                dtype=torch.float32,
                 capture_graph=capture_graph,
             )
-            # Zero-initialize so the first decode step's pre_idx (kernel
-            # adds +1 offset) points to index 1 — a valid but benign candidate.
-            # Without this, uninitialized memory produces random hint indices.
-            self.heuristic_prev_topk.zero_()
-            # The C++ top-k path needs a stable scratch address.
-            if not self.use_cute_dsl_topk:
-                max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-                self.heuristic_scratch_values = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (max_gen_tokens, self.num_sparse_topk),
-                    cache_name="heuristic_scratch_values",
-                    dtype=torch.float32,
-                    capture_graph=capture_graph,
-                )
-            # GVR row order also needs a stable address for CUDA graphs.
-            if self.use_cute_dsl_topk:
-                self.kv_lens_row_reorder_buffer = self.get_empty(
-                    self.cuda_graph_buffers,
-                    (self.max_num_sequences,),
-                    cache_name="kv_lens_row_reorder_buffer",
-                    dtype=torch.int32,
-                    capture_graph=capture_graph,
-                )
 
         # Persistent scratch for the Radix-split-work indexer path. Re-created
         # in update_spec_dec_param when max_draft_tokens changes so it stays

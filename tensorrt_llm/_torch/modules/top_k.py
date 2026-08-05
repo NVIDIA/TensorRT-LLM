@@ -147,6 +147,14 @@ class TopK(nn.Module):
             TopKImplementation(decode_implementation) if decode_implementation is not None else None
         )
         self.compress_ratio = compress_ratio
+        self.register_buffer("_prior_indices", None, persistent=False)
+        self.register_buffer("_row_order_buffer", None, persistent=False)
+        self._num_sms: int | None = None
+
+    @property
+    def is_state_prepared(self) -> bool:
+        """Whether stateful heuristic decode has persistent buffers."""
+        return self._prior_indices is not None
 
     def prepare(
         self,
@@ -156,11 +164,14 @@ class TopK(nn.Module):
         next_n: int,
         input_dtype: torch.dtype,
         num_sms: int | None = None,
+        max_num_requests: int | None = None,
     ) -> None:
-        """Warm up decode implementation state for one deployment shape."""
+        """Prepare persistent state and warm up one decode deployment shape."""
         implementation = self.decode_implementation
         if implementation is None:
             raise ValueError("decode Top-K is not configured")
+        if max_num_requests is not None:
+            self._prepare_state(device, max_num_requests, num_sms)
         if max_num_columns <= 0 or next_n <= 0:
             return
         if implementation in (
@@ -209,6 +220,53 @@ class TopK(nn.Module):
                     )
             _PREPARED_DECODE_TOP_K.add(key)
 
+    def _prepare_state(
+        self,
+        device: torch.device,
+        max_num_requests: int,
+        num_sms: int | None,
+    ) -> None:
+        implementation = self.decode_implementation
+        if implementation not in (
+            TopKImplementation.TRTLLM_HEURISTIC,
+            TopKImplementation.CUTE_DSL_GVR,
+        ):
+            return
+        if max_num_requests <= 0:
+            raise ValueError(f"max_num_requests must be positive, got {max_num_requests}")
+
+        device = torch.device(device)
+        prior_shape = (max_num_requests, self.top_k)
+        if self._prior_indices is None:
+            self._prior_indices = torch.zeros(prior_shape, dtype=torch.int32, device=device)
+        elif (
+            self._prior_indices.device != device or self._prior_indices.shape[0] < max_num_requests
+        ):
+            raise RuntimeError(
+                "Top-K state was already prepared with an incompatible device or capacity: "
+                f"got {self._prior_indices.device} {tuple(self._prior_indices.shape)}, "
+                f"requested {device} {prior_shape}"
+            )
+
+        if implementation == TopKImplementation.CUTE_DSL_GVR:
+            if num_sms is None or num_sms <= 0:
+                raise ValueError("num_sms must be positive when preparing CUTE_DSL_GVR")
+            self._num_sms = num_sms
+            if self._row_order_buffer is None:
+                self._row_order_buffer = torch.empty(
+                    (max_num_requests,), dtype=torch.int32, device=device
+                )
+            elif (
+                self._row_order_buffer.device != device
+                or self._row_order_buffer.shape[0] < max_num_requests
+            ):
+                raise RuntimeError(
+                    "GVR row-order state was already prepared with an incompatible device or "
+                    f"capacity: got {self._row_order_buffer.device} "
+                    f"{tuple(self._row_order_buffer.shape)}, requested {device} "
+                    f"({max_num_requests},)"
+                )
+
     def _warmup_trtllm_heuristic(self, input_dtype: torch.dtype) -> None:
         num_columns = max(_HEURISTIC_WARMUP_COLUMNS, self.top_k)
         device = torch.device("cuda")
@@ -251,12 +309,10 @@ class TopK(nn.Module):
         sequence_lengths: torch.Tensor | None = None,
         scan_lengths: torch.Tensor | None = None,
         next_n: int = 1,
-        prior_indices: torch.Tensor | None = None,
         heuristic_values: torch.Tensor | None = None,
         radix_indices: torch.Tensor | None = None,
         radix_values: torch.Tensor | None = None,
         max_num_columns: int | None = None,
-        row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Write prefill or decode Top-K indices into ``output_indices``.
 
@@ -277,12 +333,35 @@ class TopK(nn.Module):
             _require_tensor(scan_lengths, "scan_lengths"),
             output_indices,
             next_n=next_n,
-            prior_indices=prior_indices,
             heuristic_values=heuristic_values,
             radix_indices=radix_indices,
             radix_values=radix_values,
             max_num_columns=max_num_columns,
-            row_order=row_order,
+        )
+
+    def seed_from_prefill(
+        self,
+        output_indices: torch.Tensor,
+        request_lengths: torch.Tensor,
+        *,
+        request_offset: int = 0,
+    ) -> None:
+        """Seed decode hints from the last selected row of each prefill request."""
+        if self._prior_indices is None:
+            return
+        if request_lengths.ndim != 1:
+            raise ValueError(
+                f"request_lengths must be rank 1, got shape {tuple(request_lengths.shape)}"
+            )
+        num_requests = request_lengths.shape[0]
+        if request_offset < 0 or request_offset + num_requests > self._prior_indices.shape[0]:
+            raise ValueError(
+                f"request range [{request_offset}, {request_offset + num_requests}) exceeds "
+                f"prepared capacity {self._prior_indices.shape[0]}"
+            )
+        last_rows = (torch.cumsum(request_lengths, dim=0) - 1).to(dtype=torch.long)
+        self._prior_indices[request_offset : request_offset + num_requests].copy_(
+            output_indices[last_rows]
         )
 
     def _forward_prefill(
@@ -322,12 +401,10 @@ class TopK(nn.Module):
         output_indices: torch.Tensor,
         *,
         next_n: int,
-        prior_indices: torch.Tensor | None,
         heuristic_values: torch.Tensor | None,
         radix_indices: torch.Tensor | None,
         radix_values: torch.Tensor | None,
         max_num_columns: int | None,
-        row_order: torch.Tensor | None,
     ) -> torch.Tensor:
         implementation = self.decode_implementation
         if implementation is None:
@@ -347,6 +424,15 @@ class TopK(nn.Module):
 
         if (radix_indices is None) != (radix_values is None):
             raise ValueError("radix_indices and radix_values must be provided together")
+
+        prior_indices = None
+        if implementation in (
+            TopKImplementation.TRTLLM_HEURISTIC,
+            TopKImplementation.CUTE_DSL_GVR,
+        ):
+            if self._prior_indices is None:
+                raise RuntimeError("Top-K state must be prepared before heuristic decode")
+            prior_indices = self._prior_indices[:num_requests]
 
         if implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
@@ -375,6 +461,8 @@ class TopK(nn.Module):
                 radix_aux_indices=radix_indices,
                 radix_aux_logits=radix_values,
             )
+            if implementation == TopKImplementation.TRTLLM_HEURISTIC:
+                self._update_prior_indices(output_indices, num_requests, next_n)
             return output_indices
 
         if implementation == TopKImplementation.CUTE_DSL_PREFERRED:
@@ -387,10 +475,9 @@ class TopK(nn.Module):
             )
             return output_indices
 
-        if prior_indices is None:
-            raise ValueError("CUTE_DSL_GVR requires prior_indices")
         if max_num_columns is None:
             raise ValueError("CUTE_DSL_GVR requires max_num_columns")
+        row_order = self._prepare_row_order(sequence_lengths, next_n)
         torch.ops.trtllm.cute_dsl_gvr_topk_decode(
             scores,
             prior_indices,
@@ -402,7 +489,32 @@ class TopK(nn.Module):
             max_seq_len=max_num_columns,
             order_row=row_order,
         )
+        self._update_prior_indices(output_indices, num_requests, next_n)
         return output_indices
+
+    def _prepare_row_order(
+        self,
+        sequence_lengths: torch.Tensor,
+        next_n: int,
+    ) -> torch.Tensor | None:
+        if self._num_sms is None or self._row_order_buffer is None:
+            raise RuntimeError("GVR state must be prepared before decode")
+        num_requests = sequence_lengths.shape[0]
+        if num_requests * next_n < 2 * self._num_sms:
+            return None
+        order = torch.argsort(sequence_lengths, descending=True).to(torch.int32)
+        row_order = self._row_order_buffer[:num_requests]
+        row_order.copy_(order)
+        return row_order
+
+    def _update_prior_indices(
+        self,
+        output_indices: torch.Tensor,
+        num_requests: int,
+        next_n: int,
+    ) -> None:
+        assert self._prior_indices is not None
+        self._prior_indices[:num_requests].copy_(output_indices[next_n - 1 :: next_n])
 
     def _forward_decode_torch(
         self,
