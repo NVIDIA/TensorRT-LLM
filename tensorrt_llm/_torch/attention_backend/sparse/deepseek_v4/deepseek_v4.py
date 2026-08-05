@@ -689,7 +689,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             if is_compress_layer(extend_compress_ratios[layer_idx])
         }
 
-    def prepare(self):
+    def _prepare_impl(self):
+        # Overrides DSAtrtllmAttentionMetadata._prepare_impl, NOT prepare():
+        # the base prepare() wraps this whole body in the write-after-read
+        # guard for the pinned staging rewritten below (cached_token_lens_cpu,
+        # cu_seq_lens, gen_new_tokens_per_seq_host, and everything the called
+        # helpers stage). Overriding prepare() directly would silently opt this
+        # class out of that guard.
         assert self.kv_cache_manager is not None
         assert self.request_ids is not None
 

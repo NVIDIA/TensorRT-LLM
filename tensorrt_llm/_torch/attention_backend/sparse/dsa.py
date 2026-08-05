@@ -832,6 +832,38 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_indexer(capture_graph=capture_graph)
 
     def prepare(self):
+        # One write-after-read guard over EVERYTHING prepare stages through
+        # pinned memory -- the base class's kv_lens and block-table copies as
+        # much as the ragged row maps. Every one of these buffers is rewritten
+        # here each step and copied device-ward with non_blocking=True; under
+        # the overlap scheduler the previous step's copies can still be QUEUED
+        # behind an in-flight forward when this rewrite starts, and the device
+        # then copies this step's values into last step's consumers. The GPU
+        # coredump for the resulting fault names
+        # applyMLARopeAndAssignQKVKernelGeneration (Warp MMU Fault) storing
+        # through KVBlockArray -- garbage block offsets, which trace back
+        # through the token-major gather to the BASE block-table staging, not
+        # only the ragged row set. Hence one coarse guard at the boundary
+        # rather than per-buffer events: synchronize on the event recorded
+        # after the previous prepare's copies were enqueued, which by stream
+        # order means they have executed before any pinned buffer is touched
+        # again. Steady-state cost is nothing (the event completed long ago);
+        # it blocks only when the CPU has genuinely outrun the device, which is
+        # exactly the window that corrupted the copies.
+        if not torch.cuda.is_current_stream_capturing():
+            evt = getattr(self, "_prepare_stage_evt", None)
+            if evt is None:
+                self._prepare_stage_evt = torch.cuda.Event()
+            else:
+                evt.synchronize()
+        try:
+            self._prepare_impl()
+        finally:
+            evt = getattr(self, "_prepare_stage_evt", None)
+            if evt is not None and not torch.cuda.is_current_stream_capturing():
+                evt.record()
+
+    def _prepare_impl(self):
         super().prepare()
         self._invalidate_pool_view_cache()
         # Cross-layer indexer sharing is per-step state; clear it so a "shared"
@@ -1330,7 +1362,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # path does not, so skip the allocation when use_cute_dsl_topk.
             if not self.use_cute_dsl_topk:
                 max_gen_tokens = self.max_num_sequences * (
-                    1 + self.max_draft_tokens)
+                    1 + self._draft_sizing_cap)
                 self.heuristic_scratch_values = self.get_empty(
                     self.cuda_graph_buffers,
                     (max_gen_tokens, self.num_sparse_topk),
@@ -1359,6 +1391,25 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
+    @property
+    def _draft_sizing_cap(self) -> int:
+        """Static draft-token ceiling for buffer SIZING (not per-step logic).
+
+        Every expanded buffer must be shaped from one process-wide ceiling,
+        never from the per-step ``max_draft_tokens``: the pooled backing
+        memory is shared between the base metadata and every CUDA-graph
+        clone, and two instances viewing the same bytes with different row
+        counts interleave their rows differently -- a prepare() on one
+        layout silently corrupts every captured graph reading the other
+        (the DSpark ragged IMA). ``update_spec_dec_param`` records the
+        config-wide ``max_total_draft_tokens`` here; before the first call
+        the mutable value is all there is.
+        """
+        cap = getattr(self, "_draft_alloc_cap", None)
+        if cap is None:
+            return self.max_draft_tokens
+        return max(cap, self.max_draft_tokens)
+
     def _create_kv_lens_2d_buffer(self, capture_graph=False):
         """Pre-allocated buffer for the DeepGEMM 2D context_lens API.
 
@@ -1368,7 +1419,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """
         self.kv_lens_cuda_2d = self.get_empty(
             self.cuda_graph_buffers,
-            (self.max_num_sequences, 1 + self.max_draft_tokens),
+            (self.max_num_sequences, 1 + self._draft_sizing_cap),
             cache_name="kv_lens_cuda_2d",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -1379,7 +1430,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Create expanded KV-length and block-table buffers for speculative decoding."""
         self.kv_lens_expanded_cuda = self.get_empty(
             self.cuda_graph_buffers,
-            (self.max_num_sequences * (1 + self.max_draft_tokens), ),
+            (self.max_num_sequences * (1 + self._draft_sizing_cap), ),
             cache_name="kv_lens_expanded_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -1400,7 +1451,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # compression divisor twice.
         self.row_kv_lens_cuda = self.get_empty(
             self.cuda_graph_buffers,
-            (self.max_num_sequences * (1 + self.max_draft_tokens), ),
+            (self.max_num_sequences * (1 + self._draft_sizing_cap), ),
             cache_name="row_kv_lens_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -1416,7 +1467,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # after prepare(); the kv lengths do.
         self.row_kv_correction_cuda = self.get_empty(
             self.cuda_graph_buffers,
-            (self.max_num_sequences * (1 + self.max_draft_tokens), ),
+            (self.max_num_sequences * (1 + self._draft_sizing_cap), ),
             cache_name="row_kv_correction_cuda",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -1432,7 +1483,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # before the first replay.
         self.row_req_idx_cuda = self.get_empty(
             self.cuda_graph_buffers,
-            (self.max_num_sequences * (1 + self.max_draft_tokens), ),
+            (self.max_num_sequences * (1 + self._draft_sizing_cap), ),
             cache_name="row_req_idx_cuda",
             dtype=torch.long,
             capture_graph=capture_graph,
@@ -1474,7 +1525,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # `cache_name`, so a later reallocation would move addresses already
         # baked into captured graphs. `2 + max_draft_tokens` per sequence covers
         # one context row plus the widest generation window.
-        attn_rows_cap = self.max_num_sequences * (2 + self.max_draft_tokens)
+        attn_rows_cap = self.max_num_sequences * (2 + self._draft_sizing_cap)
         self._attn_num_rows = 0
         self.attn_row_kv_lens_cuda = self.get_empty(
             self.cuda_graph_buffers,
@@ -1561,7 +1612,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table_expanded = self.get_empty(
             self.cuda_graph_buffers,
             [
-                self.max_num_sequences * (1 + self.max_draft_tokens),
+                self.max_num_sequences * (1 + self._draft_sizing_cap),
                 self.kv_cache_manager.max_blocks_per_seq
             ],
             cache_name="block_table_expanded",
@@ -1608,18 +1659,38 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                       spec_tree_manager,
                                       num_contexts=num_contexts)
         self.max_draft_tokens = max_draft_len
+        # The config-wide ceiling, identical every call; sizing must use this
+        # so base and every clone share one buffer layout (see
+        # _draft_sizing_cap).
+        self._draft_alloc_cap = max(
+            int(max_total_draft_tokens),
+            getattr(self, "_draft_alloc_cap", 0) or 0)
         capture_graph = self.is_cuda_graph
-        if self.kv_lens_cuda_2d.shape[1] != 1 + self.max_draft_tokens:
+        # GROW-ONLY ratchet, never an equality check. Under DSpark ragged
+        # verification max_draft_len varies per step with the planner's
+        # windows; the old `!=` conditions re-created every expanded buffer
+        # whenever it moved, while already-captured graphs kept the previous
+        # allocations' raw addresses baked in. The caching allocator then
+        # reused the freed memory for the per-step indptr tensors, and every
+        # replay read indptr ramps where its row->request map and per-row KV
+        # extents used to live -- the ragged IMA. (Frozen-scene forensics:
+        # the retired attn_row buffers' addresses held int64 cumsum ramps.)
+        # Growing above the high-water mark before any graph exists is fine;
+        # after that the sizes plateau at the config ceiling and the
+        # addresses never move again. Consumers slice [:rows]/[:width], so a
+        # wider-than-this-step buffer is just capacity.
+        ratchet = max(self._draft_sizing_cap,
+                      getattr(self, "_expanded_alloc_draft_cap", -1))
+        if ratchet > getattr(self, "_expanded_alloc_draft_cap", -1):
+            self._expanded_alloc_draft_cap = ratchet
             self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
-        init_shape = self.kv_lens_expanded_host.shape[0]
-        if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
             # Resize heuristic scratch buffer for new max_draft_tokens.
             # Skip when use_cute_dsl_topk (GVR path never consumes it), matching
             # the allocation guard in create_buffers_for_indexer.
             if self.enable_heuristic_topk and not self.use_cute_dsl_topk:
                 max_gen_tokens = self.max_num_sequences * (
-                    1 + self.max_draft_tokens)
+                    1 + self._draft_sizing_cap)
                 self.heuristic_scratch_values = self.get_empty(
                     self.cuda_graph_buffers,
                     (max_gen_tokens, self.num_sparse_topk),
@@ -1955,16 +2026,21 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         num_tokens = len(rows)
         self._ragged_num_rows = num_tokens
+        # The write-after-read hazard on these pinned buffers (rewritten each
+        # ragged step, copied with non_blocking=True under the overlap
+        # scheduler's run-ahead) is fenced wholesale by the event guard in
+        # prepare(): it waits for the previous prepare's copies to execute
+        # before any pinned buffer is touched again.
         self.row_kv_lens_host[:num_tokens].copy_(
             torch.tensor(rows, dtype=torch.int32))
         self.row_kv_lens_cuda[:num_tokens].copy_(
             self.row_kv_lens_host[:num_tokens], non_blocking=True)
         self.row_kv_correction_host[:num_tokens].copy_(
             torch.tensor(corrections, dtype=torch.int32))
-        self.row_kv_correction_cuda[:num_tokens].copy_(
-            self.row_kv_correction_host[:num_tokens], non_blocking=True)
         self.row_req_idx_host[:num_tokens].copy_(
             torch.tensor(req_idx, dtype=torch.long))
+        self.row_kv_correction_cuda[:num_tokens].copy_(
+            self.row_kv_correction_host[:num_tokens], non_blocking=True)
         self.row_req_idx_cuda[:num_tokens].copy_(
             self.row_req_idx_host[:num_tokens], non_blocking=True)
 
@@ -2041,6 +2117,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # the windows again: it produced exactly these per-row extents,
         # corrections and request indices one call earlier. Rebuilding them
         # would double the only O(num_gen_tokens) host work on the step.
+        # Same WAR guard as _prepare_ragged_row_kv_lens above, same reason:
+        # attn_row_req_idx_host holds whole-batch request indices, and a
+        # rewrite racing last step's queued H2D turns into an out-of-bounds
+        # gather in refresh_token_major_gen_rows.
         self.attn_row_kv_lens_host[nc:rows].copy_(
             self.row_kv_lens_host[:ngt])
         self.attn_row_kv_correction_host[nc:rows].copy_(
