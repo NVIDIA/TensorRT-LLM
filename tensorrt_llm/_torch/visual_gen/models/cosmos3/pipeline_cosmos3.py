@@ -1724,11 +1724,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 audio_sample_rate=self.audio_tokenizer.model_config["sampling_rate"]
                 if waveform is not None
                 else None,
+                # Sliced to the embodiment's real width, so the trailing dim is
+                # raw_action_dim; the mode and embodiment are the caller's own
+                # request and are not echoed back.
                 action=action_latents[:, :, :resolved_raw_action_dim].float().cpu()
                 if do_action and action_latents is not None
                 else None,
-                raw_action_dim=resolved_raw_action_dim if do_action else None,
-                action_mode=normalized_action_mode if do_action else None,
-                domain_id=action_domain_id if do_action else None,
             )
         )

@@ -99,9 +99,6 @@ class VisualGenOutput:
     action: Optional[torch.Tensor] = None
     frame_rate: Optional[float] = None
     audio_sample_rate: Optional[int] = None
-    raw_action_dim: Optional[int] = None
-    action_mode: Optional[str] = None
-    domain_id: Optional[int] = None
     error: Optional[str] = None
     metrics: Optional[VisualGenMetrics] = None
 
@@ -173,7 +170,8 @@ class VisualGenOutput:
         if self.action is not None:
             raise NotImplementedError(
                 "Saving action outputs requires a tensor payload format "
-                "('safetensors' or 'pt') so the action tensor and metadata are preserved."
+                "('safetensors' or 'pt'); no video or image container can carry "
+                "an action trajectory."
             )
 
         if self.image is not None:

@@ -148,7 +148,12 @@ def _default_action_output_path(output_path: str) -> str:
     return str(stem.with_suffix(".action.json"))
 
 
-def _save_action_output(output, path: str) -> None:
+def _save_action_output(output, path: str, args: argparse.Namespace) -> None:
+    """Write the trajectory plus the request that produced it.
+
+    The mode and embodiment are this script's own inputs, so they are read
+    from *args* rather than echoed back through the output schema.
+    """
     if output.action is None:
         return
 
@@ -161,9 +166,10 @@ def _save_action_output(output, path: str) -> None:
         shape = list(action.shape)
 
     payload = {
-        "action_mode": output.action_mode,
-        "domain_id": output.domain_id,
-        "raw_action_dim": output.raw_action_dim,
+        "action_mode": args.action_mode,
+        "domain_name": args.domain_name,
+        "domain_id": args.domain_id,
+        "raw_action_dim": action.shape[-1],
         "shape": shape,
         "dtype": str(action.dtype).replace("torch.", ""),
         "data": action_data,
@@ -401,13 +407,10 @@ def main():
 
     if args.action_mode is not None:
         action_path = args.action_output_path or _default_action_output_path(output_path)
-        _save_action_output(output, action_path)
+        _save_action_output(output, action_path, args)
         if output.action is not None:
             print(f"Saved action: {action_path}")
-            print(
-                f"Action shape: {tuple(output.action.shape)}, "
-                f"raw_action_dim={output.raw_action_dim}, domain_id={output.domain_id}"
-            )
+            print(f"Action shape: {tuple(output.action.shape)}")
         else:
             print("Warning: action_mode was set but the output carried no action tensor.")
 

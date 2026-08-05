@@ -625,7 +625,9 @@ class WanPipeline(BasePipeline):
                 encoder_hidden_states=encoder_hidden_states,
             )
 
-        # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only)
+        # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only).
+        # post_step_fn also carries the denoise loop's side-stream latents (Cosmos3
+        # denoises action/audio alongside video); Wan has none, so they pass through.
         def _pin_i2v_first_frame(x, extra_stream_latents):
             pinned = ((1 - i2v_first_frame_mask) * i2v_condition + i2v_first_frame_mask * x).to(
                 self.dtype

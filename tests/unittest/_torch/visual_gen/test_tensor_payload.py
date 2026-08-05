@@ -55,13 +55,7 @@ def _make_video_output(batch: int = 1, t: int = 2, h: int = 4, w: int = 4) -> Vi
 def _make_action_output(batch: int = 1, t: int = 4, action_dim: int = 7) -> VisualGenOutput:
     """Action uses ``(B, T, action_dim)``: batched at rank 3, unbatched at rank 2."""
     action = torch.arange(batch * t * action_dim, dtype=torch.float32).reshape(batch, t, action_dim)
-    return VisualGenOutput(
-        request_id=3,
-        action=action,
-        action_mode="policy",
-        raw_action_dim=action_dim,
-        domain_id=7,
-    )
+    return VisualGenOutput(request_id=3, action=action)
 
 
 class TestIsTensorFormat:
@@ -154,26 +148,14 @@ class TestActionRoundTrip:
         assert loaded["action"].shape == (4, 7)
         assert torch.equal(loaded["action"], output.action)
 
-    def test_action_metadata_serialized(self, fmt):
-        output = _make_action_output(batch=1)
-        data = serialize_visual_gen_output(output, fmt, batch_index=0)
-        loaded = self._load(data, fmt)
-        assert loaded["raw_action_dim"] == 7
-        assert loaded["domain_id"] == 7
-        if fmt == "pt":
-            assert loaded["action_mode"] == "policy"
-        else:
-            assert "action_mode" not in loaded
-            import tempfile
-
-            from safetensors import safe_open
-
-            with tempfile.NamedTemporaryFile(suffix=".safetensors") as tf:
-                tf.write(data)
-                tf.flush()
-                with safe_open(tf.name, framework="pt") as f:
-                    meta = f.metadata() or {}
-            assert meta.get("action_mode") == "policy"
+    def test_action_carries_no_request_metadata(self, fmt):
+        """The trajectory's own shape states its DOF, and the mode and
+        embodiment are the caller's request. The payload stays model-agnostic:
+        media tensors plus rates, nothing Cosmos3-shaped."""
+        output = _make_action_output(batch=1, t=4, action_dim=7)
+        loaded = self._load(serialize_visual_gen_output(output, fmt, batch_index=0), fmt)
+        assert loaded["action"].shape == (4, 7)
+        assert set(loaded) == {"action"}
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "pt"])

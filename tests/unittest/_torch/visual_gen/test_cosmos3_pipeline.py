@@ -991,8 +991,6 @@ class TestCosmos3Action:
             raw_action_dim=self.RAW_ACTION_DIM,
             chunk_size=self.ACTION_CHUNK,
         )
-        assert result.action_mode == "policy"
-        assert result.domain_id == 7
 
     def test_forward_dynamics_smoke(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)
@@ -1021,8 +1019,6 @@ class TestCosmos3Action:
             raw_action_dim=self.RAW_ACTION_DIM,
             chunk_size=self.ACTION_CHUNK,
         )
-        assert result.action_mode == "forward_dynamics"
-        assert result.domain_id == 7
 
     def test_inverse_dynamics_smoke(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)
@@ -1051,8 +1047,6 @@ class TestCosmos3Action:
             raw_action_dim=self.RAW_ACTION_DIM,
             chunk_size=NUM_FRAMES - 1,
         )
-        assert result.action_mode == "inverse_dynamics"
-        assert result.domain_id == 7
 
     def test_inverse_dynamics_rejects_short_video(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)

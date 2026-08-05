@@ -35,9 +35,6 @@ def test_visual_gen_output_is_dataclass():
         "action",
         "frame_rate",
         "audio_sample_rate",
-        "raw_action_dim",
-        "action_mode",
-        "domain_id",
         "error",
         "metrics",
     }
@@ -65,9 +62,6 @@ def test_minimal_construction_defaults():
     assert out.video is None
     assert out.audio is None
     assert out.action is None
-    assert out.raw_action_dim is None
-    assert out.action_mode is None
-    assert out.domain_id is None
     assert out.frame_rate is None
     assert out.audio_sample_rate is None
     assert out.error is None
@@ -773,8 +767,8 @@ def test_encoding_not_top_level_reexport():
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_output_has_twelve_fields():
-    """PipelineOutput has the twelve expected fields."""
+def test_pipeline_output_has_nine_fields():
+    """PipelineOutput has the nine expected fields."""
     field_names = {f.name for f in fields(PipelineOutput)}
     assert field_names == {
         "image",
@@ -783,9 +777,6 @@ def test_pipeline_output_has_twelve_fields():
         "action",
         "frame_rate",
         "audio_sample_rate",
-        "raw_action_dim",
-        "action_mode",
-        "domain_id",
         "pre_denoise",
         "denoise",
         "post_denoise",
