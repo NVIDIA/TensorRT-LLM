@@ -45,7 +45,7 @@ from tensorrt_llm._torch.visual_gen.utils import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
-from tensorrt_llm.media.decoding import decode_video_reference_window
+from tensorrt_llm.media.decoding import decode_video_reference_window, video_frame_size
 
 from .defaults import (
     COSMOS3_720P_PARAMS,
@@ -62,6 +62,7 @@ from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
     Cosmos3TransferConfig,
     decode_media_to_uint8_cthw,
+    find_closest_target_size,
     load_or_compute_control_frames,
     pad_temporal_frames,
     resolve_transfer_config,
@@ -339,11 +340,34 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         def resolved(value, field_name):
             return value if value is not None else mode_params[field_name]
 
-        height = resolved(req.params.height, "height")
-        width = resolved(req.params.width, "width")
+        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
+        height, width = req.params.height, req.params.width
+        if height is None and width is None:
+            # Size the output to the reference's aspect when the request asks
+            # for nothing, so a portrait or square source is not center-cropped
+            # into the default landscape bucket. Only when *neither* dimension
+            # is given: a request naming one is stating an intent, and
+            # overriding half of it would be worse than leaving it alone.
+            # Reading the container header costs no GPU and decodes no frame.
+            source = video
+            if source is None and transfer_config is not None:
+                # Transfer can run on precomputed controls alone; then the
+                # control clip is what defines the structure to match.
+                source = next(
+                    (hint.control for hint in transfer_config.ordered_hints if hint.control),
+                    None,
+                )
+            source_size = video_frame_size(source) if source is not None else None
+            if source_size is not None:
+                width, height = find_closest_target_size(*source_size, 720)
+                if self.rank == 0:
+                    logger.info(
+                        f"Cosmos3 fitting output to the source aspect: {width}x{height} (WxH)"
+                    )
+        height = resolved(height, "height")
+        width = resolved(width, "width")
         num_inference_steps = resolved(req.params.num_inference_steps, "num_inference_steps")
         guidance_scale = resolved(req.params.guidance_scale, "guidance_scale")
-        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
 
         return self.forward(
             prompt=req.prompt,

@@ -13,6 +13,7 @@ loudly.
 
 import os
 import pickle
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
@@ -28,6 +29,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_720P_PARAMS,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_PIPELINE_DEFAULTS,
+    VIDEO_RES_SIZE_INFO,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
@@ -294,6 +296,91 @@ class TestTransferMediaHelpers:
                     input_frames=None,
                     device=torch.device("cpu"),
                 )
+
+
+class TestOutputAspectFit:
+    """An unset output size follows the reference's aspect, worker-side.
+
+    Previously only the offline example fitted the aspect, so a served portrait
+    or square reference was center-cropped into the default landscape bucket.
+    The probe reads the container header (no GPU, no frame decoded).
+    """
+
+    REFERENCE = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
+
+    def _infer_req(self, **extra):
+        params = SimpleNamespace(
+            height=None,
+            width=None,
+            num_inference_steps=None,
+            guidance_scale=None,
+            num_frames=COSMOS3_720P_PARAMS["num_frames"],
+            max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
+            frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
+            seed=0,
+            negative_prompt=None,
+            image=None,
+            extra_params=dict(extra),
+        )
+        return SimpleNamespace(params=params, prompt="a prompt")
+
+    def _size(self, req):
+        pipeline = _make_pipeline()  # rank is 0 while dist is uninitialized
+        captured = {}
+        pipeline.forward = lambda **kwargs: captured.update(kwargs)
+        pipeline.infer(req)
+        return captured["width"], captured["height"]
+
+    def test_square_reference_picks_the_square_bucket(self):
+        # The checked-in reference is 64x64, so a real header probe end to end.
+        req = self._infer_req(video=self.REFERENCE.read_bytes())
+        assert self._size(req) == VIDEO_RES_SIZE_INFO["720"]["1,1"]
+
+    # source_hw is (height, width); the bucket table is keyed (width, height).
+    @pytest.mark.parametrize(
+        "source_hw, bucket",
+        [
+            ((320, 192), "9,16"),  # portrait
+            ((192, 320), "16,9"),  # landscape
+            ((1104, 832), "3,4"),  # tall, not 9:16
+            ((832, 1104), "4,3"),  # wide, not 16:9
+            ((600, 600), "1,1"),  # square
+        ],
+    )
+    def test_aspect_selects_the_matching_bucket(self, source_hw, bucket, monkeypatch):
+        monkeypatch.setattr(pipeline_module, "video_frame_size", lambda _data: source_hw)
+        req = self._infer_req(video=b"stand-in for encoded bytes")
+        assert self._size(req) == VIDEO_RES_SIZE_INFO["720"][bucket]
+
+    def test_explicit_dimensions_win(self, monkeypatch):
+        monkeypatch.setattr(pipeline_module, "video_frame_size", lambda _data: (320, 192))
+        req = self._infer_req(video=b"stand-in")
+        req.params.height, req.params.width = 704, 1280
+        assert self._size(req) == (1280, 704)
+
+    def test_a_half_specified_size_is_left_alone(self, monkeypatch):
+        # Overriding the unset half of a stated intent would be worse than
+        # leaving the request on the mode defaults.
+        monkeypatch.setattr(pipeline_module, "video_frame_size", lambda _data: (320, 192))
+        req = self._infer_req(video=b"stand-in")
+        req.params.width = 1280
+        assert self._size(req) == (1280, COSMOS3_720P_PARAMS["height"])
+
+    def test_no_reference_keeps_the_mode_defaults(self):
+        req = self._infer_req()
+        assert self._size(req) == (COSMOS3_720P_PARAMS["width"], COSMOS3_720P_PARAMS["height"])
+
+    def test_unreadable_reference_falls_back_to_defaults(self):
+        # A convenience probe must not fail the request; the real decode still
+        # reports the problem properly.
+        req = self._infer_req(video=b"not a video container")
+        assert self._size(req) == (COSMOS3_720P_PARAMS["width"], COSMOS3_720P_PARAMS["height"])
+
+    def test_transfer_fits_to_a_control_when_there_is_no_video(self, monkeypatch):
+        # Transfer can run on precomputed controls alone.
+        monkeypatch.setattr(pipeline_module, "video_frame_size", lambda _data: (320, 192))
+        req = self._infer_req(edge={"control": b"stand-in"})
+        assert self._size(req) == VIDEO_RES_SIZE_INFO["720"]["9,16"]
 
 
 class TestTransferPreflightValidation:

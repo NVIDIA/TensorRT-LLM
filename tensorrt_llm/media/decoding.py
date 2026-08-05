@@ -107,6 +107,46 @@ def resize_center_crop_uint8(frames: torch.Tensor, target_h: int, target_w: int)
     return x.round_().clamp_(0, 255).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
 
 
+def video_frame_size(data: bytes) -> tuple[int, int] | None:
+    """Read ``(height, width)`` from an encoded clip's container header.
+
+    Demuxing is CPU-side FFmpeg inside PyNvVideoCodec, so this costs no GPU and
+    decodes no frame — the dimensions come straight off the header.
+
+    These are the *coded* dimensions. A container may additionally carry a
+    display matrix (a phone shooting portrait usually records landscape frames
+    plus a 90-degree rotation); the demuxer does not expose it and the decode
+    path does not apply it, so a clip carrying that metadata decodes
+    pixel-identically to the same clip without it. Coded dimensions therefore
+    describe the frames a caller actually receives, which is what a caller
+    sizing its output against them needs.
+
+    Returns ``None`` when the header cannot be read or reports nothing usable,
+    leaving the caller on its own defaults: this is a convenience probe, and a
+    genuinely unreadable stream still fails with a proper error at decode.
+    """
+    try:
+        import PyNvVideoCodec as nvc
+    except ImportError:
+        return None
+
+    position = 0
+
+    def _read(buf: bytearray) -> int:
+        nonlocal position
+        chunk = data[position : position + len(buf)]
+        buf[: len(chunk)] = chunk
+        position += len(chunk)
+        return len(chunk)
+
+    try:
+        demuxer = nvc.CreateDemuxer(_read)
+        height, width = int(demuxer.Height()), int(demuxer.Width())
+    except nvc.PyNvVCException:
+        return None
+    return (height, width) if height > 0 and width > 0 else None
+
+
 def decode_video_reference_window(
     data: bytes,
     *,

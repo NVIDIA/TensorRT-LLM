@@ -28,10 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
-from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
-    TRANSFER_HINT_KEYS,
-    find_closest_target_size,
-)
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import TRANSFER_HINT_KEYS
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -46,15 +43,13 @@ def _resolve_path(path: str) -> str:
     return path
 
 
-def _load_transfer_controls(extra_params: Dict[str, Any]) -> Optional[str]:
+def _load_transfer_controls(extra_params: Dict[str, Any]) -> None:
     """Read precomputed transfer controls into ``control`` bytes, client-side.
 
     A hint may name a control file (``{"edge": "ctrl.mp4"}`` or
     ``{"edge": {"control_path": "ctrl.mp4"}}``); the worker only accepts encoded
-    bytes, so the media is read here. Returns the first control path seen, for
-    output sizing.
+    bytes, so the media is read here.
     """
-    first_path = None
     for key in TRANSFER_HINT_KEYS:
         hint = extra_params.get(key)
         if isinstance(hint, str):
@@ -64,50 +59,8 @@ def _load_transfer_controls(extra_params: Dict[str, Any]) -> Optional[str]:
         control_path = hint.pop("control_path", None)
         if control_path is None:
             continue
-        control_path = _resolve_path(control_path)
-        hint["control"] = Path(control_path).read_bytes()
+        hint["control"] = Path(_resolve_path(control_path)).read_bytes()
         extra_params[key] = hint
-        first_path = first_path or control_path
-    return first_path
-
-
-def _source_frame_size(source_path: str) -> tuple[int, int] | None:
-    """Read ``(height, width)`` from a video container header.
-
-    Demuxing is CPU-side FFmpeg inside PyNvVideoCodec — the decoder this repo
-    already depends on — so it costs no GPU and no extra dependency, and the
-    stream's dimensions come off the header without decoding a frame.
-    """
-    import PyNvVideoCodec as nvc
-
-    data = Path(source_path).read_bytes()
-    position = 0
-
-    def _read(buf: bytearray) -> int:
-        nonlocal position
-        chunk = data[position : position + len(buf)]
-        buf[: len(chunk)] = chunk
-        position += len(chunk)
-        return len(chunk)
-
-    demuxer = nvc.CreateDemuxer(_read)
-    height, width = int(demuxer.Height()), int(demuxer.Width())
-    return (height, width) if height > 0 and width > 0 else None
-
-
-def _fit_output_to_source(params, source_path: str | None) -> None:
-    """Size the output to the bucket whose aspect ratio matches ``source_path``.
-
-    Transfer output resolution comes from the request (as it does for V2V), so
-    the aspect fit happens here, where the file is still at hand.
-    """
-    if source_path is None:
-        return
-    size = _source_frame_size(source_path)
-    if size is None:
-        return
-    params.width, params.height = find_closest_target_size(*size, 720)
-    print(f"Fitting output to the source aspect: {params.width}x{params.height} (WxH)")
 
 
 def load_prompt_file(path: str) -> Dict[str, Any]:
@@ -293,9 +246,9 @@ def main():
     if args.extra_params:
         # Merged last: explicit JSON wins over flag-derived values.
         params.extra_params.update(args.extra_params)
-    control_source = _load_transfer_controls(params.extra_params)
-    if any(params.extra_params.get(key) is not None for key in TRANSFER_HINT_KEYS):
-        _fit_output_to_source(params, args.video_path or control_source)
+    # The pipeline fits the output to the reference's aspect when height/width
+    # are unset, so there is nothing to do client-side.
+    _load_transfer_controls(params.extra_params)
 
     if negative_prompt is None:
         params.negative_prompt = None

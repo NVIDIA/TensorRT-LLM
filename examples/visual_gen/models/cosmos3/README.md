@@ -72,8 +72,9 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 
 # V2V: video-conditioned video (continues the first frames of --video_path).
 # Best results when the prompt describes the input video — e.g. continue a
-# T2V output reusing its original prompt. Output size is fixed (1280x720
-# default); inputs are center-cropped, not aspect-matched.
+# T2V output reusing its original prompt. Output size follows the source's
+# aspect ratio (the closest supported bucket) unless the request sets
+# height/width; the reference is center-cropped to whatever size is chosen.
 python cosmos3.py --model /path/to/Cosmos3-Nano \
     --prompt_file prompts/v2v.json \
     --video_path /path/to/Cosmos3-Nano/assets/example_i2v_output.mp4 \
