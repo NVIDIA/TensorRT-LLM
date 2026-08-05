@@ -88,6 +88,7 @@ COSMOS3_DEFAULT_SYSTEM_PROMPT = (
 COSMOS3_T2I_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate images from a give prompt."
 )
+COSMOS3_V2V_FLOW_SHIFT = 10.0
 COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
 COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
@@ -510,6 +511,16 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             base = getattr(self, "_base_audio_scheduler", None) or self.audio_scheduler
         else:
             base = getattr(self, "_base_scheduler", None) or self.scheduler
+        # Only configurations this checkpoint can resolve to on its own are
+        # memoized. ``flow_shift`` is a caller-supplied float with no bounded
+        # domain, so caching every value seen would let a client grow the cache
+        # for the worker's lifetime; a one-off value builds a scheduler that is
+        # discarded with the request instead.
+        if target_shift is not None and target_shift not in self._cacheable_flow_shifts():
+            return self.sampling.set_flow_shift(
+                base, target_shift, use_karras_sigmas=use_karras_sigmas
+            )
+
         cache = getattr(self, "_scheduler_cache", None)
         if cache is None:
             cache = self._scheduler_cache = {}
@@ -519,6 +530,48 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 base, target_shift, use_karras_sigmas=use_karras_sigmas
             )
         return cache[key]
+
+    def _cacheable_flow_shifts(self) -> frozenset:
+        """Flow shifts reachable without a caller override, for this checkpoint.
+
+        Derived rather than fixed so a new family or mode table is picked up
+        automatically: the per-mode generation tables, the checkpoint's own
+        shift, and V2V's stronger shift. Entries are still created lazily, so a
+        mode that is never served never builds one.
+        """
+        cached = getattr(self, "_cacheable_flow_shifts_cache", None)
+        if cached is not None:
+            return cached
+        shifts = {COSMOS3_V2V_FLOW_SHIFT}
+        checkpoint_shift = getattr(self.sampling, "checkpoint_flow_shift", None)
+        if checkpoint_shift is not None:
+            shifts.add(float(checkpoint_shift))
+        for mode in ("video", "image"):
+            table = COSMOS3_GENERATION_DEFAULTS.get((self.family, mode)) or {}
+            mode_shift = table.get("flow_shift")
+            if mode_shift is not None:
+                shifts.add(float(mode_shift))
+        cached = self._cacheable_flow_shifts_cache = frozenset(shifts)
+        return cached
+
+    def _release_scheduler_solver_state(self) -> None:
+        """Drop the multistep solver's retained model outputs after a request.
+
+        UniPC keeps ``solver_order`` previous outputs, which are latent-sized --
+        tens of MB of device memory that a cached scheduler would otherwise pin
+        until its next use. ``set_timesteps`` resets them at the start of every
+        request anyway, so this only shortens how long they are held; it frees
+        references rather than allocating, and generation is strictly serial, so
+        nothing else can be mid-loop on these instances.
+        """
+        for scheduler in (getattr(self, "_scheduler_cache", None) or {}).values():
+            order = getattr(getattr(scheduler, "config", None), "solver_order", None)
+            if order is None:
+                continue
+            if getattr(scheduler, "model_outputs", None) is not None:
+                scheduler.model_outputs = [None] * order
+            if getattr(scheduler, "timestep_list", None) is not None:
+                scheduler.timestep_list = [None] * order
 
     def infer(self, req):
         extra_params = req.params.extra_params or {}
@@ -1131,7 +1184,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             mode_shift = self.sampling.checkpoint_flow_shift
         if is_v2v:
             # V2V wants a stronger shift and the uniform sigma schedule.
-            target_shift = 10.0 if flow_shift is None else flow_shift
+            target_shift = COSMOS3_V2V_FLOW_SHIFT if flow_shift is None else flow_shift
             target_karras = False
         else:
             target_shift = mode_shift if flow_shift is None else flow_shift
@@ -1472,6 +1525,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         else:
             latents = denoise_result
             audio_latents = None
+
+        self._release_scheduler_solver_state()
 
         timer.mark_post_start()
 

@@ -944,6 +944,61 @@ class TestSamplingRecipeMatrix:
         assert float(scheduler.config.flow_shift) == 3.0
 
 
+class TestSchedulerCacheBounds:
+    """``flow_shift`` is a caller-supplied float, so the cache must not track it.
+
+    Only shifts this checkpoint can resolve to on its own are memoized; a one-off
+    value gets a scheduler that is discarded with the request, so a client cannot
+    grow the cache for the worker's lifetime.
+    """
+
+    def _pipeline(self, family="nemotron_dense", checkpoint_shift=3.0):
+        pipeline = object.__new__(pipeline_module.Cosmos3OmniMoTPipeline)
+        pipeline.family = family
+        pipeline.sampling = SimpleNamespace(
+            checkpoint_flow_shift=checkpoint_shift,
+            set_flow_shift=lambda base, shift, **kw: SimpleNamespace(shift=shift, **kw),
+        )
+        pipeline._base_scheduler = SimpleNamespace()
+        pipeline._base_audio_scheduler = SimpleNamespace()
+        pipeline._scheduler_cache = {}
+        pipeline._cacheable_flow_shifts_cache = None
+        return pipeline
+
+    def test_cacheable_set_is_derived_from_the_mode_tables(self):
+        pipeline = self._pipeline()
+        # Edge declares 3.0 in both mode tables; V2V contributes its stronger shift.
+        assert pipeline._cacheable_flow_shifts() == frozenset(
+            {3.0, pipeline_module.COSMOS3_V2V_FLOW_SHIFT}
+        )
+
+    def test_arbitrary_shifts_never_enter_the_cache(self):
+        pipeline = self._pipeline()
+        for i in range(200):
+            pipeline._scheduler_for(7.0 + i * 1e-3)
+        assert pipeline._scheduler_cache == {}
+
+    def test_declared_shifts_are_memoized_and_shared(self):
+        pipeline = self._pipeline()
+        first = pipeline._scheduler_for(3.0)
+        assert pipeline._scheduler_for(3.0) is first, "a declared shift must be reused"
+        assert len(pipeline._scheduler_cache) == 1
+        # Streams key separately: they share knobs but must not share the object.
+        assert pipeline._scheduler_for(3.0, stream="audio") is not first
+
+    def test_release_drops_retained_solver_state(self):
+        pipeline = self._pipeline()
+        scheduler = SimpleNamespace(
+            config=SimpleNamespace(solver_order=2),
+            model_outputs=[torch.zeros(4), torch.zeros(4)],
+            timestep_list=[torch.zeros(1), torch.zeros(1)],
+        )
+        pipeline._scheduler_cache = {("k",): scheduler}
+        pipeline._release_scheduler_solver_state()
+        assert scheduler.model_outputs == [None, None]
+        assert scheduler.timestep_list == [None, None]
+
+
 class TestEnvelopeAdvisory:
     def _warnings(self, monkeypatch):
         records = []

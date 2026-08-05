@@ -506,6 +506,27 @@ class TestConfigCompatDefaults:
         apply_pretrained_config_compat_defaults(config)
         assert vars(config) == snapshot
 
+    @pytest.mark.parametrize("rope_scaling", [None, {}], ids=["absent", "empty"])
+    def test_rope_type_tolerates_missing_rope_scaling(self, rope_scaling):
+        """``rope_axes_dim`` alone is a supported shape, so reading ``rope_type``
+        must not fail before ``resolve_rope_axes_dim`` gets to honour it."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3 import transformer_cosmos3 as tf
+
+        config = SimpleNamespace(
+            hidden_size=64,
+            head_dim=16,
+            rope_axes_dim=[4, 2, 2],
+            rope_theta=10000.0,
+            max_position_embeddings=128,
+            rope_scaling=rope_scaling,
+        )
+        apply_pretrained_config_compat_defaults(config)
+        # Construct for real: the point is that __init__ reaches the resolver
+        # instead of raising AttributeError on the missing block.
+        embedding = tf.Qwen3VLTextRotaryEmbedding(SimpleNamespace(pretrained_config=config))
+        assert embedding.rope_type == "default"
+        assert embedding.mrope_section == [4, 2, 2]
+
 
 class TestI2V4StepConfigShape:
     """The Image2Video-4Step conversion drops the audio/action towers
