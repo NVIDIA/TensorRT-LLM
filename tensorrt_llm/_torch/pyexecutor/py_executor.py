@@ -6057,6 +6057,9 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
+        # This path allocates/commits KV before the main-loop sync, so refresh the
+        # retention clock here too or disagg-gen retention would use a stale value.
+        self._sync_retention_clock()
         if fitting_disagg_gen_init_requests:
             disagg_gen_init_to_prepare = ScheduledRequests()
             disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests

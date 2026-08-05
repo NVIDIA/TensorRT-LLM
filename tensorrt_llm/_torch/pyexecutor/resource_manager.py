@@ -1521,12 +1521,18 @@ class KVCacheManager(BaseResourceManager):
                 packed.append(beam[-1])
         return packed
 
-    def are_blocks_ready(self, request) -> bool:
+    def are_blocks_ready(self, request: LlmRequest) -> bool:
         """True when every KV block this request holds has its disk read landed (detached onboard).
         Always True for requests with no in-flight disk read, so it is cheap for the common case."""
         return self.impl.are_blocks_ready(request.py_request_id)
 
     def set_retention_clock(self, now_ns: int) -> None:
+        """Set the rank-consistent clock used for disk-tier retention decisions.
+
+        Args:
+            now_ns: Timestamp in nanoseconds, broadcast from the leader so every
+                rank anchors and evaluates retention against the same value.
+        """
         self.impl.set_retention_clock(now_ns)
 
     def get_num_free_blocks(self) -> int:
