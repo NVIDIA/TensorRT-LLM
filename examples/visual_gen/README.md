@@ -10,6 +10,7 @@ for feature details.
 | [`quickstart_example.py`](quickstart_example.py) | Minimal VisualGen API example |
 | [`models/`](models/) | Per-model example scripts |
 | [`configs/`](configs/) | Shared `VisualGenArgs` YAMLs (used by `--visual_gen_args` and `trtllm-serve`) |
+| [`skip_softmax/`](skip_softmax/) | Calibrated Skip Softmax recipes and checkpoint overlay helpers |
 | [`serve/`](serve/) | `trtllm-serve` usage, benchmarking, and clients |
 
 ## Usage
@@ -40,6 +41,10 @@ python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered
 python models/qwen_image_edit.py --visual_gen_args configs/qwen-image-edit-2511-fp4-1gpu.yaml --image /path/to/source.png --prompt "Make the image look like a watercolor painting"
 python models/hunyuan_t2v.py --visual_gen_args configs/hunyuan-t2v-fp8-1gpu.yaml
 ```
+
+For Wan 2.2 Skip Softmax Attention, apply the component calibration overlays and use the packaged
+VisualGen configuration in
+[`skip_softmax/wan2.2-t2v-a14b/`](skip_softmax/wan2.2-t2v-a14b/).
 
 Install deps from the repo root: `pip install -r requirements-dev.txt`.
 
