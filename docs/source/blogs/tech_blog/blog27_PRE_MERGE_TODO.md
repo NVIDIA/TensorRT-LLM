@@ -11,14 +11,10 @@
 
 ## External reproduction package
 
-- [ ] **Waiting on ModelOpt:** publish the calibrated Skip Softmax configuration
-  in a public location. Prefer
-  `examples/visual_gen/skip_softmax/wan2.2-t2v-a14b/` so the article can use a
-  repository-local, component-aware merge helper. Once available, link it from
-  the reproduction section and verify that it contains the component-specific
-  `sparse_attention_config` blocks, calibration formulas, and ignore lists for
-  both transformers. Test the documented helper from a clean Hugging Face
-  download. The internal checkpoint itself is not a publication artifact.
+- [x] Publish the two component-specific ModelOpt calibration overlays, merge
+  helper, and VisualGen YAML under
+  `examples/visual_gen/skip_softmax/wan2.2-t2v-a14b/`, link them from the blog,
+  and verify the helper against clean public checkpoint configs.
 - [x] Correct the configuration guidance: one direct
   `threshold_scale_factor` does not reproduce this dual-transformer result,
   because the two transformer components use different calibration formulas.
@@ -27,7 +23,7 @@
 - [ ] Publish a runnable sweep harness that records the full warmup, CUDA
   synchronization, timed-forward, dense-anchor, eager-reference, and
   multi-GPU scheduling procedures.
-- [ ] Record the TensorRT-LLM release image used for the sweep and the commands
+- [x] Record the TensorRT-LLM release image used for the sweep and the commands
   needed to run it. The final blog should identify the release image only,
   without source commit or feature-PR identifiers.
 - [ ] Publish the LPIPS evaluator with pinned PyTorch, torchvision, LPIPS, and

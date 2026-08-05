@@ -4,13 +4,17 @@ By NVIDIA TensorRT-LLM Team
 
 ## Introduction
 
-Generating an 81-frame, 1280×720 video with Wan 2.2 T2V-A14B applies its dual transformers across
-50 denoising steps. In a representative compiled BF16 profile on NVIDIA B200, attention accounts
-for 71.7% of end-to-end latency and linear-layer GEMMs for another 20.8%. Together, they occupy
-more than 90% of runtime, motivating optimizations for both parts of the workload.
+A video generator does not create all 81 frames in one pass. Wan 2.2 T2V-A14B revisits the full
+spatiotemporal sequence across 50 denoising steps, switching from a high-noise transformer to a
+low-noise transformer as the video takes shape. At 1280×720, most of that repeated computation
+lands in two places: attention and the linear layers around it.
+
+In the compiled BF16 pipeline on NVIDIA B200, attention consumes 71.7% of pipeline-forward time and
+linear-layer GEMMs another 20.8%. That concentration gives us a clear optimization strategy: make
+the GEMMs cheaper, make dense attention cheaper, and avoid attention work that contributes little.
 
 <p align="center">
-  <img src="../media/tech_blog27_bf16_time_breakdown.png" alt="Pie chart showing that a representative compiled dense BF16 path spends 71.7% of end-to-end latency in attention, 20.8% in GEMMs, and 7.5% in other work" width="1080">
+  <img src="../media/tech_blog27_bf16_time_breakdown.png" alt="Pie chart showing that a compiled dense BF16 path spends 71.7% of pipeline-forward time in attention, 20.8% in GEMMs, and 7.5% in other work" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 1. Pipeline breakdown for the target Wan 2.2 workload with
@@ -78,16 +82,14 @@ that request to a `threshold_scale_factor` for each transformer component; the k
 factor by the sequence length to obtain its runtime threshold. The achieved skip rate can vary by
 layer and timestep.
 
-Wan 2.2 has separate high-noise and low-noise transformer components. To use `target_sparsity`
-with the public checkpoint, the TensorRT-LLM helper merges a calibrated `sparse_attention_config`
-overlay into both `transformer/config.json` and `transformer_2/config.json`. Each component keeps
-its own calibration formula, while the rest of both configurations remains unchanged. The
+Wan 2.2 has separate high-noise and low-noise transformer components. The
+[Wan 2.2 Skip Softmax example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b)
+provides a ModelOpt calibration overlay for each one, plus a helper that merges only
+`sparse_attention_config` into `transformer/config.json` and `transformer_2/config.json`. Because
+the overlays use different coefficients, the same `target_sparsity` becomes a component-specific
+`threshold_scale_factor`. The
 [VisualGen sparse-attention guide](../../visual-gen/features/sparse-attention.md) documents the
 checkpoint schema and precedence rules.
-
-<!-- TODO(blog27, remove before merge): Add the approved ModelOpt-produced calibration overlays
-and component-aware merge helper to the TensorRT-LLM example directory, then link its GitHub main
-URL here. -->
 
 The second control, `disabled_until_timestep`, keeps the beginning of denoising dense. Denoising
 moves from a normalized timestep near 1 toward 0, and skipping begins only after the timestep falls
@@ -170,105 +172,48 @@ conservative cutoff, then raise target sparsity only when additional speed is ne
 
 ## Reproduction
 
-The following flow runs the feature combination used at point ②. Reproducing the complete sweep
-also requires the prompt manifest, offline timing harness, and evaluation assets described below.
-Use the TensorRT-LLM release image `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19` with a
-TensorRT-LLM checkout mounted at `$TRTLLM_ROOT` so the calibration package is available inside the
-container.
+The checked-in
+[Wan 2.2 Skip Softmax example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b)
+contains the calibration overlays, merge helper, and VisualGen YAML for point ②. The published
+numbers use the TensorRT-LLM release image
+`nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19`. The commands below assume that environment, a local
+copy of the public Wan 2.2 checkpoint, and a TensorRT-LLM checkout.
 
-First, materialize the public Wan 2.2 checkpoint so its component configurations can be updated:
+### Enable the optimized path
 
-```bash
-export MODEL_DIR="$PWD/Wan2.2-T2V-A14B-Diffusers"
-hf download Wan-AI/Wan2.2-T2V-A14B-Diffusers --local-dir "$MODEL_DIR"
-```
-
-Once the approved calibration package is published, apply its high-noise and low-noise overlays to
-the corresponding transformer configurations:
+Apply the high-noise and low-noise calibration overlays to their matching transformer configs:
 
 ```bash
-export TRTLLM_ROOT=/workspace/TensorRT-LLM
-python "$TRTLLM_ROOT/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b/apply_calibration.py" \
-    --model-dir "$MODEL_DIR"
+export MODEL_DIR=/path/to/Wan2.2-T2V-A14B-Diffusers
+export TRTLLM_ROOT=/path/to/TensorRT-LLM
+export EXAMPLE_DIR="$TRTLLM_ROOT/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b"
+
+python "$EXAMPLE_DIR/apply_calibration.py" --model-dir "$MODEL_DIR"
 ```
 
-<!-- TODO(blog27, remove before merge): Add the calibration overlays and helper at the path used
-above, or update this command and link to their approved public location. Verify the command from
-a clean download of the Hugging Face checkpoint. -->
-
-Save the following feature configuration as `nvfp4_sage_skip.yaml`:
-
-```yaml
-quant_config:
-  quant_algo: NVFP4
-  dynamic: true
-
-attention_config:
-  backend: TRTLLM
-  quant_attention_config:
-    qk_dtype: int8
-    v_dtype: fp8
-    q_block_size: 1
-    k_block_size: 16
-    v_block_size: 1
-  sparse_attention_config:
-    algorithm: skip_softmax
-    target_sparsity: 0.65
-    disabled_until_timestep: 0.86
-
-torch_compile_config:
-  enable: true
-  enable_autotune: false
-
-cuda_graph_config:
-  enable: false
-
-parallel_config:
-  cfg_size: 1
-  ulysses_size: 1
-```
-
-Start VisualGen with the local checkpoint and configuration:
+The helper preserves the rest of each checkpoint config and is safe to run again. The packaged
+[`visual_gen.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b/visual_gen.yaml)
+then selects `target_sparsity=0.65` and `disabled_until_timestep=0.86`, enables dynamic NVFP4 GEMM
+quantization, and uses the INT8/FP8 SAGE recipe:
 
 ```bash
-trtllm-serve "$MODEL_DIR" --visual_gen_args nvfp4_sage_skip.yaml
+trtllm-serve "$MODEL_DIR" --visual_gen_args "$EXAMPLE_DIR/visual_gen.yaml"
 ```
 
-From another shell in the same running container, export `MODEL_DIR` again and generate the
-representative workload:
+### Match the measurement protocol
 
-```bash
-export MODEL_DIR="$PWD/Wan2.2-T2V-A14B-Diffusers"
-python -m tensorrt_llm.serve.scripts.benchmark_visual_gen \
-    --model "$MODEL_DIR" \
-    --backend openai-videos \
-    --prompt "A racehorse galloping on a dirt track, kicking up dust, side tracking shot, dramatic lighting" \
-    --num-prompts 1 \
-    --size 1280x720 \
-    --num-frames 81 \
-    --fps 16 \
-    --num-inference-steps 50 \
-    --guidance-scale 5.0 \
-    --seed 1007 \
-    --extra-body '{"max_sequence_length":512,"extra_params":{"guidance_scale_2":4.0}}' \
-    --max-concurrency 1 \
-    --no-test-input \
-    --save-result
-```
+Figures 2 and 3 measure the pipeline forward rather than HTTP handling or video encoding. For each
+prompt, run one full 50-step warmup at the exact 1280×720, 81-frame shape, synchronize the GPU,
+then time one complete 50-step forward. Average the resulting times over the seven prompts.
 
-This serving flow runs NVFP4 GEMMs, SAGE, and Skip Softmax together. The latency values in Figures
-2 and 3 use a narrower pipeline-forward protocol: the sweep bypasses the
-pipeline's generic multi-shape warmup, performs one full warmup at the exact 1280×720, 81-frame
-shape, synchronizes the GPU, and then times one complete 50-step forward for each prompt. The seven
-times are averaged. HTTP handling and video encoding are outside that interval.
+The sweep enables `torch.compile` but not CUDA graphs, because that combination was unsupported in
+the release used here. It also disables the generic multi-shape pipeline warmup in favor of the
+exact-shape warmup above. As a result, `enable_autotune=false` does not change this benchmark:
+TensorRT-LLM invokes that autotuning from the generic warmup that the sweep bypasses.
 
-The compilation controls mirror the measured sweep rather than prescribe production defaults.
-`torch.compile` is enabled, while CUDA graphs are disabled because their combination was not
-supported by the release used for this experiment. `enable_autotune` was false; this setting did not
-affect the sweep because autotuning was invoked by the built-in warmup, which the sweep bypassed.
-For quality evaluation, generate the eager BF16 references with the same prompts and seeds, compute
-AlexNet LPIPS for corresponding frames, average over each 81-frame video, and then average over the
-prompt set.
+For the quality axis, generate an eager BF16 reference with the same prompt and seed, compute
+AlexNet LPIPS between corresponding frames, average over the 81 frames, and then average over the
+seven prompts.
 
 <!-- TODO(blog27, remove before merge): Link the exact seven-prompt manifest, offline timing
 harness, LPIPS evaluator environment, result CSV, and figure-generation scripts after they are
@@ -292,6 +237,3 @@ pairing more efficient work on each GPU with rack-scale throughput.
 1. [Scaling Video Generation Across NVL72 Rack with TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md)
 2. [SageAttention: Accurate 8-Bit Attention for Plug-and-play Inference Acceleration](https://arxiv.org/abs/2410.02367)
 3. [BLASST: Dynamic BLocked Attention Sparsity via Softmax Thresholding](https://arxiv.org/abs/2512.12087)
-4. [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer)
-5. [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers)
-6. [TensorRT-LLM Visual Generation](../../models/visual-generation.md)
