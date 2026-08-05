@@ -25,7 +25,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from tensorrt_llm import VisualGen, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import TRANSFER_HINT_KEYS
@@ -43,7 +43,7 @@ def _resolve_path(path: str) -> str:
     return path
 
 
-def _load_transfer_controls(extra_params: Dict[str, Any]) -> None:
+def _load_transfer_controls(extra_params: dict[str, Any]) -> None:
     """Read precomputed transfer controls into ``control`` bytes, client-side.
 
     A hint may name a control file (``{"edge": "ctrl.mp4"}`` or
@@ -59,11 +59,16 @@ def _load_transfer_controls(extra_params: Dict[str, Any]) -> None:
         control_path = hint.pop("control_path", None)
         if control_path is None:
             continue
+        if not isinstance(control_path, str) or not control_path.strip():
+            raise ValueError(
+                f"--extra_params {key}.control_path must be a non-empty file path, "
+                f"got {control_path!r}."
+            )
         hint["control"] = Path(_resolve_path(control_path)).read_bytes()
         extra_params[key] = hint
 
 
-def _json_object(text: str) -> Dict[str, Any]:
+def _json_object(text: str) -> dict[str, Any]:
     """Argparse type for a JSON *object*.
 
     ``json.loads`` alone also accepts arrays, scalars and null, which then
@@ -80,7 +85,7 @@ def _json_object(text: str) -> Dict[str, Any]:
     return value
 
 
-def load_prompt_file(path: str) -> Dict[str, Any]:
+def load_prompt_file(path: str) -> dict[str, Any]:
     """Load a Cosmos3 omni prompt JSON (``prompt``, optional ``vision_path``, etc.)."""
     resolved = _resolve_path(path)
     with open(resolved, encoding="utf-8") as f:
@@ -94,14 +99,14 @@ def load_prompt_file(path: str) -> Dict[str, Any]:
 
 def resolve_prompt_and_options(
     *,
-    prompt: Optional[str],
-    prompt_file: Optional[str],
-    image_path: Optional[str],
+    prompt: str | None,
+    prompt_file: str | None,
+    image_path: str | None,
     enable_audio: bool,
     output_type: str,
-) -> tuple[str, Optional[str], bool, str]:
+) -> tuple[str, str | None, bool, str]:
     """Merge CLI args with optional prompt-file defaults."""
-    prompt_data: Dict[str, Any] = {}
+    prompt_data: dict[str, Any] = {}
     if prompt_file is not None:
         prompt_data = load_prompt_file(prompt_file)
 
