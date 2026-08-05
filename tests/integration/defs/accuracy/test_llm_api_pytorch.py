@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -8151,22 +8152,35 @@ class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
     )
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_device_memory(183000)
     def test_nvfp4(self):
-        """NVFP4 text accuracy on GSM8K and MMLU (Blackwell).
+        """NVFP4 text accuracy on GSM8K and MMLU (Blackwell, TP=4).
 
         Both references are the cached SGLang NVFP4 measurements the bring-up
         paired against; see references/gsm8k.yaml and references/mmlu.yaml for
-        the provenance and the TRT-side measurements.
+        the provenance and the TRT-side measurements. Those were taken at TP=4
+        with free_gpu_memory_fraction=0.6, so the runtime configuration here
+        has to match or the numbers are not comparable.
+
+        TP=4 is not a tuning choice: the checkpoint does not fit on one
+        Blackwell GPU at this KV fraction, so the default TP=1 made this test
+        unrunnable while it was listed in the test-db and QA function lists.
         """
         with LLM(
                 self.MODEL_PATH,
+                tensor_parallel_size=4,
                 max_num_tokens=self.MAX_NUM_TOKENS,
                 kv_cache_config=self.kv_cache_config,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            # A fresh SamplingParams per task: AccuracyTask.evaluate sets
+            # truncate_prompt_tokens on the object in place when it is None, so
+            # sharing one instance leaks GSM8K's input budget into MMLU and
+            # MMLU never applies its own.
             for task in (GSM8K(self.MODEL_NAME), MMLU(self.MODEL_NAME)):
                 task.evaluate(
                     llm,
-                    sampling_params=self.sampling_params,
+                    sampling_params=copy.deepcopy(self.sampling_params),
                     extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
                 )
