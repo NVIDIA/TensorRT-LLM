@@ -16,6 +16,8 @@ import pytest
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm.mapping import Mapping
 
+pytestmark = pytest.mark.cpu_only
+
 
 def get_mpi_info():
     """Get MPI rank and world size, returns (0, 1) if MPI is not available."""

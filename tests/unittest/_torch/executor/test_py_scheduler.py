@@ -41,6 +41,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 )
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
+pytestmark = pytest.mark.cpu_only
+
 
 @dataclass
 class MockPrefixReuseSummary:

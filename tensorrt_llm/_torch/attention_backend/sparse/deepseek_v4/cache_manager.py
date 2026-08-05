@@ -175,6 +175,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     # For other attention types, block size is tokens_per_block.
     compressed_block_sizes: List[int]
 
+    def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int:
+        """Retain DeepSeek-V4's max-length pool-sizing model by default."""
+        return (
+            kv_cache_config.avg_seq_len
+            if kv_cache_config.avg_seq_len is not None
+            else self.max_seq_len
+        )
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,

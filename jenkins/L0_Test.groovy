@@ -169,6 +169,17 @@ K8S_INFRA_RETRY_MAX = 1
 // to fail, we treat it as a timeout.
 SLURM_TIMEOUT_RETRY_FRACTION = 0.9
 
+// SLURM states in which the job is still alive (no terminal verdict yet). When a
+// monitor/agent exception surfaces while the job is in one of these, the failure
+// is a transient infra blip (lost SSH/agent) -- not a test result -- so the stage
+// should retry rather than defer an opaque exception to the classifier (which
+// could mistake it for a test failure and not retry). Mirrors the active-state
+// set the sbatch resubmit guard reuses an existing job on.
+SLURM_NON_TERMINAL_STATES = [
+    "RUNNING", "PENDING", "CONFIGURING", "COMPLETING",
+    "REQUEUED", "RESIZING", "SUSPENDED", "SIGNALING", "STOPPED",
+]
+
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
 // were originally inline here, but the Jenkins script-security sandbox
@@ -286,7 +297,7 @@ def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath)
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
-def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="") {
+def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="", boolean suppressTestReporting=false) {
     CloudManager.withSlurmSshCredentialRemotes(pipeline, clusterName, cluster) { remotes ->
         // Pin one reachable frontend for the whole collect: every download targets
         // the same node workspace (/home/svc_tensorrt/bloom/scripts/${nodeName}),
@@ -402,8 +413,10 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             }
         }
 
-        if (hasTimeoutTest || downloadResultSucceed) {
+        if ((hasTimeoutTest || downloadResultSucceed) && !suppressTestReporting) {
             junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+        } else if (suppressTestReporting) {
+            echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing junit() because a retry is still planned"
         }
     }
 }
@@ -662,6 +675,13 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, du
     }
 }
 
+// SLURM job IDs are digit-only. Not String.isNumber(): that is a
+// BigDecimal-style parse, so values like "1.5" pass and later feed
+// invalid IDs into scancel/sacct/scontrol.
+def isValidSlurmJobId(def slurmJobID) {
+    return slurmJobID && slurmJobID.toString() ==~ /\d+/
+}
+
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
@@ -679,7 +699,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             returnStdout: true
         ).trim()
 
-        if (!slurmJobID || !slurmJobID.isNumber()) {
+        if (!isValidSlurmJobId(slurmJobID)) {
             echo "Slurm job may not submit successfully. No job ID found."
         } else {
             Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
@@ -723,15 +743,23 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
 
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
-        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+        // A missing/non-numeric ID means the job was never submitted (or its ID
+        // never captured); running the dump anyway executes `scancel null` /
+        // `scontrol show job null`, whose "Invalid job id specified" output then
+        // shows up in failure analysis as a bogus error signature.
+        if (!isValidSlurmJobId(slurmJobID)) {
+            Utils.exec(pipeline, script: "echo No SLURM job ID captured for node ${nodeName}; skipping job cleanup dump")
+        } else {
+            Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
-        Utils.exec(
-            pipeline,
-            script: Utils.sshUserCmd(
-                remote,
-                "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
+            Utils.exec(
+                pipeline,
+                script: Utils.sshUserCmd(
+                    remote,
+                    "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
+                )
             )
-        )
+        }
 
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
 
@@ -871,7 +899,7 @@ def sweepOrphanedSlurmResources(pipeline) {
 // Best-effort: any SSH/sacct error returns null so callers fall back to the
 // duration heuristic rather than failing the stage.
 def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID) {
-    if (!slurmJobID || !slurmJobID.toString().isNumber()) {
+    if (!isValidSlurmJobId(slurmJobID)) {
         return null
     }
     String state = null
@@ -896,7 +924,11 @@ def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, S
     return state
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null)
+boolean isNonTerminalSlurmState(String state) {
+    return state != null && SLURM_NON_TERMINAL_STATES.contains(state.toUpperCase(java.util.Locale.ROOT))
+}
+
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -979,8 +1011,17 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // node once the pod is gone). Deregistered when cleanup actually runs.
                 registerSlurmResource(stageName, [clusterName: partition.clusterName, nodeName: nodeName, slurmJobId: slurmJobID, usedSbatch: false])
 
-                if (!slurmJobID || !slurmJobID.isNumber()) {
+                if (!isValidSlurmJobId(slurmJobID)) {
                     echo "Slurm job did not submit successfully. No job ID found.\nSubmission output:\n${slurmSubmitOutput}"
+                    // The job never entered the SLURM queue, so nothing ran on any
+                    // node: retryable infra by construction. Failing fast here also
+                    // keeps the node-wait loop below (up to 15h) from polling a
+                    // bogus job ID.
+                    throw new InfraFailure(
+                        "SLURM agent submission for ${stageName} produced no usable job ID " +
+                        "(none or a non-numeric value in the submission output); " +
+                        "the job never entered the queue.",
+                        null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-submit-no-jobid>")
                 }
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
                 Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
@@ -1172,7 +1213,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         }
         long executeStartMs = System.currentTimeMillis()
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations)
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -1203,6 +1244,14 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     e)
             }
 
+            if (isNonTerminalSlurmState(slurmState)) {
+                throw new InfraFailure(
+                    "SLURM job ${slurmJobID} for ${stageName} is still in non-terminal state ${slurmState} " +
+                    "(${elapsedMin}min of ${walltimeMin}min walltime); the monitor lost contact while the job was " +
+                    "alive (transient infra), so this is not a test failure. Original failure: ${e.message}",
+                    e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
+            }
+
             echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} terminal state=${slurmState ?: 'unknown'}, " +
                  "ran ${elapsedMin}min of ${walltimeMin}min walltime; deferring to failure classifier."
             throw e
@@ -1229,7 +1278,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null)
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
@@ -1256,7 +1305,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             // Copy CPP test result
             sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
             sh "ls -al ${stageName}/"
-        }, false, postTag)
+        }, false, postTag, true, retryContext)
     }
 }
 // End of Methods to run Slurm job with Jenkins Agent
@@ -1302,6 +1351,13 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " NCCL_DEBUG=INFO"
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // Persist the AutoTuner profiling cache to a CONTAINER-LOCAL, volatile path so
+    // that repeated tactic profiling is reused across testcases within one stage.
+    // /tmp lives on the container overlay (srun --no-container-mount-home / fresh
+    // pod), so the cache is never written to the host and vanishes when the stage
+    // container is destroyed. Never point this at a bind-mounted / shared path:
+    // the AutoTuner cache uses fcntl.lockf, which is unreliable over NFS.
+    extraInternalEnv += " TLLM_AUTOTUNER_CACHE_PATH=/tmp/trtllm_autotuner_cache/autotuner_cache.json"
     // CBTS stages put cbts_plugin on PYTHONPATH (via ${VAR:-} for set -u safety) plus the marker/config env vars sitecustomize.py reads in subprocesses.
     if (cbtsMode) {
         def cbtsScriptDir = "${llmSrc}/jenkins/scripts/cbts/coverage_utils"
@@ -1361,7 +1417,7 @@ def getPytestBaseCommandLine(
     if (stageName.contains("-Ray-")) {
         testCmdLine += ["--run-ray"]
     }
-    def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only and not disabled" : "not cpu_only"
+    def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
     if (ENABLE_UPLOAD_TEST_RESULTS) {
         testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
@@ -1409,7 +1465,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null)
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1430,6 +1486,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
     def stageIsInterrupted = false
+    // Captured so the finally can suppress this attempt's junit when the failure is
+    // a retryable infra failure (a retry follows) -- otherwise a stage that fails
+    // an intermediate attempt and passes on retry leaves the build UNSTABLE.
+    def caughtStageError = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -1823,7 +1883,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         --script-prefix ${scriptLaunchPrefixPathLocal} \\
                         --srun-args ${scriptLaunchSrunArgsPathLocal} \\
                         --split-group ${splitId} \\
-                        --stage-name ${stageName}
+                        --stage-name ${stageName} \\
+                        --cluster-name ${partition.clusterName}
                     """
                 } else {
                     if(nodeCount > 1) {
@@ -1931,13 +1992,26 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def slurmMetadata = captureSlurmWorkspaceMetadata(pipeline, remote, jobWorkspace, placementContext, stageName)
                 def slurmJobId = slurmMetadata.slurmJobId
                 if (!slurmJobId) {
+                    // `|| true` so a missing file (submission never wrote it) yields
+                    // an empty string and reaches the typed throw below, instead of a
+                    // generic "script returned exit code 1" the classifier can't act on.
                     slurmJobId = Utils.exec(
                         pipeline,
-                        script: Utils.sshUserCmd(remote, "\"cat ${jobWorkspace}/slurm_job_id.txt\""),
+                        script: Utils.sshUserCmd(remote, "\"cat ${jobWorkspace}/slurm_job_id.txt 2>/dev/null || true\""),
                         returnStdout: true,
                         numRetries: 3
                     ).trim()
                     recordSlurmPlacementContext(placementContext, slurmJobId, null, stageName)
+                }
+                if (!isValidSlurmJobId(slurmJobId)) {
+                    // The job never entered the SLURM queue (sbatch failed or the ID
+                    // was never captured), so nothing ran on any node: retryable
+                    // infra by construction, and node-avoidance has nothing to avoid.
+                    throw new InfraFailure(
+                        "SLURM job submission for ${stageName} produced no usable job ID " +
+                        "(slurm_job_id.txt missing, empty, or non-numeric in ${jobWorkspace}); " +
+                        "the job never entered the queue.",
+                        null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-submit-no-jobid>")
                 }
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
                 // Record the live SLURM job so a dispatcher-pod death can be reconciled
@@ -2007,15 +2081,18 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Slurm job \$jobId nodelist: \${NODE_LIST:-UNKNOWN}"
                     printf '%s\n' "\$NODE_LIST" > "${jobWorkspace}/slurm_node_list.txt"
 
+                    # Record the verdict and always exit 0: a re-run can't change a
+                    # terminal state, so numRetries should only fire on transport loss.
+                    printf '%s %s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
-                        echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
-                        exit 0
                     else
                         echo "Pytest failed in Slurm job \$jobId"
-                        echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
-                        exit 1
+                        echo "Full test output (logs not shown above) is uploaded after stage teardown to:"
+                        echo "  https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/results-${stageName}${postTag}.tar.gz"
                     fi
+                    echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
+                    exit 0
                 """.replaceAll("(?m)^\\s*", "").trim()
 
                 pipeline.writeFile(file: scriptTrackPathLocal, text: scriptTrack)
@@ -2028,54 +2105,71 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                // Track the Slurm job on the same pinned frontend.
-                try {
-                    Utils.exec(
-                        pipeline,
-                        timeout: false,
-                        script: Utils.sshUserCmd(remote, scriptTrackPathNode),
-                        numRetries: 3
+                // Monitor the job. The track script always exits 0 once it records a
+                // verdict, so a re-run can't change a terminal state. A frontend lost
+                // mid-monitor is recovered by the enclosing withSlurmFrontendFailover
+                // -- it fails the closure over to another frontend and the submit guard
+                // reuses the still-active job -- so the monitor needs no same-frontend
+                // retries of its own.
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(
+                        remote,
+                        scriptTrackPathNode
                     )
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
-                    // The track script squashes the job's terminal SLURM state to
-                    // exit 0/1, so a walltime kill is indistinguishable here from a
-                    // real test failure. Re-query sacct for the allocation-level
-                    // state (SLURM already aggregates it across nodes; TIMEOUT if
-                    // any node hit the walltime) and, when it is TIMEOUT, raise a
-                    // typed UserFailure so neither the SLURM retry loop nor the
-                    // outer K8s pod retry re-runs a job that would just time out
-                    // again. srun --kill-on-bad-exit=1 means a genuine test failure
-                    // surfaces as FAILED, not TIMEOUT, so this stays unambiguous.
-                    def slurmState = querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobId)
+                )
+
+                // Verdict: "<STATE> <EXIT_CODE>"; success is COMPLETED + exit 0.
+                def jobResult = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_result.txt", stageName, 3)
+                def resultFields = jobResult ? jobResult.tokenize(' ') : []
+                def jobState = resultFields ? resultFields[0] : null
+                def jobExit = resultFields.size() > 1 ? resultFields[1] : null
+                if (jobState != "COMPLETED" || jobExit != "0") {
+                    // Verdict unreadable: fall back to an authoritative sacct query.
+                    def slurmState = jobState ?: querySlurmJobState(pipeline, cluster, partition.clusterName, slurmJobId)
+                    // ... and re-confirm success, so a transient read blip on a job
+                    // that actually passed doesn't fail the stage.
+                    if (jobState == null && slurmState == "COMPLETED") {
+                        echo "[INFRA-RETRY] ${stageName}: verdict unreadable but sacct reports COMPLETED for ${slurmJobId}; treating as success."
+                        return
+                    }
+                    // TIMEOUT is a walltime kill -- typed UserFailure so neither
+                    // retry layer re-runs a job that would just time out again.
                     if (slurmState == "TIMEOUT") {
                         throw new UserFailure(
                             "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
-                            "(hit partition walltime ${partition?.time}min); treating as a test timeout, not retrying. " +
-                            "Original failure: ${e.message}",
-                            e)
+                            "(hit partition walltime ${partition?.time}min); not retrying.",
+                            null)
                     }
-                    // A terminal FAILED state may be a node/device fault whose
-                    // signature (CUDA/NVLink/ECC/driver) printed only into the SLURM
-                    // job output log, never into this exception chain. Scrape the log
-                    // and, on a hit, surface the matched line into a fresh exception
-                    // so the authoritative catalog (FailureClassifier.classify at the
-                    // runLLMTestlistWithSbatch caller) can match it and steer the retry
-                    // off the bad node. A miss falls through to the plain rethrow.
+                    // Verdict unreadable but the job is still alive: a transport blip
+                    // dropped the monitor while the job kept running, so this is infra,
+                    // not a test failure.
+                    if (isNonTerminalSlurmState(slurmState)) {
+                        throw new InfraFailure(
+                            "SLURM job ${slurmJobId} for ${stageName} is still in non-terminal state ${slurmState}; " +
+                            "the monitor lost contact while the job was alive (transient infra), so this is not a " +
+                            "test failure.",
+                            null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
+                    }
+                    // A terminal FAILED state may be a node/device fault whose signature
+                    // (CUDA/NVLink/ECC/driver) printed only into the SLURM job output log,
+                    // never into this verdict. Scrape the log and, on a hit, surface the
+                    // matched line into a fresh exception so the authoritative catalog
+                    // (FailureClassifier.classify at the runLLMTestlistWithSbatch caller)
+                    // can match it and steer the retry off the bad node. A miss falls
+                    // through to the plain "Pytest failed" rethrow below.
                     if (slurmState == "FAILED") {
                         def deviceHit = scrapeSlurmLogForDeviceFault(pipeline, remote, slurmJobLogPath)
                         if (deviceHit) {
                             echo "[INFRA-RETRY] ${stageName}: device-fault signature in SLURM job ${slurmJobId} log; " +
                                  "surfacing to classifier: ${deviceHit}"
                             throw new Exception(
-                                "Device/interconnect fault on SLURM node during job ${slurmJobId} for ${stageName}: " +
-                                "${deviceHit} | original: ${e.message}")
+                                "Device/interconnect fault on SLURM node during job ${slurmJobId} for ${stageName}: ${deviceHit}")
                         }
                     }
-                    echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} terminal state=${slurmState ?: 'unknown'}; " +
-                         "deferring to failure classifier."
-                    throw e
+                    echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} state=${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}; deferring to classifier."
+                    throw new Exception("Pytest failed in SLURM job ${slurmJobId} for ${stageName}")
                 }
             }
             echo "Finished test stage execution."
@@ -2084,11 +2178,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     } catch (InterruptedException e) {
         stageIsInterrupted = true
         throw e
+    } catch (Exception e) {
+        caughtStageError = e
+        throw e
     } finally {
         // Resource cleanup must run even if metadata capture or result upload is interrupted.
         try {
             captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName, jobWorkspace)
-            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
+            // Suppress this attempt's junit when a retry is still planned (a retryable
+            // infra failure with budget), so a retried-and-passed stage doesn't leave
+            // the build UNSTABLE from an intermediate attempt's results. A genuine test
+            // failure classifies as UserFailure -> not suppressed -> reported.
+            boolean suppressTestReporting = (caughtStageError != null && retryContext != null) &&
+                retryContextAllowsRetry(null, retryContext, caughtStageError, false)
+            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag, suppressTestReporting)
         } finally {
             stage("Clean Up Slurm Resource") {
                 // Workaround to handle the interruption during clean up SLURM resources
@@ -2201,10 +2304,20 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       def innerSuffix = (attempt == 1) ? "" : "-attempt-${attempt}"
       def postTag = "${outerAttemptTag}${innerSuffix}"
 
+      // Describes this attempt so the stage body can suppress its junit when a
+      // retryable infra failure means another attempt will follow (mirrors the K8s
+      // path's retryContext). scope=SLURM so classification/budget match this loop.
+      def slurmRetryContext = [
+        scope: InfraFailure.SLURM,
+        stageName: stageName,
+        attempt: attempt,
+        backoffMs: 60L * 1000L,
+      ]
+
       if (nodeCount > 1 || runWithSbatch) {
-        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext)
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       } else {
-        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext)
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       }
 
       // Job succeeded
@@ -2289,6 +2402,16 @@ def stageMatchesAnyPattern(String key, List patterns) {
 }
 
 // Test filter flags
+// Multi-GPU stages matching any entry here run inside the single-GPU job
+// instead of waiting for the separate multi-GPU dispatch (which requires
+// the 'ci: full pre-merge approved' label). Supports exact names and
+// wildcard (*) patterns.
+@Field
+def MULTI_GPU_RUN_WITH_SINGLE = [
+    // Add stage patterns here, e.g.:
+    // "DGX_H100-2_GPUs-*",
+]
+
 @Field
 def REUSE_TEST = "reuse_test"
 @Field
@@ -2551,7 +2674,7 @@ def recordSlurmPlacementContext(Map placementContext, String slurmJobID, def nod
         return
     }
 
-    if (slurmJobID) {
+    if (isValidSlurmJobId(slurmJobID)) {
         placementContext.slurmJobId = slurmJobID
     }
 
@@ -2571,6 +2694,12 @@ def captureSlurmWorkspaceMetadata(def pipeline, Map remote, String jobWorkspace,
     }
 
     metadata.slurmJobId = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_job_id.txt", stageName)
+    if (metadata.slurmJobId && !isValidSlurmJobId(metadata.slurmJobId)) {
+        // A garbage value (e.g. an error message that landed in the file) must
+        // not be recorded or later fed into sacct/scontrol diagnostics.
+        echo "[INFRA-RETRY] ${stageName}: ignoring non-numeric SLURM job ID '${metadata.slurmJobId}' from ${jobWorkspace}/slurm_job_id.txt"
+        metadata.slurmJobId = null
+    }
     metadata.nodeList = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_node_list.txt", stageName)
     if (placementContext != null && metadata.slurmJobId) {
         placementContext.slurmJobId = metadata.slurmJobId
@@ -2603,7 +2732,10 @@ def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterNa
             if (!nodeList && jobWorkspace) {
                 nodeList = readSlurmWorkspaceFile(pipeline, remote, "${jobWorkspace}/slurm_node_list.txt", stageName, 3)
             }
-            if (!capturedJobID) {
+            // Digit-only revalidation: capturedJobID may come from the caller or
+            // a raw workspace-file read, and an invalid value here would produce
+            // the same "Invalid job id specified" noise in sacct/scontrol.
+            if (!isValidSlurmJobId(capturedJobID)) {
                 return
             }
 
@@ -2791,7 +2923,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def extraDeviceEnv = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -4104,7 +4236,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def rerunFailed = false
 
         // When useClusterDurations is set, use a per-cluster durations file keyed on
-        // partition.clusterName (e.g. "aws-dfw", "dlcluster").  This lets each cluster
+        // partition.clusterName (e.g. "oci-hsg", "dlcluster").  This lets each cluster
         // build its own timing baseline so sharding is not skewed by timings collected
         // on different hardware.  Falls back to the shared .test_durations when unset.
         def clusterDurationsArgs = []
@@ -4201,11 +4333,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
             withCredentials([
                 string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
-                usernamePassword(
-                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                    usernameVariable: 'GITLAB_API_USER',
-                    passwordVariable: 'GITLAB_API_TOKEN'
-                ),
                 string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
@@ -5004,7 +5131,7 @@ def launchTestJobs(pipeline, testFilter)
     // may break the mapping functionality.
 
     x86TestConfigs = [
-        "CPU-Generic-x86-1": ["cpu", "l0_cpu_x86", 1, 1],
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 1],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
@@ -5116,6 +5243,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
@@ -5126,6 +5254,8 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
+        // Single-GPU Gemma4 PerfSanity regression gate and baseline
+        "DGX_B200-PyTorch-PerfSanity-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
@@ -5183,7 +5313,7 @@ def launchTestJobs(pipeline, testFilter)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
-        "CPU-Generic-arm-1": ["cpu", "l0_cpu_arm", 1, 1],
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 1],
         "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
@@ -5195,28 +5325,28 @@ def launchTestJobs(pipeline, testFilter)
         // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
         // useClusterDurations=true: record actual test times so each cluster builds its own
         // .test_durations_<clusterName> baseline for load-balanced sharding.
-        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 1, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 2, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 3, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 4, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4", "l0_gb200_multi_gpus", 3, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4", "l0_gb200_multi_gpus", 4, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
-        "GB300-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1],
-        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4],
-        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4],
-        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4],
+        "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
         // PerfSanity pre-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 1, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4-split", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 3, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 4, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4, 1, true, false],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -5224,11 +5354,11 @@ def launchTestJobs(pipeline, testFilter)
     multiNodesSBSAConfigs = [
         // Each testcase uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
-        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 1, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 2, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 1, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 2, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex-split", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
     ]
     // PerfSanity post-merge aggregated
     // 2 Nodes
@@ -5353,7 +5483,7 @@ def launchTestJobs(pipeline, testFilter)
     // 5 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb300-flex",
+        "gb300-flex-aws-cmh",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
         4,
         20,
@@ -5399,7 +5529,7 @@ def launchTestJobs(pipeline, testFilter)
     // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
+        "gb300-flex-aws-cmh",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
         2,
         36,
@@ -5417,7 +5547,7 @@ def launchTestJobs(pipeline, testFilter)
     // 11 Nodes: ctx3 (1 node, 4 GPUs each) + gen1 (8 nodes, 32 GPUs) = 44 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb300-flex",
+        "gb300-flex-aws-cmh",
         "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
         2,
         44,
@@ -6076,6 +6206,20 @@ pipeline {
                             def multiGpuPattern = /\d+_GPUs/
                             singleGpuJobs = parallelJobs.findAll{!(it.key =~ multiGpuPattern)}
                             dgxJobs = parallelJobs.findAll{it.key =~ multiGpuPattern}
+
+                            // Move approval-exempt multi-GPU stages into singleGpuJobs so they
+                            // run without waiting for the multi-GPU dispatch (which requires
+                            // the 'ci: full pre-merge approved' label).
+                            def exemptJobs = dgxJobs.findAll { stageName, stageValue ->
+                                MULTI_GPU_RUN_WITH_SINGLE.any { pattern ->
+                                    stageMatchesPattern(stageName, pattern)
+                                }
+                            }
+                            if (exemptJobs) {
+                                echo "[Multi-GPU split] Moving ${exemptJobs.keySet()} to single-GPU job (approval-exempt)"
+                                singleGpuJobs += exemptJobs
+                                dgxJobs -= exemptJobs
+                            }
                         }
 
                         if (env.JOB_NAME ==~ /.*Single-GPU.*/) {

@@ -25,7 +25,7 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
-MAX_TOP_LOGPROBS = 20
+MAX_TOP_LOGPROBS = 100
 
 
 def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
@@ -376,6 +376,8 @@ class SamplingParams:
             raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
         if self.top_k is not None and self.top_k < 0:
             raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
+        if self.min_p is not None and (self.min_p < 0 or self.min_p > 1):
+            raise ValueError(f"require 0 <= min_p <= 1, got min_p={self.min_p}")
         if self.temperature is not None and self.temperature < 0:
             raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
 
@@ -442,7 +444,7 @@ class SamplingParams:
             raise ValueError("logprobs_simple_format is not supported with beam search")
 
     # NB: The predicates below are static because downstream code (e.g.
-    #     sampling_utils.resolve_sampling_strategy) only holds instances of
+    #     sampler_strategy.resolve_sampling_strategy) only holds instances of
     #     bindings.SamplingConfig (not SamplingParams). They are the single
     #     source of truth for the greedy / top-p-decay resolution shared by
     #     _greedy_decoding and the torch sampler.
@@ -464,13 +466,16 @@ class SamplingParams:
         temperature: Optional[float],
         top_p: Optional[float],
         top_k: Optional[int],
+        min_p: Optional[float],
     ) -> bool:
         """Whether the request carries an explicit greedy control.
 
-        Explicit means top_k == 1, top_p == 0.0, or temperature == 0, as opposed
-        to the implicit "all params unset" greedy default.
+        Explicit means top_k == 1, top_p == 0.0, min_p == 1.0, or temperature == 0,
+        as opposed to the implicit "all params unset" greedy default. min_p == 1.0
+        keeps only tokens whose probability equals the row maximum, so like
+        top_p == 0.0 it collapses sampling to a single token.
         """
-        return top_k == 1 or top_p == 0.0 or temperature == 0
+        return top_k == 1 or top_p == 0.0 or min_p == 1.0 or temperature == 0
 
     @staticmethod
     def params_imply_greedy_decoding(
@@ -479,23 +484,28 @@ class SamplingParams:
         top_p: Optional[float],
         top_k: Optional[int],
         use_beam_search: bool | None,
+        min_p: Optional[float] = None,
         top_p_decay: Optional[float] = None,
     ) -> bool:
         """Whether the parameters resolve to greedy decoding.
 
         An explicit greedy control always wins. The implicit "all params unset"
-        greedy default is overridden by an active top-p decay (which implies
-        top-p sampling so the decayed runtime top-p can take effect); callers
-        that do not support decay may omit ``top_p_decay``.
+        greedy default is overridden by any active sampling knob: an active
+        top-p decay (which implies top-p sampling so the decayed runtime top-p
+        can take effect) or a ``min_p`` in ``(0, 1)`` (which still selects among
+        multiple tokens); callers that do not support decay may omit
+        ``top_p_decay``.
         """
         if use_beam_search:
             return False
         if SamplingParams.params_imply_explicit_greedy(
-            temperature=temperature, top_p=top_p, top_k=top_k
+            temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p
         ):
             return True
         implicitly_greedy = temperature is None and top_p is None and top_k is None
-        return implicitly_greedy and not SamplingParams.params_imply_top_p_decay_active(top_p_decay)
+        min_p_active = min_p is not None and min_p > 0.0
+        decay_active = SamplingParams.params_imply_top_p_decay_active(top_p_decay)
+        return implicitly_greedy and not min_p_active and not decay_active
 
     @property
     def _greedy_decoding(self) -> bool:
@@ -504,6 +514,7 @@ class SamplingParams:
             top_p=self.top_p,
             top_k=self.top_k,
             use_beam_search=self.use_beam_search,
+            min_p=self.min_p,
             top_p_decay=self.top_p_decay,
         )
 

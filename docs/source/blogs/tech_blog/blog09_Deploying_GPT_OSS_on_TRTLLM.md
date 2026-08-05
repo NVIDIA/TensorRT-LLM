@@ -19,7 +19,7 @@ We have a forthcoming guide for getting great performance on H100, however this 
 
 ## Launching the TensorRT LLM docker container
 
-The container image that you will use will be pulled from NVIDIA's NGC. This container is multi-platform and will run on both x64 and arm64 architectures: `nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc1`
+The container image that you will use will be pulled from NVIDIA's NGC. This container is multi-platform and will run on both x64 and arm64 architectures: `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc14`
 
 Run the follow docker command to start the TensorRT LLM container in interactive mode:
 
@@ -31,7 +31,7 @@ docker run --rm --ipc=host -it \
   -p 8000:8000 \
   -e TRTLLM_ENABLE_PDL=1 \
   -v ~/.cache:/root/.cache:rw \
-  nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc1 \
+  nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc14 \
   /bin/bash
 ```
 

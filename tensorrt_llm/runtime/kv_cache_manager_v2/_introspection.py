@@ -49,6 +49,30 @@ def active_page_stats(kv_cache: Any) -> tuple[list[int], list[int]]:
     return counts, unscheduled_evictable
 
 
+def committed_page_is_linked(kv_cache: Any, ordinal: int, lc_id: int) -> bool | None:
+    """Whether the sequence's page at ``(ordinal, lc_id)`` still points at a tree block.
+
+    ``None`` when the slot is empty or holds an uncommitted page. Test hook: in C++ the
+    back-pointer is raw, so a page left pointing at a block that dies first is read after
+    free, and freed-but-mapped memory reads back plausibly enough that only a sanitizer
+    build catches the fault itself.
+    """
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return cpp_introspection.committed_page_is_linked(kv_cache, ordinal, lc_id)
+
+    from ._common import DEFAULT_BEAM_INDEX
+    from ._page import CommittedPage
+
+    block_page = kv_cache._page(ordinal, DEFAULT_BEAM_INDEX, lc_id)
+    if block_page is None:
+        return None
+    page = block_page.page
+    if not isinstance(page, CommittedPage):
+        return None
+    return page.block() is not None
+
+
 def all_tree_pages_droppable(manager: Any) -> bool:
     """Return whether every page reachable from the radix tree is droppable."""
     cpp_introspection = _cpp_introspection_module()
@@ -196,4 +220,124 @@ def ratio_to_slot_count_list(
         CacheLevelStorage.ratio_to_slot_count_list(
             quota, slot_size_lists, ratio_list, granularity, min_slots
         )
+    )
+
+
+def attention_life_cycle_ids(manager: Any) -> list[int]:
+    """Return the lifecycle ids of all attention lifecycles, in order."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return list(cpp_introspection.attention_life_cycle_ids(manager))
+    return [lc_id for lc_id, _ in manager._life_cycles.attention_life_cycles()]
+
+
+def swa_life_cycle_ids(manager: Any) -> list[int]:
+    """Return the lifecycle ids of attention lifecycles that use a sliding window."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return list(cpp_introspection.swa_life_cycle_ids(manager))
+    return [
+        lc_id
+        for lc_id, lc in manager._life_cycles.attention_life_cycles()
+        if lc.window_size is not None
+    ]
+
+
+def ssm_life_cycle_id(manager: Any) -> int | None:
+    """Return the SSM lifecycle id, or None if there is no SSM lifecycle."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return cpp_introspection.ssm_life_cycle_id(manager)
+    return manager._life_cycles.ssm_life_cycle_id
+
+
+def reuse_match_pages(
+    manager: Any,
+    reuse_scope: Any,
+    tokens: Any,
+    lc_id: int,
+    enable_partial: bool = False,
+) -> tuple[int, list[tuple[int, int | None] | None]]:
+    """Match ``tokens`` against the radix tree and report reusable pages per block.
+
+    Returns ``(num_tokens, pages)`` where ``pages[i]`` is ``None`` when block ``i``
+    holds no page for lifecycle ``lc_id``, otherwise ``(slot_id, num_tokens_in_block)``.
+    See ``CommittedPage.num_tokens_in_block`` for how attention and SSM life cycles
+    interpret the recorded token count.
+    """
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        num_tokens, raw_pages = cpp_introspection.reuse_match_pages(
+            manager, reuse_scope, list(tokens), lc_id, enable_partial
+        )
+        pages: list[tuple[int, int | None] | None] = []
+        for entry in raw_pages:
+            if entry is None:
+                pages.append(None)
+            else:
+                slot_id, num_tokens_in_block = entry
+                pages.append((slot_id, None if num_tokens_in_block < 0 else num_tokens_in_block))
+        return num_tokens, pages
+
+    match = manager._radix_tree.match(reuse_scope, list(tokens), enable_partial)
+    py_pages: list[tuple[int, int | None] | None] = []
+    for block in match.blocks:
+        page = block.get_page(lc_id)
+        if page is None:
+            py_pages.append(None)
+        else:
+            py_pages.append((page.slot_id, getattr(page, "num_tokens_in_block", None)))
+    return match.num_tokens, py_pages
+
+
+def reuse_match_planned_drop_counts(
+    manager: Any,
+    reuse_scope: Any,
+    tokens: Any,
+    lc_id: int,
+    enable_partial: bool = False,
+) -> tuple[int, list[int | None]]:
+    """Match ``tokens`` and report each matched block's ``planned_drop_count`` for lifecycle ``lc_id``.
+
+    Returns ``(num_tokens, counts)`` where ``counts[i]`` is ``None`` when block ``i`` holds no page
+    for lifecycle ``lc_id``, otherwise the matched page's ``planned_drop_count``.
+    """
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return cpp_introspection.reuse_match_planned_drop_counts(
+            manager, reuse_scope, list(tokens), lc_id, enable_partial
+        )
+
+    match = manager._radix_tree.match(reuse_scope, list(tokens), enable_partial)
+    counts: list[int | None] = []
+    for block in match.blocks:
+        page = block.get_page(lc_id)
+        counts.append(None if page is None else page.planned_drop_count)
+    return match.num_tokens, counts
+
+
+def pool_group_index(manager: Any, lc_id: int) -> int:
+    """Return the storage pool-group index for lifecycle ``lc_id``."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return cpp_introspection.pool_group_index(manager, lc_id)
+    return manager._storage.get_pool_group_index(lc_id)
+
+
+def compute_slots_for_batch(
+    manager: Any,
+    batch: Any,
+    tokens_per_block: int,
+    swa_scratch_reuse: Any = None,
+) -> list[int]:
+    """Return the minimum per-pool-group slot counts to support ``batch``."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return list(
+            cpp_introspection.compute_slots_for_batch(
+                manager, batch, tokens_per_block, swa_scratch_reuse
+            )
+        )
+    return list(
+        manager._storage._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
     )

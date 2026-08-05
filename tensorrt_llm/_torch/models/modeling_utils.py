@@ -1184,16 +1184,28 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                             module.load_weights(
                                 weights=[module_weights],
                                 allow_partial_loading=allow_partial_loading)
+                        loaded_own_params = None
                     else:
+                        loaded_own_params = []
                         for n, p in module.named_parameters(recurse=False):
                             if not allow_partial_loading:
                                 assert n in module_weights
                             if n in module_weights:
                                 p.data.copy_(module_weights[n][:])
+                                loaded_own_params.append(n)
 
-                    # Mark consumed weights
+                    # Only a module handed the full `name.*` subtree may
+                    # consume it wholesale. Otherwise just its own
+                    # `recurse=False` params were loaded, and since
+                    # `named_modules()` is pre-order, consuming the subtree
+                    # would drop weights its descendants have not loaded yet --
+                    # they would silently keep uninitialized weights.
                     if hasattr(weights, 'mark_consumed'):
-                        weights.mark_consumed(name)
+                        if loaded_own_params is None:
+                            weights.mark_consumed(name)
+                        elif loaded_own_params:
+                            weights.mark_consumed_keys(
+                                f'{name}.{n}' for n in loaded_own_params)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
@@ -1285,6 +1297,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                             module_name,
                             module_weights,
                             allow_partial_loading=allow_partial_loading)
+                        # Handed the full subtree, like the `load_weights` case.
+                        loaded_own_params = None
                     elif hasattr(module, 'load_weights'):
                         if "linear_attn.conv1d" in name:
                             module_weights['weight'] = module_weights[
@@ -1297,7 +1311,9 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                             module.load_weights(
                                 weights=[module_weights],
                                 allow_partial_loading=allow_partial_loading)
+                        loaded_own_params = None
                     else:
+                        loaded_own_params = []
                         for n, p in module.named_parameters(recurse=False):
                             weight_mapper.handle_manual_copy(
                                 module_name,
@@ -1305,10 +1321,16 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                 n,
                                 p,
                                 allow_partial_loading=allow_partial_loading)
+                            loaded_own_params.append(n)
 
-                    # Mark consumed weights
+                    # Consume precisely what was loaded; see the matching
+                    # comment in `_load_weights_impl`.
                     if hasattr(weights, 'mark_consumed'):
-                        weights.mark_consumed(name)
+                        if loaded_own_params is None:
+                            weights.mark_consumed(name)
+                        elif loaded_own_params:
+                            weights.mark_consumed_keys(
+                                f'{name}.{n}' for n in loaded_own_params)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:

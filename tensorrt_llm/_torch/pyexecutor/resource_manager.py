@@ -19,8 +19,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, ClassVar, Dict, Iterable, List, Optional,
-                    Sequence, Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
+                    Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -66,7 +66,8 @@ WorldConfig = tensorrt_llm.bindings.WorldConfig
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
-    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                              KvCacheCompressionConfig)
 
     from .kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -291,6 +292,8 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_quant_block_size: int = 128,
         indexer_k_cache_index_head_dim: int = 0,
         indexer_k_cache_use_fp4: bool = False,
+        # Boolean array indicating whether each layer has an indexer K cache.
+        indexer_k_cache_layer_mask: Optional[List[bool]] = None,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
@@ -323,6 +326,17 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+
+        if indexer_k_cache_layer_mask is not None:
+            assert len(indexer_k_cache_layer_mask) >= max(self.pp_layers) + 1, (
+                f"indexer_k_cache_layer_mask covers "
+                f"{len(indexer_k_cache_layer_mask)} layers but this rank "
+                f"manages global layer {max(self.pp_layers)}")
+            self.indexer_k_cache_local_layer_mask: Optional[List[bool]] = [
+                bool(indexer_k_cache_layer_mask[i]) for i in self.pp_layers
+            ]
+        else:
+            self.indexer_k_cache_local_layer_mask = None
 
         self.kv_connector_manager = kv_connector_manager
 
@@ -620,6 +634,7 @@ class KVCacheManager(BaseResourceManager):
             indexer_k_cache_quant_block_size,
             'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
             'indexer_k_cache_use_fp4': indexer_k_cache_use_fp4,
+            'indexer_k_cache_layer_mask': self.indexer_k_cache_local_layer_mask,
             'linear_attention_metadata': linear_attention_metadata,
             # Forward the (possibly remapped) per-pool configurations.
             # window_size values are aligned with the post-clamp sizes.
@@ -2448,11 +2463,9 @@ class KVCacheCompressionManager(BaseResourceManager):
     engine subtracts that count when building ``num_cached_tokens_per_seq``.
     """
 
-    adjusts_generation_kv_length: ClassVar[bool] = False
-    """Whether this manager can make target and logical KV lengths diverge."""
-
     def __init__(
         self,
+        config: "KvCacheCompressionConfig",
         kv_cache_manager: "KVCacheManagerV2",
         draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
     ):
@@ -2466,18 +2479,12 @@ class KVCacheCompressionManager(BaseResourceManager):
                 "draft KV-cache compression requires KVCacheManagerV2")
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
-        # Compression evicts/rewrites stored keys and values, so a shared prefix
-        # block is no longer safe to reuse (same constraint as RocketKVCacheManager).
-        if kv_cache_manager.enable_block_reuse:
-            raise ValueError(
-                f"{type(self).__name__} changes stored keys and values and cannot "
-                f"run with KV-cache block reuse. Set "
-                f"KvCacheConfig.enable_block_reuse to False.")
-        kv_cache_manager.kv_compression_manages_history = self.adjusts_generation_kv_length
+        kv_cache_manager.kv_compression_manages_history = (
+            config.changes_physical_kv_length)
         if draft_kv_cache_manager is not None:
             # The draft cache is compacted together with the target.
             draft_kv_cache_manager.kv_compression_manages_history = (
-                self.adjusts_generation_kv_length)
+                config.changes_physical_kv_length)
 
     @property
     def has_independent_draft_kv_cache(self) -> bool:
