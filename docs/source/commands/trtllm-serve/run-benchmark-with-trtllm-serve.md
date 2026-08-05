@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Run benchmarking with `trtllm-serve`
 
 TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
@@ -161,9 +166,10 @@ can be lower than the configured output length.
 
 When benchmarking a fixed output sequence length, make sure EOS handling matches
 the methodology you want to measure. The `benchmark_serving.py` example above
-passes `--ignore-eos`, which forwards `ignore_eos` in OpenAI-compatible requests
-and avoids early EOS termination for backends that support it. If you use an
-external client such as AIPerf or GenAI-Perf, use the equivalent ignore-EOS
+passes `--ignore-eos` through `RequestFuncInput`; in the TensorRT LLM request
+path this is translated to `min_length = output_len`, avoiding early EOS
+termination without forwarding a literal `ignore_eos` request field. If you use
+an external client such as AIPerf or GenAI-Perf, use the equivalent ignore-EOS
 setting when available; otherwise interpret output-length metrics as actual
 generated tokens rather than the requested token budget.
 
@@ -408,6 +414,10 @@ aiperf profile \
     --url localhost:8000 \
     --streaming
 ```
+
+This AIPerf example does not pass an ignore-EOS equivalent, so output-length
+metrics can be shorter than `--output-tokens-mean` if the model emits EOS before
+the requested token budget is reached.
 
 ### Example: Benchmark a multimodal model
 
