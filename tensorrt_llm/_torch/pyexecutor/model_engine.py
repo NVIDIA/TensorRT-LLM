@@ -3700,15 +3700,15 @@ class PyTorchModelEngine(ModelEngine):
         filled = layout.fill_bucket(max_verify_len=1 + int(draft_len))
         for request, tokens in zip(requests, filled.verify_lens.tolist()):
             request.py_verify_len = int(tokens) - 1
-        # Publish it to the runner as well, or the graph is captured under a key
-        # that does not describe the batch just shaped. `_ragged_verify_bucket`
-        # reads `agreed_ragged_bucket` rather than re-summing the batch (so that
-        # every attention-DP rank keys on a value they agreed on, instead of one
-        # each derived independently) -- and nothing sets that during capture,
-        # because the runtime fit never runs here. The key's token axis was
-        # therefore None while the batch really held `verify_bucket` tokens, and
-        # the mismatch surfaced far away, in the MoE's shared-vs-routed row
-        # count, as `unmatched tensor shape` two graphs into the capture pass.
+        # Publish it to the runner as well: the graph key re-derives its token
+        # axis from the batch (`_ragged_verify_bucket`), but the layout assert
+        # cross-checks that against `agreed_ragged_bucket` -- the fit's claim --
+        # and during capture nothing else sets it, because the runtime fit
+        # never runs here. Before this line existed the capture-time key's
+        # token axis was None while the batch really held `verify_bucket`
+        # tokens, and the mismatch surfaced far away, in the MoE's
+        # shared-vs-routed row count, as `unmatched tensor shape` two graphs
+        # into the capture pass.
         self.cuda_graph_runner.agreed_ragged_bucket = int(verify_bucket)
 
     def ragged_verify_token_buckets(self, padded_bs: int) -> List[int]:
@@ -3780,8 +3780,13 @@ class PyTorchModelEngine(ModelEngine):
         runner = self.cuda_graph_runner
         # Cleared on entry so that every early return leaves no stale
         # value behind: the graph key reads this, and a bucket carried
-        # over from a previous step would key into the wrong graph.
+        # over from a previous step would key into the wrong graph. The
+        # padded row count follows the same rule -- record_step books it
+        # into padded_bs_hist on every step, and a value surviving from the
+        # last successful fit would pollute exactly the fallback steps the
+        # histogram exists to distinguish.
         runner.agreed_ragged_bucket = None
+        self._dspark_last_padded_bs = None
         if not runner.enabled or not verify_lens:
             return None
         if len(verify_lens) != len(generation_requests):
@@ -3886,7 +3891,6 @@ class PyTorchModelEngine(ModelEngine):
         buckets = self.ragged_verify_token_buckets(padded_bs)
         if not buckets:
             return None
-
         try:
             shape = choose_ragged_capture_shape(
                 num_real_requests=len(token_lens),
@@ -3902,8 +3906,16 @@ class PyTorchModelEngine(ModelEngine):
         # Remembered so a graph miss can report the shape it actually submitted
         # rather than just that one happened.
         self._dspark_last_total_tokens = int(bucket)
-        # The graph key uses THIS value rather than re-summing the
-        # per-request windows. Both used to be derived independently --
+        # And the ROW count behind that bucket. The observability ceiling is
+        # booked over the rank-local, unpadded request count while `delivered`
+        # is booked over this padded, cross-rank-maximum one, which is how
+        # trim_ratio went negative in four runs. Only the caller can reconcile
+        # them, and it cannot do that without this number.
+        self._dspark_last_padded_bs = int(padded_bs)
+        # The fit's agreed value; the graph key re-derives its token axis
+        # from the padded batch and the layout assert cross-checks the two
+        # derivations against each other. Both used to be derived
+        # independently WITHOUT that check --
         # the key walked generation_requests *after* padding was
         # appended, while the fit worked from the allgathered peer
         # stats -- so their agreement across attention-DP ranks was
@@ -4075,8 +4087,7 @@ class PyTorchModelEngine(ModelEngine):
         from_requests = sum(verify_lens)
         from_layout = attn_metadata.num_tokens - attn_metadata.num_ctx_tokens
         from_spec = int(spec_metadata.total_verify_tokens)
-        bucket = self.cuda_graph_runner._ragged_verify_bucket(
-            scheduled_requests)
+        agreed = getattr(self.cuda_graph_runner, "agreed_ragged_bucket", None)
 
         assert from_requests == from_layout, (
             f"ragged layout mismatch: requests carry {from_requests} generation "
@@ -4088,12 +4099,19 @@ class PyTorchModelEngine(ModelEngine):
             f"ragged layout mismatch: requests carry {from_requests} generation "
             f"tokens but spec_metadata.total_verify_tokens is {from_spec}; "
             f"acceptance would slice the target logits at the wrong offsets.")
-        if bucket is not None:
-            assert from_requests == int(bucket), (
-                f"ragged layout mismatch: requests carry {from_requests} "
-                f"generation tokens but the CUDA-graph key's token axis is "
-                f"{bucket}; the replayed graph was captured at a different "
-                f"width and nothing downstream would notice.")
+        if agreed is not None:
+            # Two INDEPENDENT derivations of the token axis: `from_requests`
+            # walks this batch's windows, `agreed` is the fit's allgathered
+            # arithmetic, and the graph key carries the latter. Comparing the
+            # key's own return value instead (what an earlier form did) is a
+            # tautology -- _ragged_verify_bucket publishes `agreed` -- so a fit
+            # that budgeted for padding rows the batch never got would replay a
+            # graph captured at a different width with nothing to say so.
+            assert from_requests == int(agreed), (
+                f"ragged layout mismatch: the batch carries {from_requests} "
+                f"generation tokens but the fit agreed on {agreed}, which is "
+                f"what the CUDA-graph key's token axis says; the replayed "
+                f"graph was captured at a different width.")
 
         # Row axis. Everything above is a token count, so all four agree even
         # when the token-major presentation is malformed -- the presentation is
