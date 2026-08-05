@@ -878,36 +878,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
         return self._condition_frames_to_video_tensor(frames_u8).squeeze(2)
 
-    def _encode_video_tensor(self, video_tensor: torch.Tensor) -> torch.Tensor:
-        """VAE-encode a preprocessed pixel video [1, 3, T, H, W]."""
-        if video_tensor.ndim == 4:
-            video_tensor = video_tensor.unsqueeze(0)
-        if video_tensor.ndim != 5 or video_tensor.shape[0] != 1 or video_tensor.shape[1] != 3:
-            raise ValueError(
-                f"Cosmos3 video tensor must have shape [1, 3, T, H, W], got {tuple(video_tensor.shape)}."
-            )
-
-        video = video_tensor.to(device=self.device, dtype=self.vae.dtype)
-        latent = self.vae.encode(video).latent_dist.mode()
-
-        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, -1, 1, 1, 1)
-                .to(latent.device, latent.dtype)
-            )
-            latents_std = (
-                torch.tensor(self.vae.config.latents_std)
-                .view(1, -1, 1, 1, 1)
-                .to(latent.device, latent.dtype)
-            )
-            latent = (latent - latents_mean) / latents_std
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latent = latent * scaling_factor
-
-        return latent.to(self.dtype)
-
     def _prepare_latents_action_video(
         self,
         video_tensor: torch.Tensor,
@@ -956,7 +926,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             mode=mode,
             action_chunk_size=action_chunk_size,
             raw_action_dim=raw_action_dim,
-            action_dim=int(getattr(self.transformer, "action_dim", 64)),
+            action_dim=int(self.transformer.action_dim),
             generator=generator,
             device=self.device,
             dtype=self.dtype,

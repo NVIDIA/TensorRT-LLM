@@ -15,21 +15,6 @@
 """Per-model default generation parameters for Cosmos3 pipelines.
 
 Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
-
-Action generation
------------------
-``COSMOS3_DOMAIN_PRESETS`` lists training-aligned sampling defaults per
-embodiment. When ``domain_name`` (or a uniquely mapped ``domain_id``) is set,
-the pipeline fills omitted ``action_chunk_size``, ``action_resolution``, and
-``frame_rate`` from the preset and logs a warning if explicit values differ.
-``num_frames`` is always ``action_chunk_size + 1``, never a preset field. See
-Cosmos3 omni ``action_*.json`` inputs for reference configs (bridge, av, droid,
-libero, etc.).
-
-``raw_action_dim`` is deliberately *not* a preset field: it is fixed by the
-embodiment, while several embodiments share one preset via
-``COSMOS3_DOMAIN_PRESET_ALIASES``. It resolves from
-``action.EMBODIMENT_TO_RAW_ACTION_DIM`` instead.
 """
 
 from typing import Any, Dict, Iterable, TypedDict
@@ -164,7 +149,8 @@ class Cosmos3DomainPreset(TypedDict, total=False):
     frame_rate: float
 
 
-# Training-aligned defaults. Values mirror Cosmos3 omni action JSON examples where available.
+# Training-aligned defaults, mirroring the Cosmos3 omni ``action_*.json`` inputs
+# (bridge, av, droid, libero, ...) where those exist.
 COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     # WidowX bridge.
     "bridge_orig_lerobot": {
@@ -292,7 +278,14 @@ def resolve_domain_action_config(
     frame_rate: float | None = None,
     action_fps: float | None = None,
 ) -> dict[str, Any]:
-    """Merge user action params with domain presets and generic fallbacks."""
+    """Merge user action params with domain presets and generic fallbacks.
+
+    A recognized ``domain_name`` (or a uniquely mapped ``domain_id``) fills
+    whichever of ``action_chunk_size``, ``action_resolution`` and ``frame_rate``
+    the caller left unset; an explicit value wins but is reported in
+    ``warnings`` when it differs from the preset. ``num_frames`` is derived as
+    ``action_chunk_size + 1`` and is never a preset field.
+    """
     preset_key = canonical_domain_preset_key(domain_name, domain_id)
     preset = COSMOS3_DOMAIN_PRESETS.get(preset_key) if preset_key else None
     warnings: list[str] = []
