@@ -367,6 +367,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
             }
         }) {
         stage ("Docker Login") {
+            // Read-write artifactory credentials (image push)
             withCredentials([usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
                 trtllm_utils.llmExecStepWithRetry(this, script: "docker login artifactory.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
             }
