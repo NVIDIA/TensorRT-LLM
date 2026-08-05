@@ -460,3 +460,6 @@ properties:
   disaggregated_params:
     annotation: dict
     default: None
+  startup_metrics:
+    annotation: dict
+    default: None

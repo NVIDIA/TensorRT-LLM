@@ -254,6 +254,7 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
         llm_id (str): The unique ID of the LLM instance.
         disaggregated_params (dict): The disaggregated parameters of the LLM instance.
+        startup_metrics (dict): The startup metrics reported by worker rank 0.
 """
 
 
