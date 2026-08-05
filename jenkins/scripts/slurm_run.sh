@@ -65,8 +65,20 @@ if [[ "${TRTLLM_VISUAL_GEN_MULTINODE_SLURM_PARENT:-0}" == "1" ]]; then
 
     if [[ "${SLURM_PROCID:-0}" == "0" ]]; then
         expected_nodes="${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}"
-        while [[ "$(find "$install_done_dir" -maxdepth 1 -type f -name 'node_*' | wc -l)" -lt "$expected_nodes" ]]; do
-            echo "Waiting for VisualGen multi-node install markers in $install_done_dir"
+        install_wait_timeout="${TRTLLM_VISUAL_GEN_MULTINODE_INSTALL_TIMEOUT:-3600}"
+        install_wait_deadline=$((SECONDS + install_wait_timeout))
+        while true; do
+            marker_count="$(find "$install_done_dir" -maxdepth 1 -type f -name 'node_*' -print | wc -l)"
+            if [[ "$marker_count" -ge "$expected_nodes" ]]; then
+                break
+            fi
+            if ((SECONDS >= install_wait_deadline)); then
+                echo "Timed out after ${install_wait_timeout}s waiting for VisualGen install markers (${marker_count}/${expected_nodes})."
+                echo "Markers present in $install_done_dir:"
+                find "$install_done_dir" -maxdepth 1 -type f -name 'node_*' -print | sort || true
+                exit 1
+            fi
+            echo "Waiting for VisualGen multi-node install markers in $install_done_dir (${marker_count}/${expected_nodes})"
             sleep 10
         done
         pytestCommand="env -u SLURM_PROCID -u SLURM_NTASKS -u SLURM_LOCALID -u SLURM_NODEID -u SLURM_GTIDS ${pytestCommand}"

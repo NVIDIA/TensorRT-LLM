@@ -337,6 +337,16 @@ class TestToLlmMapping:
 
 class TestRankLinearizationWithoutDist:
     def test_world_size_16_cfg_attn2d_ulysses_rank_groups(self):
+        """CPU-side guard for the 16-GPU multi-node E2E's rank linearization.
+
+        The topology below must stay in sync with
+        WAN22_LPIPS_MULTINODE_PARALLEL in
+        tests/integration/defs/examples/visual_gen/test_visual_gen_multi_gpu.py.
+        Nothing enforces that: the two trees have separate conftests, so
+        importing the constant would drag integration fixtures into a
+        CPU-only unit test. If you change the E2E's parallel config, change
+        this test too, or it silently guards a topology nobody runs.
+        """
         from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 
         old_mesh = DeviceMeshTopologyImpl.device_mesh
