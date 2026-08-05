@@ -1047,8 +1047,12 @@ class KVCacheManager(BaseResourceManager):
             # for cache-size estimation, such a leak leaves too few blocks
             # for the estimation requests themselves, so the executor loop
             # spins forever without ever scheduling them and LLM startup
-            # hangs (TRTLLM-14903). Best-effort removal, then re-raise so
-            # callers keep their existing skip-on-failure semantics.
+            # hangs (TRTLLM-14903). remove_sequence is a no-op for request
+            # ids the failed batched add never registered, so every request
+            # can be removed unconditionally; attempt all target and draft
+            # cleanup before re-raising so one cleanup failure doesn't leak
+            # the remaining sequences.
+            cleanup_error = None
             for freeing_impl, freeing_requests in (
                 (self.impl, batch_llm_requests),
                 (draft_kv_cache_manager.impl if draft_kv_cache_manager
@@ -1060,10 +1064,13 @@ class KVCacheManager(BaseResourceManager):
                     try:
                         freeing_impl.remove_sequence(req.py_request_id, req,
                                                      False)
-                    except Exception:
-                        # The sequence may never have been registered (the
-                        # batched add itself failed); nothing to clean up.
-                        pass
+                    except Exception as e:
+                        cleanup_error = cleanup_error or e
+            if cleanup_error is not None:
+                # A failed release leaves the KV pool poisoned — the same
+                # hang mechanism this cleanup exists to prevent — so it
+                # must not be masked by the allocation failure alone.
+                raise cleanup_error
             raise
 
         return requests
