@@ -57,7 +57,7 @@ from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
                                                 _build_request_multimodal_input)
-from ..models.modeling_utils import DecoderModelForCausalLM
+from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -384,6 +384,7 @@ class PyTorchModelEngine(ModelEngine):
     ):
         _configure_deep_gemm_pdl()
 
+        self._metrics: dict[str, float] = {}
         self.forward_pass_callable = None
         self._cleanup_done = False
         self._runner: Optional[Union[ModelRunner, PackedModelRunner]] = None
@@ -1218,6 +1219,11 @@ class PyTorchModelEngine(ModelEngine):
         """Which of the two runner contracts `_runner` implements."""
         return isinstance(self._runner, EncoderRunner)
 
+    @property
+    def metrics(self) -> dict[str, float]:
+        """Return model-engine warmup time metrics."""
+        return self._metrics
+
     def _get_draft_kv_cache_manager(
         self, resource_manager: ResourceManager
     ) -> Optional[Union[KVCacheManager, KVCacheManagerV2]]:
@@ -1334,16 +1340,17 @@ class PyTorchModelEngine(ModelEngine):
                     *args,
                     **kwargs):
             result = method(self, resource_manager, *args, **kwargs)
-            kv_cache_manager = (resource_manager.get_resource_manager(
-                self.kv_cache_manager_key)
-                                if resource_manager is not None else None)
-            if kv_cache_manager is not None:
-                has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
-                    fill_with_zero=True)
-                if has_invalid_values:
-                    logger.warning(
-                        "NaNs/Infs have been introduced to KVCache during warmup, KVCache was filled with zeros to avoid potential issues"
-                    )
+            with timing_metric("kv_cache_cleanup_seconds", self._metrics):
+                kv_cache_manager = (resource_manager.get_resource_manager(
+                    self.kv_cache_manager_key)
+                                    if resource_manager is not None else None)
+                if kv_cache_manager is not None:
+                    has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
+                        fill_with_zero=True)
+                    if has_invalid_values:
+                        logger.warning(
+                            "NaNs/Infs have been introduced to KVCache during warmup, KVCache was filled with zeros to avoid potential issues"
+                        )
             return result
 
         return wrapper
@@ -1463,8 +1470,12 @@ class PyTorchModelEngine(ModelEngine):
 
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
-    def warmup(self,
-               resource_manager: Optional[ResourceManager] = None) -> None:
+    def warmup(self, resource_manager: Optional[ResourceManager] = None) -> None:
+        """Run model warmup and record its total wall-clock duration."""
+        with timing_metric("total_warmup_seconds", self._metrics):
+            self._warmup_impl(resource_manager)
+
+    def _warmup_impl(self, resource_manager: Optional[ResourceManager] = None) -> None:
         """
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
@@ -1546,7 +1557,8 @@ class PyTorchModelEngine(ModelEngine):
             self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if not is_enc_dec:
-            with self._warmup_timer.phase("attention_jit"):
+            with self._warmup_timer.phase("attention_jit"), timing_metric(
+                    "attention_warmup_seconds", self._metrics):
                 self._run_attention_warmup(resource_manager,
                                            can_run_general_warmup)
 
@@ -1556,7 +1568,7 @@ class PyTorchModelEngine(ModelEngine):
                 warmup_requests_configs = self._agree_warmup_shapes(
                     self._get_full_general_warmup_requests(resource_manager))
                 # Currently graph has not been captured, disable cuda graph for this warmup.
-                with self.no_cuda_graph():
+                with timing_metric("general_warmup_seconds", self._metrics), self.no_cuda_graph():
                     self._general_warmup(resource_manager,
                                          warmup_requests_configs)
                     # Release C++ MoE workspace buffers so the autotuner can
@@ -1571,7 +1583,8 @@ class PyTorchModelEngine(ModelEngine):
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if not is_enc_dec and not self.mapping.has_cp_helix():
-            with self._warmup_timer.phase("autotuner"):
+            with self._warmup_timer.phase("autotuner"), timing_metric(
+                    "autotuner_warmup_seconds", self._metrics):
                 self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
@@ -1579,7 +1592,8 @@ class PyTorchModelEngine(ModelEngine):
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            with self._warmup_timer.phase("mamba_hybrid"):
+            with self._warmup_timer.phase("mamba_hybrid"), timing_metric(
+                    "mamba_hybrid_warmup_seconds", self._metrics):
                 self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
@@ -1600,12 +1614,15 @@ class PyTorchModelEngine(ModelEngine):
             with self.cuda_graph_runner.allow_capture():
                 self.cuda_graph_runner.is_warmup_only = True
                 try:
-                    with self.maybe_autotune_lora():
-                        self._run_cuda_graph_warmup(resource_manager)
+                    with timing_metric("cuda_graph_warmup_seconds",
+                                       self._metrics):
+                        with self.maybe_autotune_lora():
+                            self._run_cuda_graph_warmup(resource_manager)
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
                 self.cuda_graph_runner.padding_dummy_requests = {}
-                self._run_cuda_graph_warmup(resource_manager)
+                with timing_metric("cuda_graph_capture_seconds", self._metrics):
+                    self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
@@ -1620,9 +1637,11 @@ class PyTorchModelEngine(ModelEngine):
         # creates; build it when every forward above was skipped.
         with self._warmup_timer.phase("dsa_prewarm"):
             self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
-            self._warmup_dg_paged_mqa_logits_metadata()
+            with timing_metric("dg_paged_mqa_warmup_seconds", self._metrics):
+                self._warmup_dg_paged_mqa_logits_metadata()
             log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
-            self._warmup_cute_dsl_radix_topk()
+            with timing_metric("cute_dsl_radix_topk_warmup_seconds", self._metrics):
+                self._warmup_cute_dsl_radix_topk()
         log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
@@ -1630,7 +1649,8 @@ class PyTorchModelEngine(ModelEngine):
             with self._warmup_timer.phase("memory_pool_prepop"):
                 warmup_requests_configs = self._get_max_shape_warmup_requests(
                     resource_manager)
-                self._general_warmup(resource_manager, warmup_requests_configs)
+                with timing_metric("memory_pool_prepopulation_seconds", self._metrics):
+                    self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
         # Allocate the CUDA graph padding dummies now, while the KV cache is
