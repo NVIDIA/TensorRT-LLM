@@ -246,7 +246,6 @@ full:GB300/accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_4
 full:GB300/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-dp4-trtllm-fp8] SKIP (https://nvbugs/6474894)
 full:GB300/accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized[torch_compile=True] SKIP (https://nvbugs/6475346)
 full:GB300/accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[pp4-attn_backend=FLASHINFER-torch_compile=False] SKIP (https://nvbugs/6385771)
-full:GB300/accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=True] SKIP (https://nvbugs/6546909)
 full:GB300/accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[pp4-fp8kv=True-attn_backend=FLASHINFER-torch_compile=False] SKIP (https://nvbugs/6385771)
 full:GB300/accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=FLASHINFER-torch_compile=True] SKIP (https://nvbugs/6473161)
 full:GB300/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8[use_msa=False] SKIP (https://nvbugs/6422502)
