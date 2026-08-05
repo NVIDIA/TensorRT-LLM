@@ -995,7 +995,7 @@ def main(*,
             install_file(nixl_utils_dir / "libtensorrt_llm_nixl_wrapper.so",
                          lib_dir / "libtensorrt_llm_nixl_wrapper.so")
             build_run(
-                f'patchelf --set-rpath \'$ORIGIN/nixl/\' {lib_dir / "libtensorrt_llm_nixl_wrapper.so"}'
+                f'patchelf --set-rpath \'$ORIGIN:$ORIGIN/nixl/\' {lib_dir / "libtensorrt_llm_nixl_wrapper.so"}'
             )
             # Copy NIXL libraries
             if os.path.exists("/opt/nvidia/nvda_nixl"):
