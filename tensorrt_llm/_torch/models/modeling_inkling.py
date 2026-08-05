@@ -82,7 +82,6 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 # Protocol only -- no BaseResourceManager / KV-cache import, so this stays free
 # of an import cycle back through pyexecutor at model-load time.
-from tensorrt_llm._torch.pyexecutor.conv_state_manager import BaseConvStateManager
 from tensorrt_llm._utils import prefer_pinned
 
 from ...inputs import (
@@ -140,16 +139,17 @@ class InklingConvStateCache:
 
     def __init__(
         self,
-        model_config: "ModelConfig[InklingTextConfig]",
+        pretrained_config,
+        tp_size: int,
         max_batch_size: int,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
     ):
-        # Accept either the text ``ModelConfig`` or the top-level multimodal one;
-        # resolve to the text sub-config either way.
-        config = model_config.pretrained_config
-        config = getattr(config, "text_config", config)
-        tp_size = model_config.mapping.tp_size
+        # Takes the pretrained config + tp_size rather than a ``ModelConfig`` so
+        # the KV cache manager can build the pool from the arguments
+        # ``_create_kv_cache_manager`` already passes it, without a ModelConfig.
+        # Accept either the text config or the top-level multimodal one.
+        config = getattr(pretrained_config, "text_config", pretrained_config)
         kwin = config.sconv_kernel_size - 1
         self.max_batch_size = max_batch_size
         self.kwin = kwin
@@ -284,115 +284,6 @@ class InklingConvStateCache:
                 self._free.append(slot)
 
 
-class InklingConvStateManager(BaseConvStateManager):
-    """Request-lifetime resource manager wrapping the short-conv state pool.
-
-    Owns one :class:`InklingConvStateCache` and is registered in the executor's
-    resource dict under ``ResourceManagerType.CONV_STATE_MANAGER`` (see
-    ``pyexecutor/py_executor_creator.py``), so the four short-conv states of
-    every decoder layer are carried per request with the same lifetime as the
-    paged KV cache.
-
-    Pool rows are allocated lazily on first sight of a request id
-    (:meth:`prepare_conv_runtime`, called per forward with the batch's request
-    ids) and released in :meth:`free_resources` when a request completes --
-    keyed on the same ``LlmRequest.py_request_id`` the KV cache and
-    ``attn_metadata.request_ids`` use, so slot ownership stays in lock-step with
-    the KV cache. The ``ResourceManager`` container dispatches
-    ``prepare_resources`` / ``free_resources`` / ``update_resources`` via
-    ``hasattr``, so no ``BaseResourceManager`` import is needed at model-load
-    time (and no import cycle through ``pyexecutor``).
-
-    It implements :class:`BaseConvStateManager` so the new resource type has a
-    capability interface behind it rather than a model-specific branch: a
-    consumer can ``isinstance``-test the protocol the way
-    ``AttentionMetadata._prepare_mamba_metadata`` tests
-    ``BaseMambaCacheManager``, and any future short-conv model reuses it.
-
-    NOTE: this is deliberately still a manager *beside* the KV cache rather
-    than one folded into it (``class InklingHybridCacheManager(KVCacheManagerV2,
-    BaseConvStateManager)``, the shape ``CppMambaHybridCacheManager`` uses).
-    Folding it in would delete the CONV_STATE_MANAGER resource type and its
-    creator wiring, and -- more importantly -- would make it structurally
-    impossible for the pool and the KV cache to disagree about block reuse,
-    which is the bug ``get_model_defaults`` currently has to paper over by
-    defaulting ``enable_block_reuse`` off. That change alters the allocation
-    and lifetime path of both caches and needs the full accuracy gate, not the
-    smoke gate, so it is left as follow-up work.
-    """
-
-    def __init__(
-        self,
-        model_config: "ModelConfig[InklingConfig]",
-        max_batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype = torch.bfloat16,
-    ):
-        # +1 row for a CUDA-graph padding / dummy-request slot (mamba pattern):
-        # padded decode batches admit up to max_batch_size real requests plus a
-        # shared dummy row.
-        self.cache = InklingConvStateCache(model_config, max_batch_size + 1, device, dtype)
-        self.max_batch_size = max_batch_size
-
-    # ---- BaseResourceManager duck-typed interface (container uses hasattr) ----
-    def get_max_resource_count(self) -> int:
-        return self.max_batch_size
-
-    def get_needed_resource_to_completion(self, request) -> int:
-        # One pool row per request for its whole lifetime; the KV cache is the
-        # binding admission constraint, so a flat 1 keeps this from over-gating
-        # the capacity scheduler.
-        return 1
-
-    def prepare_resources(self, scheduled_batch):
-        # Rows are allocated per forward from the padded batch's request ids in
-        # prepare_conv_runtime (called by the model engine's eager input-prep,
-        # which sees the CUDA-graph padding this hook does not), so there is
-        # nothing to pre-allocate here.
-        pass
-
-    def update_resources(self, scheduled_batch):
-        pass
-
-    def add_dummy_requests(self, request_ids):
-        # CUDA-graph dummy / padding requests get zero-initialised rows on first
-        # sight via slots_for (in write_state_indices), like real requests.
-        pass
-
-    def free_resources(self, request):
-        rid = getattr(request, "py_request_id", None)
-        if rid is not None:
-            self.free_conv_state([rid])
-
-    def shutdown(self):
-        pass
-
-    # ---- BaseConvStateManager capability protocol -----------------------------
-    def get_conv_state_cache(self) -> InklingConvStateCache:
-        return self.cache
-
-    def write_conv_state_indices(self, request_ids, is_cuda_graph: bool):
-        self.cache.write_state_indices(list(request_ids), is_cuda_graph)
-        return self.cache.state_indices
-
-    def free_conv_state(self, request_ids) -> None:
-        self.cache.free(list(request_ids))
-
-    # ---- Model-facing eager entry point ---------------------------------------
-    def prepare_conv_runtime(self, attn_metadata):
-        """Resolve this batch's conv pool rows and build its per-forward split.
-
-        Called EAGERLY by the model engine (``_prepare_tp_inputs``) -- before
-        CUDA-graph capture/replay and before ``model.forward`` -- so the H2D
-        state_indices write happens outside the captured region and each replay
-        reads the current (padded) batch's rows. Returns ``(pool, conv_rt)`` for
-        the model to consume via its ``conv_cache`` / ``conv_rt`` kwargs; the
-        captured forward then performs no host->device slot copy.
-        """
-        conv_rt = InklingConvRuntime.build(attn_metadata, self.cache)
-        return self.cache, conv_rt
-
-
 @dataclass
 class InklingConvRuntime:
     """Per-forward short-conv plumbing for the pool path (all layers share it).
@@ -422,8 +313,8 @@ class InklingConvRuntime:
         one-token generation requests. Prefill-only tensors
         (``query_start_loc`` / ``has_initial_state``) are built only when
         ``num_contexts > 0`` -- never during decode-graph capture. Reached from
-        the model engine's eager input-prep via
-        :meth:`InklingConvStateManager.prepare_conv_runtime`, so the
+        ``InklingAttentionMetadata.prepare()`` via
+        :meth:`InklingHybridCacheManager.prepare_conv_runtime`, so the
         host->device slot write lands outside the captured ``model.forward``.
         """
         is_graph = bool(getattr(attn_metadata, "is_cuda_graph", False))
@@ -458,27 +349,6 @@ class InklingConvRuntime:
             query_start_loc=query_start_loc,
             has_initial_state=has_initial_state,
         )
-
-
-def _resolve_conv_runtime(resource_manager, attn_metadata):
-    """Fallback fetch of the runtime short-conv pool + this forward's split.
-
-    Looks up the registered :class:`InklingConvStateManager` in the executor's
-    ``ResourceManager`` container and, when present, returns ``(pool, conv_rt)``
-    via :meth:`InklingConvStateManager.prepare_conv_runtime`; ``(None, None)``
-    when no conv manager is registered, leaving the model on its stateless conv.
-
-    The runtime decode path pre-builds ``conv_cache`` / ``conv_rt`` EAGERLY in
-    the model engine (so the captured ``model.forward`` does no host->device slot
-    copy); this fallback only fires for eager, never-captured warmup paths that
-    reach ``model.forward`` without the engine having pre-built the split.
-    """
-    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-
-    mgr = resource_manager.get_resource_manager(ResourceManagerType.CONV_STATE_MANAGER)
-    if mgr is None:
-        return None, None
-    return mgr.prepare_conv_runtime(attn_metadata)
 
 
 def _apply_sconv(
@@ -1503,16 +1373,17 @@ class InklingModel(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        conv_cache: Optional[InklingConvStateCache] = None,
-        conv_rt: Optional[InklingConvRuntime] = None,
         inputs_embeds_prenormed: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        """Decoder stack. ``conv_cache`` (+ ``conv_rt``) is the runtime short-conv
-        state pool: each layer reads its own four ``[max_batch, C, K-1]`` buffers
-        and the shared per-forward ``conv_rt`` split, so the four short-convs of
-        every layer carry per-request state across decode steps exactly like the
-        paged KV cache. ``conv_cache=None`` keeps the stateless conv.
+        """Decoder stack. The runtime short-conv state pool and this forward's
+        context/generation split come from ``attn_metadata`` -- published by
+        ``InklingAttentionMetadata.prepare()`` from the cache manager, which owns
+        the pool. Each layer reads its own four ``[max_batch, C, K-1]`` buffers
+        and the shared split, so the four short-convs of every layer carry
+        per-request state across decode steps exactly like the paged KV cache.
+        A metadata without them (no conv-capable cache manager) keeps the
+        stateless conv.
 
         ``inputs_embeds_prenormed``: on the multimodal path the wrapper has
         ALREADY applied ``embed_norm`` to the text embeddings and scattered the
@@ -1523,6 +1394,8 @@ class InklingModel(DecoderModel):
         norm (default ``False``)."""
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        conv_cache = getattr(attn_metadata, "ink_conv_cache", None)
+        conv_rt = getattr(attn_metadata, "ink_conv_rt", None)
         hidden_states = inputs_embeds if inputs_embeds_prenormed else self.embed_norm(inputs_embeds)
         for i, layer in enumerate(self.layers):
             layer_state = conv_cache.layer_state(i) if conv_cache is not None else None
@@ -1623,27 +1496,19 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         return_context_logits: bool = False,
-        conv_cache: Optional[InklingConvStateCache] = None,
-        conv_rt: Optional[InklingConvRuntime] = None,
-        resource_manager=None,
         inputs_embeds_prenormed: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # Real-runtime path: the short-conv state pool is owned by the registered
-        # InklingConvStateManager (request lifetime shared with the KV cache).
-        # The model engine's eager input-prep pre-builds ``conv_cache``/``conv_rt``
-        # for this batch (so the captured forward does no host->device slot copy);
-        # they arrive here as kwargs. This fallback only fires for eager,
-        # never-captured warmup paths that reach forward without a pre-built split.
-        if conv_cache is None and resource_manager is not None:
-            conv_cache, conv_rt = _resolve_conv_runtime(resource_manager, attn_metadata)
+        # The short-conv state pool is owned by InklingHybridCacheManager, so it
+        # shares the KV cache's request lifetime and reaches the decoder through
+        # attn_metadata (published by InklingAttentionMetadata.prepare(), outside
+        # the captured region). No conv kwargs on the main path, and no
+        # ResourceManager lookup from inside forward.
         hidden_states = self.model(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            conv_cache=conv_cache,
-            conv_rt=conv_rt,
             inputs_embeds_prenormed=inputs_embeds_prenormed,
         )
         hidden_states = hidden_states / self.mup_multiplier

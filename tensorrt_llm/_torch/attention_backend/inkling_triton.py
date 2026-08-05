@@ -569,6 +569,11 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         self.ink_page_table: Dict[int, torch.Tensor] = {}  # layer -> [cap, pages]
         self._ink_sl_host: Optional[torch.Tensor] = None
         self._ink_pt_host: Optional[torch.Tensor] = None
+        # Short-conv pool + this forward's context/generation split, published
+        # alongside the attention metadata because both are per-step host work
+        # that must land in stable buffers before CUDA-graph capture.
+        self.ink_conv_cache = None
+        self.ink_conv_rt = None
 
     def _ink_layers(self) -> List[int]:
         """Global decoder-layer indices this rank owns.
@@ -603,7 +608,26 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare(self) -> None:
         super().prepare()
+        self._prepare_inkling_conv()
         self._prepare_inkling_decode()
+
+    def _prepare_inkling_conv(self) -> None:
+        """Publish the short-conv pool rows for this batch.
+
+        Gated on the capability, not on the model: any cache manager that
+        implements BaseConvStateManager gets this, which is the same shape
+        AttentionMetadata._prepare_mamba_metadata uses for BaseMambaCacheManager.
+        Runs here rather than from PyTorchModelEngine because prepare() is the
+        framework's pre-forward hook and is already called on every input-prep
+        path, so the host->device slot write stays outside the captured region.
+        """
+        from ..pyexecutor.conv_state_manager import BaseConvStateManager
+
+        mgr = self.kv_cache_manager
+        if not isinstance(mgr, BaseConvStateManager) or self.request_ids is None:
+            self.ink_conv_cache = self.ink_conv_rt = None
+            return
+        self.ink_conv_cache, self.ink_conv_rt = mgr.prepare_conv_runtime(self)
 
     def _prepare_inkling_decode(self) -> None:
         # Reset first: a step that returns early below must not leave the
@@ -688,6 +712,8 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         md.ink_num_gen = 0
         md._ink_sl_host = None
         md._ink_pt_host = None
+        md.ink_conv_cache = None
+        md.ink_conv_rt = None
         md.ink_seq_lens = torch.ones(max_batch_size, dtype=torch.int32, device="cuda")
         md.ink_page_table = {
             layer: torch.zeros((max_batch_size, md.ink_max_pages), dtype=torch.int32, device="cuda")

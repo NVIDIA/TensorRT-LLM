@@ -2127,12 +2127,6 @@ class PyTorchModelEngine(ModelEngine):
             ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
-        # Request-lifetime managers that piggyback on the KV cache (e.g. Inkling's
-        # short-conv state pool) must release their per-request rows for warmup /
-        # estimation dummy batches too; otherwise a leaked slot is later reused
-        # (with stale state) by a real request whose id collides with a dummy id.
-        conv_state_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.CONV_STATE_MANAGER)
         try:
             yield batch
         finally:
@@ -2145,8 +2139,6 @@ class PyTorchModelEngine(ModelEngine):
                         cross_kv_cache_manager.free_resources(req)
                     if spec_resource_manager is not None:
                         spec_resource_manager.free_resources(req)
-                    if conv_state_manager is not None:
-                        conv_state_manager.free_resources(req)
 
     def _get_num_extra_decoding_steps(self) -> int:
         """Determines extra decoding steps needed for fused drafting loops."""
@@ -3802,34 +3794,6 @@ class PyTorchModelEngine(ModelEngine):
 
         return inputs, self.gather_ids_cuda[:num_generation_tokens]
 
-    def _maybe_prepare_inkling_runtime(self, inputs, attn_metadata,
-                                       resource_manager):
-        """Eagerly publish Inkling's short-conv pool slots into the pool's STABLE
-        ``state_indices`` GPU buffer BEFORE CUDA-graph capture/replay, so the
-        captured decode forward performs no host->device copy.
-
-        This MUST run in both ``_prepare_tp_inputs`` (the KV-cache generation path
-        used by graph capture AND every decode replay) and
-        ``_prepare_tp_inputs_no_cache``. Publishing here (not inside the captured
-        ``model.forward``) is what makes both graph-safe and refreshed every step;
-        the model's in-forward fallbacks only cover eager, never-captured paths.
-        No-op for non-Inkling models (gated on the registered conv-state manager).
-
-        The attention half of this publish (total-KV seq_lens + per-layer page
-        table) now lives in ``InklingAttentionMetadata.prepare()``, the
-        framework's documented pre-forward hook, and needs nothing here.
-        """
-        if resource_manager is None:
-            return
-        conv_state_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.CONV_STATE_MANAGER)
-        if conv_state_manager is None:
-            return
-        conv_cache, conv_rt = conv_state_manager.prepare_conv_runtime(
-            attn_metadata)
-        inputs['conv_cache'] = conv_cache
-        inputs['conv_rt'] = conv_rt
-
     def _can_use_steady_gen_fast_prepare(
             self, scheduled_requests: ScheduledRequests,
             new_tokens_device: Optional[torch.Tensor],
@@ -3965,13 +3929,6 @@ class PyTorchModelEngine(ModelEngine):
             'multimodal_params': [],
             'resource_manager': resource_manager,
         }
-        # This fast path returns instead of falling through to the end of
-        # _prepare_tp_inputs, so it has to publish the per-request runtime state
-        # itself: an unchanged generation-only batch is exactly the steady-state
-        # decode where a stale short-conv pool row or attention page table would
-        # be read by the captured graph. No-op for models without the pool.
-        self._maybe_prepare_inkling_runtime(inputs, attn_metadata,
-                                            resource_manager)
         return inputs, None
 
     def _prepare_tp_inputs(
@@ -5230,13 +5187,6 @@ class PyTorchModelEngine(ModelEngine):
                     _use_mrope,
                 }
 
-        # Inkling runtime state (short-conv pool + attention decode metadata) must
-        # be published here: this is the KV-cache path taken by CUDA-graph capture
-        # AND every decode replay, so publishing eagerly per step keeps the
-        # captured forward copy-free and the stable buffers fresh.
-        self._maybe_prepare_inkling_runtime(inputs, attn_metadata,
-                                            resource_manager)
-
         return inputs, self.gather_ids_cuda[:len(
             gather_ids)] if self.enable_spec_decode else None
 
@@ -5646,23 +5596,13 @@ class PyTorchModelEngine(ModelEngine):
                 attn_metadata.num_tokens)
             attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        inputs = {
+        return {
             'attn_metadata': attn_metadata,
             'input_ids': self.input_ids_cuda[:num_tokens],
             'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
             'inputs_embeds': None,
             'resource_manager': resource_manager,
-        }
-        # Models with a per-request short-conv state pool (e.g. Inkling) resolve
-        # this batch's pool rows and publish them into their stable state_indices
-        # CUDA buffer EAGERLY here -- before CUDA-graph capture/replay and before
-        # model.forward -- so the captured forward performs no host->device slot
-        # copy and each replay reads the current (padded) batch's rows. Only a
-        # registered CONV_STATE_MANAGER triggers this; other models are
-        # unaffected (no extra kwargs added).
-        self._maybe_prepare_inkling_runtime(inputs, attn_metadata,
-                                            resource_manager)
-        return inputs, gather_ids if is_spec_decode else None
+        }, gather_ids if is_spec_decode else None
 
     def _get_lora_params_from_requests(
             self,

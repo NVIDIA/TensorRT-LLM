@@ -21,6 +21,7 @@ guarantee no required text tensor (q/k norm, relative bias, short conv,
 route/global scale, unpadded logits) can silently go missing.
 """
 
+import inspect
 import json
 import os
 import struct
@@ -232,8 +233,11 @@ class _FakeKvManager:
         self.calls = []
 
     def get_batch_cache_indices(self, request_ids, layer_idx):
+        # One row per request id, like the real manager -- returning a fixed
+        # row count regardless of the batch is what made this fake disagree
+        # with production.
         self.calls.append((tuple(request_ids), layer_idx))
-        return self._blocks[layer_idx]
+        return self._blocks[layer_idx][: len(request_ids)]
 
 
 def _ink_metadata(
@@ -266,7 +270,9 @@ def _ink_metadata(
         for layer in pp_layers
     }
     md.kv_cache_manager = _FakeKvManager(list(pp_layers), blocks, max_blocks_per_seq)
-    md.seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
+    # seq_lens_cuda is a read-only property over this field; _ink_ensure
+    # reads it only for the device.
+    md._seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
     return md
 
 
@@ -346,6 +352,17 @@ def test_inkling_backend_is_registered_and_carries_the_metadata():
     assert InklingTritonAttention.Metadata is InklingAttentionMetadata
 
 
+def test_llm_args_is_untouched_by_the_inkling_backend():
+    """Adding INKLING to the attn_backend telemetry list would change
+    llmapi/llm_args.py, which trips the API-stability label gate and stales the
+    golden manifest -- for a value no user ever supplies. Keep that file out of
+    this PR."""
+    from tensorrt_llm.llmapi import llm_args as la
+
+    src = inspect.getsource(la.TorchLlmArgs)
+    assert "INKLING" not in src
+
+
 def test_model_defaults_select_the_inkling_backend():
     from tensorrt_llm._torch.models.modeling_inkling import InklingForConditionalGeneration
 
@@ -353,16 +370,18 @@ def test_model_defaults_select_the_inkling_backend():
 
 
 def test_conv_state_manager_implements_the_capability_protocol():
-    """The CONV_STATE_MANAGER resource type must stand behind a capability
-    interface, not a model-specific branch, so a consumer can isinstance-test
-    it the way _prepare_mamba_metadata tests BaseMambaCacheManager."""
-    from tensorrt_llm._torch.models.modeling_inkling import InklingConvStateManager
-    from tensorrt_llm._torch.pyexecutor.conv_state_manager import BaseConvStateManager
+    """The pool stands behind a capability interface, not a model-specific
+    branch, so a consumer can isinstance-test it the way
+    _prepare_mamba_metadata tests BaseMambaCacheManager."""
+    from tensorrt_llm._torch.pyexecutor.conv_state_manager import (
+        BaseConvStateManager,
+        InklingHybridCacheManager,
+    )
 
-    assert issubclass(InklingConvStateManager, BaseConvStateManager)
+    assert issubclass(InklingHybridCacheManager, BaseConvStateManager)
     # No abstract method left unimplemented -- an incomplete implementation
     # would only surface at instantiation time on a GPU node otherwise.
-    assert not getattr(InklingConvStateManager, "__abstractmethods__", frozenset())
+    assert not getattr(InklingHybridCacheManager, "__abstractmethods__", frozenset())
 
 
 def test_conv_state_protocol_is_not_the_mamba_one():
@@ -375,7 +394,7 @@ def test_conv_state_protocol_is_not_the_mamba_one():
     assert not issubclass(BaseConvStateManager, BaseMambaCacheManager)
     assert set(BaseConvStateManager.__abstractmethods__) == {
         "get_conv_state_cache",
-        "write_conv_state_indices",
+        "prepare_conv_runtime",
         "free_conv_state",
     }
 
@@ -394,3 +413,126 @@ def test_attn_backend_override_fails_loudly():
     for bad in ("TRTLLM", "FLASHINFER", "VANILLA"):
         with pytest.raises(ValueError, match="attn_backend='INKLING'"):
             check(SimpleNamespace(attn_backend=bad))
+
+
+def test_metadata_stages_each_layer_in_its_own_pinned_row():
+    """Regression: a single shared staging buffer refilled per layer corrupts
+    every layer but the last.
+
+    The H2D copies are non_blocking, so refilling one host buffer per layer
+    races the in-flight copy of the previous layer. The observable symptom is
+    page tables that all end up holding the same (or torn) rows, attention
+    reading the wrong KV pages, and decode collapsing to repeated tokens --
+    accuracy 0. Assert the staging buffer has a per-layer dimension and that
+    the published tables actually differ per layer.
+    """
+    md = _ink_metadata(pp_layers=(0, 1))
+
+    md._prepare_inkling_decode()
+
+    # One staging row per layer, not one buffer shared across layers.
+    assert md._ink_pt_host.dim() == 3
+    assert md._ink_pt_host.shape[0] == 2
+    # Distinct per-layer block ids must survive to distinct device tables.
+    assert md.ink_page_table[0][:2].tolist() != md.ink_page_table[1][:2].tolist()
+    assert md.ink_page_table[0][:2].tolist() == [[1, 0, 0, 0], [2, 3, 0, 0]]
+    assert md.ink_page_table[1][:2].tolist() == [[11, 0, 0, 0], [12, 13, 0, 0]]
+
+
+def test_conv_pool_is_owned_by_the_kv_cache_manager():
+    """The pool must be part of the cache manager, not a resource manager beside
+    it: that is what frees the conv row with the request's KV blocks and lets
+    the model reach it through attn_metadata.kv_cache_manager."""
+    from tensorrt_llm._torch.pyexecutor.conv_state_manager import (
+        BaseConvStateManager,
+        InklingHybridCacheManager,
+    )
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+    assert issubclass(InklingHybridCacheManager, KVCacheManagerV2)
+    assert issubclass(InklingHybridCacheManager, BaseConvStateManager)
+    assert not getattr(InklingHybridCacheManager, "__abstractmethods__", frozenset())
+    # free_resources must be overridden, or conv rows outlive their KV blocks.
+    assert InklingHybridCacheManager.free_resources is not KVCacheManagerV2.free_resources
+
+
+def test_conv_state_resource_type_is_gone():
+    """The framework-level resource type existed only for the standalone pool."""
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    assert not hasattr(ResourceManagerType, "CONV_STATE_MANAGER")
+
+
+def test_inkling_selects_the_hybrid_cache_manager():
+    from tensorrt_llm._torch.pyexecutor._util import _non_hybrid_kv_cache_manager_cls
+    from tensorrt_llm._torch.pyexecutor.conv_state_manager import InklingHybridCacheManager
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    cfg = SimpleNamespace(model_type="inkling_text")
+    assert _non_hybrid_kv_cache_manager_cls(cfg, KvCacheConfig()) is (InklingHybridCacheManager)
+
+
+def test_metadata_publishes_the_conv_runtime_from_the_manager():
+    """prepare() must take the pool off the cache manager via the capability
+    protocol, so the publish stays outside the captured forward."""
+    from tensorrt_llm._torch.pyexecutor.conv_state_manager import BaseConvStateManager
+
+    class _FakeConvManager(_FakeKvManager, BaseConvStateManager):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.prepared = 0
+
+        def get_conv_state_cache(self):
+            return "POOL"
+
+        def prepare_conv_runtime(self, attn_metadata):
+            self.prepared += 1
+            return "POOL", "RUNTIME"
+
+        def free_conv_state(self, request_ids):
+            pass
+
+    md = _ink_metadata()
+    md.kv_cache_manager = _FakeConvManager(
+        md.kv_cache_manager.pp_layers, md.kv_cache_manager._blocks
+    )
+
+    md._prepare_inkling_conv()
+
+    assert md.kv_cache_manager.prepared == 1
+    assert (md.ink_conv_cache, md.ink_conv_rt) == ("POOL", "RUNTIME")
+
+
+def test_metadata_leaves_conv_state_empty_without_the_capability():
+    """A plain KV manager must not get a conv publish -- other models keep the
+    stateless path and pay nothing."""
+    md = _ink_metadata()
+
+    md._prepare_inkling_conv()
+
+    assert md.ink_conv_cache is None and md.ink_conv_rt is None
+
+
+def test_conv_pool_dtype_is_a_torch_dtype_not_the_kv_cache_dtype():
+    """_create_kv_cache_manager passes dtype= as the KV cache dtype, a C++
+    tensorrt_llm.bindings.DataType. Feeding that to torch.zeros raises
+    "invalid combination of arguments" and kills the server at startup, so the
+    conv pool must take its dtype from the model config instead."""
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor import conv_state_manager as csm
+
+    src = inspect.getsource(csm.InklingHybridCacheManager.__init__)
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    assert 'kwargs["dtype"]' not in code and 'kwargs.get("dtype")' not in code
+
+    # The resolution itself: a config torch_dtype wins, anything else -> bf16.
+    for cfg, expected in (
+        (SimpleNamespace(torch_dtype=torch.float16), torch.float16),
+        (SimpleNamespace(torch_dtype="not-a-dtype"), torch.bfloat16),
+        (SimpleNamespace(), torch.bfloat16),
+    ):
+        resolved = getattr(cfg, "torch_dtype", None)
+        if not isinstance(resolved, torch.dtype):
+            resolved = torch.bfloat16
+        assert resolved is expected

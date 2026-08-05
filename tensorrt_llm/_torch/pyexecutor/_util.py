@@ -96,6 +96,15 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     # loud failure instead of wrong outputs.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
                 or is_gemma4_hybrid(config) or is_inkling(config))
+    if is_inkling(config):
+        # Inkling's four per-layer short convolutions hold per-request state
+        # with the KV cache's lifetime, so the cache manager owns that pool too
+        # (the CppMambaHybridCacheManager shape). Keeping it here rather than in
+        # a separate ResourceManager is what lets the pool reach the model
+        # through attn_metadata.kv_cache_manager and be released by the same
+        # free_resources call that frees the request's KV blocks.
+        from .conv_state_manager import InklingHybridCacheManager
+        return InklingHybridCacheManager
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
