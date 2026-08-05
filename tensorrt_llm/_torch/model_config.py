@@ -351,7 +351,6 @@ class ModelConfig(Generic[TConfig]):
             sm_version = get_sm_version()
             if 100 <= sm_version < 120:
                 return "TRTLLM"
-            return "CUTLASS"
 
         is_w4a16_nvfp4 = (quant_config is not None and quant_config.quant_algo
                           in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))

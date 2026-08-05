@@ -1532,8 +1532,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             not (self.fusion_config.POST_MOE_FUSION
                  and hidden_states.shape[0] <= self.moe_allreduce.max_token
                  and self.model_config.moe_backend == "TRTLLM"
-                 and self.mlp.experts.has_nvfp4_activation_quantization
-                 and self.is_p2p_supported))
+                 and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
@@ -1605,7 +1604,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
-            if self.mlp.gate_up_proj.has_nvfp4_activation_quantization:
+            if self.mlp.gate_up_proj.has_nvfp4:
                 act_fp4, act_sf, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(

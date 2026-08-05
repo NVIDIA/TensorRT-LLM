@@ -720,7 +720,7 @@ class Glm4DecoderLayer(DecoderLayer):
                 hidden_states.shape[0] <= self.moe_allreduce.max_token
                 and self.fusion_config.POST_MOE_FUSION
                 and self.model_config.moe_backend == "TRTLLM"
-                and self.mlp.experts.has_nvfp4_activation_quantization
+                and self.mlp.experts.has_nvfp4
                 and self.is_p2p_supported
             )
         )

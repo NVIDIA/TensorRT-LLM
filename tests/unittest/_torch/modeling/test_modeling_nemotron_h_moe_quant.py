@@ -101,7 +101,7 @@ def test_nemotron_h_moe_uses_mixer_expert_layer_quant_config():
     assert captured["override_quant_config"] is layer_quant_config
 
 
-def test_nemotron_h_mtp_bf16_body_uses_cutlass_moe_backend():
+def test_nemotron_h_mtp_overrides_quant_and_inherits_moe_backend():
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16, exclude_modules=["lm_head"]
     )
@@ -141,6 +141,5 @@ def test_nemotron_h_mtp_bf16_body_uses_cutlass_moe_backend():
     for layer_kwargs in captured:
         sublayer_model_config = layer_kwargs["model_config"]
         assert sublayer_model_config.quant_config.quant_algo is None
-        assert sublayer_model_config.moe_backend == "CUTLASS"
-    assert model_config.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
-    assert model_config.moe_backend == "CUTEDSL"
+        assert sublayer_model_config.moe_backend == model_config.moe_backend
+    assert model_config.quant_config is quant_config

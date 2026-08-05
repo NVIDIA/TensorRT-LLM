@@ -379,10 +379,9 @@ class _DenseMlpAdapter(nn.Module):
         self.mlp = mlp
         self.mapping = mapping
         self.enable_attention_dp = mapping.enable_attention_dp
-        # Provide a dummy `experts` attribute so that the
-        # `self.mlp.experts.has_nvfp4_activation_quantization` checks in decoder
-        # forward don't crash.
-        self.experts = SimpleNamespace(has_nvfp4_activation_quantization=False)
+        # Provide a dummy `experts` attribute so that
+        # `self.mlp.experts.has_nvfp4` checks in decoder forward don't crash.
+        self.experts = SimpleNamespace(has_nvfp4=False)
 
     def forward(
         self,

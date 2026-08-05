@@ -27,24 +27,6 @@ from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
 
-def _is_same_or_child_module_path(lhs: str, rhs: str) -> bool:
-    return lhs == rhs or lhs.startswith(f"{rhs}.") or rhs.startswith(f"{lhs}.")
-
-
-def _get_layer_quant_config(
-        model_config: ModelConfig,
-        layer_idx: Optional[int],
-        expert_module_suffix: str = "mlp.experts") -> Optional[QuantConfig]:
-    if layer_idx is None or model_config.quant_config_dict is None:
-        return None
-
-    moe_module_name = f"model.layers.{layer_idx}.{expert_module_suffix}"
-    for name, quant_config in model_config.quant_config_dict.items():
-        if _is_same_or_child_module_path(name, moe_module_name):
-            return quant_config
-    return None
-
-
 def _get_pretrained_megamoe_capability_args(
         model_config: ModelConfig) -> Dict[str, Optional[object]]:
     """Extract dtype / hidden / intermediate kwargs for MegaMoE
@@ -113,7 +95,7 @@ def get_moe_cls(
                 if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
                     mapping = model_config.mapping
                     if mapping.moe_ep_size > 1 or mapping.dp_size > 1:
-                        logger.info(
+                        logger.warning(
                             "CuteDslB12xFusedMoE does not support expert "
                             "parallelism or attention-DP/all-to-all; selecting "
                             "CutlassFusedMoE.")

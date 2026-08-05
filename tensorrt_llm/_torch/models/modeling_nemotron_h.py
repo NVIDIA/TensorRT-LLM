@@ -42,7 +42,6 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MoEWeightLoadingMode, create_moe
-from ..modules.fused_moe.create_moe import _get_layer_quant_config
 from ..modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from ..modules.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
                                               W4A16NVFP4CutlassFusedMoEMethod)
@@ -247,14 +246,18 @@ class NemotronHMOE(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
-        # For MIXED_PRECISION models, the global quant_config has
-        # quant_algo=MIXED_PRECISION which maps to QuantMode(0) (no quant). This
-        # would cause the MoE backend to select UnquantizedFusedMoEMethod and
-        # allocate BF16 weight buffers, causing a shape mismatch when loading
-        # NVFP4/W4A8_NVFP4_FP8 quantized expert weights. The per-expert entry in
-        # quant_config_dict is more specific, so prefer it when present.
-        moe_quant_config = _get_layer_quant_config(model_config, layer_idx,
-                                                   "mixer.experts")
+        # For MIXED_PRECISION models, the global quant_config has quant_algo=MIXED_PRECISION
+        # which maps to QuantMode(0) (no quant). This would cause the MoE backend to select
+        # UnquantizedFusedMoEMethod and allocate BF16 weight buffers, causing a shape mismatch
+        # when loading NVFP4/W4A8_NVFP4_FP8 quantized expert weights.
+        # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
+        override_quant_config = None
+        if model_config.quant_config_dict is not None:
+            experts_prefix = f"model.layers.{layer_idx}.mixer.experts."
+            for key, cfg in model_config.quant_config_dict.items():
+                if key.startswith(experts_prefix):
+                    override_quant_config = cfg
+                    break
 
         # Setup MoE experts.
         self.experts = create_moe(
@@ -266,7 +269,7 @@ class NemotronHMOE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=self.reduce_results,
             model_config=model_config,
-            override_quant_config=moe_quant_config,
+            override_quant_config=override_quant_config,
             layer_idx=self.layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             bias=self.mlp_bias,
@@ -1218,20 +1221,14 @@ class NemotronHMTP(nn.Module):
 
             sublayer_quant_config = self._get_mtp_sublayer_quant_config(
                 model_config, self.layer_idx)
-            sublayer_moe_backend = model_config.moe_backend
-            if (sublayer_quant_config is None
-                    or sublayer_quant_config.quant_algo is None):
-                sublayer_moe_backend = "CUTLASS"
 
             # Create a model_config copy with quant_config overridden and
             # spec_config cleared. All other fields (use_cuda_graph,
-            # moe_max_num_tokens, etc.) must be inherited so MoE layers are
-            # configured correctly for CUDA graph capture and communication
-            # (e.g., DeepEP). BF16 MTP body layers cannot use NVFP4-only MoE
-            # backends, so route those sublayers to CUTLASS.
+            # moe_backend, moe_max_num_tokens, etc.) must be inherited
+            # so MoE layers are configured correctly for CUDA graph
+            # capture and communication (e.g., DeepEP).
             sublayer_model_config = replace(model_config,
                                             quant_config=sublayer_quant_config,
-                                            moe_backend=sublayer_moe_backend,
                                             spec_config=None)
 
             self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(
@@ -1251,15 +1248,14 @@ class NemotronHMTP(nn.Module):
                                        layer_idx: int):
         """
         Get quantization config for MTP sublayer.
-        The MTP body tensors are stored in BF16. The shared MTP head still
-        receives the checkpoint-backed lm_head, so its logits path keeps the
-        lm_head precision instead of inheriting this sublayer override.
+        The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
+        moe_backend only supports fp8/fp4 quantization, we need to override
+        the quant_config for the MTP layer.
         """
         from tensorrt_llm.models.modeling_utils import QuantConfig
 
         quant_config = model_config.quant_config
-        # This checkpoint's MTP body is unquantized, so force quant_algo=None
-        # only for the MTP sublayers constructed here.
+        # MTP layers are always unquantized, force quant_algo=None
         if quant_config is None:
             return None
         return QuantConfig(

@@ -769,6 +769,7 @@ def test_fp4_linear_cuda_core(dtype, mnk):
     not (89 <= get_sm_version() < 100 or get_sm_version() in (120, 121)),
     reason="Dense Marlin NVFP4 runs on SM89-99 and SM120/121",
 )
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "mnk",
@@ -790,7 +791,10 @@ def test_fp4_linear_cuda_core(dtype, mnk):
         (3, 176, 144),
         (128, 928, 1360),
     ])
-def test_fp4_linear_marlin(dtype, mnk):
+def test_fp4_linear_marlin(quant_algo, dtype, mnk):
+    if quant_algo == QuantAlgo.NVFP4 and get_sm_version() in (120, 121):
+        pytest.skip(
+            "Marlin backend shouldn't be used for NVFP4 quant on SM120/121")
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
 
@@ -812,7 +816,7 @@ def test_fp4_linear_marlin(dtype, mnk):
             out_features=OUTPUT_SIZE,
             bias=False,
             dtype=dtype,
-            quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4),
+            quant_config=QuantConfig(quant_algo=quant_algo),
             nvfp4_allowed_backends=['marlin'],  # key
         )
 
