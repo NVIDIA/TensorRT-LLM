@@ -963,6 +963,30 @@ class CLIPVisionConfig:
 
 
 # ---------------------------------------------------------------------------
+# Layer norm.
+# ---------------------------------------------------------------------------
+
+
+class MiniMaxVLLayerNorm(nn.LayerNorm):
+    """``nn.LayerNorm`` whose parameter init is skipped on meta tensors.
+
+    ``nn.LayerNorm.reset_parameters`` fills weight/bias via ``aten.fill_.Scalar``,
+    which ``MetaInitMode`` does not allow, so a plain ``nn.LayerNorm`` anywhere in
+    the ``__init__`` tree aborts meta-init for the whole model and forces the
+    loader onto its regular-init fallback (hundreds of GB of host allocation per
+    rank for M3). Every layer-norm slot here is covered by the checkpoint, so the
+    skipped values are always overwritten at load time.
+    """
+
+    def reset_parameters(self) -> None:
+        # Only skip on meta: real tensors still need ones/zeros, otherwise a
+        # module built without a checkpoint keeps uninitialized storage.
+        if self.weight is not None and self.weight.is_meta:
+            return
+        super().reset_parameters()
+
+
+# ---------------------------------------------------------------------------
 # Patch embedding (Conv3d).
 # ---------------------------------------------------------------------------
 
@@ -1192,9 +1216,13 @@ class MiniMaxVLEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.self_attn = MiniMaxVLEncoderSelfAttention(config, dtype)
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.layer_norm1 = MiniMaxVLLayerNorm(
+            self.embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
         self.mlp = MiniMaxVLEncoderMLP(config, dtype)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.layer_norm2 = MiniMaxVLLayerNorm(
+            self.embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
 
     def forward(
         self,
@@ -1265,7 +1293,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
 
         self.embeddings = MiniMaxVLPatchEmbedding(config, dtype)
         # NOTE: the typo "layrnorm" matches the published checkpoint key.
-        self.pre_layrnorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps, dtype=dtype)
+        self.pre_layrnorm = MiniMaxVLLayerNorm(embed_dim, eps=config.layer_norm_eps, dtype=dtype)
         self.encoder = MiniMaxVLEncoder(config, dtype)
 
         if config.position_embedding_type != "rope" or config.rope_mode != "3d":
