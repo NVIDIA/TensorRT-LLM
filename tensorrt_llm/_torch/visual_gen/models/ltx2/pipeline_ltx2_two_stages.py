@@ -1722,7 +1722,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             timer.mark_stage2_start()
 
         # --- Euler denoising loop (no guidance) ---
-        for i in range(len(sigmas) - 1):
+        # Stage 2 runs its own loop rather than BasePipeline.denoise(), so it
+        # drives the profiler windows itself. Without this a numeric range
+        # would capture stage 1 only and the trace would silently omit half
+        # the denoising.
+        for i, _ in self._profile_denoise_steps(range(len(sigmas) - 1)):
             with nvtx_range(f"refinement_step {i}"):
                 sigma = sigmas[i]
                 sigma_next = sigmas[i + 1]

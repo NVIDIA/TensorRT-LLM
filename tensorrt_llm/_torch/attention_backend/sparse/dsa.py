@@ -115,6 +115,7 @@ class DSAParams(SparseParams):
     # ("full") or reuses the previous full layer's top-k ("shared"). Always
     # True for a dense per-layer indexer (e.g. DeepSeek-V3.2).
     is_full_indexer_layer: bool = True
+    mtp_index_share: bool = False
 
     @property
     def indices_block_size(self) -> int:
@@ -825,9 +826,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
-        # Per-step state for cross-layer indexer sharing; clear at the step
-        # boundary so a "shared" layer never reuses a stale top-k.
-        self.shared_topk_indices = None
+        # Clear per-step cross-layer top-k, but keep it inside the MTP draft
+        # loop so the step-0 stash survives for the reuse branch.
+        if not self.in_mtp_draft_loop:
+            self.shared_topk_indices = None
 
         if self.kv_cache_manager is not None and self.num_tokens > 0:
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
@@ -1221,6 +1223,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     capture_graph=capture_graph,
                 )
 
+        # MTP cross-step indexer Top-K reuse state.
+        self.indexer_skip_topk = False
+        self.in_mtp_draft_loop = False
+        self.mtp_num_accepted = None
+
         # Persistent scratch for the Radix-split-work indexer path. Re-created
         # in update_spec_dec_param when max_draft_tokens changes so it stays
         # large enough for the MTP generation-row count.
@@ -1363,6 +1370,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         pool_indices = pool_indices.clamp(min=0,
                                           max=max_pool_idx).to(torch.int32)
         return pool_indices
+
+    def set_skip_topk(self, skip: bool):
+        self.indexer_skip_topk = skip
+
+    def set_in_mtp_draft_loop(self, active: bool):
+        self.in_mtp_draft_loop = active
+
+    def set_mtp_num_accepted(self, num_accepted):
+        self.mtp_num_accepted = num_accepted
 
     def _invalidate_pool_view_cache(self):
         """Invalidate the cached pool view and related step-invariant values.
@@ -1873,6 +1889,10 @@ class Indexer(nn.Module):
 
         self._enable_heuristic_topk = (sparse_params.enable_heuristic_topk
                                        and get_sm_version() >= 100)
+
+        # Default False for sparse configs that don't define it (e.g. the
+        # DeepSeekV4 path shares this DSA constructor with its own config class).
+        self.mtp_index_share = getattr(sparse_params, "mtp_index_share", False)
 
         if self._enable_heuristic_topk and layer_idx == 0:
             # Populate static caches (sm_count, L2 cache size) inside the C++
@@ -2705,7 +2725,14 @@ class Indexer(nn.Module):
                 local_layer, num_generations:num_generations +
                 num_contexts].copy_(topk_indices_buffer[last_ctx_idx, :])
 
-        if has_decode and not metadata.skip_indexer_for_gen_reqs:
+        reuse_topk = (self.mtp_index_share and metadata.indexer_skip_topk
+                      and metadata.shared_topk_indices is not None)
+
+        if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_topk:
+            topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                num_gen_tokens, :] = \
+                metadata.shared_topk_indices[:num_generations, :]
+        elif has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
@@ -2961,7 +2988,45 @@ class Indexer(nn.Module):
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
+
+        # MTP Top-K stash: save each request's last accepted Top-K for reuse
+        # by subsequent draft steps.
+        if (self.mtp_index_share and metadata.in_mtp_draft_loop
+                and not reuse_topk):
+            rows = None
+            if num_generations > 0:
+                next_n = num_gen_tokens // num_generations
+                gen_topk = topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                               num_gen_tokens]
+                rows = self._mtp_last_accepted_rows(gen_topk, metadata,
+                                                    num_contexts,
+                                                    num_generations, next_n)
+            if num_contexts > 0:
+                ctx_last = torch.cumsum(
+                    metadata.seq_lens_cuda[:num_contexts].to(
+                        torch.long), dim=0) - 1
+                ctx_rows = topk_indices_buffer[ctx_last]
+                rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+            if rows is not None:
+                metadata.shared_topk_indices = rows.contiguous()
         return topk_indices_buffer
+
+    def _mtp_last_accepted_rows(self, gen_topk, metadata, num_contexts,
+                                num_generations, next_n):
+        """Return each gen request's last accepted Top-K row
+        (base + num_accepted - 1); rows past num_accepted are rejected-branch
+        padding that corrupts partial-accept reuse. CUDA-graph safe; falls back
+        to the last row when accepted counts aren't plumbed in.
+        """
+        num_accepted = getattr(metadata, "mtp_num_accepted", None)
+        if num_accepted is None:
+            return gen_topk[next_n - 1::next_n]
+        gen_num_accepted = num_accepted[num_contexts:num_contexts +
+                                        num_generations]
+        base = torch.arange(
+            num_generations, device=gen_topk.device, dtype=torch.long) * next_n
+        offset = (gen_num_accepted - 1).clamp(0, next_n - 1)
+        return gen_topk[base + offset]
 
     def _weight_scale(self, weights: torch.Tensor,
                       q_scale: torch.Tensor) -> torch.Tensor:
@@ -3235,6 +3300,21 @@ class DSATrtllmAttention(TrtllmAttention):
         )
 
 
+def derive_indexer_k_cache_layer_mask(
+    sparse_attention_config: "SparseAttentionConfig",
+    pretrained_config,
+    num_layers: int,
+) -> List[bool]:
+    return [
+        bool(
+            getattr(
+                sparse_attention_config.to_sparse_params(
+                    pretrained_config=pretrained_config, layer_idx=layer_idx),
+                "is_full_indexer_layer", True))
+        for layer_idx in range(num_layers)
+    ]
+
+
 class DSACacheManager(KVCacheManager):
     """KV cache manager for DSA with additional indexer K-cache pools."""
 
@@ -3281,6 +3361,14 @@ class DSACacheManager(KVCacheManager):
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
 
+        from tensorrt_llm._torch.speculative import get_num_spec_layers
+        total_num_layers = (len(layer_mask)
+                            if layer_mask is not None else num_layers)
+        if spec_config is not None and layer_mask is None:
+            total_num_layers += get_num_spec_layers(spec_config)
+        indexer_k_cache_layer_mask = derive_indexer_k_cache_layer_mask(
+            sparse_attention_config, pretrained_config, total_num_layers)
+
         super().__init__(
             kv_cache_config,
             kv_cache_type,
@@ -3301,6 +3389,7 @@ class DSACacheManager(KVCacheManager):
             indexer_k_cache_quant_block_size=128,
             indexer_k_cache_index_head_dim=self.index_head_dim,
             indexer_k_cache_use_fp4=self.use_fp4,
+            indexer_k_cache_layer_mask=indexer_k_cache_layer_mask,
             **kwargs,
         )
         self.num_blocks = self.blocks_in_primary_pool
@@ -3308,11 +3397,20 @@ class DSACacheManager(KVCacheManager):
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.tokens_per_block * (index_head_dim + scale_size)]
         # Non-interleaved layout: [fp8_tok0 | fp8_tok1 | ... | scale_tok0 | scale_tok1 | ...]
-        # Store FP8-quantized k values from the indexer
+        # Store FP8-quantized k values from the indexer.
+        # One entry per local layer; None for shared-indexer layers, which own
+        # no row in the masked indexer pool (the C++ binding raises if asked).
+        local_mask = self.indexer_k_cache_local_layer_mask
         self.indexer_k_cache_pool_per_layer = [
-            self.get_indexer_k_cache_pool_data(layer_idx)
-            for layer_idx in range(self.num_local_layers)
+            self.get_indexer_k_cache_pool_data(local_offset)
+            if local_mask[local_offset] else None
+            for local_offset in range(self.num_local_layers)
         ]
+        num_full = sum(local_mask)
+        if num_full < self.num_local_layers:
+            logger.info(
+                f"[DSACacheManager] Indexer k-cache: {num_full} of "
+                f"{self.num_local_layers} local layers own an indexer k-cache.")
 
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer k cache buffer from a specific layer pool."""
@@ -3320,8 +3418,11 @@ class DSACacheManager(KVCacheManager):
         data_bytes = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
         per_token_size = data_bytes + self.index_head_dim // self.quant_block_size * 4
         layer_offset = self.layer_offsets[layer_idx]
-        return self.indexer_k_cache_pool_per_layer[layer_offset].view(
-            self.num_blocks, block_size, 1, per_token_size)
+        pool = self.indexer_k_cache_pool_per_layer[layer_offset]
+        assert pool is not None, (
+            f"Layer {layer_idx} is a shared-indexer layer and owns no indexer "
+            f"k-cache; only full-indexer layers may access it.")
+        return pool.view(self.num_blocks, block_size, 1, per_token_size)
 
     def get_batch_indexer_k_cache_indices(
             self, request_ids: List[int]) -> List[List[int]]:
@@ -3376,12 +3477,23 @@ class DSACacheManager(KVCacheManager):
         # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
         mem_per_token *= num_attention_layers * head_dim
 
+        if num_layers is not None:
+            num_indexer_layers = max(num_layers, 1)
+        else:
+            local_layer_ids = mapping.pp_layers(
+                model_config.get_num_attention_layers())
+            num_indexer_layers = sum(
+                1 for layer_id in local_layer_ids if getattr(
+                    sparse_attention_config.to_sparse_params(
+                        pretrained_config=config, layer_idx=layer_id),
+                    "is_full_indexer_layer", True))
+
         # Indexer K cache: physically allocated as raw UINT8 in
         # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
         # 1 byte/element here -- it is NOT scaled by the KV cache dtype (unlike
         # the latent above). The data-portion byte count already reflects fp8 vs
         # fp4 via indexer_data_dim.
-        indexer_bytes_per_token = num_attention_layers * (
+        indexer_bytes_per_token = num_indexer_layers * (
             indexer_data_dim + index_head_dim // quant_block_size * 4)
         mem_per_token += indexer_bytes_per_token
         return mem_per_token
@@ -3409,9 +3521,17 @@ class DSACacheManager(KVCacheManager):
         # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
         # 1 byte/element here -- it is NOT scaled by the KV cache dtype (unlike
         # the latent above). Under FP4 the indexer data portion is halved (two
-        # E2M1 codes per byte); the scale bytes are unchanged.
+        # E2M1 codes per byte); the scale bytes are unchanged. Only
+        # full-indexer local layers own a row in the masked indexer pool, so
+        # shared layers (cross-layer indexer sharing) contribute no bytes.
         indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
-        indexer_bytes_per_token = sum(self.num_kv_heads_per_layer) * (
+        local_mask = self.indexer_k_cache_local_layer_mask
+        if local_mask is not None:
+            num_indexer_layers = sum(kv_heads for kv_heads, has_indexer in zip(
+                self.num_kv_heads_per_layer, local_mask) if has_indexer)
+        else:
+            num_indexer_layers = sum(self.num_kv_heads_per_layer)
+        indexer_bytes_per_token = num_indexer_layers * (
             indexer_data_dim + self.index_head_dim // self.quant_block_size * 4)
         cache_size_bytes_per_token += indexer_bytes_per_token
 

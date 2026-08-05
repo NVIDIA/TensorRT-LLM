@@ -1686,7 +1686,12 @@ class VideoGenerationRequest(OpenAIBaseModel):
                                 description="Random seed for reproducibility.")
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
-        description="Optional image reference that guides generation.",
+        description=(
+            "Optional image or video reference that guides generation. PNG or "
+            "JPEG images condition image-to-video; MP4 or AVI video conditions "
+            "video-to-video, with H.264 the tested codec and others "
+            "best-effort. HEIF/AVIF are not supported. JSON requests carry "
+            "base64 bytes; multipart requests upload the file."),
     )
 
     # Resolution

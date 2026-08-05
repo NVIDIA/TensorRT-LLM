@@ -60,6 +60,13 @@ public:
     [[nodiscard]] size_t getWorkspaceSizeForContext(tensorrt_llm::DataType type, int32_t nbReq,
         int32_t max_input_length, int32_t cross_kv_length = 0, int32_t max_num_tokens = 0,
         int32_t total_kv_len = 0) const noexcept;
+    // Per-token byte cost of the context-MLA K/V dequant staging buffers, whose size scales with the summed
+    // attended KV length (`total_kv_len`). Only the fp8 context-MLA separate-Q/KV path stages these buffers;
+    // every other path (incl. sparse MLA, which reads K/V straight from the paged cache) returns 0. Single
+    // source of truth shared by getWorkspaceSizeForContext (runtime sizing) and the KV-cache estimator, so
+    // the two cannot drift.
+    [[nodiscard]] static size_t contextMlaWorkspaceBytesPerToken(int32_t numAttnHeads, int32_t qkRopeHeadDim,
+        int32_t qkNopeHeadDim, int32_t vHeadDim, bool fp8ContextMla, bool separateQAndKvInput, bool sparseMla) noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
     [[nodiscard]] size_t getWorkspaceSizeForGeneration(tensorrt_llm::DataType type, int32_t total_num_seq,
         int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept;

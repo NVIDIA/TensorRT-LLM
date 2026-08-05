@@ -71,8 +71,6 @@ logger = logging.getLogger(__name__)
 
 # TODO: turn off this when the nightly storage issue is resolved.
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
-GITLAB_API_USER = os.environ.get("GITLAB_API_USER")
-GITLAB_API_TOKEN = os.environ.get("GITLAB_API_TOKEN")
 
 
 def _get_s3_output():

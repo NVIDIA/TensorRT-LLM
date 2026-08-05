@@ -22,6 +22,8 @@ from tensorrt_llm.llmapi.reasoning_parser import (NemotronV3ReasoningParser,
                                                   ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 
+pytestmark = pytest.mark.cpu_only
+
 R1_START, R1_END = "<think>", "</think>"
 
 
