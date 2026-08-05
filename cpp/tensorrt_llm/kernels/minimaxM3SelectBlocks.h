@@ -29,7 +29,7 @@ namespace kernels
 
 void invokeMinimaxM3SelectBlocks(float const* scores, int64_t headStride, int64_t blockStride, int64_t queryStride,
     int32_t const* nValidBlocks, int32_t* output, int32_t numKvHeads, int32_t numBlocks, int32_t totalQueries,
-    int32_t initBlocks, int32_t localBlocks, cudaStream_t stream);
+    int32_t initBlocks, int32_t localBlocks, bool headMajorOutput, cudaStream_t stream);
 
 } // namespace kernels
 

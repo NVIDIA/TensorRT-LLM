@@ -57,7 +57,9 @@ def _reference_select_blocks(
 
 
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
-@pytest.mark.parametrize("num_blocks", [1, 8, 16, 17, 127, 1024, 1537])
+@pytest.mark.parametrize(
+    "num_blocks", [1, 8, 16, 17, 32, 33, 64, 65, 96, 127, 128, 129, 1024, 1537]
+)
 def test_fused_selector_matches_reference_random(num_kv_heads, num_blocks):
     total_q = 19
     generator = torch.Generator(device="cuda").manual_seed(num_blocks)
@@ -95,7 +97,82 @@ def test_fused_selector_matches_reference_random(num_kv_heads, num_blocks):
 
     assert actual.dtype == torch.int32
     assert actual.shape == (total_q, num_kv_heads, 16)
+    assert actual.stride() == (num_kv_heads * 16, 16, 1)
+    assert actual.is_contiguous()
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("num_blocks", [65, 96, 128])
+def test_fused_selector_128_path_matches_reference_ties_and_forcing(num_blocks):
+    scores = torch.zeros((2, num_blocks, 5), device="cuda", dtype=torch.float32)
+    n_valid_blocks = torch.tensor(
+        [0, 8, 16, num_blocks - 1, num_blocks], device="cuda", dtype=torch.int32
+    )
+
+    expected = _reference_select_blocks(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=8,
+        local_blocks=12,
+    )
+    actual = select_blocks_from_maxscore(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=8,
+        local_blocks=12,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("num_blocks", [16, 48, 96, 129])
+def test_fused_selector_head_major_output_is_zero_copy_q2k(num_blocks):
+    total_q, num_kv_heads = 7, 4
+    generator = torch.Generator(device="cuda").manual_seed(num_blocks)
+    scores = torch.randn(
+        num_kv_heads,
+        num_blocks,
+        total_q,
+        generator=generator,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    n_valid_blocks = torch.randint(
+        0,
+        num_blocks + 1,
+        (total_q,),
+        generator=generator,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    expected = _reference_select_blocks(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=8,
+        local_blocks=12,
+    )
+    actual = select_blocks_from_maxscore(
+        scores,
+        topk=16,
+        n_valid_blocks=n_valid_blocks,
+        init_blocks=8,
+        local_blocks=12,
+        head_major_output=True,
+    )
+    q2k = actual.permute(1, 0, 2).contiguous().to(torch.int32)
+
+    assert torch.equal(actual, expected)
+    assert actual.shape == (total_q, num_kv_heads, 16)
+    assert actual.stride() == (16, total_q * 16, 1)
+    assert not actual.is_contiguous()
+    assert q2k.shape == (num_kv_heads, total_q, 16)
+    assert q2k.is_contiguous()
+    assert q2k.data_ptr() == actual.data_ptr()
+    assert q2k.untyped_storage().data_ptr() == actual.untyped_storage().data_ptr()
 
 
 @pytest.mark.parametrize(

@@ -34,10 +34,11 @@ namespace torch_ext
 //! @param topK Number of blocks to select. The operator currently requires topK == 16.
 //! @param initBlocks Number of initial blocks forced into the selection.
 //! @param localBlocks Number of blocks immediately preceding each query's valid-block boundary forced into selection.
+//! @param headMajorOutput Whether to use head-major backing storage while preserving the logical return shape.
 //! @return Int32 CUDA tensor shaped [total_queries, num_kv_heads, 16]. Valid block IDs are ascending, followed by -1
 //! padding when fewer than 16 valid blocks exist.
 torch::Tensor minimaxM3SelectBlocks(torch::Tensor const& scores, torch::Tensor const& nValidBlocks, int64_t topK,
-    int64_t initBlocks, int64_t localBlocks)
+    int64_t initBlocks, int64_t localBlocks, bool headMajorOutput)
 {
     constexpr int64_t kRequiredTopK = 16;
     constexpr int64_t kMaxBlockIndex = 65'535;
@@ -72,13 +73,16 @@ torch::Tensor minimaxM3SelectBlocks(torch::Tensor const& scores, torch::Tensor c
         "minimax_m3_select_blocks forcing ranges exceed int32 range");
 
     c10::cuda::CUDAGuard const deviceGuard{scores.device()};
-    auto const output = torch::empty({scores.size(2), scores.size(0), topK}, scores.options().dtype(torch::kInt32));
+    auto const outputOptions = scores.options().dtype(torch::kInt32);
+    auto const output = headMajorOutput
+        ? torch::empty({scores.size(0), scores.size(2), topK}, outputOptions).permute({1, 0, 2})
+        : torch::empty({scores.size(2), scores.size(0), topK}, outputOptions);
     auto const stream = at::cuda::getCurrentCUDAStream(scores.get_device());
     tensorrt_llm::kernels::invokeMinimaxM3SelectBlocks(scores.data_ptr<float>(), scores.stride(0), scores.stride(1),
         scores.stride(2), nValidBlocks.data_ptr<int32_t>(), output.data_ptr<int32_t>(),
         static_cast<int32_t>(scores.size(0)), static_cast<int32_t>(scores.size(1)),
         static_cast<int32_t>(scores.size(2)), static_cast<int32_t>(initBlocks), static_cast<int32_t>(localBlocks),
-        stream);
+        headMajorOutput, stream);
     return output;
 }
 
@@ -90,7 +94,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "minimax_m3_select_blocks(Tensor scores, Tensor n_valid_blocks, int topk, int init_blocks, int "
-        "local_blocks) -> Tensor");
+        "local_blocks, bool head_major_output=False) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
