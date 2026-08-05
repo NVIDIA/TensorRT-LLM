@@ -1260,9 +1260,6 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
 }
 
 // Upload sqlite-only early coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
-// Both x86_64 and SBSA jobs upload to the same test-results directory, so filter by arch before
-// downloading to avoid cross-contamination. SBSA stage names begin with GH200-, GB10-, GB200-,
-// GB300-, or CPU-Generic-arm-; all other stage names belong to x86_64.
 def uploadArchCoverage(String arch, pipeline, testFilter) {
     if (!testFilter[(CBTS_COVERAGE)]) {
         return
