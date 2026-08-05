@@ -86,6 +86,40 @@ def test_model_and_config_are_registered():
     assert cfg.text_config.model_type == "inkling_text"
 
 
+def test_model_defaults_pin_v2_and_disable_block_reuse():
+    """Both defaults are correctness requirements, not tuning.
+
+    V2 because the per-layer KV-head split (local 16 / global 8) needs
+    per-layer geometry V1 cannot represent; block reuse off because the four
+    depthwise short convs per layer hold a ``kernel_size - 1`` window outside
+    the KV cache, and ``InklingConvRuntime.build`` seeds every context request
+    with ``has_initial_state=False`` -- a reused prefix would restart the
+    convolutions from zeros while attention resumed from real history.
+    """
+    from tensorrt_llm._torch.models.modeling_inkling import (
+        InklingForConditionalGeneration,
+    )
+
+    defaults = InklingForConditionalGeneration.get_model_defaults(None)
+
+    assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
+    assert defaults["kv_cache_config"]["enable_block_reuse"] is False
+
+
+def test_block_reuse_default_departs_from_the_framework_default():
+    """The framework enables block reuse by default, so the model default is
+    load-bearing. If KvCacheConfig ever flips its default, this test still
+    documents which direction Inkling needs."""
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm._torch.models.modeling_inkling import (
+        InklingForConditionalGeneration,
+    )
+
+    assert KvCacheConfig().enable_block_reuse is True
+    defaults = InklingForConditionalGeneration.get_model_defaults(None)
+    assert defaults["kv_cache_config"]["enable_block_reuse"] is False
+
+
 def test_text_geometry():
     """The config defaults are the checkpoint's text-tower geometry."""
     tc = InklingTextConfig()

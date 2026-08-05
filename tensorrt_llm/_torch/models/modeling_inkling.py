@@ -413,8 +413,12 @@ class InklingConvRuntime:
                 0
             )
             query_start_loc = cu
-            # Fresh prefill carries no prior conv window (chunked-prefill reuse
-            # would set this per request from cached-token counts).
+            # Fresh prefill carries no prior conv window. This is only correct
+            # because Inkling defaults ``enable_block_reuse`` off
+            # (``get_model_defaults``): a reused prefix would need this set per
+            # request from ``num_cached_tokens_per_seq``, with the preceding
+            # ``kernel_size - 1`` activations restored into the pool. Do not
+            # re-enable block reuse without implementing both.
             has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
         return cls(
             num_ctx_tokens=num_ctx_tokens,
@@ -1827,8 +1831,27 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         # ``kv_cache_hash_algo`` report, and the KV-cache-event hash algo -- no
         # longer report 'auto -> False' while the engine actually runs V2.
         #
+        # ``enable_block_reuse`` defaults to True framework-wide, but Inkling's
+        # short-conv state cannot honour a reused prefix. Each decoder layer
+        # carries four depthwise short convolutions whose ``kernel_size - 1``
+        # token window is per-request state living outside the KV cache, and
+        # ``InklingConvRuntime.build`` seeds every context request with
+        # ``has_initial_state=False``. When a prefill reuses cached KV blocks,
+        # attention resumes from the correct history while the convolutions
+        # restart from zeros, so the first ``kernel_size - 1`` tokens of each
+        # reused chunk convolve against padding instead of the real preceding
+        # activations -- wrong outputs, not just a cache miss.
+        #
+        # ``MixedMambaHybridCacheManager`` documents the same limitation for
+        # mamba states. Default the reuse off until the conv window can be
+        # cached and restored per block; a user who sets
+        # ``enable_block_reuse`` explicitly still wins the deep-merge, so this
+        # is a safe default rather than a hard block.
         return {
-            "kv_cache_config": {"use_kv_cache_manager_v2": True},
+            "kv_cache_config": {
+                "use_kv_cache_manager_v2": True,
+                "enable_block_reuse": False,
+            },
         }
 
     def __init__(self, model_config: ModelConfig[InklingConfig]):
