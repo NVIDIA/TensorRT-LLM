@@ -731,7 +731,8 @@ class ModelLoader:
                             value, self._metrics):
                         self._call_load_weights(model.load_weights, weights,
                                                 self.weight_mapper)
-                        torch.cuda.synchronize()
+                        if torch.cuda.is_available():  # CPU guard
+                            torch.cuda.synchronize()
 
                 if loads_draft_weights:
                     with timing_metric(
@@ -755,7 +756,8 @@ class ModelLoader:
                             self._metrics):
                         self._call_load_weights(model.load_draft_weights,
                                                 weights, draft_weight_mapper)
-                        torch.cuda.synchronize()
+                        if torch.cuda.is_available():  # CPU guard
+                            torch.cuda.synchronize()
 
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a
@@ -876,7 +878,8 @@ class ModelLoader:
                                     self._call_load_weights(
                                         model.load_weights, weights,
                                         self.weight_mapper)
-                                    torch.cuda.synchronize()
+                                    if torch.cuda.is_available():  # CPU guard
+                                        torch.cuda.synchronize()
                             elif not weights_preloaded:
                                 raise RuntimeError(
                                     f"GMS RW: checkpoint loader "
@@ -910,7 +913,8 @@ class ModelLoader:
                                     self._call_load_weights(
                                         model.load_draft_weights, draft_weights,
                                         draft_weight_mapper)
-                                    torch.cuda.synchronize()
+                                    if torch.cuda.is_available():  # CPU guard
+                                        torch.cuda.synchronize()
 
                             with timing_metric(
                                     ModelLoaderMetricNames.
@@ -1088,7 +1092,8 @@ class ModelLoader:
                     moe_load_balancer.finalize_model()
                     logger.info("moe_load_balancer finalize model done")
 
-                torch.cuda.synchronize()
+                if torch.cuda.is_available():  # CPU guard
+                    torch.cuda.synchronize()
                 # Reclaim segments freed during per-module post_load_weights (e.g.
                 # MegaMoE _transform_main_weights releases ~5-6 GiB of redundant
                 # weight Parameters via `.data = empty(0)` that PyTorch's caching
@@ -1382,7 +1387,8 @@ class ModelLoader:
                                 weights,
                                 self.weight_mapper,
                                 allow_partial_loading=allow_partial_loading)
-        torch.cuda.current_stream().synchronize()
+        if torch.cuda.is_available():  # CPU guard
+            torch.cuda.current_stream().synchronize()
 
     def begin_update_weights(self) -> None:
         """Start an incremental update session on the persistent mapper."""

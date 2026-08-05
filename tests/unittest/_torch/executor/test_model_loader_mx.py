@@ -264,7 +264,6 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         MagicMock(return_value=_TinyModel(events)),
     )
     monkeypatch.setattr(model_loader_mod, "get_rank_model_storage", lambda _model: 0)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     return loader
 
 
