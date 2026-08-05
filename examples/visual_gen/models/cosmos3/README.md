@@ -1,4 +1,4 @@
-# Cosmos3 Text(+Image)-to-Video(+Audio) and action generation
+# Cosmos3 Text(+Image)-to-Video(+Audio) generation
 
 Cosmos3 supports the following generation modes from a single checkpoint:
 
