@@ -99,10 +99,12 @@ def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(
 
 
 def test_deepseek_r1_reasoning_parser_finish_flushes_partial_tag() -> None:
-    """A delta carrying both text and a partial tag fills `_buffer` through
-    the `rfind` branch of `parse_delta`, which one-character-at-a-time
-    streaming never reaches. That is the shape a real stream delivers, and
-    the fragment must still be emitted when the stream ends."""
+    """A partial tag arriving alongside text must still be flushed.
+
+    Such a delta fills `_buffer` through the `rfind` branch of `parse_delta`,
+    which one-character-at-a-time streaming never reaches - and it is the
+    shape a real stream delivers.
+    """
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         "deepseek-r1")
     assert reasoning_parser.parse_delta("a </thin").reasoning_content == "a "
@@ -118,10 +120,13 @@ def test_deepseek_r1_reasoning_parser_finish_flushes_partial_tag() -> None:
     }, ""),
 ])
 def test_deepseek_v4_reasoning_parser_finish_delegates(
-        chat_template_kwargs: dict, flushed: str) -> None:
-    """`DeepSeekV4ReasoningParser.finish()` forwards to whichever parser the
-    thinking flag selected: `DeepSeekR1Parser`, which now flushes, or
-    `IdentityReasoningParser`, which withholds nothing to flush."""
+        chat_template_kwargs: dict[str, bool], flushed: str) -> None:
+    """`finish()` must reach whichever parser the thinking flag selected.
+
+    `DeepSeekV4ReasoningParser` delegates to two different targets:
+    `DeepSeekR1Parser`, which now flushes, and `IdentityReasoningParser`,
+    which withholds nothing to flush.
+    """
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         "deepseek_v4", chat_template_kwargs)
     reasoning_parser.parse_delta("a <")
