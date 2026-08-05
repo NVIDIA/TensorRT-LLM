@@ -27,6 +27,8 @@ ptxas cannot contract mul+add into an FMA (which would round differently from
 the unfused eager reference), and ``float2int_rn`` for round-half-even.
 """
 
+import functools
+
 import numpy as np
 import torch
 import triton
@@ -37,10 +39,14 @@ _BLOCK = 256
 _COEF_BITS = 11
 _COEF_SCALE = 1 << _COEF_BITS
 
-# Axis tables are cached per (mode, src, dst, C, device): a clip reuses the
-# same handful of sizes for every frame, and rebuilding them on the host
-# dominated the resize wall time (~3x the kernel time when measured).
-_tbl_cache: dict = {}
+# Axis tables are cached per (src, dst, C, device): a clip reuses the same
+# handful of sizes for every frame, and rebuilding them on the host dominated
+# the resize wall time (~3x the kernel time when measured). The cache is
+# bounded because the key carries caller-supplied source dimensions -- a
+# long-lived worker serving many distinct resolutions would otherwise retain a
+# GPU table for every one it had ever seen. A transfer chain touches a handful
+# of sizes, so this evicts only across unrelated requests.
+_TABLE_CACHE_ENTRIES = 32
 
 
 def _linear_axis(dst_n: int, src_n: int, clamp_coeffs: bool):
@@ -95,36 +101,28 @@ def _check_input(frames: torch.Tensor, op: str) -> None:
     assert frames.ndim == 4, f"{op} expects [T, H, W, C], got shape={tuple(frames.shape)}"
 
 
+@functools.lru_cache(maxsize=_TABLE_CACHE_ENTRIES)
 def _linear_tables_x(src_w, dst_w, C, dev):
     """Horizontal tables re-indexed per output *byte* (k = x*C + c), so the
     kernel loads them contiguously instead of gathering per-x through a
     runtime div/mod."""
-    key = ("linx", src_w, dst_w, C, str(dev))
-    ent = _tbl_cache.get(key)
-    if ent is None:
-        xs0, xs1, xa0, xa1 = _linear_axis(dst_w, src_w, clamp_coeffs=True)
-        ch = np.tile(np.arange(C, dtype=np.int64), dst_w)
-        tabs = (
-            np.repeat(xs0.astype(np.int64) * C, C) + ch,
-            np.repeat(xs1.astype(np.int64) * C, C) + ch,
-            np.repeat(xa0, C),
-            np.repeat(xa1, C),
-        )
-        ent = tuple(torch.from_numpy(a).to(device=dev, dtype=torch.int32) for a in tabs)
-        _tbl_cache[key] = ent
-    return ent
+    xs0, xs1, xa0, xa1 = _linear_axis(dst_w, src_w, clamp_coeffs=True)
+    ch = np.tile(np.arange(C, dtype=np.int64), dst_w)
+    tabs = (
+        np.repeat(xs0.astype(np.int64) * C, C) + ch,
+        np.repeat(xs1.astype(np.int64) * C, C) + ch,
+        np.repeat(xa0, C),
+        np.repeat(xa1, C),
+    )
+    return tuple(torch.from_numpy(a).to(device=dev, dtype=torch.int32) for a in tabs)
 
 
+@functools.lru_cache(maxsize=_TABLE_CACHE_ENTRIES)
 def _linear_tables_y(src_h, dst_h, dev):
-    key = ("liny", src_h, dst_h, str(dev))
-    ent = _tbl_cache.get(key)
-    if ent is None:
-        ent = tuple(
-            torch.from_numpy(a).to(device=dev, dtype=torch.int32)
-            for a in _linear_axis(dst_h, src_h, clamp_coeffs=False)
-        )
-        _tbl_cache[key] = ent
-    return ent
+    return tuple(
+        torch.from_numpy(a).to(device=dev, dtype=torch.int32)
+        for a in _linear_axis(dst_h, src_h, clamp_coeffs=False)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +404,11 @@ def resize_area_u8(frames: torch.Tensor, factor: int) -> torch.Tensor:
     dst = torch.empty(T, dh, dw, C, dtype=torch.uint8, device=frames.device)
     half_up = factor == 2 and C in (1, 3, 4)
     pix = 8 // factor  # output pixels per lane (24 source bytes either way)
-    if C == 3 and dw % pix == 0 and (W * 3) % 4 == 0 and frames.is_contiguous():
+    # data_ptr alignment matters: the C=3 path reinterprets the buffer as
+    # int32, and a contiguous *view* can still start on an odd byte, which
+    # faults the device rather than returning wrong data.
+    word_aligned = frames.data_ptr() % 4 == 0 and (W * 3) % 4 == 0
+    if C == 3 and dw % pix == 0 and word_aligned and frames.is_contiguous():
         nlanes = T * dh * (dw // pix)
         # one lane per thread: this kernel streams (DRAM-bound), so resident
         # warps matter more than per-thread ILP (2 lanes/thread measured
@@ -424,34 +426,26 @@ def resize_area_u8(frames: torch.Tensor, factor: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Bicubic
 # ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=_TABLE_CACHE_ENTRIES)
 def _cubic_tables_x(src_w, dst_w, C, dev):
     """Horizontal tap/coeff tables re-indexed per output byte, like bilinear."""
-    key = ("cubx", src_w, dst_w, C, str(dev))
-    ent = _tbl_cache.get(key)
-    if ent is None:
-        xtaps, xcoef = _cubic_axis(dst_w, src_w)
-        ch = np.tile(np.arange(C, dtype=np.int64), dst_w)
-        txb = np.repeat(np.stack(xtaps).astype(np.int64) * C, C, axis=1) + ch[None, :]
-        cxb = np.repeat(np.stack(xcoef), C, axis=1)
-        ent = (
-            torch.from_numpy(txb).to(device=dev, dtype=torch.int32).contiguous(),
-            torch.from_numpy(cxb).to(device=dev, dtype=torch.int32).contiguous(),
-        )
-        _tbl_cache[key] = ent
-    return ent
+    xtaps, xcoef = _cubic_axis(dst_w, src_w)
+    ch = np.tile(np.arange(C, dtype=np.int64), dst_w)
+    txb = np.repeat(np.stack(xtaps).astype(np.int64) * C, C, axis=1) + ch[None, :]
+    cxb = np.repeat(np.stack(xcoef), C, axis=1)
+    return (
+        torch.from_numpy(txb).to(device=dev, dtype=torch.int32).contiguous(),
+        torch.from_numpy(cxb).to(device=dev, dtype=torch.int32).contiguous(),
+    )
 
 
+@functools.lru_cache(maxsize=_TABLE_CACHE_ENTRIES)
 def _cubic_tables_y(src_h, dst_h, dev):
-    key = ("cuby", src_h, dst_h, str(dev))
-    ent = _tbl_cache.get(key)
-    if ent is None:
-        ytaps, ycoef = _cubic_axis(dst_h, src_h)
-        ent = (
-            torch.from_numpy(np.stack(ytaps)).to(device=dev, dtype=torch.int32),
-            torch.from_numpy(np.stack(ycoef)).to(device=dev, dtype=torch.int32),
-        )
-        _tbl_cache[key] = ent
-    return ent
+    ytaps, ycoef = _cubic_axis(dst_h, src_h)
+    return (
+        torch.from_numpy(np.stack(ytaps)).to(device=dev, dtype=torch.int32),
+        torch.from_numpy(np.stack(ycoef)).to(device=dev, dtype=torch.int32),
+    )
 
 
 @triton.jit

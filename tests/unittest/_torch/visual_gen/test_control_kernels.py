@@ -35,6 +35,7 @@ from tensorrt_llm._torch.visual_gen.triton_kernels import (
     resize_cubic_u8,
     resize_linear_u8,
 )
+from tensorrt_llm._torch.visual_gen.triton_kernels import resize as resize_module
 
 pytestmark = [
     pytest.mark.cosmos3,
@@ -98,6 +99,30 @@ class TestResizeKernels:
         got = resize_cubic_u8(frames, *dst)
         assert got.shape == (3, dst[1], dst[0], 3)
         assert torch.equal(got, reference.resize_cubic_u8(frames, *dst))
+
+    @pytest.mark.parametrize("byte_offset", [0, 1, 2, 3])
+    def test_area_handles_unaligned_input(self, byte_offset):
+        # The C=3 fast path reinterprets the buffer as int32. A contiguous
+        # *view* can still start on an odd byte, which faults the device rather
+        # than returning wrong data, so the fast path must decline it.
+        t, h, w = 2, 64, 96
+        n = t * h * w * 3
+        g = torch.Generator(device="cuda").manual_seed(0)
+        base = torch.randint(0, 256, (n + 4,), dtype=torch.uint8, device="cuda", generator=g)
+        frames = base[byte_offset : byte_offset + n].view(t, h, w, 3)
+        assert frames.is_contiguous()
+        assert torch.equal(resize_area_u8(frames, 2), reference.resize_area_u8(frames, 2))
+
+    def test_axis_table_cache_is_bounded(self):
+        # The cache key carries caller-supplied source dimensions, so an
+        # unbounded cache would let a long-lived worker retain a GPU table for
+        # every resolution it ever served.
+        resize_module._cubic_tables_x.cache_clear()
+        clip = _clip(64, 96, t=1)
+        for dst_w in range(8, 8 + 2 * resize_module._TABLE_CACHE_ENTRIES):
+            resize_cubic_u8(clip, dst_w, 16)
+        info = resize_module._cubic_tables_x.cache_info()
+        assert info.currsize <= resize_module._TABLE_CACHE_ENTRIES
 
     def test_area_rejects_unsupported_geometry(self):
         frames = _clip(64, 64)
