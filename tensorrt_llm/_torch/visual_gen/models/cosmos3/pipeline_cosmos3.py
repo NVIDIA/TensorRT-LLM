@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import json
 import math
 import os
@@ -47,11 +48,39 @@ from .defaults import (
     _normalize_condition_video_latent_indexes,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
+from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
 from .sampling import Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transformer_cosmos3 import NEMOTRON_DENSE_RECIPE, Cosmos3VFMTransformer, resolve_arch_recipe
 
+# Image modes declare no negative prompt in the reference
+# while every video mode points at ``neg_prompts.json``.
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
+
+
+@functools.lru_cache(maxsize=1)
+def default_video_negative_prompt() -> str:
+    """The reference's default negative prompt for video modes.
+
+    Serialized the way the reference loads it -- ``json.dumps(json.loads(...))`` --
+    so the text reaching the tokenizer is byte-identical.
+    """
+    return json.dumps(COSMOS3_VIDEO_NEGATIVE_PROMPT)
+
+
+def default_negative_prompt(output_type: str) -> str:
+    """Default negative prompt for a request, keyed on output kind not request mode.
+
+    The reference wires its negative prompt into every video mode and none of the
+    image ones, so anything producing an image defaults to empty.
+    """
+    return (
+        COSMOS3_DEFAULT_NEGATIVE_PROMPT
+        if output_type == "image"
+        else default_video_negative_prompt()
+    )
+
+
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
 COSMOS3_DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate videos from a give prompt."
@@ -1168,7 +1197,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         if negative_prompt is None:
-            negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT
+            negative_prompt = default_negative_prompt(output_type)
 
         # Positive prompt: forward duration/resolution templates.  T2I has no
         # duration concept (single image) and uses the image-flavored
