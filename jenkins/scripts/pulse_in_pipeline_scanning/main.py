@@ -171,13 +171,16 @@ def process_result():
         if args.scan_mode == "monitor":
             post_slack_msg(args.build_number, args.ref, detail)
 
-        return {
+        result = {
             "status": status,
             "detail": detail,
             "risks": RISKY_DEPENDENCIES,
             "detected_licenses": detected_licenses,
             "dashboard_url": get_dashboard_url(args.build_number, args.ref),
         }
+        if args.scan_mode == "release" and detected_licenses:
+            result["needs_manual_review"] = True
+        return result
     else:
         return {"status": "success"}
 

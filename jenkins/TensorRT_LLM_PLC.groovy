@@ -372,6 +372,10 @@ def processScanResults(ref) {
                 def result = new JsonSlurper().parseText(output)
                 if (result.status == "unstable") {
                     echo "New risks detected: ${result.detail}"
+                    if (result.needs_manual_review) {
+                        needsManualReview = true
+                        manualReviewUrl = pipelineUrl
+                    }
                     if (result.detected_licenses) {
                         def colWidths = [scan_type: 9, dependency_name: 15, license: 7, corrected_license: 17, is_nvidia_proprietary: 17]
                         result.detected_licenses.each { entry ->
@@ -402,6 +406,9 @@ def processScanResults(ref) {
         }
     }
 }
+
+def needsManualReview = false
+def manualReviewUrl = ""
 
 pipeline {
     agent {
@@ -487,6 +494,28 @@ pipeline {
             steps {
                 script {
                     processScanResults(env.REF)
+                }
+            }
+        }
+        stage("Manual License Review") {
+            when {
+                expression { return needsManualReview }
+            }
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+                        def slackPayload = groovy.json.JsonOutput.toJson([
+                            report      : "New licenses detected in release mode (${params.ref} branch). Manual approval required before release.",
+                            dashboardUrl: manualReviewUrl,
+                        ])
+                        sh "curl -s -X POST -H 'Content-Type: application/json' -d '${slackPayload}' \$PLC_SLACK_WEBHOOK"
+                    }
+                    timeout(time: 24, unit: 'HOURS') {
+                        input(
+                            message: "New licenses detected in release mode. Please review the licenses listed above and confirm they are all approved for release.",
+                            ok: "Approve"
+                        )
+                    }
                 }
             }
         }
