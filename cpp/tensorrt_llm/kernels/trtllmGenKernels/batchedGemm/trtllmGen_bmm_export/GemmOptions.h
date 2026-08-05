@@ -930,10 +930,12 @@ inline bool checkAndUpdateGemmOptions(
             options.mValidM, " validN=", options.mValidN, " validK=", options.mValidK);
     }
 
+#ifdef TLLM_PUBLIC_RELEASE
     if (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeMmaA == tg::Dtype::E4m3)
     {
         TLLM_CHECK_ERROR(false, "E2m1 x E4m3 is not supported for JIT compile. Use cubins instead.");
     }
+#endif // TLLM_PUBLIC_RELEASE
 
     // Check that the A cast is supported.
     // Currently, we only support {MxFp4, NvFp4, MxInt4} -> Bf16.
@@ -961,7 +963,9 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mDtypeA == tg::Dtype::MxE2m1 && options.mDtypeMmaA == tg::Dtype::Bfloat16,
             "PatchF2fp is only supported for MxFp4 to Bf16 casts.");
     }
+#ifdef TLLM_PUBLIC_RELEASE
     options.mPatchF2fp = false;
+#endif // TLLM_PUBLIC_RELEASE
 
     // FIXME: We do not support different dtypes for A and B when not on Blackwell.
     if (!isBlackwell)
