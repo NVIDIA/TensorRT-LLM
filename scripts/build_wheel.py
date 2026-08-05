@@ -1074,7 +1074,21 @@ def main(*,
                 "did not populate the expected sources.")
         if msa_dst.exists():
             rmtree(msa_dst)
-        install_tree(msa_src, msa_dst, dirs_exist_ok=True)
+        msa_dst.mkdir(parents=True)
+        for python_source in msa_src.glob("*.py"):
+            install_file(python_source, msa_dst)
+        for relative_dir in (
+                Path("csrc"),
+                Path("cute"),
+                Path("cutlass/include"),
+                Path("cutlass/tools/util/include"),
+        ):
+            install_tree(
+                msa_src / relative_dir,
+                msa_dst / relative_dir,
+                dirs_exist_ok=True,
+            )
+        install_file(msa_src / "cutlass" / "LICENSE.txt", msa_dst / "cutlass")
 
         if not skip_stubs:
             with working_directory(pkg_dir):
