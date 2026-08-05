@@ -169,6 +169,10 @@ public:
     int tokensPerBlock() const noexcept;
     bool enablePartialMatch() const noexcept;
 
+    // Partial commit is independent of partial matching so beam search can
+    // retain full-block reuse without publishing a writable prompt tail.
+    bool enablePartialCommit() const noexcept;
+
     bool commitMinSnapshot() const noexcept
     {
         return mConfig.commitMinSnapshot;
