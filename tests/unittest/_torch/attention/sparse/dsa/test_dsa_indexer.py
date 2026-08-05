@@ -56,6 +56,12 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.modules.top_k import (
+    DecodeTopK,
+    DecodeTopKPolicy,
+    PrefillTopK,
+    PrefillTopKImplementation,
+)
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
@@ -81,6 +87,18 @@ def has_deep_gemm():
         return deep_gemm is not None
     except Exception:
         return False
+
+
+def _set_torch_top_k(indexer: Indexer) -> None:
+    indexer.prefill_top_k = PrefillTopK(
+        indexer.index_topk,
+        PrefillTopKImplementation.TORCH,
+    )
+    indexer.decode_top_k = DecodeTopK(
+        indexer.index_topk,
+        DecodeTopKPolicy.TORCH,
+        compress_ratio=indexer.compress_ratio,
+    )
 
 
 def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
@@ -2660,7 +2678,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
 @pytest.mark.parametrize("seq_len_range", [(2048, 8192), (512, 1024)])
 def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_len_range):
     """
-    Test that use_custom_topk=True and use_custom_topk=False produce identical results
+    Test that the production and Torch Top-K modules produce identical results
     in the decode phase of sparse_attn_indexer.
 
     This test validates:
@@ -2806,7 +2824,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(
-            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
@@ -2830,8 +2848,9 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
+    _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
-        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Test with indexer skip enabled
@@ -2858,7 +2877,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 
         try:
             topk_indices_skip = indexer.sparse_attn_indexer(
-                metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+                metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
             )
         except Exception as e:
             raise RuntimeError(f"Error when testing indexer skip: {e}")
@@ -3009,9 +3028,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
     h0, q0, k0_fp8, k0_scale, w0 = make_inputs(step0_tokens)
     indexer._update_k_cache(k0_fp8, k0_scale, meta0)
     try:
-        topk0 = indexer.sparse_attn_indexer(
-            meta0, h0, q0, k0_fp8, k0_scale, w0, use_custom_topk=True
-        )
+        topk0 = indexer.sparse_attn_indexer(meta0, h0, q0, k0_fp8, k0_scale, w0)
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
 
@@ -3049,7 +3066,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
         meta.indexer_skip_topk = True
         hs, qs, ks_fp8, ks_scale, ws = make_inputs(batch_size)
         indexer._update_k_cache(ks_fp8, ks_scale, meta)
-        topk = indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws, use_custom_topk=True)
+        topk = indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws)
         assert torch.equal(topk, stash[:batch_size, :]), (
             f"{step0_mode} draft reuse step {step} should copy the stash 1:1 (next_n=1)"
         )
@@ -3062,7 +3079,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
 @pytest.mark.parametrize("chunk_size", [1024, 2048])
 def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chunk_size):
     """
-    Test chunked prefill: use_custom_topk=True vs use_custom_topk=False
+    Test chunked prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks != None.
 
     This test validates:
@@ -3135,7 +3152,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(
-            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
@@ -3158,8 +3175,9 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
+    _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
-        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Validation
@@ -3179,7 +3197,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 @pytest.mark.parametrize("seq_len_range", [(1, 512)])
 def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, seq_len_range):
     """
-    Test single-pass prefill: use_custom_topk=True vs use_custom_topk=False
+    Test single-pass prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks == None (else branch).
     """
     torch.manual_seed(42)
@@ -3243,7 +3261,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
 
     try:
         topk_indices_custom = indexer.sparse_attn_indexer(
-            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_custom, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         pytest.skip(f"Custom topk not available: {e}")
@@ -3269,8 +3287,9 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
     # Force single-pass path by setting indexer_prefill_chunks to None
     metadata_fallback.indexer_prefill_chunks = None
 
+    _set_torch_top_k(indexer)
     topk_indices_fallback = indexer.sparse_attn_indexer(
-        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata_fallback, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Test with indexer skip enabled
@@ -3295,7 +3314,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
 
     try:
         topk_indices_skip = indexer.sparse_attn_indexer(
-            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
     except Exception as e:
         raise RuntimeError(f"Indexer skip not available: {e}")
@@ -3399,12 +3418,13 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
 
     # Test custom kernel
     topk_custom = indexer.sparse_attn_indexer(
-        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
-    )
+        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights
+    ).clone()
 
     # Test fallback
+    _set_torch_top_k(indexer)
     topk_fallback = indexer.sparse_attn_indexer(
-        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=False
+        metadata, hidden_states, q_fp8, k_fp8, k_scale, weights
     )
 
     # Test with indexer skip enabled
@@ -3428,7 +3448,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         Indexer.prepare(metadata_skip)
         indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
         topk_indices_skip = indexer.sparse_attn_indexer(
-            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights, use_custom_topk=True
+            metadata_skip, hidden_states, q_fp8, k_fp8, k_scale, weights
         )
 
     # Validate: custom and fallback should match

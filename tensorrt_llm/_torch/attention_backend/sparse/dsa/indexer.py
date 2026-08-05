@@ -5,10 +5,9 @@
 from __future__ import annotations
 
 import os
-import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -26,6 +25,12 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
     maybe_execute_in_parallel,
 )
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.modules.top_k import (
+    DecodeTopK,
+    DecodeTopKPolicy,
+    PrefillTopK,
+    PrefillTopKImplementation,
+)
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.deep_gemm import (
@@ -67,69 +72,7 @@ except ImportError:
     hadamard_transform = None
     HAS_FAST_HADAMARD = False
 
-# Idempotency guard for warmup_heuristic_topk_decode — keyed by
-# (device_index, top_k, hint_size, num_cols). Prevents repeated allocations
-# and synchronizations when multiple Indexer modules invoke the warmup with
-# the same parameters during model construction.
-_HEURISTIC_TOPK_WARMUP_DONE: Set[Tuple[int, int, int, int]] = set()
-_HEURISTIC_TOPK_WARMUP_LOCK = threading.Lock()
 _DG_SCHEDULE_BLOCK_KV = 64
-
-
-def warmup_heuristic_topk_decode(
-    top_k: int = 2048, hint_size: int = 2048, num_cols: int = 4096
-) -> None:
-    """Pre-initialize cached hardware attributes in the C++ Scheme X dispatcher.
-
-    The dispatcher inside ``invokeIndexerTopKDecode`` lazily queries
-    ``cudaDeviceGetAttribute`` for ``MultiProcessorCount`` and
-    ``L2CacheSize`` on its first call. Those host-side queries must not
-    be issued during ``cudaStreamBeginCapture / EndCapture``: the values
-    captured there become frozen into the graph and cannot be refreshed
-    across replays on a different device.
-
-    This warmup issues one small heuristic decode call so the static
-    caches are populated before any CUDA Graph capture begins. Must be
-    called from the Indexer setup hook (``layer_idx == 0``) when
-    ``enable_heuristic_topk`` is true.
-
-    Repeated invocations with the same ``(device, top_k, hint_size,
-    num_cols)`` key are short-circuited so that constructing many Indexer
-    modules in the same process does not re-allocate scratch tensors or
-    issue redundant synchronizations.
-    """
-    key = (torch.cuda.current_device(), top_k, hint_size, num_cols)
-    with _HEURISTIC_TOPK_WARMUP_LOCK:
-        if key in _HEURISTIC_TOPK_WARMUP_DONE:
-            return
-        _HEURISTIC_TOPK_WARMUP_DONE.add(key)
-
-    device = torch.device("cuda")
-    logits = torch.zeros((1, num_cols), dtype=torch.float32, device=device)
-    seq_lens = torch.tensor([num_cols], dtype=torch.int32, device=device)
-    indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
-    pre_idx = torch.zeros((1, hint_size), dtype=torch.int32, device=device)
-    scratch = torch.empty((top_k,), dtype=torch.float32, device=device)
-    # The default warmup geometry (num_cols=4096) falls below kSeqSmall=12288
-    # and routes to the Radix path with blocks_per_row=2 (num_rows=1 sweeps
-    # bp ∈ [2, maxByCols=2]). The cpp op rejects blocks_per_row > 1 without
-    # caller-owned radix aux scratch, so supply worst-case (kMaxBlocksPerRowDecode=10)
-    # buffers here. Cost is negligible (~80 KB) and the warmup is a one-shot.
-    _radix_max_bp = 10
-    radix_aux_indices = torch.empty((1, _radix_max_bp, top_k), dtype=torch.int32, device=device)
-    radix_aux_logits = torch.empty((1, _radix_max_bp, top_k), dtype=torch.float32, device=device)
-    torch.ops.trtllm.indexer_topk_decode(
-        logits,
-        seq_lens,
-        indices,
-        1,
-        top_k,
-        pre_idx=pre_idx,
-        heuristic_scratch=scratch,
-        radix_aux_indices=radix_aux_indices,
-        radix_aux_logits=radix_aux_logits,
-    )
-    torch.cuda.synchronize()
 
 
 def _pick_dsl_expand(
@@ -699,11 +642,35 @@ class Indexer(nn.Module):
         )
         self.mtp_index_share = sparse_params.mtp_index_share
 
-        if self._enable_heuristic_topk and layer_idx == 0:
-            # Populate static caches (sm_count, L2 cache size) inside the C++
-            # Scheme X dispatcher before any CUDA Graph capture so the host
-            # attribute queries do not end up frozen into a captured graph.
-            warmup_heuristic_topk_decode(top_k=self.index_topk)
+        self.prefill_top_k = PrefillTopK(
+            self.index_topk,
+            PrefillTopKImplementation.TRTLLM,
+        )
+        if self.use_cute_dsl_topk:
+            decode_top_k_policy = (
+                DecodeTopKPolicy.CUTE_DSL_GVR
+                if self._enable_heuristic_topk
+                else DecodeTopKPolicy.CUTE_DSL_PREFERRED
+            )
+        elif self._enable_heuristic_topk:
+            decode_top_k_policy = DecodeTopKPolicy.TRTLLM_HEURISTIC
+        else:
+            decode_top_k_policy = DecodeTopKPolicy.TRTLLM
+        self.decode_top_k = DecodeTopK(
+            self.index_topk,
+            decode_top_k_policy,
+            compress_ratio=self.compress_ratio,
+        )
+
+        if decode_top_k_policy == DecodeTopKPolicy.TRTLLM_HEURISTIC and layer_idx == 0:
+            # Populate static caches inside the C++ dispatcher before CUDA
+            # Graph capture. DecodeTopK globally de-duplicates this warmup.
+            self.decode_top_k.prepare(
+                device=torch.device("cuda", torch.cuda.current_device()),
+                max_num_columns=4096,
+                next_n=1,
+                input_dtype=torch.float32,
+            )
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
         # (populated in cache_derived_state; maps to TF32 tensor cores on Ampere+)
@@ -1099,11 +1066,11 @@ class Indexer(nn.Module):
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
+        gen_seq_lens = metadata.get_indexer_kv_lens(
+            metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
+        )
+        metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
         if not metadata.use_expanded_buffers_for_mtp:
-            gen_seq_lens = metadata.get_indexer_kv_lens(
-                metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
-            )
-            metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
             next_n_cap = metadata.kv_lens_cuda_2d.shape[1]
             metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
                 gen_seq_lens.unsqueeze(-1).expand(-1, next_n_cap)
@@ -1379,7 +1346,6 @@ class Indexer(nn.Module):
         k_fp8: torch.Tensor,
         k_scale: torch.Tensor,
         weights: torch.Tensor,
-        use_custom_topk: bool = True,
         q_scale: Optional[torch.Tensor] = None,
         is_generation: Optional[bool] = None,
     ) -> torch.Tensor:
@@ -1431,8 +1397,6 @@ class Indexer(nn.Module):
             dtype=torch.int32,
             capture_graph=metadata.is_cuda_graph,
         )
-        if not use_custom_topk:
-            topk_indices_buffer[: hidden_states.shape[0]] = -1
 
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
             # Use chunked prefill to reduce memory footprint
@@ -1517,36 +1481,14 @@ class Indexer(nn.Module):
                             chunk.cu_seqlen_ks[c0:c1],
                             chunk.cu_seqlen_ke[c0:c1],
                             tile_q_scale,
-                            clean_logits=not use_custom_topk,
+                            clean_logits=False,
                         )
-                        if use_custom_topk:
-                            torch.ops.trtllm.indexer_topk_prefill(
-                                logits,
-                                chunk.cu_seqlen_ks[c0:c1],
-                                chunk.cu_seqlen_ke[c0:c1],
-                                topk_indices_buffer[g0:g1, :],
-                                self.index_topk,
-                            )
-                        else:
-                            topk_indices = logits.topk(
-                                min(self.index_topk, logits.shape[-1]), dim=-1
-                            )[1]
-                            topk_indices -= chunk.cu_seqlen_ks[c0:c1][:, None]
-
-                            mask_lo = topk_indices >= 0
-                            mask_hi = (
-                                topk_indices
-                                - (chunk.cu_seqlen_ke[c0:c1] - chunk.cu_seqlen_ks[c0:c1])[:, None]
-                                < 0
-                            )
-                            mask = mask_lo & mask_hi
-
-                            # local indices per sequence
-                            topk_indices = topk_indices.masked_fill(~mask, -1)
-
-                            topk_indices_buffer[g0:g1, : topk_indices.shape[-1]] = topk_indices.to(
-                                dtype=torch.int32
-                            )
+                        self.prefill_top_k(
+                            logits,
+                            chunk.cu_seqlen_ks[c0:c1],
+                            chunk.cu_seqlen_ke[c0:c1],
+                            topk_indices_buffer[g0:g1, :],
+                        )
 
                     if apply_q_split:
                         q_sizes = [
@@ -1577,28 +1519,14 @@ class Indexer(nn.Module):
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                     ctx_q_scale,
-                    clean_logits=not use_custom_topk,
+                    clean_logits=False,
                 )
-                if use_custom_topk:
-                    torch.ops.trtllm.indexer_topk_prefill(
-                        logits,
-                        cu_seqlen_ks,
-                        cu_seqlen_ke,
-                        topk_indices_buffer[:num_ctx_tokens, :],
-                        self.index_topk,
-                    )
-                else:
-                    topk_indices = logits.topk(min(self.index_topk, logits.shape[-1]), dim=-1)[1]
-                    topk_indices -= cu_seqlen_ks[:, None]
-                    mask_lo = topk_indices >= 0
-                    mask_hi = topk_indices - (cu_seqlen_ke - cu_seqlen_ks)[:, None] < 0
-                    mask = mask_lo & mask_hi
-
-                    # local indices per sequence
-                    topk_indices = topk_indices.masked_fill(~mask, -1)
-                    topk_indices_buffer[:num_ctx_tokens, : topk_indices.shape[-1]] = (
-                        topk_indices.to(dtype=torch.int32)
-                    )
+                self.prefill_top_k(
+                    logits,
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
+                    topk_indices_buffer[:num_ctx_tokens, :],
+                )
         elif has_prefill and metadata.skip_indexer_for_ctx_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[:num_ctx_tokens, :] = metadata.topk_indices_buffer[
@@ -1802,84 +1730,37 @@ class Indexer(nn.Module):
                     decode_q_scale,
                 )
 
-            if use_custom_topk:
-                # Kernel expects kv_lens (total cache length), not seq_lens (new tokens)
-                # This is because rowEnd = seq_len - next_n + offset + 1
-                gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
-                    num_contexts : num_contexts + num_generations
-                ]
+            # The native TRTLLM and GVR paths consume logical KV lengths and
+            # apply compress_ratio internally. CuTe radix and the Torch oracle
+            # consume lengths in the score-column coordinate system.
+            gen_kv_lens_cuda = metadata.kv_lens_cuda_runtime[
+                num_contexts : num_contexts + num_generations
+            ]
+            scan_lengths = metadata.gen_indexer_kv_lens_cuda_runtime
+            assert scan_lengths is not None
 
-                pre_idx = None
-                heuristic_scratch = None
-                if self._enable_heuristic_topk:
-                    local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
-                    # Pass prev_topk directly; the +1 temporal offset is
-                    # handled inside the C++ kernel (preIdxOffset += 1).
-                    pre_idx = metadata.heuristic_prev_topk[local_layer, :num_generations]
-                    if not metadata.use_cute_dsl_topk:
-                        heuristic_scratch = metadata.heuristic_scratch_values[:num_gen_tokens]
+            prior_indices = None
+            heuristic_values = None
+            if self._enable_heuristic_topk:
+                local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+                # The +1 temporal offset is handled by the native kernels.
+                prior_indices = metadata.heuristic_prev_topk[local_layer, :num_generations]
+                if not metadata.use_cute_dsl_topk:
+                    heuristic_values = metadata.heuristic_scratch_values[:num_gen_tokens]
 
-                if self.use_cute_dsl_topk and self._enable_heuristic_topk:
-                    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
-                        logits_decode,
-                        pre_idx,
-                        gen_kv_lens_cuda,
-                        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
-                        self.index_topk,
-                        next_n=next_n,
-                        compress_ratio=self.compress_ratio,
-                        max_seq_len=indexer_max_seq_len,
-                        order_row=metadata.kv_lens_row_reorder,
-                    )
-                elif self.use_cute_dsl_topk and (self.compress_ratio == 1 or next_n == 1):
-                    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-                        logits_decode,
-                        context_lens if self.compress_ratio > 1 else gen_kv_lens_cuda,
-                        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
-                        self.index_topk,
-                        next_n,
-                    )
-                else:
-                    torch.ops.trtllm.indexer_topk_decode(
-                        logits_decode,
-                        gen_kv_lens_cuda,
-                        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
-                        next_n,
-                        self.index_topk,
-                        pre_idx=pre_idx,
-                        heuristic_scratch=heuristic_scratch,
-                        compress_ratio=self.compress_ratio,
-                        radix_aux_indices=metadata.radix_aux_indices,
-                        radix_aux_logits=metadata.radix_aux_logits,
-                    )
-            else:
-                # padded
-                positions = (
-                    torch.arange(logits_decode.shape[-1], device=q_decode.device)
-                    .unsqueeze(0)
-                    .expand(num_gen_tokens, -1)
-                )
-                row_indices = torch.arange(num_gen_tokens, device=q_decode.device) // next_n
-                next_n_offset = torch.arange(num_gen_tokens, device=q_decode.device) % next_n
-                index_end_pos = (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1)
-                # index_end_pos: [B * N, 1]
-                mask = positions <= index_end_pos
-                # mask: [B * N, L]
-                logits_decode = logits_decode.masked_fill(~mask, float("-inf"))
-                topk_indices_decode = logits_decode.topk(
-                    min(self.index_topk, logits_decode.shape[-1]), dim=-1
-                )[1].to(torch.int32)  # [B * N, K]
-                # ensure we don't set indices for the top k
-                # that is out of range(masked already)
-                # this will happen if context length is shorter than K
-                mask_decode = topk_indices_decode <= index_end_pos
-
-                # local indices per sequence
-                topk_indices_decode = topk_indices_decode.masked_fill(~mask_decode, -1)
-                # Store in buffer
-                topk_indices_buffer[
-                    token_offset : token_offset + num_gen_tokens, : topk_indices_decode.shape[-1]
-                ] = topk_indices_decode.to(dtype=torch.int32)
+            self.decode_top_k(
+                logits_decode,
+                gen_kv_lens_cuda,
+                scan_lengths,
+                topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
+                next_n=next_n,
+                prior_indices=prior_indices,
+                heuristic_values=heuristic_values,
+                radix_indices=metadata.radix_aux_indices,
+                radix_values=metadata.radix_aux_logits,
+                max_num_columns=indexer_max_seq_len,
+                row_order=getattr(metadata, "kv_lens_row_reorder", None),
+            )
 
             if self._enable_heuristic_topk:
                 local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
