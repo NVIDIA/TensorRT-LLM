@@ -265,8 +265,11 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         pytest.param(_LLAVA_DIR, id="llava_7b"),
         pytest.param(_QWEN_2_5_VL_DIR, id="qwen2.5_3b"),
         pytest.param(_QWEN_3_VL_DIR, id="qwen3_2b"),
-        pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
-                     id="qwen3_30b_a3b_fp8"),
+        *[
+            pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
+                         id=f"qwen3_30b_a3b_fp8-repeat-{repeat}")
+            for repeat in range(20)
+        ],
     ],
 )
 def model_dir(request, tmp_path_factory: pytest.TempPathFactory) -> Path:
