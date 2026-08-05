@@ -301,6 +301,20 @@ class CUDAGraphRunner:
         from ..speculative.dspark_observability import trims_submitted_tokens
         if not trims_submitted_tokens(self.spec_config):
             return None
+        # Enforce what the docstring promises: None unless EVERY generation
+        # request carries a window. The fit publishes `agreed_ragged_bucket`,
+        # but windows can be absent by the time the key is derived (planner
+        # or peer declined after the fit, roster changed) -- and a ragged key
+        # over a window-less batch replays a graph whose token-major row maps
+        # were never staged this step, so the replay consumes the previous
+        # ragged step's rows: stale request mapping, stale extents, stale
+        # block table, and the rope KV-append walks off a retired request's
+        # allocation (the ragged IMA; proven by prepare-tick vs staged-tick
+        # stamps: tick N prepare, tick N-1 staging, no skip-guard fired).
+        if any(
+                getattr(request, "py_verify_len", None) is None
+                for request in batch.generation_requests):
+            return None
         # The bucket the fit agreed on, not a fresh sum over the batch. Summing
         # here walks generation_requests *after* _get_padded_batch has appended
         # padding, so it is a second, independent derivation of a quantity every
