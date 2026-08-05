@@ -95,16 +95,20 @@ def has_nvlink():
         return False
 
 
-def get_disagg_ucx_tls():
+def get_disagg_ucx_tls() -> str:
     """UCX transports for the disaggregated worker processes.
 
     Without NVLink, cuda_ipc is excluded (preserving the pre-existing
     behavior, which leaves IB allowed there). With NVLink on Hopper (SM90),
     IB is allowed: KVCacheManagerV2 KV pools are VMM allocations that CUDA
     IPC cannot map without fabric handles, so KV transfers need IB GPUDirect
-    RDMA to avoid falling back to slow non-IPC emulation. On the remaining
-    NVLink architectures IB stays excluded to avoid hangs on the CI B200
-    cluster.
+    RDMA to avoid falling back to slow non-IPC emulation. gdr_copy is
+    intentionally excluded on SM90, matching the get_ucx_tls() helpers under
+    disaggregated/. On the remaining NVLink architectures IB stays excluded
+    to avoid hangs on the CI B200 cluster.
+
+    Returns:
+        str: The UCX_TLS transport selection string.
     """
     if not has_nvlink():
         return "^cuda_ipc"
