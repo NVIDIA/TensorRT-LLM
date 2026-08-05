@@ -23,6 +23,7 @@ from typing import Dict, List
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 from PIL import Image
 from safetensors import safe_open
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer
@@ -31,6 +32,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.models.modeling_minimaxm3 import get_text_config
 from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
     CLIPVisionConfig,
+    MiniMaxVLLayerNorm,
     MiniMaxVLPatchEmbedding,
     MiniMaxVLPatchMerger,
     MiniMaxVLVisionModel,
@@ -47,6 +49,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
     reanchor_multimodal_checkpoint_keys,
     split_multimodal_weights,
 )
+from tensorrt_llm._torch.models.modeling_utils import MetaInitException, MetaInitMode
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirror the conventions used by test_minimax_m3.py).
@@ -810,6 +813,66 @@ def test_patch_merger_rejects_unaligned_input():
     x = torch.randn((7, 16), dtype=torch.float32)  # 7 not divisible by 4.
     with pytest.raises(ValueError, match="divisible by"):
         merge(x)
+
+
+# ---------------------------------------------------------------------------
+# meta-init compatibility (CPU, no checkpoint).
+# ---------------------------------------------------------------------------
+
+
+def _build_tiny_vision_model() -> MiniMaxVLVisionModel:
+    cfg = CLIPVisionConfig.from_dict_or_obj(_tiny_vision_config())
+    return MiniMaxVLVisionModel(
+        config=cfg,
+        text_hidden_size=16,
+        projector_hidden_size=16,
+        dtype=torch.float32,
+    )
+
+
+def test_vision_tower_builds_under_meta_init():
+    """The vision tower must construct inside ``MetaInitMode``.
+
+    See :class:`MiniMaxVLLayerNorm` for why a plain ``nn.LayerNorm`` here aborts
+    meta-init for the whole M3 model.
+    """
+    with MetaInitMode():
+        model = _build_tiny_vision_model()
+
+    layer_norms = [m for m in model.modules() if isinstance(m, nn.LayerNorm)]
+    assert layer_norms, "expected layer norms in the vision tower"
+    # pre_layrnorm + layer_norm1/2 per encoder layer.
+    assert len(layer_norms) == 1 + 2 * len(model.vision_model.encoder.layers)
+    for ln in layer_norms:
+        assert ln.weight.is_meta
+        assert ln.bias.is_meta
+
+
+def test_meta_init_still_rejects_plain_layer_norm_init(monkeypatch):
+    """Control for :func:`test_vision_tower_builds_under_meta_init`.
+
+    Restoring the upstream ``reset_parameters`` must bring the exception back,
+    otherwise that test could pass without the skip doing any work.
+    """
+    monkeypatch.setattr(MiniMaxVLLayerNorm, "reset_parameters", nn.LayerNorm.reset_parameters)
+    with pytest.raises(MetaInitException, match="fill_"):
+        with MetaInitMode():
+            _build_tiny_vision_model()
+
+
+def test_layer_norm_off_meta_init_matches_upstream():
+    """Off meta the skip must not engage, else a checkpoint-free build keeps
+    uninitialized ``torch.empty`` storage instead of ones/zeros."""
+    ln = MiniMaxVLLayerNorm(8, dtype=torch.float32)
+    assert torch.equal(ln.weight, torch.ones(8))
+    assert torch.equal(ln.bias, torch.zeros(8))
+
+
+def test_layer_norm_without_affine_params_builds_under_meta_init():
+    """``elementwise_affine=False`` registers ``weight`` as ``None``."""
+    with MetaInitMode():
+        ln = MiniMaxVLLayerNorm(8, elementwise_affine=False, dtype=torch.float32)
+    assert ln.weight is None
 
 
 # ---------------------------------------------------------------------------

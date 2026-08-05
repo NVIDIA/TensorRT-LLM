@@ -970,17 +970,18 @@ class CLIPVisionConfig:
 class MiniMaxVLLayerNorm(nn.LayerNorm):
     """``nn.LayerNorm`` whose parameter init is skipped on meta tensors.
 
-    ``nn.LayerNorm.reset_parameters`` fills weight/bias via ``aten.fill_.Scalar``,
-    which ``MetaInitMode`` does not allow, so a plain ``nn.LayerNorm`` anywhere in
-    the ``__init__`` tree aborts meta-init for the whole model and forces the
-    loader onto its regular-init fallback (hundreds of GB of host allocation per
-    rank for M3). Every layer-norm slot here is covered by the checkpoint, so the
+    ``reset_parameters`` fills weight/bias via ``aten.fill_.Scalar``, which
+    ``MetaInitMode`` rejects, so a plain ``nn.LayerNorm`` anywhere in the
+    ``__init__`` tree aborts meta-init for the whole model and drops the loader
+    onto its regular-init fallback (hundreds of GB of host allocation per rank
+    for M3). Every layer-norm slot here is covered by the checkpoint, so the
     skipped values are always overwritten at load time.
     """
 
     def reset_parameters(self) -> None:
-        # Only skip on meta: real tensors still need ones/zeros, otherwise a
-        # module built without a checkpoint keeps uninitialized storage.
+        # Skip only on meta: off meta the ones/zeros are still needed, otherwise
+        # a module built without a checkpoint keeps uninitialized storage.
+        # ``weight`` is None when elementwise_affine=False.
         if self.weight is not None and self.weight.is_meta:
             return
         super().reset_parameters()
