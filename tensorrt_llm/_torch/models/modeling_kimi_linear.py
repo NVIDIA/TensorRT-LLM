@@ -1714,6 +1714,12 @@ class KimiKDARuntime(nn.Module):
             ssm_pool if ssm_state_indices is not None else ssm_pool.index_select(0, slot_indices)
         )
 
+        # Breakable-CUDA-graph core buffer: point the kernel's ``out`` at the
+        # pre-o_proj core slice so ``trtllm::kda_decode`` writes the post-o_norm
+        # result in place (contiguous bf16 ``[B, 1, H, head_dim]``). o_proj runs
+        # on-graph in the caller.
+        kda_out = output.view(B, 1, H, hd) if output is not None else None
+
         o = mixer._dispatch.decode_kda(
             x_q=x_qkv[:, :d].unflatten(-1, (H, hd)).unsqueeze(0),
             x_k=x_qkv[:, d : 2 * d].unflatten(-1, (H, hd)).unsqueeze(0),
@@ -1734,7 +1740,7 @@ class KimiKDARuntime(nn.Module):
             state=state,
             onorm_g=onorm_g.unflatten(-1, (H, hd)).unsqueeze(0),
             onorm_weight=self._onorm_w_f32,
-            out=None,
+            out=kda_out,
             ssm_state_indices=ssm_state_indices,
             cu_seqlens=mamba_metadata._arange_buffer[: B + 1],
             scale=hd**-0.5,
@@ -1760,10 +1766,7 @@ class KimiKDARuntime(nn.Module):
         )
 
         if output is not None:
-            # Breakable-CUDA-graph core buffer: post-o_norm, pre-o_proj result
-            # (o_proj runs on-graph in the caller). Step 2 replaces this copy
-            # with a real kernel-level ``out=`` on decode_kda.
-            output.copy_(o.view(B, H, hd))
+            # decode_kda already wrote the core in place via out=kda_out.
             return None
         return mixer.o_proj(o.view(B, d))
 
