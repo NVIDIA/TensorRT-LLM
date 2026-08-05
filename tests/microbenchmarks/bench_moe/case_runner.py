@@ -697,6 +697,10 @@ def _run_one_candidate(
                 # workspace from max_num_tokens and require every rank to allocate the
                 # same size, so use the global per-rank maximum rather than this rank's
                 # local token count (which differs under uneven attention-DP shards).
+                # No CUDA-graph special-casing is needed anymore: since #15397 the
+                # non-DP (TEP/TTP) path passes all_rank_num_tokens=None and the MoE
+                # scheduler derives chunking from this rank's rows, so max(per_rank)
+                # already yields num_chunks==1 under graph capture.
                 max_num_tokens=max(int(max(per_rank)) if per_rank else 0, 1),
                 use_low_precision_moe_combine=bool(config.use_low_precision_moe_combine),
                 enable_perfect_router=enable_perfect_router,
@@ -706,7 +710,7 @@ def _run_one_candidate(
             )
         except Exception as exc:
             reason = f"build error: {type(exc).__name__}: {exc}"
-            _maybe_print_rank0(f"[bench_moe] build failed: {reason}")
+            _maybe_print_rank0(f"[bench_moe] build failed: {reason}\n{traceback.format_exc()}")
             return _short_circuit(result, "failed", reason)
 
         result.actual_backend = _backend_name_from_module(moe)

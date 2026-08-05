@@ -433,7 +433,6 @@ class MegaMoECuteDsl(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_limit: Optional[torch.Tensor] = None,
         **kwargs,

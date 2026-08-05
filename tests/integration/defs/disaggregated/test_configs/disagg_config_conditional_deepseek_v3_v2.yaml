@@ -7,9 +7,9 @@ conditional_disagg_config:
   max_local_prefill_length: 100
 disable_overlap_scheduler: true
 enable_autotuner: false
-# Enable per-request perf metrics so the disagg /perf_metrics endpoint (used by
-# the test's _check_bypass_signal) records routed requests; bypassed ones absent.
+# Enable response-carried metrics so the test can validate routed phases.
 perf_metrics_max_requests: 1000
+return_perf_metrics: true
 context_servers:
   num_instances: 1
   tensor_parallel_size: 1
