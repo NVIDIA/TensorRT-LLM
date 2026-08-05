@@ -36,6 +36,18 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    from ...custom_ops.dspark_attention_custom_op import (
+        cute_dsl_dspark_attention,
+        is_fused_dspark_attention_supported,
+    )
+    from ...custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+
 __all__ = [
     "get_dspark_topk_idxs",
     "get_dspark_topk_idxs_batched",
@@ -287,6 +299,45 @@ def _rope_last_dims_batched(
     return torch.cat([nope, rope], dim=-1)
 
 
+def _rmsnorm_rope_batched(
+    t: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    rope_head_dim: int,
+    freqs_cis: torch.Tensor,
+    *,
+    num_heads: int = 1,
+    apply_weight: bool = True,
+    apply_rmsnorm: bool = True,
+    inverse_rope: bool = False,
+) -> torch.Tensor:
+    """Fuse DSpark RMSNorm and last-dimension RoPE when supported."""
+    freqs_real = torch.view_as_real(freqs_cis).reshape(-1, freqs_cis.shape[-1], 2)
+    if IS_CUTLASS_DSL_AVAILABLE and is_fused_dspark_rmsnorm_rope_supported(
+        t, weight, freqs_real, num_heads, rope_head_dim
+    ):
+        return cute_dsl_dspark_rmsnorm_rope(
+            t,
+            weight,
+            freqs_real,
+            num_heads,
+            rope_head_dim,
+            eps,
+            apply_weight,
+            apply_rmsnorm,
+            inverse_rope,
+        )
+
+    if apply_rmsnorm:
+        if apply_weight:
+            t = _rmsnorm(t, weight, eps)
+        else:
+            t = t * torch.rsqrt(t.square().mean(-1, keepdim=True) + eps)
+    if rope_head_dim > 0:
+        t = _rope_last_dims_batched(t, rope_head_dim, freqs_cis, inverse=inverse_rope)
+    return t
+
+
 def dspark_attention_forward(
     x: torch.Tensor,
     main_x: torch.Tensor,
@@ -438,31 +489,70 @@ def dspark_attention_forward_batched(
     blk_freqs = freqs_cis[blk_pos]  # [G, block, rd//2]
 
     # Captured-context K/V from main_x (MQA, shared across heads).
-    main_kv = _rmsnorm(F.linear(main_x, wkv), kv_norm_w, eps)  # [G, 1, head_dim]
-    main_kv = _rope_last_dims_batched(main_kv, rd, main_freqs)
+    main_kv = _rmsnorm_rope_batched(F.linear(main_x, wkv), kv_norm_w, eps, rd, main_freqs)
 
     # Query: low-rank + per-head RMS + RoPE.
-    q = _rmsnorm(F.linear(x, wq_a), q_norm_w, eps)
+    q = _rmsnorm_rope_batched(F.linear(x, wq_a), q_norm_w, eps, 0, blk_freqs)
     q = F.linear(q, wq_b).unflatten(-1, (n_heads, head_dim))  # [G, block, h, head_dim]
-    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
-    q = _rope_last_dims_batched(q, rd, blk_freqs)
+    q = _rmsnorm_rope_batched(
+        q,
+        kv_norm_w,
+        eps,
+        rd,
+        blk_freqs,
+        num_heads=n_heads,
+        apply_weight=False,
+    )
 
     # Block K/V.
-    kv = _rmsnorm(F.linear(x, wkv), kv_norm_w, eps)  # [G, block, head_dim]
-    kv = _rope_last_dims_batched(kv, rd, blk_freqs)
+    kv = _rmsnorm_rope_batched(F.linear(x, wkv), kv_norm_w, eps, rd, blk_freqs)
 
     # Write the context K/V into the rolling window at slot start_pos%window_size,
     # then attend over [window context | block]. ``persist=True`` writes through to
     # the worker-owned buffer (cross-step decode); otherwise clone so single-shot
-    # callers stay pure. Indexed scatter/gather by (slots, slot_pos) is graph-safe.
+    # callers stay pure.
     write_target = kv_cache if persist else kv_cache.clone()
-    slot_pos = start_pos % window_size  # [G]
-    write_target[slots, slot_pos] = main_kv.squeeze(1).to(write_target.dtype)
-    cache_rows = write_target[slots]  # [G, window, head_dim]
-    kv_full = torch.cat([cache_rows, kv], dim=1)  # [G, window + block, head_dim]
-    topk = get_dspark_topk_idxs_batched(window_size, block, start_pos, valid_len)
-    o = dspark_sparse_attn(q, kv_full, attn_sink, topk, softmax_scale)  # [G, block, h, head_dim]
-    o = _rope_last_dims_batched(o, rd, blk_freqs, inverse=True)
+    main_kv_flat = main_kv.squeeze(1).to(write_target.dtype)
+    if (
+        valid_len is None
+        and IS_CUTLASS_DSL_AVAILABLE
+        and is_fused_dspark_attention_supported(
+            q, main_kv_flat, kv, write_target, slots, start_pos, attn_sink
+        )
+    ):
+        # One custom op performs the rolling-cache write/read, validity handling,
+        # QK, attention-sink online softmax, and PV. In particular it creates no
+        # topk index, gathered KV, score, or probability tensors.
+        o = cute_dsl_dspark_attention(
+            q,
+            main_kv_flat,
+            kv,
+            write_target,
+            slots,
+            start_pos,
+            attn_sink,
+            softmax_scale,
+        )
+    else:
+        slot_pos = start_pos % window_size  # [G]
+        write_target[slots, slot_pos] = main_kv_flat
+        cache_rows = write_target[slots]  # [G, window, head_dim]
+        kv_full = torch.cat([cache_rows, kv], dim=1)  # [G, window + block, head_dim]
+        topk = get_dspark_topk_idxs_batched(window_size, block, start_pos, valid_len)
+        o = dspark_sparse_attn(
+            q, kv_full, attn_sink, topk, softmax_scale
+        )  # [G, block, h, head_dim]
+    o = _rmsnorm_rope_batched(
+        o,
+        kv_norm_w,
+        eps,
+        rd,
+        blk_freqs,
+        num_heads=n_heads,
+        apply_weight=False,
+        apply_rmsnorm=False,
+        inverse_rope=True,
+    )
 
     # Grouped low-rank O projection.
     o = o.reshape(g, block, n_groups, -1)
