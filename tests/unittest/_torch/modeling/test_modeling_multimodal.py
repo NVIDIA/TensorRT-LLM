@@ -867,6 +867,8 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
 
         self.attn_metadata = None
         self.runtime_features = None
+        self.hf_model = None
+        self.trtllm_model = None
 
         gc.collect()
         if torch.cuda.is_available():
