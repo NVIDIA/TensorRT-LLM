@@ -34,9 +34,6 @@ _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 
 _thread_local = threading.local()
 
-# Mirrored by the autotune context so Dynamo can guard this branch without
-# tracing the stateful AutoTuner singleton.
-_ALLREDUCE_AUTOTUNER_TUNING_MODE = False
 # Disabled only after the Python/C++ native-tactic contract cannot be honored.
 _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED = True
 
@@ -916,7 +913,10 @@ class AllReduce(nn.Module):
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
             # Use native lookup after tuning unless its Python/C++ contract
             # failed; then retain the existing Python cache and selection path.
-            if _ALLREDUCE_AUTOTUNER_TUNING_MODE or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
+            # Import lazily because AutoTuner imports the distributed package.
+            from tensorrt_llm._torch.autotuner import AutoTuner
+            is_tuning_mode = AutoTuner.get().is_tuning_mode
+            if is_tuning_mode or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
                 output = torch.ops.trtllm.tunable_allreduce(
                     input=input,
                     residual=all_reduce_params.residual,

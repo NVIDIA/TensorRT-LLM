@@ -2125,6 +2125,8 @@ class AllReduceRunner(TunableRunner):
     def unique_id(self) -> Tuple[int, Tuple[int, ...], torch.dtype, int, bool]:
         return (
             self.tp_size,
+            # Keep Python cache entries aligned with the native tactic cache:
+            # groups with the same size can use distinct communicators/topologies.
             tuple(self.group),
             self.input_dtype,
             self.op,
@@ -2215,7 +2217,6 @@ class AllReduceRunner(TunableRunner):
     def _register_native_tactics(self, inputs: List[torch.Tensor]) -> None:
         input, residual, norm_weight, scale, bias, workspace = inputs
         custom_op = "trtllm::tunable_allreduce::allreduce"
-        runner_key = (custom_op, self.__class__.__name__, str(self.unique_id()))
         tuning_buckets = self.tuning_config.dynamic_tensor_specs[
             0].gen_tuning_buckets
         # Avoid a module-import cycle during custom-op registration.
@@ -2233,28 +2234,26 @@ class AllReduceRunner(TunableRunner):
                 raise
             disable_native_allreduce_autotuner(str(error))
             return
-        cache = AutoTuner.get().profiling_cache.cache
-        static_input_shapes = tuple(
-            (tuple(tensor.shape[1:]) if index == 0 else (
-                -1, *tensor.shape[1:]) if index == 1 else tuple(tensor.shape)
-             ) if isinstance(tensor, torch.Tensor) else (0, )
-            for index, tensor in enumerate(inputs))
-        for cache_key, (_, tactic, _) in cache.items():
-            if cache_key[:3] != runner_key:
-                continue
-            profile = cache_key[3]
-            if not profile or len(profile) != len(inputs) or not profile[0]:
-                continue
-            input_shape = profile[0]
-            profile_static_input_shapes = (
-                tuple(input_shape[1:]),
-                *(tuple(shape) for shape in profile[1:]),
+        tuner = AutoTuner.get()
+        cache = tuner.profiling_cache
+        input_shapes = tuple(tuner._get_input_sizes(inputs))
+        # Look up the fixed set of allreduce buckets directly instead of
+        # scanning unrelated custom-op and profile entries in the full cache.
+        for bucket in tuning_buckets:
+            bucket_input_shapes = list(input_shapes)
+            bucket_input_shapes[0] = torch.Size(
+                (bucket, *input_shapes[0][1:]))
+            cache_key = cache.get_cache_key(
+                custom_op,
+                self,
+                tuple(bucket_input_shapes),
+                self.tuning_config,
+                apply_map_to_tuning_buckets=False,
             )
-            if profile_static_input_shapes != static_input_shapes:
+            cache_entry = cache.cache.get(cache_key)
+            if cache_entry is None:
                 continue
-            bucket = int(input_shape[0])
-            if bucket not in tuning_buckets:
-                continue
+            _, tactic, _ = cache_entry
             torch.ops.trtllm.register_allreduce_tactic(input, residual,
                                                        norm_weight, scale, bias,
                                                        workspace, self.group,
