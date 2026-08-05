@@ -59,8 +59,13 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
     if license_ticket and license_ticket.get("ticket_url"):
         url = license_ticket["ticket_url"]
         license_info = license_ticket.get("license_info", {})
-        for pkg in license_ticket.get("dependencies") or []:
-            new_tickets[pkg.get("name")] = url
+        dep_names = {pkg.get("name") for pkg in (license_ticket.get("dependencies") or [])}
+        if not dep_names:
+            # Agent created a ticket but returned no dependency list — cover all submitted packages
+            dep_names = {doc["s_package_name"] for doc in risk_docs}
+        for name in dep_names:
+            if name:
+                new_tickets[name] = url
     if new_tickets:
         save_triage_records(
             ES_POST_URL,
@@ -170,7 +175,9 @@ def submit_source_code_licenses(
     risks_to_report = []
     sbom_path = Path(input_file)
     if sbom_path.exists():
-        sbom_data = json.loads(sbom_path.read_text())
+        sbom_raw = sbom_path.read_text()
+        print(f"=== SBOM ({input_file}) ===\n{sbom_raw}", file=sys.stderr)
+        sbom_data = json.loads(sbom_raw)
         components = sbom_data.get("components", [])
 
         # Build {license_id: [components]} and call the API once for all licenses
@@ -231,6 +238,11 @@ def submit_source_code_licenses(
 
         license_info: dict = {}
         if risks_to_report:
+            print(
+                f"=== risks_to_report ({SCAN_TYPE}, {len(risks_to_report)} items) ===\n"
+                + json.dumps(risks_to_report, indent=2),
+                file=sys.stderr,
+            )
             new_tickets, license_info = _run_triage(
                 risks_to_report, SCAN_TYPE, build_metadata["ref"], ts
             )
@@ -397,6 +409,11 @@ def submit_container_licenses(
 
     license_info: dict = {}
     if risks_to_report:
+        print(
+            f"=== risks_to_report ({SCAN_TYPE}, {len(risks_to_report)} items) ===\n"
+            + json.dumps(risks_to_report, indent=2),
+            file=sys.stderr,
+        )
         new_tickets, license_info = _run_triage(
             risks_to_report, SCAN_TYPE, build_metadata["ref"], ts
         )
