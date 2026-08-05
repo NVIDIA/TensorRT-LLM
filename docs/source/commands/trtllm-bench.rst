@@ -13,7 +13,7 @@ Syntax
 .. click:: tensorrt_llm.commands.bench:main
    :prog: trtllm-bench
    :nested: full
-   :commands: throughput, latency, build
+   :commands: throughput, latency, build, prepare-dataset
 
 
 
@@ -28,15 +28,7 @@ Dataset preparation
 
 **Key Features:**
 
-- Tokenizer integration for proper text preprocessing
+- Tokenizer integration for proper text preprocessing — the tokenizer is resolved from the model passed to ``trtllm-bench --model``
 - Configurable random seeds for reproducible results
 - Support for LoRA adapters and task IDs
 - Output in JSON format compatible with trtllm-bench
-
-prepare-dataset
-^^^^^^^^^^^^^^^
-
-.. click:: tensorrt_llm.commands.bench:main
-   :prog: trtllm-bench
-   :nested: full
-   :commands: prepare-dataset
