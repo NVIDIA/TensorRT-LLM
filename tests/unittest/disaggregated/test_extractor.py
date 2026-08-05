@@ -208,8 +208,17 @@ def test_build_page_table():
     manager.shutdown()
 
 
-def _make_v1_dsa_manager(pp_size: int = 1, pp_rank: int = 0) -> KVCacheManager:
-    """V1 KVCacheManager with the DSA indexer K cache enabled (MLA-style)."""
+def _make_v1_dsa_manager(
+    pp_size: int = 1,
+    pp_rank: int = 0,
+    indexer_k_cache_layer_mask=None,
+) -> KVCacheManager:
+    """V1 KVCacheManager with the DSA indexer K cache enabled (MLA-style).
+
+    ``indexer_k_cache_layer_mask`` is a global per-model ``list[bool]`` marking
+    the "full" indexer-owning layers (cross-layer indexer sharing, e.g. GLM
+    5.2); ``None`` keeps the dense layout where every layer owns an indexer row.
+    """
     return KVCacheManager(
         kv_cache_config=KvCacheConfig(
             max_tokens=512,
@@ -228,6 +237,7 @@ def _make_v1_dsa_manager(pp_size: int = 1, pp_rank: int = 0) -> KVCacheManager:
         enable_indexer_k_cache=True,
         indexer_k_cache_quant_block_size=128,
         indexer_k_cache_index_head_dim=128,
+        indexer_k_cache_layer_mask=indexer_k_cache_layer_mask,
     )
 
 
@@ -259,6 +269,44 @@ def test_v1_dsa_indexer_page_table_is_replicated_with_per_layer_entries():
         assert per_layer * len(idx_view.buffer_entries) == idx_pool.slot_bytes
         offsets = sorted(int(entry["offset"]) for entry in idx_view.buffer_entries)
         assert offsets == [i * per_layer for i in range(len(offsets))]
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.cuda
+def test_v1_dsa_masked_indexer_page_table_covers_owning_layers():
+    """The masked indexer view covers only the owning layers.
+
+    A per-layer indexer mask (cross-layer indexer sharing, e.g. GLM 5.2) gives
+    only the owning layers a pool row, so the REPLICATED indexer view covers
+    exactly that subset -- one entry per owning layer mapped to its packed row
+    -- instead of one entry per LG layer.
+    """
+    # Of the 4 layers, only local layers 0 and 2 own an indexer K cache row.
+    manager = _make_v1_dsa_manager(indexer_k_cache_layer_mask=[True, False, True, False])
+    try:
+        page_table = build_page_table(manager)
+        lg = page_table.layer_groups[0]
+        assert len(lg.pool_views) == 2
+        _, idx_view = lg.pool_views
+        assert idx_view.mapper_kind == MapperKind.REPLICATED
+        assert idx_view.pool_role == frozenset({"indexer_k"})
+
+        # Only the two owning layers appear -- a strict subset of the LG.
+        owning = sorted(int(e["local_layer_id"]) for e in idx_view.buffer_entries)
+        assert owning == [0, 2]
+
+        # The pool holds one row per owning layer; entries pack contiguously in
+        # owning (local-layer) order, so layer 0 -> row 0, layer 2 -> row 1.
+        idx_pool = get_physical_pool(page_table, 0, idx_view.pool_idx)
+        sizes = {int(e["size"]) for e in idx_view.buffer_entries}
+        assert len(sizes) == 1
+        per_layer = sizes.pop()
+        assert per_layer * len(idx_view.buffer_entries) == idx_pool.slot_bytes
+        offset_by_layer = {
+            int(e["local_layer_id"]): int(e["offset"]) for e in idx_view.buffer_entries
+        }
+        assert offset_by_layer == {0: 0, 2: per_layer}
     finally:
         manager.shutdown()
 
