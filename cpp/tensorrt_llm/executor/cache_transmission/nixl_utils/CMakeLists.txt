@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -41,6 +41,8 @@ if(NIXL_ROOT)
 
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE ${TORCH_LIBRARIES}
+                                                       pg_utils)
 
   set(NIXL_ENABLED TRUE)
 else()
