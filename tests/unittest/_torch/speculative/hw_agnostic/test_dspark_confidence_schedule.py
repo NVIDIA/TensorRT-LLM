@@ -467,3 +467,43 @@ def test_trim_regret_counts_only_drafts_alive_at_the_cut():
     assert untrimmed.requests_trimmed == 0
     assert untrimmed.trim_regret_rate == 0.0
     assert untrimmed.summary()["accept_len"] == pytest.approx(8 / 3, abs=1e-4)
+
+
+# --------------------------------------------------------------------------
+# top-k allocation follows confidence (moved from test_dspark_planner_trims.py)
+# --------------------------------------------------------------------------
+
+
+def _block5_cfg() -> DSparkScheduleConfig:
+    return DSparkScheduleConfig(block_size=5, min_verify_len=1, max_verify_len=5)
+
+
+def test_topk_hands_longer_windows_to_more_confident_requests():
+    """The budget must follow survival, not batch position."""
+    # survival[r, k] = P(the first k+1 drafted tokens all get accepted)
+    survival = torch.tensor([
+        [0.99, 0.98, 0.97, 0.96, 0.95],  # confident
+        [0.90, 0.70, 0.50, 0.30, 0.10],  # middling
+        [0.20, 0.04, 0.01, 0.00, 0.00],  # collapses
+    ])
+    lens = schedule_verify_lens_topk(survival=survival, budget=6,
+                                     cfg=_block5_cfg()).tolist()
+
+    assert len(lens) == 3
+    assert lens[0] > lens[2], (
+        f"confident request got {lens[0]}, collapsing request got {lens[2]}; "
+        f"the budget must follow survival, not batch position")
+    assert lens[0] >= lens[1] >= lens[2]
+    # Every request keeps at least the floor, and the budget is respected.
+    assert min(lens) >= 1
+    assert sum(lens) - len(lens) * 1 <= 6
+
+
+def test_a_full_budget_degenerates_to_the_uniform_full_window():
+    """The no-trim case must stay exactly uniform: ragged must cost nothing."""
+    num_reqs, max_len = 4, 5
+    survival = torch.full((num_reqs, max_len), 0.99)
+    budget = num_reqs * (max_len - 1)
+    lens = schedule_verify_lens_topk(survival=survival, budget=budget,
+                                     cfg=_block5_cfg()).tolist()
+    assert lens == [max_len] * num_reqs

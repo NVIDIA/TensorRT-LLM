@@ -120,8 +120,7 @@ class SpsCostTable:
     breakpoint's price, making tokens look free right before a riser, and the
     argmax then over-spends -- measured live as the planner buying the full
     block on ~95% of decisions because its cost ratio between tiers collapsed
-    below the survival ratio (see test_dspark_cost_interpolation for the
-    pinned numbers). A table that wants a flat shelf must MEASURE the shelf:
+    below the survival ratio. A table that wants a flat shelf must MEASURE the shelf:
     two breakpoints with equal values. Queries outside the measured range
     clamp to the end values; the caller is expected to bound the budget so the
     high clamp does not happen silently.
