@@ -265,16 +265,10 @@ def _pick_dsl_expand(
 
 def build_req_idx_per_token(seq_lens: torch.Tensor,
                             num_tokens: int) -> torch.Tensor:
-    """Map each token of the flattened batch to the request it belongs to.
+    """Map each flattened-batch token to its request index.
 
-    Token ``t`` belongs to the first request whose cumulative token end
-    exceeds ``t``; ``right=True`` makes duplicated cumsum boundaries skip
-    zero-length rows, so the result matches ``torch.repeat_interleave(
-    arange(num_seqs), seq_lens)`` for every layout (see the unit test).
-
-    Device-side, fixed-shape counterpart of the host build in
-    ``prepare_for_indices_conversion()`` — usable between draft-loop
-    iterations and inside CUDA-graph capture, where a host round-trip is not.
+    Capture-safe device counterpart of prepare_for_indices_conversion()'s
+    host repeat_interleave; right=True keeps zero-length rows equivalent.
     """
     cu_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
     token_idx = torch.arange(num_tokens,
@@ -849,12 +843,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # boundary so a "shared" layer never reuses a stale top-k.
         self.shared_topk_indices = None
 
-        # Rebuild the token->request map from the current seq_lens: the map
-        # built in prepare() describes the target forward's layout, but the
-        # draft loop rewrites seq_lens to one token per request. Equivalent to
-        # prepare()'s repeat_interleave whenever seq_lens is unchanged.
-        # Unconditional (no kv_cache_manager guard) so subclasses such as
-        # DeepSeek-V4 can reuse the rebuilt buffer instead of recomputing it.
+        # prepare()'s map is stale once the draft loop rewrites seq_lens.
+        # Unconditional so subclasses (DeepSeek-V4) can reuse the buffer.
         if self.num_tokens > 0:
             self.req_idx_per_token[:self.num_tokens] = build_req_idx_per_token(
                 self.seq_lens_cuda[:self.num_seqs],

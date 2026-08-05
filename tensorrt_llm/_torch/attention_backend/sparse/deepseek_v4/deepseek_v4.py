@@ -933,10 +933,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     ) -> torch.Tensor:
         """Compute cu_seq_lens and token_positions (eager).
 
-        ``req_idx_per_token_buf`` must already describe the current seq_lens
-        layout; ``super().on_update_kv_lens()`` rebuilds it via
-        ``build_req_idx_per_token`` before this runs, so it is read here
-        rather than recomputed.
+        req_idx_per_token_buf is read, not recomputed: super().on_update_kv_lens()
+        has already rebuilt it for the current seq_lens.
         """
         device = seq_lens.device
 

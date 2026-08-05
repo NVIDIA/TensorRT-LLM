@@ -15,16 +15,11 @@
 """
 Tests for the token->request map used by DSAtrtllmAttentionMetadata.
 
-Two invariants, one test each:
-
-1. build_req_idx_per_token (device searchsorted) must equal
-   prepare_for_indices_conversion()'s host repeat_interleave for every batch
-   layout, so the two builders cannot drift.
-2. on_update_kv_lens() must rebuild the map for the CURRENT seq_lens. The MTP
-   draft loop rewrites seq_lens to one token per request without re-running
-   prepare(); reusing prepare()'s map misattributes every draft token to
-   request 0, corrupting indexer K-writes and top-k reads through the wrong
-   block table (https://nvbugs/6513132, https://nvbugs/6513093).
+1. build_req_idx_per_token must match the host repeat_interleave build for
+   every layout, so the device and host builders cannot drift.
+2. on_update_kv_lens() must rebuild the map after the MTP draft loop rewrites
+   seq_lens, or every draft token is misattributed to request 0
+   (https://nvbugs/6513132, https://nvbugs/6513093).
 """
 
 from unittest.mock import Mock
@@ -70,12 +65,7 @@ def test_matches_host_repeat_interleave(seq_lens, device):
 
 
 def test_on_update_kv_lens_rebuilds_stale_map():
-    """The draft-loop transition: the regression this PR fixes.
-
-    Bare-instance construction (object.__new__ + backing fields) mirrors
-    test_dsa_indexer.py; kv_cache_manager=None and num_generations=0 confine
-    on_update_kv_lens() to the map rebuild under test.
-    """
+    """on_update_kv_lens() must replace prepare()'s stale map (fails pre-fix)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     device = "cuda"
@@ -85,14 +75,12 @@ def test_on_update_kv_lens_rebuilds_stale_map():
     md = object.__new__(DSAtrtllmAttentionMetadata)
     md.kv_cache_manager = None
     md._num_generations = 0
-    # Collaborators invoked at the end of on_update_kv_lens(); unrelated to
-    # the map rebuild under test (same stubbing style as test_dsa_indexer.py).
+    # Stub collaborators unrelated to the map rebuild (test_dsa_indexer.py style).
     md.kv_lens_cuda = torch.tensor([100, 200, 300], dtype=torch.int32, device=device)
     md._compute_kv_lens_row_reorder = Mock()
     md.prepare_dense_topk_indices = Mock()
 
-    # prepare() state for the target forward: 1 + max_draft_len tokens per
-    # request, map built host-side via repeat_interleave.
+    # prepare()-time state: target forward, 1 + max_draft_len tokens/request.
     target_seq_lens = torch.full((num_requests,), 1 + max_draft_len, dtype=torch.int32)
     md._seq_lens = target_seq_lens
     md._seq_lens_cuda = target_seq_lens.to(device)
@@ -100,9 +88,7 @@ def test_on_update_kv_lens_rebuilds_stale_map():
     md.req_idx_per_token = torch.empty(md._num_tokens, dtype=torch.int32, device=device)
     md.req_idx_per_token[:] = _host_reference(md._seq_lens_cuda)
 
-    # The draft loop rewrites seq_lens to one token per request (what
-    # _preprocess_inputs does between draft iterations) without re-running
-    # prepare(). The stale prefix misattributes every token to request 0.
+    # Draft loop: one token per request; the stale prefix reads [0, 0, 0].
     draft_seq_lens = torch.ones(num_requests, dtype=torch.int32)
     md._seq_lens = draft_seq_lens
     md._seq_lens_cuda = draft_seq_lens.to(device)
