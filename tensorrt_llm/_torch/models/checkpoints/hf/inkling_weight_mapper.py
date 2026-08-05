@@ -258,7 +258,7 @@ class InklingHfWeightMapper(HfWeightMapper):
     """
 
     @property
-    def _text_config(self):
+    def _text_config(self) -> InklingTextConfig:
         """The text sub-config the mapped weights actually describe.
 
         ``ModelLoader.load`` initializes the mapper with the TOP-LEVEL
@@ -270,8 +270,8 @@ class InklingHfWeightMapper(HfWeightMapper):
         cfg = self.config.pretrained_config
         return getattr(cfg, "text_config", cfg)
 
-    def preprocess_weights(self, weights: Dict) -> Dict:
-        new_weights: Dict[str, torch.Tensor] = {}
+    def preprocess_weights(self, weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        new_weights: dict[str, torch.Tensor] = {}
         text_config = self._text_config
         unpadded_vocab = int(
             getattr(
@@ -325,7 +325,13 @@ class InklingHfWeightMapper(HfWeightMapper):
             new_weights[name] = tensor
         return new_weights
 
-    def _map_expert(self, name: str, tensor: torch.Tensor, match: "re.Match", out: Dict) -> None:
+    def _map_expert(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        match: re.Match[str],
+        out: dict[str, torch.Tensor],
+    ) -> None:
         """Unfuse a stacked expert tensor into per-expert fused-MoE keys.
 
         ``w13_weight[e]`` is ``[2*inter, hidden]`` (gate rows first, up rows
@@ -365,7 +371,7 @@ class InklingHfWeightMapper(HfWeightMapper):
         n_experts = int(getattr(self._text_config, "n_routed_experts", tensor.shape[0]))
         projs = ("w1", "w3") if which == "w13_weight" else ("w2",)
 
-        def _assign(e, vals):
+        def _assign(e: int, vals: tuple[torch.Tensor, ...]) -> None:
             for proj, val in zip(projs, vals):
                 out[f"{prefix}.{e}.{proj}.{scale_name}"] = val
 

@@ -716,7 +716,8 @@ class InklingReasoningParser(BaseReasoningParser):
         self._kind: Optional[str] = None
         self._buffer = ""
 
-    def _emit(self, segment: str, content: list, reasoning: list) -> None:
+    def _emit(self, segment: str, content: list[str],
+              reasoning: list[str]) -> None:
         if not segment:
             return
         # content / tool / None(between blocks or no marker) -> visible content;
@@ -726,7 +727,8 @@ class InklingReasoningParser(BaseReasoningParser):
         elif self._kind == "reasoning":
             reasoning.append(segment)
 
-    def _consume(self, text: str, content: list, reasoning: list) -> None:
+    def _consume(self, text: str, content: list[str],
+                 reasoning: list[str]) -> None:
         pos = 0
         for m in _INKLING_CONTROL_RE.finditer(text):
             self._emit(text[pos:m.start()], content, reasoning)
@@ -748,8 +750,8 @@ class InklingReasoningParser(BaseReasoningParser):
     def parse(self, text: str) -> ReasoningParserResult:
         self._kind = None
         self._buffer = ""
-        content: list = []
-        reasoning: list = []
+        content: list[str] = []
+        reasoning: list[str] = []
         self._consume(text, content, reasoning)
         return ReasoningParserResult(content="".join(content),
                                      reasoning_content="".join(reasoning))
@@ -778,8 +780,8 @@ class InklingReasoningParser(BaseReasoningParser):
             text = text[:-hold]
         else:
             self._buffer = ""
-        content: list = []
-        reasoning: list = []
+        content: list[str] = []
+        reasoning: list[str] = []
         self._consume(text, content, reasoning)
         return ReasoningParserResult(content="".join(content),
                                      reasoning_content="".join(reasoning))
@@ -790,8 +792,8 @@ class InklingReasoningParser(BaseReasoningParser):
         if not remaining:
             self._kind = None
             return ReasoningParserResult()
-        content: list = []
-        reasoning: list = []
+        content: list[str] = []
+        reasoning: list[str] = []
         self._consume(remaining, content, reasoning)
         # Reset the block kind too, so reusing this instance for a second stream
         # does not route its first segment by the previous stream's channel.
