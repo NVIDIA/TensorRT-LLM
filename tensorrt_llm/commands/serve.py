@@ -712,24 +712,39 @@ def launch_server(
                     f"{backend} is not a known backend, check help for available options.",
                     param_hint="backend")
 
-            if multi_frontend.is_launcher:
-                _spawn_attached_frontends(llm, multi_frontend.num_frontends,
-                                          frontend_children)
+            # From here on the engine is live but no reference to it has
+            # reached the caller yet. If anything below raises, `build_frontend`
+            # propagates and `server` stays None in serve_with_lifecycle, so its
+            # `on_startup_failure` hook is skipped (lifecycle.py's
+            # `if server is not None` guard) and the attached-frontend path
+            # never gets a server either. The only teardown left would be the
+            # LLM atexit hook — the unbounded interpreter-shutdown path this
+            # lifecycle exists to avoid. Shut the engine down here instead.
+            try:
+                if multi_frontend.is_launcher:
+                    _spawn_attached_frontends(llm, multi_frontend.num_frontends,
+                                              frontend_children)
 
-            server = OpenAIServer(
-                generator=llm,
-                model=model,
-                tool_parser=tool_parser,
-                server_role=server_role,
-                metadata_server_cfg=metadata_server_cfg,
-                disagg_cluster_config=disagg_cluster_config,
-                multimodal_server_config=multimodal_server_config,
-                chat_template=chat_template,
-                allow_request_chat_template=allow_request_chat_template,
-                input_processor_workers=num_input_processor_workers,
-                media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key)
-            _apply_fastapi_middlewares(server.app, middleware)
+                server = OpenAIServer(
+                    generator=llm,
+                    model=model,
+                    tool_parser=tool_parser,
+                    server_role=server_role,
+                    metadata_server_cfg=metadata_server_cfg,
+                    disagg_cluster_config=disagg_cluster_config,
+                    multimodal_server_config=multimodal_server_config,
+                    chat_template=chat_template,
+                    allow_request_chat_template=allow_request_chat_template,
+                    input_processor_workers=num_input_processor_workers,
+                    media_load_workers=num_media_load_workers,
+                    internal_disagg_auth_key=internal_disagg_auth_key)
+                _apply_fastapi_middlewares(server.app, middleware)
+            except BaseException:
+                # BaseException, not Exception: a KeyboardInterrupt or a
+                # CancelledError landing here leaks the engine just as surely
+                # as a TypeError would.
+                llm.shutdown()
+                raise
 
             # Optionally disable GC (default: not disabled)
             if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":

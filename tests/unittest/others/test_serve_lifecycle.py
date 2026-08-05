@@ -1935,3 +1935,54 @@ def test_server_harness_fails_fast_on_any_exit_during_startup(monkeypatch, exit_
         server._wait_for_server(url="http://127.0.0.1:1/health", timeout=5.0)
     assert time.monotonic() - started < 2.0, "the exit must be noticed on the first poll"
     assert not server.terminated
+
+
+# ---------------------------------------------------------------------------
+# launch_server: the engine must not outlive a failed frontend build.
+# ---------------------------------------------------------------------------
+
+
+def test_engine_is_shut_down_when_the_frontend_build_fails(monkeypatch):
+    """A build that dies after the engine is up must still tear the engine down.
+
+    ``build_frontend`` constructs the engine first and the ``OpenAIServer``
+    second. If the second step raises, no reference to the engine ever reaches
+    ``serve_with_lifecycle``, so its ``on_startup_failure`` hook is skipped by
+    the ``if server is not None`` guard in ``lifecycle.py``. Before the fix the
+    only remaining teardown was ``LLM``'s ``atexit`` hook -- the unbounded
+    interpreter-shutdown path this lifecycle exists to replace, which leaves
+    the engine's worker processes running in the meantime.
+    """
+    from tensorrt_llm.commands import serve as serve_mod
+
+    shutdown_calls = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            pass
+
+        def shutdown(self):
+            shutdown_calls.append(True)
+
+    def exploding_server(**kwargs):
+        raise RuntimeError("frontend construction exploded")
+
+    monkeypatch.setattr(serve_mod, "PyTorchLLM", FakeLLM)
+    monkeypatch.setattr(serve_mod, "OpenAIServer", exploding_server)
+
+    sock = bound_socket()
+    port = sock.getsockname()[1]
+    sock.close()
+
+    with pytest.raises(RuntimeError, match="frontend construction exploded"):
+        serve_mod.launch_server(
+            host="127.0.0.1",
+            port=port,
+            llm_args={"backend": "pytorch", "model": "fake-model"},
+            multi_frontend_enabled=False,
+        )
+
+    assert shutdown_calls == [True], (
+        "the engine was not shut down after the frontend build failed; it "
+        "would be left to the atexit hook"
+    )
