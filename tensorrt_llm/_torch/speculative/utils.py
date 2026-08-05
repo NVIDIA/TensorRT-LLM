@@ -37,6 +37,11 @@ from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
 from .suffix_automaton import SuffixAutomatonManager
 
+_GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+)
+
 
 def _is_effective_dynamic_tree(spec_config) -> bool:
     # At dynamic_tree_max_topK == 1 the tree collapses to a linear chain; route
@@ -445,6 +450,8 @@ def get_spec_drafter(model_engine,
 
 
 def get_num_spec_layers(spec_config):
+    if getattr(spec_config, "_use_shared_kv_cache", False):
+        return 0
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         return 1
     if spec_config.spec_dec_mode.is_mtp_vanilla():
@@ -521,6 +528,8 @@ def get_num_extra_kv_tokens(spec_config):
     """
     if spec_config is None:
         return 0
+    if getattr(spec_config, "_use_shared_kv_cache", False):
+        return 0
     if spec_config.spec_dec_mode.use_one_engine():
         return spec_config.max_draft_len - 1
     return 0
@@ -545,6 +554,11 @@ def update_spec_config_from_model_config(spec_config, model_config):
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
     if not isinstance(spec_config, MTPDecodingConfig):
         return
+    architectures = getattr(model_config, "architectures", None) or ()
+    if (architectures
+            and architectures[0] in _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES):
+        spec_config._use_shared_kv_cache = (
+            spec_config.spec_dec_mode.is_mtp_eagle_one_model())
     # Read the MTP layer count from the model's pretrained config. This
     # determines the actual MTP layer count in the checkpoint and drives the
     # spec_dec_mode decision (EAGLE vs vanilla MTP). Different checkpoints expose
