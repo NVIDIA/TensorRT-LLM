@@ -12,50 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Verification mode selection and per-step observability for DSpark.
+"""Verification-mode selection and per-step counters for DSpark ragged verify.
 
-Why this module exists
-----------------------
-Every failure mode of confidence-scheduled verification is *silent*. The
-scheduler can decline to trim, the planner can fall back on a flat cost model,
-a batch can miss its captured shape and drop out of graph replay, and a
-partially-windowed batch can be refused -- and in every one of those cases the
-run still produces correct output at the baseline accuracy. A GSM8K pass
-therefore proves nothing about whether the feature was ever active.
-
-So the two questions a reviewer actually has -- *did the ragged path run?* and
-*did it trim anything?* -- are made into counters rather than left to
-inference, and :meth:`DSparkRaggedStats.assert_ragged_active` turns them into a
-test assertion.
-
-Verification modes
-------------------
-Mirrors SGLang's ``SGLANG_RAGGED_VERIFY_MODE``, and for the same reason: it
-separates "is the ragged layout computed correctly" from "does the planner
-choose to trim", which otherwise fail together and are indistinguishable.
-
-``static``
-    Verify the whole drafted block for every request. The baseline, and what
-    every non-DSpark path already does. Scheduling is off.
-
-``cap-accept``
-    Compute the per-request windows and carry them through the whole layout,
-    but still submit the full block to the target and only *commit* the window.
-    The expensive path is unchanged, so this buys no throughput -- it exists
-    because its output must be **bit-identical** to ``static``. Any divergence
-    is a scheduling bug isolated from the kernel-side packing, which is the one
-    comparison that separates the two.
-
-``compact``
-    Submit only each request's window. The production path, and the only one
-    that trims tokens.
-
-Cost-table dependence
----------------------
-``compact`` needs a profiled :class:`~.dspark_planner.SpsCostTable`. Without
-one the planner's cost model is flat, every extra verified token looks free,
-and the budget degenerates to verify-all -- ragged silently becomes uniform.
-:meth:`DSparkRaggedStats.assert_ragged_active` catches exactly that.
+Failures on this path are silent (output stays correct at baseline accuracy),
+so activity is counted rather than inferred, and
+:meth:`DSparkRaggedStats.assert_ragged_active` turns the counters into a test
+gate. Modes: ``static`` verifies the full block; ``cap-accept`` computes and
+commits per-request windows but submits the full block, so its output must
+stay bit-identical to ``static``; ``compact`` submits only each request's
+window and needs a profiled :class:`~.dspark_planner.SpsCostTable` -- with a
+flat cost model the budget degenerates to verify-all.
 """
 
 import os
@@ -71,9 +37,8 @@ __all__ = [
     "DSparkRaggedStats",
 ]
 
-#: Overrides ``DSparkDecodingConfig`` so a mode can be selected without editing
-#: a test or a serving config. Reading it per call (rather than caching at
-#: import) is deliberate: tests flip it with ``monkeypatch.setenv``.
+#: Overrides ``DSparkDecodingConfig``. Read per call, not cached at import:
+#: tests flip it with ``monkeypatch.setenv``.
 RAGGED_VERIFY_MODE_ENV = "TLLM_DSPARK_RAGGED_VERIFY_MODE"
 
 
@@ -86,12 +51,9 @@ class RaggedVerifyMode(str, Enum):
 
     @property
     def computes_windows(self) -> bool:
-        """Whether per-request windows are computed at all.
-
-        ``cap-accept`` computes them and commits against them without trimming
-        the submitted batch, so it shares every host-side code path with
-        ``compact`` except the one that shrinks the token axis.
-        """
+        """Whether per-request windows are computed at all (``cap-accept``
+        shares every host-side path with ``compact`` except the token-axis
+        trim)."""
         return self is not RaggedVerifyMode.STATIC
 
     @property
@@ -106,10 +68,8 @@ def read_ragged_verify_mode(
     """Resolve the verification mode from the environment.
 
     Raises:
-        ValueError: if the variable is set to something that is not a mode.
-            Silently falling back to ``static`` on a typo would turn "I asked
-            for compact" into "the feature never ran", which is the one
-            outcome this module exists to make impossible.
+        ValueError: on an unrecognized value; a silent fallback to ``static``
+            would turn a typo into "the feature never ran".
     """
     value = os.environ.get(RAGGED_VERIFY_MODE_ENV)
     if value is None or value == "":
@@ -125,15 +85,10 @@ def read_ragged_verify_mode(
 def resolve_ragged_verify_mode(spec_config) -> RaggedVerifyMode:
     """The mode a config plus the environment actually select.
 
-    The config flag alone is not the answer, and using it as one is a bug with
-    a long fuse: ``enable_ragged_verify`` is what ``cap-accept`` is configured
-    with too, but cap-accept submits the FULL block. Anything that shapes the
-    batch -- the CUDA-graph capture set, the graph key -- has to ask whether
-    the token axis actually shrinks (:attr:`RaggedVerifyMode.trims_submitted_tokens`),
-    not whether ragged was requested.
-
-    Resolved identically to the DSpark worker's own resolution, and separately
-    from it, because the capture set is built before any batch exists.
+    ``enable_ragged_verify`` alone is not the answer: ``cap-accept`` sets it
+    too but submits the FULL block, so batch-shaping code (capture set, graph
+    key) must ask :attr:`RaggedVerifyMode.trims_submitted_tokens`. Must stay
+    identical to the DSpark worker's own resolution.
     """
     configured = (RaggedVerifyMode.COMPACT if getattr(
         spec_config, "enable_ragged_verify", False) else RaggedVerifyMode.STATIC)
@@ -150,27 +105,21 @@ def trims_submitted_tokens(spec_config) -> bool:
 class DSparkRaggedStats:
     """Per-step counters for the ragged verification path.
 
-    Cheap enough to leave on: one integer histogram update per decode step, no
-    device work and no synchronization. Nothing here reads a device tensor --
-    every value recorded is already a host value by the time the scheduler has
-    made its decision.
+    Host-only and cheap enough to leave on: no device reads, no
+    synchronization.
     """
 
     def __init__(self, *, mode: RaggedVerifyMode, max_draft_len: int):
         self.mode = mode
         self.max_draft_len = int(max_draft_len)
-        #: The planner's own decision counters, attached by the worker once the
-        #: planner exists (goal doc A6). They answer a question these counters
-        #: cannot: *why* a step declined to trim. `fallback_flat_cost` in
-        #: particular means the run had no profiled SPS table, under which the
-        #: budget search is constructionally incapable of trimming -- so a run
-        #: can look entirely healthy here and still have delivered nothing.
+        #: Planner decision counters, attached by the worker once the planner
+        #: exists; the only record of WHY a step declined to trim
+        #: (`fallback_flat_cost` = no profiled SPS table, so no trimming).
         self.planner_stats: Optional[Dict[str, int]] = None
 
         self.steps_total = 0
-        #: Steps where per-request windows were produced AND differed from each
-        #: other. A step where every request got the same window is counted as
-        #: uniform: it exercises none of the ragged packing.
+        #: Steps where per-request windows were produced AND differed; a step
+        #: where every request got the same window counts as uniform.
         self.steps_ragged = 0
         #: Windows were produced, but every request got the same one.
         self.steps_uniform_windows = 0
@@ -187,13 +136,12 @@ class DSparkRaggedStats:
         self.verify_len_hist: Counter = Counter()
         self.bucket_hist: Counter = Counter()
         self.padded_bs_hist: Counter = Counter()
-        #: why the graph runner declined -> count. The reasons mean opposite
-        #: things: "peer_shape_mismatch" is one rank declining to go ragged and
-        #: dragging the world eager, "key_not_captured" is the bucket grid being
-        #: wrong, "peer_not_gen_only" is ordinary continuous batching.
-        #: Steps whose batch held at least two generation requests. The gate
-        #: counts these rather than all steps: trtllm-bench ramps concurrency,
-        #: so step 64 can still be a batch of two.
+        #: why the graph runner declined -> count. "peer_shape_mismatch" = one
+        #: rank declined ragged and dragged the world eager; "key_not_captured"
+        #: = wrong bucket grid; "peer_not_gen_only" = ordinary continuous
+        #: batching.
+        #: Steps whose batch held at least two generation requests; the gate's
+        #: floor counts these, not all steps (concurrency ramps up).
         self.steps_multi_request = 0
         self.graph_miss_reasons: Dict[str, int] = {}
         #: the actual graph key, kept only for the reasons where it localizes
@@ -201,41 +149,25 @@ class DSparkRaggedStats:
         self.graph_miss_shapes: Dict[str, int] = {}
 
         #: Acceptance, split by whether the request's window was shortened.
-        #: This is the term the trim/ceiling ratio needs and the one TRT-LLM
-        #: did not have: `ceiling_tokens` above counts tokens *submitted* with
-        #: no trim, which answers "how much compute did we save" and never
-        #: "how much acceptance did we destroy".
         self.accepted_tokens = 0
         self.requests_scored = 0
         #: Requests whose window was shorter than the full block.
         self.requests_trimmed = 0
-        #: Trimmed requests that accepted their ENTIRE window. Those are the
-        #: ones where the draft was still alive at the cut, so trimming
-        #: certainly cost acceptance -- a trimmed request that accepted fewer
-        #: than its window would have died on its own and cost nothing. This is
-        #: an exact, unbiased count, which is why it is preferred here over
-        #: estimating the uncapped acceptance length: no model, no extrapolation
-        #: from the untrimmed subpopulation (which the planner selected, so it
-        #: is not a fair sample of the trimmed one).
+        #: Trimmed requests that accepted their ENTIRE window: the draft was
+        #: still alive at the cut, so the trim certainly cost acceptance (one
+        #: that accepted fewer would have died on its own and cost nothing).
         self.trimmed_hit_ceiling = 0
-        #: Positions the target accepted and the window then discarded --
-        #: the exact acceptance the schedule cost. Only ``cap-accept`` can
-        #: populate this, because only there are those positions scored at all;
-        #: it stays 0 under ``compact``, where the honest answer is that the
-        #: number is unknowable without re-running.
+        #: Positions the target accepted and the window then discarded. Only
+        #: ``cap-accept`` scores these; under ``compact`` 0 means "unknowable",
+        #: not "no loss".
         self.cap_trim_tokens = 0
-        #: The distribution, not just the total. "Every request gave up a
-        #: little" and "a few were cut to pieces" sum to the same
-        #: cap_trim_tokens and mean opposite things about the planner: the
-        #: first is a tuning knob, the second is the scheduler concentrating
-        #: its whole cost on a subpopulation it selected. A total cannot tell
-        #: them apart, which is the reason this is kept per request at all.
+        #: Kept per request because a broad mild trim and a concentrated one
+        #: sum to the same total and mean opposite things about the planner.
         self.requests_cap_trimmed = 0
         self.cap_trim_max = 0
         self.cap_trim_hist: Counter = Counter()
 
-        #: Graph replay is the whole point of landing on a bucket; an eager
-        #: step costs far more than the tokens it saved.
+        #: An eager step costs far more than the tokens the trim saved.
         self.graph_replays = 0
         self.graph_eager = 0
 
@@ -265,35 +197,20 @@ class DSparkRaggedStats:
             delivered: tokens actually handed to the target, when that is not
                 derivable from ``verify_lens`` and ``bucket``. Required by
                 ``cap-accept``, which schedules windows but submits the full
-                block: deriving it there would report the windows as if they
-                had been submitted, i.e. credit the mode with a compute saving
-                it deliberately does not take, and ``trim_ratio`` would then
-                describe a run that never happened.
+                block.
         """
         self.steps_total += 1
-        # Steps where raggedness is even definable. A window can only differ
-        # *between* requests, so a batch of one is uniform by construction --
-        # counting it toward the gate's floor makes the gate fire during ramp-up
-        # and blame the scheduler for a batch that had not filled yet.
+        # A batch of one is uniform by construction; counting it toward the
+        # gate's floor would make the gate fire during ramp-up.
         if int(num_gen_requests) >= 2:
             self.steps_multi_request += 1
-        # What a no-trim step would have submitted: every row sends its bonus
-        # token plus the full block.
-        #
-        # ROWS, not requests. When the step ran on a fitted bucket, `delivered`
-        # below books `bucket = padded_bs * (tier + 1)`, and `padded_bs` is the
-        # CUDA-graph-rounded maximum row count ACROSS RANKS -- so a rank holding
-        # fewer requests than its widest peer still submits the peer's rows.
-        # Booking those rows as delivered against a ceiling counted over this
-        # rank's real requests made trim_ratio negative in four separate runs
-        # (jobs 2560992 -0.001, 2561519 -0.0438, 2563581 -0.0082), and the
-        # assert_ragged_active gate then reported "nothing was saved", which is
-        # the opposite of what a negative ratio means.
-        #
-        # Only that one case rebases. Every other path books `delivered` over
-        # the real rows -- the no-window path and the cap-accept path each add
-        # exactly n*(1+K), and the bucket-less ragged path adds sum(1+v) <=
-        # n*(1+K) -- so widening their ceiling would understate the trim.
+        # Ceiling = what a no-trim step would have submitted: each ROW sends
+        # its bonus token plus the full block. ROWS, not requests: on a fitted
+        # bucket `delivered` books `padded_bs * (tier + 1)` where `padded_bs`
+        # is the CUDA-graph-rounded max row count ACROSS RANKS, so the ceiling
+        # must count the same rows or trim_ratio goes negative. Only that case
+        # rebases; every other path books `delivered` over the real rows, and
+        # widening their ceiling would understate the trim.
         ceiling_rows = int(num_gen_requests)
         if bucket and delivered is None and padded_bs:
             ceiling_rows = max(ceiling_rows, int(padded_bs))
@@ -336,17 +253,9 @@ class DSparkRaggedStats:
         """Record whether this step replayed a CUDA graph or ran eager.
 
         ``shape`` is the ``(num_rows, total_verify_tokens)`` the step actually
-        submitted, or None on a replay. It is kept only for misses, and only
-        the distinct ones: a miss means some shape was not captured, and
-        knowing *which* is the whole diagnosis. Counting misses without
-        recording the shape leaves only guessing or re-running with a profiler.
-
-        Required rather than defaulted, deliberately. A run reported
-        ``graph_eager: 9`` alongside an empty ``graph_miss_shapes`` because the
-        caller was loaded from a build that predated this argument -- with a
-        default that reads as "no misses had shapes", which is indistinguishable
-        from "the probe works and found nothing". Without a default it is a
-        TypeError instead.
+        submitted, or None on a replay; kept only for misses. Deliberately
+        required, not defaulted: a default would make "probe not wired"
+        indistinguishable from "no misses had shapes".
         """
         if replayed:
             self.graph_replays += 1
@@ -423,11 +332,9 @@ class DSparkRaggedStats:
     def accept_loss_per_request(self) -> float:
         """Mean accepted positions the schedule discarded, per request.
 
-        The exact counterpart to :attr:`accept_len`: add the two and you get
-        the acceptance a no-trim run would have achieved on the same drafts.
-        Meaningful only under ``cap-accept``; 0.0 elsewhere, where it means
-        "not measured", not "no loss" -- ``trim_regret_rate`` is the bound
-        available under ``compact``.
+        :attr:`accept_len` plus this is the no-trim acceptance on the same
+        drafts. Meaningful only under ``cap-accept``; elsewhere 0.0 means "not
+        measured", not "no loss".
         """
         if not self.requests_scored:
             return 0.0
@@ -437,10 +344,8 @@ class DSparkRaggedStats:
     def cap_trim_concentration(self) -> float:
         """Share of scored requests that lost anything at all. ``cap-accept``.
 
-        Read it together with :attr:`accept_loss_per_request`. The same mean
-        loss at 0.9 concentration is a broad, mild trim; at 0.02 it is the
-        scheduler paying for its throughput out of two percent of the traffic.
-        Only the second is a problem, and the mean alone cannot see it.
+        Distinguishes a broad mild trim from the same mean loss concentrated
+        on a few requests; only the second is a problem.
         """
         if not self.requests_scored:
             return 0.0
@@ -450,11 +355,8 @@ class DSparkRaggedStats:
     def trim_regret_rate(self) -> float:
         """Share of trimmed requests whose draft was still alive at the cut.
 
-        The operational reading: 0.0 means every trim was free -- those drafts
-        would have died anyway -- and the scheduler is taking compute back for
-        nothing. Climbing toward 1.0 means trimming is buying its throughput by
-        throwing away acceptance, which is the regression a delivered-only
-        acceptance metric cannot distinguish from a harder workload.
+        0.0 means every trim was free (those drafts would have died anyway);
+        toward 1.0 the trims are buying throughput with acceptance.
         """
         if not self.requests_trimmed:
             return 0.0
@@ -502,19 +404,16 @@ class DSparkRaggedStats:
     def assert_ragged_active(self, *, require_trim: bool = True) -> None:
         """Fail loudly if the ragged path never actually ran.
 
-        This is the check that makes an accuracy run meaningful. Passing GSM8K
-        with ``compact`` selected proves nothing on its own -- the scheduler
-        may have declined on every step and the run may have been a plain
-        uniform baseline wearing a different config.
+        An accuracy pass alone proves nothing: the scheduler may have declined
+        every step.
 
         Args:
-            require_trim: also require that the delivered token count came in
-                under the no-trim ceiling. Leave it on unless deliberately
-                measuring a workload where every draft survives.
+            require_trim: also require that delivered tokens came in under the
+                no-trim ceiling. Leave on unless deliberately measuring a
+                workload where every draft survives.
 
         Raises:
-            AssertionError: with the full counter summary, so the reason is in
-                the failure rather than in a log the CI dropped.
+            AssertionError: with the full counter summary.
         """
         summary = self.summary()
         if self.steps_total == 0:
@@ -531,12 +430,9 @@ class DSparkRaggedStats:
             raise AssertionError(
                 f"DSpark ragged verify handed out only one distinct window "
                 f"size, so the batch was uniform in all but name: {summary}")
-        # The two counter families have to move together. A run once reported
-        # per-step scheduling activity here beside an all-zero planner block,
-        # because `decisions` was never incremented -- which made the fallback
-        # counters unreadable, and those are the only thing that says WHY a
-        # step declined to trim. Zero decisions against non-zero windowed steps
-        # means the planner's stats are not wired to this object at all.
+        # Zero planner decisions against non-zero windowed steps means the
+        # planner's stats are not wired to this object -- and its fallback
+        # counters are the only record of WHY a step declined to trim.
         if self.planner_stats is not None:
             decisions = int(self.planner_stats.get("decisions", 0))
             windowed = self.steps_ragged + self.steps_uniform_windows
@@ -546,26 +442,19 @@ class DSparkRaggedStats:
                     f"but the planner recorded 0 decisions, so its fallback "
                     f"counters cannot be read -- and they are the only record "
                     f"of why a step declined to trim: {summary}")
-        # `cap-accept` submits the full block on purpose -- it measures the
-        # commitment policy, not a compute saving -- so a zero trim ratio is
-        # the expected outcome there, not a silent no-op. Requiring one would
-        # make the gate unsatisfiable in the one mode whose entire job is to be
-        # the trusted reference the other modes are compared against.
+        # `cap-accept` submits the full block on purpose, so a zero trim ratio
+        # is expected there, not a silent no-op.
         if (require_trim and self.mode.trims_submitted_tokens
                 and self.trim_ratio <= 0.0):
             raise AssertionError(
                 f"DSpark ragged verify delivered as many tokens as a no-trim "
                 f"run, so nothing was saved: {summary}")
-        # Only the misses ragged is responsible for. A batch some rank filled
-        # with context requests falls out of replay on the uniform path too --
-        # the uniform GSM8K run sat at ~1.7% eager for exactly that reason --
-        # so failing on it makes this check unsatisfiable on any workload with
-        # continuous batching, which is all of them. The three below are
-        # different: "key_not_captured" and "bs_not_supported" mean the batch
-        # was graphable, every rank agreed, and the shape was still missing --
-        # i.e. the token bucket grid is wrong. "peer_shape_mismatch" means one
-        # rank chose a different ragged bucket and dragged the whole world
-        # eager, which is the attention-DP divergence this feature has to avoid.
+        # Fail only on misses ragged is responsible for: context-filled batches
+        # fall out of replay on the uniform path too, and blaming those would
+        # make the check unsatisfiable under continuous batching.
+        # "key_not_captured"/"bs_not_supported" mean the batch was graphable
+        # and the bucket grid is wrong; "peer_shape_mismatch" means one rank
+        # chose a different ragged bucket and dragged the whole world eager.
         blamed = {"key_not_captured", "bs_not_supported", "peer_shape_mismatch"}
         attributable = {
             reason: n

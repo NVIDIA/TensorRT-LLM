@@ -15,23 +15,13 @@
 #
 # The DSpark Markov/RNN/confidence-head math is ported from DeepSeek's DeepSpec
 # reference implementation (https://github.com/deepseek-ai/DeepSpec, MIT License).
-"""DSpark draft-network heads (pure-torch, framework-agnostic).
+"""DSpark draft-network heads (pure-torch so they unit-test against DeepSpec).
 
-These modules implement the *sequential refinement* and *acceptance-confidence*
-parts of DeepSeek's DSpark speculative-decoding draft network:
-
-  - Markov head: a low-rank token-bigram logit bias ``logits_k += W2(W1[t_{k-1}])``
-    applied autoregressively across the ``block_size`` draft positions (the cheap
-    "sequential" half of DSpark's "semi-parallel" drafting). RNN variant carries
-    a GRU-style recurrent state across positions.
-  - Confidence head: predicts a per-position *conditional* acceptance probability
-    (``P(accept_k | accept_1..k-1)``); the cumulative product over positions is the
-    prefix-survival probability the verification scheduler budgets against. It only
-    decides *how many* tokens are verified, never *whether* one is accepted, so
-    scheduling stays lossless. See ``_torch/speculative/dspark_schedule.py``.
-
-This file deliberately depends on ``torch`` only so it can be unit-tested in
-isolation (token-for-token) against the DeepSpec reference.
+Markov/RNN heads apply an autoregressive per-position logit bias across the
+draft block. The confidence head predicts per-position *conditional* acceptance
+probabilities (``P(accept_k | accept_1..k-1)``) whose cumulative product the
+verification scheduler budgets against; it decides *how many* tokens are
+verified, never *whether* one is accepted, so scheduling stays lossless.
 """
 
 from typing import Optional
@@ -215,16 +205,9 @@ def build_markov_head(
 class DSparkConfidenceHead(nn.Module):
     """Per-position acceptance-confidence predictor (DeepSpec AcceptRatePredictor).
 
-    Input features are the backbone hidden state, optionally concatenated with the
-    Markov head's previous-token embedding. Output is a single *raw logit* per
-    position; callers turn it into a probability with :meth:`apply_sts`, which
-    folds in the sequential-temperature-scaling (STS) calibration.
-
-    Calibration matters here because the scheduler consumes the *cumulative
-    product* of per-position probabilities: a per-position bias is amplified
-    geometrically along the block, so an uncalibrated head systematically
-    over-estimates prefix survival. ``sts_temperatures`` defaults to all-ones,
-    which makes :meth:`apply_sts` a plain sigmoid (identity calibration).
+    Emits one raw logit per position; :meth:`apply_sts` turns it into a
+    probability, folding in the sequential-temperature-scaling (STS)
+    calibration (``sts_temperatures`` defaults to all-ones: plain sigmoid).
     """
 
     def __init__(
@@ -239,16 +222,11 @@ class DSparkConfidenceHead(nn.Module):
         super().__init__()
         self.with_markov = bool(with_markov)
         input_dim = int(hidden_size) + (int(markov_rank) if with_markov else 0)
-        # The checkpoint stores ``proj`` as a bias-free bf16 weight, but the
-        # confidence score is computed in fp32 (mirrors the DeepSpec reference
-        # ``Linear(input_dim, 1, dtype=torch.float32)`` with the fp32 matmul).
+        # Checkpoint weight is bf16, but the score matmul is fp32 (DeepSpec parity).
         self.proj = nn.Linear(input_dim, 1, bias=bool(bias), dtype=torch.float32)
-        # Per-position temperatures, broadcast against ``[batch, block]``. Shape
-        # ``(block_size,)`` when known, else ``(1,)``; both broadcast correctly.
-        # ``persistent=False`` keeps it out of ``state_dict`` so it never
-        # participates in checkpoint loading. It is sized at construction and
-        # only ever updated in place, so a captured CUDA graph keeps seeing the
-        # same storage (rebinding the attribute would be invisible to the graph).
+        # Per-position temperatures, broadcast against ``[batch, block]``.
+        # Update in place only: a captured CUDA graph holds this storage;
+        # rebinding the attribute would be invisible to the graph.
         self.register_buffer(
             "sts_temperatures",
             torch.ones(max(int(block_size), 1), dtype=torch.float32),
@@ -273,20 +251,10 @@ class DSparkConfidenceHead(nn.Module):
     def apply_sts(self, confidence_logits: torch.Tensor) -> torch.Tensor:
         """Raw logits -> calibrated per-position acceptance probabilities in [0, 1].
 
-        Works on host tensors too. The verification planner stages confidence to
-        pinned CPU memory and calibrates there, so it calls this with CPU logits
-        while the head (and therefore ``sts_temperatures``) lives on the device;
-        without the transfer that is a device-mismatch ``RuntimeError`` on the
-        first step that reaches calibration. The branch is host-side and the
-        devices match on the in-graph path, so nothing extra is captured.
-
-        The host copy is cached rather than re-fetched. Transferring the table
-        per call is a device->host copy into pageable memory, which serializes
-        the stream, and it lands on the planner's path once per decode step --
-        and only once a profiled cost table exists, i.e. exactly in the
-        configuration where the feature is supposed to pay for itself. The table
-        is written only through :meth:`load_sts_temperatures`, which refreshes
-        this cache, so it cannot go stale.
+        Must accept CPU logits: the verification planner calibrates on pinned
+        host memory while the head lives on the device. The device-mismatch
+        branch is host-side and devices match on the in-graph path, so nothing
+        extra is captured.
         """
         temperatures = self.sts_temperatures
         if temperatures.device != confidence_logits.device:
@@ -320,13 +288,8 @@ class DSparkConfidenceHead(nn.Module):
         self._sts_temperatures_host = None
 
     def load_weights(self, weights: list) -> None:
-        """Strict loader that refuses to silently drop a checkpoint bias.
-
-        The generic DeepseekV4 loader copies by iterating ``named_parameters()``,
-        so a ``proj.bias`` present in the checkpoint but absent from the module
-        would be dropped without any error -- shifting every confidence score.
-        Fail loudly instead.
-        """
+        """Strict loader: fail loudly on checkpoint keys the module lacks (a
+        silently dropped ``proj.bias`` would shift every confidence score)."""
         (module_weights,) = weights
         expected = dict(self.named_parameters())
         unexpected = [k for k in module_weights if k not in expected]

@@ -12,54 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ragged verification layout: per-request verify lengths in one packed batch.
+"""Ragged verification layout: per-request verify lengths in one packed batch,
+as a flat token axis plus a ``qo_indptr`` exclusive prefix sum.
 
-Uniform-K scheduling picks one verify length for the whole batch. That leaves
-real budget on the table, because requests differ a lot in how deep their draft
-survives: giving a request with survival ``0.55, 0.22, 0.07`` the same window as
-one sitting at ``0.98, 0.95, 0.91`` wastes verification on the first and starves
-the second. Ragged verification gives each request its own length.
-
-The packing follows the shape every variable-length attention path already uses:
-a flat token axis plus an index pointer.
-
-    verify_lens      [bs]      per-request number of verified positions
-    qo_indptr        [bs + 1]  exclusive prefix sum; request r owns
-                               [qo_indptr[r], qo_indptr[r + 1])
-    extend_start_loc [bs]      == qo_indptr[:-1], the offset form some
-                               attention backends want directly
-
-Two invariants make the rest of the system safe:
-
-* ``verify_lens >= 1`` for every request. Position 0 carries the bonus/anchor
-  token; a request that verifies nothing makes no progress at all and would
-  stall forever.
-* ``sum(verify_lens) == graph_num_tokens`` after :meth:`fill_bucket`. The batch
-  is padded up to a captured CUDA-graph token bucket, so the packed shape is one
-  of a small fixed set even though the per-request split is arbitrary. That is
-  what lets a graph capture a ragged batch: the *shape* is constant, the
-  raggedness lives in the *contents* of ``verify_lens`` / ``qo_indptr``.
-
-Why the token count has to land exactly on the bucket
------------------------------------------------------
-``seq_lens.sum()`` becomes ``attn_metadata.num_tokens``, which is what gets
-all-gathered across attention-DP ranks and drives the MoE's chunk count. If the
-packed token count under-reports the rows actually in the batch, attention and
-the MoE disagree about how many tokens are in flight -- and nothing raises.
-
-Reclaiming the bucket padding
------------------------------
-Rounding up to a bucket would normally waste the difference. :meth:`fill_bucket`
-spends it in two stages: real requests first (up to ``max_verify_len``, so those
-tokens verify real draft positions the step is already paying for), then pad rows
-added to reach the captured batch size. Same idea as SGLang's
-``align_verify_tokens_to_graph_tier``.
-
-The real requests cannot always absorb everything -- a request verifies at most
-``max_verify_len`` positions, so the batch's capacity is
-``padded_bs * max_verify_len``. When the bucket exceeds what the real requests
-can take, the remainder must go to pad rows; when it exceeds even the padded
-capacity, :meth:`fill_bucket` raises rather than returning a short batch.
+Two invariants keep the pipeline safe: ``verify_lens >= 1`` for every request
+(position 0 carries the bonus/anchor token; a request that verifies nothing
+never progresses), and ``sum(verify_lens) == graph_num_tokens`` after
+:meth:`RaggedVerifyLayout.fill_bucket` -- ``seq_lens.sum()`` becomes
+``attn_metadata.num_tokens``, which is all-gathered across attention-DP ranks
+and drives the MoE's chunk count, and an under-filled bucket desynchronizes
+them without raising.
 """
 
 import bisect
@@ -85,10 +47,8 @@ __all__ = [
 def round_up_to_bucket(total: int, buckets: Sequence[int]) -> int:
     """Smallest captured bucket that fits ``total``.
 
-    Raises rather than clamping: a batch that exceeds the largest captured
-    bucket has no graph, and silently running it eager costs far more than the
-    trimming saves. Callers must reject such a batch *before* selecting a
-    layout (see :func:`exceeds_captured_buckets`).
+    Raises rather than clamping; callers must reject an oversized batch before
+    selecting a layout (see :func:`exceeds_captured_buckets`).
     """
     if not buckets:
         raise ValueError("round_up_to_bucket requires a non-empty bucket list")
@@ -159,10 +119,9 @@ class RaggedVerifyLayout:
     ) -> "RaggedVerifyLayout":
         """Pack ``[bs]`` per-request lengths, rounding up to a captured bucket.
 
-        ``graph_num_tokens`` may be given directly (the usual path -- the caller
-        already knows the bucket because it also had to pick the graph), or
-        derived from ``buckets`` plus a host-side ``total_verify_tokens``.
-        Deriving it from the device tensor would need a sync.
+        Give ``graph_num_tokens`` directly, or ``buckets`` plus a host-side
+        ``total_verify_tokens``; deriving the total from the device tensor
+        would sync.
         """
         lens = verify_lens.to(torch.int32)
         if graph_num_tokens is None:
@@ -186,28 +145,12 @@ class RaggedVerifyLayout:
     def fill_bucket(
         self, *, max_verify_len: int, padded_bs: Optional[int] = None
     ) -> "RaggedVerifyLayout":
-        """Pad the batch to the captured shape, spending the slack on real work.
-
-        Two things have to line up before the batch can run:
-
-        * the row count must equal the captured batch size (``padded_bs``), and
-        * the token count must equal the captured bucket
-          (``graph_num_tokens``) -- because ``seq_lens.sum()`` becomes
-          ``attn_metadata.num_tokens``, which is what gets all-gathered and
-          drives the MoE's chunk count. If it under-reports, attention and MoE
-          disagree about how many tokens are in flight.
-
-        So the slack is distributed in two stages:
-
-        1. **Real requests first**, up to ``max_verify_len``. The step is
-           already paying for the bucket, so these tokens verify real draft
-           positions instead of nothing.
-        2. **Pad rows** take whatever is left. They exist only to reach
-           ``padded_bs``; every pad row needs at least one token because an
-           empty range breaks ``qo_indptr``'s per-row slicing.
-
-        Raises when the bucket cannot be hit exactly -- silently returning a
-        short batch is what would desynchronize attention from the MoE.
+        """Pad rows to ``padded_bs`` and tokens to exactly ``graph_num_tokens``
+        (a short batch desynchronizes attention from the MoE; see the module
+        docstring). Slack goes to real requests first (up to ``max_verify_len``),
+        then to pad rows; every pad row needs at least one token or its empty
+        ``qo_indptr`` range breaks per-row slicing. Raises when the bucket
+        cannot be hit exactly.
         """
         if self.total_verify_tokens is None:
             raise ValueError("fill_bucket needs the host-side total_verify_tokens")
@@ -238,11 +181,8 @@ class RaggedVerifyLayout:
 
         lens = real + [1] * n_pad
         spare = self.graph_num_tokens - baseline
-        # Round-robin over real rows first -- spreading keeps the extra
-        # verification where survival is still plausible for several requests
-        # instead of pushing one request deep into its low-survival tail. Only
-        # once every real row is saturated does the remainder go to pad rows,
-        # where it is genuinely wasted.
+        # Round-robin: spread extra tokens across real rows (not one request's
+        # low-survival tail), then spill to pad rows.
         for lo, hi in ((0, n_real), (n_real, padded_bs)):
             i = lo
             while spare > 0 and any(lens[j] < max_verify_len for j in range(lo, hi)):
@@ -268,15 +208,12 @@ class RaggedVerifyLayout:
         max_verify_len: Optional[int] = None,
         exact_fill: bool = False,
     ) -> None:
-        """Assert the invariants the rest of the pipeline relies on.
+        """Assert the layout invariants (host-syncing: tests/debug only, never
+        the hot path).
 
         ``exact_fill`` additionally requires the token count to hit the bucket
-        exactly -- the post-:meth:`fill_bucket` contract. Check it on anything
-        heading for a captured graph: a short batch does not raise anywhere
-        downstream, it just makes ``seq_lens.sum()`` disagree with the row count
-        the graph was captured for.
-
-        Host-syncing, so this is for tests and debug builds -- not the hot path.
+        exactly -- the post-:meth:`fill_bucket` contract for anything heading
+        into a captured graph; a short batch raises nowhere downstream.
         """
         lens = [int(v) for v in self.verify_lens.tolist()]
         if not lens:
@@ -358,40 +295,24 @@ def choose_ragged_capture_shape(
 ) -> RaggedCaptureShape:
     """Pick the captured ``(padded_bs, bucket)`` for a ragged batch.
 
-    Uniform speculation needs one number -- the batch size -- because the token
-    count follows from it (``bs * (K + 1)``). Ragged verification breaks that
-    link: two batches with the same row count can hold very different token
-    totals, so the captured shape is genuinely two-dimensional and both axes
-    have to be agreed on before the graph is looked up.
-
     Under attention DP every rank must land on the *same* shape or the ranks
-    replay different graphs and their collectives diverge. Ranks do not have
-    equal batches, so agreement cannot come from each rank rounding its own
-    numbers; it comes from rounding a reduction. Pass every rank's
+    replay different graphs and their collectives diverge, so agreement comes
+    from rounding a reduction: pass every rank's
     ``(num_real_requests, total_verify_tokens)`` as ``peer_stats`` (including
-    this rank's own) and each rank computes an identical answer:
+    this rank's own) and each rank computes an identical
 
         padded_bs = round_up_bs(max_r  num_real_r)
-        bucket    = round_up_bucket(padded_bs + max_r  slack_r)
+        bucket    = round_up_bucket(padded_bs + max_r  (total_r - num_real_r))
 
     where ``slack_r = total_r - num_real_r`` is the drafted-position count on
-    rank ``r``. The ``padded_bs +`` term is the floor every row contributes
-    (each request verifies at least its bonus position), so the bucket is large
-    enough for the widest rank's drafts on top of the widest rank's rows.
-
-    Raises when no captured bucket fits, rather than clamping: a batch with no
-    graph runs eager, which costs far more than the trimming saves, so the
-    caller has to see it and shrink the batch instead.
+    rank ``r`` and the ``padded_bs +`` term is the one-token-per-row floor.
+    Raises when no captured bucket fits; the caller must shrink the batch.
 
     With ``max_verify_len`` given, the answer is additionally required to be
     DECOMPOSABLE BY EVERY RANK (see ``_bucket_decomposable``): the smallest
-    such bucket is chosen, walking past candidates any rank cannot realise.
-    This makes accept/decline a pure function of the allgathered payload --
-    all ranks pick the same bucket or all raise together -- where previously
-    the per-rank decomposition check ran locally and a skewed rank declined
-    alone, splitting the group's graph keys. The cost is at most one bucket
-    step of extra verification on the steps that used to diverge, spent on
-    real tokens by ``fill_bucket``.
+    such bucket is chosen, walking past candidates any rank cannot realise,
+    so accept/decline is a pure function of the allgathered payload -- all
+    ranks pick the same bucket or all raise together.
     """
     if not bs_buckets:
         raise ValueError("choose_ragged_capture_shape requires bs_buckets")
@@ -403,9 +324,7 @@ def choose_ragged_capture_shape(
         )
 
     stats = list(peer_stats) if peer_stats else [(num_real_requests, total_verify_tokens)]
-    # Tolerate extra trailing fields: the caller's payload has grown before
-    # (the group's graph-capability answer rides along with the row and token
-    # counts) and only the first two are this function's business.
+    # Peer entries may carry extra trailing fields; only the first two are read.
     max_real = max(int(peer[0]) for peer in stats)
     max_slack = max(int(peer[1]) - int(peer[0]) for peer in stats)
 
@@ -445,11 +364,9 @@ def ragged_gather_index_lists(
     """Row/column index lists for gathering a ragged block from a
     ``[num_slots, max_width]`` tensor.
 
-    ``slots[i]`` contributes ``counts[i]`` entries taken from columns
-    ``0..counts[i]-1``, concatenated in batch order. This is the ragged
-    replacement for the ``tensor[slots, :width]`` strided gather the overlap
-    scheduler uses when every request verifies the same number of positions;
-    with a constant ``counts`` the two produce the identical flat sequence.
+    ``slots[i]`` contributes ``counts[i]`` entries from columns
+    ``0..counts[i]-1``, concatenated in batch order; with a constant ``counts``
+    this matches the uniform ``tensor[slots, :width]`` gather.
     """
     if len(slots) != len(counts):
         raise ValueError(
@@ -468,16 +385,9 @@ def ragged_gather_index_lists(
 def row_ids_from_lens(verify_lens: torch.Tensor, *, total: int) -> torch.Tensor:
     """``[bs]`` lengths -> ``[total]`` owning-request id for each packed token.
 
-    ``repeat_interleave`` with a *tensor* of repeats is what makes the packing
-    ragged; the uniform paths use a scalar repeat and get a fixed stride.
-
-    ``total`` (``sum(verify_lens)``) is mandatory rather than derived. With a
-    device-resident ``repeats`` and no ``output_size``, torch reads the
-    cumulative sum back to the host to size its output -- a sync that is
-    outright *illegal* here, because DSpark is a one-engine drafter whose
-    acceptance runs inside the target's captured CUDA graph. The callers all
-    know the total on the host already (``spec_metadata.total_verify_tokens``,
-    or the packed buffer's own leading dimension).
+    ``total`` (``sum(verify_lens)``) is mandatory: without ``output_size``,
+    ``repeat_interleave`` with device-resident repeats syncs to size its
+    output, which is illegal inside the captured graph.
     """
     return torch.repeat_interleave(
         torch.arange(verify_lens.numel(), device=verify_lens.device),
@@ -496,15 +406,9 @@ def scatter_ragged_to_padded(
 ) -> torch.Tensor:
     """Unpack a flat ragged batch into ``[bs, max_len, ...]`` with padding.
 
-    The verify path is packed (one flat token axis) because that is what the
-    attention kernels want, but the acceptance logic is naturally rectangular
-    (compare draft vs target position by position). This bridges the two
-    without a host sync: token ``t`` belongs to request ``row_ids[t]`` at column
-    ``t - qo_indptr[row_ids[t]]``.
-
-    ``flat.shape[0]`` is the packed token total, so it is exactly the
-    ``output_size`` :func:`row_ids_from_lens` needs to stay sync-free (and
-    therefore capturable).
+    Sync-free (capturable): token ``t`` goes to request ``row_ids[t]`` at
+    column ``t - qo_indptr[row_ids[t]]``, and ``flat.shape[0]`` supplies the
+    ``output_size`` :func:`row_ids_from_lens` needs.
     """
     bs = int(verify_lens.numel())
     rows = row_ids_from_lens(verify_lens, total=flat.shape[0])
@@ -521,14 +425,10 @@ def fill_padded_rows_onehot(
 ) -> torch.Tensor:
     """Make ``[bs, max_len, vocab]`` padding rows a valid one-hot distribution.
 
-    Scattering a ragged batch into a rectangle leaves all-zero probability rows
-    past each request's window. Those rows are never read -- the accepted count
-    is clamped to the window -- but a rejection-sampling kernel still walks them
-    when every real position was accepted, and sampling from an all-zero
-    distribution can index out of bounds. Putting all the mass on token 0 keeps
-    the kernel well-defined without affecting any position that is read.
-
-    Modifies ``probs`` in place and returns it.
+    Padding rows are never read, but a rejection-sampling kernel still walks
+    them and sampling an all-zero row can index out of bounds; all mass goes
+    to token 0, which affects no position that is read. Modifies ``probs`` in
+    place and returns it.
     """
     positions = torch.arange(probs.shape[1], device=probs.device)
     invalid = positions.unsqueeze(0) >= verify_lens.to(positions.dtype).unsqueeze(1)
@@ -544,18 +444,14 @@ def count_accepted_ragged(
 ) -> torch.Tensor:
     """Accepted draft-token count per request, honouring per-request windows.
 
+    Positions at or beyond a request's ``verify_len`` hold stale padding and
+    must be masked to "no match" before the cumulative product, or a stale
+    slot can credit an acceptance the target never made.
+
     Args:
         draft_tokens: ``[bs, max_len]`` padded drafted tokens.
-        target_tokens: ``[bs, max_len]`` padded target tokens at the same
-            positions.
-        verify_lens: ``[bs]`` how many positions each request actually verified.
-
-    Positions at or beyond a request's ``verify_len`` were never sent to the
-    target, so whatever sits there is stale padding. Masking them to "no match"
-    before the cumulative product makes the run of matches stop at the window
-    edge -- without the mask a stale slot could compare equal and credit an
-    acceptance the target never made, which is a silent correctness bug rather
-    than a throughput one.
+        target_tokens: ``[bs, max_len]`` padded target tokens.
+        verify_lens: ``[bs]`` positions actually verified per request.
     """
     if draft_tokens.shape != target_tokens.shape:
         raise ValueError(

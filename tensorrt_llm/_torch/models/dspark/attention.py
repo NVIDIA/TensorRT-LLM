@@ -15,20 +15,13 @@
 #
 # The DSpark captured-context attention primitives are ported from DeepSeek's
 # DeepSpec reference ``inference/kernel.py`` (``sparse_attn``) and
-# ``inference/model.py`` (``get_dspark_topk_idxs``). The reference computes these
-# with a TileLang kernel; this is a functional-first pure-PyTorch port with the
-# same math (index-gather + online softmax + a learnable attention sink that
-# contributes only to the softmax denominator).
+# ``inference/model.py`` (``get_dspark_topk_idxs``); pure-PyTorch, same math.
 """DSpark draft captured-context attention primitives (hardware-agnostic).
 
-The DSpark draft uses *dense* sliding-window MLA (``compress_ratio == 0``): the
-query comes from the block's draft tokens, while the keys/values are gathered
-from a small per-request set of positions (a sliding window of the projected
-captured context plus the current block's own positions). Two primitives capture
-the parts that differ from the standard MLA path:
-
-* :func:`get_dspark_topk_idxs` — the (window-context + block) position list.
-* :func:`dspark_sparse_attn` — index-gathered attention with an attention sink.
+Dense sliding-window MLA (``compress_ratio == 0``) for the draft block: queries
+come from the block's draft tokens; keys/values are gathered from a rolling
+window of projected captured context plus the block's own positions, with an
+attention-sink softmax.
 """
 
 from functools import lru_cache
@@ -54,11 +47,8 @@ def precompute_dspark_freqs_cis(
     rope_theta: float = 10000.0,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    """Plain (non-YaRN) RoPE complex exponentials for the DSpark draft.
-
-    The dense draft attention (``compress_ratio == 0``) disables YaRN and uses the
-    base ``rope_theta`` (DeepSpec ``precompute_freqs_cis`` with
-    ``original_seq_len == 0``).
+    """Plain (non-YaRN) RoPE table: the dense draft disables YaRN and uses the
+    base ``rope_theta``.
 
     Returns:
         complex64 tensor ``[seqlen, rope_head_dim // 2]``.
@@ -75,13 +65,11 @@ def precompute_dspark_freqs_cis(
 def apply_dspark_rotary(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
-    """Apply (or, with ``inverse``, de-apply) rotary embeddings, DeepSpec-style.
+    """Apply (or, with ``inverse``, de-apply) rotary embeddings.
 
-    Functional (non-in-place) port of DeepSpec ``apply_rotary_emb``: treats the
-    last dim as adjacent (re, im) pairs, rotates by ``freqs_cis`` indexed along the
-    sequence axis, and conjugates for the inverse (de-rotation applied to the
-    attention output). ``x`` is the rope-dim slice only: ``[b, s, rd]`` (3D) or
-    ``[b, s, h, rd]`` (4D), with ``freqs_cis`` of shape ``[s, rd // 2]``.
+    Last dim is adjacent (re, im) pairs; ``inverse`` conjugates. ``x`` is the
+    rope-dim slice only: ``[b, s, rd]`` or ``[b, s, h, rd]``, with ``freqs_cis``
+    of shape ``[s, rd // 2]``.
     """
     orig_dtype = x.dtype
     xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
@@ -98,13 +86,10 @@ def apply_dspark_rotary(
 def apply_dspark_rotary_batched(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
-    """Per-row (batched) variant of :func:`apply_dspark_rotary`.
-
-    Identical math, but ``freqs_cis`` carries a leading batch axis so each row of
-    ``x`` is rotated by its own per-request phases (the generation draft runs each
-    request at a different absolute ``start_pos``). ``x`` is the rope-dim slice
-    only: ``[G, s, rd]`` (3D) or ``[G, s, h, rd]`` (4D), with ``freqs_cis`` of shape
-    ``[G, s, rd // 2]``.
+    """Per-row variant of :func:`apply_dspark_rotary`: ``freqs_cis`` carries a
+    leading batch axis (one set of phases per request). ``x`` is the rope-dim
+    slice only: ``[G, s, rd]`` or ``[G, s, h, rd]``, with ``freqs_cis`` of
+    shape ``[G, s, rd // 2]``.
     """
     orig_dtype = x.dtype
     xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
@@ -138,19 +123,10 @@ def get_dspark_topk_idxs(
 ) -> torch.Tensor:
     """Per-query attended-position indices for the DSpark draft block.
 
-    Mirrors DeepSpec ``get_dspark_topk_idxs``: every one of the ``block_size``
-    query positions attends to the same set — the ``min(window_size, start_pos+1)``
-    most-recent context positions in the rolling KV window, then the
-    ``block_size`` positions of the current block (stored at offset
-    ``window_size`` in the concatenated KV). Note this is *non-causal* within the
-    block (every position sees every block position), matching the reference.
-
-    Args:
-        window_size: sliding-window length of the captured-context KV cache.
-        bsz: batch size.
-        block_size: number of draft positions per request.
-        start_pos: absolute decode position (must be > 0); bounds the context.
-        device: device for the returned index tensor.
+    Every query position attends to the same set: the
+    ``min(window_size, start_pos+1)`` most-recent context positions in the
+    rolling KV window, then the ``block_size`` block positions stored at offset
+    ``window_size``. *Non-causal* within the block, matching the reference.
 
     Returns:
         int32 tensor ``[bsz, block_size, topk]`` with
@@ -166,26 +142,13 @@ def get_dspark_topk_idxs_batched(
     block_size: int,
     start_pos: torch.Tensor,
 ) -> torch.Tensor:
-    """Sync-free, fixed-size (CUDA-graph-safe) batched ``get_dspark_topk_idxs``.
+    """Sync-free, fixed-shape (CUDA-graph-safe) batched ``get_dspark_topk_idxs``.
 
-    Unlike the scalar :func:`get_dspark_topk_idxs` (whose ``topk`` width
-    ``min(window_size, start_pos+1) + block_size`` depends on the host int
-    ``start_pos``), this always returns the **fixed** width ``window_size +
-    block_size`` and masks the unfilled context slots with ``-1``. The masked
-    slots are excluded by :func:`dspark_sparse_attn` exactly as if they were
-    absent, so the result is numerically identical to gathering only the
-    ``min(window_size, start_pos+1)`` valid context positions — but the shape no
-    longer depends on the data, which is what CUDA-graph capture requires.
-
-    Every query position attends to the same set: context window slots
-    ``0..window_size-1`` (slot ``c`` valid iff ``c <= start_pos[g]``, i.e. it has
-    been written) followed by the ``block_size`` block positions at offset
-    ``window_size`` (always valid).
-
-    Args:
-        window_size: sliding-window length of the captured-context KV cache.
-        block_size: number of draft positions per request.
-        start_pos: ``[G]`` int tensor of per-request absolute decode positions.
+    Always returns the fixed width ``window_size + block_size``, masking
+    unfilled context slots with ``-1`` (excluded by :func:`dspark_sparse_attn`),
+    so the result matches the scalar path while the shape stays data-independent
+    for graph capture. Context slot ``c`` is valid iff ``c <= start_pos[g]``;
+    ``start_pos`` is a ``[G]`` int tensor of absolute decode positions.
 
     Returns:
         int32 tensor ``[G, block_size, window_size + block_size]``.
@@ -193,8 +156,6 @@ def get_dspark_topk_idxs_batched(
     device = start_pos.device
     g = start_pos.shape[0]
     ctx_cols = torch.arange(window_size, device=device)  # [win]
-    # Context slot c holds a written key iff c <= start_pos (slots 0..start_pos
-    # filled; for start_pos >= window_size-1 the whole rolling window is filled).
     valid = ctx_cols.unsqueeze(0) <= start_pos.unsqueeze(1)  # [G, win]
     ctx_idx = torch.where(
         valid, ctx_cols.unsqueeze(0).expand(g, -1), torch.full_like(valid, -1, dtype=torch.long)
@@ -214,12 +175,10 @@ def dspark_sparse_attn(
 ) -> torch.Tensor:
     """Index-gathered multi-query attention with an attention sink.
 
-    Functional-first port of the DeepSpec ``sparse_attn`` TileLang kernel. For
-    each ``(batch, query, head)`` it gathers the ``topk`` KV rows named by
-    ``topk_idxs`` (an index of ``-1`` masks that slot), computes a scaled
-    dot-product softmax over them, and adds a per-head learnable *sink* logit that
-    participates only in the softmax denominator (i.e. an "attend-to-nothing"
-    option with a zero value vector). KV is shared across query heads (MQA).
+    Gathers the ``topk`` KV rows named by ``topk_idxs`` (``-1`` masks a slot),
+    softmaxes over them, and adds a per-head learnable *sink* logit that
+    participates only in the softmax denominator (an "attend-to-nothing" option
+    with a zero value vector). KV is shared across query heads (MQA).
 
     Args:
         q: ``[b, m, h, d]`` query (``m`` = block_size, ``h`` = heads).
@@ -309,21 +268,15 @@ def dspark_attention_forward(
 ) -> torch.Tensor:
     """Captured-context DSpark draft attention (generation path, ``start_pos > 0``).
 
-    Functional port of DeepSpec ``DSparkAttention.forward`` for the dense
-    (``compress_ratio == 0``) draft: low-rank Q (``wq_a`` -> ``q_norm`` -> ``wq_b``)
-    with a per-head RMS + RoPE, MQA K/V from ``wkv`` (shared across heads), keys
-    gathered from a rolling captured-context window (``kv_cache``, into which the
-    projected ``main_x`` context is written at ``start_pos % window_size``) plus the
-    block's own positions, attention-sink softmax, inverse-RoPE on the output, and a
-    grouped low-rank O projection (``wo_a`` einsum + ``wo_b``).
-
-    Weights are plain tensors for ``F.linear`` (the caller supplies the loaded /
-    dequantized projection weights); ``wo_a`` is the raw grouped weight matrix
-    ``[n_groups * o_lora_rank, n_heads * head_dim // n_groups]``. ``kv_cache`` is
-    ``[b, window_size, head_dim]`` and is updated functionally (cloned).
+    Port of DeepSpec ``DSparkAttention.forward`` for the dense
+    (``compress_ratio == 0``) draft. Weights are plain (already dequantized)
+    tensors for ``F.linear``; ``wo_a`` is the raw grouped weight
+    ``[n_groups * o_lora_rank, n_heads * head_dim // n_groups]``. ``kv_cache``
+    is ``[b, window_size, head_dim]``; the projected ``main_x`` context is
+    written at ``start_pos % window_size`` (into a clone unless ``persist``).
 
     Returns:
-        ``[b, block_size, dim]`` attention output (residual stream contribution).
+        ``[b, block_size, dim]`` attention output.
     """
     assert start_pos > 0, "DSpark draft attention runs at generation (start_pos > 0)"
     b, block, _ = x.shape
@@ -347,10 +300,8 @@ def dspark_attention_forward(
     kv = _rmsnorm(F.linear(x, wkv), kv_norm_w, eps)  # [b, block, head_dim]
     kv = _rope_last_dims(kv, rd, blk_freqs)
 
-    # Write the context K/V into the rolling window, then attend over
-    # [window context | block] with the sink. ``persist=True`` writes through
-    # to the caller's buffer (cross-step decode, worker-owned window); the
-    # default clones so single-shot callers (golden / unit tests) stay pure.
+    # persist=True writes through to the caller's window (cross-step decode);
+    # the default clones so single-shot callers stay pure.
     cache = kv_cache if persist else kv_cache.clone()
     cache[:, start_pos % window_size] = main_kv.squeeze(1)
     kv_full = torch.cat([cache, kv], dim=1)  # [b, window + block, head_dim]
@@ -391,35 +342,25 @@ def dspark_attention_forward_batched(
     freqs_cis: torch.Tensor,
     persist: bool = False,
 ) -> torch.Tensor:
-    """Batched, CUDA-graph-safe captured-context DSpark draft attention.
+    """Batched, CUDA-graph-safe :func:`dspark_attention_forward`.
 
-    Numerically identical, per request, to :func:`dspark_attention_forward`, but
-    free of host syncs and data-dependent shapes so it can be captured into a CUDA
-    graph (the one-engine drafter runs inside the target's graph). The differences
-    from the scalar path are purely mechanical:
-
-    * ``start_pos`` is a ``[G]`` int tensor (one absolute decode position per gen
-      request) instead of a python int; RoPE phases are *gathered* per request from
-      the fixed ``freqs_cis`` table rather than sliced.
-    * the rolling-window context K/V is written/read through the ``slots`` index
-      into a shared ``kv_cache`` (``persist=True`` writes through to the caller's
-      worker-owned buffer; otherwise a clone is used), instead of mutating a
-      per-request cache in place.
-    * the attended-position list has the fixed width ``window_size + block_size``
-      with ``-1`` masking (see :func:`get_dspark_topk_idxs_batched`).
+    Numerically identical per request to the scalar path, but free of host
+    syncs and data-dependent shapes so it can be captured into a CUDA graph
+    (the one-engine drafter runs inside the target's graph).
 
     Args:
         x: ``[G, block, dim]`` block layer input (per gen request).
         main_x: ``[G, 1, hidden]`` projected captured context.
         start_pos: ``[G]`` int tensor of absolute decode positions (> 0).
-        kv_cache: ``[N, window_size, head_dim]`` rolling captured-context windows
-            (``N`` rows indexed by ``slots``; ``N == G`` for single-shot callers).
+        kv_cache: ``[N, window_size, head_dim]`` rolling captured-context
+            windows, rows indexed by ``slots`` (``persist=True`` writes
+            through to the caller's buffer; otherwise a clone is used).
         slots: ``[G]`` int tensor mapping each request to its ``kv_cache`` row.
-        freqs_cis: ``[maxlen, rope_head_dim // 2]`` precomputed plain-RoPE table;
-            must satisfy ``maxlen > start_pos.max() + block_size``.
+        freqs_cis: ``[maxlen, rope_head_dim // 2]`` plain-RoPE table; must
+            satisfy ``maxlen > start_pos.max() + block_size``.
 
     Returns:
-        ``[G, block, dim]`` attention output (residual stream contribution).
+        ``[G, block, dim]`` attention output.
     """
     g, block, _ = x.shape
     rd = rope_head_dim
@@ -442,10 +383,8 @@ def dspark_attention_forward_batched(
     kv = _rmsnorm(F.linear(x, wkv), kv_norm_w, eps)  # [G, block, head_dim]
     kv = _rope_last_dims_batched(kv, rd, blk_freqs)
 
-    # Write the context K/V into the rolling window at slot start_pos%window_size,
-    # then attend over [window context | block]. ``persist=True`` writes through to
-    # the worker-owned buffer (cross-step decode); otherwise clone so single-shot
-    # callers stay pure. Indexed scatter/gather by (slots, slot_pos) is graph-safe.
+    # persist=True writes through to the worker-owned window; the default clones.
+    # Indexed scatter/gather by (slots, slot_pos) is graph-safe.
     write_target = kv_cache if persist else kv_cache.clone()
     slot_pos = start_pos % window_size  # [G]
     write_target[slots, slot_pos] = main_kv.squeeze(1).to(write_target.dtype)

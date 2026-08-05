@@ -800,14 +800,9 @@ def add_token(
 
 
 def int_tensor(shape: tuple[int, ...], device: str = "cuda") -> torch.Tensor:
-    # zeros, not empty: several of these buffers are slot-indexed stores that
-    # are only written for the slots sampled in a given step, while consumers
-    # (the overlap scheduler's previous-batch gather in model_engine) index
-    # them by slots from a *previous* roster. A slot that has not been written
-    # yet must read as 0 -- with empty it reads arbitrary bytes, and one such
-    # read (previous_kv_lens_offsets) feeds the captured kv_lens correction,
-    # where a garbage value walks the KV append past the request's allocated
-    # blocks (the DSpark ragged IMA).
+    # zeros, not empty: these buffers are slot-indexed stores whose consumers
+    # (e.g. the overlap scheduler's previous-batch gather) may read slots the
+    # current step never wrote; an unwritten slot must read as 0.
     return torch.zeros(shape, dtype=torch.int, device=device)
 
 

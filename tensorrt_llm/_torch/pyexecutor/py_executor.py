@@ -558,9 +558,6 @@ class PyExecutor:
         self.peft_cache_config = peft_cache_config
 
         self.iter_counter = 0
-        # TLLM_DSPARK_SYNC_DEBUG bookkeeping; see _maybe_arm_dspark_sync_debug.
-        self._dspark_sync_debug_iters = 0
-        self._dspark_sync_debug_armed = False
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
@@ -2402,64 +2399,19 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
 
-    def _maybe_arm_dspark_sync_debug(self) -> None:
-        """Turn on CUDA sync detection once decode is in steady state.
-
-        The overlap scheduler's entire value is that the host runs ahead of the
-        device, so one device->host sync per decode step gives it back. Static
-        review can show the code *looks* sync-free; only the allocator's own
-        detector shows that it *is*.
-
-        Armed late on purpose. Warmup, CUDA-graph capture and the first steady
-        steps legitimately synchronize, so arming at startup would bury the
-        signal in expected hits. ``TLLM_DSPARK_SYNC_DEBUG=<n>`` arms after ``n``
-        DSpark decode iterations (``1`` means "on", which arms after the default
-        64). Each subsequent sync emits a Python warning with a stack, which is
-        what makes the offender identifiable rather than merely countable.
-
-        Diagnostic only: never on by default, and 'warn' rather than 'error' so
-        a run surfaces every offender instead of dying at the first.
-        """
-        if self._dspark_sync_debug_armed:
-            return
-        raw = os.environ.get("TLLM_DSPARK_SYNC_DEBUG", "")
-        if not raw or raw in ("0", "false", "False"):
-            return
-        try:
-            after = 64 if raw in ("1", "true", "True") else int(raw)
-        except ValueError:
-            logger.warning(
-                f"ignoring TLLM_DSPARK_SYNC_DEBUG={raw!r}: expected an integer "
-                f"iteration count, or 1 for the default")
-            self._dspark_sync_debug_armed = True
-            return
-        self._dspark_sync_debug_iters += 1
-        if self._dspark_sync_debug_iters < after:
-            return
-        torch.cuda.set_sync_debug_mode("warn")
-        self._dspark_sync_debug_armed = True
-        logger.warning(
-            f"DSpark: CUDA sync detection armed after "
-            f"{self._dspark_sync_debug_iters} decode iterations. Any "
-            f"device->host synchronization from here on emits a warning with a "
-            f"stack; on the overlap-scheduler path there should be none.")
-
     def _maybe_assert_dspark_ragged_active(self, stats) -> None:
         """Run the ragged gate mid-loop, once the step floor is reached.
 
-        The cleanup-time copy of this check raises into a shutdown path pytest
-        never sees; raised mid-loop instead, the exception fails the run. Only
-        once, so the first (and only informative) failure is not buried.
+        Raises mid-loop (a cleanup-time raise lands in a shutdown path the
+        test runner never sees); fires at most once.
         """
-        # Lazy rather than set in __init__: this class has several
-        # construction paths and a gate that silently no-ops because one of
-        # them missed an attribute is the exact failure being fixed here.
+        # Deliberately lazy: this class has several construction paths, and a
+        # missed __init__ attribute would silently disable the gate.
         if getattr(self, "_dspark_asserted", False):
             return
         min_steps = self._dspark_assert_min_steps
-        # Counted over steps with a real batch, not all steps: trtllm-bench
-        # ramps concurrency from zero, and a tiny early batch has trivially
-        # identical windows, which would fail an innocent run.
+        # Count only multi-request steps: tiny ramp-up batches have trivially
+        # identical windows and would fail an innocent run.
         if min_steps is None or stats.steps_multi_request < min_steps:
             return
         self._dspark_asserted = True
@@ -2479,36 +2431,23 @@ class PyExecutor:
     def _report_dspark_ragged_stats(self) -> None:
         """Final DSpark scheduling summary, and optionally a hard gate on it.
 
-        The counters live in the worker process. Under TP8 + attention-DP the
-        driver cannot reach them -- ``collective_rpc`` refuses a multi-rank
-        world -- so a test can assert on a GSM8K score and nothing else. But a
-        run where the planner declined on every step scores *exactly* the same
-        as one where it worked, so that assertion is evidence-free: the known
-        failure mode here is not a wrong answer, it is a feature that quietly
-        did nothing.
-
-        Two things close that. The summary is logged unconditionally at
-        shutdown, so the numbers are in the log of every run rather than only in
-        whatever the 32-step periodic emit happened to catch. And with
-        ``TLLM_DSPARK_ASSERT_ACTIVE=1`` the worker asserts on its own counters
-        here -- an exception in the worker does propagate to the driver, which
-        is the one channel that crosses the MPI boundary reliably.
+        The counters live in the worker process and are unreachable from the
+        driver under multi-rank TP, so the summary is always logged at
+        shutdown, and with ``TLLM_DSPARK_ASSERT_ACTIVE`` the worker asserts on
+        its own counters (a worker exception does propagate to the driver).
         """
         worker = getattr(self.model_engine, "_get_spec_worker", None)
         stats = getattr(worker(), "ragged_stats", None) if worker else None
-        # Drained BEFORE the ragged early-return: STS collection runs in static
-        # mode too, so gating the final flush on ragged counters drops the tail
-        # of every static-mode collection run.
+        # Flush BEFORE the ragged early-return: STS collection also runs in
+        # static mode.
         recorder = getattr(self.sampler, "sts_recorder", None)
         if recorder is not None:
             recorder.flush()
         if stats is None or not stats.steps_total:
             return
         stats.log_summary(prefix="DSpark ragged verify [final]")
-        # The value is a MINIMUM STEP COUNT, not a boolean: an engine build
-        # spins up throwaway executors (KV-cache estimation) that run a couple
-        # of decode steps, and asserting on one of those reports "the feature
-        # did nothing" about an executor never asked to do anything.
+        # A MINIMUM STEP COUNT, not a boolean: throwaway executors (KV-cache
+        # estimation) run a few decode steps and must not trip the assert.
         min_steps = self._dspark_assert_min_steps
         if min_steps is None:
             return
@@ -3318,16 +3257,10 @@ class PyExecutor:
     def set_dspark_verify_len_pin(self, verify_len: Optional[int]) -> Optional[int]:
         """Queue a DSpark verify-length pin, or ``None`` to clear it.
 
-        The pin bypasses the confidence planner and makes every request verify
-        the same number of positions -- the shape a cost-table sweep needs to
-        measure a cell it can label. It exists so a sweep can walk the ladder
-        against a RUNNING server instead of rebuilding the engine per length
-        (which is what the ``TLLM_DSPARK_FORCE_VERIFY_LEN`` environment
-        variable requires, and which cannot reach ranks that were spawned
-        before it was set).
-
-        Validated here and applied on the next decode step, when the step's
-        existing cross-rank allgather hands the same value to every rank.
+        The pin bypasses the confidence planner so every request verifies the
+        same number of positions (for cost-table sweeps against a running
+        server). Validated here, applied on the next decode step, when the
+        step's cross-rank allgather hands the same value to every rank.
 
         Returns:
             The validated pin, or None when cleared.
@@ -3347,12 +3280,10 @@ class PyExecutor:
                 "scheduling enabled")
         mode = getattr(worker, "ragged_verify_mode", None)
         computes = (mode.computes_windows if mode is not None else
-                    getattr(self.model_engine.spec_config,
-                            "enable_ragged_verify", False))
+                    self.model_engine.spec_config.enable_ragged_verify)
         if not computes:
             # Static mode never calls decide_verify_lens, so an accepted pin
-            # would be adopted, logged as set -- and never influence a step.
-            # Answering 200 there is the mislabelled-sweep trap all over again.
+            # would be adopted and silently never applied.
             raise RuntimeError(
                 "this engine runs static (uniform) verification; the "
                 "verify-length pin only affects window-computing modes, so "
@@ -3360,10 +3291,9 @@ class PyExecutor:
         if (worker.sts_recorder is not None
                 and verify_len is not None
                 and int(verify_len) < int(self.model_engine.max_draft_len)):
-            # The collector's own guard refuses to START under a censoring
-            # window; this closes the runtime door that guard cannot see. A
-            # sub-block pin clips the acceptance label of every sample
-            # collected after it, and the shards keep looking healthy.
+            # A sub-block pin censors the acceptance label of every STS sample
+            # collected after it; the collector's start-time guard cannot see
+            # a runtime pin.
             raise RuntimeError(
                 "STS calibration collection is active on this engine; a pin "
                 "below the full block censors the acceptance label for every "
@@ -3375,14 +3305,10 @@ class PyExecutor:
                                      scheduled_batch: ScheduledRequests) -> int:
         """Draft length for this iteration, from the DSpark confidence planner.
 
-        Runs entirely outside CUDA-graph capture, which is what makes the
-        device->host relay legal: the worker writes confidence device-side inside
-        the captured graph, and this hook -- called before the next forward --
-        first *reads* the previously staged snapshot, then stages a fresh one.
-        That gives a one-iteration lag for free, with no synchronization.
-
-        Falls back to the full block on any missing piece, so an engine without a
-        confidence-capable checkpoint behaves exactly as before.
+        Runs outside CUDA-graph capture: it reads the confidence snapshot
+        staged on the previous iteration, then stages a fresh one -- a
+        one-iteration lag with no synchronization. Falls back to the full
+        block on any missing piece.
         """
         max_draft_len = self.model_engine.max_draft_len
         worker = self.model_engine._get_spec_worker()
@@ -3390,40 +3316,29 @@ class PyExecutor:
         if planner is None:
             return max_draft_len
 
-        self._maybe_arm_dspark_sync_debug()
-
         gen_requests = scheduled_batch.generation_requests
         num_gen_requests = len(gen_requests)
-        # Confidence is read back by SLOT, not by batch position. The snapshot
-        # is one iteration old, and joins/departures reshuffle the batch in
-        # between, so position i is routinely a different request than the one
-        # that was scored there. A request with no slot yet maps to the neutral
-        # row, i.e. "verify the whole block".
+        # Read back by SLOT, not batch position: the snapshot is one iteration
+        # old and the batch reshuffles in between. Slotless requests map to
+        # the neutral row ("verify the whole block").
         confidence_rows = [
             worker.confidence_row_for(request.py_request_id)
             for request in gen_requests
         ]
 
-        # The mode, not the config flag, decides whether windows are computed:
-        # the environment override exists so a run can be switched between
-        # `static` and `compact` without editing the serving config, and every
-        # counter below is keyed off the same decision.
+        # The mode, not the config flag, decides whether windows are computed;
+        # every counter below is keyed off the same decision.
         stats = worker.ragged_stats
-        # The sampler is built independently of the worker, so nothing connects
-        # them; do it here, where both are reachable. Acceptance has to be
-        # recorded in the sampler (that is where the accepted count and the
-        # window it was measured against are both host-side and belong to the
-        # same step), but the counters live on the worker.
+        # Wire the worker's counters into the sampler here, where both are
+        # reachable: acceptance is only observable host-side in the sampler.
         if (stats is not None and self.sampler is not None
-                and getattr(self.sampler, "acceptance_stats", None) is None):
+                and self.sampler.acceptance_stats is None):
             self.sampler.acceptance_stats = stats
-        # Same wiring, same reason, for STS collection: the logits live on the
-        # worker and the accepted count is only host-side in the sampler. The
-        # sampler gets the worker's OWN row resolver and pass counter, never a
-        # raw buffer: the recorder joins by (draft pass, buffer row), and both
-        # keys must come from the allocator that wrote the buffer.
+        # Same wiring for STS. The sampler gets the worker's OWN row resolver
+        # and pass counter: the recorder joins by (draft pass, buffer row),
+        # and both keys must come from the allocator that wrote the buffer.
         if (self.sampler is not None
-                and getattr(self.sampler, "sts_recorder", None) is None):
+                and self.sampler.sts_recorder is None):
             recorder = worker.sts_recorder
             if recorder is not None:
                 self.sampler.sts_recorder = recorder
@@ -3437,8 +3352,7 @@ class PyExecutor:
 
         # --- Phase 1: decide locally, issue nothing ---------------------------
         #
-        # goal doc H9. Every decline reason is rank-local and one
-        # (_ready_snapshot) is timing-dependent, so a collective placed after
+        # Every decline reason is rank-local, so a collective placed after
         # them deadlocks: nothing below may branch on rank-local state before
         # the single collective, and nothing after it may issue another one.
         ragged_lens = None
@@ -3453,28 +3367,14 @@ class PyExecutor:
         else:
             fallback_reason = "mode_static"
             # Nothing to compute: the fallback verifies the full drafted block.
-            # (The batch-wide uniform-tier middle ground was removed; llm_args
-            # now rejects the config that reached it, so two states, not three.)
 
         # --- Phase 2: one collective, same shape on every rank, every step ----
         #
-        # Carries everything the rest of the step needs, so the `peer_stats`
-        # gather that used to follow is folded in here rather than added to it:
-        #   [wants_ragged, num_rows, total_verify_tokens, max_window, can_graph]
-        # `_can_queue` already runs `tp_allgather(batch_size)` just before this
-        # hook and could absorb this too, but that would mean computing the
-        # local draft length inside a hot path shared by every speculation mode.
-        #
-        # `can_graph` rides along because the ragged fit has to know what row
-        # padding will actually do, and it runs before the graph runner's own
-        # allgather answers that. `_get_padded_batch` only takes the cross-rank
-        # row maximum when EVERY rank can graph this step; one rank holding a
-        # context request makes each rank keep its local count instead, so a fit
-        # that assumed the maximum budgets tokens for pad rows that are never
-        # appended. Predicting that from size rules alone is what `will_pad_to`
-        # tried and got wrong. Carrying the input costs nothing here -- the
-        # collective is already being issued, and one more int does not change
-        # its cost -- and it replaces a second derivation with the same data.
+        # Payload: [wants_ragged, num_rows, total_verify_tokens, max_window,
+        # can_graph, pending_pin]. `can_graph` rides along because the ragged
+        # fit runs before the graph runner's own allgather and must know
+        # whether row padding will happen: _get_padded_batch only takes the
+        # cross-rank row maximum when EVERY rank can graph this step.
         local_rows = len(ragged_lens) if ragged_lens is not None else 0
         local_tokens = (sum(1 + int(v)
                             for v in ragged_lens) if ragged_lens else 0)
@@ -3492,76 +3392,52 @@ class PyExecutor:
                 1 if scheduled_batch.can_run_cuda_graph else 0,
                 planner.pending_verify_len_pin(),
             ])
-            # A runtime verify-length pin (profiling endpoint) reaches the
-            # group here rather than through each rank's own environment: the
-            # endpoint lands on one rank, and a pin applied locally would make
-            # that rank disagree with its peers for as long as it held. Taking
-            # the first rank that queued one makes the choice a function of the
-            # allgathered payload, identical everywhere, effective on the same
-            # step. -1 means nobody queued anything.
+            # The pin rides the allgather so every rank adopts the same value
+            # on the same step (the endpoint lands on one rank). -1 means
+            # nobody queued anything.
             agreed_pin = next(
                 (int(payload[5]) for payload in payloads
                  if len(payload) > 5 and int(payload[5]) >= 0), -1)
             planner.adopt_verify_len_pin(agreed_pin)
             if not all(int(payload[0]) for payload in payloads):
-                # Any rank that cannot go ragged takes the whole group with it:
-                # a mixed step means one rank replays a ragged graph while
-                # another runs a different token count, and `all_rank_num_tokens`
-                # is frozen into the captured graph, so the mismatch would not
-                # even be observable at replay time.
+                # All-or-nothing across ranks: `all_rank_num_tokens` is frozen
+                # into the captured graph, so a mixed step's mismatch would
+                # not even be observable at replay time.
                 if ragged_lens is not None:
                     fallback_reason = "peer_declined"
                 ragged_lens = None
             else:
-                # payload[3] (the local max window) stays in the collective so
-                # its shape is stable, but capping local windows at the global
-                # max was a no-op by construction (the global max is >= every
-                # local window) and nothing else consumed it.
-                # Third element is the group's answer, identical on every rank
-                # by construction, not each rank's own flag: what the fit needs
-                # to know is whether the row maximum will be taken at all.
+                # payload[3] is unread; it stays so the collective keeps a
+                # stable shape. peer_stats' third element is the GROUP's
+                # can-graph answer, identical on every rank, not each rank's
+                # own flag.
                 all_can_graph = all(int(payload[4]) for payload in payloads)
                 peer_stats = [[
                     int(payload[1]),
                     int(payload[2]), 1 if all_can_graph else 0
                 ] for payload in payloads]
         else:
-            # A single-rank world has no allgather to carry the pin, and
-            # without this branch a queued pin sat forever: the endpoint
-            # returned 200, forced_steps stayed 0, and a sweep labelled every
-            # cell with a length the planner never ran. The local queue IS the
-            # group's agreement when the group is one rank.
+            # Single-rank world: the local queue IS the group's agreement.
             planner.adopt_verify_len_pin(planner.pending_verify_len_pin())
 
         # --- Phase 3: no more collectives -------------------------------------
         #
-        # Land the batch's token total on a captured bucket before the graph key
-        # is built, spending the rounding slack on real verification. A batch
-        # with no captured shape gets None back and falls through to uniform,
-        # which always has a graph -- running ragged without one would cost far
-        # more than the trimmed tokens save. This can still come out differently
-        # on different ranks (the pad-row fit is sized from the local request
-        # count), which is why the attention-DP graph gate compares the token
-        # bucket and not just the batch size.
+        # Land the token total on a captured bucket BEFORE the graph key is
+        # built; no captured shape means fall through to uniform, which always
+        # has a graph. The fit can still differ across ranks, which is why the
+        # attention-DP graph gate compares the token bucket, not just the
+        # batch size.
         #
-        # `cap-accept` stops short of this: it wants the schedule's commitment
-        # policy without the layout that pays for it, so it submits the full
-        # block and needs no bucket at all. The windows go onto `py_verify_cap`
-        # rather than `py_verify_len` precisely so the whole token-layout path
-        # below and downstream (input layout, DSA row expansion, graph key, KV
-        # rewind) keeps seeing an untrimmed batch -- the mode is then a pure
-        # addition rather than a second set of conditions inside code that took
-        # three bugs to get right for `compact`.
+        # `cap-accept` submits the full block: its windows go on
+        # `py_verify_cap`, not `py_verify_len`, so the whole token-layout path
+        # downstream keeps seeing an untrimmed batch.
         bucket = None
         ragged_active = False
         cap_accept = (mode is not None and mode.computes_windows
                       and not mode.trims_submitted_tokens)
         if cap_accept:
-            # Stale caps are the same hazard as stale windows, minus the one
-            # thing that makes stale windows survivable: a mismatched layout
-            # eventually trips an assert, whereas a stale cap just commits
-            # against last step's schedule with nothing to contradict it.
-            # Clear every request first, set second.
+            # Clear every request first, set second: a stale cap silently
+            # commits against last step's schedule, with no assert to trip.
             for request in gen_requests:
                 request.py_verify_cap = None
         if ragged_lens is not None:
@@ -3576,10 +3452,9 @@ class PyExecutor:
                 if bucket is None:
                     fallback_reason = "no_captured_shape"
             else:
-                # No rank can replay a graph this step (context requests
-                # present); such steps were always eager, so run the windows
-                # eagerly. Do not fit a bucket: fitting sizes pad rows that
-                # _get_padded_batch will not append on an ungraphable step.
+                # No rank can graph this step, so run the windows eagerly. Do
+                # not fit a bucket: the fit sizes pad rows _get_padded_batch
+                # will not append on an ungraphable step.
                 runner = self.model_engine.cuda_graph_runner
                 runner.agreed_ragged_bucket = None
                 runner.ragged_pad_verify_len = 0
@@ -3587,32 +3462,23 @@ class PyExecutor:
                     request.py_verify_len = int(window)
                 ragged_active = True
 
-        # Record what the step actually decided, reading the windows back off
-        # the requests rather than off `ragged_lens`: fit_ragged_verify_lens
-        # spends the bucket's rounding slack on real verification, so the
-        # fitted windows are what the target will see.
+        # Record what the step actually decided.
         if stats is not None:
-            # The stats object lives in the worker process; under TP the caller
-            # that wants to assert on it is on the far side of an MPI boundary
-            # and cannot reach it. Emit a periodic summary so the decision is
-            # recoverable from the log, which is the only shared channel.
+            # Periodic summary: under TP the counters sit across an MPI
+            # boundary, so the log is the only shared channel.
             if stats.steps_total and stats.steps_total % 32 == 0:
                 stats.log_summary(prefix="DSpark ragged verify [periodic]")
             self._maybe_assert_dspark_ragged_active(stats)
             fitted = None
             delivered = None
             if cap_accept:
-                # Nothing was fitted, so there is nothing to read back: the
-                # scheduled windows ARE the decision. The block is submitted
-                # whole, which `delivered` has to say explicitly -- otherwise
-                # the windows would be booked as if they had been submitted.
+                # Nothing was fitted: the scheduled windows ARE the decision,
+                # and `delivered` must say the block was submitted whole.
                 fitted = [int(v) for v in ragged_lens] if ragged_lens else None
                 delivered = num_gen_requests * (1 + max_draft_len)
             elif ragged_active:
-                # Read back off the requests, not off `ragged_lens`: when a
-                # bucket was fitted its rounding slack was spent on real
-                # verification, so the fitted windows are what the target sees.
-                # Without a bucket the two are the same thing.
+                # Read back off the requests, not `ragged_lens`: the fit spent
+                # the bucket's rounding slack on real verification.
                 fitted = [
                     int(request.py_verify_len) for request in gen_requests
                     if getattr(request, "py_verify_len", None) is not None
@@ -3622,10 +3488,9 @@ class PyExecutor:
             stats.record_step(num_gen_requests=num_gen_requests,
                               verify_lens=fitted,
                               bucket=bucket,
-                              # Only when the fit delivered (bucket non-None):
-                              # reading it every step books the LAST fit's row
-                              # count into padded_bs_hist on eager-ragged and
-                              # cap-accept steps, which never enter the fit.
+                              # Only when the fit delivered: otherwise this
+                              # books the LAST fit's row count on steps that
+                              # never entered the fit.
                               padded_bs=(getattr(self.model_engine,
                                                  "_dspark_last_padded_bs", None)
                                          if bucket is not None else None),
@@ -3633,37 +3498,24 @@ class PyExecutor:
                               delivered=delivered)
 
         if ragged_active and not cap_accept:
-            # The block is always drafted in full -- only verification is
-            # trimmed -- so the batch-wide draft length stays at the top tier.
-            # That keeps the drafted-token buffer and the padded acceptance
-            # rectangle a fixed width; each request's own (smaller) verify
-            # window rides along on py_verify_len.
+            # The block is always drafted in full, so the batch-wide draft
+            # length stays at the top tier (fixed-width buffers); per-request
+            # windows ride on py_verify_len.
             runtime_draft_len = max(
                 int(t) for t in self.model_engine.spec_config.verify_len_tiers)
         else:
-            # Clear any window left over from a previous ragged step, otherwise
-            # a fallback iteration would keep trimming on a stale split. This
-            # has to cover EVERY generation request: _prepare_tp_inputs builds
-            # the token layout per request from py_verify_len, but
-            # _attach_ragged_verify_layout disables the ragged spec metadata as
-            # soon as one request is missing a window. A batch where only some
-            # requests still carry a stale window therefore gets a ragged input
-            # layout with uniform acceptance -- silent token misattribution.
+            # Clear stale windows on EVERY generation request: a batch where
+            # only some requests carry one gets a ragged input layout with
+            # uniform acceptance -- silent token misattribution.
             for request in gen_requests:
                 request.py_verify_len = None
-            # And the published fit state with them: a fallback step that
-            # inherits the previous ragged step's agreed bucket carries a
-            # claim about a batch it does not describe. The window guard in
-            # the graph key tolerates that today; the layout assert's uniform
-            # branch does not, on purpose -- one line of defense where there
-            # were zero.
+            # Clear the published fit state too: a stale agreed bucket
+            # describes a batch that no longer exists.
             if self.model_engine.cuda_graph_runner is not None:
                 self.model_engine.cuda_graph_runner.agreed_ragged_bucket = None
                 self.model_engine.cuda_graph_runner.ragged_pad_verify_len = 0
-            # Verify the full drafted block. This is the only fallback: the
-            # uniform tier ladder that used to sit between "schedule per
-            # request" and "verify everything" is gone, so there is nothing to
-            # agree on across ranks here and no collective is needed.
+            # The only fallback is the full drafted block; nothing to agree on
+            # across ranks, so no collective.
             runtime_draft_len = planner.max_tier
 
         # Stage this step's confidence for the *next* decision. Non-blocking; if
@@ -3679,11 +3531,9 @@ class PyExecutor:
             stamps = worker.confidence_stamp_buffer()
             planner.stage_confidence(buffer, stamps=stamps,
                                      staged_seq=staged_seq)
-            # The STS recorder keeps its own ring of these snapshots: its
-            # labels arrive one-plus steps later and must be paired with the
-            # pass that DRAFTED the block being labeled, not with whatever the
-            # live buffer holds by then. Same relay, same stamps, staged in
-            # the same breath as the planner's copy.
+            # The STS recorder rings its own copy: labels arrive steps later
+            # and must pair with the pass that DRAFTED the block, not whatever
+            # the live buffer holds by then.
             recorder = worker.sts_recorder
             if recorder is not None:
                 recorder.stage_snapshot(device_logits=buffer,

@@ -14,30 +14,13 @@
 # limitations under the License.
 """Host-side coordinator turning DSpark confidence into a per-iteration draft length.
 
-Three constraints shape this component, and all three point the same way:
-
-1. **The decision must be on the host.** TensorRT-LLM picks a decode CUDA graph
-   from ``(batch_size, draft_len, ...)`` -- every input to that choice is a host
-   value. A device-resident budget would have to be copied back before the batch
-   could be shaped, which is the synchronization we are trying to avoid.
-2. **The step must land on a captured graph.** A shape with no captured graph
-   does not raise; ``maybe_get_cuda_graph`` returns ``None`` and the step
-   silently runs eager, which costs far more than the tokens saved. The drafted
-   block is always ``max_tier`` long, so what varies is the *verified* token
-   total, and the layout rounds that up to a captured verify bucket before the
-   batch is shaped.
-3. **Every rank must decide identically.** The graph key is not part of the
-   attention-DP consistency allgather, so two ranks that shape the batch
-   differently select different graphs -- one replays, one falls back to eager
-   -- and their collectives diverge. The caller therefore reduces the ragged
-   decision across ranks (a single allgather in ``py_executor``) before any rank
-   acts on it; :meth:`decide_verify_lens` itself is rank-local by default.
-
-Confidence for step ``t`` only becomes readable on the host at ``t+1`` (or ``t+2``
-with the overlap scheduler), so the decision always runs on a lagged snapshot.
-That is fine -- it is a throughput heuristic, not a correctness input -- but the
-snapshot has to be *taken* without blocking, and a snapshot that is not ready yet
-must degrade to verifying everything rather than to a stale guess.
+Contracts: the decision is made on the host (CUDA-graph selection is a host
+value); the verified token total must round up to a captured verify bucket, or
+the step silently runs eager; and every rank must shape the batch identically
+-- the caller reduces the ragged decision across ranks before any rank acts on
+it, while :meth:`decide_verify_lens` itself is rank-local by default.
+Confidence is read from a lagged, non-blocking snapshot; a snapshot that is
+not ready degrades to verifying everything, never to a stale guess.
 """
 
 import os
@@ -52,11 +35,8 @@ from .dspark_planner import SpsCostTable, compute_verify_token_budget
 from .dspark_schedule import (NEUTRAL_CONFIDENCE_LOGIT, DSparkScheduleConfig,
                               compute_survival, schedule_verify_lens_topk)
 
-#: Pin every request's verify window to this length, bypassing the planner.
-#: Set by the SPS profiler to move M at a fixed draft length; also used to
-#: hold the full block during STS collection, where a trimmed window would
-#: clip the acceptance label and fit a temperature to the scheduler instead
-#: of to the head. Not a serving knob.
+#: Profiling-only pin (SPS profiling / STS collection): fixes every request's
+#: verify window at this length, bypassing the planner. Not a serving knob.
 FORCE_VERIFY_LEN_ENV = "TLLM_DSPARK_FORCE_VERIFY_LEN"
 
 __all__ = ["DSparkVerifyPlanner"]
@@ -92,32 +72,16 @@ class DSparkVerifyPlanner:
         self.apply_calibration = apply_calibration or torch.sigmoid
         self.all_rank_max = all_rank_max
 
-        # Profiling pin. The SPS profiler has to hold M at a known value while it
-        # times steps, and it cannot use the planner's own decision to do that:
-        # the planner needs a cost table, and the cost table is what the profiler
-        # is producing. SGLang solves this with `dspark_force_budget_frac` pushed
-        # to a running server; TRT-LLM has no runtime control plane at
-        # world_size > 1, so this is an env var read ONCE here -- constant per
-        # process, zero cost on the step path, and forwarded to every worker at
-        # spawn, so all ranks agree by construction rather than by a collective.
-        #
-        # Absolute length, not SGLang's fraction. `schedule_verify_lens_topk`
-        # drops candidates below survival_eps, so a fractional budget yields
-        # `granted <= budget` and `choose_ragged_capture_shape` then rounds the
-        # total DOWN onto a smaller captured bucket -- the cell would be timed at
-        # one M and filed under another. With an absolute L every request gets
-        # exactly L, so M = bs * (L + 1) is the captured bucket by construction.
+        # Profiling pin, read once at init: constant per process and forwarded
+        # to every worker at spawn, so all ranks agree without a collective.
+        # An absolute length (not a fraction) so M = bs * (L + 1) lands exactly
+        # on a captured bucket.
         self._forced_verify_len = self._read_forced_verify_len()
-        # A pin requested at runtime (profiling endpoint) but not yet in force,
-        # held as its WIRE value because three states have to survive the trip:
-        # -1 nothing queued, 0 clear the pin, >0 pin to that length. Storing
-        # Optional[int] collapsed "clear" into "nothing queued", so a clear
-        # never reached the peers. min_verify_len is validated >= 1, so 0 can
-        # never collide with a real length.
-        # It is adopted through the step's existing cross-rank allgather so
-        # every rank starts pinning on the SAME step. Setting it locally would
-        # diverge the shape gate for as long as the ranks disagreed -- the same
-        # failure the env-var pin has on a pre-spawned world.
+        # Runtime pin queued but not yet in force, held as its wire value:
+        # -1 nothing queued, 0 clear the pin, >0 pin to that length
+        # (min_verify_len >= 1, so 0 is unambiguous). Adopted through the
+        # step's cross-rank allgather so every rank starts pinning on the
+        # same step; applying it locally would diverge the shape gate.
         self._pending_verify_len_pin: int = -1
 
         self._host_buffer: Optional[torch.Tensor] = None
@@ -125,8 +89,7 @@ class DSparkVerifyPlanner:
         self._host_stamps: Optional[torch.Tensor] = None
         self._staged_seq: Optional[int] = None
         self._snapshot_valid = False
-        # Observability: silent degradation is the main failure mode here, so
-        # count every path that gives up on trimming.
+        # Count every path that declines to trim; degradation here is silent.
         self.stats = {
             "decisions": 0,
             "fallback_no_snapshot": 0,
@@ -148,14 +111,10 @@ class DSparkVerifyPlanner:
 
         ``confidence_logits`` is the worker's whole slot-indexed buffer, staged
         in full so :meth:`decide_verify_lens` can look up any live request by
-        slot. It is kilobytes (``max_num_requests x block`` fp32), so there is
-        nothing to gain from staging a subset -- and a subset would need a row
-        ordering to survive the one-iteration lag, which is exactly what slot
-        keying exists to avoid.
-
-        Never synchronizes: the copy is issued on the current stream and an event
-        is recorded. :meth:`decide_verify_lens` polls that event and simply does
-        not use the snapshot if it has not landed.
+        slot across the one-iteration lag. Never synchronizes: the copy is
+        issued on the current stream and an event is recorded;
+        :meth:`decide_verify_lens` polls the event and skips a snapshot that
+        has not landed.
         """
         if confidence_logits is None or confidence_logits.shape[0] == 0:
             return
@@ -206,10 +165,6 @@ class DSparkVerifyPlanner:
             raise ValueError(
                 f"{self._FORCE_ENV}={value} outside [{lo}, {hi}]")
         if value not in self.tiers:
-            # A length with no captured graph makes every step run eager, and an
-            # eager step is orders of magnitude off the graph-replay cost the
-            # profiler is trying to measure -- the curve would be noise wearing
-            # the shape of a cost model. Refuse rather than produce it.
             raise ValueError(
                 f"{self._FORCE_ENV}={value} is not in the captured tier ladder "
                 f"{self.tiers}; every step would fall out of CUDA-graph replay "
@@ -238,9 +193,8 @@ class DSparkVerifyPlanner:
     def request_verify_len_pin(self, value: Optional[int]) -> Optional[int]:
         """Queue a pin (or ``None`` to clear) for the next decode step.
 
-        Validated here so a bad value is rejected at the call site rather than
-        on some later step, but NOT applied here: the step's allgather carries
-        it so all ranks adopt it together (see ``adopt_verify_len_pin``).
+        Validated here but NOT applied: the step's allgather carries it so all
+        ranks adopt it together (see ``adopt_verify_len_pin``).
         """
         value = self.validate_verify_len_pin(value)
         self._pending_verify_len_pin = 0 if value is None else int(value)
@@ -251,19 +205,18 @@ class DSparkVerifyPlanner:
         return int(self._pending_verify_len_pin)
 
     def adopt_verify_len_pin(self, wire_value: int) -> None:
-        """Apply the group's agreed pin. ``-1`` leaves the current one alone.
+        """Apply the group's agreed pin from the allgathered payload.
 
-        Called from the executor with a value every rank read out of the same
-        allgathered payload, so the pin takes effect on the same step
-        everywhere. 0 is the wire encoding for "clear the pin".
+        Every rank applies the same payload, so the pin takes effect on the
+        same step everywhere. ``-1`` leaves the current pin alone; ``0``
+        clears it.
         """
         wire_value = int(wire_value)
         if wire_value < 0:
             return
-        # Compare-and-clear: the RPC thread may queue a NEW request between
-        # the decode loop reading the payload and adopting it (they are an
-        # allgather apart). Unconditionally resetting here wiped that second
-        # request after its endpoint had already answered 200.
+        # Compare-and-clear: the RPC thread may queue a new request between
+        # the payload being read and adopted; an unconditional reset would
+        # drop it.
         if self._pending_verify_len_pin == wire_value:
             self._pending_verify_len_pin = -1
         new_pin = None if wire_value == 0 else wire_value
@@ -277,17 +230,9 @@ class DSparkVerifyPlanner:
 
     def _note_snapshot_stats(self, selected: torch.Tensor,
                              rows: Optional[Sequence[int]]) -> None:
-        """Measure what the argmax is about to eat. Never changes behaviour.
-
-        Two independent instruments:
-        - stamp-lag histogram: (staged_seq - row stamp) per gathered row. A
-          healthy relay shows one tight mode; mass at large lags is stale
-          replay masquerading as data, and the clamp bucket collects
-          never-drafted rows.
-        - neutral-row count: rows still carrying the neutral fill on every
-          position, i.e. "unknown" rows entering the argmax as certainties.
-        Together they say whether the per-step snapshot content can be
-        trusted; without them the planner's input was never measured at all.
+        """Record snapshot-quality stats: stamp-lag histogram (staleness per
+        gathered row) and neutral-row count ("unknown" rows entering the
+        argmax as certainties). Observability only; never changes behaviour.
         """
         try:
             n = int(selected.shape[0])
@@ -318,17 +263,11 @@ class DSparkVerifyPlanner:
         """This step's confidence, one row per generation request, or None.
 
         ``rows`` is the per-request buffer row index (``DSparkWorker.
-        confidence_row_for``). Supplying it is what makes the lagged snapshot
-        correct: the batch is reshuffled between the step that wrote the
-        confidence and the step that reads it, so the request at position ``i``
-        is routinely a different one.
-
-        ``rows=None`` keeps the positional reading for callers that own the
-        ordering themselves (the unit tests stage a purpose-built buffer). That
-        path refuses to run on a snapshot with fewer rows than the batch rather
-        than silently returning a short answer -- a short answer becomes a
-        partially-assigned batch downstream, where half the requests get a
-        verify window and half do not.
+        confidence_row_for``); the batch is reshuffled across the one-iteration
+        lag, so positional reads (``rows=None``) are only correct for callers
+        that own the ordering. Declines (None) rather than returning fewer
+        rows than the batch, which would partially assign verify windows
+        downstream.
         """
         snapshot = self._ready_snapshot()
         if snapshot is None:
@@ -359,43 +298,25 @@ class DSparkVerifyPlanner:
     ) -> Optional[List[int]]:
         """Per-request verify lengths for a ragged step, or None to stay uniform.
 
-        The budget still comes from the cost-model argmax -- that is what knows
-        how many verified tokens the step can afford -- but instead of splitting
-        it evenly it is handed to the global survival top-k, so a request whose
-        draft is still alive at depth 5 can take positions from one whose draft
-        died at depth 1.
-
-        Returns None whenever the uniform path would have fallen back (no
-        snapshot, flat cost table, empty batch): raggedness is a throughput
-        heuristic and an untrustworthy input must degrade to verifying
-        everything, not to a stale split.
-
-        The batch-wide *maximum* is still reduced across ranks, because the
-        drafted-token buffer width and the per-request padding are sized from
-        it; the individual lengths stay local.
-
-        The returned list always has exactly ``num_gen_requests`` entries, or is
-        None. A partial list would leave the tail of the batch without a verify
-        window, and the callers downstream disagree about what that means: the
-        input layout is built per request (so it goes ragged) while the spec
-        metadata sees a ``None`` and stays uniform.
+        The cost-model argmax sets the budget; the global survival top-k splits
+        it across requests. Fail-closed: any untrustworthy input (no snapshot,
+        flat cost table, empty batch) returns None and the step verifies
+        everything. The batch-wide maximum is reduced across ranks (it sizes
+        the drafted-token buffer and per-request padding); individual lengths
+        stay local. Returns exactly ``num_gen_requests`` entries or None,
+        never a partial list.
         """
-        # Counted before any decline, so the fallback counters below have a
-        # denominator rather than being absolute counts against an unknown total.
+        # Counted before any decline so the fallback counters have a denominator.
         self.stats["decisions"] += 1
 
         if num_gen_requests <= 0:
-            # Benign during ramp-up, but it has to be nameable: an unlabelled
-            # `return None` here is indistinguishable in the counters from a
-            # real decline, and this feature's failures are all silent.
             self.stats["fallback_no_gen_requests"] += 1
             return None
 
         if self._forced_verify_len is not None:
-            # Ahead of the cost-table gate on purpose: the profiler runs
-            # without a table, so a pin placed after it would never fire. Sets
-            # `lens` rather than returning, so the pinned path still runs the
-            # cross-rank agreement and the length assert below.
+            # Must stay ahead of the cost-table gate (the profiler runs without
+            # a table) and must set `lens` rather than return, so the pinned
+            # path still runs the cross-rank agreement below.
             self.stats["forced_steps"] += 1
             lens = [int(self._forced_verify_len)] * int(num_gen_requests)
         else:
@@ -409,34 +330,21 @@ class DSparkVerifyPlanner:
             self._note_snapshot_stats(selected, rows)
             probs = self.apply_calibration(selected)
             survival = compute_survival(probs)
-            # Scored with the tau the step will actually collect. The rung is
-            # still chosen from the same ladder over the same cost grid -- the
-            # token totals, the buckets and the captured graphs are unchanged --
-            # but budget_argmax_over_uniform_lens scores rung L as if every
-            # request took columns [min, L), while what runs is a top-k
-            # redistribution of the same B = n*(L - min) tokens. Top-k takes the
-            # B largest survivals, so the realised tau is >= the scored one at
-            # an identical cost, for every rung. The gap is not constant across
-            # rungs, so the argmax could sit on the wrong one; scoring what runs
-            # removes the question.
+            # Scored as the top-k redistribution that actually runs, on the
+            # same tier-aligned cost grid as the uniform argmax.
             budget = compute_verify_token_budget(
                 survival=survival.numpy().astype(np.float64),
                 num_gen_requests=int(num_gen_requests),
                 cost_table=self.cost_table,
                 min_verify_len=self.cfg.min_verify_len,
                 max_verify_len=self.cfg.resolved_max_verify_len,
-                # Without this the answer is unrealisable: any non-tier total is
-                # rounded up to a captured bucket, which can push a budget
-                # chosen to sit below a cost riser back over it.
+                # Required: any non-tier total is rounded up to a captured
+                # bucket, pushing a budget chosen below a cost riser back over it.
                 allowed_lens=self.tiers,
             )
-            # The price the argmax just paid for this step, kept so the run can
-            # be reconciled against reality: hostStepTimeMS measures what the
-            # step actually cost, and a systematic gap between the two is the
-            # one number that catches a wrong table, a wrong lookup, and an
-            # engine/table config mismatch alike (same cell measured 23% apart
-            # across two engine configs). These keys ride along in self.stats,
-            # which the [final] summary prints wholesale -- no extra plumbing.
+            # Predicted step cost, recorded so runs can be reconciled against
+            # measured hostStepTimeMS; a systematic gap flags a wrong or
+            # mismatched cost table.
             floor_tokens = int(num_gen_requests) * (self.cfg.min_verify_len + 1)
             predicted = float(self.cost_table.step_times(
                 np.asarray([floor_tokens + int(budget)]),
@@ -447,11 +355,8 @@ class DSparkVerifyPlanner:
             self.stats["predicted_steps"] = (
                 self.stats.get("predicted_steps", 0) + 1)
             lens = schedule_verify_lens_topk(survival=survival, budget=budget, cfg=self.cfg).tolist()
-            # What the argmax bought and what top-k handed out, recorded
-            # SEPARATELY: the realized windows in verify_len_hist are read back
-            # after the bucket fit widened them, so without these two counters
-            # nothing says what this rank's own decision was -- and a fit-side
-            # defect is indistinguishable from a planner-side one.
+            # Local decision histograms, recorded before the bucket fit widens
+            # the realized windows (verify_len_hist is post-fit).
             rung = self.cfg.min_verify_len + int(budget) // max(int(num_gen_requests), 1)
             rhist = self.stats.setdefault("local_rung_hist", {})
             rhist[rung] = rhist.get(rung, 0) + 1
@@ -459,14 +364,10 @@ class DSparkVerifyPlanner:
             for v in lens:
                 lhist[int(v)] = lhist.get(int(v), 0) + 1
 
-        # `reduce_across_ranks=False` means the caller is doing the cross-rank
-        # agreement itself. That is not just an optimization here: every early
-        # return above is rank-local (an empty batch, an unprofiled cost table,
-        # a confidence snapshot whose copy event has not landed yet -- that last
-        # one is timing-dependent), so a collective issued *after* them is issued
-        # by some ranks and not others. Deciding locally and reducing once,
-        # unconditionally, at a point every rank reaches is the only shape of
-        # this that cannot deadlock.
+        # The early returns above are rank-local (some timing-dependent), so no
+        # collective may run before this point; reduce once, unconditionally,
+        # at a point every rank reaches. reduce_across_ranks=False means the
+        # caller does that agreement itself.
         if reduce_across_ranks:
             all_rank_max = all_rank_max or self.all_rank_max
             if all_rank_max is not None:

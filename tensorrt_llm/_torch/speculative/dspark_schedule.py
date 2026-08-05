@@ -12,33 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DSpark confidence-scheduled verification: survival + per-request allocation.
+"""DSpark confidence-scheduled verification (arXiv:2607.05147 §5).
 
-Given the draft's calibrated per-position acceptance probabilities, decide how
-many of the proposed tokens are worth sending to the target for verification.
-
-The algorithm (DSpark, arXiv:2607.05147 §5; cross-checked against SGLang's
-``dspark_schedule.py`` and vLLM PR #47808's ``adaptive_verification.py``):
-
-  1. ``survival[r][j] = prod(conf[r][:j+1])`` -- the probability that draft
-     position ``j`` of request ``r`` is reached *and* accepted. The confidence
-     head predicts a *conditional* acceptance probability, which is exactly what
-     makes this cumulative product the right prefix statistic.
-  2. Rank every ``(request, position)`` candidate by survival, globally across
-     the batch, and admit the best ``budget`` of them.
-
-Step 2 needs no explicit prefix constraint: ``survival`` is non-increasing along
-each request's positions, so any global top-k is automatically a per-request
-*prefix*. That is why the allocation only has to *count* admitted candidates per
-row rather than track which ones they were.
-
-Nothing here decides acceptance -- only how many tokens get verified -- so
-scheduling is lossless with respect to the target distribution.
-
-Determinism note: ties are broken by ``(position, request)``, never by value.
-Two TP ranks that compute bitwise-different confidences must still choose the
-same verify lengths, or their batch shapes (and therefore their collectives)
-diverge. See :func:`schedule_verify_lens_topk`.
+``survival[r][j] = prod(conf[r][:j+1])`` ranks every ``(request, position)``
+candidate globally; the best ``budget`` are admitted. Survival is
+non-increasing along each request's positions, so any global top-k is
+automatically a per-request prefix and the allocation only counts admitted
+candidates per row. Only the number of verified tokens is decided here, never
+acceptance, so scheduling is lossless w.r.t. the target distribution. Ties are
+broken by ``(position, request)``, never by value: ranks with
+bitwise-different confidences must still choose identical lengths or their
+batch shapes (and collectives) diverge.
 """
 
 from dataclasses import dataclass
@@ -52,12 +36,10 @@ __all__ = [
 ]
 
 
-# Raw logit written into confidence rows that carry no measurement (slot-free
-# fill, never-drafted slots): sigmoid(30/T) ~ 1.0 at any fitted temperature, so
-# an unknown row is treated as "certainly accept" -- optimistic by design, the
-# same convention as SGLang's ones-fill for stale rows. Shared from here
-# because both the worker (writes it) and the planner (counts it) need it and
-# they cannot import each other.
+# Raw logit for confidence rows that carry no measurement: sigmoid(30/T) ~ 1.0
+# at any fitted temperature, so an unknown row is treated as "certainly accept"
+# -- optimistic by design. Lives here because the worker (writes it) and the
+# planner (counts it) cannot import each other.
 NEUTRAL_CONFIDENCE_LOGIT = 30.0
 
 
@@ -66,18 +48,14 @@ class DSparkScheduleConfig:
     """Bounds for the per-request verify length.
 
     Attributes:
-        block_size: draft block length ``K`` (the number of speculative tokens
-            the draft proposes per step).
-        min_verify_len: floor on every request's verify length. Must stay >= 1:
-            position 0 carries the bonus/anchor token, and a request that
-            verifies nothing makes no progress at all. Budget is allocated
+        block_size: draft block length ``K``.
+        min_verify_len: floor on every request's verify length; must stay >= 1
+            (position 0 carries the bonus/anchor token). Budget is allocated
             *above* this floor.
         max_verify_len: cap on every request's verify length; 0 means
-            ``block_size``. Never exceeds ``block_size`` -- a request cannot
-            verify more tokens than the draft proposed.
-        survival_eps: candidates whose survival falls below this are dropped
-            before ranking. Purely a numerical floor, not a tuning knob: it
-            keeps hopeless positions out of the ordering.
+            ``block_size``; never exceeds ``block_size``.
+        survival_eps: numerical floor (not a tuning knob); candidates below it
+            are dropped before ranking.
     """
 
     block_size: int
@@ -143,10 +121,9 @@ def schedule_verify_lens_topk(
         ``[min_verify_len, resolved_max_verify_len]``, summing to at most
         ``bs * min_verify_len + budget``.
 
-    Determinism: ranking uses a value-independent tie-break, so equal survivals
-    always resolve the same way regardless of float noise or backend. Positions
-    are ordered before requests, which biases ties toward *earlier* positions --
-    the ones every downstream prefix depends on.
+    Determinism: ranking uses a value-independent tie-break (position before
+    request), so equal survivals resolve identically regardless of float noise
+    or backend.
     """
     if survival.dim() != 2:
         raise ValueError(f"survival must be [bs, K], got shape {tuple(survival.shape)}")
@@ -164,22 +141,16 @@ def schedule_verify_lens_topk(
     if bs == 0 or schedulable <= 0 or budget <= 0:
         return verify_lens
 
-    # Only positions above the floor are up for grabs: positions [0, floor) are
-    # already granted to every request, so scoring them would let a request win
-    # budget for something it is getting for free.
+    # Positions [0, floor) are already granted to every request; only those
+    # above compete for budget.
     candidates = survival[:, floor : floor + schedulable].to(torch.float32)
     flat = candidates.reshape(-1)
     eligible = flat >= cfg.survival_eps
 
-    # Rank by survival, then break ties deterministically. Sorting the tie-break
-    # key first and using a *stable* sort on the values makes the final order a
-    # pure function of (survival values, position, request) -- no dependence on
-    # the sort implementation's handling of equal keys.
-    #
-    # Ineligible candidates are scored -1 so they sort below every eligible one;
-    # the ``& eligible`` below then drops them even when ``budget`` is larger
-    # than the eligible count. That keeps the whole path free of any device->host
-    # sync (no ``.item()``), so it stays usable inside a captured graph.
+    # Sort the tie-break key first, then stable-sort on the scores: the final
+    # order is a pure function of (survival, position, request). Ineligible
+    # candidates score -1 and are masked by ``& eligible`` below; no
+    # ``.item()``/host sync anywhere, so the path stays capture-safe.
     scores = torch.where(eligible, flat, torch.full_like(flat, -1.0))
     tie_break = torch.arange(schedulable, device=device).repeat(bs) * bs + torch.arange(
         bs, device=device

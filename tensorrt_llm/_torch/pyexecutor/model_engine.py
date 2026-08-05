@@ -259,11 +259,9 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
 
 _DEEP_GEMM_PDL_CONFIGURED = False
 
-# goal doc A3/A4. Ragged-verification layout bugs are silent by construction --
-# the token totals stay integer multiples of the row count, so every
-# divisibility check inside the kernels still passes and rows are merely
-# attributed to the wrong requests. These assertions make that class of bug
-# loud, at the cost of walking the batch on the hot path, so they are opt-in.
+# Ragged layout bugs are silent (rows get attributed to the wrong requests
+# while every kernel-side divisibility check still passes); these assertions
+# make them loud at the cost of walking the batch, so they are opt-in.
 _DSPARK_ASSERT_LAYOUT = os.environ.get("TLLM_DSPARK_ASSERT_LAYOUT",
                                        "0") in ("1", "true", "True")
 
@@ -610,13 +608,8 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
         self.previous_request_ids = []
         # Per-request verify windows seen by the last full _prepare_tp_inputs
-        # pass. All None without ragged verification, so the incremental-update
-        # gate below never trips for uniform speculation.
+        # pass; all None without ragged verification.
         self.previous_verify_lens = []
-        # NOTE: the captured token bucket and the padding rows' window live on
-        # the CUDA graph runner (``ragged_pad_verify_len``), which is what reads
-        # them; the bucket itself is re-derived from the batch in
-        # ``CUDAGraphRunner._ragged_verify_bucket`` so it cannot go stale.
         self.has_previous_device_draft = False
         self.previous_accepted_tokens_cuda = torch.empty((self.batch_size, ),
                                                          dtype=torch.int,
@@ -715,22 +708,17 @@ class PyTorchModelEngine(ModelEngine):
         self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
                                                        dtype=torch.int,
                                                        device='cuda')
-        # Ragged verification windows. These are read *inside* the captured
-        # graph (one-engine acceptance runs in the target's graph), so they must
-        # live at a stable address and be written in place -- rebinding
-        # spec_metadata.verify_lens to a freshly allocated tensor each step
-        # would leave the graph replaying against the first step's buffer.
+        # Ragged verification windows, read *inside* the captured graph: they
+        # must live at a stable address and be written in place.
         self.ragged_verify_lens_cuda = torch.empty((self.batch_size + 1, ),
                                                    dtype=torch.int,
                                                    device='cuda')
         self.ragged_qo_indptr_cuda = torch.empty((self.batch_size + 2, ),
                                                  dtype=torch.int,
                                                  device='cuda')
-        # cap-accept: per-request acceptance ceilings for an UNTRIMMED batch,
-        # and the per-request positions those ceilings discarded. Same
-        # stable-address requirement as the two above -- both are read and
-        # written inside the captured graph. The losses ride back to the host
-        # on the sampler's existing copy, so nothing here ever syncs.
+        # cap-accept: per-request acceptance ceilings for an untrimmed batch
+        # and the positions they discarded. Same stable-address requirement as
+        # above; nothing here ever syncs.
         self.accept_caps_cuda = torch.empty((self.batch_size + 1, ),
                                             dtype=torch.int,
                                             device='cuda')
@@ -1839,38 +1827,25 @@ class PyTorchModelEngine(ModelEngine):
                         f"Capturing {len(graphs)} graphs: {graphs}")
             return graphs
 
-        # Case 2b: DSpark confidence-scheduled verification.
-        # The drafted block is always full -- scheduling trims *verification*,
-        # not drafting -- so draft_len is pinned to the top tier in every mode.
-        # What varies is which axis the tiers land on: `compact` moves them to
-        # the token count (a cross product with the batch sizes), while
-        # `cap-accept` and the static fallback keep the ordinary one graph per
-        # batch size.
-        #
-        # Captured graphs are the expensive part of this feature: each costs
-        # ~10-23 MB of metadata outside the shared pool, taken directly out of
-        # KV cache (the KV pool is sized from what is left after capture). So a
-        # tier that no mode can select is not free, it is KV cache spent on a
-        # graph that will never be replayed.
+        # Case 2b: DSpark confidence-scheduled verification. The drafted block
+        # is always full, so draft_len is pinned to the top tier in every
+        # mode; `compact` moves the tiers to the token axis, `cap-accept` and
+        # the static fallback keep one graph per batch size. Captured graphs
+        # cost KV cache, so capture no tier a mode cannot select.
         if (self.spec_config is not None and getattr(
                 self.spec_config, "enable_confidence_scheduling", False)):
             tiers = sorted({
                 int(t)
                 for t in self.spec_config.verify_len_tiers if int(t) >= 0
             })
-            # The MODE, not the config flag. `cap-accept` is configured with
-            # enable_ragged_verify=True as well, but submits the FULL block, so
-            # capturing the ragged token ladder for it builds synthetic batches
-            # at token totals its real steps never produce -- which fails
-            # during capture, inside MoE, long before any of it is explicable.
+            # The MODE, not the config flag: `cap-accept` also sets
+            # enable_ragged_verify=True but submits the FULL block, so it must
+            # not capture the ragged token ladder.
             from ..speculative.dspark_observability import \
                 trims_submitted_tokens
             if trims_submitted_tokens(self.spec_config):
-                # Ragged always drafts the full block -- only verification is
-                # trimmed -- so draft_len is pinned to the top tier and the
-                # ladder moves to the *token* axis: one bucket per tier, i.e.
-                # exactly the token totals the uniform ladder would produce.
-                # Same graph count, different second axis.
+                # One token bucket per tier -- exactly the totals the uniform
+                # ladder would produce, so the graph count does not grow.
                 top_tier = tiers[-1]
                 graphs = [(bs, top_tier, bs * (t + 1))
                           for bs in cuda_graph_batch_sizes for t in tiers]
@@ -1881,9 +1856,7 @@ class PyTorchModelEngine(ModelEngine):
                     f"{top_tier}).")
                 return graphs
             # One draft length, not the ladder: nothing varies draft_len at
-            # runtime any more (cap-accept pins runtime_draft_len to
-            # planner.max_tier; compact takes the ragged branch above), so
-            # lower tiers would be captured graphs paid for out of KV cache.
+            # runtime, so lower tiers would be captured graphs never replayed.
             top_tier = tiers[-1]
             graphs = [(bs, top_tier) for bs in cuda_graph_batch_sizes]
             logger.info(
@@ -2048,9 +2021,6 @@ class PyTorchModelEngine(ModelEngine):
                 # in this pass uses the non-greedy key; populate's override
                 # below will keep it False on every subsequent iteration.
                 spec_metadata.is_all_greedy_sample = False
-            # Count graphs and report private-pool memory (in the finally
-            # block below): ragged keys multiply the capture set, and OOM
-            # messages report private-pool bytes without attributing them.
             _graph_mem_before = (torch.cuda.memory_reserved(),
                                  torch.cuda.memory_allocated())
             _graph_count = 0
@@ -2101,16 +2071,13 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
-                # The warmup batches published a bucket per captured shape; the
-                # first real step must not inherit the last one. `fit_ragged_
-                # verify_lens` clears it on entry, but a step that never reaches
-                # the fit -- the planner declining, or a non-ragged mode -- would
-                # otherwise key on a bucket from capture.
+                # Warmup published a bucket per captured shape; the first real
+                # step must not inherit the last one (a step that never reaches
+                # the fit would otherwise key on a capture-time bucket).
                 self.cuda_graph_runner.agreed_ragged_bucket = None
-                # Absolute private-pool size, not a delta: capture passes share
-                # the allocator, so per-pass deltas mislead. CUDA graphs live in
-                # private pools (segment_pool_id != (0, 0)) -- the same quantity
-                # PyTorch's OOM message reports -- so sum those directly.
+                # Absolute private-pool size, not a per-pass delta (passes
+                # share the allocator); CUDA graphs live in private pools
+                # (segment_pool_id != (0, 0)).
                 _pool_bytes = 0
                 _pool_ids = set()
                 for _seg in torch.cuda.memory_snapshot():
@@ -3116,14 +3083,10 @@ class PyTorchModelEngine(ModelEngine):
         # sequence contributes one token per iteration).
         spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
         spec_metadata.all_rank_num_seqs = all_rank_num_seqs
-        # DSpark can draft only after the target processes the current bonus token,
-        # because it consumes captured target-layer hidden states for that token.
-        # Prefill computes hidden states for prompt tokens; the first generated token
-        # is sampled from the last prompt logits and has not itself passed through the
-        # target layers. Thus context requests seed the rolling window but do not run
-        # the draft. On mixed steps, num_seqs therefore over-counts the draft MoE
-        # workload; gen-only per-rank counts keep the FUSED_COMM (DeepGEMM MegaMoE)
-        # chunk loop identical across EP ranks.
+        # DSpark drafts only for generation requests (it needs the bonus
+        # token's target hidden states), so on mixed steps num_seqs
+        # over-counts the draft MoE workload; gen-only per-rank counts keep
+        # the FUSED_COMM chunk loop identical across EP ranks.
         if all_rank_num_gens is not None:
             spec_metadata.all_rank_num_gens = all_rank_num_gens
         if (spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
@@ -3407,11 +3370,9 @@ class PyTorchModelEngine(ModelEngine):
         if self.previous_request_ids != request_ids:
             return False
 
-        # This path reuses the attention/spec metadata built by the last full
-        # prepare, which is only valid while every request's sequence length is
-        # unchanged. Uniform speculation guarantees that; ragged verification
-        # re-picks each window every step, so fall back to a full prepare
-        # whenever the windows moved.
+        # The incremental path is only valid while every request's sequence
+        # length is unchanged; ragged verification re-picks windows every
+        # step, so fall back to a full prepare whenever they moved.
         verify_lens = [
             getattr(request, "py_verify_len", None)
             for request in scheduled_requests.generation_requests
@@ -3661,12 +3622,10 @@ class PyTorchModelEngine(ModelEngine):
                                    draft_len: int) -> None:
         """Give a capture batch per-request windows summing to ``verify_bucket``.
 
-        A captured ragged graph is keyed on its token total, so the warmup batch
-        has to hit that total exactly -- otherwise the graph is captured under a
-        key no runtime batch will ever produce, and every ragged step silently
-        falls back to eager. Any split with the right sum captures the right
-        shape (the raggedness lives in the *contents* of qo_indptr, not the
-        shape), so reuse the same spreading rule the runtime fit uses.
+        The warmup batch must hit the bucket total exactly, or the graph is
+        keyed under a total no runtime batch produces and every ragged step
+        silently falls back to eager. Any split with the right sum captures
+        the right shape (the raggedness lives in the contents of qo_indptr).
         """
         requests = batch.generation_requests
         if not requests:
@@ -3681,34 +3640,26 @@ class PyTorchModelEngine(ModelEngine):
         filled = layout.fill_bucket(max_verify_len=1 + int(draft_len))
         for request, tokens in zip(requests, filled.verify_lens.tolist()):
             request.py_verify_len = int(tokens) - 1
-        # Publish it to the runner as well: the graph key carries this value
-        # and the layout assert cross-checks it against the batch walk; the
-        # runtime fit never runs during capture, so nothing else sets it here.
+        # Publish to the runner too: the graph key carries this value, and the
+        # runtime fit never runs during capture.
         self.cuda_graph_runner.agreed_ragged_bucket = int(verify_bucket)
 
     def ragged_verify_token_buckets(self, padded_bs: int) -> List[int]:
         """Captured token totals for a ragged batch of ``padded_bs`` rows.
 
-        One bucket per verify-length tier, i.e. exactly the token counts the
-        uniform ladder would have produced at this batch size. A ragged batch
-        rounds its own total up to one of these, so the captured graph set does
-        not grow beyond the uniform one on the token axis.
+        One bucket per verify-length tier -- exactly the totals the uniform
+        ladder would produce, so the captured graph set does not grow.
         """
         if self.spec_config is None:
             return []
         tiers = sorted({
             int(t)
-            for t in getattr(self.spec_config, "verify_len_tiers", None) or []
+            for t in self.spec_config.verify_len_tiers
         })
         return [int(padded_bs) * (t + 1) for t in tiers]
 
     def _record_dspark_graph_use(self, *, replayed: bool, shape=None) -> None:
-        """Count graph replay vs eager for the DSpark ragged stats, if enabled.
-
-        Deliberately tolerant: this runs on the hot path for every model, and a
-        non-DSpark engine has no worker, no planner and no stats object. Guard
-        rather than branch on config so the cost is one attribute lookup.
-        """
+        """Count graph replay vs eager for the DSpark ragged stats, if enabled."""
         stats = self._dspark_ragged_stats
         if stats is not None:
             stats.record_graph(replayed=replayed, shape=shape)
@@ -3726,49 +3677,30 @@ class PyTorchModelEngine(ModelEngine):
             peer_stats: Optional[List[List[int]]] = None) -> Optional[int]:
         """Round this batch's verify total onto a captured bucket, in place.
 
-        The graph key gains a token axis under ragged verification: two batches
-        with the same row count and the same maximum draft length can still
-        carry very different token totals, and the flat token count is baked
-        into the captured graph. So the total has to land on a captured value
-        *before* the key is built, and the slack is spent on real verification
-        rather than thrown away (see ``RaggedVerifyLayout.fill_bucket``).
-
-        Writes the fitted window back onto each request's ``py_verify_len`` and
-        returns the bucket, or None when no captured shape fits -- in which
-        case the caller should fall back to uniform scheduling rather than drop
-        out of graph replay.
+        The flat token count is a CUDA-graph key axis, so the total must land
+        on a captured value *before* the key is built; the rounding slack is
+        spent on real verification (``RaggedVerifyLayout.fill_bucket``).
+        Writes the fitted window onto each request's ``py_verify_len`` and
+        returns the bucket, or None when no captured shape fits (the caller
+        falls back to uniform scheduling).
 
         ``peer_stats`` is every attention-DP rank's ``[num_requests,
-        total_tokens, all_can_graph]``, including this rank's. The first two
-        are required under ADP because ``_get_padded_batch`` pads to the
-        *maximum* batch size across ranks: sizing the bucket from the local
-        count alone makes each rank pick a different shape, which is the
-        graph-key divergence this whole path exists to avoid.
-
-        The third is the group's answer to "will that maximum be taken at
-        all", identical on every rank. ``_get_padded_batch`` only takes it when
-        every rank can graph the step; one rank holding a context request makes
-        each keep its own row count instead. It is gathered rather than
-        predicted because the graph runner's own allgather, which decides this,
-        runs after the fit.
+        total_tokens, all_can_graph]``, including this rank's: the bucket must
+        be sized from the cross-rank maximum or ranks pick different shapes,
+        and ``all_can_graph`` is the group's answer to whether that maximum
+        will be taken at all.
         """
         runner = self.cuda_graph_runner
-        # Cleared on entry so that every early return leaves no stale
-        # value behind: the graph key reads this, and a bucket carried
-        # over from a previous step would key into the wrong graph. The
-        # padded row count follows the same rule -- record_step books it
-        # into padded_bs_hist on every step, and a value surviving from the
-        # last successful fit would pollute exactly the fallback steps the
-        # histogram exists to distinguish.
+        # Cleared on entry so every early return leaves no stale value: a
+        # bucket carried over from a previous step would key into the wrong
+        # graph. The padded row count follows the same rule.
         runner.agreed_ragged_bucket = None
         self._dspark_last_padded_bs = None
         if not runner.enabled or not verify_lens:
             return None
         if len(verify_lens) != len(generation_requests):
-            # Partially windowing a batch is worse than not windowing it: the
-            # token layout is built per request and would go ragged, while
-            # _attach_ragged_verify_layout sees the missing windows and leaves
-            # the spec metadata uniform. Refuse and let the caller fall back.
+            # A partially windowed batch would go ragged in the token layout
+            # while the spec metadata stayed uniform; refuse instead.
             logger.debug(
                 f"DSpark ragged: got {len(verify_lens)} verify lengths for "
                 f"{len(generation_requests)} generation requests; falling back "
@@ -3776,7 +3708,7 @@ class PyTorchModelEngine(ModelEngine):
             return None
         tiers = sorted({
             int(t)
-            for t in getattr(self.spec_config, "verify_len_tiers", None) or []
+            for t in self.spec_config.verify_len_tiers
         })
         if not tiers:
             return None
@@ -3789,33 +3721,17 @@ class PyTorchModelEngine(ModelEngine):
         bs_buckets = sorted({int(b) for b in runner.supported_batch_sizes})
         if not bs_buckets:
             return None
-        # The token bucket grid depends on the row count, which itself depends
-        # on the widest rank, so resolve the rows first and then the tokens.
-        # Whether _get_padded_batch will take the cross-rank row maximum at all
-        # is a group decision, gathered with the peer stats rather than guessed
-        # here: it only does so when EVERY rank can graph this step. One rank
-        # holding a context request makes each rank keep its own row count, and
-        # a fit that assumed the maximum would budget tokens for pad rows that
-        # never arrive. Third element of a peer stat; absent means single-rank,
-        # where the local count IS the maximum.
+        # Resolve rows first, then tokens: the bucket grid depends on the
+        # widest rank's row count. `all_can_graph` (third peer-stat element;
+        # absent means single-rank) says whether _get_padded_batch will take
+        # the cross-rank row maximum at all -- only when EVERY rank can graph.
         all_can_graph = (bool(peer_stats[0][2]) if peer_stats
                          and len(peer_stats[0]) > 2 else True)
         if not all_can_graph:
-            # Some rank holds a context request, so no rank will replay a graph
-            # this step -- and everything below exists to land the batch on a
-            # captured one. Two things then go wrong at once if we continue:
-            # _get_padded_batch declines the cross-rank row maximum AND pads the
-            # TOTAL batch size (context + generation) while this fit counts
-            # generation rows only, so its budget goes to rows that never
-            # appear. Observed as `requests carry 18 generation tokens but the
-            # CUDA-graph key's token axis is 24` -- 3 generation rows fitted as
-            # 4 -- which throws inside the forward and, since a rank that throws
-            # stops issuing collectives, deadlocks every other rank behind it.
-            #
-            # An eager ragged step would still save real compute, so this is
-            # conservative rather than necessary; making it safe means teaching
-            # the bucket machinery that a step may have no graph at all, which
-            # is a larger change than the saving justifies on a mixed batch.
+            # No rank will replay a graph this step, and _get_padded_batch
+            # pads differently than this fit assumes on such steps, so the
+            # budget would go to rows that never appear. Decline (conservative:
+            # an eager ragged step would still save compute).
             logger.debug(
                 "DSpark ragged: some rank cannot run a CUDA graph this step, "
                 "so no captured bucket applies; falling back to uniform")
@@ -3826,28 +3742,11 @@ class PyTorchModelEngine(ModelEngine):
         padded_bs = runner._round_up_batch_size(widest_rows)
         if padded_bs == 0:
             return None
-        # The whole fit is built on the assumption that the batch will be padded
-        # up to `padded_bs`: the bucket grid is derived from it and fill_bucket
-        # hands the rounding slack to rows that do not exist yet. But padding is
-        # allowed to decline -- _get_padded_batch bails when the dummy request
-        # has no KV capacity, when padding would exceed the configured batch
-        # size, and on a few other resource checks. When it does, the rows never
-        # appear, the grid was derived for a row count that is not realised, and
-        # the filled total lands in no captured bucket: observed as
-        # graph_miss_keys {'(193, 5, False, False, True, 449)': 16} on a run
-        # where the ladder held 192 and 256 but not 193, costing every rank a
-        # replay on 16 of 318 steps.
-        #
-        # Only reachable with real trimming. Without it the total is always
-        # padded_bs * (max_verify_len + 1), which is a captured bucket by
-        # construction, so no amount of uniform testing surfaces this.
-        #
-        # Decline to go ragged rather than fit against rows that will not exist.
-        # Uniform always has a captured graph, so the fallback is cheap and the
-        # step still runs.
-        # `will_pad_to` mirrors only the SIZE guards; the group's graph answer
-        # is `all_can_graph` above, and the resource bails stay unmodeled -- an
-        # optimistic miss desyncs the layout from the graph key under ADP.
+        # The fit assumes the batch will actually be padded to `padded_bs`;
+        # padding may decline, and then the fitted total lands in no captured
+        # bucket. Decline to go ragged rather than fit against rows that will
+        # not exist (`will_pad_to` mirrors only the SIZE guards; the group's
+        # graph answer is `all_can_graph` above).
         if not runner.will_pad_to(padded_bs, len(token_lens)):
             logger.debug(
                 f"DSpark ragged: padding to {padded_bs} rows is not available "
@@ -3876,17 +3775,11 @@ class PyTorchModelEngine(ModelEngine):
             return None
         padded_bs, bucket = shape.padded_bs, shape.bucket
 
-        # The CUDA-graph padding rows are appended later by _get_padded_batch,
-        # which appends a *single shared dummy object*, so every pad row
-        # necessarily carries the same window. Their contribution therefore has
-        # to be decided here, not left to the fill: a total the padding step
-        # then contradicts would key into a graph that was never captured.
-        #
-        # Pad rows take the minimum (one token) so real requests get the slack,
-        # and only grow when the real rows cannot absorb the bucket on their
-        # own -- SGLang spreads the leftover across pad rows for the same
-        # reason, just at per-row granularity it can afford because it builds
-        # the pad block on device.
+        # Pad rows are appended later as a *single shared dummy object*, so
+        # they all carry the same window and their contribution must be
+        # decided here, not left to the fill. They take the minimum (one
+        # token) so real requests get the slack, growing only when the real
+        # rows cannot absorb the bucket.
         n_real = len(token_lens)
         n_pad = padded_bs - n_real
         real_capacity = n_real * max_verify_len
@@ -3929,23 +3822,16 @@ class PyTorchModelEngine(ModelEngine):
         try:
             filled = layout.fill_bucket(max_verify_len=max_verify_len)
         except ValueError as exc:
-            # The guards are about caller consistency, not impossibility; a
-            # mismatch means this batch has no captured shape, so degrade to
+            # A mismatch means this batch has no captured shape; degrade to
             # uniform rather than run eager.
             logger.debug(f"DSpark ragged bucket fit failed, falling back to "
                          f"uniform scheduling: {exc}")
             return None
 
         # Published only now, past the last way this fit can fail: a stale
-        # published bucket on a fallback step is the state family behind the
-        # ragged IMA, and clearing at entry protects the next call, not the
-        # remainder of THIS one. The graph key carries `agreed_ragged_bucket`
-        # verbatim so every attention-DP rank keys on the value they
-        # allgathered, and the layout assert cross-checks it against the
-        # batch walk. `_dspark_last_total_tokens` lets a graph miss report the
-        # shape it submitted; `_dspark_last_padded_bs` is the row count the
-        # stats need to book a ceiling comparable to `delivered`;
-        # `ragged_pad_verify_len` is stamped on the shared dummy by
+        # published bucket on a fallback step is the state behind the ragged
+        # IMA. `_dspark_last_total_tokens`/`_dspark_last_padded_bs` feed the
+        # stats; `ragged_pad_verify_len` is stamped on the shared dummy by
         # _get_padded_batch.
         self._dspark_last_total_tokens = int(bucket)
         self._dspark_last_padded_bs = int(padded_bs)
@@ -3961,13 +3847,9 @@ class PyTorchModelEngine(ModelEngine):
     def _ragged_token_lens(generation_requests) -> Optional[List[int]]:
         """Each generation request's token window, or None if the batch is uniform.
 
-        ``py_verify_len`` counts drafted positions; a request also verifies its
-        bonus position, so its token window is one wider.
-
-        Returns None unless *every* request carries a window. A partially
-        windowed batch is worse than an unwindowed one: the flat token layout
-        would go ragged while the spec metadata stayed uniform, which is silent
-        token misattribution rather than a crash.
+        ``py_verify_len`` counts drafted positions; the token window adds the
+        bonus position. None unless *every* request carries a window --
+        partially windowed batches are silent token misattribution.
         """
         verify_lens = [
             getattr(request, "py_verify_len", None)
@@ -3982,31 +3864,14 @@ class PyTorchModelEngine(ModelEngine):
         """Hand the attention metadata this step's gen-token layout, before it
         prepares.
 
-        Split out of :meth:`_attach_ragged_verify_layout` because of ordering:
-        ``attn_metadata.prepare()`` is the *only* consumer of
-        ``ragged_verify_lens`` -- it drives the DSA expanded-buffer decision, the
-        per-row causal extents, and DeepSeek-V4's per-request compressor token
-        counts -- and it runs well before the spec metadata is assembled.
-        Publishing both together meant ``prepare()`` read the previous step's
-        split every time, and None on the first ragged step.
-
-        The spec-metadata half stays where it was; it is consumed later and has
-        no such constraint.
-
-        The uniform stride is published for the same reason and at the same
-        moment. ``prepare()`` expands kv_lens and the block table once per query
-        token, and the only value that describes how many tokens a request
-        actually contributes this step is ``1 + runtime_draft_len``. The
-        attention metadata's own ``max_draft_tokens`` cannot stand in for it: it
-        is the static ceiling that sizes those buffers, and for the parallel-draft
-        modes it is pinned to ``tokens_per_gen_step - 1`` for the engine's whole
-        lifetime (see the ``update_spec_dec_param`` call in :meth:`forward`), so
-        it does not move when a shorter tier is chosen.
-
-        Note this has to happen here rather than in ``update_spec_dec_param``:
-        that runs against the base metadata, while ``prepare()`` runs against the
-        per-key CUDA-graph copy taken later, and a plain attribute set on the
-        base is invisible to the copy.
+        Split out of :meth:`_attach_ragged_verify_layout` for ordering:
+        ``attn_metadata.prepare()`` is the only consumer of
+        ``ragged_verify_lens`` and runs well before the spec metadata is
+        assembled. The uniform stride is published here too, because
+        ``max_draft_tokens`` is a static buffer-sizing ceiling that does not
+        move when a shorter tier is chosen. It cannot live in
+        ``update_spec_dec_param`` either: that runs against the base metadata,
+        and ``prepare()`` runs against the per-key CUDA-graph copy.
         """
         if attn_metadata is None:
             return
@@ -4019,34 +3884,21 @@ class PyTorchModelEngine(ModelEngine):
 
     def _assert_ragged_layout_consistent(self, spec_metadata, attn_metadata,
                                          scheduled_requests) -> None:
-        """goal doc A3: one identity that catches H0, H5 and H8 at once.
+        """Assert the four descriptions of this step's generation-token count agree:
 
-        Four independent descriptions of "how many generation tokens are in this
-        step" have to agree:
+          sum(1 + py_verify_len)         the requests, as fitted
+          num_tokens - num_ctx_tokens    the flat input layout
+          total_verify_tokens            what acceptance slices by
+          the ragged bucket              the CUDA-graph key's token axis
 
-          sum(1 + py_verify_len)   the requests, as the scheduler fitted them
-          num_tokens - num_ctx_tokens   the flat input layout the kernels see
-          total_verify_tokens      what acceptance will slice by
-          the ragged bucket        the CUDA-graph key's token axis
-
-        Each of the bugs this guards against breaks exactly one of these while
-        leaving the others self-consistent, which is why none of them raise on
-        their own: the token totals are always an integer multiple of the row
-        count, so the divisibility checks inside the kernels still pass and the
-        rows are simply attributed to the wrong requests.
-
-        Off by default -- it walks the batch on the hot path. Enable with
-        TLLM_DSPARK_ASSERT_LAYOUT=1 for correctness runs.
+        A mismatch is silent token misattribution, not a crash. Off by
+        default (walks the batch); enable with TLLM_DSPARK_ASSERT_LAYOUT=1.
         """
         verify_lens = self._ragged_token_lens(
             scheduled_requests.generation_requests)
         if verify_lens is None:
-            # A uniform step must not be carrying a published ragged bucket:
-            # that is exactly the stale state a failed fit used to leave
-            # behind, and a later ragged step would key a graph the batch
-            # does not describe. Checked here because the ragged branch below
-            # never runs for uniform steps, which made the staleness invisible
-            # even with this assert enabled.
+            # A uniform step must not carry a published ragged bucket: a later
+            # ragged step would key a graph the batch does not describe.
             agreed_stale = self.cuda_graph_runner.agreed_ragged_bucket
             assert agreed_stale is None, (
                 f"uniform step carries a stale published ragged bucket "
@@ -4077,22 +3929,17 @@ class PyTorchModelEngine(ModelEngine):
             f"tokens but spec_metadata.total_verify_tokens is {from_spec}; "
             f"acceptance would slice the target logits at the wrong offsets.")
         if agreed is not None:
-            # Two derivations of the token axis: `from_requests` walks this
-            # batch's windows, `agreed` is the fit's allgathered arithmetic,
-            # and the graph key carries the latter. If the fit reserved for
-            # padding rows that were then not appended, the replayed graph is
-            # a different width than the batch -- and nothing downstream says
-            # so, because acceptance's output_size was frozen at capture.
+            # `from_requests` walks this batch's windows; `agreed` is what the
+            # graph key carries. A mismatch means the replayed graph is a
+            # different width than the batch, and nothing downstream says so.
             assert from_requests == int(agreed), (
                 f"ragged layout mismatch: the batch carries {from_requests} "
                 f"generation tokens but the fit agreed on {agreed}, which is "
                 f"what the CUDA-graph key's token axis says; the replayed "
                 f"graph was captured at a different width.")
 
-        # Row axis. Everything above is a token count, so all four agree even
-        # when the token-major presentation is malformed -- the presentation is
-        # about how many ROWS the MLA generation ops are shown, which is a
-        # different quantity and needs its own check.
+        # Row axis: the token-major presentation can be malformed while every
+        # token count above agrees, so it needs its own check.
         view = attn_metadata.token_major_gen_view() if hasattr(
             attn_metadata, "token_major_gen_view") else None
         if view is not None:
@@ -4111,28 +3958,16 @@ class PyTorchModelEngine(ModelEngine):
     def _pinned_host(self, key: str, values, dtype) -> torch.Tensor:
         """A persistent pinned staging buffer holding ``values``.
 
-        Every async host-to-device copy on the ragged path used to source from
-        a freshly built ``torch.tensor(..., pin_memory=True)``. Nothing keeps
-        that temporary alive: the statement ends, Python is free to reclaim the
-        page, and ``non_blocking=True`` means the copy has only been QUEUED.
-        PyTorch does not extend the lifetime of an async H2D source -- that is
-        the caller's job -- so the DMA can read a freed page.
-
-        Intermittent by nature: the fault needs the allocator to reuse the
-        page before the queued copy drains (CUDA_LAUNCH_BLOCKING=1 hides it).
-
-        Buffers are keyed by name and grown monotonically, so a steady state
-        allocates nothing.
+        Async H2D sources must outlive the queued copy -- PyTorch does not
+        extend the lifetime of an async source, so a temporary tensor can be
+        reclaimed while the DMA still reads it. Buffers are keyed by name and
+        grown monotonically.
         """
         values = list(values)
         cache = self._pinned_host_cache
-        # WAR guard, the counterpart of the use-after-free this helper fixed:
-        # a persistent buffer can be REWRITTEN while its previous non_blocking
-        # H2D is still queued behind an in-flight forward, so the device copies
-        # this step's values into last step's consumer. Callers record the
-        # key's event via _pinned_host_record after enqueuing the copy; waiting
-        # here closes the window, and in the steady state the event completed
-        # long ago so this costs nothing.
+        # WAR guard: the buffer must not be rewritten while its previous
+        # non_blocking H2D is still queued. Callers record the key's event via
+        # _pinned_host_record after enqueuing; waiting here closes the window.
         evt = self._pinned_host_events.get(key)
         if evt is not None:
             evt.synchronize()
@@ -4165,28 +4000,19 @@ class PyTorchModelEngine(ModelEngine):
     def _attach_accept_caps(self, spec_metadata, generation_requests) -> None:
         """Publish ``cap-accept`` ceilings, without touching the layout.
 
-        ``py_verify_cap`` is the cap-accept twin of ``py_verify_len``: the
-        scheduler's window for a batch whose token axis was deliberately NOT
-        trimmed. Keeping them on separate attributes is what makes the mode a
-        pure addition -- every layout consumer keys off ``py_verify_len``, so
-        the input packing, the DSA row expansion, the graph key and the KV
-        rewind all keep seeing an ordinary uniform batch with no changes.
-
-        The cap is in ``num_accepted_tokens`` units (accepted drafts plus the
-        bonus), matching ``verify_lens``, hence ``1 + py_verify_cap``.
+        ``py_verify_cap`` is kept separate from ``py_verify_len`` so every
+        layout consumer (input packing, DSA row expansion, graph key, KV
+        rewind) keeps seeing an ordinary uniform batch. The cap is in
+        ``num_accepted_tokens`` units (accepted drafts plus the bonus), hence
+        ``1 + py_verify_cap``.
         """
         caps = [
             getattr(request, "py_verify_cap", None)
             for request in generation_requests
         ]
         if not caps or any(cap is None for cap in caps):
-            # Partial caps are worse than none: the uncapped requests would
-            # commit their full block while the rest honoured a window, which
-            # is neither mode and reproducible by neither. So drop them all --
-            # but say so, because the result is a run that looks like a
-            # successful cap-accept and measured nothing. The CUDA-graph
-            # padding dummy used to land here on every padded step (it carries
-            # no cap of its own); it is given one in `pad_batch` now.
+            # Partial caps are neither mode: drop them all, but warn, because
+            # the step then silently runs as `static`.
             if caps and any(cap is not None for cap in caps):
                 if not getattr(self, "_warned_partial_accept_caps", False):
                     self._warned_partial_accept_caps = True
@@ -4201,9 +4027,8 @@ class PyTorchModelEngine(ModelEngine):
             return
 
         n = len(caps)
-        # Written through the persistent buffer for the same reason as
-        # verify_lens: acceptance runs inside the target's captured graph, so a
-        # freshly allocated tensor here would be invisible to every replay.
+        # Persistent buffer: acceptance runs inside the captured graph, so a
+        # fresh tensor here would be invisible to every replay.
         caps_view = self.accept_caps_cuda[:n]
         caps_view.copy_(self._pinned_host("accept_caps",
                                           [1 + int(cap) for cap in caps],
@@ -4217,12 +4042,10 @@ class PyTorchModelEngine(ModelEngine):
                                      generation_requests) -> None:
         """Publish this step's per-request verify windows to both metadatas.
 
-        Only the DSpark confidence scheduler sets ``py_verify_len``; every other
-        path leaves the fields None and the uniform strides downstream stay
-        live. Both metadatas need it and for different reasons: acceptance has
-        to know each request's window to stop its cumulative product at the
-        right place, and the DSA indexer has to expand kv_lens/block tables one
-        row per query token instead of a fixed count per request.
+        Only the DSpark confidence scheduler sets ``py_verify_len``; every
+        other path leaves the fields None. Acceptance needs the windows to
+        slice correctly; the DSA indexer needs them to expand kv_lens/block
+        tables per query token.
         """
         self._attach_accept_caps(spec_metadata, generation_requests)
         token_lens = self._ragged_token_lens(generation_requests)
@@ -4238,9 +4061,8 @@ class PyTorchModelEngine(ModelEngine):
         from ..speculative.dspark_ragged import build_qo_indptr
 
         n = len(token_lens)
-        # Write through the persistent buffers rather than binding a fresh
-        # tensor: a captured graph baked in the address it saw at capture time,
-        # so a new allocation here would be invisible to every replay.
+        # Persistent buffers: a captured graph baked in the address it saw at
+        # capture time, so a fresh tensor would be invisible to every replay.
         lens_view = self.ragged_verify_lens_cuda[:n]
         lens_view.copy_(self._pinned_host("ragged_verify_lens", token_lens,
                                           torch.int32),
@@ -4354,14 +4176,9 @@ class PyTorchModelEngine(ModelEngine):
                 dtype=torch.long,
                 pin_memory=prefer_pinned()).to(new_tokens_lens_device.device,
                                                non_blocking=True)
-            # `output_size` is not optional here. With a tensor `repeats`,
-            # repeat_interleave has to know the output length before it can
-            # allocate, and without this it gets it by reading the cumulative
-            # sum back to the host -- a device->host sync on every ragged step,
-            # inside the overlap scheduler's window, which is precisely what
-            # overlap exists to avoid. The total is already known on the host:
-            # the caller derived `total_num_tokens` as
-            # `sum(tokens_per_extend_request)`.
+            # `output_size` is not optional: without it repeat_interleave with
+            # tensor `repeats` reads the cumulative sum back to the host -- a
+            # device->host sync on every ragged step.
             previous_pos_indices = torch.repeat_interleave(
                 previous_slots,
                 tokens_per_request_device,
@@ -5042,7 +4859,7 @@ class PyTorchModelEngine(ModelEngine):
             self.runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
-            if getattr(request, "py_needs_onehot_draft_probs", False):
+            if request.py_needs_onehot_draft_probs:
                 if request.py_seq_slot is not None:
                     padding_gen_slots.append(request.py_seq_slot)
                 request.py_needs_onehot_draft_probs = False  # consume once
@@ -5057,15 +4874,9 @@ class PyTorchModelEngine(ModelEngine):
             if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
-                # Under ragged verification the block is still drafted in full,
-                # but only the request's own window is submitted to the target.
-                # This branch runs whenever the overlap scheduler is off -- i.e.
-                # on every step of the accuracy configuration -- so taking the
-                # full drafted length here would leave the flat token layout
-                # uniform while the spec metadata and the CUDA-graph key both
-                # believe it is ragged: silent token misattribution rather than
-                # a crash. Mirrors the overlap branch below, which already
-                # derives every length from the same per-request value.
+                # Only the request's own window is submitted to the target;
+                # taking the full drafted length here would desynchronize the
+                # flat token layout from the spec metadata and the graph key.
                 num_draft_tokens = get_request_tokens_per_gen_step(
                     request, 1 + get_draft_token_length(request)) - 1
                 if not (request.is_attention_dp_dummy
@@ -5504,13 +5315,9 @@ class PyTorchModelEngine(ModelEngine):
 
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
-                # Ragged verification gives each request its own window, so the
-                # fixed [previous_batch_len, runtime_tokens_per_gen_step] block
-                # gathers below no longer describe the layout. Detect that here
-                # and fall back to explicit (row, col) index lists; a uniform
-                # batch -- every non-DSpark model, and DSpark whenever the
-                # scheduler picks one window for the whole batch -- keeps the
-                # cheaper strided path.
+                # Ragged windows break the fixed strided gathers below; use
+                # explicit (row, col) index lists, keeping the cheaper strided
+                # path for uniform batches.
                 is_ragged_gen = any(
                     tokens != runtime_tokens_per_gen_step
                     for tokens in previous_batch_tokens_per_request)
@@ -5569,15 +5376,10 @@ class PyTorchModelEngine(ModelEngine):
                     previous_kv_len_offsets = (
                         new_tokens_lens_device[previous_slots] -
                         tokens_per_previous_request)
-                    # The gather above reads the sampler's slot-indexed store;
-                    # a slot the sampler has not (yet) written for the previous
-                    # step yields a stale or uninitialized count, and the
-                    # captured kv_lens correction then walks the KV append past
-                    # the request's allocated blocks (the ragged IMA). The
-                    # physically possible range is tight -- accepted tokens
-                    # minus this request's window -- so clamp to it; a clamped
-                    # value is at worst one window of KV length, never an OOB
-                    # address.
+                    # A slot the sampler has not yet written yields a stale
+                    # count, and the captured kv_lens correction then walks the
+                    # KV append out of bounds (the ragged IMA); clamp to the
+                    # physically possible range.
                     previous_kv_len_offsets = previous_kv_len_offsets.clamp_(
                         min=-int(self.runtime_draft_len + 1),
                         max=int(self.runtime_draft_len + 1))
@@ -5743,24 +5545,13 @@ class PyTorchModelEngine(ModelEngine):
                 helix_is_inactive_rank=helix_is_inactive_rank,
             )
 
-        # Ragged verification is the one case where the per-request lengths
-        # genuinely move between replays of the same graph: the row count and
-        # the padded token total are both pinned by the key, but how the tokens
-        # are split across rows is not. Leaving the captured ones(bs)*(1+top)
-        # in place would make attn_metadata.num_tokens (== seq_lens.sum(),
-        # interface.py) disagree with the input_ids width on every trimmed step
-        # -- and that sum is what attention-DP all-gathers and the MoE chunks
-        # from. The setter already copies in place under CUDA graphs (see its
-        # comment: "The seqlens can change if we are doing spec decode"), so
-        # this reallocates nothing as long as the row count is unchanged.
-        # Publish before the refresh decision below, not after: that decision
-        # asks whether this is a ragged step, and asking `attn_metadata` before
-        # this step's windows are on it reads the *previous* step's answer --
-        # None on a freshly copied per-key graph metadata. The refresh is then
-        # skipped and `seq_lens` keeps the uniform `ones(bs) * (1 +
-        # max_draft_tokens)` that `create_cuda_graph_metadata` seeded it with,
-        # so the layout claims bs*(top_tier+1) tokens while the windows describe
-        # the trimmed bucket.
+        # Under ragged verification the per-request lengths move between
+        # replays of the same graph (the key pins the row count and token
+        # total, not the split), so seq_lens must be refreshed or
+        # attn_metadata.num_tokens disagrees with the input_ids width. Publish
+        # BEFORE the refresh decision below: it asks the metadata whether this
+        # step is ragged, and asking before this step's windows are on it
+        # reads the previous step's answer.
         self._publish_gen_token_layout(attn_metadata,
                                        scheduled_requests.generation_requests)
 
@@ -7189,17 +6980,10 @@ class PyTorchModelEngine(ModelEngine):
             )
 
             can_run_graph = key is not None
-            # A ragged step that misses its captured shape does not raise -- it
-            # quietly runs eager, which costs far more than the tokens it
-            # trimmed. Record it so the miss is a counter rather than something
-            # only a profiler would reveal.
-            #
-            # Only generation-only steps count. A batch carrying context
-            # requests has no generation graph to miss, so recording it as an
-            # eager fallback would make `graph_eager` a prefill counter -- and
-            # `assert_ragged_active` refuses a run with any eager step, so that
-            # miscount alone makes the check unsatisfiable on every real
-            # workload.
+            # A ragged step that misses its captured shape quietly runs eager;
+            # count it. Only generation-only steps count: a batch with context
+            # requests has no generation graph to miss, and booking it as
+            # eager would make `assert_ragged_active` unsatisfiable.
             if padded_requests.can_run_cuda_graph:
                 self._record_dspark_graph_use(
                     replayed=can_run_graph,

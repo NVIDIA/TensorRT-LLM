@@ -274,17 +274,10 @@ class CUDAGraphRunner:
                 set(draft_len_list)) == 1, "All draft lengths must be the same"
             key = (batch_size, draft_len, False, short_seq_len_mode,
                    is_all_greedy_sample)
-            # Ragged verification breaks the link between the row count and the
-            # token count: the block is still drafted in full (so draft_len is
-            # unchanged) but the number of positions actually verified varies,
-            # and that flat token count is baked into the captured graph. Add it
-            # as a second axis. The element is absent for every uniform batch,
-            # so those keys stay exactly what they were.
-            #
-            # Derived from the batch rather than plumbed in, because this runs
-            # inside pad_batch: the padding rows are already present and must be
-            # counted, and the scheduler has already fitted the total onto a
-            # captured bucket (see ModelEngine.fit_ragged_verify_lens).
+            # Ragged verification bakes the flat verified-token total into the
+            # captured graph, so it becomes a second key axis; the element is
+            # absent for uniform batches, whose keys stay exactly what they
+            # were.
             verify_bucket = self._ragged_verify_bucket(batch)
             if verify_bucket is not None:
                 key = key + (verify_bucket, )
@@ -293,45 +286,34 @@ class CUDAGraphRunner:
     def _ragged_verify_bucket(self, batch: ScheduledRequests) -> Optional[int]:
         """Total verified token count when the batch uses ragged windows.
 
-        None unless *every* generation request carries a window, so a batch the
-        scheduler declined to make ragged -- or any non-DSpark batch -- keeps
-        the original key.
-
-        Config-gated before touching the batch: this runs on every graph-key
-        build for every model, and a per-request scan there is pure overhead for
-        the ~all of them that will never be ragged.
+        None unless *every* generation request carries a window; None keeps
+        the original (uniform) key. Config-gated before touching the batch:
+        this runs on every graph-key build for every model.
         """
         # Keyed on the MODE: `cap-accept` shares this config flag but never
         # shrinks the token axis, so it must keep the ordinary uniform key.
         from ..speculative.dspark_observability import trims_submitted_tokens
         if not trims_submitted_tokens(self.spec_config):
             return None
-        # Enforce the docstring: None unless EVERY generation request carries a
-        # window. Windows can vanish between the fit and key derivation (planner
-        # or peer declined, roster changed); a ragged key over a window-less
-        # batch replays stale token-major row maps -- the ragged IMA.
+        # Windows can vanish between the fit and key derivation; a ragged key
+        # over a window-less batch replays stale token-major row maps (IMA).
         if any(
                 getattr(request, "py_verify_len", None) is None
                 for request in batch.generation_requests):
             return None
-        # The bucket the fit agreed on, not a fresh sum over the batch. Summing
-        # here walks generation_requests *after* _get_padded_batch has appended
-        # padding, so it is a second, independent derivation of a quantity every
-        # attention-DP rank must match exactly -- agreement was incidental. The
-        # fitted value is computed from allgathered peer stats by rules every
-        # rank runs identically, so it agrees by construction. None means this
-        # step is not ragged, which keeps the key exactly what it was.
+        # Return the fitted bucket, never a fresh sum over the batch: every
+        # attention-DP rank must key on the same value, and the fit's
+        # allgathered arithmetic agrees by construction where a local sum only
+        # agrees by accident.
         return self.agreed_ragged_bucket
 
     @staticmethod
     def _local_draft_len(batch: ScheduledRequests) -> int:
         """This rank's draft length, for the attention-DP shape comparison.
 
-        Deliberately tolerant where :meth:`get_graph_key` asserts: this runs
-        before the batch is known to be graphable, and a batch whose requests
-        disagree has no single draft length to compare. Reporting the maximum
-        makes such a batch differ from a well-formed peer, which is the
-        conservative answer -- the gate then declines the graph.
+        Tolerant where :meth:`get_graph_key` asserts: a malformed batch
+        reports its max, differs from well-formed peers, and the gate
+        declines the graph.
         """
         return max(
             (len(request.py_draft_tokens)
@@ -385,13 +367,8 @@ class CUDAGraphRunner:
         - The spec_metadata for the graph, if applicable.
         - The key for the graph, if applicable.
         """
-        # Why the last call declined, for the DSpark ragged counters. A miss is
-        # counted at the call site, which cannot see which of the several
-        # independent reasons applied -- and they mean opposite things: a peer
-        # shape mismatch is one rank declining to go ragged and dragging the
-        # whole world eager, while an uncaptured key is the token bucket grid
-        # being wrong. Attributing one to the other sends the fix to the wrong
-        # place.
+        # Why the last call declined, for the DSpark ragged counters; the call
+        # site that counts the miss cannot see the reason.
         self.last_miss_reason = None
         self.last_miss_key = None
 
@@ -403,16 +380,11 @@ class CUDAGraphRunner:
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            # goal doc §4.4. Batch size alone is not enough once the token
-            # count stops tracking the row count, and replay freezes
-            # all_rank_num_tokens, so a mismatch is invisible at replay time:
-            # compare every key component a rank can decide for itself.
-            #
-            # `draft_len` is agreed by the DSpark planner's single collective,
-            # but it is also settable rank-locally by the acceptance-rate
-            # speculation gate, so it is compared here too rather than assumed.
-            # -1 stands in for "uniform batch" / "not applicable" so the payload
-            # is plain ints on every rank and compares elementwise.
+            # Compare every key component a rank can decide for itself: replay
+            # freezes all_rank_num_tokens, so a shape mismatch is invisible at
+            # replay time. draft_len is settable rank-locally (acceptance-rate
+            # gate), so it is compared rather than assumed. -1 = "not
+            # applicable" so the payload is plain ints on every rank.
             local_bucket = self._ragged_verify_bucket(
                 batch) if can_run_cuda_graph else None
             all_can_graph_batch = self.config.dist.tp_allgather([
@@ -427,10 +399,6 @@ class CUDAGraphRunner:
                 for peer in all_can_graph_batch)
 
             if not is_all_gen_only or not all_shapes_equal:
-                # Deliberately distinguished: "some rank had contexts" is
-                # ordinary continuous batching, while "shapes differ" means a
-                # rank chose a different ragged bucket and is the one worth
-                # chasing.
                 self.last_miss_reason = ("peer_not_gen_only"
                                          if not is_all_gen_only else
                                          "peer_shape_mismatch")
@@ -459,8 +427,6 @@ class CUDAGraphRunner:
         # Graph doesn't exist yet.  If on-the-fly capture is not allowed,
         # fall back to eager so the caller doesn't need a separate check.
         if not self._capture_allowed:
-            # THE reason that means the bucket grid is wrong: the batch was
-            # graphable and every rank agreed, but this key was never captured.
             self.last_miss_reason = "key_not_captured"
             self.last_miss_key = key
             return None, None, None
@@ -523,10 +489,8 @@ class CUDAGraphRunner:
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
         max_draft_len = key[1]
         token_per_request = max_draft_len + 1
-        # Ragged keys carry the flat token total as a sixth element (see
-        # _get_graph_key); that is the replay width, NOT bs * (draft_len + 1):
-        # the block is drafted in full while the verified total shrinks (the
-        # two only coincide at the widest bucket, which is what warmup sees).
+        # Ragged keys carry the flat token total as a sixth element; that is
+        # the replay width, NOT bs * (draft_len + 1).
         num_tokens_for_capture = (key[5] if len(key) > 5 else
                                   batch_size * self.max_beam_width *
                                   token_per_request)
@@ -637,15 +601,11 @@ class CUDAGraphRunner:
     def will_pad_to(self, padded_bs: int, num_requests: int) -> bool:
         """Whether a batch of ``num_requests`` can actually reach ``padded_bs``.
 
-        The ragged fit derives its token-bucket grid from an assumed padded row
-        count and hands the rounding slack to pad rows; if padding declines,
-        the fitted total lands in no captured bucket and every rank runs eager.
-
-        Mirrors the size guards in :meth:`_get_padded_batch`. It deliberately
-        does not try to predict the resource-dependent bails (KV capacity for
-        the dummy request, encoder-decoder state): those are checked when the
-        dummy is created, and being wrong in the optimistic direction there
-        leaves the pre-existing behaviour rather than making it worse.
+        Mirrors the SIZE guards in :meth:`_get_padded_batch` only; the
+        resource-dependent bails (dummy KV capacity, encoder-decoder state)
+        are deliberately not predicted. The ragged fit sizes its bucket grid
+        from the padded row count, so a wrong yes strands the fitted total in
+        no captured bucket.
         """
         if padded_bs <= 0 or num_requests <= 0:
             return False
@@ -756,27 +716,21 @@ class CUDAGraphRunner:
             self.padding_dummy_requests[runtime_draft_len] = dummy_request
 
         padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
-        # Under ragged verification the padding rows are part of the token
-        # budget the scheduler fitted onto a captured bucket. The scheduler
-        # decided their (uniform) window when it chose the bucket -- it has to,
-        # because these rows are one shared object and cannot carry different
-        # values -- so read it back rather than assume. Cleared otherwise: the
-        # dummy is cached across steps and would carry a stale window into a
-        # uniform batch.
+        # The pad rows' (uniform) window was decided by the fit when it chose
+        # the bucket (they are one shared object), so read it back. Cleared
+        # otherwise: the dummy is cached across steps and would carry a stale
+        # window into a uniform batch.
         if getattr(self.spec_config, "enable_ragged_verify", False):
             ragged = any(
                 getattr(request, "py_verify_len", None) is not None
                 for request in batch.generation_requests)
             padding_dummy_request.py_verify_len = (self.ragged_pad_verify_len
                                                    if ragged else None)
-            # cap-accept needs the same treatment for the same reason, and
-            # fails differently without it: `_attach_accept_caps` drops the
-            # whole batch's caps if any request lacks one, so a single
-            # capless dummy would degrade the mode to `static` -- silently,
-            # and only on the steps that happen to need padding. The dummy's
-            # own acceptance is discarded, so give it the full block, i.e. no
-            # cap at all. Cleared otherwise: the object is cached across steps
-            # and would carry a stale cap into a static batch.
+            # Same for cap-accept: `_attach_accept_caps` drops the whole
+            # batch's caps if any request lacks one, so a capless dummy would
+            # silently degrade the mode to `static`. Its acceptance is
+            # discarded, so give it the full block; cleared otherwise against
+            # staleness.
             cap_accept = any(
                 getattr(request, "py_verify_cap", None) is not None
                 for request in batch.generation_requests)

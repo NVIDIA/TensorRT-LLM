@@ -657,29 +657,20 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
     gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
-    # Ragged verification: how many query tokens each generation request
-    # contributes this step, host-side and in batch order. None (the default,
-    # and every non-DSpark path) means the uniform `1 + max_draft_tokens` per
-    # request, which is what the strided expansions below assume. Kept on the
-    # host because the expansions are built host-side and copied in; reading
-    # the repeats off a device tensor would sync.
+    # Ragged verification: query tokens per generation request this step,
+    # host-side and in batch order. None (the default) means the uniform
+    # `1 + max_draft_tokens` the strided expansions assume. Host-side because
+    # reading repeats off a device tensor would sync.
     ragged_verify_lens: Optional[List[int]] = None
-    # Query tokens per generation request on a *uniform* batch this step, i.e.
-    # `1 + runtime_draft_len`. Zero means "not published", and every expansion
-    # below falls back to the static `1 + max_draft_tokens` -- which is what
-    # every caller that never shortens its draft length wants, and keeps them
-    # bit-identical.
+    # Query tokens per generation request on a *uniform* batch this step
+    # (`1 + runtime_draft_len`). Zero means "not published"; expansions then
+    # fall back to the static `1 + max_draft_tokens`.
     #
-    # This is deliberately NOT `max_draft_tokens`. That field is the static
-    # ceiling: it sizes every expanded buffer (see `create_expanded_buffers`)
-    # and must stay at the maximum so a shorter step never reallocates inside a
-    # CUDA-graph capture. The *stride* has to follow the runtime tier instead,
-    # because `Indexer.forward` slices the very same buffers by the true token
-    # count (`num_gen_tokens // num_generations`, see the decode branch). Left
-    # at the ceiling, a step that verifies fewer positions writes each
-    # request's kv_len/block-table row `1 + max_draft_tokens` apart and then
-    # reads them back `1 + runtime_draft_len` apart, so every request past the
-    # first silently picks up a neighbour's rows.
+    # Deliberately NOT `max_draft_tokens`: that ceiling sizes the expanded
+    # buffers and must never change under CUDA-graph capture, while the
+    # *stride* must follow the runtime tier -- `Indexer.forward` slices the
+    # same buffers by the true token count, so a ceiling stride makes every
+    # request past the first read a neighbour's rows.
     runtime_tokens_per_gen_step: int = 0
 
     @property
@@ -703,14 +694,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def gen_token_repeat_list(self) -> List[int]:
         """Per-generation-request query-token counts, on the host.
 
-        Uniform batches get `gen_token_stride` for every request, so the
-        callers below stay bit-identical whenever the runtime draft length is
-        the static maximum; ragged batches get the scheduler's per-request
-        windows.
-
-        Host-side on purpose: the expanded token count derived from these feeds
-        buffer slicing, and reducing it off a device tensor would be a
-        device->host sync on every step of the *uniform* path too.
+        Uniform batches get `gen_token_stride` per request; ragged batches get
+        the scheduler's windows. Host-side on purpose: the total feeds buffer
+        slicing, and reducing it off a device tensor would sync every step.
         """
         if self.ragged_verify_lens is None:
             return [self.gen_token_stride] * self.num_generations
@@ -727,22 +713,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                              dim: int = 0) -> Tuple[torch.Tensor, int]:
         """Repeat `values` once per query token, returning `(expanded, num_tokens)`.
 
-        Uniform batches take the scalar `repeat_interleave` -- no repeats
-        tensor, no host->device copy, and no output-size question at all, so
-        this is bit-identical and cost-identical to the fixed-stride expansion
-        it replaced.
-
-        Ragged batches need a per-request repeats vector, which costs two things
-        the scalar form does not, and both are paid for here:
-
-        * `repeat_interleave` with a tensor `repeats` reads their cumulative sum
-          back to the host to size its output unless `output_size` is given, so
-          the total is computed on the host and passed explicitly;
-        * materializing `repeats` on the device is a host->device copy, and from
-          *pageable* memory CUDA synchronizes the stream before starting it. The
-          staging tensor is therefore pinned and the copy issued
-          `non_blocking=True`, matching how the rest of the engine stages
-          host-built index vectors.
+        Uniform batches take the scalar `repeat_interleave` (no repeats tensor,
+        no copy). Ragged batches must pass `output_size` (a tensor-repeats
+        interleave otherwise reads the cumsum back to the host) and stage the
+        repeats through pinned memory so the H2D copy is non-blocking.
         """
         repeats = self.gen_token_repeat_list()
         num_tokens = sum(repeats)
@@ -1039,10 +1013,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.scheduler_metadata_buffer_full_next_n.copy_(
                     scheduler_metadata_buffer_full_next_n, non_blocking=True)
             if self.use_expanded_buffers_for_mtp:
-                # One row per query token; the repeat count is per-request
-                # under ragged verification and a constant otherwise. Both the
-                # host-side total and the sync-free expansion live in
-                # ``expand_per_gen_token``.
+                # One row per query token; per-request repeats under ragged
+                # verification (see ``expand_per_gen_token``).
                 expanded, num_tokens = self.expand_per_gen_token(
                     gen_indexer_kv_lens)
                 self.kv_lens_expanded_cuda[:num_tokens] = expanded
@@ -1382,14 +1354,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Static draft-token ceiling for buffer SIZING (not per-step logic).
 
         Every expanded buffer must be shaped from one process-wide ceiling,
-        never from the per-step ``max_draft_tokens``: the pooled backing
-        memory is shared between the base metadata and every CUDA-graph
-        clone, and two instances viewing the same bytes with different row
-        counts interleave their rows differently -- a prepare() on one
-        layout silently corrupts every captured graph reading the other
-        (the DSpark ragged IMA). ``update_spec_dec_param`` records the
-        config-wide ``max_total_draft_tokens`` here; before the first call
-        the mutable value is all there is.
+        never the per-step ``max_draft_tokens``: the pooled backing memory is
+        shared between the base metadata and every CUDA-graph clone, and two
+        instances viewing the same bytes with different row counts corrupt
+        each other. ``update_spec_dec_param`` records the config-wide
+        ``max_total_draft_tokens`` here; before the first call the mutable
+        value is all there is.
         """
         cap = getattr(self, "_draft_alloc_cap", None)
         if cap is None:
@@ -1483,34 +1453,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._ragged_num_rows = 0
 
         # ------------------------------------------------------------------
-        # Token-major presentation of the generation half, for the MLA rope and
-        # sparse-MLA generation ops (goal doc K1 / K2).
+        # Token-major presentation of the generation half, for the MLA rope
+        # and sparse-MLA generation ops. Both derive their sequence count from
+        # `host_context_lengths.size(0)` and require the query tokens to
+        # divide evenly across it; a ragged batch does not, so hand them one
+        # row per generation token (seq_len == 1).
         #
-        # Both of those ops learn their sequence count from a tensor *shape* --
-        # `num_seqs = host_context_lengths.size(0)` in dsv3RopeOp.cpp and
-        # thop/attentionOp.cpp -- and then require the query tokens to divide
-        # evenly across it. A ragged batch does not divide, so the assert
-        # "MLA can only support input sequences with the same sequence length"
-        # fires. Handing those two ops one row per generation *token* makes the
-        # division trivial (seq_len == 1) and satisfies the assert rather than
-        # weakening it; no kernel changes.
-        #
-        # These are a PARALLEL set of views, never the metadata's own fields.
-        # `num_seqs` is read as a request count in roughly twenty places --
-        # spec workers sizing acceptance rectangles, the KV-length correction in
-        # _preprocess_inputs, the indexer's own metadata -- so redefining it
-        # would be a global re-typing rather than a presentation change.
-        #
-        # Rows are laid out prefix-preserving: the context rows first, unchanged,
-        # then one row per generation token. That keeps `num_contexts`,
-        # `num_ctx_tokens` and the ops' `seq_offset = num_contexts` all correct
-        # without touching them.
+        # These are a PARALLEL set of views, never the metadata's own fields:
+        # `num_seqs` is read as a request count throughout and must not be
+        # redefined. Rows are prefix-preserving -- context rows first,
+        # unchanged, then one row per generation token -- keeping
+        # `num_contexts`, `num_ctx_tokens` and the ops' `seq_offset` correct.
         #
         # Capacity is the static ceiling and must never be recomputed from a
         # runtime count: these live in the process-wide buffer pool keyed by
-        # `cache_name`, so a later reallocation would move addresses already
-        # baked into captured graphs. `2 + max_draft_tokens` per sequence covers
-        # one context row plus the widest generation window.
+        # `cache_name`, so reallocation would move addresses baked into
+        # captured graphs. `2 + max_draft_tokens` per sequence covers one
+        # context row plus the widest generation window.
         attn_rows_cap = self.max_num_sequences * (2 + self._draft_sizing_cap)
         self._attn_num_rows = 0
         self.attn_row_kv_lens_cuda = self.get_empty(
@@ -1546,14 +1505,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=prefer_pinned())
         self.attn_row_req_idx_host = torch.zeros(
             (attn_rows_cap, ), dtype=torch.long, pin_memory=prefer_pinned())
-        # host_context_lengths: the shape oracle both ops key off.
-        # The op indexes request_types over its whole num_seqs -- which under
-        # this presentation is the ROW count -- in
-        # `for (idx = num_contexts; idx < num_seqs; idx++)
-        #  TLLM_CHECK(request_types[idx] == kGENERATION)`
-        # (thop/attentionOp.cpp). Handing it the batch-major array would read
-        # past its end. Generation is 1, context 0; prefill the whole capacity
-        # as generation so a step only has to stamp its context prefix.
+        # host_context_lengths: the shape oracle both ops key off. The op
+        # reads request_types over its whole num_seqs -- the ROW count under
+        # this presentation -- so the array must be row-sized. Generation is
+        # 1, context 0; prefill the whole capacity as generation so a step
+        # only stamps its context prefix.
         self.attn_row_request_types_host = torch.ones(
             (attn_rows_cap, ), dtype=torch.int32,
             pin_memory=prefer_pinned())
@@ -1571,16 +1527,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=prefer_pinned())
         # The main KV block table, one row per query token. Distinct from
         # `block_table_expanded` below, which carries *indexer* pool indices at
-        # the indexer's own compression. On the DSv4 sparse generation path the
-        # only consumer that walks this per row is the KV write inside the rope
-        # kernel; the attention op overrides its page index pointer with the
-        # sparse top-k indices, which are already per token.
-        # Same [num_pools, num_seqs, 2, max_blocks_per_seq] layout the attention
-        # op reads, expanded on the *sequence* axis only: this tensor is
-        # substituted for `kv_cache_block_offsets` wholesale while the ops are
-        # presented token-major, so its rank and axis order have to match what
-        # they already expect. The pool and K/V axes are carried through
-        # unchanged -- only the row axis is what token-major changes.
+        # the indexer's own compression. Same [num_pools, num_seqs, 2,
+        # max_blocks_per_seq] layout the attention op reads, expanded on the
+        # sequence axis only: it substitutes for `kv_cache_block_offsets`
+        # wholesale, so rank and axis order must match.
         num_attention_op_pools = getattr(self.kv_cache_manager,
                                          "num_attention_op_pools",
                                          self.kv_cache_manager.num_pools)
@@ -1653,9 +1603,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             getattr(self, "_draft_alloc_cap", 0) or 0)
         capture_graph = self.is_cuda_graph
         # GROW-ONLY ratchet, never an equality check: captured graphs bake the
-        # buffer addresses in, and the old `!=` re-created the buffers whenever
-        # max_draft_len moved per step -- the graph-path ragged IMA. Consumers
-        # slice [:rows]/[:width].
+        # buffer addresses in, so re-creating buffers when max_draft_len moves
+        # per step corrupts every captured graph. Consumers slice
+        # [:rows]/[:width].
         prev_cap = getattr(self, "_expanded_alloc_draft_cap", -1)
         ratchet = max(self._draft_sizing_cap, prev_cap)
         if ratchet > prev_cap:
@@ -1675,12 +1625,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     dtype=torch.float32,
                     capture_graph=capture_graph,
                 )
-            # The Radix-split-work scratch (radix_aux_*) is sized the same way
-            # (num_seqs * (1 + max_draft_tokens) rows) and is allocated
-            # unconditionally, so it must be resized here too -- otherwise the
-            # cpp indexer_topk_decode op aborts once MTP raises max_draft_tokens
-            # ("radix_aux_* must hold at least num_rows*blocks_per_row*index_topk
-            # elements").
+            # radix_aux_* is sized by the same generation-row count and
+            # allocated unconditionally, so it must be resized here too or the
+            # cpp indexer_topk_decode op aborts once MTP raises
+            # max_draft_tokens.
             self._create_radix_aux_buffers(capture_graph=capture_graph)
 
     def _get_pool_block_indices(self) -> torch.Tensor:
@@ -1824,41 +1772,27 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         use_dsl = self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits
         if not self.is_ragged_verify:
             # A uniform step must not inherit a previous ragged step's row
-            # count: refresh_ragged_row_kv_lens and ragged_row_kv_lens both key
-            # off it, and this covers every uniform path, not just the one that
-            # skips the expanded buffers.
+            # count: refresh_ragged_row_kv_lens and ragged_row_kv_lens key
+            # off it.
             self._ragged_num_rows = 0
         if self.is_ragged_verify:
-            # The DSL paged-MQA path reshapes (num_gen, next_n) -> (num_gen *
-            # factor, atom) and broadcasts a single 1-D kv_lens per request, so
-            # it is structurally uniform: there is no next_n that describes a
-            # ragged batch. The expanded path already materializes one row per
-            # token, which is exactly the ragged layout, so route there.
+            # The DSL paged-MQA path is structurally uniform (one broadcast
+            # kv_len per request, factor * atom == next_n); route ragged
+            # batches to the expanded one-row-per-token path instead.
             use_dsl = False
-            # goal doc K13. The dense XQA spec-dec metadata
-            # (`spec_decoding_generation_lengths`, packed mask) is written by
-            # scalar `fill_` at every Python call site, so it can only describe a
-            # uniform window -- even though the C++ side would accept a
-            # per-request vector. Today that block is unreachable here twice
-            # over: `update_spec_dec_param` forces `is_spec_decoding_enabled`
-            # False on the Blackwell trtllm-gen kernels for a linear tree, and
-            # MLA generation reads `mlaGeneration` state instead. Both are
-            # incidental. Assert the property that actually matters so a future
-            # SM, or a change to that gate, fails here rather than silently
-            # verifying every request at the batch-wide window.
+            # The dense XQA spec-dec metadata (spec_decoding_generation_lengths,
+            # packed mask) is filled with a single scalar window and cannot
+            # describe per-request verify lengths; assert it stays off so a
+            # future change fails here rather than silently verifying every
+            # request at the batch-wide window.
             assert not self.is_spec_decoding_enabled, (
                 "ragged verification requires the dense spec-decoding metadata "
                 "to be off: spec_decoding_generation_lengths and the packed "
                 "mask are filled with a single scalar window, which cannot "
                 "describe per-request verify lengths")
-        # Deliberately keyed on the static ceiling rather than this step's tier.
-        # Whether DeepGEMM supports a given next_n natively is a per-step
-        # question, so a shorter tier could sometimes take the cheaper strided
-        # path -- but that would make the *layout regime* a function of the tier,
-        # and the expanded path is the general one (one kernel row per query
-        # token) that is correct at every tier and required for ragged batches
-        # anyway. Holding the regime fixed keeps the tiers, and the ragged path
-        # built on top of them, comparable to each other.
+        # Keyed on the static ceiling, not this step's tier, so the layout
+        # regime never changes per step; the expanded path is correct at every
+        # tier and required for ragged batches anyway.
         self.use_expanded_buffers_for_mtp = (
             not use_dsl
             and (self.is_ragged_verify or
@@ -1945,27 +1879,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def _prepare_ragged_row_kv_lens(self, kv_lens: torch.Tensor) -> None:
         """Populate ``row_kv_lens_cuda``: how far back each query row may attend.
 
-        The decode top-k kernel normally reconstructs this from ``next_n``::
-
-            actual_kv_len = seq_len - next_n + (row % next_n) + 1
-
-        which is only meaningful while every request contributes the same number
-        of rows. Under ragged verification neither ``row // next_n`` (which
-        request) nor ``row % next_n`` (which position in its window) holds, so
-        the extent is materialized per row instead.
-
-        The generalization is exact: for a request verifying ``v`` positions,
-        row ``o`` of its window may attend to ``kv_len - v + o + 1`` tokens.
-        Substituting ``v = next_n`` recovers the formula above, which is why the
-        uniform path can keep passing ``nullptr`` and stay bit-identical.
-
-        Sync-free by construction: ``kv_lens`` is already a host tensor here
-        (:meth:`prepare` builds it from ``num_cached_tokens_per_seq``, which
-        lives on the CPU), so the whole vector is assembled on the host and
-        crosses once, through pinned memory so the copy does not serialize the
-        stream. Reading it on the device instead would mean a D2H sync, and
-        combining the two halves on the device would mean adding a CPU tensor to
-        a CUDA one.
+        The uniform kernel reconstructs this from ``next_n``, which is
+        meaningless on a ragged batch, so materialize it per row: row ``o`` of
+        a request verifying ``v`` positions attends to ``kv_len - v + o + 1``
+        tokens (``v = next_n`` recovers the uniform formula, so that path
+        keeps passing ``nullptr``). Assembled on the host -- ``kv_lens`` is
+        already a CPU tensor -- and copied once through pinned memory;
+        building it on device would sync.
         """
         verify_lens = self.ragged_verify_lens
         if not verify_lens:
@@ -1974,22 +1894,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         assert len(gen_kv_lens) == len(verify_lens), (
             f"ragged verify lengths {len(verify_lens)} != generation requests "
             f"{len(gen_kv_lens)}")
-        # goal doc A4. `seq_lens` is rebuilt from this step's requests, so its
-        # generation half is by definition current; `ragged_verify_lens` is
-        # published separately and used to be published *after* prepare(), which
-        # meant reading the previous step's split -- and under CUDA graphs
-        # "previous step" really meant "whenever this key last ran". Checking
-        # the two against each other tests the property (these windows describe
-        # this step) rather than the mechanism (publish happens before prepare).
+        # `ragged_verify_lens` is published separately from this step's token
+        # layout; check they describe the same step.
         expected_gen_tokens = self.num_tokens - self.num_ctx_tokens
         assert sum(verify_lens) == expected_gen_tokens, (
             f"ragged verify windows sum to {sum(verify_lens)} but this step's "
             f"token layout has {expected_gen_tokens} generation tokens; the "
             f"windows belong to a different step than seq_lens does")
 
-        # Row o of a request verifying v positions sees kv_len - v + o + 1
-        # tokens: the last row sees the request's full KV, each earlier row one
-        # token less.
         rows: List[int] = []
         for kv_len, verify_len in zip(gen_kv_lens, verify_lens):
             base = int(kv_len) - int(verify_len) + 1
@@ -2004,10 +1916,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         num_tokens = len(rows)
         self._ragged_num_rows = num_tokens
         # The write-after-read hazard on these pinned buffers (rewritten each
-        # ragged step, copied with non_blocking=True under the overlap
-        # scheduler's run-ahead) is fenced wholesale by the event guard in
-        # prepare(): it waits for the previous prepare's copies to execute
-        # before any pinned buffer is touched again.
+        # ragged step, copied non_blocking under the overlap scheduler) is
+        # fenced by the event guard in prepare().
         self.row_kv_lens_host[:num_tokens].copy_(
             torch.tensor(rows, dtype=torch.int32))
         self.row_kv_lens_cuda[:num_tokens].copy_(
@@ -2024,25 +1934,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def refresh_ragged_row_kv_lens(self) -> None:
         """Rebuild the per-row extent from the corrected ``kv_lens_cuda``.
 
-        ``prepare()`` builds the extent from the host-side kv lengths, but under
-        the overlap scheduler ``_preprocess_inputs`` corrects ``kv_lens_cuda``
-        afterwards to account for how many draft tokens were actually accepted.
-        Leaving the extent at its prepare-time value would make the top-k kernel
-        and ``gen_kv_lens_cuda`` -- both arguments of the same op call -- disagree
-        about the same quantity.
-
-        Stays on the device: the correction term was staged at prepare time and
-        does not move, so this is one gather plus one add, with no sync.
+        Under the overlap scheduler ``_preprocess_inputs`` corrects
+        ``kv_lens_cuda`` after prepare(); the extent must follow or the top-k
+        kernel's arguments disagree. Device-only: one gather plus one add, no
+        sync.
         """
         num_tokens = self._ragged_num_rows
         if not self.is_ragged_verify or num_tokens <= 0:
             return
         gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
-        # Gather, not repeat_interleave: this runs inside the capture body, and
-        # a tensor-repeats interleave both allocates and (without output_size)
-        # reads the cumulative sum back to the host. The row->request map and
-        # the correction were staged at prepare() time and are pinned by the
-        # graph key, so all that is left is one gather plus one add.
+        # Gather, not repeat_interleave: this runs inside the capture body,
+        # where a tensor-repeats interleave would allocate and sync. The map
+        # and correction were staged at prepare() time.
         row_kv_lens = self.row_kv_lens_cuda[:num_tokens]
         torch.index_select(gen_kv_lens, 0,
                            self.row_req_idx_cuda[:num_tokens],
@@ -2052,19 +1955,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def _prepare_token_major_gen_rows(self, kv_lens: torch.Tensor) -> None:
         """Build the one-row-per-generation-token view for the MLA gen ops.
 
-        See the buffer comments in :meth:`create_expanded_buffers` for why this
-        exists and why it is a parallel view rather than a redefinition of
-        ``num_seqs``.
-
-        Rows are ``[contexts unchanged] ++ [one per generation token]``. Row
-        ``o`` of a request verifying ``v`` positions attends to
-        ``kv_len - v + o + 1`` tokens, the same generalization the decode top-k
-        uses; substituting ``v = next_n`` recovers the uniform formula, which is
-        why the uniform path can keep its single row per request.
-
-        Assembled entirely on the host -- ``kv_lens`` is already a CPU tensor
-        here -- and crossed once through pinned memory. Reading it on the device
-        would be a D2H sync on a path the overlap scheduler depends on.
+        See the buffer comments in :meth:`create_expanded_buffers`. Rows are
+        ``[contexts unchanged] ++ [one per generation token]``; row ``o`` of a
+        request verifying ``v`` positions attends to ``kv_len - v + o + 1``
+        tokens. Assembled on the host and copied once through pinned memory;
+        building it on device would sync.
         """
         verify_lens = self.ragged_verify_lens
         ngt = self._ragged_num_rows
@@ -2090,14 +1985,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.attn_row_prompt_lens_cpu[:nc].copy_(
                 self.prompt_lens_cpu[:nc].to(torch.int32))
 
-        # Reuse what _prepare_ragged_row_kv_lens just built rather than walking
-        # the windows again: it produced exactly these per-row extents,
-        # corrections and request indices one call earlier. Rebuilding them
-        # would double the only O(num_gen_tokens) host work on the step.
-        # Same WAR guard as _prepare_ragged_row_kv_lens above, same reason:
-        # attn_row_req_idx_host holds whole-batch request indices, and a
-        # rewrite racing last step's queued H2D turns into an out-of-bounds
-        # gather in refresh_token_major_gen_rows.
+        # Reuse the per-row extents/corrections/request indices
+        # _prepare_ragged_row_kv_lens just built. The pinned-buffer WAR hazard
+        # is fenced by the event guard in prepare().
         self.attn_row_kv_lens_host[nc:rows].copy_(
             self.row_kv_lens_host[:ngt])
         self.attn_row_kv_correction_host[nc:rows].copy_(
@@ -2106,9 +1996,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # rows are indexed over the whole batch, so shift past the contexts.
         torch.add(self.row_req_idx_host[:ngt], nc,
                   out=self.attn_row_req_idx_host[nc:rows])
-        # host_context_lengths is only a shape oracle for the generation half
-        # (the ops read it for num_seqs and, for contexts, for the q length);
-        # one token per row.
+        # One query token per generation row; contexts keep their real q
+        # length.
         self.attn_row_prompt_lens_cpu[nc:rows].fill_(1)
         # Capacity is prefilled with kGENERATION, so only the context prefix
         # needs stamping, and nc is small.
@@ -2126,53 +2015,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.attn_row_prompt_lens_cpu[:rows], non_blocking=True)
 
         self._attn_num_rows = rows
-        # The block table is expanded on the DEVICE, from the copy that is
-        # already there. Building it host-side and copying would add ~96 KiB of
-        # H2D per decode step (768 rows x max_blocks_per_seq int32) plus a host
-        # gather, both on the critical path the overlap scheduler exists to keep
-        # clear. One index_select costs neither.
         self.refresh_token_major_block_table()
 
     def refresh_token_major_gen_rows(self) -> None:
         """Rebuild the per-row KV extent from the corrected ``kv_lens_cuda``.
 
-        Mirrors :meth:`refresh_ragged_row_kv_lens` and for the same reason: the
-        overlap scheduler corrects ``kv_lens_cuda`` on device after prepare(),
-        inside the CUDA-graph capture body, so a prepare-time extent would make
-        the rope kernel and the attention op disagree about the same quantity.
-
-        One gather plus one add. No allocation, no repeat_interleave, no D2H --
-        the row->request map and the correction were staged at prepare() time
-        and their addresses are pinned by the graph key.
+        Mirrors :meth:`refresh_ragged_row_kv_lens`: the overlap scheduler
+        corrects ``kv_lens_cuda`` on device after prepare(), inside the
+        capture body. One gather plus one add; no allocation, no D2H.
         """
         rows = self._attn_num_rows
         if not self.is_ragged_verify or rows <= 0:
             return
-        # TLLM_DSPARK_ASSERT_ROWS: name the failure instead of taking an
-        # illegal memory access several hundred frames later.
-        #
-        # The docstring above says the row->request map's addresses "are
-        # pinned by the graph key". That is true on the graph path and false
-        # on an eager one, where the same metadata object serves ragged and
-        # non-ragged steps in turn. If `_attn_num_rows` and
-        # `attn_row_req_idx_cuda` are stale relative to this step's
-        # `num_seqs` -- 64 requests last step, 3 now -- the gather below reads
-        # request 63 out of a length-3 tensor, which is exactly the shape of
-        # the fault seen on the eager-ragged path.
-        #
-        # Costs a device-to-host read, so it is opt-in.
-        if (os.environ.get("TLLM_DSPARK_ASSERT_ROWS")
-                and not torch.cuda.is_current_stream_capturing()):
-            # The .max() is a device-to-host read; during capture it would
-            # raise cudaErrorStreamCaptureInvalidated. The eager path is where
-            # the interesting case lives anyway.
-            worst = int(self.attn_row_req_idx_cuda[:rows].max())
-            assert worst < self.num_seqs, (
-                f"token-major row map is stale: {rows} rows index up to "
-                f"request {worst} but this step has only {self.num_seqs} "
-                f"sequences. The map was staged by a previous prepare() and "
-                f"never restaged; the gather that follows would read out of "
-                f"bounds.")
         torch.index_select(self.kv_lens_cuda[:self.num_seqs], 0,
                            self.attn_row_req_idx_cuda[:rows],
                            out=self.attn_row_kv_lens_cuda[:rows])
@@ -2182,23 +2036,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def refresh_token_major_block_table(self) -> None:
         """Expand the main KV block table to one row per query token, on device.
 
-        Every row of a request sees that request's blocks -- a verify window
-        never spans a request -- so this is a plain gather by the row->request
-        map. Done on the device because the source is already resident; doing it
-        host-side would mean a per-step H2D of the whole table.
-
-        Not refreshed from ``on_update_kv_lens``: block IDs do not move within a
-        step, the same reason ``block_table_expanded`` is built once per
-        prepare().
+        A verify window never spans a request, so this is a gather by the
+        row->request map on the already-resident table. Not refreshed from
+        ``on_update_kv_lens``: block IDs do not move within a step.
         """
         rows = self._attn_num_rows
         if rows <= 0 or self.kv_cache_block_offsets is None:
             return
         src = self.kv_cache_block_offsets
-        # Gather along the sequence axis (1) and leave the pool and K/V axes
-        # alone. Collapsing leading axes instead would strip num_seqs itself and
-        # index a length-2 K/V axis with request ids, which the gather kernel
-        # catches as an out-of-bounds index rather than silently mis-reading.
+        # Gather along the sequence axis (1); the pool and K/V axes pass
+        # through unchanged.
         pools = min(src.shape[0], self.attn_row_block_offsets.shape[0])
         width = min(src.shape[-1], self.attn_row_block_offsets.shape[-1])
         torch.index_select(
@@ -2208,11 +2055,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def token_major_gen_view(self) -> Optional["TokenMajorGenView"]:
         """The token-major presentation for this step, or None.
 
-        None on every uniform batch, which is what keeps those paths
-        bit-identical: at ``s_q == 1`` trtllm-gen selects different kernels
-        (`mIsCausalSpecDecodingGen` is gated on ``mMaxSeqLenQ > 1``), so
-        presenting a uniform batch token-major would be functionally equivalent
-        but not bitwise so.
+        Must be None on every uniform batch: at ``s_q == 1`` trtllm-gen
+        selects different kernels, so presenting a uniform batch token-major
+        would not stay bit-identical.
         """
         rows = self._attn_num_rows
         if not self.is_ragged_verify or rows <= 0:
@@ -2920,12 +2765,10 @@ class Indexer(nn.Module):
                 metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
                                               num_generations])
             metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
-            # The 2D DeepGEMM metadata API encodes next_n into the schedule, and
-            # `Indexer.forward` launches the strided path with the *runtime*
-            # next_n (`num_gen_tokens // num_generations`). Building the
-            # schedule at the buffer's full static width instead would describe
-            # more query positions than the kernel is given whenever a shorter
-            # verify tier is in play.
+            # The 2D DeepGEMM metadata API encodes next_n into the schedule;
+            # build it at the *runtime* next_n `Indexer.forward` launches
+            # with, or a shorter verify tier describes more query positions
+            # than the kernel is given.
             next_n_cap = min(metadata.gen_token_stride,
                              metadata.kv_lens_cuda_2d.shape[1])
             metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
@@ -2943,16 +2786,10 @@ class Indexer(nn.Module):
                     scheduler_metadata_buffer_full_next_n, non_blocking=True)
         else:
             # Expand schedule metadata buffer (only generation). The DeepGEMM
-            # API requires 2D; each expanded token becomes a (1,) row.
-            #
-            # The row count has to be the one the expansions actually populated,
-            # which is what `gen_token_repeat_list` reports: the runtime tier on
-            # a uniform batch, the scheduler's windows on a ragged one. Deriving
-            # it from `1 + max_draft_tokens` instead described `num_generations *
-            # (1 + max_draft_tokens)` rows while `Indexer.forward` handed the
-            # kernel only `num_gen_tokens` of them -- the schedule and the logits
-            # then disagree about how much work exists, which is a hang rather
-            # than an error because the kernel waits on tiles nobody produces.
+            # API requires 2D; each expanded token becomes a (1,) row. The row
+            # count must be what the expansions actually populated
+            # (`gen_token_repeat_list`); a mismatch makes the kernel wait on
+            # tiles nobody produces (hang, not an error).
             num_tokens = sum(metadata.gen_token_repeat_list())
             scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
                 metadata.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
@@ -3411,10 +3248,8 @@ class Indexer(nn.Module):
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
             if not metadata.is_ragged_verify:
-                # Ragged verification makes unequal decode lengths the whole
-                # point; the expanded path below handles them natively (one
-                # kernel row per query token), so this uniformity check only
-                # applies to the strided paths.
+                # Uniformity only holds on the strided paths; ragged batches
+                # take the expanded (one row per token) path.
                 max_decode_len = gen_seq_lens.max().item()
                 min_decode_len = gen_seq_lens.min().item()
                 assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
@@ -3463,9 +3298,8 @@ class Indexer(nn.Module):
                 block_table = metadata.block_table_expanded[:num_tokens]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
-            # Ragged verification packs a different number of query tokens per
-            # request, so the only invariant left is that the expanded buffers
-            # cover exactly the tokens handed to the kernel.
+            # The expanded buffers must cover exactly the tokens handed to the
+            # kernel.
             if metadata.is_ragged_verify:
                 assert num_gen_tokens == sum(metadata.ragged_verify_lens), (
                     f"ragged gen tokens {num_gen_tokens} != "
@@ -3482,11 +3316,9 @@ class Indexer(nn.Module):
                 self.layer_idx)
             indexer_max_seq_len = metadata.get_indexer_max_seq_len()
 
-            # The DSL path broadcasts one kv_len per request across all next_n
-            # positions and requires factor * atom == next_n, neither of which
-            # a ragged batch can satisfy. prepare_for_spec_decode already
-            # routed such batches to the expanded buffers; keep the forward
-            # consistent with that decision.
+            # A ragged batch cannot satisfy the DSL path's uniform kv_len
+            # broadcast / factor * atom == next_n; prepare_for_spec_decode
+            # routed it to the expanded buffers, keep the forward consistent.
             if self.use_cute_dsl_paged_mqa_logits and not metadata.is_ragged_verify:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
                 # kNumNextNAtoms = 1 for any real next_n. The matching schedule
@@ -3606,13 +3438,10 @@ class Indexer(nn.Module):
                             metadata.heuristic_scratch_values[
                                 :num_gen_tokens]
 
-                # Ragged batches carry a per-row causal extent instead of
-                # deriving one from next_n. Both CuTe DSL top-k kernels still
-                # take next_n as a compile-time-ish scalar and reconstruct the
-                # row->request map from it, and GVR additionally indexes its
-                # previous-step hint the same way, so neither can express a
-                # ragged batch. Route to the C++ kernel, which now accepts the
-                # extent directly.
+                # The CuTe DSL top-k kernels reconstruct the row->request map
+                # from a scalar next_n and cannot express a ragged batch;
+                # route to the C++ kernel, which accepts the per-row extent
+                # directly.
                 ragged_row_kv_lens = metadata.ragged_row_kv_lens(num_gen_tokens)
                 if ragged_row_kv_lens is not None:
                     torch.ops.trtllm.indexer_topk_decode(
@@ -3620,9 +3449,8 @@ class Indexer(nn.Module):
                         gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens, :],
-                        # Dead on this path: the kernel reads the extent out of
-                        # row_kv_lens rather than rebuilding it. Pass 1 so a
-                        # stale next_n cannot quietly come back into use.
+                        # next_n is dead on this path (the kernel reads
+                        # row_kv_lens); pass 1 so a stale value cannot be used.
                         1,
                         self.index_topk,
                         pre_idx=None,
