@@ -40,7 +40,7 @@ import os
 import pickle
 import signal
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
@@ -58,7 +58,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -105,7 +105,7 @@ class KvCacheConfigV2:
     dtype: str = "auto"
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
-    block_reuse_policy: str = "all_reusable"
+    block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     disk_prefetch_num_reqs: int = 4
     max_util_for_resume: float = 0.95
