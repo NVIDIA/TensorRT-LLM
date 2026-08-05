@@ -3863,7 +3863,13 @@ class PyTorchModelEngine(ModelEngine):
                 total_verify_tokens=sum(token_lens),
                 bs_buckets=bs_buckets,
                 token_buckets=buckets,
-                peer_stats=peer_stats)
+                peer_stats=peer_stats,
+                # With the window cap the chooser also enforces per-rank
+                # decomposability from the allgathered stats, so accept vs
+                # decline is identical on every rank -- the local checks
+                # below become unreachable safety nets instead of the
+                # group-splitting decision points they used to be.
+                max_verify_len=max_verify_len)
         except ValueError as exc:
             logger.debug(f"DSpark ragged shape selection failed, falling back "
                          f"to uniform scheduling: {exc}")
@@ -3895,7 +3901,11 @@ class PyTorchModelEngine(ModelEngine):
             lo = max(1, -(-(bucket - real_capacity) // n_pad))  # ceil division
             hi = min(max_verify_len, (bucket - floor_tokens) // n_pad)
             if lo > hi:
-                logger.debug(
+                # Unreachable when the chooser ran with max_verify_len (it
+                # verified this rank's decomposition from the payload); a hit
+                # here means the two arithmetics diverged -- worth a warning,
+                # not a silent debug line.
+                logger.warning(
                     f"DSpark ragged: bucket {bucket} admits no pad-row window "
                     f"for {n_real} real ({floor_tokens}..{real_capacity} "
                     f"tokens) + {n_pad} pad rows; falling back to uniform "
@@ -3904,7 +3914,7 @@ class PyTorchModelEngine(ModelEngine):
             pad_len = lo
         real_target = bucket - n_pad * pad_len
         if real_target < floor_tokens or real_target > real_capacity:
-            logger.debug(
+            logger.warning(
                 f"DSpark ragged: bucket {bucket} leaves {real_target} tokens "
                 f"for {n_real} real requests ({n_pad} pad rows at {pad_len}), "
                 f"outside [{floor_tokens}, {real_capacity}]; falling back "

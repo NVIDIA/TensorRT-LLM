@@ -321,6 +321,32 @@ class RaggedCaptureShape:
     bucket: int
 
 
+def _bucket_decomposable(bucket: int, rows: int, tokens: int, padded_bs: int,
+                         max_verify_len: int) -> bool:
+    """Can a rank with ``rows`` real requests (``tokens`` floor) realise ``bucket``?
+
+    Mirrors the pad-row arithmetic in ``fit_ragged_verify_lens`` exactly: the
+    ``padded_bs - rows`` pad rows all carry ONE shared window in
+    ``[1, max_verify_len]`` (they are a single shared dummy object), and the
+    real rows absorb the remainder within ``[tokens, rows * max_verify_len]``.
+
+    This is computed here, from the allgathered ``(rows, tokens)``, so that
+    every rank evaluates every OTHER rank's feasibility too: a bucket that
+    rank 3 cannot decompose used to make rank 3 alone decline the fit while
+    its peers published the bucket -- a graph-key divergence the ADP shape
+    gate then turned into a whole-group eager step. Measured on job 2586075
+    (pinned full block, where floor == capacity and the divisibility trap is
+    sharpest): 70 of 962 steps went eager on exactly this.
+    """
+    n_pad = padded_bs - rows
+    floor, cap = tokens, rows * max_verify_len
+    if n_pad == 0:
+        return floor <= bucket <= cap
+    lo = max(1, -(-(bucket - cap) // n_pad))
+    hi = min(max_verify_len, (bucket - floor) // n_pad)
+    return lo <= hi
+
+
 def choose_ragged_capture_shape(
     *,
     num_real_requests: int,
@@ -328,6 +354,7 @@ def choose_ragged_capture_shape(
     bs_buckets: Sequence[int],
     token_buckets: Sequence[int],
     peer_stats: Optional[Sequence[Sequence[int]]] = None,
+    max_verify_len: Optional[int] = None,
 ) -> RaggedCaptureShape:
     """Pick the captured ``(padded_bs, bucket)`` for a ragged batch.
 
@@ -355,6 +382,16 @@ def choose_ragged_capture_shape(
     Raises when no captured bucket fits, rather than clamping: a batch with no
     graph runs eager, which costs far more than the trimming saves, so the
     caller has to see it and shrink the batch instead.
+
+    With ``max_verify_len`` given, the answer is additionally required to be
+    DECOMPOSABLE BY EVERY RANK (see ``_bucket_decomposable``): the smallest
+    such bucket is chosen, walking past candidates any rank cannot realise.
+    This makes accept/decline a pure function of the allgathered payload --
+    all ranks pick the same bucket or all raise together -- where previously
+    the per-rank decomposition check ran locally and a skewed rank declined
+    alone, splitting the group's graph keys. The cost is at most one bucket
+    step of extra verification on the steps that used to diverge, spent on
+    real tokens by ``fill_bucket``.
     """
     if not bs_buckets:
         raise ValueError("choose_ragged_capture_shape requires bs_buckets")
@@ -381,8 +418,25 @@ def choose_ragged_capture_shape(
     padded_bs = sorted_bs[bisect.bisect_left(sorted_bs, max_real)]
 
     needed = padded_bs + max_slack
-    bucket = round_up_to_bucket(needed, sorted({int(t) for t in token_buckets}))
-    return RaggedCaptureShape(padded_bs=padded_bs, bucket=bucket)
+    candidates = sorted({int(t) for t in token_buckets})
+    if max_verify_len is None:
+        bucket = round_up_to_bucket(needed, candidates)
+        return RaggedCaptureShape(padded_bs=padded_bs, bucket=bucket)
+    # Group-consistent choice: smallest captured bucket every rank can
+    # decompose. The floor requirement (bucket >= tokens_r + pad rows at one
+    # token each, i.e. >= needed at the widest rank) is subsumed by the
+    # decomposability test, so no separate >= needed cut is applied.
+    for cand in candidates:
+        if all(
+                _bucket_decomposable(cand, int(peer[0]), int(peer[1]),
+                                     padded_bs, int(max_verify_len))
+                for peer in stats):
+            return RaggedCaptureShape(padded_bs=padded_bs, bucket=cand)
+    raise ValueError(
+        f"no captured bucket (grid {candidates}) is decomposable by every "
+        f"rank (peer stats {list(stats)}, padded_bs {padded_bs}, "
+        f"max_verify_len {max_verify_len}); the group falls back to uniform "
+        f"together rather than splitting its graph keys")
 
 
 def ragged_gather_index_lists(

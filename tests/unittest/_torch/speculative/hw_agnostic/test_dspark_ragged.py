@@ -417,6 +417,91 @@ def test_shape_requires_bs_buckets():
 
 
 # ---------------------------------------------------------------------------
+# group-consistent bucket choice (max_verify_len given)
+#
+# The regression these pin: the chooser used to pick the smallest bucket >=
+# needed and leave "can MY rank decompose it into real + pad rows" to a LOCAL
+# check in fit_ragged_verify_lens. Pad rows all share one window (single
+# shared dummy), so decomposability is a divisibility question -- sharpest
+# under a full-block pin where real rows have zero slack -- and a rank that
+# failed it declined ALONE while its peers published the bucket. The ADP
+# shape gate then took the whole group eager: 70/962 steps on job 2586075.
+# ---------------------------------------------------------------------------
+
+MAXLEN_BUCKETS = [16, 24, 32, 40, 48]   # padded_bs 8, tiers 1..5 -> 8*(t+1)
+
+
+def _shape6(num_real, total, peers):
+    return choose_ragged_capture_shape(
+        num_real_requests=num_real,
+        total_verify_tokens=total,
+        bs_buckets=BS_BUCKETS,
+        token_buckets=MAXLEN_BUCKETS,
+        peer_stats=peers,
+        max_verify_len=6,
+    )
+
+
+def test_pinned_ranks_agree_on_a_bucket_every_rank_can_decompose():
+    """The job-2586075 divergence, miniaturised.
+
+    Both ranks are pinned to the full block (floor == capacity). needed =
+    8 + 25 = 33 rounds to 40, which rank (5, 30) cannot decompose (3 pad rows,
+    (40-30)/3 is not an integer window) while rank (4, 24) can (4 rows at
+    window 4 exactly) -- the old code split the group here. The chooser must
+    now walk past 40 and land BOTH ranks on 48.
+    """
+    peers = [(5, 30), (4, 24)]
+    shapes = {_shape6(num_real=r, total=t, peers=peers) for r, t in peers}
+    assert len(shapes) == 1
+    assert shapes.pop().bucket == 48
+
+
+def test_slacky_batch_keeps_the_smallest_bucket():
+    """Feasibility filtering must not grow the bucket when real rows have
+    slack to absorb the remainder -- the ordinary trimmed batch keeps the
+    exact answer the ungated chooser gave."""
+    peers = [(3, 9), (6, 30), (5, 11)]
+    got = _shape6(num_real=3, total=9, peers=peers)
+    ungated = choose_ragged_capture_shape(
+        num_real_requests=3, total_verify_tokens=9,
+        bs_buckets=BS_BUCKETS, token_buckets=MAXLEN_BUCKETS,
+        peer_stats=peers)
+    assert got.bucket == ungated.bucket == 32
+    assert got.padded_bs == ungated.padded_bs == 8
+
+
+def test_group_declines_together_when_nothing_decomposes():
+    """When no captured bucket works for every rank, every rank must see the
+    same ValueError -- a group-consistent decline replays the uniform graph,
+    where a lone decline used to split the graph keys.
+
+    A full-block-pinned rank can always decompose the FULL bucket (pad rows
+    at the max window), so total infeasibility requires a grid whose top tier
+    is missing -- which capture produces for real when max_num_tokens
+    truncates the ladder at the largest batch size.
+    """
+    truncated = [16, 24, 32, 40]   # top tier 48 not captured
+    peers = [(5, 30), (4, 24)]     # pinned: 40 fails (5,30), 32 fails it too
+    for r, t in peers:
+        with pytest.raises(ValueError, match="decomposable by every rank"):
+            choose_ragged_capture_shape(
+                num_real_requests=r, total_verify_tokens=t,
+                bs_buckets=BS_BUCKETS, token_buckets=truncated,
+                peer_stats=peers, max_verify_len=6)
+
+
+def test_uniform_batch_shape_matches_the_one_dimensional_rule():
+    # With a uniform K the token total is bs * (K + 1), so the joint rule must
+    # not pick anything larger than the uniform path would have needed.
+    k_plus_1 = 4
+    for num_real in (1, 3, 8):
+        got = _shape(num_real=num_real, total=num_real * k_plus_1)
+        assert got.padded_bs >= num_real
+        assert got.bucket >= num_real * k_plus_1
+
+
+# ---------------------------------------------------------------------------
 # fill_padded_rows_onehot
 # ---------------------------------------------------------------------------
 
