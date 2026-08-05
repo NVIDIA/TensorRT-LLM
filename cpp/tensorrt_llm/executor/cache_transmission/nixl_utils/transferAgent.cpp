@@ -17,10 +17,12 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/ipUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -28,7 +30,6 @@
 #include <cuda.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <ifaddrs.h>
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -108,62 +109,6 @@ public:
     }
 };
 
-static std::string getAvailableIP()
-{
-    struct ifaddrs *ifaddr, *ifa;
-    void* addr_ptr;
-    std::string ip("UNKNOWN IP");
-
-    // Get the list of network interfaces
-    if (getifaddrs(&ifaddr) == -1)
-    {
-        perror("getifaddrs");
-        return ip;
-    }
-
-    // Loop through the linked list of interfaces
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
-    {
-        // Check if the interface is an IP interface
-        if (ifa->ifa_addr == nullptr)
-            continue;
-
-        std::string nixlInterface = common::getEnvNixlInterface();
-        if (!nixlInterface.empty() && strcmp(ifa->ifa_name, nixlInterface.c_str()) != 0)
-        {
-            continue;
-        }
-
-        // Skip the loopback interface
-        if (nixlInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
-        {
-            continue;
-        }
-
-        // Check if the address family is AF_INET (IPv4)
-        // TODO: USER CAN SPECIFY THE IP ADDRESS
-        if (ifa->ifa_addr->sa_family == AF_INET)
-        {
-            addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
-            char address_buffer[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
-
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** NIXL    Interface: %s IP Address: %s",
-                ifa->ifa_name, address_buffer);
-            ip = address_buffer;
-            break;
-        }
-    }
-    if (ifa == nullptr)
-    {
-        TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
-            "UCX   No valid IP address found please set correct NIXL interface with env variable TRTLLM_UCX_INTERFACE");
-    }
-
-    freeifaddrs(ifaddr);
-    return ip;
-}
-
 uint16_t getAvailablePort(std::string const& ip = "0.0.0.0")
 {
     struct addrinfo hints
@@ -197,10 +142,10 @@ uint16_t getAvailablePort(std::string const& ip = "0.0.0.0")
     return port;
 }
 
-uint16_t getIncrmentPort(uint16_t basePort)
+uint16_t getIncrmentPort(uint16_t basePort, int rank, int worldSize)
 {
     static uint16_t times = 0;
-    return basePort + mpi::MpiComm::world().getRank() + (times++) * mpi::MpiComm::world().getSize();
+    return basePort + rank + (times++) * worldSize;
     // just for test
 }
 
@@ -458,6 +403,26 @@ nixl_status_t NixlTransferStatus::queryStatus() const
 NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
+    if (useMPI())
+    {
+        mRank = mpi::MpiComm::world().getRank();
+        mWorldSize = mpi::MpiComm::world().getSize();
+    }
+    else
+    {
+        auto const worldPg = pg_utils::get_world_pg();
+        if (worldPg)
+        {
+            mRank = worldPg->getRank();
+            mWorldSize = worldPg->getSize();
+            TLLM_LOG_DEBUG(mRank, "NIXL using Torch process group - rank: %d, world size: %d", mRank, mWorldSize);
+        }
+        else
+        {
+            TLLM_LOG_WARNING("Torch process group is not initialized; NIXL defaults to one process");
+        }
+    }
+
     nixl_status_t status;
     if (config.useListenThread)
     {
@@ -467,13 +432,14 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
             TLLM_THROW("Failed to lock /tmp/trtllm_nixl_port.lock");
         }
         auto envPort = common::getEnvNixlPort();
-        uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
+        uint16_t port = envPort > 0 ? getIncrmentPort(envPort, mRank, mWorldSize) : getAvailablePort();
         uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
         nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
             numWorker, 0, 10000, config.enableTelemetry};
-        mAddress = getAvailableIP() + ":" + std::to_string(port);
+        std::string localIp = common::getLocalIp(common::getEnvNixlInterface(), mRank);
+        mAddress = localIp + "#" + std::to_string(port);
         mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
     else
@@ -664,9 +630,8 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
-        " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s",
-        mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), mName.c_str(),
-        request.getRemoteName().c_str());
+        " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s", mRank,
+        nixlEnumStrings::statusStr(status).c_str(), mName.c_str(), request.getRemoteName().c_str());
     {
         NVTX3_SCOPED_RANGE(postXferReq);
         status = mRawAgent->postXferReq(handle, &reqParams);
@@ -705,11 +670,13 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
 {
     std::unique_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::loadRemoteAgent called after shutdown");
-    std::string ip = connectionInfo.substr(0, connectionInfo.find(":"));
-    std::string port = connectionInfo.substr(connectionInfo.find(":") + 1);
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s", connectionInfo.c_str(),
-        name.c_str());
+    auto const separator = connectionInfo.rfind('#');
+    TLLM_CHECK_WITH_INFO(
+        separator != std::string::npos, "Invalid NIXL connection info, missing '#': %s", connectionInfo.c_str());
+    std::string ip = connectionInfo.substr(0, separator);
+    std::string port = connectionInfo.substr(separator + 1);
+    TLLM_LOG_DEBUG(mRank, "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s",
+        connectionInfo.c_str(), name.c_str());
     TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "loadRemoteAgent get empty ip or port, connectionInfo: %s",
         connectionInfo.c_str());
     nixl_opt_args_t md_extra_params;
@@ -734,7 +701,7 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mRank,
         "NixlTransferAgent::loadRemoteAgent loadRemoteAgent to %s remoteagent name: %s success status: %s",
         connectionInfo.c_str(), name.c_str(), nixlEnumStrings::statusStr(status).c_str());
 }
