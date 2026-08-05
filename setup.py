@@ -303,12 +303,18 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
 
         source_fmha = os.path.join(precompiled_location, "3rdparty",
                                    "fmha_sm100")
-        if os.path.isdir(source_fmha):
-            dst_fmha = os.path.join("3rdparty", "fmha_sm100")
-            print(f"Copying fmha_sm100 from local directory: {source_fmha}")
-            if os.path.isdir(dst_fmha):
-                shutil.rmtree(dst_fmha)
-            shutil.copytree(source_fmha, dst_fmha)
+        if not os.path.isdir(source_fmha):
+            raise SetupError(
+                f"Precompiled directory {precompiled_location} predates MSA "
+                "packaging and does not contain 3rdparty/fmha_sm100. Use a "
+                "precompiled source built with MSA packaging support.")
+        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+        print(f"Copying fmha_sm100 from local directory: {source_fmha}")
+        if os.path.islink(dst_fmha):
+            os.unlink(dst_fmha)
+        elif os.path.isdir(dst_fmha):
+            shutil.rmtree(dst_fmha)
+        shutil.copytree(source_fmha, dst_fmha)
         return
 
     # Handle local file or remote URL
@@ -347,11 +353,15 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         dst_fmha = os.path.join("3rdparty", "fmha_sm100")
         wheel_has_fmha = any(
             file.filename.startswith("fmha_sm100/") for file in wheel.filelist)
-        if wheel_has_fmha:
-            if os.path.islink(dst_fmha):
-                os.unlink(dst_fmha)
-            elif os.path.isdir(dst_fmha):
-                shutil.rmtree(dst_fmha)
+        if not wheel_has_fmha:
+            raise SetupError(
+                f"Precompiled wheel {wheel_path} predates MSA packaging and "
+                "does not contain fmha_sm100. Use a precompiled wheel built "
+                "with MSA packaging support.")
+        if os.path.islink(dst_fmha):
+            os.unlink(dst_fmha)
+        elif os.path.isdir(dst_fmha):
+            shutil.rmtree(dst_fmha)
         for file in wheel.filelist:
             # Skip yaml files
             if file.filename.endswith(".yaml"):

@@ -107,6 +107,21 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   string(JSON DEP_PATCH_FILE            ERROR_VARIABLE _err GET "${DEP_OBJECT}" "patch_file")
   # cmake-format: on
 
+  if(DEP_NAME STREQUAL "cutlass")
+    set(TRTLLM_CUTLASS_TAG "${DEP_GIT_TAG}")
+  elseif(DEP_NAME STREQUAL "msa")
+    # MSA JIT-compiles against the CUTLASS headers staged by TRT-LLM. Force
+    # revalidation when TRT-LLM changes its CUTLASS pin.
+    set(MSA_VALIDATED_CUTLASS_TAG "v4.4.2")
+    if(NOT MSA_VALIDATED_CUTLASS_TAG STREQUAL TRTLLM_CUTLASS_TAG)
+      message(
+        FATAL_ERROR
+          "MSA ${DEP_GIT_TAG} was validated with CUTLASS ${MSA_VALIDATED_CUTLASS_TAG}, "
+          "but fetch_content.json selects ${TRTLLM_CUTLASS_TAG}. Revalidate MSA and "
+          "update MSA_VALIDATED_CUTLASS_TAG.")
+    endif()
+  endif()
+
   # Build FetchContent_Declare arguments
   set(FETCH_ARGS "${DEP_NAME}")
 
