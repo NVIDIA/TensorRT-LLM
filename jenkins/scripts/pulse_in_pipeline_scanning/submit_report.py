@@ -176,7 +176,6 @@ def submit_source_code_licenses(
     sbom_path = Path(input_file)
     if sbom_path.exists():
         sbom_raw = sbom_path.read_text()
-        print(f"=== SBOM ({input_file}) ===\n{sbom_raw}", file=sys.stderr)
         sbom_data = json.loads(sbom_raw)
         components = sbom_data.get("components", [])
 
@@ -233,9 +232,7 @@ def submit_source_code_licenses(
                 "s_component_type": component.get("type"),
                 "s_ticket_url": triaged_deps.get(package_name, "N/A"),
             }
-            if package_name not in triaged_deps and not is_preapproved(
-                map_preapproved, package_name, "pypi"
-            ):
+            if not is_preapproved(map_preapproved, package_name, "pypi"):
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
 
@@ -408,9 +405,7 @@ def submit_container_licenses(
             "s_license_ids": ",".join(license_ids),
             "s_ticket_url": triaged_deps.get(package_name, ""),
         }
-        if package_name not in triaged_deps and not is_preapproved(
-            map_preapproved, package_name, (v.get("type") or "unknown").lower()
-        ):
+        if not is_preapproved(map_preapproved, package_name, (v.get("type") or "unknown").lower()):
             risks_to_report.append(doc)
         docs.append(doc)
 
