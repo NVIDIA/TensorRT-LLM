@@ -2196,11 +2196,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[dspark-sps] {len(samples)} steps from {args.base_url}",
               file=sys.stderr)
         provenance = {"source": "server_sweep", "base_url": args.base_url}
-        # The requested concurrencies are ladder entries, so a steady cell's
-        # padded batch size lands exactly on them; everything else in the
-        # server's log is admission ramp or drain-down.
-        expected_cells = frozenset(
+        # Which cells the sweep can PROMISE depends on who controls the batch
+        # size. Without attention DP the server schedules one global batch, so
+        # a steady client concurrency IS the row count and the requested grid
+        # is enforceable. Under attention DP the router spreads the load and
+        # each rank's occupancy is emergent -- 1024 requests over 8 ranks
+        # oscillates around 128/rank and pads to whatever ladder entry the
+        # drift lands on (job 2585368: requested 128, measured at 192; only
+        # the cap-saturated 256 landed exactly). The pin guarantees L; bs is
+        # whatever the deployment did. Require nothing, keep what is thick,
+        # and let the fit's grid-connectivity check catch a real hole.
+        expected_cells = (frozenset(
             (int(b), int(l)) for b in batch_sizes for l in verify_lens)
+                          if not args.enable_attention_dp else frozenset())
     else:
         if not args.model:
             raise SystemExit("--model is required unless --fit-only is used")
