@@ -169,6 +169,11 @@ class PyTorchWorker(Worker):
             **model_kwargs,
         )
 
+        # Sequence classification heads locate the final non-padding token, which needs
+        # a pad id on the config. Decoder-only checkpoints often ship without one.
+        if model.config.pad_token_id is None:
+            model.config.pad_token_id = tokenizer.pad_token_id
+
         return cls(model, tokenizer, device=device)
 
     def _tokenize_input(self, input_str: Optional[str], input_tokens: Optional[list]):
@@ -291,6 +296,14 @@ class PyTorchWorker(Worker):
 
             gen_config = self.convert_task_params(task)
             input_length = inputs["input_ids"].shape[1]
+
+            # Prompt-position logits, matching TRTLLMWorker's context_logits. Reward
+            # controllers such as PRMController score from these rather than from the
+            # generated text. generate() only exposes scores for generated steps, so
+            # this needs its own forward pass over the prompt.
+            if task.return_context_logits:
+                with torch.no_grad():
+                    task.context_logits = self.model(**inputs).logits[0]
 
             stopping_criteria = self._build_stopping_criteria(task, input_length)
 

@@ -24,8 +24,11 @@ import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm.scaffolding import (
+    BestOfNController,
     GenerationTask,
     NativeGenerationController,
+    NativeRewardController,
+    PRMController,
     PyTorchWorker,
     RewardTask,
     ScaffoldingLlm,
@@ -279,6 +282,139 @@ class TestPyTorchWorkerReward:
         status = await pytorch_worker.reward_handler(task)
         # Accept either SUCCESS or error (model type mismatch is OK)
         assert status in (TaskStatus.SUCCESS, TaskStatus.WORKER_EXECEPTION)
+
+
+class TestPyTorchWorkerContextLogits:
+    @pytest.mark.asyncio
+    async def test_context_logits_returned(self, pytorch_worker, test_prompt):
+        """return_context_logits fills prompt-position logits, as TRTLLMWorker does."""
+        task = GenerationTask.create_from_prompt(test_prompt)
+        task.max_tokens = 1
+        task.temperature = 0.0
+        task.return_context_logits = True
+
+        status = await pytorch_worker.generation_handler(task)
+
+        assert status == TaskStatus.SUCCESS
+        assert task.context_logits is not None
+        prompt_len = len(pytorch_worker.tokenizer.encode(test_prompt))
+        assert task.context_logits.shape[0] == prompt_len
+        assert task.context_logits.shape[1] == pytorch_worker.model.config.vocab_size
+
+    @pytest.mark.asyncio
+    async def test_not_returned_unless_requested(self, pytorch_worker, test_prompt):
+        task = GenerationTask.create_from_prompt(test_prompt)
+        task.max_tokens = 1
+        task.temperature = 0.0
+
+        assert await pytorch_worker.generation_handler(task) == TaskStatus.SUCCESS
+        assert task.context_logits is None
+
+    @pytest.mark.asyncio
+    async def test_drives_prm_controller(self, pytorch_worker):
+        """Score through the real PRMController, which reads task.context_logits.
+
+        ``split_steps=False`` takes PRMController's last-token path, which works with a
+        causal LM's vocab-width logits; the step-splitting path expects a two-label
+        process reward model.
+        """
+        tokenizer = pytorch_worker.tokenizer
+        if not getattr(tokenizer, "chat_template", None):
+            tokenizer.chat_template = (
+                "{% for message in messages %}{{ message['content'] }}\n{% endfor %}"
+            )
+
+        controller = PRMController(tokenizer, split_steps=False)
+
+        task = GenerationTask.create_from_prompt("What is 2 + 2?")
+        task.output_str = "The answer is 4."
+
+        # Drive the controller's generator by hand so the worker plays the reward role.
+        process = controller.process([task])
+        reward_tasks = next(process)
+        assert reward_tasks, "PRMController should emit at least one reward task"
+        for reward_task in reward_tasks:
+            assert reward_task.return_context_logits is True
+            assert await pytorch_worker.generation_handler(reward_task) == TaskStatus.SUCCESS
+        with pytest.raises(StopIteration):
+            next(process)
+
+        assert controller.scores is not None
+        assert len(controller.scores) == len(reward_tasks)
+        for score in controller.scores:
+            assert 0.0 <= score <= 1.0
+
+
+class _RewardTaskController(NativeRewardController):
+    """Emits RewardTask so the worker's reward_handler is actually reached.
+
+    The built-in reward controllers forward GenerationTask objects, and Worker.run_task
+    dispatches on the exact task type, so reward_handler is unreachable through them
+    today. Changing that contract affects every existing worker and is tracked
+    separately; this keeps the end-to-end path testable in the meantime.
+    """
+
+    # ScaffoldingLlm runs prototype_controller.clone(), i.e. a deepcopy, so scores set on
+    # the running instance never reach the prototype the test holds. A class attribute is
+    # shared across those copies.
+    observed_scores = []
+
+    def process(self, tasks, **kwargs):
+        reward_tasks = []
+        for task in tasks:
+            reward_task = RewardTask()
+            reward_task.input_str = task.output_str or ""
+            reward_task.worker_tag = self.WorkerTag.REWARD
+            reward_tasks.append(reward_task)
+
+        yield reward_tasks
+
+        self.scores = [
+            (reward_task.custom_output_params or {}).get("score", 0.0)
+            for reward_task in reward_tasks
+        ]
+        _RewardTaskController.observed_scores.extend(self.scores)
+
+
+class TestPyTorchWorkerBestOfN:
+    def test_best_of_n_with_sequence_classification_reward(self, small_model_path, test_prompt):
+        """End-to-end Best-of-N: causal LM generates, classification model scores."""
+        _RewardTaskController.observed_scores.clear()
+
+        generation_worker = PyTorchWorker.from_pretrained(
+            small_model_path, device="cpu", torch_dtype=torch.float32
+        )
+        reward_worker = PyTorchWorker.from_pretrained_reward_model(
+            small_model_path, device="cpu", torch_dtype=torch.float32, num_labels=2
+        )
+
+        controller = BestOfNController(
+            NativeGenerationController(sampling_params={"max_tokens": 8, "temperature": 0.9}),
+            _RewardTaskController(),
+            # BestOfNController.process takes sample_num=4 by default and uses
+            # max(sample_num, default_sample_num), so match it to keep the count exact.
+            default_sample_num=4,
+        )
+
+        llm = ScaffoldingLlm(
+            controller,
+            {
+                NativeGenerationController.WorkerTag.GENERATION: generation_worker,
+                NativeRewardController.WorkerTag.REWARD: reward_worker,
+            },
+        )
+        try:
+            result = llm.generate(test_prompt)
+
+            # Best-of-N returns the selected candidate's text.
+            assert result.outputs[0].text is not None
+            # reward_handler ran on the classification model for every candidate.
+            assert len(_RewardTaskController.observed_scores) == 4
+            for score in _RewardTaskController.observed_scores:
+                assert isinstance(score, float)
+                assert 0.0 <= score <= 1.0
+        finally:
+            llm.shutdown(shutdown_workers=True)
 
 
 class TestPyTorchWorkerWithScaffolding:
