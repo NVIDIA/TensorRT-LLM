@@ -2254,10 +2254,30 @@ class PyTorchModelEngine(ModelEngine):
         if num_ctx_requests + num_gen_requests > self.batch_size:
             return None  # Not enough batch size to fill the request
 
-        blocks_to_use = num_full_seqs * math.ceil(
-            max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
-                num_left_over_tokens / kv_cache_manager.tokens_per_block
-            ) + num_gen_requests * self.max_beam_width
+        # Mirror add_dummy_requests' actual allocation: on top of the raw
+        # token count, every sequence gets num_extra_kv_tokens +
+        # num_extra_decoding_steps add_token calls, and generation dummies
+        # additionally reserve max_draft_loop_tokens for the draft loop.
+        # In one-engine spec modes that is (max_draft_len - 1) extra KV
+        # tokens plus max_draft_len draft-loop tokens per gen dummy, i.e.
+        # 2 * max_draft_len - 1 on top of the single prompt token.
+        # Under-counting these let warmup start an allocation that fails
+        # midway and, before the partial-allocation cleanup existed,
+        # permanently leaked most of the estimation-sized KV pool
+        # (TRTLLM-14903).
+        def blocks_for_seq(num_tokens: int) -> int:
+            return math.ceil(num_tokens / kv_cache_manager.tokens_per_block)
+
+        extra_ctx_tokens = (getattr(kv_cache_manager, "num_extra_kv_tokens", 0)
+                            or 0) + num_extra_decoding_steps
+        extra_gen_tokens = extra_ctx_tokens + self.max_draft_loop_tokens
+        blocks_to_use = num_full_seqs * blocks_for_seq(max_seq_len +
+                                                       extra_ctx_tokens)
+        if num_left_over_tokens > 0:
+            blocks_to_use += blocks_for_seq(num_left_over_tokens +
+                                            extra_ctx_tokens)
+        blocks_to_use += (num_gen_requests * self.max_beam_width *
+                          blocks_for_seq(1 + extra_gen_tokens))
 
         if blocks_to_use > available_blocks and isinstance(
                 kv_cache_manager, KVCacheManager):
