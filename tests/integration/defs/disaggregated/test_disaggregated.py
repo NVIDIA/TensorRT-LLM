@@ -40,7 +40,9 @@ from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
-from test_common.perf_metrics_utils import wait_for_perf_metrics_jsonl
+from test_common.perf_metrics_utils import (get_timing_metrics,
+                                            validate_timing_metrics,
+                                            wait_for_perf_metrics_jsonl)
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
@@ -261,6 +263,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_python_transceiver_host_offload.yaml",
         "tool_calls":
         f"{test_configs_root}/disagg_config_overlap.yaml",
+        "perf_metrics":
+        f"{test_configs_root}/disagg_config_metrics.yaml",
         "load_balance":
         f"{test_configs_root}/disagg_config_load_balance.yaml",
         "cache_aware_balance":
@@ -325,6 +329,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2ep2pp2_gentp4_deepseek_v3_lite_one_mtp_block_reuse_chunked.yaml",
         "deepseek_v3_lite_bf16_empty_batch":
         f"{test_configs_root}/disagg_config_deepseek_v3_lite_empty_batch.yaml",
+        "llama4_kv_cache_overflow":
+        f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml",
         "deepseek_v3_lite_bf16_tllm_gen_helix":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml",
         "deepseek_r1_v2_fp4_stress":
@@ -355,8 +361,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "cancel_stress_test_large":
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
-        "llama31_8b_nixl_python":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_nixl_python.yaml",
+        "llama31_8b_ucx":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
         "mamba_conc_greater_than_mbs":
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
     }
@@ -1502,6 +1508,37 @@ def test_disaggregated_python_transceiver_host_offload(
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
+                                    disaggregated_example_root,
+                                    llama_model_root, tmp_path):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    perf_metrics_output_dir = str(tmp_path / "perf_metrics")
+
+    def extra_endpoints_test(_server_url: str):
+        item = get_timing_metrics(perf_metrics_output_dir)
+        # Use helper function to validate all timing metrics comprehensively
+        validate_timing_metrics(item, "perf_metrics test")
+
+    # This test validates the C++ transceiver's timing-metric semantics. Force
+    # DEFAULT to UCX so Llama's Python preference falls back to C++.
+    env = llm_venv._new_env | {
+        "TRTLLM_USE_NIXL_KVCACHE": "0",
+        "TRTLLM_USE_UCX_KVCACHE": "1",
+        "UCX_TLS": get_ucx_tls(),
+    }
+    run_disaggregated_test(disaggregated_example_root,
+                           "perf_metrics",
+                           env=env,
+                           extra_endpoints_test=extra_endpoints_test,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory(),
+                           perf_metrics_output_dir=perf_metrics_output_dir)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                                                   llm_venv,
                                                   disaggregated_example_root,
@@ -1516,6 +1553,63 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                            env=llm_venv._new_env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
+                                            disaggregated_example_root,
+                                            llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    env = llm_venv._new_env.copy()
+    # This test validates the C++ transceiver's CSV format. Selecting UCX for
+    # the DEFAULT backend also resolves the automatic runtime to C++.
+    env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
+    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = get_ucx_tls()
+    env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
+    run_disaggregated_test(disaggregated_example_root,
+                           "perf_metrics",
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+    assert os.path.isdir(output_path)
+    # The C++ transceiver names timing files "<instanceId>_<rank>_<tag>.csv"
+    # (instanceId is a runtime UUID that disambiguates instances sharing an
+    # output directory), so match by the "_<tag>.csv" suffix instead of a fixed
+    # "rank_0" prefix.
+    send_files = sorted(f for f in os.listdir(output_path)
+                        if f.endswith("_send.csv"))
+    recv_files = sorted(f for f in os.listdir(output_path)
+                        if f.endswith("_recv.csv"))
+    assert send_files, f"no *_send.csv in {output_path}: {os.listdir(output_path)}"
+    assert recv_files, f"no *_recv.csv in {output_path}: {os.listdir(output_path)}"
+    send_file = os.path.join(output_path, send_files[0])
+    recv_file = os.path.join(output_path, recv_files[0])
+    with open(send_file, "r") as f:
+        lines = f.readlines()
+        assert len(lines) > 1
+        assert lines[0].startswith(
+            "RequestID,RequestInfo,Preparation,Preprocess,Transmissions,Postprocess"
+        )
+        assert ",Delay,Duration,Bandwidth(Gbps)" in lines[0]
+        # get a send sample and match the recv
+        sample = lines[1].split(',')
+        assert len(sample) >= 9
+    with open(recv_file, "r") as f:
+        lines = f.readlines()
+        assert len(lines) > 1
+        matched = False
+        for line in lines:
+            sample_recv = line.split(',')
+            if sample_recv[0] == sample[0]:
+                matched = True
+                assert float(sample_recv[1]) <= float(sample[1])
+                break
+        assert matched
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -2571,6 +2665,37 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
     print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
 
     assert e2el > 0 and ttft > 0
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.parametrize(
+    "model_path",
+    ['llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8'])
+def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
+                                               disaggregated_example_root,
+                                               llm_venv, model_path):
+    """
+    RCCA: https://nvbugspro.nvidia.com/bug/5555681
+    Test to reproduce KV cache buffer overflow bug with long context.
+    """
+    models_root = llm_models_root()
+    llama4_model_root = os.path.join(models_root, model_path)
+
+    # Create symlink to match config file path
+    setup_model_symlink(llm_venv, llama4_model_root, model_path)
+
+    config_file = get_test_config("llama4_kv_cache_overflow",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    run_disaggregated_aiperf(config_file=config_file,
+                             model_path=llama4_model_root,
+                             server_start_timeout=1200,
+                             input_tokens=128000,
+                             output_tokens=100,
+                             env=llm_venv._new_env,
+                             cwd=llm_venv.get_working_directory())
 
 
 @skip_pre_blackwell
@@ -3642,7 +3767,7 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 def test_disaggregated_logprobs_serving(disaggregated_test_root,
                                         disaggregated_example_root, llm_venv,
                                         llama_model_root):
-    """Test logprobs with NIXL Python V2 and multi-GPU TP.
+    """Test logprobs via OpenAI API in disaggregated serving with multi-GPU TP.
 
     Covers the RCCA scenario (NVBug 5926823): disaggregated + streaming + logprobs,
     where the context worker returns prefill result (request_type=generation_only)
@@ -3706,11 +3831,12 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     setup_model_symlink(llm_venv, llama_model_root,
                         "llama-3.1-model/Llama-3.1-8B-Instruct")
 
-    config_file = get_test_config("llama31_8b_nixl_python",
-                                  disaggregated_example_root,
+    config_file = get_test_config("llama31_8b_ucx", disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
+    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
