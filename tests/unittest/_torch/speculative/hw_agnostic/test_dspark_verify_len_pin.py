@@ -33,17 +33,14 @@ def _planner(tiers=(1, 2, 5)):
     return DSparkVerifyPlanner(cfg=cfg, cost_table=table, tiers=list(tiers))
 
 
-def test_queued_pin_is_not_yet_in_force():
-    """Queuing must not change this rank's behaviour before the group agrees."""
+def test_adopting_the_agreed_value_applies_it():
+    """Queuing must not change this rank's behaviour before the group agrees;
+    adopting the agreed value applies it and consumes the pending request."""
     planner = _planner()
     assert planner.request_verify_len_pin(2) == 2
+    # Queued, not yet in force.
     assert planner._forced_verify_len is None
     assert planner.pending_verify_len_pin() == 2
-
-
-def test_adopting_the_agreed_value_applies_it():
-    planner = _planner()
-    planner.request_verify_len_pin(2)
     planner.adopt_verify_len_pin(2)
     assert planner._forced_verify_len == 2
     # Consumed: the next step must not re-broadcast a pin nobody asked for.
@@ -58,17 +55,13 @@ def test_a_rank_that_queued_nothing_still_adopts_the_group_value():
     assert peer._forced_verify_len == 5
 
 
-def test_minus_one_means_nobody_asked_and_leaves_the_pin_alone():
+def test_zero_clears_the_pin():
+    """Wire protocol: -1 means nobody asked (leave the pin alone); clearing
+    needs its own value, 0, because None cannot travel in an int payload."""
     planner = _planner()
     planner.adopt_verify_len_pin(2)
     planner.adopt_verify_len_pin(-1)
     assert planner._forced_verify_len == 2
-
-
-def test_zero_clears_the_pin():
-    """Clearing needs its own wire value: None cannot travel in an int payload."""
-    planner = _planner()
-    planner.adopt_verify_len_pin(2)
     assert planner.request_verify_len_pin(None) is None
     assert planner.pending_verify_len_pin() == 0
     planner.adopt_verify_len_pin(0)
@@ -80,14 +73,10 @@ def test_an_uncaptured_length_is_refused_at_the_call_site():
     planner = _planner(tiers=(1, 2, 5))
     with pytest.raises(ValueError, match="captured tier ladder"):
         planner.request_verify_len_pin(3)
-    assert planner.pending_verify_len_pin() == -1
-    assert planner._forced_verify_len is None
-
-
-def test_a_length_outside_the_bounds_is_refused():
-    planner = _planner()
     with pytest.raises(ValueError, match="outside"):
         planner.request_verify_len_pin(9)
+    assert planner.pending_verify_len_pin() == -1
+    assert planner._forced_verify_len is None
 
 
 def test_pinned_steps_hand_every_request_the_same_window():

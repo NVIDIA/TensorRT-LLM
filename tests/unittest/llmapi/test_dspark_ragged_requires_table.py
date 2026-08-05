@@ -31,11 +31,9 @@ def _cfg(**kwargs):
 def test_ragged_without_a_cost_table_is_rejected():
     with pytest.raises(ValueError, match="requires a profiled cost table"):
         _cfg()
-
-
-def test_ragged_with_an_sps_table_is_accepted():
-    cfg = _cfg(confidence_sps_table_path="/tmp/table.json")
-    assert cfg.enable_ragged_verify
+    # The same gate must open once a table is named -- a gate that rejects
+    # everything would pass the raise above.
+    assert _cfg(confidence_sps_table_path="/tmp/table.json").enable_ragged_verify
 
 
 def test_confidence_scheduling_without_ragged_is_rejected():

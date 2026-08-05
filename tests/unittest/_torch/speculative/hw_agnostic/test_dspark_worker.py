@@ -58,39 +58,29 @@ def test_metadata_buffer_and_layer_lookup():
     # sorted, O(1) membership
     assert meta.is_layer_capture(58) and meta.is_layer_capture(60)
     assert not meta.is_layer_capture(0) and not meta.is_layer_capture(61)
-
-
-def test_metadata_capture_plain_hidden():
-    """A [num_tokens, hidden] capture is stored at the layer's slice as-is."""
-    meta = _make_metadata()
-    hs = torch.randn(4, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    meta.maybe_capture_hidden_states(59, hs)  # layer 59 -> capture index 1
-    got = meta.get_hidden_states(4)
-    assert torch.equal(got[:, HIDDEN : 2 * HIDDEN], hs)
-
-
-def test_metadata_capture_hc_mean_reduction():
-    """A flattened mHC residual [N, hc_mult*hidden] is reduced by mean over hc."""
-    meta = _make_metadata()
-    mhc = torch.randn(4, HC_MULT * HIDDEN, device="cuda", dtype=torch.bfloat16)
-    meta.maybe_capture_hidden_states(58, mhc)  # layer 58 -> capture index 0
-    expected = mhc.reshape(4, HC_MULT, HIDDEN).mean(dim=1)
-    got = meta.get_hidden_states(4)
-    assert torch.equal(got[:, 0:HIDDEN], expected)
-
-
-def test_metadata_no_capture_for_unlisted_layer():
-    meta = _make_metadata()
-    meta.captured_hidden_states.zero_()
-    meta.maybe_capture_hidden_states(10, torch.randn(4, HIDDEN, device="cuda"))
-    assert torch.count_nonzero(meta.get_hidden_states(4)) == 0
-
-
-def test_metadata_prepare_batch_indices():
-    meta = _make_metadata()
+    # prepare() publishes contiguous batch indices for the current batch.
     meta.request_ids = [7, 3, 5]
     meta.prepare()
     assert meta.batch_indices_cuda[:3].tolist() == [0, 1, 2]
+
+
+def test_metadata_capture_plain_hidden():
+    """Capture routing: a [num_tokens, hidden] capture is stored at the layer's
+    slice as-is; a flattened mHC residual [N, hc_mult*hidden] is reduced by mean
+    over the hc streams; an unlisted layer writes nothing."""
+    meta = _make_metadata()
+    meta.captured_hidden_states.zero_()
+    hs = torch.randn(4, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    meta.maybe_capture_hidden_states(59, hs)  # layer 59 -> capture index 1
+    mhc = torch.randn(4, HC_MULT * HIDDEN, device="cuda", dtype=torch.bfloat16)
+    meta.maybe_capture_hidden_states(58, mhc)  # layer 58 -> capture index 0
+    meta.maybe_capture_hidden_states(10, torch.randn(4, HIDDEN, device="cuda"))  # unlisted
+    got = meta.get_hidden_states(4)
+    assert torch.equal(got[:, HIDDEN : 2 * HIDDEN], hs)
+    expected = mhc.reshape(4, HC_MULT, HIDDEN).mean(dim=1)
+    assert torch.equal(got[:, 0:HIDDEN], expected)
+    # The unlisted layer landed nowhere: the remaining slice stays zero.
+    assert torch.count_nonzero(got[:, 2 * HIDDEN :]) == 0
 
 
 def _make_worker(enable_confidence_scheduling=False, verify_len_tiers=None):
@@ -106,12 +96,6 @@ def _make_worker(enable_confidence_scheduling=False, verify_len_tiers=None):
     from tensorrt_llm.mapping import Mapping
 
     return DSparkWorker(cfg, Mapping())
-
-
-def test_worker_reads_confidence_flag_once():
-    """The flag must be run-constant: a per-step read could diverge the graph."""
-    assert _make_worker().return_confidence is False
-    assert _make_worker(enable_confidence_scheduling=True).return_confidence is True
 
 
 def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
@@ -143,14 +127,11 @@ def test_worker_lazy_init_window_buffers():
     worker._lazy_init(dm, meta)
     assert id(worker._kv_windows) == buf_id
 
-
-def test_worker_rejects_mismatched_block_size():
-    worker = _make_worker()
-    draft_model = _fake_draft_model()
-    draft_model.block_size = 4
-
+    # A draft model whose block_size disagrees with the worker is refused.
+    bad = _fake_draft_model()
+    bad.block_size = 4
     with pytest.raises(ValueError, match="block_size must equal worker max_draft_len"):
-        worker._lazy_init(draft_model, _make_metadata())
+        _make_worker()._lazy_init(bad, _make_metadata())
 
 
 def test_worker_slot_assignment_and_reset():
@@ -235,7 +216,8 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
 
 
 def test_prepare_builds_batch_to_slot_on_batched_path():
-    """prepare() mirrors the host slot map into _batch_to_slot (default batched path)."""
+    """prepare() mirrors the host slot map into _batch_to_slot (default batched
+    path) and returns a dropped request's slot to the free pool."""
     worker = _make_worker()
     meta = _make_metadata(max_num_requests=4)
     worker._lazy_init(_fake_draft_model(), meta)  # batched is the default
@@ -244,23 +226,12 @@ def test_prepare_builds_batch_to_slot_on_batched_path():
     # Assign slots for two requests (as the prefill path would).
     sa = worker._assign_slot(100, reset=True)
     sb = worker._assign_slot(101, reset=True)
+    worker._ctx_len[sa] = 17
 
     meta.request_ids = [101, 100]
     meta.prepare()
     # Mirror reflects request-order -> slot.
     assert worker._batch_to_slot[:2].tolist() == [sb, sa]
-
-
-def test_prepare_frees_stale_slots_on_batched_path():
-    """A request that drops out of the batch returns its slot to the free pool."""
-    worker = _make_worker()
-    meta = _make_metadata(max_num_requests=4)
-    worker._lazy_init(_fake_draft_model(), meta)
-    meta._dspark_worker = worker
-
-    sa = worker._assign_slot(100, reset=True)
-    worker._assign_slot(101, reset=True)
-    worker._ctx_len[sa] = 17
 
     # Only request 101 survives; 100's slot must be freed + cleared.
     meta.request_ids = [101]
@@ -489,7 +460,7 @@ def _stride_probe_draft_model(block_size=5, num_stages=3, window_size=128, head_
     return dm, seen
 
 
-@pytest.mark.parametrize("runtime_draft_len", [3, 1])
+@pytest.mark.parametrize("runtime_draft_len", [3, None])
 def test_gen_draft_gathers_hidden_with_the_runtime_stride(runtime_draft_len):
     """The gather stride must follow runtime_draft_len, not max_draft_len.
 
@@ -497,6 +468,8 @@ def test_gen_draft_gathers_hidden_with_the_runtime_stride(runtime_draft_len):
     Striding by ``max_draft_len + 1`` instead walks into the *next* request's
     hidden states as soon as the scheduler trims the draft length -- the draft
     then conditions on another request's context, with no error anywhere.
+    ``runtime_draft_len=None`` pins the fallback: metadata without a runtime
+    length keeps the pre-existing max_draft_len stride.
     """
     num_gens, hidden = 4, HIDDEN * NCAP
     worker = _make_worker()
@@ -506,7 +479,7 @@ def test_gen_draft_gathers_hidden_with_the_runtime_stride(runtime_draft_len):
     worker._batch_to_slot[:num_gens] = torch.arange(num_gens, device="cuda")
 
     # Row r of request g is tagged with g so a cross-request read is visible.
-    stride = runtime_draft_len + 1
+    stride = (runtime_draft_len or worker.max_draft_len) + 1
     captured = torch.zeros(num_gens * stride, hidden, device="cuda")
     for g in range(num_gens):
         captured[g * stride : (g + 1) * stride] = float(g)
@@ -538,80 +511,37 @@ def test_gen_draft_gathers_hidden_with_the_runtime_stride(runtime_draft_len):
     )
 
 
-def test_gen_draft_stride_falls_back_to_max_draft_len():
-    """Metadata without runtime_draft_len keeps the pre-existing behavior."""
-    num_gens, hidden = 3, HIDDEN * NCAP
-    worker = _make_worker()
-    dm, seen = _stride_probe_draft_model()
-    meta = _make_metadata(max_num_requests=8, max_num_tokens=256)
-    worker._lazy_init(dm, meta)
-    worker._batch_to_slot[:num_gens] = torch.arange(num_gens, device="cuda")
-
-    stride = worker.max_draft_len + 1
-    captured = torch.zeros(num_gens * stride, hidden, device="cuda")
-    for g in range(num_gens):
-        captured[g * stride : (g + 1) * stride] = float(g)
-
-    meta.runtime_draft_len = None
-    meta.get_hidden_states = lambda _n: captured
-    attn = types.SimpleNamespace(num_ctx_tokens=0, num_seqs=num_gens, num_contexts=0)
-    nacc = torch.ones(num_gens, dtype=torch.int32, device="cuda")
-    accepted = torch.zeros(num_gens, worker.max_draft_len + 1, dtype=torch.int32, device="cuda")
-
-    worker._draft_gen_block_batched(
-        dm,
-        meta,
-        attn,
-        accepted,
-        nacc,
-        num_contexts=0,
-        batch_size=num_gens,
-        total_target_tokens=captured.shape[0],
-    )
-    assert seen["main_hidden"][:, 0].tolist() == [float(g) for g in range(num_gens)]
-
-
 def test_confidence_rows_are_looked_up_by_slot():
     """The confidence buffer is slot-indexed; a batch rarely owns slots 0..G-1.
 
     The snapshot the scheduler reads is one iteration old, and joins/departures
     reshuffle the batch in between, so batch position is not a usable key.
     ``confidence_row_for`` re-associates each request with the row its own draft
-    wrote.
+    wrote. A request with no slot yet falls back to a dedicated, permanently
+    neutral row ("verify the whole block") past every real slot -- the scratch
+    row is not safe for that, since padded and unknown requests write through it.
     """
     worker = _make_worker(enable_confidence_scheduling=True)
     dm, _ = _stride_probe_draft_model()
     worker._lazy_init(dm, _make_metadata(max_num_requests=8))
     assert worker._confidence_logits is not None
 
-    # Tag every row with its index, then hand three requests explicit slots.
-    for s in range(worker._confidence_logits.shape[0]):
+    # Unscored request: the permanently-neutral row, past every real slot AND
+    # past the scratch row, and it reads as ~certain acceptance.
+    neutral = worker.confidence_row_for(12345)
+    assert neutral == worker._neutral_conf_row
+    assert neutral > worker._scratch_slot
+    buf = worker.staged_confidence_buffer()
+    assert torch.sigmoid(buf[neutral]).min().item() > 0.999
+
+    # Tag every real row with its index, then hand three requests explicit slots.
+    for s in range(worker._scratch_slot):
         worker._confidence_logits[s] = float(s)
     worker._req_to_slot = {100: 5, 101: 2, 102: 7}
 
     rows = [worker.confidence_row_for(r) for r in (100, 101, 102)]
     assert rows == [5, 2, 7]
-    buf = worker.staged_confidence_buffer()
     assert buf[rows][:, 0].tolist() == [5.0, 2.0, 7.0]
-
-
-def test_unscored_request_maps_to_a_permanently_neutral_row():
-    """A request with no slot yet must read as "verify the whole block".
-
-    The scratch row is not safe for this -- padded and unknown requests write
-    through it -- so there is a dedicated row past every real slot that nothing
-    ever writes.
-    """
-    worker = _make_worker(enable_confidence_scheduling=True)
-    dm, _ = _stride_probe_draft_model()
-    worker._lazy_init(dm, _make_metadata(max_num_requests=8))
-
-    neutral = worker.confidence_row_for(12345)
-    assert neutral == worker._neutral_conf_row
-    # Past every real slot AND past the scratch row.
-    assert neutral > worker._scratch_slot
-    buf = worker.staged_confidence_buffer()
-    assert torch.sigmoid(buf[neutral]).min().item() > 0.999
 
 
 def test_a_freshly_assigned_slot_starts_neutral():

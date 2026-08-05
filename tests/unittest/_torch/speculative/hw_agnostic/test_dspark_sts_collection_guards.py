@@ -68,17 +68,20 @@ def test_a_loaded_cost_table_without_a_pin_is_refused():
 
 
 def test_a_pinned_window_makes_the_table_harmless():
-    """Pinning to the full block makes the label uncensored by construction."""
+    """The uncensored regimes must all build a recorder.
+
+    Pinning to the full block makes the label uncensored by construction;
+    without a table the planner cannot trim, so nothing censors anything;
+    static mode contributes no padding rows.
+    """
     with collecting(pin=5):
         rec = make_recorder_from_env(block_size=5, has_cost_table=True)
         assert rec is not None and rec.block_size == 5
-
-
-def test_no_table_needs_no_pin():
-    """Without a table the planner cannot trim, so nothing censors anything."""
     with collecting():
         assert make_recorder_from_env(block_size=5,
                                       has_cost_table=False) is not None
+        assert make_recorder_from_env(block_size=5,
+                                      ragged_mode="static") is not None
 
 
 def test_compact_mode_is_refused():
@@ -90,12 +93,6 @@ def test_compact_mode_is_refused():
     with collecting(pin=5):
         with pytest.raises(ValueError, match="Padded verify rows"):
             make_recorder_from_env(block_size=5, ragged_mode="compact")
-
-
-def test_static_mode_is_allowed():
-    with collecting():
-        assert make_recorder_from_env(block_size=5,
-                                      ragged_mode="static") is not None
 
 
 class _Head:
@@ -125,20 +122,14 @@ class _Wrapper:
         self.dspark_model = _Bare(head)
 
 
-def test_head_resolves_on_the_bare_model():
+def test_head_resolves_across_both_layouts_and_absence_is_none():
     from tensorrt_llm._torch.speculative.dspark_sts import resolve_confidence_head
     h = _Head()
     assert resolve_confidence_head(_Bare(h)) is h
-
-
-def test_head_resolves_through_the_forcausallm_wrapper():
-    from tensorrt_llm._torch.speculative.dspark_sts import resolve_confidence_head
-    h = _Head()
+    # The wrapper layout is the one the chained getattr missed: resolving to
+    # None here silently disabled calibration for every confidence-scheduled
+    # run of the first campaign.
     assert resolve_confidence_head(_Wrapper(h)) is h
-
-
-def test_absent_head_is_none_not_an_error():
-    from tensorrt_llm._torch.speculative.dspark_sts import resolve_confidence_head
     assert resolve_confidence_head(_Bare(None)) is None
     assert resolve_confidence_head(_Wrapper(None)) is None
     assert resolve_confidence_head(object()) is None

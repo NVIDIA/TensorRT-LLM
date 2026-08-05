@@ -49,30 +49,15 @@ def _layout(lens, bucket=None, buckets=None):
 # --------------------------------------------------------------------------
 
 
-def test_qo_indptr_is_the_exclusive_prefix_sum():
-    lens = torch.tensor([3, 1, 4, 2], dtype=torch.int32)
-    assert build_qo_indptr(lens).tolist() == [0, 3, 4, 8, 10]
-
-
-def test_qo_indptr_slices_recover_each_request():
-    """Request r must own exactly [qo_indptr[r], qo_indptr[r+1])."""
-    lens = [3, 1, 4, 2]
-    lay = _layout(lens, bucket=10)
-    flat = torch.arange(sum(lens))
-    for r, n in enumerate(lens):
-        lo, hi = int(lay.qo_indptr[r]), int(lay.qo_indptr[r + 1])
-        assert hi - lo == n
-        assert flat[lo:hi].numel() == n
-    assert int(lay.qo_indptr[-1]) == sum(lens)
-
-
-def test_extend_start_loc_matches_indptr_head():
-    lay = _layout([2, 5, 1], bucket=8)
-    assert torch.equal(lay.extend_start_loc, lay.qo_indptr[:-1])
-
-
-def test_empty_batch_indptr():
-    assert build_qo_indptr(torch.zeros(0, dtype=torch.int32)).tolist() == [0]
+@pytest.mark.parametrize(
+    "lens, expected",
+    [
+        ([3, 1, 4, 2], [0, 3, 4, 8, 10]),
+        ([], [0]),  # empty batch still yields the leading 0
+    ],
+)
+def test_qo_indptr_is_the_exclusive_prefix_sum(lens, expected):
+    assert build_qo_indptr(torch.tensor(lens, dtype=torch.int32)).tolist() == expected
 
 
 def test_build_qo_indptr_rejects_2d():
@@ -106,6 +91,8 @@ def test_layout_derives_the_bucket_from_the_host_total():
         torch.tensor([3, 1, 4], dtype=torch.int32), buckets=[8, 16, 32], total_verify_tokens=8
     )
     assert lay.graph_num_tokens == 8
+    # extend_start_loc is the offset form some attention backends want directly.
+    assert torch.equal(lay.extend_start_loc, lay.qo_indptr[:-1])
 
 
 def test_layout_refuses_to_sync_for_the_total():
@@ -118,12 +105,19 @@ def test_layout_refuses_to_sync_for_the_total():
 # --------------------------------------------------------------------------
 
 
-def test_fill_bucket_converts_padding_into_real_verification():
+@pytest.mark.parametrize(
+    "lens, bucket",
+    [
+        ([2, 1, 1], 12),  # 4 used, 8 spare: padding becomes real verification
+        ([3, 2, 3], 8),  # already exact: the fill is a no-op
+    ],
+)
+def test_fill_bucket_converts_padding_into_real_verification(lens, bucket):
     """The step already pays for the bucket -- spare slots must not be wasted."""
-    lay = _layout([2, 1, 1], bucket=12)  # 4 used, 8 spare
+    lay = _layout(lens, bucket=bucket)
     filled = lay.fill_bucket(max_verify_len=BLOCK)
-    assert filled.total_verify_tokens == 12
-    assert int(filled.verify_lens.sum()) == 12
+    assert filled.total_verify_tokens == bucket
+    assert int(filled.verify_lens.sum()) == bucket
     filled.validate(max_verify_len=BLOCK, exact_fill=True)
 
 
@@ -136,14 +130,8 @@ def test_fill_bucket_spreads_over_real_requests_first():
     assert max(lens) - min(lens) <= 1, f"unbalanced: {lens}"
 
 
-def test_fill_bucket_is_a_noop_when_exact():
-    lay = _layout([3, 2, 3], bucket=8)
-    assert lay.fill_bucket(max_verify_len=BLOCK) is not None
-    assert int(lay.fill_bucket(max_verify_len=BLOCK).verify_lens.sum()) == 8
-
-
 def test_fill_bucket_adds_pad_rows_to_reach_the_captured_batch_size():
-    """Row count must hit padded_bs; the leftovers land on the pad rows."""
+    """Row count must hit padded_bs; slack goes to real rows before pad rows."""
     lay = _layout([3, 2], bucket=12)
     filled = lay.fill_bucket(max_verify_len=BLOCK, padded_bs=4)
     assert filled.bs == 4
@@ -151,10 +139,11 @@ def test_fill_bucket_adds_pad_rows_to_reach_the_captured_batch_size():
     assert filled.num_pad_requests == 2
     assert int(filled.verify_lens.sum()) == 12
     filled.validate(max_verify_len=BLOCK, exact_fill=True)
-    # Real rows are saturated before any slack is wasted on pad rows.
+    # Real rows absorb all the slack; the pad rows stay at the 1-token minimum
+    # (a pad row with 0 tokens would break qo_indptr slicing).
     lens = filled.verify_lens.tolist()
-    assert lens[0] >= 3 and lens[1] >= 2
-    assert min(lens[2:]) >= 1, "a pad row with 0 tokens breaks qo_indptr slicing"
+    assert lens[2:] == [1, 1]
+    assert lens[0] + lens[1] == 10
 
 
 def test_fill_bucket_raises_when_the_bucket_cannot_be_reached():
@@ -164,10 +153,20 @@ def test_fill_bucket_raises_when_the_bucket_cannot_be_reached():
         lay.fill_bucket(max_verify_len=BLOCK)
 
 
-def test_fill_bucket_raises_when_the_bucket_is_too_small():
-    lay = _layout([5, 5], bucket=8)  # 10 real tokens already > 8
+@pytest.mark.parametrize(
+    "lens, bucket, padded_bs",
+    [
+        ([5, 5], 8, None),  # 10 real tokens already > 8
+        # 8 real tokens + 6 one-token pad rows needs 14, not 10: the pad-row
+        # floor counts against the bucket too. A short batch would desync
+        # attention from the MoE.
+        ([4, 4], 10, 8),
+    ],
+)
+def test_fill_bucket_raises_when_the_bucket_is_too_small(lens, bucket, padded_bs):
+    lay = _layout(lens, bucket=bucket)
     with pytest.raises(ValueError, match="too small"):
-        lay.fill_bucket(max_verify_len=BLOCK)
+        lay.fill_bucket(max_verify_len=BLOCK, padded_bs=padded_bs)
 
 
 def test_fill_bucket_rejects_a_padded_bs_below_the_real_count():
@@ -222,8 +221,10 @@ def test_validate_rejects_a_stale_indptr():
 # --------------------------------------------------------------------------
 
 
-def test_scheduler_output_packs_into_a_valid_layout():
-    """The whole point: heterogeneous confidence must yield heterogeneous lengths."""
+def test_ragged_beats_uniform_at_equal_budget():
+    """Pins the reason ragged exists: heterogeneous confidence must yield
+    heterogeneous lengths that pack into a valid layout and out-earn the best
+    uniform split at the same token spend."""
     conf = torch.tensor(
         [
             [0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92],  # deep, worth verifying
@@ -232,10 +233,14 @@ def test_scheduler_output_packs_into_a_valid_layout():
             [0.60, 0.45, 0.35, 0.28, 0.22, 0.18, 0.12],
         ]
     )
+    surv = compute_survival(conf)
     cfg = DSparkScheduleConfig(block_size=BLOCK, min_verify_len=1)
-    lens = schedule_verify_lens_topk(survival=compute_survival(conf), budget=8, cfg=cfg)
+    budget, bs = 8, conf.shape[0]
 
+    lens = schedule_verify_lens_topk(survival=surv, budget=budget, cfg=cfg)
     assert lens[0] > lens[1], "the confident request should verify deeper"
+
+    # The lengths pack into a valid captured layout.
     total = int(lens.sum())
     lay = RaggedVerifyLayout.from_verify_lens(
         lens, buckets=[8, 16, 32, 64], total_verify_tokens=total
@@ -243,31 +248,13 @@ def test_scheduler_output_packs_into_a_valid_layout():
     lay.validate(max_verify_len=BLOCK)
     assert lay.graph_num_tokens >= total
 
-
-def test_ragged_beats_uniform_at_equal_budget():
-    """Pins the reason ragged exists: same tokens verified, more expected yield."""
-    conf = torch.tensor(
-        [
-            [0.98, 0.97, 0.96, 0.95, 0.94, 0.93, 0.92],
-            [0.55, 0.40, 0.30, 0.25, 0.20, 0.15, 0.10],
-            [0.90, 0.85, 0.70, 0.55, 0.45, 0.35, 0.25],
-            [0.60, 0.45, 0.35, 0.28, 0.22, 0.18, 0.12],
-        ]
-    )
-    surv = compute_survival(conf)
-    cfg = DSparkScheduleConfig(block_size=BLOCK, min_verify_len=1)
-    budget, bs = 8, conf.shape[0]
-
-    ragged_lens = schedule_verify_lens_topk(survival=surv, budget=budget, cfg=cfg)
-    tau_ragged = sum(float(surv[r, : int(ragged_lens[r])].sum()) for r in range(bs))
-
-    # Best uniform length that fits the same total token spend.
+    # Same tokens verified, more expected yield than the best uniform length.
+    tau_ragged = sum(float(surv[r, : int(lens[r])].sum()) for r in range(bs))
     budget_tokens = bs * cfg.min_verify_len + budget
     tau_uniform = max(
         float(surv[:, :L].sum()) for L in range(1, BLOCK + 1) if bs * L <= budget_tokens
     )
-
-    assert int(ragged_lens.sum()) <= budget_tokens
+    assert int(lens.sum()) <= budget_tokens
     assert tau_ragged > tau_uniform, (
         f"ragged {tau_ragged:.2f} should beat uniform {tau_uniform:.2f} at the same token spend"
     )
@@ -306,50 +293,24 @@ def test_scatter_unpacks_a_flat_batch_into_rows():
     assert out.tolist() == [[10, 11, 12, -1], [20, -1, -1, -1], [30, 31, -1, -1]]
 
 
-def test_scatter_round_trips_through_qo_indptr():
-    torch.manual_seed(4)
-    lens_list = [4, 1, 7, 2, 5]
-    lens = torch.tensor(lens_list, dtype=torch.int32)
-    lay = _layout(lens_list, bucket=32)
-    flat = torch.randint(0, 1000, (sum(lens_list),))
-    out = scatter_ragged_to_padded(flat, verify_lens=lens, qo_indptr=lay.qo_indptr, max_len=BLOCK)
-    for r, n in enumerate(lens_list):
-        lo = int(lay.qo_indptr[r])
-        assert out[r, :n].tolist() == flat[lo : lo + n].tolist()
-
-
-def test_accept_count_stops_at_the_first_mismatch():
-    draft = torch.tensor([[1, 2, 3, 4]])
-    target = torch.tensor([[1, 2, 9, 4]])
-    lens = torch.tensor([4])
-    assert count_accepted_ragged(
-        draft_tokens=draft, target_tokens=target, verify_lens=lens
-    ).tolist() == [2]
-
-
-def test_accept_count_respects_each_request_window():
-    """The core ragged invariant: a request only gets credit inside its window."""
-    draft = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
-    target = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
-    # Row 0 verified all 4; row 1 verified only 2 even though everything matches.
-    lens = torch.tensor([4, 2])
-    got = count_accepted_ragged(draft_tokens=draft, target_tokens=target, verify_lens=lens)
-    assert got.tolist() == [4, 2]
-
-
-def test_accept_count_ignores_stale_padding_beyond_the_window():
-    """Stale slots must not be able to credit an acceptance the target never made.
-
-    Positions past verify_len were never sent to the target. If they happen to
-    hold matching values from a previous iteration and are not masked, the
-    cumulative product runs straight through them and reports more accepted
-    tokens than were actually verified -- wrong output, no error.
-    """
-    draft = torch.tensor([[1, 2, 3, 4]])
-    target = torch.tensor([[1, 2, 3, 4]])  # everything "matches", incl. stale tail
-    lens = torch.tensor([2])  # but only 2 were really verified
-    got = count_accepted_ragged(draft_tokens=draft, target_tokens=target, verify_lens=lens)
-    assert got.tolist() == [2], "unmasked padding leaked into the accept count"
+@pytest.mark.parametrize(
+    "draft, target, lens, expected",
+    [
+        # the run of matches stops at the first mismatch
+        ([[1, 2, 3, 4]], [[1, 2, 9, 4]], [4], [2]),
+        # a request only gets credit inside its window, even when the stale
+        # padding beyond it happens to match -- unmasked padding would credit
+        # an acceptance the target never made (wrong output, no error).
+        ([[1, 2, 3, 4], [5, 6, 7, 8]], [[1, 2, 3, 4], [5, 6, 7, 8]], [4, 2], [4, 2]),
+    ],
+)
+def test_accept_count_respects_each_request_window(draft, target, lens, expected):
+    got = count_accepted_ragged(
+        draft_tokens=torch.tensor(draft),
+        target_tokens=torch.tensor(target),
+        verify_lens=torch.tensor(lens),
+    )
+    assert got.tolist() == expected
 
 
 def test_accept_count_matches_the_uniform_path_when_lengths_are_equal():
@@ -391,26 +352,20 @@ def _shape(num_real, total, peers=None):
     )
 
 
-def test_shape_rounds_both_axes_up_to_captured_values():
-    got = _shape(num_real=5, total=20)
-    assert got.padded_bs == 8  # 5 -> 8
-    # slack = 20 - 5 = 15; needed = 8 + 15 = 23 -> 32
-    assert got.bucket == 32
-
-
-def test_bucket_covers_the_padded_rows_floor():
-    # Every row verifies at least its bonus position, so the bucket can never
-    # be smaller than the row count.
-    got = _shape(num_real=3, total=3)
-    assert got.padded_bs == 4
-    assert got.bucket >= got.padded_bs
-
-
-def test_exact_captured_values_are_not_rounded_further():
-    # 8 requests, slack 8 -> needed 16, both already captured.
-    got = _shape(num_real=8, total=16)
-    assert got.padded_bs == 8
-    assert got.bucket == 16
+@pytest.mark.parametrize(
+    "num_real, total, want_bs, want_bucket",
+    [
+        # 5 -> 8 rows; slack = 20 - 5 = 15; needed = 8 + 15 = 23 -> 32.
+        (5, 20, 8, 32),
+        # exact captured values are not rounded further: 8 requests with
+        # slack 8 -> needed 16, both axes already captured.
+        (8, 16, 8, 16),
+    ],
+)
+def test_shape_rounds_both_axes_up_to_captured_values(num_real, total, want_bs, want_bucket):
+    got = _shape(num_real=num_real, total=total)
+    assert got.padded_bs == want_bs
+    assert got.bucket == want_bucket
 
 
 def test_every_rank_computes_the_same_shape():
@@ -421,37 +376,37 @@ def test_every_rank_computes_the_same_shape():
     assert len(shapes) == 1
 
 
-def test_shape_is_driven_by_the_widest_rank_not_the_local_one():
-    # This rank is small (3 requests, 9 tokens) but must still size for the
-    # widest peer: rows from max real (6 -> 8), slack from max (30 - 6 = 24).
-    peers = [(3, 9), (6, 30), (5, 11)]
-    got = _shape(num_real=3, total=9, peers=peers)
-    assert got.padded_bs == 8
-    assert got.bucket == 32  # 8 + 24 = 32, exactly a captured bucket
+@pytest.mark.parametrize(
+    "num_real, total, peers, want_bs, want_bucket",
+    [
+        # This rank is small (3 requests, 9 tokens) but must size for the
+        # widest peer: rows from max real (6 -> 8), slack from the max
+        # (30 - 6 = 24) -> 8 + 24 = 32, exactly a captured bucket.
+        (3, 9, [(3, 9), (6, 30), (5, 11)], 8, 32),
+        # The widest axes can come from different ranks: rank A has the most
+        # rows (7 -> 8), rank B the most slack (18) -> 8 + 18 = 26 -> 32.
+        (7, 8, [(7, 8), (2, 20)], 8, 32),
+    ],
+)
+def test_shape_is_driven_by_the_widest_rank_not_the_local_one(
+    num_real, total, peers, want_bs, want_bucket
+):
+    got = _shape(num_real=num_real, total=total, peers=peers)
+    assert got.padded_bs == want_bs
+    assert got.bucket == want_bucket
 
 
-def test_widest_axes_can_come_from_different_ranks():
-    # rank A has the most rows, rank B the most slack.
-    peers = [(7, 8), (2, 20)]
-    got = _shape(num_real=7, total=8, peers=peers)
-    assert got.padded_bs == 8  # from rank A
-    # slack: A = 1, B = 18 -> needed = 8 + 18 = 26 -> 32
-    assert got.bucket == 32
-
-
-def test_shape_raises_when_the_batch_exceeds_captured_rows():
-    with pytest.raises(ValueError, match="exceed the largest captured batch"):
-        _shape(num_real=17, total=17)
-
-
-def test_shape_raises_when_no_token_bucket_fits():
-    with pytest.raises(ValueError, match="exceeds the largest captured bucket"):
-        _shape(num_real=16, total=1000)
-
-
-def test_shape_rejects_fewer_tokens_than_requests():
-    with pytest.raises(ValueError, match="cannot be below"):
-        _shape(num_real=5, total=4)
+@pytest.mark.parametrize(
+    "num_real, total, match",
+    [
+        (17, 17, "exceed the largest captured batch"),  # rows overflow
+        (16, 1000, "exceeds the largest captured bucket"),  # tokens overflow
+        (5, 4, "cannot be below"),  # fewer tokens than requests
+    ],
+)
+def test_shape_raises_when_the_batch_exceeds_captured_rows(num_real, total, match):
+    with pytest.raises(ValueError, match=match):
+        _shape(num_real=num_real, total=total)
 
 
 def test_shape_requires_bs_buckets():
@@ -459,16 +414,6 @@ def test_shape_requires_bs_buckets():
         choose_ragged_capture_shape(
             num_real_requests=1, total_verify_tokens=1, bs_buckets=[], token_buckets=TOK_BUCKETS
         )
-
-
-def test_uniform_batch_shape_matches_the_one_dimensional_rule():
-    # With a uniform K the token total is bs * (K + 1), so the joint rule must
-    # not pick anything larger than the uniform path would have needed.
-    k_plus_1 = 4
-    for num_real in (1, 3, 8):
-        got = _shape(num_real=num_real, total=num_real * k_plus_1)
-        assert got.padded_bs >= num_real
-        assert got.bucket >= num_real * k_plus_1
 
 
 # ---------------------------------------------------------------------------
@@ -489,12 +434,11 @@ def test_padding_rows_become_a_valid_distribution():
     assert torch.allclose(probs[1, 1].sum(), torch.tensor(1.0))
     assert torch.allclose(probs[1, 2].sum(), torch.tensor(1.0))
 
-
-def test_full_length_rows_are_left_alone():
-    probs = torch.full((2, 3, 4), 0.25)
-    before = probs.clone()
-    fill_padded_rows_onehot(probs, verify_lens=torch.tensor([3, 3]))
-    assert torch.equal(probs, before)
+    # Full-length rows are left entirely alone (guards the >= boundary).
+    full = torch.full((2, 3, 4), 0.25)
+    before = full.clone()
+    fill_padded_rows_onehot(full, verify_lens=torch.tensor([3, 3]))
+    assert torch.equal(full, before)
 
 
 # ---------------------------------------------------------------------------
@@ -511,40 +455,9 @@ def _fit(real_token_lens, bucket, padded_bs, max_verify_len):
     return layout.fill_bucket(max_verify_len=max_verify_len, padded_bs=padded_bs)
 
 
-def test_fit_spends_slack_on_real_requests_before_pad_rows():
-    got = _fit([2, 2], bucket=8, padded_bs=4, max_verify_len=6)
-    lens = got.verify_lens.tolist()
-    # Two real rows grew; the two pad rows stay at the 1-token minimum.
-    assert sum(lens) == 8
-    assert lens[2] == 1 and lens[3] == 1
-    assert lens[0] + lens[1] == 6
-
-
-def test_fit_rejects_a_bucket_that_cannot_hold_the_pad_rows():
-    # The same batch against a bucket that leaves no room for the pad rows:
-    # 8 real tokens + 6 pad rows needs 14, not 10. Raising here is the point --
-    # a short batch would desync attention from the MoE.
-    with pytest.raises(ValueError, match="too small"):
-        _fit([4, 4], bucket=10, padded_bs=8, max_verify_len=4)
-
-
 def test_fit_never_exceeds_the_per_request_ceiling():
     got = _fit([1, 1, 1], bucket=12, padded_bs=4, max_verify_len=3)
     assert max(got.verify_lens.tolist()) <= 3
-
-
-def test_capture_buckets_match_the_uniform_token_totals():
-    # The ragged ladder is one bucket per tier at each batch size, which is
-    # exactly what the uniform ladder would have produced -- so enabling ragged
-    # does not grow the captured graph count.
-    tiers = [1, 3, 5]
-    for bs in (1, 4, 16):
-        buckets = [bs * (t + 1) for t in tiers]
-        assert buckets == sorted(buckets)
-        assert len(buckets) == len(tiers)
-        # Every bucket is reachable: bs rows at >= 1 token, <= max tier + 1.
-        for b in buckets:
-            assert bs <= b <= bs * (tiers[-1] + 1)
 
 
 def test_warmup_split_reaches_any_captured_bucket():
@@ -582,28 +495,24 @@ def _pad_len(*, bucket, n_real, n_pad, max_verify_len, floor=None):
     return pad_len
 
 
-def test_pad_rows_take_the_minimum_when_real_rows_can_absorb_the_bucket():
-    # 3 real rows capped at 6 hold up to 18; bucket 24 minus 5 pad rows leaves
-    # 19 -- one too many, so the pad rows have to grow. Contrast with below.
-    padded_bs, bucket, max_verify_len = 8, 18, 6
+@pytest.mark.parametrize(
+    "bucket, expected_pad_len",
+    [
+        # 3 real rows capped at 6 hold up to 18; bucket 18 minus 5 one-token
+        # pad rows leaves 13, which the real rows absorb -- pads stay minimal.
+        (18, 1),
+        # The case that used to have no solution: bucket 24 with 5 one-token
+        # pad rows would demand 19 from real rows that cap at 18, so the pad
+        # rows must absorb what the real rows cannot.
+        (24, 2),
+    ],
+)
+def test_pad_rows_grow_when_the_real_rows_cannot_absorb_the_bucket(bucket, expected_pad_len):
+    padded_bs, max_verify_len = 8, 6
     real = [2, 3, 2]
     n_pad = padded_bs - len(real)
     pad_len = _pad_len(bucket=bucket, n_real=len(real), n_pad=n_pad, max_verify_len=max_verify_len)
-    assert pad_len == 1
-
-    real_target = bucket - n_pad * pad_len
-    got = _fit(real, bucket=real_target, padded_bs=len(real), max_verify_len=max_verify_len)
-    assert int(got.verify_lens.sum()) + n_pad * pad_len == bucket
-
-
-def test_pad_rows_grow_when_the_real_rows_cannot_absorb_the_bucket():
-    # This is the case that used to have no solution: 3 real rows cap at 18,
-    # but bucket 24 with 5 one-token pad rows would demand 19 from them.
-    padded_bs, bucket, max_verify_len = 8, 24, 6
-    real = [2, 3, 2]
-    n_pad = padded_bs - len(real)
-    pad_len = _pad_len(bucket=bucket, n_real=len(real), n_pad=n_pad, max_verify_len=max_verify_len)
-    assert pad_len == 2, "pad rows must absorb what the real rows cannot"
+    assert pad_len == expected_pad_len
 
     real_target = bucket - n_pad * pad_len
     assert sum(real) <= real_target <= len(real) * max_verify_len

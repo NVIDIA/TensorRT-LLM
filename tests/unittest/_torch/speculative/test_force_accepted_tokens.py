@@ -80,32 +80,21 @@ def _require_cuda():
 
 
 @pytest.mark.parametrize(
-    "env_value, expected",
+    "env_value, expected_float, expected_int",
     [
-        ("0", 0.0),
-        ("3", 3.0),
-        ("2.6", 2.6),
-        ("0.5", 0.5),
-        ("not-a-number", 0.0),
+        ("0", 0.0, 0),
+        ("3", 3.0, 3),
+        ("2.6", 2.6, 0),
+        ("0.5", 0.5, 0),
+        ("not-a-number", 0.0, 0),
     ],
 )
-def test_get_force_num_accepted_tokens_float(env_value, expected):
+def test_get_force_num_accepted_tokens_float(env_value, expected_float, expected_int):
+    """The float helper parses fractional rates; the int helper (used by the
+    2-model path) must keep its original behavior on the same values."""
     with patch.dict(os.environ, {FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR: env_value}):
-        assert get_force_num_accepted_tokens_float() == pytest.approx(expected)
-
-
-@pytest.mark.parametrize(
-    "env_value, expected",
-    [
-        ("0", 0),
-        ("3", 3),
-        ("2.6", 0),
-    ],
-)
-def test_get_force_num_accepted_tokens_int_unchanged(env_value, expected):
-    """The int helper must keep its original behavior (used by 2-model)."""
-    with patch.dict(os.environ, {FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR: env_value}):
-        assert get_force_num_accepted_tokens() == expected
+        assert get_force_num_accepted_tokens_float() == pytest.approx(expected_float)
+        assert get_force_num_accepted_tokens() == expected_int
 
 
 # ---------------- _apply_force_accepted_tokens semantics --------------------
@@ -123,76 +112,56 @@ def test_zero_value_is_noop():
     assert worker._force_accept_rng_counter is None
 
 
-@pytest.mark.parametrize("value", [1.0, 2.0, 4.0])
-def test_integer_value_matches_legacy_behavior(value):
+@pytest.mark.parametrize(
+    "value, runtime_draft_len",
+    [
+        (1.0, 4),
+        (2.0, 4),
+        (4.0, 4),
+        # 10 draft tokens requested but only 2 available -> capped at 3.
+        (10.0, 2),
+        # Fractional but no room: max_total = 3, base_total = min(10, 3) = 3,
+        # so ``base_total < max_total`` is False -> all 3, no RNG draw.
+        (9.5, 2),
+    ],
+)
+def test_integer_value_matches_legacy_behavior(value, runtime_draft_len):
     _require_cuda()
     worker = _make_worker(value)
     out = worker._apply_force_accepted_tokens(
-        _make_input(batch_size=8), num_contexts=0, runtime_draft_len=4
+        _make_input(batch_size=8), num_contexts=0, runtime_draft_len=runtime_draft_len
     )
-    expected = min(int(value) + 1, 4 + 1)
+    expected = min(int(value) + 1, runtime_draft_len + 1)
     assert torch.all(out == expected)
-    # Pure-integer path must not allocate the RNG pool.
+    # The deterministic (non-random) path must not allocate the RNG pool.
     assert worker._force_accept_rng_pool is None
 
 
-def test_integer_value_caps_at_runtime_draft_len_plus_one():
-    _require_cuda()
-    worker = _make_worker(10.0)
-    out = worker._apply_force_accepted_tokens(
-        _make_input(batch_size=4), num_contexts=0, runtime_draft_len=2
-    )
-    # 10 draft tokens requested but only 2 available → all 3 (= 2 + target).
-    assert torch.all(out == 3)
-
-
-def test_fractional_only_emits_two_values():
-    _require_cuda()
-    worker = _make_worker(2.6)
-    seen = set()
-    for _ in range(50):
-        out = worker._apply_force_accepted_tokens(
-            _make_input(batch_size=64), num_contexts=0, runtime_draft_len=4
-        )
-        seen.update(out.unique().tolist())
-    # Either 2 draft + target = 3, or 3 draft + target = 4.
-    assert seen == {3, 4}
-
-
 def test_fractional_distribution_matches_target_probability():
-    """Average over many draws should converge to the target fraction."""
+    """Fractional draws emit only base/base+1 and average to the target rate."""
     _require_cuda()
     worker = _make_worker(2.6)
     target_frac = 0.6
     n_iters = 200
     batch = 64
+    seen = set()
     extra_count = 0
     total = 0
     for _ in range(n_iters):
         out = worker._apply_force_accepted_tokens(
             _make_input(batch_size=batch), num_contexts=0, runtime_draft_len=4
         )
+        seen.update(out.unique().tolist())
         extra_count += int((out == 4).sum().item())
         total += batch
+    # Either 2 draft + target = 3, or 3 draft + target = 4 -- never anything else.
+    assert seen == {3, 4}
     measured = extra_count / total
     # Pool-based RNG is deterministic; the empirical mean over ~13k draws
     # is tight against 0.6.
     assert abs(measured - target_frac) < 0.03, (
         f"measured fraction {measured:.4f} differs from target {target_frac}"
     )
-
-
-def test_fractional_capped_when_no_room():
-    """If ``int_part + 1`` already saturates the cap, no extra is granted."""
-    _require_cuda()
-    worker = _make_worker(9.5)
-    out = worker._apply_force_accepted_tokens(
-        _make_input(batch_size=8), num_contexts=0, runtime_draft_len=2
-    )
-    # max_total = runtime_draft_len + 1 = 3, base_total = min(10, 3) = 3.
-    # frac_part > 0 but ``base_total < max_total`` is False → all 3, no RNG.
-    assert torch.all(out == 3)
-    assert worker._force_accept_rng_pool is None
 
 
 def test_num_contexts_offset_is_respected():

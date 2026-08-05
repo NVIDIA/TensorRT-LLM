@@ -39,7 +39,9 @@ def _stats(**reasons):
 
 
 def test_continuous_batching_misses_are_not_blamed_on_ragged():
-    """A rank with context requests is normal, not a ragged defect."""
+    """A rank with context requests is normal, not a ragged defect -- and a
+    fully clean run (no misses at all) passes the same gate."""
+    _stats().assert_ragged_active(require_trim=True)
     _stats(peer_not_gen_only=9).assert_ragged_active(require_trim=True)
 
 
@@ -74,10 +76,6 @@ def test_unattributed_misses_are_a_broken_probe_not_a_clean_run():
     stats.graph_eager = 9  # counted, but no reason recorded
     with pytest.raises(AssertionError, match="cannot be attributed"):
         stats.assert_ragged_active(require_trim=True)
-
-
-def test_clean_run_passes():
-    _stats().assert_ragged_active(require_trim=True)
 
 
 def test_ramp_up_steps_do_not_count_toward_the_gate_floor():

@@ -99,15 +99,13 @@ def test_confidence_head_emits_raw_logits():
     assert conf.dtype == torch.float32
 
 
-def test_apply_sts_is_identity_by_default():
+def test_apply_sts_uses_per_position_temperatures():
     head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    # Default (all-ones) calibration is a plain sigmoid, bounded in [0, 1].
     raw = torch.tensor([[2.0, 0.0, -2.0, 1.0, -1.0]])
     assert torch.allclose(head.apply_sts(raw), torch.sigmoid(raw), atol=1e-6)
     assert torch.all((head.apply_sts(raw) >= 0.0) & (head.apply_sts(raw) <= 1.0))
 
-
-def test_apply_sts_uses_per_position_temperatures():
-    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
     temps = torch.tensor([1.0, 2.0, 4.0, 1.0, 1.0])
     head.load_sts_temperatures(temps)
     raw = torch.full((1, BLK), 4.0)
@@ -118,26 +116,19 @@ def test_apply_sts_uses_per_position_temperatures():
 
 
 def test_load_sts_temperatures_updates_in_place():
-    """Rebinding the buffer would be invisible to an already-captured graph."""
+    """Rebinding the buffer would be invisible to an already-captured graph;
+    and it is calibration, not a checkpoint weight, so it must stay out of
+    state_dict and refuse malformed tables."""
     head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
-    before = head.sts_temperatures
-    head.load_sts_temperatures(torch.full((BLK,), 2.0))
-    assert head.sts_temperatures is before
-    assert torch.allclose(before, torch.full((BLK,), 2.0))
-
-
-def test_load_sts_temperatures_validates():
-    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    assert "sts_temperatures" not in head.state_dict()
     with pytest.raises(ValueError, match="one per block position"):
         head.load_sts_temperatures(torch.ones(BLK + 1))
     with pytest.raises(ValueError, match="strictly positive"):
         head.load_sts_temperatures(torch.zeros(BLK))
-
-
-def test_sts_buffer_is_not_persistent():
-    """It is calibration, not a checkpoint weight -- it must not affect loading."""
-    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
-    assert "sts_temperatures" not in head.state_dict()
+    before = head.sts_temperatures
+    head.load_sts_temperatures(torch.full((BLK,), 2.0))
+    assert head.sts_temperatures is before
+    assert torch.allclose(before, torch.full((BLK,), 2.0))
 
 
 def test_confidence_head_load_weights_rejects_a_dropped_bias():
@@ -150,12 +141,11 @@ def test_confidence_head_load_weights_rejects_a_dropped_bias():
     with pytest.raises(ValueError, match="bias=True"):
         head.load_weights([{**good, "proj.bias": torch.zeros(1)}])
 
-
-def test_confidence_head_with_bias_accepts_bias_weights():
-    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK, bias=True)
+    # Constructed with bias=True, the same checkpoint bias is accepted.
+    biased = DSparkConfidenceHead(hidden_size=HID, block_size=BLK, bias=True)
     w = {"proj.weight": torch.randn(1, HID), "proj.bias": torch.randn(1)}
-    head.load_weights([w])
-    assert torch.allclose(head.proj.bias, w["proj.bias"])
+    biased.load_weights([w])
+    assert torch.allclose(biased.proj.bias, w["proj.bias"])
 
 
 def test_confidence_head_with_markov_concat_dim():

@@ -55,12 +55,22 @@ def test_local_value_used_when_no_group_sync():
 
 
 def test_group_override_pulls_greedy_rank_onto_advanced_path():
-    # This rank's batch is all-greedy, but another rank in the LM-head-TP
-    # group has a sampling request: the group AND (False) must win so the
-    # whole group takes the advanced path together.
-    meta = _fake_meta(group_all_greedy_sample=False)
-    _scan(meta, [_fake_request(), _fake_request()])
-    assert meta.is_all_greedy_sample is False
+    # (group value, capture force) -> final flag. This rank's batch is
+    # all-greedy in every case; the group AND (False) must win so the whole
+    # LM-head-TP group takes the advanced path together, group-wide True keeps
+    # greedy, and the warmup capture force composes without changing the
+    # outcome (the synced value is derived from capture-forced locals).
+    cases = [
+        (False, False, False),
+        (True, False, True),
+        (False, True, False),
+    ]
+    for group_value, force_capture, expected in cases:
+        meta = _fake_meta(group_all_greedy_sample=group_value,
+                          force_capture=force_capture)
+        _scan(meta, [_fake_request(), _fake_request()])
+        assert meta.is_all_greedy_sample is expected, (group_value,
+                                                       force_capture)
 
 
 def test_group_override_survives_rescan():
@@ -71,18 +81,3 @@ def test_group_override_survives_rescan():
     for _ in range(3):
         _scan(meta, [_fake_request()])
         assert meta.is_all_greedy_sample is False
-
-
-def test_group_override_true_keeps_greedy():
-    meta = _fake_meta(group_all_greedy_sample=True)
-    _scan(meta, [_fake_request()])
-    assert meta.is_all_greedy_sample is True
-
-
-def test_capture_override_composes_with_group_sync():
-    # Warmup forces the advanced variant to capture its CUDA graph; the group
-    # value is derived from capture-forced locals (all False), so the final
-    # flag stays False regardless of composition order.
-    meta = _fake_meta(group_all_greedy_sample=False, force_capture=True)
-    _scan(meta, [_fake_request()])
-    assert meta.is_all_greedy_sample is False

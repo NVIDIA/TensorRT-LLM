@@ -71,26 +71,21 @@ def test_no_caps_is_a_no_op():
 
 
 def test_counts_beyond_their_windows_are_clamped_and_the_loss_accumulated():
-    counts = torch.tensor([6, 5, 2], dtype=torch.int32)
-    meta = _Meta(caps=[3, 5, 6])
-    apply_accept_caps(counts, 0, meta)
-    assert counts.tolist() == [3, 5, 2]
-    # Only the first request lost anything: 6 -> 3. And we can say WHICH.
-    assert meta.accept_cap_trim[:3].tolist() == [3, 0, 0]
+    """Clamp plus per-step (not cumulative) loss recording.
 
-
-def test_each_step_overwrites_the_previous_step_s_losses():
-    """Per step, not cumulative: the buffer is what THIS step lost.
-
-    The host accumulates across steps. A buffer that added would double-count
-    every request still in the batch next step.
+    The host accumulates across steps, so the buffer must hold what THIS step
+    lost: a buffer that added would double-count every request still in the
+    batch next step. Repeating the same step must therefore leave the same
+    losses, not multiples of them.
     """
-    meta = _Meta(caps=[2, 2])
+    meta = _Meta(caps=[3, 5, 6])
     for _ in range(3):
-        counts = torch.tensor([5, 5], dtype=torch.int32)
+        counts = torch.tensor([6, 5, 2], dtype=torch.int32)
         apply_accept_caps(counts, 0, meta)
-        assert counts.tolist() == [2, 2]
-        assert meta.accept_cap_trim[:2].tolist() == [3, 3]
+        # Request 2's cap (6) is wider than its count (2): never raised.
+        assert counts.tolist() == [3, 5, 2]
+        # Only the first request lost anything: 6 -> 3. And we can say WHICH.
+        assert meta.accept_cap_trim[:3].tolist() == [3, 0, 0]
 
 
 def test_context_requests_are_left_alone():
@@ -102,11 +97,9 @@ def test_context_requests_are_left_alone():
     # Context slots are zeroed, not left stale.
     assert meta.accept_cap_trim[:4].tolist() == [0, 0, 4, 3]
 
-
-def test_a_generation_free_batch_does_not_crash():
+    # Degenerate endpoint: a generation-free batch must not crash or clamp.
     counts = torch.tensor([4, 4], dtype=torch.int32)
-    meta = _Meta(caps=[2, 2])
-    apply_accept_caps(counts, 2, meta)
+    apply_accept_caps(counts, 2, _Meta(caps=[2, 2]))
     assert counts.tolist() == [4, 4]
 
 
@@ -132,14 +125,6 @@ def test_nothing_is_lost_or_invented(accepted, window):
     assert committed <= window + 1
 
 
-def test_the_cap_never_raises_a_count():
-    """A window wider than the block must not invent acceptance."""
-    counts = torch.tensor([2], dtype=torch.int32)
-    meta = _Meta(caps=[99])
-    apply_accept_caps(counts, 0, meta)
-    assert counts.tolist() == [2]
-
-
 # --- what the counters must say ---------------------------------------------
 
 
@@ -157,6 +142,15 @@ def test_cap_trim_is_recorded_per_request():
     # accept_len + accept_loss is what a no-trim run would have accepted.
     assert (stats.accept_len +
             stats.accept_loss_per_request) == pytest.approx(3.0)
+
+    # And the summary carries the measurement.
+    summary = stats.summary()
+    assert summary["mode"] == "cap-accept"
+    assert summary["cap_trim_tokens"] == 3
+    assert summary["accept_loss_per_request"] == pytest.approx(1.5)
+    for key in ("requests_cap_trimmed", "cap_trim_max", "cap_trim_hist",
+                "cap_trim_concentration"):
+        assert key in summary, f"{key} missing from the summary"
 
 
 def test_the_same_total_loss_is_distinguished_by_its_shape():
@@ -188,18 +182,13 @@ def test_the_same_total_loss_is_distinguished_by_its_shape():
     assert concentrated.cap_trim_hist == {20: 1}
 
 
-def test_concentration_is_zero_when_nothing_was_measured():
-    stats = _stats(mode=RaggedVerifyMode.COMPACT)
-    stats.record_acceptance(accepted=3, window=5)
-    assert stats.cap_trim_concentration == 0.0
-    assert stats.cap_trim_max == 0
-
-
 def test_the_loss_is_absent_rather_than_zero_when_not_measured():
     """`compact` cannot produce this number, and must not appear to."""
     stats = _stats(mode=RaggedVerifyMode.COMPACT)
     stats.record_acceptance(accepted=3, window=3)
     assert stats.cap_trim_tokens == 0
+    assert stats.cap_trim_concentration == 0.0
+    assert stats.cap_trim_max == 0
     # The bound that IS available under compact still works.
     assert stats.trimmed_hit_ceiling == 1
 
@@ -210,6 +199,12 @@ def test_cap_accept_must_not_be_credited_with_a_compute_saving():
     It submits the full block by construction. Deriving delivered tokens from
     the windows would report a trim ratio for a run that trimmed no compute at
     all -- and that ratio is the headline number for whether the feature works.
+
+    For the same reason the active gate must not demand a saving here:
+    `require_trim` asks "did delivered tokens come in under the no-trim
+    ceiling", cap-accept answers no by construction, and keying the gate on
+    the ratio alone would fail every cap-accept run -- the reference run
+    against which the others are judged.
     """
     stats = _stats()
     num_reqs = 4
@@ -225,6 +220,8 @@ def test_cap_accept_must_not_be_credited_with_a_compute_saving():
     # The schedule is still visible -- that is the whole point of the mode.
     assert stats.window_tokens == sum(1 + v for v in (5, 3, 2, 1))
     assert stats.steps_ragged == 1
+    # ...and the gate stays satisfiable in the mode it exists to validate.
+    stats.assert_ragged_active(require_trim=True)
 
 
 def test_compact_still_derives_delivered_from_the_bucket():
@@ -252,23 +249,6 @@ def test_cap_accept_computes_windows_but_does_not_trim_the_token_axis():
     assert not RaggedVerifyMode.STATIC.trims_submitted_tokens
 
 
-def test_the_active_gate_does_not_demand_a_saving_cap_accept_never_makes():
-    """The gate must stay satisfiable in the mode it exists to validate.
-
-    `require_trim` asks "did delivered tokens come in under the no-trim
-    ceiling". cap-accept answers no by construction, so keying the gate on the
-    ratio alone would fail every cap-accept run -- the reference run against
-    which the others are judged.
-    """
-    stats = _stats()
-    stats.record_step(num_gen_requests=4,
-                      verify_lens=[5, 3, 2, 1],
-                      bucket=None,
-                      delivered=4 * (1 + MAX_DRAFT_LEN))
-    assert stats.trim_ratio == 0.0
-    stats.assert_ragged_active(require_trim=True)
-
-
 def test_the_active_gate_still_demands_a_saving_from_compact():
     """The regression the clause above must not introduce."""
     stats = _stats(mode=RaggedVerifyMode.COMPACT)
@@ -278,18 +258,6 @@ def test_the_active_gate_still_demands_a_saving_from_compact():
     assert stats.trim_ratio == 0.0
     with pytest.raises(AssertionError, match="nothing was saved"):
         stats.assert_ragged_active(require_trim=True)
-
-
-def test_the_summary_carries_the_measurement():
-    stats = _stats()
-    stats.record_acceptance(accepted=2, window=2, cap_trim=3)
-    summary = stats.summary()
-    assert summary["mode"] == "cap-accept"
-    assert summary["cap_trim_tokens"] == 3
-    assert summary["accept_loss_per_request"] == pytest.approx(3.0)
-    for key in ("requests_cap_trimmed", "cap_trim_max", "cap_trim_hist",
-                "cap_trim_concentration"):
-        assert key in summary, f"{key} missing from the summary"
 
 
 def test_a_slot_left_unwritten_cannot_inherit_the_previous_occupant_s_loss():

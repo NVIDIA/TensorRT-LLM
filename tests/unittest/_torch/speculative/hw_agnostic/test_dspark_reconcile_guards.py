@@ -28,10 +28,6 @@ def _payload(engine):
             "_meta": {"engine": engine} if engine is not None else {}}
 
 
-def test_matching_fingerprint_loads_silently():
-    check_table_fingerprint(payload=_payload(dict(LIVE)), live=dict(LIVE))
-
-
 def test_mismatched_engine_is_refused():
     """The 23%-apart case: same cell, different max_batch_size."""
     wrong = dict(LIVE, max_batch_size=64)
@@ -39,26 +35,23 @@ def test_mismatched_engine_is_refused():
         check_table_fingerprint(payload=_payload(wrong), live=dict(LIVE))
 
 
-def test_comparison_is_case_insensitive():
-    """String facts must not fail on spelling case (MEGAMOE vs MegaMoe)."""
-    fp = dict(LIVE, moe_backend="megamoe_cutedsl")
-    live = dict(LIVE, moe_backend="MEGAMOE_CUTEDSL")
-    check_table_fingerprint(payload=_payload(fp), live=live)
+def test_fingerprints_that_must_load():
+    """Every non-contradicted fingerprint loads; only a contradicted fact refuses.
 
-
-def test_extra_table_facts_do_not_block_loading():
-    """Facts the consumer cannot see (image hash, geometry) are informational.
-
-    They must neither raise nor be silently swallowed -- the function logs
-    them -- but loading proceeds: refusing on unverifiable keys would make
-    every fingerprint addition a breaking change.
+    Matching facts load silently; string facts must not fail on spelling case
+    (MEGAMOE vs MegaMoe); facts the consumer cannot see (image hash, geometry)
+    are informational and logged, not refused -- refusing on unverifiable keys
+    would make every fingerprint addition a breaking change; and an old table
+    with no fingerprint warns rather than breaking existing deployments.
     """
-    fp = dict(LIVE, image="faf2c60935", geometry="constant_block")
-    check_table_fingerprint(payload=_payload(fp), live=dict(LIVE))
-
-
-def test_unfingerprinted_table_still_loads():
-    """Backward compatibility: old tables warn, they do not break."""
+    check_table_fingerprint(payload=_payload(dict(LIVE)), live=dict(LIVE))
+    check_table_fingerprint(
+        payload=_payload(dict(LIVE, moe_backend="megamoe_cutedsl")),
+        live=dict(LIVE, moe_backend="MEGAMOE_CUTEDSL"))
+    check_table_fingerprint(
+        payload=_payload(dict(LIVE, image="faf2c60935",
+                              geometry="constant_block")),
+        live=dict(LIVE))
     check_table_fingerprint(payload=_payload(None), live=dict(LIVE))
 
 

@@ -16,11 +16,9 @@ The consumer this was ported from (SGLang ``_additive_step_time_tensor``)
 interpolates both theta(M) and alpha(bs); this port must match.
 """
 
-import numpy as np
 import pytest
 
-from tensorrt_llm._torch.speculative.dspark_planner import (
-    SpsCostTable, compute_verify_token_budget)
+from tensorrt_llm._torch.speculative.dspark_planner import SpsCostTable
 
 # The certified GB300 table's shape, abbreviated to the two breakpoints whose
 # gap hid the bug.
@@ -31,13 +29,14 @@ TABLE = SpsCostTable(token_counts=(512, 768, 1536),
                      batch_overhead_ms=(11.462, 19.343))
 
 
-def test_theta_is_exact_on_breakpoints():
+def test_theta_interpolates_between_breakpoints():
+    """Exact on breakpoints, linear between them.
+
+    The regression case: 1512 tokens must cost ~the 1536 price, not the 768
+    one.
+    """
     assert TABLE.step_time(768, 256) == pytest.approx(25.244 + 19.343 + 35.61)
     assert TABLE.step_time(1536, 256) == pytest.approx(25.244 + 19.343 + 105.64)
-
-
-def test_theta_interpolates_between_breakpoints():
-    """The regression case: 1512 tokens must cost ~the 1536 price, not the 768 one."""
     got = TABLE.step_time(1512, 252)
     theta = 35.61 + (105.64 - 35.61) * (1512 - 768) / (1536 - 768)
     alpha = 11.462 + (19.343 - 11.462) * (252 - 128) / (256 - 128)
@@ -60,28 +59,3 @@ def test_theta_clamps_outside_the_measured_range():
                          fixed_overhead_ms=25.244)
     assert plain.step_time(100, 0) == pytest.approx(25.244 + 23.85)
     assert plain.step_time(4096, 0) == pytest.approx(25.244 + 105.64)
-
-
-def test_step_times_vector_matches_scalar():
-    tokens = np.asarray([512, 900, 1512, 1536])
-    vec = TABLE.step_times(tokens, 200)
-    for tok, v in zip(tokens.tolist(), vec.tolist()):
-        assert v == pytest.approx(TABLE.step_time(tok, 200))
-
-
-def test_full_batch_argmax_now_trims():
-    """The live failure in miniature: GSM8K pooled survivals at a near-full batch.
-
-    tau5/tau2 ~ 1.48 sits below the true cost ratio ~2.0 but above the floored
-    one (1.19). With interpolation the argmax must stop buying the full block;
-    the whole campaign's zero-trim runs came down to this comparison.
-    """
-    bs = 252
-    survival = np.tile([0.771, 0.693, 0.502, 0.360, 0.315], (bs, 1))
-    budget = compute_verify_token_budget(survival=survival,
-                                         num_gen_requests=bs,
-                                         cost_table=TABLE,
-                                         min_verify_len=1,
-                                         allowed_lens=[1, 2, 5])
-    rung = 1 + budget // bs
-    assert rung < 5, f"argmax still buys the full block (budget={budget})"

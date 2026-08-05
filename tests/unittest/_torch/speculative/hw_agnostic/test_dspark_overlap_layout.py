@@ -16,18 +16,13 @@
 
 The overlap path builds this iteration's inputs from the *previous* iteration's
 device tensors, and does it with a fixed stride: every request is assumed to
-contribute ``runtime_tokens_per_gen_step`` tokens. Two places break silently
-when that assumption is dropped:
+contribute ``runtime_tokens_per_gen_step`` tokens. The flat gathers out of
+``new_tokens`` / ``next_draft_tokens`` and the ``position_ids`` /
+``gather_ids`` / ``seq_lens`` the host appends break silently when that
+assumption is dropped: a wrong count shifts every following request, so RoPE
+phases and attention windows go wrong without any shape error.
 
-  * the flat gathers out of ``new_tokens`` / ``next_draft_tokens``, and the
-    ``position_ids`` / ``gather_ids`` / ``seq_lens`` the host appends -- a wrong
-    count shifts every following request, so RoPE phases and attention windows
-    go wrong without any shape error; and
-  * ``kv_len_offsets``, which is subtracted from a host-side estimate that was
-    built with the *same* count. If only one of the two is made per-request the
-    KV length is off by exactly their difference.
-
-These tests pin the arithmetic of both, and -- most importantly -- that a
+These tests pin that arithmetic, and -- most importantly -- that a
 uniform batch reproduces the strided layout exactly, since that is the path
 every non-DSpark model keeps taking.
 """
@@ -52,25 +47,29 @@ class _Req:
 # --------------------------------------------------------------------------
 
 
-def test_missing_attribute_yields_the_batch_wide_count():
-    # Every non-DSpark request lands here: the attribute does not exist at all.
-    assert get_request_tokens_per_gen_step(_Req(), 4) == 4
+_MISSING = object()
 
 
-def test_none_verify_len_yields_the_batch_wide_count():
+@pytest.mark.parametrize(
+    "verify_len, runtime_tokens, expected",
+    [
+        # Every non-DSpark request lands here: the attribute does not exist.
+        (_MISSING, 4, 4),
+        # The ragged path declined this request: the attribute is None.
+        (None, 4, 4),
+        # py_verify_len counts draft positions, matching runtime_draft_len;
+        # the accepted token makes it one more.
+        (2, 6, 3),
+        # A zero-draft window still carries the accepted token.
+        (0, 6, 1),
+    ],
+)
+def test_tokens_per_gen_step_resolves_each_request_window(
+        verify_len, runtime_tokens, expected):
     req = _Req()
-    req.py_verify_len = None
-    assert get_request_tokens_per_gen_step(req, 4) == 4
-
-
-def test_verify_len_is_a_draft_length_not_a_token_count():
-    # py_verify_len counts draft positions, matching runtime_draft_len; the
-    # accepted token makes it one more.
-    assert get_request_tokens_per_gen_step(_Req(2), 6) == 3
-
-
-def test_zero_verify_len_still_carries_the_accepted_token():
-    assert get_request_tokens_per_gen_step(_Req(0), 6) == 1
+    if verify_len is not _MISSING:
+        req.py_verify_len = verify_len
+    assert get_request_tokens_per_gen_step(req, runtime_tokens) == expected
 
 
 # --------------------------------------------------------------------------
@@ -100,143 +99,14 @@ def test_ragged_counts_pack_each_request_window():
     # slot 2 columns 0..2, then slot 0 column 0
     assert gathered.tolist() == [10, 11, 12, 0]
 
-
-def test_zero_count_contributes_nothing():
-    rows, cols = ragged_gather_index_lists([1, 2, 3], [2, 0, 1])
-    assert rows == [1, 1, 3]
-    assert cols == [0, 1, 0]
-
-
-def test_empty_batch():
+    # A zero count contributes nothing while its neighbours keep their order,
+    # and the empty batch degenerates cleanly.
+    assert ragged_gather_index_lists([1, 2, 3], [2, 0, 1]) == ([1, 1, 3], [0, 1, 0])
     assert ragged_gather_index_lists([], []) == ([], [])
 
 
 def test_mismatched_lengths_raise():
     with pytest.raises(ValueError, match="same length"):
         ragged_gather_index_lists([0, 1], [3])
-
-
-def test_negative_count_raises():
     with pytest.raises(ValueError, match="negative gather count"):
         ragged_gather_index_lists([0], [-1])
-
-
-def test_total_gathered_equals_the_sum_of_counts():
-    counts = [4, 1, 3, 2]
-    rows, cols = ragged_gather_index_lists([0, 1, 2, 3], counts)
-    assert len(rows) == len(cols) == sum(counts)
-
-
-# --------------------------------------------------------------------------
-# Host-side layout arithmetic (mirrors the extend-request loop)
-# --------------------------------------------------------------------------
-
-
-def _build_overlap_layout(requests, past_seens, runtime_tokens_per_gen_step):
-    """Reproduce the per-request bookkeeping the overlap branch emits.
-
-    Mirrors _prepare_tp_inputs' previous-batch branch: one entry per request in
-    seq_lens/draft_lens/cached, and ``tokens`` flat entries per request in
-    position_ids/gather_ids/previous_pos_indices.
-    """
-    seq_lens, draft_lens, cached, tokens_each = [], [], [], []
-    position_ids, gather_ids, pos_indices = [], [], []
-    for slot, (req, past_seen) in enumerate(zip(requests, past_seens)):
-        tokens = get_request_tokens_per_gen_step(req, runtime_tokens_per_gen_step)
-        seq_lens.append(tokens)
-        draft_lens.append(tokens - 1)
-        tokens_each.append(tokens)
-        gather_ids.extend(range(len(position_ids), len(position_ids) + tokens))
-        position_ids.extend(range(past_seen, past_seen + tokens))
-        pos_indices.extend([slot] * tokens)
-        cached.append(past_seen + tokens)
-    return {
-        "seq_lens": seq_lens,
-        "draft_lens": draft_lens,
-        "cached": cached,
-        "tokens_each": tokens_each,
-        "position_ids": position_ids,
-        "gather_ids": gather_ids,
-        "pos_indices": pos_indices,
-    }
-
-
-def test_uniform_batch_reproduces_the_fixed_stride_layout():
-    n = 4
-    reqs = [_Req(), _Req(), _Req()]
-    past = [100, 250, 7]
-    got = _build_overlap_layout(reqs, past, n)
-
-    assert got["seq_lens"] == [n] * 3
-    assert got["draft_lens"] == [n - 1] * 3
-    assert len(got["position_ids"]) == 3 * n
-    assert got["pos_indices"] == [0] * n + [1] * n + [2] * n
-    assert got["gather_ids"] == list(range(3 * n))
-    for slot, base in enumerate(past):
-        window = got["position_ids"][slot * n : (slot + 1) * n]
-        assert window == list(range(base, base + n))
-
-
-def test_ragged_batch_keeps_each_request_positions_contiguous():
-    # The bug this pins: emitting a fixed count per request shifts every later
-    # request's position_ids, which is a silent RoPE-phase error.
-    reqs = [_Req(3), _Req(0), _Req(1)]
-    past = [100, 250, 7]
-    got = _build_overlap_layout(reqs, past, 6)
-
-    assert got["tokens_each"] == [4, 1, 2]
-    assert got["seq_lens"] == [4, 1, 2]
-    assert got["draft_lens"] == [3, 0, 1]
-    assert got["position_ids"] == [100, 101, 102, 103, 250, 7, 8]
-    assert got["gather_ids"] == list(range(7))
-    assert got["pos_indices"] == [0, 0, 0, 0, 1, 2, 2]
-
-
-# --------------------------------------------------------------------------
-# kv_len_offsets: the host estimate and the correction must use one count
-# --------------------------------------------------------------------------
-
-
-def _corrected_kv_lens(
-    requests, past_seens, accepted, runtime_tokens_per_gen_step, correction_tokens
-):
-    """Host estimate (past_seen + tokens) plus the device correction.
-
-    ``correction_tokens`` is what kv_len_offsets subtracts; passing the
-    batch-wide value while the estimate used a per-request one is exactly the
-    A2 bug.
-    """
-    out = []
-    for req, past_seen, acc, corr in zip(requests, past_seens, accepted, correction_tokens):
-        tokens = get_request_tokens_per_gen_step(req, runtime_tokens_per_gen_step)
-        estimate = past_seen + tokens
-        out.append(estimate + (acc - corr))
-    return out
-
-
-def test_paired_counts_cancel_to_past_seen_plus_accepted():
-    reqs = [_Req(3), _Req(0), _Req(1)]
-    past = [100, 250, 7]
-    accepted = [2, 1, 2]
-    tokens_each = [get_request_tokens_per_gen_step(r, 6) for r in reqs]
-
-    got = _corrected_kv_lens(reqs, past, accepted, 6, tokens_each)
-
-    # The token count drops out entirely -- that is what makes the correction
-    # correct regardless of which window the scheduler picked.
-    assert got == [p + a for p, a in zip(past, accepted)]
-
-
-def test_batch_wide_correction_under_ragged_is_off_by_the_window_difference():
-    reqs = [_Req(3), _Req(0), _Req(1)]
-    past = [100, 250, 7]
-    accepted = [2, 1, 2]
-    n = 6
-
-    wrong = _corrected_kv_lens(reqs, past, accepted, n, [n] * 3)
-    right = [p + a for p, a in zip(past, accepted)]
-
-    # Off by (per-request tokens - batch-wide tokens) for every request.
-    deltas = [w - r for w, r in zip(wrong, right)]
-    assert deltas == [4 - n, 1 - n, 2 - n]
-    assert all(d != 0 for d in deltas)

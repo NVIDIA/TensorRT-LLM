@@ -807,7 +807,7 @@ def int_tensor(shape: tuple[int, ...], device: str = "cuda") -> torch.Tensor:
     # yet must read as 0 -- with empty it reads arbitrary bytes, and one such
     # read (previous_kv_lens_offsets) feeds the captured kv_lens correction,
     # where a garbage value walks the KV append past the request's allocated
-    # blocks (the DSpark ragged IMA; see docs/dspark_ragged_ima_handoff.md).
+    # blocks (the DSpark ragged IMA).
     return torch.zeros(shape, dtype=torch.int, device=device)
 
 

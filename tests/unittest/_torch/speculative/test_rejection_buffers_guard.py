@@ -58,8 +58,6 @@ def test_prepare_buffers_allocates_when_enabled():
     assert m.full_draft_probs is None
     assert m.draft_probs_vocab_size == V
 
-
-def test_prepare_buffers_allocates_full_draft_probs_on_vocab_mismatch():
     # Distinct draft vocab: full_draft_probs (d2t-expanded) is allocated.
     m = _alloc_meta(draft_vocab_size=V - 1)
     SpecMetadata.prepare_rejection_sampling_buffers(m)
@@ -237,38 +235,33 @@ def _make_worker():
     return w, calls
 
 
-def test_accept_dispatch_fails_closed_on_malformed_buffers():
+@pytest.mark.parametrize(
+    "meta_over, expected_path",
+    [
+        # Malformed buffers (draft_probs None): _rejection_buffers_valid must
+        # return False, so acceptance fails closed to base and the rejection
+        # kernel is skipped.
+        (dict(draft_probs=None), "base"),
+        # Valid buffers: the rejection path runs.
+        (dict(), "rejection"),
+        # All-greedy batch: rejection is bypassed regardless of buffers.
+        (dict(is_all_greedy_sample=True), "base"),
+    ],
+    ids=[
+        "fails_closed_on_malformed_buffers",
+        "routes_to_rejection_on_valid_state",
+        "base_when_all_greedy",
+    ],
+)
+def test_accept_dispatch(meta_over, expected_path):
     w, calls = _make_worker()
-    # Buffers are malformed (draft_probs None) -> _rejection_buffers_valid must
-    # return False, so acceptance falls back to base and the rejection kernel is
-    # skipped.
-    meta = _dispatch_meta(draft_probs=None)
+    meta = _dispatch_meta(**meta_over)
     draft_tokens = torch.zeros((_NUM_GENS, K), dtype=torch.int, device="cuda")
     logits = torch.zeros((_NUM_CTX + _NUM_GENS * (K + 1), V), device="cuda")
     out = w._accept_draft_tokens(logits, draft_tokens, _NUM_CTX, _BATCH, meta)
-    assert out == ("base", None)
-    assert calls["base"] == 1 and calls["rejection"] == 0
-
-
-def test_accept_dispatch_routes_to_rejection_on_valid_state():
-    w, calls = _make_worker()
-    meta = _dispatch_meta()  # valid buffers
-    draft_tokens = torch.zeros((_NUM_GENS, K), dtype=torch.int, device="cuda")
-    logits = torch.zeros((_NUM_CTX + _NUM_GENS * (K + 1), V), device="cuda")
-    out = w._accept_draft_tokens(logits, draft_tokens, _NUM_CTX, _BATCH, meta)
-    assert out == ("rejection", None)
-    assert calls["rejection"] == 1 and calls["base"] == 0
-
-
-def test_accept_dispatch_base_when_all_greedy():
-    w, calls = _make_worker()
-    # All-greedy batch: rejection is bypassed regardless of buffers.
-    meta = _dispatch_meta(is_all_greedy_sample=True)
-    draft_tokens = torch.zeros((_NUM_GENS, K), dtype=torch.int, device="cuda")
-    logits = torch.zeros((_NUM_CTX + _NUM_GENS * (K + 1), V), device="cuda")
-    out = w._accept_draft_tokens(logits, draft_tokens, _NUM_CTX, _BATCH, meta)
-    assert out == ("base", None)
-    assert calls["base"] == 1 and calls["rejection"] == 0
+    assert out == (expected_path, None)
+    other = "rejection" if expected_path == "base" else "base"
+    assert calls[expected_path] == 1 and calls[other] == 0
 
 
 if __name__ == "__main__":

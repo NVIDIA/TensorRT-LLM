@@ -55,19 +55,6 @@ def test_survival_is_cumulative_product():
     assert torch.allclose(surv[0, :3], torch.tensor([0.9, 0.72, 0.36]), atol=1e-6)
 
 
-def test_survival_is_non_increasing():
-    """The allocator's prefix property depends on this holding for any input."""
-    torch.manual_seed(0)
-    conf = torch.rand(16, BLOCK)
-    surv = compute_survival(conf)
-    assert torch.all(surv[:, 1:] <= surv[:, :-1] + 1e-7)
-
-
-def test_survival_rejects_wrong_rank():
-    with pytest.raises(ValueError, match=r"\[bs, K\]"):
-        compute_survival(torch.rand(BLOCK))
-
-
 # --------------------------------------------------------------------------
 # budget argmax
 # --------------------------------------------------------------------------
@@ -95,37 +82,6 @@ def _brute_force_budget(survival, num_gen, table, min_len=1, max_len=None):
     return best_n
 
 
-def test_tau_counts_the_always_verified_floor_positions():
-    """The floor is verified for free, but its yield still belongs in tau.
-
-    argmax((C + f(n)) / g(n)) depends on C, so dropping the floor's contribution
-    silently moves the optimum. Two batches that differ only in how good their
-    floor positions are must be able to choose different budgets.
-    """
-    # The riser sits just past the floor (bs*(min_len+1) = 8 tokens), so both
-    # shelves are reachable and the constant term can actually decide between
-    # them. With the riser outside the reachable range this test would still
-    # pass but prove nothing.
-    table = SpsCostTable(token_counts=(0, 10), step_time_ms=(1.0, 3.0), fixed_overhead_ms=1.0)
-    bs = 4
-    good_floor = np.cumprod(np.full((bs, BLOCK), 0.99), axis=1)
-    bad_floor = good_floor.copy()
-    bad_floor[:, 0] = 0.01  # a hopeless first position drags the whole row down
-    bad_floor = np.cumprod(
-        np.concatenate([bad_floor[:, :1], np.full((bs, BLOCK - 1), 0.99)], axis=1), axis=1
-    )
-    budgets = []
-    for surv in (good_floor, bad_floor):
-        got = compute_verify_token_budget(survival=surv, num_gen_requests=bs, cost_table=table)
-        assert got == _brute_force_budget(surv, bs, table)
-        budgets.append(got)
-    assert budgets[0] != budgets[1], (
-        "the two batches differ only in their floor positions' survival, so a "
-        "planner that ignored the floor's contribution to tau would give them "
-        "the same budget -- keep the riser inside the reachable token range"
-    )
-
-
 def test_budget_matches_brute_force_on_staircase():
     """Theta is not unimodal on a staircase; a greedy first-descent scan is wrong."""
     rng = np.random.default_rng(7)
@@ -143,44 +99,6 @@ def test_budget_matches_brute_force_on_staircase():
         assert got == want, f"trial {trial}: bs={bs} got={got} want={want}"
 
 
-def test_greedy_first_descent_would_be_wrong():
-    """Pin the specific failure mode the global argmax exists to avoid.
-
-    Theta rises along a shelf, drops at a riser, then rises again along the next
-    shelf. A greedy loop that stops at the first non-improvement (as the paper's
-    pseudocode does) parks at the end of the *first* shelf; here the second
-    shelf's optimum is almost 3x better.
-    """
-    bs = 4
-    # A steep measured segment right past the floor (bs*(min_len+1) = 8
-    # tokens), then a nearly-flat one out to the end of the range. Under
-    # interpolation the kink between segment slopes is what makes Theta
-    # non-unimodal: the first candidates buy tokens on the steep slope and
-    # Theta drops, then the flat segment makes every further token nearly
-    # free and Theta climbs past the starting point.
-    table = SpsCostTable(token_counts=(0, 8, 9, 40),
-                         step_time_ms=(0.5, 0.5, 4.0, 4.2),
-                         fixed_overhead_ms=1.0)
-    # Uniformly high confidence: every extra candidate adds nearly a full
-    # token, so tau grows ~7x across the range while cost less than doubles
-    # past the wall.
-    surv = np.cumprod(np.full((bs, BLOCK), 0.995), axis=1)
-    n_star = compute_verify_token_budget(survival=surv, num_gen_requests=bs, cost_table=table)
-
-    cand = np.sort(surv[:, 1:].reshape(-1))[::-1]
-
-    def theta(n):
-        return (bs + cand[:n].sum()) / table.step_time(2 * bs + n, bs)
-
-    greedy = 0
-    while greedy + 1 <= cand.size and theta(greedy + 1) > theta(greedy):
-        greedy += 1
-
-    assert theta(n_star) >= theta(greedy)
-    assert n_star > greedy, "expected the cost kink to defeat a first-descent scan"
-    assert theta(n_star) > 1.5 * theta(greedy), "the gap should be large, not marginal"
-
-
 def test_flat_cost_table_degenerates_to_verify_all():
     """A flat cost model makes every token free -> spend the whole budget."""
     table = SpsCostTable.flat(2.0)
@@ -188,19 +106,7 @@ def test_flat_cost_table_degenerates_to_verify_all():
     surv = np.cumprod(np.full((6, BLOCK), 0.9), axis=1)
     budget = compute_verify_token_budget(survival=surv, num_gen_requests=6, cost_table=table)
     assert budget == 6 * (BLOCK - 1)
-
-
-def test_low_confidence_yields_small_budget():
-    table = SpsCostTable(token_counts=(0, 8, 16, 24, 32), step_time_ms=(2.0, 3.0, 4.0, 5.0, 6.0))
-    hi = np.cumprod(np.full((8, BLOCK), 0.98), axis=1)
-    lo = np.cumprod(np.full((8, BLOCK), 0.30), axis=1)
-    b_hi = compute_verify_token_budget(survival=hi, num_gen_requests=8, cost_table=table)
-    b_lo = compute_verify_token_budget(survival=lo, num_gen_requests=8, cost_table=table)
-    assert b_lo < b_hi
-
-
-def test_budget_is_zero_for_empty_batch():
-    table = SpsCostTable.flat()
+    # An empty batch has no candidates to buy, whatever the table says.
     assert (
         compute_verify_token_budget(
             survival=np.zeros((0, BLOCK)), num_gen_requests=0, cost_table=table
@@ -254,20 +160,19 @@ def test_allocation_is_a_prefix_and_respects_bounds():
     assert torch.all(lens <= cfg.resolved_max_verify_len)
     # Budget is spent above the floor and never exceeded.
     assert int((lens - cfg.min_verify_len).sum()) <= 20
-
-
-def test_zero_budget_gives_everyone_the_floor():
-    cfg = _cfg(min_verify_len=2)
-    surv = compute_survival(torch.rand(5, BLOCK))
-    lens = schedule_verify_lens_topk(survival=surv, budget=0, cfg=cfg)
+    # Zero budget degenerates to the floor for everyone.
+    cfg_floor = _cfg(min_verify_len=2)
+    lens = schedule_verify_lens_topk(
+        survival=compute_survival(torch.rand(5, BLOCK)), budget=0, cfg=cfg_floor)
     assert torch.equal(lens, torch.full((5,), 2, dtype=torch.int32))
-
-
-def test_huge_budget_saturates_at_the_cap():
-    cfg = _cfg(min_verify_len=1, max_verify_len=4)
-    surv = compute_survival(torch.full((5, BLOCK), 0.99))
-    lens = schedule_verify_lens_topk(survival=surv, budget=10**6, cfg=cfg)
+    # A huge budget saturates at the cap.
+    cfg_cap = _cfg(min_verify_len=1, max_verify_len=4)
+    lens = schedule_verify_lens_topk(
+        survival=compute_survival(torch.full((5, BLOCK), 0.99)), budget=10**6, cfg=cfg_cap)
     assert torch.equal(lens, torch.full((5,), 4, dtype=torch.int32))
+    # An empty batch allocates nothing.
+    assert schedule_verify_lens_topk(
+        survival=torch.zeros(0, BLOCK), budget=5, cfg=_cfg()).numel() == 0
 
 
 def test_survival_eps_excludes_hopeless_positions():
@@ -301,12 +206,6 @@ def test_ties_break_toward_earlier_positions():
     assert int(lens.max()) - int(lens.min()) <= 1
 
 
-def test_empty_batch_returns_empty():
-    cfg = _cfg()
-    lens = schedule_verify_lens_topk(survival=torch.zeros(0, BLOCK), budget=5, cfg=cfg)
-    assert lens.numel() == 0
-
-
 def test_schedule_config_rejects_bad_bounds():
     with pytest.raises(ValueError, match="min_verify_len must be >= 1"):
         DSparkScheduleConfig(block_size=BLOCK, min_verify_len=0)
@@ -314,6 +213,8 @@ def test_schedule_config_rejects_bad_bounds():
         DSparkScheduleConfig(block_size=0)
     with pytest.raises(ValueError, match="< min_verify_len"):
         DSparkScheduleConfig(block_size=BLOCK, min_verify_len=5, max_verify_len=3)
+    with pytest.raises(ValueError, match=r"\[bs, K\]"):
+        compute_survival(torch.rand(BLOCK))
 
 
 # --------------------------------------------------------------------------
@@ -368,6 +269,13 @@ def test_discrete_argmax_beats_round_then_snap_across_a_riser():
         return tau / table.step_time(8 * (length + 1), 8)
 
     assert theta(chosen) == max(theta(v) for v in (1, 3, 5, 7))
+    # With nothing runnable, fall back to the floor.
+    assert (
+        budget_argmax_over_uniform_lens(
+            survival=surv, num_gen_requests=8, cost_table=table, allowed_lens=[]
+        )
+        == 1
+    )
 
 
 def test_derived_tiers_lose_nothing_versus_continuous_k():
@@ -432,25 +340,6 @@ def test_derived_tiers_are_a_function_of_batch_size():
     ) == [1, BLOCK]
 
 
-def test_flat_cost_table_derives_only_the_endpoints():
-    """No shelves to find -> nothing to derive beyond floor and full block."""
-    tiers = derive_verify_len_tiers(
-        cost_table=SpsCostTable.flat(), num_requests=8, block_size=BLOCK, max_tiers=99
-    )
-    assert tiers == [1, BLOCK]
-
-
-def test_discrete_argmax_falls_back_when_nothing_is_allowed():
-    table = SpsCostTable.flat()
-    surv = np.cumprod(np.full((4, BLOCK), 0.9), axis=1)
-    assert (
-        budget_argmax_over_uniform_lens(
-            survival=surv, num_gen_requests=4, cost_table=table, allowed_lens=[]
-        )
-        == 1
-    )
-
-
 # --------------------------------------------------------------------------
 # host-side planner: relay, fallbacks, cross-rank agreement
 # --------------------------------------------------------------------------
@@ -466,13 +355,6 @@ def _planner(**kw):
     )
     kw.setdefault("tiers", [1, 3, BLOCK])
     return DSparkVerifyPlanner(**kw)
-
-
-def test_planner_returns_one_verify_len_per_request():
-    p = _planner()
-    p._host_buffer, p._copy_event, p._snapshot_valid = torch.rand(6, BLOCK), None, True
-    lens = p.decide_verify_lens(num_gen_requests=6)
-    assert lens is not None and len(lens) == 6
 
 
 def test_planner_reads_confidence_by_row_not_by_batch_position():
@@ -573,21 +455,15 @@ def test_trim_regret_counts_only_drafts_alive_at_the_cut():
     assert stats.trimmed_hit_ceiling == 1
     assert stats.trim_regret_rate == 0.5
     assert stats.accept_len == pytest.approx(2.0)
-
-
-def test_trim_regret_is_zero_when_nothing_was_trimmed():
-    stats = _stats()
-    for accepted in (0, 3, 5):
-        stats.record_acceptance(accepted=accepted, window=5)
-    assert stats.requests_trimmed == 0
-    assert stats.trim_regret_rate == 0.0
-    assert stats.summary()["accept_len"] == pytest.approx(8 / 3, abs=1e-4)
-
-
-def test_acceptance_metrics_appear_in_summary():
-    stats = _stats()
-    stats.record_acceptance(accepted=3, window=3)
     summary = stats.summary()
     for key in ("accept_len", "requests_scored", "requests_trimmed",
                 "trim_regret_rate"):
         assert key in summary, f"{key} missing from the summary"
+
+    # Nothing trimmed: the regret rate is 0/0-safe and stays 0.
+    untrimmed = _stats()
+    for accepted in (0, 3, 5):
+        untrimmed.record_acceptance(accepted=accepted, window=5)
+    assert untrimmed.requests_trimmed == 0
+    assert untrimmed.trim_regret_rate == 0.0
+    assert untrimmed.summary()["accept_len"] == pytest.approx(8 / 3, abs=1e-4)

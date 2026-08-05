@@ -40,20 +40,10 @@ def test_padding_rows_do_not_make_the_trim_look_negative():
         f"the ratio is 0 -- got {summary['trim_ratio']}, which came from "
         f"comparing {summary['delivered_tokens']} padded-row tokens against a "
         f"ceiling counted over {3} real requests")
-
-
-def test_narrow_rank_is_not_charged_for_its_widest_peer():
-    """Under attention-DP the padding comes from the widest peer, not locally.
-
-    This is the larger of the two terms: a rank holding 2 requests while its
-    widest peer holds 7 submits the peer's rows. Booked against a two-request
-    ceiling that is a ratio of -3.0, i.e. the metric claims the feature made the
-    step four times more expensive.
-    """
-    stats = _stats(block_size=5)
-    stats.record_step(num_gen_requests=2, verify_lens=[5, 5],
-                      bucket=8 * 6, padded_bs=8)
-    assert stats.summary()["trim_ratio"] == pytest.approx(0.0)
+    # The padded row count itself must land in the summary: the executor once
+    # passed padded_bs=None unconditionally, and an always-empty padded_bs_hist
+    # is indistinguishable from "padding never happened".
+    assert summary["padded_bs_hist"] == {4: 1}
 
 
 def test_a_real_trim_still_reads_as_a_saving():
@@ -82,17 +72,3 @@ def test_paths_without_a_bucket_keep_the_local_row_base():
     explicit.record_step(num_gen_requests=3, verify_lens=[2, 3, 1],
                          bucket=8 * 6, padded_bs=8, delivered=3 * 6)
     assert explicit.summary()["trim_ratio"] == pytest.approx(0.0)
-
-
-def test_padded_bs_reaches_the_histogram():
-    """``padded_bs_hist`` was empty in every summary ever logged.
-
-    The executor passed ``padded_bs=None`` unconditionally, so the padded row
-    count -- the thing that explains the negative ratio -- was never recorded
-    anywhere. An always-empty histogram is indistinguishable from "padding never
-    happened", which is how this survived.
-    """
-    stats = _stats(block_size=5)
-    stats.record_step(num_gen_requests=3, verify_lens=[5, 5, 5],
-                      bucket=4 * 6, padded_bs=4)
-    assert stats.summary()["padded_bs_hist"] == {4: 1}

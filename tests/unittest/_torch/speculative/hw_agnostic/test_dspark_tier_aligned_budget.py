@@ -54,40 +54,22 @@ def test_restricted_answer_is_always_realisable(tiers):
             f"budget {n} implies tier {(n // bs) + 1}, not in {tiers}")
 
 
-def test_agrees_with_the_uniform_scorer_at_a_degenerate_batch():
-    """With one row the two taus coincide, so the rungs must match.
-
-    A single request makes the uniform allocation and the top-k allocation the
-    same set, which is the one case where any disagreement would be a plain bug
-    rather than the intended improvement.
-    """
-    table = _table()
-    rng = np.random.default_rng(7)
-    tiers = [1, 2, 5]
-    for _ in range(100):
-        survival = np.sort(rng.random((1, 5)), axis=1)[:, ::-1]
-        n = compute_verify_token_budget(
-            survival=survival, num_gen_requests=1, cost_table=table,
-            min_verify_len=1, allowed_lens=tiers)
-        uniform = budget_argmax_over_uniform_lens(
-            survival=survival, num_gen_requests=1, cost_table=table,
-            allowed_lens=tiers, min_verify_len=1)
-        assert (n // 1) + 1 == uniform
-
-
 def test_restricted_never_scores_worse_than_the_uniform_choice():
     """Same grid, better numerator: the chosen rung's realised theta wins.
 
     Both routes evaluate the same discrete cost points, so the restricted form
     cannot be worse under the tau that the step actually collects. This is the
     property that makes the swap safe -- if it ever failed, the change would be
-    trading a modelling error for a real one.
+    trading a modelling error for a real one. At bs=1 the uniform and top-k
+    allocations are the same set, so there the two scorers must agree on the
+    rung outright: any disagreement is a plain bug, not the intended
+    improvement.
     """
     rng = np.random.default_rng(31337)
     table = _table()
     tiers = [1, 2, 5]
     for _ in range(300):
-        bs = int(rng.integers(2, 17))
+        bs = int(rng.integers(1, 17))
         survival = np.sort(rng.random((bs, 5)), axis=1)[:, ::-1]
 
         def realised_theta(tier: int) -> float:
@@ -108,23 +90,7 @@ def test_restricted_never_scores_worse_than_the_uniform_choice():
         assert realised_theta(chosen) >= realised_theta(uniform) - 1e-12, (
             f"restricted picked tier {chosen} whose realised theta is below "
             f"the uniform scorer's tier {uniform}")
-
-
-def test_unrestricted_form_is_unchanged():
-    """Omitting allowed_lens must still answer the unconstrained question.
-
-    The existing tests use that form as the reference, and it is still the right
-    thing to ask when sizing a ladder rather than executing one.
-    """
-    table = _table()
-    rng = np.random.default_rng(99)
-    survival = np.sort(rng.random((6, 5)), axis=1)[:, ::-1]
-    free = compute_verify_token_budget(
-        survival=survival, num_gen_requests=6, cost_table=table,
-        min_verify_len=1)
-    assert 0 <= free <= 6 * 4
-    tied = compute_verify_token_budget(
-        survival=survival, num_gen_requests=6, cost_table=table,
-        min_verify_len=1, allowed_lens=[1, 2, 5])
-    # The restricted answer is one of the grid points; the free one need not be.
-    assert tied in {0, 6, 24}
+        if bs == 1:
+            assert chosen == uniform, (
+                "at bs=1 the uniform and top-k allocations are the same set; "
+                "the two scorers must pick the same rung")

@@ -74,7 +74,8 @@ def _propose_with_confidence(conf, markov, *, return_confidence):
 
 
 def test_dspark_propose_scores_without_shortening_the_block():
-    """The block is always proposed in full; confidence only scores it."""
+    """The block is always proposed in full; confidence only scores it, and
+    only when asked (return_confidence is the run-constant opt-in)."""
     torch.manual_seed(1)
     markov = build_markov_head(
         markov_head_type="vanilla", vocab_size=VOCAB, markov_rank=RANK, hidden_size=HID
@@ -93,13 +94,7 @@ def test_dspark_propose_scores_without_shortening_the_block():
     assert torch.all(confidence < 0.0)
     assert torch.all(conf.apply_sts(confidence) < 0.5)
 
-
-def test_dspark_propose_confidence_is_opt_in():
-    torch.manual_seed(2)
-    markov = build_markov_head(
-        markov_head_type="vanilla", vocab_size=VOCAB, markov_rank=RANK, hidden_size=HID
-    ).eval()
-    conf = DSparkConfidenceHead(hidden_size=HID, block_size=BLK).eval()
+    # Opt-in: with the flag off the head is not consulted at all.
     _, confidence = _propose_with_confidence(conf, markov, return_confidence=False)
     assert confidence is None
 

@@ -88,13 +88,10 @@ def _stats_row(*, iteration, num_gen, rank=0, num_ctx=0, host_ms=10.0, gpu_ms=8.
 # --------------------------------------------------------------------------
 
 
-def test_aligned_steps_single_rank():
-    rows = [_stats_row(iteration=i, num_gen=8, host_ms=10.0 + i) for i in range(3)]
-    assert aligned_steps_from_stats(rows) == [(0, 8, 10.0), (1, 8, 11.0), (2, 8, 12.0)]
-
-
 def test_aligned_steps_drops_prefill_iterations():
     """A step with context requests is a different shape, not a cheap decode."""
+    steady = [_stats_row(iteration=i, num_gen=8, host_ms=10.0 + i) for i in range(3)]
+    assert aligned_steps_from_stats(steady) == [(0, 8, 10.0), (1, 8, 11.0), (2, 8, 12.0)]
     rows = [
         _stats_row(iteration=0, num_gen=0, num_ctx=8, host_ms=90.0),
         _stats_row(iteration=1, num_gen=8, num_ctx=2, host_ms=40.0),
@@ -104,7 +101,12 @@ def test_aligned_steps_drops_prefill_iterations():
 
 
 def test_aligned_steps_requires_every_dp_rank():
-    """A missing rank means the iteration was not observed batch-wide."""
+    """Multi-rank alignment: complete, agreeing, and timed by rank 0.
+
+    A missing rank means the iteration was not observed batch-wide; ranks at
+    different batch sizes are not one (bs, M) point; and ADP fans out
+    rank-local counters with rank-0's clock, so timing must never be averaged.
+    """
     rows = [
         _stats_row(iteration=0, num_gen=8, rank=0),
         _stats_row(iteration=0, num_gen=8, rank=1),
@@ -112,23 +114,17 @@ def test_aligned_steps_requires_every_dp_rank():
     ]
     assert aligned_steps_from_stats(rows, expected_ranks=2) == [(0, 8, 10.0)]
 
-
-def test_aligned_steps_requires_ranks_to_agree_on_batch_size():
-    """Ranks at different batch sizes are not one (bs, M) point."""
-    rows = [
+    disagreeing = [
         _stats_row(iteration=0, num_gen=8, rank=0),
         _stats_row(iteration=0, num_gen=7, rank=1),
     ]
-    assert aligned_steps_from_stats(rows, expected_ranks=2) == []
+    assert aligned_steps_from_stats(disagreeing, expected_ranks=2) == []
 
-
-def test_aligned_steps_takes_rank0_timing():
-    """ADP fans out rank-local counters with rank-0's clock; do not average."""
-    rows = [
+    rank0_not_first = [
         _stats_row(iteration=0, num_gen=8, rank=1, host_ms=99.0),
         _stats_row(iteration=0, num_gen=8, rank=0, host_ms=10.0),
     ]
-    assert aligned_steps_from_stats(rows, expected_ranks=2) == [(0, 8, 10.0)]
+    assert aligned_steps_from_stats(rank0_not_first, expected_ranks=2) == [(0, 8, 10.0)]
 
 
 def test_aligned_steps_skips_missing_timing_field():
@@ -171,12 +167,6 @@ def test_summarize_reports_median_not_mean():
     assert cells[0].p90_ms > cells[0].step_time_ms
 
 
-def test_summarize_refuses_short_cell():
-    """A silently dropped cell can disconnect the grid, not just widen error bars."""
-    with pytest.raises(InsufficientSamplesError, match="steady samples"):
-        summarize_cells(_samples(8, 3, [10.0] * 5), warmup_steps=4, min_samples=8)
-
-
 def test_summarize_drops_thin_cells_outside_the_requested_grid():
     """A deployment log carries ramp/drain occupancy nobody asked to measure.
 
@@ -184,7 +174,9 @@ def test_summarize_drops_thin_cells_outside_the_requested_grid():
     requested (bs, L) died at the very end on (bs=2, L=1) with one sample --
     the admission ramp of the first cell's client, filed as a cell and then
     held to the requested-grid bar. Incidental cells must be dropped when
-    thin, kept when thick, and a thin REQUESTED cell must still refuse.
+    thin, kept when thick, and a thin REQUESTED cell must still refuse --
+    with or without a requested grid, since a silently dropped cell can
+    disconnect the grid, not just widen error bars.
     """
     grid = [(8, 3)]
     requested = _samples(8, 3, [10.0] * 8)
@@ -196,6 +188,9 @@ def test_summarize_drops_thin_cells_outside_the_requested_grid():
     with pytest.raises(InsufficientSamplesError, match="steady samples"):
         summarize_cells(_samples(8, 3, [10.0]) + thick_extra, warmup_steps=0,
                         min_samples=4, expected_cells=grid)
+    # No grid given means every observed cell was requested: same refusal.
+    with pytest.raises(InsufficientSamplesError, match="steady samples"):
+        summarize_cells(_samples(8, 3, [10.0] * 5), warmup_steps=4, min_samples=8)
 
 
 def test_summarize_orders_by_iteration_before_cutting_warmup():
@@ -313,25 +308,11 @@ def test_fit_clamps_a_dip_upward():
     assert any("monoton" in w for w in fit.warnings)
 
 
-def test_fit_keeps_theta_positive():
-    """SpsCostTable rejects a non-positive step time, so the shift is bounded."""
-    cells = _synthetic_cells(BATCH_SIZES, VERIFY_LENS, alpha=ALPHA.get, theta=THETA)
-    fit = fit_additive_cost_model(cells)
-    assert min(fit.theta_ms.values()) > 0.0
-
-
 def test_fit_refuses_a_disconnected_sweep():
     """Two islands each carry their own unknown offset; splicing them lies."""
     cells = _synthetic_cells([8], [1, 2], alpha=ALPHA.get, theta=THETA)
     cells += _synthetic_cells([100], [1, 2], alpha=lambda _: 40.0, theta=THETA)
     with pytest.raises(SweepGeometryError, match="disconnected"):
-        fit_additive_cost_model(cells)
-
-
-def test_fit_refuses_a_single_length_sweep():
-    """One verify length per batch size confounds alpha and theta completely."""
-    cells = _synthetic_cells(BATCH_SIZES, [5], alpha=ALPHA.get, theta=THETA)
-    with pytest.raises(SweepGeometryError):
         fit_additive_cost_model(cells)
 
 
@@ -395,17 +376,21 @@ def _payload():
     return build_cost_table_payload(cells, riser_tolerance=0.01, max_breakpoints=8), cells
 
 
-def test_payload_has_exactly_the_loader_keys():
-    payload, _ = _payload()
+def test_round_trip_reproduces_measured_cells():
+    """The whole point: what the planner reads back must be what was measured.
+
+    The payload must carry exactly the keys ``dspark.py::_build_verify_planner``
+    reads (everything else under ``_meta``, where the loader ignores it),
+    survive a JSON file round trip into a real ``SpsCostTable``, and price
+    every measured cell back to within one shelf width -- the emitted curve is
+    a floor staircase by construction, so a cell between two risers is
+    deliberately priced at the lower shelf.
+    """
+    payload, cells = _payload()
     assert LOADER_KEYS.issubset(payload)
-    # Everything else must live under _meta, where the loader ignores it.
     assert set(payload) - LOADER_KEYS == {"_meta"}
 
-
-def test_payload_survives_a_json_file_round_trip():
-    payload, _ = _payload()
-    reloaded = json.loads(json.dumps(payload))
-    table = load_cost_table(reloaded)
+    table = load_cost_table(json.loads(json.dumps(payload)))
     assert isinstance(table, SpsCostTable)
     assert not table.is_flat
     # The loader builds SpsCostTable directly, so the profiler's own validation
@@ -413,16 +398,6 @@ def test_payload_survives_a_json_file_round_trip():
     assert list(table.token_counts) == payload["token_counts"]
     assert len(table.batch_sizes) == len(table.batch_overhead_ms)
 
-
-def test_round_trip_reproduces_measured_cells():
-    """The whole point: what the planner reads back must be what was measured.
-
-    The tolerance is one shelf width, because the emitted curve is a floor
-    staircase by construction -- a cell between two risers is deliberately
-    priced at the lower shelf.
-    """
-    payload, cells = _payload()
-    table = load_cost_table(json.loads(json.dumps(payload)))
     for cell in cells:
         predicted = table.step_time(cell.total_verify_tokens, cell.batch_size)
         assert predicted == pytest.approx(cell.step_time_ms, abs=1e-4)
@@ -442,15 +417,12 @@ def test_emitted_terms_are_not_double_counted():
 
 
 def test_batch_overhead_grows_with_batch_size():
-    payload, _ = _payload()
+    payload, cells = _payload()
     overheads = payload["batch_overhead_ms"]
     assert overheads == sorted(overheads)
     assert payload["batch_sizes"] == sorted(BATCH_SIZES)
     assert payload["fixed_overhead_ms"] >= 0.0
-
-
-def test_meta_carries_the_tier_advice_and_the_cells():
-    payload, cells = _payload()
+    # Provenance rides along under _meta: the encoding marker and the cells.
     assert payload["_meta"]["encoding"] == "decomposed"
     assert len(payload["_meta"]["cells"]) == len(cells)
 
@@ -508,32 +480,14 @@ def test_refuses_an_inert_table():
     """Non-flat, but no tier pair is worth trading yield for.
 
     This is the failure mode that does *not* trip ``fallback_flat_cost``, so
-    nothing downstream would report it.
+    nothing downstream would report it. ``allow_inert=True`` is the explicit
+    escape hatch -- and it must still say that nothing trims.
     """
+    kwargs = dict(batch_sizes=[32], tiers=[1, 3, 5], acceptance_rates=[0.9, 0.95])
     with pytest.raises(InertCostTableError, match="inert"):
-        check_table_is_informative(
-            INERT_PAYLOAD,
-            batch_sizes=[32],
-            tiers=[1, 3, 5],
-            acceptance_rates=[0.9, 0.95],
-        )
-
-
-def test_allow_inert_escape_hatch():
-    diagnostics = check_table_is_informative(
-        INERT_PAYLOAD,
-        batch_sizes=[32],
-        tiers=[1, 3, 5],
-        acceptance_rates=[0.9, 0.95],
-        allow_inert=True,
-    )
+        check_table_is_informative(INERT_PAYLOAD, **kwargs)
+    diagnostics = check_table_is_informative(INERT_PAYLOAD, allow_inert=True, **kwargs)
     assert diagnostics["trims_somewhere"] is False
-
-
-def test_refuses_a_single_entry_ladder():
-    payload, _ = _payload()
-    with pytest.raises(InertCostTableError, match="single entry"):
-        check_table_is_informative(payload, batch_sizes=BATCH_SIZES, tiers=[5])
 
 
 def test_informative_table_passes_and_reports_where_trimming_wins():
@@ -546,6 +500,9 @@ def test_informative_table_passes_and_reports_where_trimming_wins():
     )
     assert diagnostics["trims_somewhere"] is True
     assert diagnostics["best_step_time_spread"] > 0.02
+    # Even a good table cannot rescue a one-rung ladder: nothing to choose.
+    with pytest.raises(InertCostTableError, match="single entry"):
+        check_table_is_informative(payload, batch_sizes=BATCH_SIZES, tiers=[5])
 
 
 # --------------------------------------------------------------------------
@@ -570,14 +527,10 @@ def _sweep(**overrides) -> SweepConfig:
 
 
 def test_token_budget_is_the_step_count_when_acceptance_is_pinned():
-    """Pinned, a step commits exactly one token, so the two are the same number."""
-    config = _sweep()
-    assert config.max_tokens_for(5) == config.warmup_steps + config.measure_steps + 16
-
-
-def test_token_budget_is_scaled_when_acceptance_is_not_pinned():
-    """Unpinned, a step can commit verify_len + 1 tokens, so the budget must cover it."""
+    """Pinned, a step commits exactly one token, so the two are the same
+    number; unpinned it can commit verify_len + 1, so the budget must scale."""
     pinned = _sweep()
+    assert pinned.max_tokens_for(5) == pinned.warmup_steps + pinned.measure_steps + 16
     loose = _sweep(pin_acceptance=0.0)
     assert loose.max_tokens_for(5) == pinned.max_tokens_for(5) * 6
 

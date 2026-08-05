@@ -1654,8 +1654,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         capture_graph = self.is_cuda_graph
         # GROW-ONLY ratchet, never an equality check: captured graphs bake the
         # buffer addresses in, and the old `!=` re-created the buffers whenever
-        # max_draft_len moved per step -- the graph-path ragged IMA (see
-        # docs/dspark_ragged_ima_handoff.md). Consumers slice [:rows]/[:width].
+        # max_draft_len moved per step -- the graph-path ragged IMA. Consumers
+        # slice [:rows]/[:width].
         prev_cap = getattr(self, "_expanded_alloc_draft_cap", -1)
         ratchet = max(self._draft_sizing_cap, prev_cap)
         if ratchet > prev_cap:

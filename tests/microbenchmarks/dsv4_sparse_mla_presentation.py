@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """B2: batch-major vs token-major presentation of DeepSeek-V4 sparse-MLA generation.
 
-This is the measurement the DSpark ragged-verification design hinges on
-(``docs/dspark_confidence_schedule_goal.md`` §6.4 B2 / §7.1 U1).
+This is the measurement the DSpark ragged-verification design hinges on.
 
 The question
 ------------
@@ -41,9 +40,8 @@ the arithmetic is the same; only the presentation differs.
 
 How to read the result
 ----------------------
-``docs/dspark_p0_task_prompt.md`` §3: if token-major is materially slower or
-incorrect, stop and fall back to the uniform tier ladder (D3 Stage A), which
-needs no kernel change at all. The prior is that DeepSeek-V4-Pro under DEP8
+If token-major is materially slower or incorrect, the fallback is the uniform
+tier ladder, which needs no kernel change at all. The prior is that DeepSeek-V4-Pro under DEP8
 keeps all 128 Q heads per rank, so BMM1's M dimension falls from
 ``128 * (tier+1)`` to ``128`` -- and because the sparse index set differs per
 row there was never any KV tile sharing across the window to lose. That is an

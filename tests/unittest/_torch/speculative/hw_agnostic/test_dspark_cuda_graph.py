@@ -153,13 +153,21 @@ def test_batched_attention_matches_scalar_per_request(seed):
 
 
 def test_batched_attention_persist_writes_through_window():
-    """persist=True writes main_kv into the shared window at start_pos%window."""
+    """persist gates the window write: False mutates nothing, True writes
+    main_kv into exactly the start_pos%window row of each request."""
     g = _make_batched_inputs(seed=3)
     G, win = g["G"], g["window"]
     start_pos = torch.tensor(g["start_positions"], dtype=torch.long)
     slots = torch.arange(G, dtype=torch.long)
     cache = g["kv_cache"].clone()
     before = cache.clone()
+
+    dspark_attention_forward_batched(
+        g["x"], g["main_x"], start_pos, cache, slots, persist=False, **_attn_kwargs(g)
+    )
+    # persist=False must not mutate the caller's window (functional).
+    torch.testing.assert_close(cache, before)
+
     dspark_attention_forward_batched(
         g["x"], g["main_x"], start_pos, cache, slots, persist=True, **_attn_kwargs(g)
     )
@@ -169,14 +177,6 @@ def test_batched_attention_persist_writes_through_window():
         expected = torch.zeros(win, dtype=torch.bool)
         expected[sp % win] = True
         assert torch.equal(changed, expected), f"req {i}: wrong window row written"
-
-
-def test_batched_attention_no_persist_keeps_window():
-    """persist=False must not mutate the caller's window (functional)."""
-    g = _make_batched_inputs(seed=4)
-    before = g["kv_cache"].clone()
-    _batched(g, persist=False)
-    torch.testing.assert_close(g["kv_cache"], before)
 
 
 @pytest.mark.parametrize("start_positions", [(1, 3, 20), (5, 5, 5), (2, 7, 200)])
@@ -389,20 +389,34 @@ def test_apply_sts_accepts_host_logits_from_a_device_head():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
 def test_ragged_scatter_is_cuda_graph_capturable():
+    """scatter_ragged_to_padded and count_accepted_ragged capture and replay.
+
+    Both run inside the target's captured graph; the scatter is the op that
+    needs ``repeat_interleave`` told its output size up front, and the accept
+    count must never gain a host sync either.
+    """
     from tensorrt_llm._torch.speculative.dspark_ragged import (
         build_qo_indptr,
+        count_accepted_ragged,
         scatter_ragged_to_padded,
     )
 
     lens = torch.tensor([3, 1, 2], dtype=torch.int32, device="cuda")
     indptr = build_qo_indptr(lens)
     flat = torch.tensor([10, 11, 12, 20, 30, 31], dtype=torch.int32, device="cuda")
+    draft = torch.tensor([[1, 2, 3, 9], [4, 9, 9, 9], [5, 6, 9, 9]], device="cuda")
+    target = torch.tensor([[1, 2, 7, 9], [4, 9, 9, 9], [5, 6, 9, 9]], device="cuda")
     out = torch.empty(3, 4, dtype=torch.int32, device="cuda")
+    accepted = torch.empty(3, dtype=torch.int64, device="cuda")
 
     def run():
-        return scatter_ragged_to_padded(
+        padded = scatter_ragged_to_padded(
             flat, verify_lens=lens, qo_indptr=indptr, max_len=4, pad_value=-1
         )
+        counts = count_accepted_ragged(
+            draft_tokens=draft, target_tokens=target, verify_lens=lens
+        )
+        return padded, counts
 
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -413,44 +427,19 @@ def test_ragged_scatter_is_cuda_graph_capturable():
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        out.copy_(run())
+        padded, counts = run()
+        out.copy_(padded)
+        accepted.copy_(counts)
 
     g.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [[10, 11, 12, -1], [20, -1, -1, -1], [30, 31, -1, -1]]
+    # req 0 matches 2 then diverges; req 1 matches its single position; req 2
+    # matches both. Column 3 is padding for every row and must never count.
+    assert accepted.tolist() == [2, 1, 2]
 
     # New packed contents must flow through on replay.
     flat.copy_(torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int32, device="cuda"))
     g.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [[1, 2, 3, -1], [4, -1, -1, -1], [5, 6, -1, -1]]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU")
-def test_ragged_accept_count_is_cuda_graph_capturable():
-    from tensorrt_llm._torch.speculative.dspark_ragged import count_accepted_ragged
-
-    lens = torch.tensor([3, 1, 2], dtype=torch.int32, device="cuda")
-    draft = torch.tensor([[1, 2, 3, 9], [4, 9, 9, 9], [5, 6, 9, 9]], device="cuda")
-    target = torch.tensor([[1, 2, 7, 9], [4, 9, 9, 9], [5, 6, 9, 9]], device="cuda")
-    out = torch.empty(3, dtype=torch.int64, device="cuda")
-
-    def run():
-        return count_accepted_ragged(draft_tokens=draft, target_tokens=target, verify_lens=lens)
-
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        for _ in range(3):
-            run()
-    torch.cuda.current_stream().wait_stream(s)
-
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        out.copy_(run())
-
-    g.replay()
-    torch.cuda.synchronize()
-    # req 0 matches 2 then diverges; req 1 matches its single position; req 2
-    # matches both. Column 3 is padding for every row and must never count.
-    assert out.tolist() == [2, 1, 2]
