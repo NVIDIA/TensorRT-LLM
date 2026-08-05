@@ -368,6 +368,7 @@ def test_model_defaults_select_the_inkling_backend():
 
     assert InklingForConditionalGeneration.get_model_defaults(None)["attn_backend"] == "INKLING"
 
+
 def test_attn_backend_override_fails_loudly():
     """An attn_backend override silently removes the decode publish and the run
     then dies inside CUDA-graph capture with a message that names neither
@@ -429,12 +430,13 @@ def test_conv_state_resource_type_is_gone():
 
 
 def test_inkling_selects_the_hybrid_cache_manager():
-    from tensorrt_llm._torch.pyexecutor._util import _non_hybrid_kv_cache_manager_cls
     from tensorrt_llm._torch.attention_backend.inkling import InklingHybridCacheManager
+    from tensorrt_llm._torch.pyexecutor._util import _non_hybrid_kv_cache_manager_cls
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
     cfg = SimpleNamespace(model_type="inkling_text")
     assert _non_hybrid_kv_cache_manager_cls(cfg, KvCacheConfig()) is (InklingHybridCacheManager)
+
 
 def test_conv_pool_dtype_is_a_torch_dtype_not_the_kv_cache_dtype():
     """_create_kv_cache_manager passes dtype= as the KV cache dtype, a C++
@@ -475,14 +477,17 @@ def test_inkling_attention_lives_in_its_own_package_not_under_sparse():
     pkg = importlib.import_module("tensorrt_llm._torch.attention_backend.inkling")
     for mod in ("kernels", "metadata", "backend", "cache_manager"):
         importlib.import_module(f"tensorrt_llm._torch.attention_backend.inkling.{mod}")
-    for sym in ("InklingAttentionMetadata", "InklingTritonAttention",
-                "InklingHybridCacheManager", "inkling_prefill_attention",
-                "inkling_decode_attention"):
+    for sym in (
+        "InklingAttentionMetadata",
+        "InklingTritonAttention",
+        "InklingHybridCacheManager",
+        "inkling_prefill_attention",
+        "inkling_decode_attention",
+    ):
         assert hasattr(pkg, sym), sym
 
     with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(
-            "tensorrt_llm._torch.attention_backend.sparse.inkling")
+        importlib.import_module("tensorrt_llm._torch.attention_backend.sparse.inkling")
 
 
 def test_no_conv_state_protocol_and_no_inkling_file_in_pyexecutor():
@@ -503,9 +508,11 @@ def test_no_conv_state_protocol_and_no_inkling_file_in_pyexecutor():
         importlib.import_module("tensorrt_llm._torch.pyexecutor.conv_state_manager")
 
     root = pathlib.Path(pyexec.__file__).parent
-    offenders = [f.name for f in root.glob("*.py")
-                 if "InklingHybridCacheManager" in f.read_text()
-                 and f.name != "_util.py"]
+    offenders = [
+        f.name
+        for f in root.glob("*.py")
+        if "InklingHybridCacheManager" in f.read_text() and f.name != "_util.py"
+    ]
     assert not offenders, offenders
 
 
@@ -524,7 +531,8 @@ def test_metadata_type_tests_the_concrete_manager():
 
     md = _ink_metadata()
     md.kv_cache_manager = _FakeConvManager(
-        md.kv_cache_manager.pp_layers, md.kv_cache_manager._blocks)
+        md.kv_cache_manager.pp_layers, md.kv_cache_manager._blocks
+    )
 
     md._prepare_inkling_conv()
 
@@ -546,12 +554,9 @@ def test_metadata_ignores_a_plain_kv_manager():
 # ---------------------------------------------------------------------------
 def _decoder_layer_stub(is_moe: bool):
     """An InklingDecoderLayer with only the mlp dispatch wired up."""
-    from tensorrt_llm._torch.models.modeling_inkling import (
-        InklingDecoderLayer,
-        InklingMoE,
-    )
-
     import torch.nn as nn
+
+    from tensorrt_llm._torch.models.modeling_inkling import InklingDecoderLayer, InklingMoE
 
     layer = object.__new__(InklingDecoderLayer)
     # nn.Module.__setattr__ refuses submodule assignment until Module.__init__
@@ -560,6 +565,7 @@ def _decoder_layer_stub(is_moe: bool):
     seen = {}
 
     if is_moe:
+
         class _Moe(InklingMoE):
             def __init__(self):
                 pass
@@ -567,12 +573,15 @@ def _decoder_layer_stub(is_moe: bool):
             def __call__(self, hidden_states, all_rank_num_tokens=None):
                 seen["arnt"] = all_rank_num_tokens
                 return hidden_states
+
         layer.mlp = _Moe()
     else:
+
         class _Dense:
             def __call__(self, hidden_states):
                 seen["called"] = True
                 return hidden_states
+
         layer.mlp = _Dense()
     return layer, seen
 
@@ -626,8 +635,7 @@ def test_model_forward_sources_the_counts_from_attn_metadata():
 def _ep_model_config(ep_size, n_routed=256):
     return SimpleNamespace(
         mapping=SimpleNamespace(moe_ep_size=ep_size, moe_tp_size=1),
-        pretrained_config=SimpleNamespace(
-            text_config=SimpleNamespace(n_routed_experts=n_routed)),
+        pretrained_config=SimpleNamespace(text_config=SimpleNamespace(n_routed_experts=n_routed)),
     )
 
 
@@ -660,8 +668,7 @@ def test_expert_parallel_rejects_more_ranks_than_experts():
     from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
 
     with pytest.raises(ValueError, match="exceeds"):
-        InklingForCausalLM._assert_inkling_moe_parallel(
-            _ep_model_config(8, n_routed=4))
+        InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(8, n_routed=4))
 
 
 def test_expert_parallel_guard_is_inert_when_ep_is_off():
@@ -685,8 +692,7 @@ def test_inkling_moe_leaves_expert_sharding_to_the_generic_factory():
     from tensorrt_llm._torch.models.modeling_inkling import InklingMoE
 
     src = inspect.getsource(InklingMoE)
-    for forbidden in ("slot_start", "slot_end", "expert_size_per_partition",
-                      "moe_ep_rank"):
+    for forbidden in ("slot_start", "slot_end", "expert_size_per_partition", "moe_ep_rank"):
         assert forbidden not in src, forbidden
     assert "create_moe(" in inspect.getsource(modeling_inkling.InklingMoE.__init__)
 
@@ -733,15 +739,13 @@ def test_every_deferred_import_in_the_inkling_package_resolves():
     unresolved = []
     checked = 0
     for path in sorted(pkg_dir.rglob("*.py")):
-        module = ".".join(
-            path.relative_to(root.parent).with_suffix("").parts)
+        module = ".".join(path.relative_to(root.parent).with_suffix("").parts)
         package = module.rsplit(".", 1)[0]
         for node in ast.walk(ast.parse(path.read_text())):
             if not isinstance(node, ast.ImportFrom) or not node.level:
                 continue
             checked += 1
-            target = importlib.util.resolve_name(
-                "." * node.level + (node.module or ""), package)
+            target = importlib.util.resolve_name("." * node.level + (node.module or ""), package)
             if importlib.util.find_spec(target) is None:
                 unresolved.append(f"{path.name}:{node.lineno} -> {target}")
 

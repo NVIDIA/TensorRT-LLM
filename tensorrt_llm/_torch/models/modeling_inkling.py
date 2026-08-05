@@ -1463,6 +1463,7 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
             vocab_size=config.unpadded_vocab_size,
         )
         self._assert_inkling_attn_backend(model_config)
+        self._assert_inkling_moe_parallel(model_config)
         self._apply_allreduce_strategy()
 
     @staticmethod
@@ -1488,6 +1489,58 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
                 "backend supplies. Remove the attn_backend override from "
                 "--extra_llm_api_options / LLM(attn_backend=...) so the model "
                 "default applies."
+            )
+
+    @staticmethod
+    def _assert_inkling_moe_parallel(model_config) -> None:
+        """Reject an expert-parallel layout the MoE backend cannot serve.
+
+        Inkling's routed experts go through the generic ``create_moe`` factory,
+        so expert parallelism needs no Inkling-specific code: ``Mapping``
+        derives ``moe_ep_size`` / ``moe_tp_size``, ``FusedMoE`` slices the 256
+        experts with ``_compute_ep_partition``, and CutlassFusedMoE remaps the
+        NVFP4 per-expert scales onto the local slice. What it does NOT have is
+        a check that the requested split is one the backend supports.
+
+        ``FusedMoE._supports_non_divisible_ep`` is opt-in and the CUTLASS
+        backend -- the only routed-expert backend Inkling ships -- does not opt
+        in, so a non-divisible ``moe_expert_parallel_size`` fails somewhere
+        inside expert-slot bookkeeping rather than at load. 256 divides evenly
+        by every power of two, so this only bites on values like 3, 5 or 6.
+
+        Note this deliberately does NOT constrain moe_tp_size: with
+        ``moe_ep_size = 1`` (the default) the experts are TP-sharded, which is
+        what every Inkling accuracy run to date measured.
+        """
+        mapping = getattr(model_config, "mapping", None)
+        if mapping is None:
+            return
+        ep_size = getattr(mapping, "moe_ep_size", 1) or 1
+        if ep_size <= 1:
+            return
+        config = model_config.pretrained_config
+        config = getattr(config, "text_config", config)
+        num_experts = getattr(config, "n_routed_experts", None)
+        if num_experts is None:
+            return
+        # Order matters: more ranks than experts is the more fundamental
+        # problem and subsumes non-divisibility, so report it first. Checking
+        # divisibility first would tell a user with 8 ranks and 4 experts to
+        # "pick a divisor of 4", which is not the advice they need.
+        if num_experts < ep_size:
+            raise ValueError(
+                f"moe_expert_parallel_size={ep_size} exceeds Inkling's "
+                f"{num_experts} routed experts; ranks with zero experts are "
+                f"not supported by any MoE backend."
+            )
+        if num_experts % ep_size != 0:
+            raise ValueError(
+                f"Inkling has {num_experts} routed experts, which "
+                f"moe_expert_parallel_size={ep_size} does not divide evenly. "
+                f"The CUTLASS MoE backend does not opt into non-divisible "
+                f"expert parallelism, so the uneven split would fail inside "
+                f"expert-slot bookkeeping instead of here. Pick a divisor of "
+                f"{num_experts}."
             )
 
     def _apply_allreduce_strategy(self) -> None:

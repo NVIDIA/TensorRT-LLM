@@ -25,8 +25,12 @@ dense -- full causal on global layers, a 512-token sliding window on local ones
 
 from .backend import InklingTritonAttention
 from .cache_manager import InklingHybridCacheManager
-from .kernels import (build_page_table, inkling_decode_attention,
-                      inkling_prefill_attention, write_kv_cache_hnd)
+from .kernels import (
+    build_page_table,
+    inkling_decode_attention,
+    inkling_prefill_attention,
+    write_kv_cache_hnd,
+)
 from .metadata import InklingAttentionMetadata
 
 __all__ = [

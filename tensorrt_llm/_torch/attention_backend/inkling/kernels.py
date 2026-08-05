@@ -50,7 +50,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 # Additive value used to drop a masked key from the softmax. Large enough that
 # ``exp(qk - max)`` underflows to 0 in fp32, finite so online-softmax bookkeeping
 # never sees a NaN. (float("-inf") would poison the running max on the first,
