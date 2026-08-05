@@ -17,6 +17,7 @@
 Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
 """
 
+from collections.abc import Mapping
 from typing import Dict, Iterable
 
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
@@ -137,6 +138,110 @@ def _validate_video_reference(video) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Transfer preflight validators.
+#
+# These mirror ``transfer.resolve_transfer_config``'s parsing rather than adding
+# rules of their own: a validator that is stricter than the worker would reject
+# requests the pipeline would have served. The worker keeps its own checks --
+# offline callers do not go through preflight -- so these exist purely to turn a
+# deterministic client mistake into a 400 at enqueue instead of a failure deep
+# in the pipeline, after the request has already been accepted with a 202.
+# ---------------------------------------------------------------------------
+def _transfer_hint_payload(value) -> Mapping:
+    """Normalize a control hint to its object form, as the worker does.
+
+    Normalization first, checks after, so a hint carried as bare bytes and the
+    same hint carried as ``{"control": <bytes>}`` are held to one standard.
+    """
+    if value is True:
+        payload: Mapping = {}
+    elif isinstance(value, bytes):
+        payload = {"control": value}
+    elif isinstance(value, bool):  # False, having already excluded True
+        raise ValueError(
+            "control hint must be true, encoded MP4/AVI bytes, or an object; got false. "
+            "Omit the key entirely to leave the hint off."
+        )
+    elif not isinstance(value, Mapping):
+        raise TypeError(
+            "control hint must be an object, encoded control bytes, or true; "
+            f"got {type(value).__name__}."
+        )
+    else:
+        if value.get("control_path") is not None:
+            raise ValueError(
+                "control hint no longer accepts 'control_path'; pass the encoded control clip "
+                "as 'control' bytes (Path(control).read_bytes())."
+            )
+        payload = value
+
+    control = payload.get("control")
+    if control is not None:
+        if not isinstance(control, bytes):
+            raise TypeError(
+                "control hint 'control' must be encoded MP4/AVI bytes, got "
+                f"{type(control).__name__}."
+            )
+        # Same bar the `video` reference is held to: undecodable bytes fail at
+        # decode anyway, so name the problem now rather than mid-request.
+        if sniff_media_kind(control) != "video":
+            raise ValueError(
+                "control hint bytes are not a recognized video container (supported: MP4/AVI)."
+            )
+    return payload
+
+
+def _validate_edge_hint(value) -> None:
+    # Imported at call time: transfer imports this module, so a module-level
+    # import would be circular. Specs pickle by name, so this stays picklable.
+    from .transfer import EDGE_PRESETS
+
+    payload = _transfer_hint_payload(value)
+    # `or "medium"` matches the worker, which treats empty/None as the default.
+    preset = str(payload.get("preset_edge_threshold") or "medium").lower()
+    if preset not in EDGE_PRESETS:
+        raise ValueError(
+            f"unsupported preset_edge_threshold {preset!r}; expected one of {sorted(EDGE_PRESETS)}."
+        )
+
+
+def _validate_blur_hint(value) -> None:
+    from .transfer import BLUR_PRESETS
+
+    payload = _transfer_hint_payload(value)
+    preset = str(payload.get("preset_blur_strength") or "medium").lower()
+    if preset not in BLUR_PRESETS:
+        raise ValueError(
+            f"unsupported preset_blur_strength {preset!r}; expected one of {sorted(BLUR_PRESETS)}."
+        )
+
+
+def _validate_precomputed_control_hint(value) -> None:
+    """For hints with no on-the-fly generator: a control clip is mandatory."""
+    if _transfer_hint_payload(value).get("control") is None:
+        raise ValueError(
+            "this control has no on-the-fly generator, so it requires a precomputed clip "
+            "as encoded MP4/AVI bytes; only 'edge' and 'blur' accept true."
+        )
+
+
+def _validate_control_guidance_interval(value) -> None:
+    from .transfer import _as_interval
+
+    _as_interval(value)  # reused outright, so preflight cannot drift from the worker
+
+
+def _validate_positive_frames(value) -> None:
+    if int(value) <= 0:
+        raise ValueError(f"must be a positive frame count, got {value}.")
+
+
+def _validate_non_negative_frames(value) -> None:
+    if int(value) < 0:
+        raise ValueError(f"must be a non-negative frame count, got {value}.")
+
+
 # Text-to-image (``output_type="image"``) defaults; resolved in ``infer()``.
 COSMOS3_T2I_PARAMS = {
     "height": 1024,
@@ -239,6 +344,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             "or pass the encoded MP4/AVI bytes of a precomputed control clip, or an "
             'object {"control": <bytes>, "preset_edge_threshold": "medium"}.'
         ),
+        validator=_validate_edge_hint,
     ),
     "blur": ExtraParamSchema(
         type="bool_or_bytes_or_dict",
@@ -248,6 +354,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             "`video` extra param; or pass encoded control bytes, or an object "
             '{"control": <bytes>, "preset_blur_strength": "medium"}.'
         ),
+        validator=_validate_blur_hint,
     ),
     "depth": ExtraParamSchema(
         type="bool_or_bytes_or_dict",
@@ -255,11 +362,13 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description=(
             "Depth control. Requires precomputed encoded MP4/AVI bytes (no auto-computation)."
         ),
+        validator=_validate_precomputed_control_hint,
     ),
     "seg": ExtraParamSchema(
         type="bool_or_bytes_or_dict",
         default=None,
         description="Semantic-segmentation control. Requires precomputed encoded MP4/AVI bytes.",
+        validator=_validate_precomputed_control_hint,
     ),
     "wsm": ExtraParamSchema(
         type="bool_or_bytes_or_dict",
@@ -268,6 +377,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             "World-scenario-model control. Requires precomputed encoded MP4/AVI bytes; "
             "runs 101-frame chunks at 10 fps."
         ),
+        validator=_validate_precomputed_control_hint,
     ),
     "control_guidance": ExtraParamSchema(
         type="float",
@@ -278,24 +388,31 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         type="list",
         default=None,
         description="[lo, hi] timestep window where control guidance is active.",
+        validator=_validate_control_guidance_interval,
     ),
     "num_video_frames_per_chunk": ExtraParamSchema(
         type="int",
         default=None,
         description="Transfer chunk length in frames (default 93; 101 for wsm).",
+        validator=_validate_positive_frames,
     ),
     "num_conditional_frames": ExtraParamSchema(
         type="int",
         default=None,
         description="Overlap frames pinned from the previous chunk when stitching.",
+        validator=_validate_non_negative_frames,
     ),
     "num_first_chunk_conditional_frames": ExtraParamSchema(
         type="int",
         default=None,
         description="Input-video frames pinned at the start of the first chunk.",
+        validator=_validate_non_negative_frames,
     ),
     "max_frames": ExtraParamSchema(
-        type="int", default=None, description="Cap on frames decoded from transfer inputs/controls."
+        type="int",
+        default=None,
+        description="Cap on frames decoded from transfer inputs/controls.",
+        validator=_validate_positive_frames,
     ),
     "show_control_condition": ExtraParamSchema(
         type="bool", default=False, description="Concatenate the control video beside the output."

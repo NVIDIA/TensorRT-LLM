@@ -12,6 +12,7 @@ loudly.
 """
 
 import os
+import pickle
 from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pi
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_720P_PARAMS,
+    COSMOS3_EXTRA_SPECS,
     COSMOS3_PIPELINE_DEFAULTS,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
@@ -292,6 +294,81 @@ class TestTransferMediaHelpers:
                     input_frames=None,
                     device=torch.device("cpu"),
                 )
+
+
+class TestTransferPreflightValidation:
+    """Deterministic client mistakes must 400 at enqueue, not 202 then fail.
+
+    These validators run in the coordinator (``visual_gen/params.py``), so they
+    must stay in step with ``resolve_transfer_config``: anything they reject has
+    to be something the worker would have rejected too, only later.
+    """
+
+    # Minimal ISO-BMFF header, enough for the container sniff.
+    MP4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
+
+    def _check(self, key, value):
+        COSMOS3_EXTRA_SPECS[key].validator(value)
+
+    def test_validators_are_picklable(self):
+        # Specs are pickled to the coordinator in the READY handshake, so a
+        # closure or lambda here would break serving but pass every other test.
+        for key in ("edge", "blur", "depth", "seg", "wsm", "control_guidance_interval"):
+            validator = COSMOS3_EXTRA_SPECS[key].validator
+            assert pickle.loads(pickle.dumps(validator)) is validator
+
+    @pytest.mark.parametrize("key", ["edge", "blur"])
+    def test_generated_hints_accept_auto_compute_and_controls(self, key):
+        self._check(key, True)
+        self._check(key, self.MP4)
+        self._check(key, {"control": self.MP4})
+        self._check(key, {})
+
+    @pytest.mark.parametrize("key", ["depth", "seg", "wsm"])
+    def test_precomputed_hints_reject_auto_compute(self, key):
+        # These have no generator; `true` used to 202 and then fail in the worker.
+        for value in (True, {}):
+            with pytest.raises(ValueError, match="no on-the-fly generator"):
+                self._check(key, value)
+        self._check(key, self.MP4)  # a real control clip is still fine
+
+    def test_presets_are_checked_against_the_tables(self):
+        self._check("edge", {"preset_edge_threshold": "very_high"})
+        self._check("blur", {"preset_blur_strength": "very_high"})
+        # Empty/None means "default", exactly as resolve_transfer_config reads it.
+        self._check("edge", {"preset_edge_threshold": ""})
+        with pytest.raises(ValueError, match="unsupported preset_edge_threshold"):
+            self._check("edge", {"preset_edge_threshold": "sharpish"})
+        with pytest.raises(ValueError, match="unsupported preset_blur_strength"):
+            self._check("blur", {"preset_blur_strength": "soupy"})
+
+    def test_rejects_paths_and_undecodable_bytes(self):
+        with pytest.raises(ValueError, match="control_path"):
+            self._check("edge", {"control_path": "/tmp/control.mp4"})
+        with pytest.raises(ValueError, match="not a recognized video container"):
+            self._check("edge", b"not a video")
+        # Bare bytes and the object form are held to the same bar.
+        with pytest.raises(ValueError, match="not a recognized video container"):
+            self._check("edge", {"control": b"not a video"})
+        with pytest.raises(ValueError, match="Omit the key"):
+            self._check("edge", False)
+
+    def test_interval_must_be_an_ordered_pair(self):
+        self._check("control_guidance_interval", [0.1, 0.9])
+        with pytest.raises(ValueError, match="exactly two values"):
+            self._check("control_guidance_interval", [0.5])
+        with pytest.raises(ValueError, match="ordered as"):
+            self._check("control_guidance_interval", [0.9, 0.1])
+
+    def test_frame_counts_are_bounded(self):
+        self._check("num_video_frames_per_chunk", 93)
+        self._check("num_conditional_frames", 0)
+        for key in ("num_video_frames_per_chunk", "max_frames"):
+            with pytest.raises(ValueError, match="positive frame count"):
+                self._check(key, 0)
+        for key in ("num_conditional_frames", "num_first_chunk_conditional_frames"):
+            with pytest.raises(ValueError, match="non-negative frame count"):
+                self._check(key, -1)
 
 
 class TestTransferFrameConversions:
