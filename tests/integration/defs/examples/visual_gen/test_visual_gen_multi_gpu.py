@@ -84,7 +84,6 @@ WAN22_LPIPS_TP_VARIANTS = [
 WAN22_LPIPS_MULTINODE_WORLD_SIZE = 16
 WAN22_LPIPS_MULTINODE_NODES = 2
 WAN22_LPIPS_MULTINODE_GPUS_PER_NODE = 8
-# Keep this topology aligned with its 16-rank mapping unit test.
 WAN22_LPIPS_MULTINODE_PARALLEL = {
     "cfg_size": 2,
     "attn2d_size": (2, 2),
@@ -211,13 +210,6 @@ def _slurm_node_count():
         if var in os.environ:
             return int(os.environ[var])
     return None
-
-
-def _trtllm_launch_wrapper_world_size():
-    try:
-        return int(os.environ.get("tllm_mpi_size", "1") or 1)
-    except ValueError:
-        return 1
 
 
 def _multinode_subprocess_timeout():
@@ -353,10 +345,10 @@ def _run_wan22_multinode_slurm_rank(request, tmp_path):
 
 
 def _run_wan22_multinode_slurm_parent():
-    if (
-        os.environ.get("TLLM_SPAWN_PROXY_PROCESS") == "1"
-        and _trtllm_launch_wrapper_world_size() >= WAN22_LPIPS_MULTINODE_WORLD_SIZE
-    ):
+    # Guard on the wrapper alone, not on its world size: trtllm-llmapi-launch
+    # strips SLURM_* at any scale, and a size-gated check would let the
+    # stripped-env case fall through to a misleading "no SLURM allocation" skip.
+    if os.environ.get("TLLM_SPAWN_PROXY_PROCESS") == "1":
         pytest.fail(
             "VisualGen SLURM external-launch coverage cannot run under "
             "trtllm-llmapi-launch because that wrapper removes SLURM_* env "

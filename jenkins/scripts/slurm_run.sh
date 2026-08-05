@@ -57,7 +57,10 @@ env | sort
 echo "Full Command: $pytestCommand"
 
 if [[ "${TRTLLM_VISUAL_GEN_MULTINODE_SLURM_PARENT:-0}" == "1" ]]; then
-    install_done_dir="${jobWorkspace}/visual_gen_multinode_install_done"
+    # Scope the markers to the SLURM job: the stage's infra-retry loop can reuse
+    # jobWorkspace, and stale node_* files from a previous attempt would let
+    # rank 0 start before this attempt's nodes finish installing.
+    install_done_dir="${jobWorkspace}/visual_gen_multinode_install_done_${SLURM_JOB_ID:-0}"
     mkdir -p "$install_done_dir"
     if [[ "${SLURM_LOCALID:-0}" == "0" ]]; then
         touch "${install_done_dir}/node_${SLURM_NODEID:-0}"

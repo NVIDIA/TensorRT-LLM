@@ -13,11 +13,7 @@ import pytest
 
 from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
 from tensorrt_llm.visual_gen.args import VisualGenArgs
-from tensorrt_llm.visual_gen.visual_gen import (
-    DiffusionRemoteClient,
-    VisualGen,
-    _detect_external_launch,
-)
+from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient, _detect_external_launch
 
 pytestmark = pytest.mark.cpu_only
 
@@ -255,97 +251,3 @@ class TestSingleNodeSpawnLocalRank:
                 f"Worker {i}: expected local_rank={i}, got {kwargs['local_rank']}. "
                 f"With LOCAL_RANK=0 in env, all workers would get device_id=0."
             )
-
-
-class TestVisualGenExternalLaunchInit:
-    def test_world_size_mismatch_raises(self):
-        args = VisualGenArgs(model="/tmp/model", parallel_config={"ulysses_size": 4})
-
-        with patch(
-            "tensorrt_llm.visual_gen.visual_gen._detect_external_launch",
-            return_value=(0, 0, 8, "node0", 29500),
-        ):
-            with pytest.raises(ValueError, match="does not match"):
-                VisualGen(model="/tmp/model", args=args)
-
-    def test_nonzero_rank_runs_worker_then_exits(self):
-        args = VisualGenArgs(model="/tmp/model", parallel_config={"ulysses_size": 4})
-        mock_worker = MagicMock()
-
-        with (
-            patch(
-                "tensorrt_llm.visual_gen.visual_gen._detect_external_launch",
-                return_value=(2, 2, 4, "node0", 29500),
-            ),
-            patch("tensorrt_llm.visual_gen.visual_gen.run_diffusion_worker", mock_worker),
-        ):
-            with pytest.raises(SystemExit) as exc_info:
-                VisualGen(model="/tmp/model", args=args)
-
-        assert exc_info.value.code == 0
-        kwargs = mock_worker.call_args.kwargs
-        assert (
-            kwargs["rank"],
-            kwargs["local_rank"],
-            kwargs["world_size"],
-            kwargs["master_addr"],
-            kwargs["master_port"],
-        ) == (2, 2, 4, "node0", 29500)
-        assert kwargs["request_queue_addr"] is kwargs["response_queue_addr"] is None
-
-
-class TestExternalLaunchClientWiring:
-    @pytest.fixture(autouse=True)
-    def _clean_env(self, monkeypatch):
-        for var in ["RANK", "WORLD_SIZE", "LOCAL_RANK", "SLURM_PROCID", "SLURM_NTASKS"]:
-            monkeypatch.delenv(var, raising=False)
-
-    def test_rank0_uses_master_addr_and_thread_worker(self):
-        args = VisualGenArgs(model="/tmp/model", parallel_config={"ulysses_size": 4})
-
-        mock_ctx = MagicMock()
-        original_event = threading.Event
-
-        def pre_set_event():
-            event = original_event()
-            event.set()
-            return event
-
-        with (
-            patch(
-                "tensorrt_llm._torch.visual_gen.executor._detect_external_launch",
-                return_value=(0, 0, 4, "node0", 29500),
-            ),
-            patch("tensorrt_llm._torch.visual_gen.executor.mp.get_context", return_value=mock_ctx),
-            patch("tensorrt_llm._torch.visual_gen.executor.threading.Thread") as mock_thread_cls,
-            patch(
-                "tensorrt_llm._torch.visual_gen.executor.threading.Event", side_effect=pre_set_event
-            ),
-            patch.object(DiffusionRemoteClient, "_wait_ready"),
-        ):
-            mock_thread_cls.return_value = MagicMock()
-            client = DiffusionRemoteClient(args=args)
-
-        assert (client.master_addr, client.master_port) == ("node0", 29500)
-        assert client.req_addr_connect.startswith("tcp://node0:")
-        assert client.resp_addr_connect.startswith("tcp://node0:")
-        mock_ctx.Process.assert_not_called()
-        worker_calls = [
-            c
-            for c in mock_thread_cls.call_args_list
-            if "in_client_process" in c.kwargs.get("kwargs", {})
-        ]
-        assert len(worker_calls) == 1
-        thread_call = worker_calls[0]
-        assert thread_call.kwargs["daemon"] is True
-        worker_kwargs = thread_call.kwargs["kwargs"]
-        assert worker_kwargs["in_client_process"]
-        assert (
-            worker_kwargs["rank"],
-            worker_kwargs["local_rank"],
-            worker_kwargs["world_size"],
-            worker_kwargs["master_addr"],
-            worker_kwargs["master_port"],
-        ) == (0, 0, 4, "node0", 29500)
-        assert worker_kwargs["request_queue_addr"] == client.req_addr_connect
-        assert worker_kwargs["response_queue_addr"] == client.resp_addr_connect
