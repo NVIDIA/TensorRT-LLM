@@ -342,31 +342,22 @@ def sample(
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
                 "BeamSearchMetadata is required for beam_search_sampling_batch"
             )
-            if cast(int, early_stopping) != BeamSearchEarlyStop.TRUE:
-                tokens, softmax = beam_search_sampling_batch_cba(
-                    logits,
-                    beam_width_in=cast(int, beam_width_in),
-                    beam_width_out=cast(int, beam_width_out),
-                    row_stride=cast(int, row_stride),
-                    beam_search_args=group_metadata,
-                    temperature=cast(float, temperature),
-                    early_stopping=cast(int, early_stopping),
-                    length_penalty=cast(float, length_penalty),
-                    diversity_rate=cast(float, beam_search_diversity_rate),
-                    return_probs=return_probs,
-                )
-            else:
-                tokens, softmax = beam_search_sampling_batch(
-                    logits,
-                    beam_width_in=cast(int, beam_width_in),
-                    beam_width_out=cast(int, beam_width_out),
-                    row_stride=cast(int, row_stride),
-                    beam_search_args=group_metadata,
-                    temperature=cast(float, temperature),
-                    length_penalty=cast(float, length_penalty),
-                    diversity_rate=cast(float, beam_search_diversity_rate),
-                    return_probs=return_probs,
-                )
+            # Every early_stopping mode goes through the candidate-beams-array
+            # path: TRUE differs only in the done verdict (pool full, without
+            # weighing attainability), matching the C++ decoder, which keeps
+            # the pool for all modes.
+            tokens, softmax = beam_search_sampling_batch_cba(
+                logits,
+                beam_width_in=cast(int, beam_width_in),
+                beam_width_out=cast(int, beam_width_out),
+                row_stride=cast(int, row_stride),
+                beam_search_args=group_metadata,
+                temperature=cast(float, temperature),
+                early_stopping=cast(int, early_stopping),
+                length_penalty=cast(float, length_penalty),
+                diversity_rate=cast(float, beam_search_diversity_rate),
+                return_probs=return_probs,
+            )
     return tokens, softmax, cast(float, temperature)
 
 
@@ -1311,15 +1302,12 @@ class FlashInferGroupedStrategySampler:
                     strategy_impl_cls = _StrategyImpls.MinPWithProbs
                 case "greedy":
                     strategy_impl_cls = _StrategyImpls.GreedyWithProbs
-                case ("beam_search", beam_width_in_key, _, early_stopping_key):
+                case ("beam_search", beam_width_in_key, _, _):
                     beam_width_in = beam_width_in_key
-                    # Beam search encodes with-probs as a constructor flag, not a
-                    # subclass; the stopping mode selects the class.
-                    strategy_impl_cls = (
-                        _StrategyImpls.RegularBeamSearchStep
-                        if early_stopping_key == BeamSearchEarlyStop.TRUE
-                        else _StrategyImpls.CBABeamSearchStep
-                    )
+                    # Beam search encodes with-probs as a constructor flag, not
+                    # a subclass. Every stopping mode uses the CBA step; the
+                    # mode only changes the done verdict inside it.
+                    strategy_impl_cls = _StrategyImpls.CBABeamSearchStep
                 case _:
                     raise NotImplementedError("Unsupported strategy key encountered")
         else:
@@ -1336,13 +1324,9 @@ class FlashInferGroupedStrategySampler:
                     strategy_impl_cls = _StrategyImpls.MinPSampleOnly
                 case "greedy":
                     strategy_impl_cls = _StrategyImpls.GreedySampleOnly
-                case ("beam_search", beam_width_in_key, _, early_stopping_key):
+                case ("beam_search", beam_width_in_key, _, _):
                     beam_width_in = beam_width_in_key
-                    strategy_impl_cls = (
-                        _StrategyImpls.RegularBeamSearchStep
-                        if early_stopping_key == BeamSearchEarlyStop.TRUE
-                        else _StrategyImpls.CBABeamSearchStep
-                    )
+                    strategy_impl_cls = _StrategyImpls.CBABeamSearchStep
                 case _:
                     raise NotImplementedError("Unsupported strategy key encountered")
         if group_logit_indices is None:

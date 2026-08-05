@@ -86,8 +86,6 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
-from .sampler.beam_search import BeamSearchEarlyStop
-from .sampler.sampler_common import _unwrap_singleton
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
@@ -4945,29 +4943,53 @@ class PyExecutor:
                     f"is not equal to max_beam_width {self.max_beam_width}. "
                     "This is not supported!")
 
-            # Exhaustive early_stopping keeps a pool of finished candidates,
-            # which the context server can already populate on its first step.
-            # That pool is not part of the disaggregated handoff and is cleared
-            # on the generation side, so a completion the context phase found
-            # would be silently dropped -- reachable under aggregation but not
-            # under disaggregation. Reject the combination until the handoff
-            # carries the pool; TRTLLM-14792.
+            # Variable-Beam-Width-Search is only defined for a non-decreasing
+            # array. The documented semantics (see getBeamWidthByIter in
+            # llmRequest.h) only cover widening, ending at the full width, and
+            # both samplers rely on that: the per-step ops write the leading
+            # beam_width_out rows while finalize reads py_beam_width (the
+            # array maximum) of them, so a narrowing array leaves the trailing
+            # rows holding ancestry from an earlier, wider step. The C++
+            # finalize path has the same gap -- it indexes with nBeamWidth
+            # only. Reject rather than emit silently stale beams; narrowing
+            # can be allowed once its semantics are defined (TRTLLM-14792).
+            beam_width_array = sampling_config.beam_width_array
+            if beam_width_array:
+                if isinstance(beam_width_array[0], (list, tuple)):
+                    beam_width_array = beam_width_array[0]
+                if any(b < a
+                       for a, b in zip(beam_width_array, beam_width_array[1:])):
+                    raise ValueError(
+                        f"beam_width_array {list(beam_width_array)} decreases; "
+                        "only non-decreasing arrays are supported for "
+                        "Variable-Beam-Width-Search.")
+
+            # Beam search keeps a pool of finished candidates, which the
+            # context server can already populate on its first step. That pool
+            # is not part of the disaggregated handoff (ContextPhaseParams
+            # carries only the first generated tokens) and is cleared on the
+            # generation side, so a completion the context phase found would be
+            # silently dropped -- reachable under aggregation but not under
+            # disaggregation.
+            #
+            # This applies to every early_stopping mode and to both samplers:
+            # TorchSampler now serves all modes from the candidate-beams-array
+            # path, and the C++ decoder behind TRTLLMSampler maintains the pool
+            # unconditionally (beamSearchLayer.cu assigns numBeamsCBA with no
+            # mode check). Reject until the handoff carries the pool;
+            # TRTLLM-14792.
             # NB: is_context_only_request is a property, but
             # is_generation_only_request is a plain method -- it must be called,
             # otherwise the bound method is truthy and this matches every request.
             if (request.is_context_only_request
                     or request.is_generation_only_request()):
-                early_stopping = _unwrap_singleton(
-                    sampling_config.early_stopping)
-                if (early_stopping is not None
-                        and BeamSearchEarlyStop.from_raw(early_stopping)
-                        is not BeamSearchEarlyStop.TRUE):
+                if sampling_config.beam_width > 1:
                     raise ValueError(
-                        f"Beam search early_stopping={early_stopping} is not "
-                        "supported with disaggregated serving: the finished-"
-                        "candidate pool is not transferred between the context "
-                        "and generation servers. Use the default "
-                        "(early_stopping=True).")
+                        "Beam search is not supported with disaggregated "
+                        "serving: the finished-candidate pool built during the "
+                        "context phase is not transferred to the generation "
+                        "server, so completions found there would be silently "
+                        "dropped. Use beam_width=1.")
 
         # Check token ID ranges
         self._validate_token_id_range(request)

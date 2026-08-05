@@ -842,13 +842,22 @@ def _cba_step_math(
     # decrease monotonically with sequence length, so longer sequences only get
     # less attractive).
     min_kept = top_normed.gather(1, (caps - 1).long()).view(-1)
-    if early_stopping != BeamSearchEarlyStop.FALSE:
-        max_gen = (max_seq_len - prompts.view(-1)).to(cand_len.dtype)
-        bound_len = torch.where(exponent.view(-1) > 0, max_gen, cand_len.view(-1))
+    # `min_kept > neg_inf` means the pool holds `caps` finished hypotheses,
+    # i.e. the C++ `numBeamsCBA[slot] >= nBM` test.
+    pool_full = min_kept > neg_inf
+    if early_stopping == BeamSearchEarlyStop.TRUE:
+        # HF `True`: stop as soon as `beam_width` finished candidates exist,
+        # without weighing what is still attainable. Matches C++
+        # beamStage3Kernel, which short-circuits to done here.
+        done = pool_full
     else:
-        bound_len = cand_len.view(-1)
-    best_attainable = cand_cum[:, 0] / bound_len.to(cand_cum.dtype).pow(exponent.view(-1))
-    done = (min_kept > neg_inf) & (min_kept >= best_attainable)
+        if early_stopping != BeamSearchEarlyStop.FALSE:
+            max_gen = (max_seq_len - prompts.view(-1)).to(cand_len.dtype)
+            bound_len = torch.where(exponent.view(-1) > 0, max_gen, cand_len.view(-1))
+        else:
+            bound_len = cand_len.view(-1)
+        best_attainable = cand_cum[:, 0] / bound_len.to(cand_cum.dtype).pow(exponent.view(-1))
+        done = pool_full & (min_kept >= best_attainable)
 
     # Reorder the finish handler's rolling stop-word window to follow the
     # beam swap (matching stays correct across swaps).
@@ -1166,12 +1175,18 @@ def _prepare_beam_search(
 
 
 def _request_uses_cba(request: LlmRequest) -> bool:
-    """Whether this beam-search request runs on the candidate-beams-array
-    path (exhaustive early_stopping modes)."""
-    early_stopping = _unwrap_singleton(
-        cast(Optional[list[int]], request.sampling_config.early_stopping)
-    )
-    return BeamSearchEarlyStop.from_raw(early_stopping) != BeamSearchEarlyStop.TRUE
+    """Whether this beam-search request runs on the candidate-beams-array path.
+
+    Every early_stopping mode does. The modes differ only in the done verdict
+    computed inside the CBA step (TRUE stops as soon as the pool is full;
+    FALSE / NEVER additionally weigh what is still attainable), matching the
+    C++ decoder, which maintains the pool for all modes.
+
+    Kept as a predicate rather than inlined: it marks the places that depend on
+    the CBA state existing, and it is the hook to restore should a
+    pool-free path be reintroduced.
+    """
+    return True
 
 
 def _prepare_beam_history_cba(
