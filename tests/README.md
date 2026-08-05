@@ -76,6 +76,23 @@ pytest -k llmapi --co -q
 You can set the output directory for logs/runtime data using the --output-dir flag.
 For more options, refer to pytest --help, paying attention to Custom options added for TRT-LLM.
 
+### Optional media dependencies
+
+Video multimodal and VisualGen tests need optional packages that are not part of
+the default install (OpenCV, and for VisualGen also PyAV / ffmpeg).
+
+If these are already installed, tests proceed without further action. Otherwise
+set the following to auto-install missing packages:
+
+```bash
+export TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1
+```
+
+When set, an autouse session fixture installs `opencv-python-headless` if needed,
+and VisualGen fixtures additionally install `av` and `ffmpeg` if needed. If the
+packages are missing and the flag is unset, those fixtures fail with an install
+hint.
+
 ### Common issues:
 
 1. `trtllm-build: not found`

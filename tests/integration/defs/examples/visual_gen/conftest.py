@@ -15,13 +15,31 @@
 
 """Shared fixtures for VisualGen example integration tests."""
 
+import importlib.util
+import os
+import shutil
+
 import pytest
 from defs.trt_test_alternative import check_call
 
 
 @pytest.fixture(scope="session")
-def _visual_gen_deps(llm_venv):
-    """Install optional media dependencies once per VisualGen test session."""
+def _visual_gen_deps(llm_venv, _auto_install_media_deps):
+    """Ensure PyAV and ffmpeg are available for VisualGen tests.
+
+    Uses packages already on the system when present. Otherwise set
+    ``TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1`` to install them. OpenCV is handled by
+    ``_auto_install_media_deps``.
+    """
+    av_available = importlib.util.find_spec("av") is not None
+    ffmpeg_available = shutil.which("ffmpeg") is not None
+    if av_available and ffmpeg_available:
+        return
+    if os.environ.get("TRTLLM_AUTO_INSTALL_MEDIA_DEPS", "0") != "1":
+        pytest.fail(
+            "PyAV and/or ffmpeg are not installed. Install them manually, or set "
+            "TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1 to auto-install."
+        )
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     check_call(["apt-get", "update", "-y"], shell=False)
     check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
