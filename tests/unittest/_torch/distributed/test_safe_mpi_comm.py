@@ -34,6 +34,8 @@ from tensorrt_llm._torch import distributed
 from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm.bindings import BuildInfo
 
+pytestmark = pytest.mark.cpu_only
+
 
 def get_mpi_info():
     """Get MPI rank and world size, returns (0, 1) if MPI is not available."""

@@ -15,6 +15,8 @@ from tensorrt_llm.serve.cluster_storage import (WatchEventType,
 from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
                                                     DisaggClusterWorker)
 
+pytestmark = pytest.mark.cpu_only
+
 INACTIVE_TIMEOUT = 4
 HEARTBEAT_INTERVAL = 2
 

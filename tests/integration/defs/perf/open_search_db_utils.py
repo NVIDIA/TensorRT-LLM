@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@ import time
 from datetime import datetime
 
 from defs.trt_test_alternative import print_info, print_warning
+from test_common.perf_sanity_matching import benchmark_data_matches
 
 _project_root = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '../../../..'))
@@ -41,33 +42,6 @@ QUERY_LOOKBACK_DAYS = 90
 
 def add_id(data):
     OpenSearchDB.add_id_of_json(data)
-
-
-def _match(history_data, new_data, match_keys):
-    """
-    Check if the server and client config of history data match the new data.
-    """
-
-    def is_empty(value):
-        return value is None or value == ""
-
-    for field in match_keys:
-        history_value = history_data.get(field, None)
-        new_value = new_data.get(field, None)
-        # For boolean fields (b_ prefix), treat None/missing as False.
-        # This ensures backward compatibility when new boolean match keys
-        # are added — historical data without the field can still match
-        # current data where the field defaults to False.
-        if field.startswith("b_"):
-            if history_value is None:
-                history_value = False
-            if new_value is None:
-                new_value = False
-        if is_empty(history_value) and is_empty(new_value):
-            continue
-        if history_value != new_value:
-            return False
-    return True
 
 
 def get_history_data(new_data_dict, match_keys, common_values_dict):
@@ -216,7 +190,8 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
     if history_data_list:
         for history_data in history_data_list:
             for cmd_idx in cmd_idxs:
-                if _match(history_data, new_data_dict[cmd_idx], match_keys):
+                if benchmark_data_matches(history_data, new_data_dict[cmd_idx],
+                                          match_keys):
                     history_data_dict[cmd_idx].append(history_data)
                     break
 
