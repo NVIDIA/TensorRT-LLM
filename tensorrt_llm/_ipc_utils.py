@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 import array
 import struct
 import sys
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 try:
     from cuda.bindings import driver as cuda
@@ -30,10 +30,10 @@ from .mapping import Mapping
 def _raise_if_error(error: cudart.cudaError_t | cuda.CUresult):
     if isinstance(error, cudart.cudaError_t):
         if error != cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"CUDA Runtime API error: {repr(error)}")
+            raise RuntimeError(f"CUDA Runtime API error: {error!r}")
     if isinstance(error, cuda.CUresult):
         if error != cuda.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"CUDA Driver API error: {repr(error)}")
+            raise RuntimeError(f"CUDA Driver API error: {error!r}")
 
 
 def can_access_peer(mapping: Mapping) -> bool:
@@ -77,7 +77,13 @@ class IpcMemory:
         self.local_ptr = 0
 
         if self.open_ipc:
-            self.peer_ptrs, self.local_ptr = IpcMemory.open_ipc_memory(self.mapping, size, True)
+            ipc_memory = IpcMemory.open_ipc_memory(self.mapping, size, True)
+            if ipc_memory is None:
+                # CUDA IPC is unusable on this system. Keep the pointers null so that
+                # callers fall back to the non-IPC (NCCL) path instead of failing hard.
+                self.open_ipc = False
+            else:
+                self.peer_ptrs, self.local_ptr = ipc_memory
 
     def __del__(self):
         if not sys.is_finalizing() and self.open_ipc:
@@ -93,10 +99,16 @@ class IpcMemory:
     @staticmethod
     def open_ipc_memory(
         mapping: Mapping, size: int, set_to_zero: bool = False
-    ) -> Tuple[List[int], int]:
+    ) -> Optional[Tuple[List[int], int]]:
         """Allocates a buffer with the given *size* on each GPU. Then, enables IPC communication between TP groups.
         Returns a list of buffer pointers, buffers[i] is a handle to the corresponding buffer residing on GPU #i.
         Call close_ipc_handle with the *buffer*.
+
+        Returns None when CUDA IPC is not usable. `cudaDeviceCanAccessPeer` only reports that the
+        GPUs can address each other's memory, it does not guarantee that IPC handles can be
+        exported/imported: that additionally fails on GPUs without CUDA IPC support and when the
+        ranks do not share an IPC namespace. The outcome is agreed upon by the whole TP group, so
+        that either every rank gets IPC buffers or none of them does.
         """
 
         def align_size(size, alignment):
@@ -115,8 +127,12 @@ class IpcMemory:
         _raise_if_error(error)
         if set_to_zero:
             _raise_if_error(cudart.cudaMemset(local_ptr, 0, aligned_size)[0])
+
         error, local_handle = cudart.cudaIpcGetMemHandle(local_ptr)
-        _raise_if_error(error)
+        ipc_error = None if error == cudart.cudaError_t.cudaSuccess else error
+        if ipc_error is not None:
+            # Exchange a dummy handle to keep the collective below symmetric.
+            local_handle = cudart.cudaIpcMemHandle_t()
         handles_reserved = dist.tp_allgather(local_handle.reserved)
 
         handles = []
@@ -126,15 +142,30 @@ class IpcMemory:
             handles.append(handle)
 
         peer_ptrs = []
+        opened_ptrs = []
         for node, handle in enumerate(handles):
             if node == mapping.tp_rank:
                 peer_ptrs.append(local_ptr)
-            else:
+            elif ipc_error is None:
                 error, ptr = cudart.cudaIpcOpenMemHandle(
                     handle, cudart.cudaIpcMemLazyEnablePeerAccess
                 )
-                _raise_if_error(error)
+                if error != cudart.cudaError_t.cudaSuccess:
+                    ipc_error = error
+                    continue
                 peer_ptrs.append(ptr)
+                opened_ptrs.append(ptr)
+
+        if not all(dist.tp_allgather(ipc_error is None)):
+            if ipc_error is not None:
+                logger.warning(
+                    f"CUDA IPC is not usable on this system: {ipc_error!r}. "
+                    "Custom all-reduce kernels are disabled, falling back to NCCL."
+                )
+            for ptr in opened_ptrs:
+                _raise_if_error(cudart.cudaIpcCloseMemHandle(ptr)[0])
+            _raise_if_error(cudart.cudaFree(local_ptr)[0])
+            return None
 
         return peer_ptrs, local_ptr
 
