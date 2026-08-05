@@ -57,8 +57,7 @@ env | sort
 echo "Full Command: $pytestCommand"
 
 if [[ "${TRTLLM_VISUAL_GEN_MULTINODE_SLURM_PARENT:-0}" == "1" ]]; then
-    # Scope to the job: infra retries reuse jobWorkspace, and stale markers would end the wait early.
-    install_done_dir="${jobWorkspace}/visual_gen_multinode_install_done_${SLURM_JOB_ID:-0}"
+    install_done_dir="${jobWorkspace}/visual_gen_multinode_install_done"
     mkdir -p "$install_done_dir"
     if [[ "${SLURM_LOCALID:-0}" == "0" ]]; then
         touch "${install_done_dir}/node_${SLURM_NODEID:-0}"
