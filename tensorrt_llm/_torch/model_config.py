@@ -355,8 +355,14 @@ class ModelConfig(Generic[TConfig]):
 
         is_w4a16_nvfp4 = (quant_config is not None and quant_config.quant_algo
                           in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))
-        if is_w4a16_nvfp4 and get_sm_version() in (120, 121):
-            return "CUTEDSL"
+        if is_w4a16_nvfp4:
+            sm_version = get_sm_version()
+            # CuteDslB12xFusedMoE on SM120/121, MarlinFusedMoE on Hopper. Any
+            # other SM falls through to CUTLASS, which dequantizes on the fly.
+            if sm_version in (120, 121):
+                return "CUTEDSL"
+            if 90 <= sm_version < 100:
+                return "MARLIN"
 
         if architecture == "GptOssForCausalLM":
             sm_version = get_sm_version()

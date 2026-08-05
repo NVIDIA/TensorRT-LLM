@@ -2975,6 +2975,9 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     raw ``weight_scale_2`` values.
     """
 
+    # BF16 activations in, so the NVFP4FusedMoEMethod default does not hold.
+    quantizes_nvfp4_activations = False
+
     # Marlin's ``transform_weights`` repacks weights into Marlin tiled format
     # and rebuilds the module parameters, which is incompatible with dynamic
     # EPLB weight migration.

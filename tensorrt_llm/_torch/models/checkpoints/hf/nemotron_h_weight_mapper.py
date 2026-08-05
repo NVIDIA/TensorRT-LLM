@@ -53,23 +53,6 @@ class NemotronHHfWeightMapper(HfWeightMapper):
         # input_scale) do not and are left alone.
         d_in_proj = 2 * d_inner + 2 * n_groups * d_state + nheads
 
-        def _invert_compressed_tensors_scale(value) -> torch.Tensor:
-            value = value[...] if not isinstance(value, torch.Tensor) else value
-            value = value.to(torch.float32)
-            return torch.where(value > 0, value.reciprocal(),
-                               torch.zeros_like(value)).contiguous()
-
-        def _canonicalize_quant_weight(key: str, value):
-            if key.endswith(".weight_packed"):
-                return f"{key[:-len('.weight_packed')]}.weight", value
-            if key.endswith(".weight_global_scale"):
-                key = f"{key[:-len('.weight_global_scale')]}.weight_scale_2"
-                return key, _invert_compressed_tensors_scale(value)
-            if key.endswith(".input_global_scale"):
-                key = f"{key[:-len('.input_global_scale')]}.input_scale"
-                return key, _invert_compressed_tensors_scale(value)
-            return key, value
-
         new_weights = {}
         for name, _ in weights.items():
             key = name
@@ -94,8 +77,6 @@ class NemotronHHfWeightMapper(HfWeightMapper):
 
             if "A_log" in key:
                 key = key.replace("A_log", "A")
-
-            key, value = _canonicalize_quant_weight(key, value)
 
             if "mixer.in_proj" in key and "_scale" in key:
                 if self._num_rows(value) == d_in_proj:

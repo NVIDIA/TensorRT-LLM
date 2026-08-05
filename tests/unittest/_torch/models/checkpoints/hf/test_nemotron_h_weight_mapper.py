@@ -14,7 +14,6 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from typing import Optional
 
 import torch
 
@@ -23,12 +22,10 @@ from tensorrt_llm._torch.models.checkpoints.hf.nemotron_h_weight_mapper import (
     NemotronHHfWeightMapper,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
-def _make_mapper(
-    quant_algo: Optional[QuantAlgo] = None,
-) -> NemotronHHfWeightMapper:
+def _make_mapper() -> NemotronHHfWeightMapper:
     mapper = NemotronHHfWeightMapper()
     mapper._config = ModelConfig(
         pretrained_config=SimpleNamespace(
@@ -44,7 +41,7 @@ def _make_mapper(
         ),
         mapping=Mapping(),
         moe_backend="CUTLASS",
-        quant_config=QuantConfig(quant_algo=quant_algo),
+        quant_config=QuantConfig(),
     )
     return mapper
 
@@ -92,21 +89,3 @@ def test_nemotron_h_mapper_remaps_w4a16_moe_weights_without_input_scale():
     assert mapped["model.layers.1.mixer.experts.0.w3.weight_scale_2"] is up_weight_scale_2
     assert mapped["model.layers.1.mixer.experts.0.w2.weight_scale_2"] is down_weight_scale_2
     assert not any(key.endswith(".input_scale") for key in mapped)
-
-
-def test_nemotron_h_mapper_converts_compressed_tensors_global_scale():
-    mapper = _make_mapper(QuantAlgo.W4A16_NVFP4)
-    global_scale = torch.tensor(9362.2861328125, dtype=torch.float32)
-    weights = {
-        "lm_head.weight_packed": torch.empty((8, 4), dtype=torch.uint8),
-        "lm_head.weight_scale": torch.empty((8, 1), dtype=torch.float8_e4m3fn),
-        "lm_head.weight_global_scale": global_scale,
-    }
-
-    mapped = mapper.preprocess_weights(weights)
-
-    assert mapped["lm_head.weight"] is weights["lm_head.weight_packed"]
-    assert "lm_head.weight_packed" not in mapped
-    assert "lm_head.weight_global_scale" not in mapped
-    assert "lm_head.input_scale" not in mapped
-    torch.testing.assert_close(mapped["lm_head.weight_scale_2"], global_scale.reciprocal())

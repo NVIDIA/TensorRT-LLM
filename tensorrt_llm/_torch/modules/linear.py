@@ -2051,11 +2051,13 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
                 "W4A16NVFP4LinearMethod requires a high-precision input; "
                 "disable upstream FP4 fusion")
 
+        # create_weights leaves inv_input_scale None on this path, so an FP8
+        # activation has no scale to dequantize it with. Reject it up front the
+        # same way as a pre-quantized FP4 input.
         if input.dtype == torch.float8_e4m3fn:
-            assert module.inv_input_scale is not None, \
-                "W4A16NVFP4LinearMethod: FP8 input requires static inv_input_scale"
-            input = (input.to(module.dtype) / module.inv_input_scale).to(
-                module.dtype)
+            raise RuntimeError(
+                "W4A16NVFP4LinearMethod requires a high-precision input; "
+                "disable upstream FP8 attention output")
 
         original_shape = None
         if input.dim() > 2:
@@ -2124,7 +2126,9 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
     # the symmetric-memory window.
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
 
-    def get_tp_alignment(self, tp_mode, quant_config=None):
+    def get_tp_alignment(self,
+                         tp_mode: Optional[TensorParallelMode],
+                         quant_config: Optional[QuantConfig] = None) -> int:
         # Same 32-element alignment as the parent NVFP4 path. The Marlin kernel
         # itself wants K%64 and N%128, but ``transform_weights`` pads the weight
         # and scales up to those bounds (and ``apply`` slices the N padding back

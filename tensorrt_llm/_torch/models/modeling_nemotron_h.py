@@ -34,7 +34,6 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import QuantAlgo  # noqa: E402
-from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
@@ -164,26 +163,6 @@ class TransformerLayer(Attention):
                                **kwargs)
 
 
-def _get_nemotron_h_moe_quant_config(
-        model_config: ModelConfig[PretrainedConfig],
-        layer_idx: int) -> QuantConfig | None:
-    # Per-expert mixed precision config is more specific than the global config.
-    layer_quant_config = _get_layer_quant_config(model_config, layer_idx,
-                                                 "mixer.experts")
-    if layer_quant_config is not None:
-        return layer_quant_config
-
-    quant_config = model_config.quant_config
-    if (quant_config is not None and quant_config.quant_algo
-            in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4")
-            and model_config.moe_backend.upper() != "CUTEDSL"):
-        values = quant_config.model_dump()
-        values["quant_algo"] = QuantAlgo.NVFP4
-        return QuantConfig.model_validate(values)
-
-    return None
-
-
 class NemotronHMOE(nn.Module):
 
     def __init__(
@@ -268,8 +247,14 @@ class NemotronHMOE(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
-        moe_quant_config = _get_nemotron_h_moe_quant_config(
-            model_config, layer_idx)
+        # For MIXED_PRECISION models, the global quant_config has
+        # quant_algo=MIXED_PRECISION which maps to QuantMode(0) (no quant). This
+        # would cause the MoE backend to select UnquantizedFusedMoEMethod and
+        # allocate BF16 weight buffers, causing a shape mismatch when loading
+        # NVFP4/W4A8_NVFP4_FP8 quantized expert weights. The per-expert entry in
+        # quant_config_dict is more specific, so prefer it when present.
+        moe_quant_config = _get_layer_quant_config(model_config, layer_idx,
+                                                   "mixer.experts")
 
         # Setup MoE experts.
         self.experts = create_moe(
