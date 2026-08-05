@@ -1247,9 +1247,26 @@ class InklingMoE(nn.Module):
             return QuantConfig()
         return model_config.quant_config
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """Routed + shared experts.
+
+        ``all_rank_num_tokens`` is the per-rank token count this step, taken
+        from ``attn_metadata``. ``FusedMoE`` sets ``use_dp`` from
+        ``mapping.enable_attention_dp`` and needs the list to pad and gather
+        across ranks; without it a DP or EP-with-DP layout cannot know how much
+        each peer contributed. ``None`` is the non-DP case and leaves the
+        expert call exactly as it was.
+        """
         router_logits = self.gate(hidden_states)  # [T, 258] fp32
-        routed = self.experts(hidden_states, router_logits)
+        routed = self.experts(
+            hidden_states,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+        )
         _, _, shared_gammas = inkling_joint_renorm(
             router_logits,
             gate_bias=self.gate.bias,
@@ -1291,6 +1308,17 @@ class InklingDecoderLayer(nn.Module):
             self.mlp = InklingMoE(model_config, layer_idx)
         self.mlp_sconv = InklingShortConv(config.hidden_size, config.sconv_kernel_size)
 
+    def _run_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]],
+    ) -> torch.Tensor:
+        """Dense layers 0/1 take only the activations; MoE layers also take the
+        per-rank token counts the fused kernel needs to gather across ranks."""
+        if isinstance(self.mlp, InklingMoE):
+            return self.mlp(hidden_states, all_rank_num_tokens=all_rank_num_tokens)
+        return self.mlp(hidden_states)
+
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -1299,6 +1327,7 @@ class InklingDecoderLayer(nn.Module):
         *,
         conv_state: Optional[InklingConvState] = None,
         conv_rt: Optional[InklingConvRuntime] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Pre-norm attention + MLP, each followed by a short-conv (internal
@@ -1320,7 +1349,7 @@ class InklingDecoderLayer(nn.Module):
 
             residual = hidden_states
             hidden_states = self.mlp_norm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self._run_mlp(hidden_states, all_rank_num_tokens)
             hidden_states = self.mlp_sconv(hidden_states)  # internal residual
             return residual + hidden_states
 
@@ -1338,7 +1367,7 @@ class InklingDecoderLayer(nn.Module):
         h = residual + _apply_sconv(self.attn_sconv, h, conv_state.attn, conv_rt)
 
         residual = h
-        hm = self.mlp(self.mlp_norm(h))
+        hm = self._run_mlp(self.mlp_norm(h), all_rank_num_tokens)
         return residual + _apply_sconv(self.mlp_sconv, hm, conv_state.mlp, conv_rt)
 
 
@@ -1396,6 +1425,11 @@ class InklingModel(DecoderModel):
             inputs_embeds = self.embed_tokens(input_ids)
         conv_cache = getattr(attn_metadata, "ink_conv_cache", None)
         conv_rt = getattr(attn_metadata, "ink_conv_rt", None)
+        # Per-rank token counts for this step. The model engine fills this on
+        # attn_metadata only when attention DP is on; FusedMoE reads it to pad
+        # and gather across ranks. None everywhere else, which is the
+        # single-rank / pure-TP path and behaves exactly as before.
+        all_rank_num_tokens = getattr(attn_metadata, "all_rank_num_tokens", None)
         hidden_states = inputs_embeds if inputs_embeds_prenormed else self.embed_norm(inputs_embeds)
         for i, layer in enumerate(self.layers):
             layer_state = conv_cache.layer_state(i) if conv_cache is not None else None
@@ -1405,6 +1439,7 @@ class InklingModel(DecoderModel):
                 attn_metadata,
                 conv_state=layer_state,
                 conv_rt=conv_rt,
+                all_rank_num_tokens=all_rank_num_tokens,
             )
         return self.norm(hidden_states)
 

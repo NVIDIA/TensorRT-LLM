@@ -541,6 +541,172 @@ def test_metadata_ignores_a_plain_kv_manager():
     assert md.ink_conv_cache is None and md.ink_conv_rt is None
 
 
+# ---------------------------------------------------------------------------
+# Phase 0 for DP / EP: the per-rank token counts must reach the fused MoE
+# ---------------------------------------------------------------------------
+def _decoder_layer_stub(is_moe: bool):
+    """An InklingDecoderLayer with only the mlp dispatch wired up."""
+    from tensorrt_llm._torch.models.modeling_inkling import (
+        InklingDecoderLayer,
+        InklingMoE,
+    )
+
+    import torch.nn as nn
+
+    layer = object.__new__(InklingDecoderLayer)
+    # nn.Module.__setattr__ refuses submodule assignment until Module.__init__
+    # has run, and object.__new__ skips it.
+    nn.Module.__init__(layer)
+    seen = {}
+
+    if is_moe:
+        class _Moe(InklingMoE):
+            def __init__(self):
+                pass
+
+            def __call__(self, hidden_states, all_rank_num_tokens=None):
+                seen["arnt"] = all_rank_num_tokens
+                return hidden_states
+        layer.mlp = _Moe()
+    else:
+        class _Dense:
+            def __call__(self, hidden_states):
+                seen["called"] = True
+                return hidden_states
+        layer.mlp = _Dense()
+    return layer, seen
+
+
+def test_moe_layers_receive_the_per_rank_token_counts():
+    """FusedMoE sets use_dp from mapping.enable_attention_dp and needs this list
+    to pad and gather across ranks; without it a DP or EP-with-DP layout cannot
+    know how much each peer contributed."""
+    layer, seen = _decoder_layer_stub(is_moe=True)
+
+    layer._run_mlp("H", [4, 7, 4, 5])
+
+    assert seen["arnt"] == [4, 7, 4, 5]
+
+
+def test_dense_layers_are_not_handed_the_token_counts():
+    """Layers 0 and 1 are InklingDenseMLP, whose forward takes activations only;
+    passing the DP list would be a TypeError."""
+    layer, seen = _decoder_layer_stub(is_moe=False)
+
+    layer._run_mlp("H", [4, 7, 4, 5])
+
+    assert seen.get("called") is True
+
+
+def test_non_dp_passes_none_and_keeps_the_old_call_shape():
+    """Single-rank / pure-TP has no all_rank_num_tokens on attn_metadata, and
+    the expert call must be exactly what it was before this plumbing."""
+    layer, seen = _decoder_layer_stub(is_moe=True)
+
+    layer._run_mlp("H", None)
+
+    assert seen["arnt"] is None
+
+
+def test_model_forward_sources_the_counts_from_attn_metadata():
+    """The value comes off attn_metadata, which the model engine fills only when
+    attention DP is on -- the model must not invent it."""
+    import inspect
+
+    from tensorrt_llm._torch.models.modeling_inkling import InklingModel
+
+    src = inspect.getsource(InklingModel.forward)
+    assert 'getattr(attn_metadata, "all_rank_num_tokens", None)' in src
+    assert "all_rank_num_tokens=all_rank_num_tokens" in src
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: expert parallelism
+# ---------------------------------------------------------------------------
+def _ep_model_config(ep_size, n_routed=256):
+    return SimpleNamespace(
+        mapping=SimpleNamespace(moe_ep_size=ep_size, moe_tp_size=1),
+        pretrained_config=SimpleNamespace(
+            text_config=SimpleNamespace(n_routed_experts=n_routed)),
+    )
+
+
+@pytest.mark.parametrize("ep_size", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+def test_expert_parallel_accepts_every_divisor_of_256(ep_size):
+    """256 routed experts divide evenly by every power of two, which is the
+    whole practical range."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
+
+    InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(ep_size))
+
+
+@pytest.mark.parametrize("ep_size", [3, 5, 6, 7, 24])
+def test_expert_parallel_rejects_a_non_divisor(ep_size):
+    """FusedMoE._supports_non_divisible_ep is opt-in and CUTLASS -- Inkling's
+    only routed-expert backend -- does not opt in, so an uneven split would
+    fail inside expert-slot bookkeeping instead of at load."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
+
+    with pytest.raises(ValueError, match="does not divide evenly"):
+        InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(ep_size))
+
+
+def test_expert_parallel_rejects_more_ranks_than_experts():
+    """Zero-expert ranks are unsupported by every MoE backend.
+
+    This case is also non-divisible, so it exercises the check ORDER: the
+    user needs to hear "more ranks than experts", not "pick a divisor of 4".
+    """
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
+
+    with pytest.raises(ValueError, match="exceeds"):
+        InklingForCausalLM._assert_inkling_moe_parallel(
+            _ep_model_config(8, n_routed=4))
+
+
+def test_expert_parallel_guard_is_inert_when_ep_is_off():
+    """ep_size == 1 is the default and is what every accuracy run measured; the
+    guard must not constrain moe_tp_size."""
+    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
+
+    cfg = _ep_model_config(1)
+    cfg.mapping.moe_tp_size = 3  # deliberately not a divisor
+    InklingForCausalLM._assert_inkling_moe_parallel(cfg)
+
+
+def test_inkling_moe_leaves_expert_sharding_to_the_generic_factory():
+    """Inkling must not reimplement expert sharding: Mapping derives
+    moe_ep_size, FusedMoE slices with _compute_ep_partition, and CutlassFusedMoE
+    remaps the NVFP4 per-expert scales. A local slot_start/slot_end here would
+    mean two sources of truth."""
+    import inspect
+
+    from tensorrt_llm._torch.models import modeling_inkling
+    from tensorrt_llm._torch.models.modeling_inkling import InklingMoE
+
+    src = inspect.getsource(InklingMoE)
+    for forbidden in ("slot_start", "slot_end", "expert_size_per_partition",
+                      "moe_ep_rank"):
+        assert forbidden not in src, forbidden
+    assert "create_moe(" in inspect.getsource(modeling_inkling.InklingMoE.__init__)
+
+
+def test_shared_experts_are_replicated_so_ep_does_not_change_the_combine():
+    """routed + shared is correct on every rank only because the shared experts
+    are replicated: FusedMoE all-reduces the routed part (parallel_size is the
+    GLOBAL tp_size, so it fires under pure EP too) while the shared part is
+    computed in full locally. If the shared experts ever became TP-sharded this
+    sum would double-count under EP."""
+    import inspect
+
+    from tensorrt_llm._torch.models.modeling_inkling import InklingSharedExperts
+
+    sig = inspect.signature(InklingSharedExperts.__init__)
+    assert list(sig.parameters) == ["self", "config"], list(sig.parameters)
+    src = inspect.getsource(InklingSharedExperts)
+    assert "mapping" not in src and "TensorParallelMode" not in src
+
+
 def test_every_deferred_import_in_the_inkling_package_resolves():
     """Deferred (function-body) imports must resolve, including their level.
 
