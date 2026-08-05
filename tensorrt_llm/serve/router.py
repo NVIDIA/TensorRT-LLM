@@ -395,6 +395,18 @@ class Router(ABC):
             url = self._ensure_url(server)
             async with self.session.get(f"{url}/server_info",
                                         timeout=timeout) as response:
+                # Check the status before parsing. Until this PR a server that
+                # was still initializing refused the connection, so this call
+                # raised and _prepare_server() retried later. Now the socket
+                # listens through startup and answers 503 STARTING, so an
+                # unchecked .json() would parse the STARTING body and
+                # _prepare_server() would cache it as the worker's real
+                # server_info -- permanently, because _prepared_ready_servers
+                # is only discarded on removal, and prepare_servers() runs
+                # BEFORE _wait_for_all_servers_ready() in
+                # disagg_coordinator.start(). Raising keeps the old
+                # retry-until-actually-ready behaviour.
+                response.raise_for_status()
                 return await response.json()
         except Exception as e:
             logger.warning(
