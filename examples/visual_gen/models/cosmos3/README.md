@@ -38,7 +38,7 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 
 - Saving `.mp4` output requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`); without it the encoder falls back to `.avi`.
 - Decoding MP4/AVI reference videos (V2V) happens in the worker processes on NVDEC via PyNvVideoCodec, a declared TensorRT-LLM dependency — nothing extra to install. Tested combinations: H.264 in MP4 and H.264 in AVI; other containers/codecs/profiles depend on the demuxer and the GPU's NVDEC capabilities and are best-effort.
-- Transfer's `edge`/`blur` auto-computation uses OpenCV — install it yourself: `pip install opencv-python-headless`. Precomputed controls (`depth`/`seg`/`wsm`, or a precomputed `edge`/`blur`) need nothing extra.
+- Transfer's `edge`/`blur` controls are derived on the GPU from the reference video — nothing extra to install. Precomputed controls (`depth`/`seg`/`wsm`, or a precomputed `edge`/`blur`) are decoded like any other reference video.
 
 ## Deployment configs
 

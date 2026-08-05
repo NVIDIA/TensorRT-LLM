@@ -17,7 +17,6 @@ from types import SimpleNamespace
 os.environ["TLLM_DISABLE_MPI"] = "1"
 os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
-import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -30,11 +29,13 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
+    BILATERAL_D,
+    BILATERAL_SIGMA_COLOR,
+    BILATERAL_SIGMA_SPACE,
+    _scaled_bilateral_params,
     decode_media_to_uint8_cthw,
     find_closest_target_size,
     load_or_compute_control_frames,
-    make_blur_control,
-    make_edge_control,
     pad_temporal_frames,
     resolve_transfer_config,
     uint8_cthw_to_normalized_5d,
@@ -266,76 +267,31 @@ class TestTransferMediaHelpers:
         frames = torch.arange(3 * 3, dtype=torch.uint8).reshape(1, 3, 1, 3)
         assert pad_temporal_frames(frames, 5)[0, :, 0, 0].tolist() == [0, 3, 6, 6, 3]
 
-    def test_missing_cv2_raises_clear_error(self, monkeypatch):
-        real_import_module = transfer_module.importlib.import_module
+    def test_bilateral_params_scale_with_resolution(self):
+        # Tuned at a 720p reference: a 72px longest side is 1/10 of it, so the
+        # diameter and both sigmas scale down by the same factor.
+        assert _scaled_bilateral_params(72, 72) == (3, 15.0, 10.0)
+        assert _scaled_bilateral_params(720, 720) == (
+            BILATERAL_D + 1,  # 30 is even; diameters are forced odd
+            float(BILATERAL_SIGMA_COLOR),
+            float(BILATERAL_SIGMA_SPACE),
+        )
+        # The longest side drives the scale, and the sigmas have a floor of 1.
+        assert _scaled_bilateral_params(4, 1280) == _scaled_bilateral_params(1280, 4)
+        assert _scaled_bilateral_params(1, 1) == (1, 1.0, 1.0)
 
-        def raise_missing_cv2(name, *args, **kwargs):
-            if name == "cv2":
-                raise ImportError("missing cv2")
-            return real_import_module(name, *args, **kwargs)
-
-        monkeypatch.setattr(transfer_module.importlib, "import_module", raise_missing_cv2)
-        cfg = resolve_transfer_config({"edge": True}, _req())
-        with pytest.raises(ImportError, match="opencv-python"):
-            load_or_compute_control_frames(
-                cfg.hints["edge"],
-                height=8,
-                width=8,
-                max_frames=1,
-                input_frames=torch.zeros(3, 1, 8, 8, dtype=torch.uint8),
-                device=torch.device("cpu"),
-            )
-
-    def test_edge_uses_rgb_canny(self, monkeypatch):
-        class FakeCv2:
-            def __init__(self):
-                self.canny_inputs = []
-
-            def Canny(self, image, lower, upper):
-                assert (lower, upper) == (100, 200)
-                self.canny_inputs.append(image.copy())
-                return np.zeros(image.shape[:2], dtype=np.uint8)
-
-        fake_cv2 = FakeCv2()
-        monkeypatch.setattr(transfer_module, "_import_cv2", lambda _key: fake_cv2)
-
-        frames = torch.zeros(3, 1, 4, 5, dtype=torch.uint8)
-        frames[0] = 255
-        edge = make_edge_control(frames, "medium")
-
-        assert tuple(edge.shape) == (3, 1, 4, 5)
-        assert len(fake_cv2.canny_inputs) == 1
-        assert fake_cv2.canny_inputs[0].shape == (4, 5, 3)
-
-    def test_blur_uses_scaled_bilateral(self, monkeypatch):
-        class FakeCv2:
-            INTER_AREA = 1
-            INTER_LINEAR = 2
-            INTER_CUBIC = 3
-
-            def __init__(self):
-                self.bilateral_calls = []
-
-            def resize(self, image, size, interpolation):
-                del interpolation
-                width, height = size
-                return np.zeros((height, width, image.shape[2]), dtype=image.dtype)
-
-            def bilateralFilter(self, image, diameter, sigma_color, sigma_space):
-                self.bilateral_calls.append((image.shape, diameter, sigma_color, sigma_space))
-                return image
-
-            def GaussianBlur(self, *args, **kwargs):
-                raise AssertionError("blur must use bilateralFilter, not GaussianBlur")
-
-        fake_cv2 = FakeCv2()
-        monkeypatch.setattr(transfer_module, "_import_cv2", lambda _key: fake_cv2)
-
-        frames = torch.zeros(3, 1, 72, 72, dtype=torch.uint8)
-        blurred = make_blur_control(frames, "high")
-
-        assert tuple(blurred.shape) == (3, 1, 72, 72)
-        assert fake_cv2.bilateral_calls == [((72, 72, 3), 3, 15.0, 10.0)]
+    def test_generated_control_hints_require_input_frames(self):
+        for key in ("edge", "blur"):
+            cfg = resolve_transfer_config({key: True}, _req())
+            with pytest.raises(ValueError, match="requires either a video input"):
+                load_or_compute_control_frames(
+                    cfg.hints[key],
+                    height=8,
+                    width=8,
+                    max_frames=1,
+                    input_frames=None,
+                    device=torch.device("cpu"),
+                )
 
 
 class TestTransferFrameConversions:

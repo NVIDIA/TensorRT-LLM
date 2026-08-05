@@ -5,15 +5,21 @@
 
 from __future__ import annotations
 
-import importlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
+from tensorrt_llm._torch.visual_gen.triton_kernels import (
+    bilateral_filter,
+    canny_edges,
+    resize_area_u8,
+    resize_cubic_u8,
+    resize_linear_u8,
+)
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.media.decoding import decode_video_reference_window
 
 from .defaults import COSMOS3_720P_PARAMS, VIDEO_RES_SIZE_INFO
@@ -86,7 +92,7 @@ TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
     },
 }
 
-# Canny (lower, upper) thresholds per edge-strength preset (fed to cv2.Canny);
+# Canny (lower, upper) hysteresis thresholds per edge-strength preset;
 # higher preset = higher thresholds = sparser edges.
 EDGE_PRESETS: dict[str, tuple[int, int]] = {
     "none": (20, 50),
@@ -109,7 +115,7 @@ BLUR_PRESETS: dict[str, dict[str, int]] = {
     "very_high": {"pre_blur_downscale": 4, "downup": 16},
 }
 
-# cv2.bilateralFilter parameters for the blur control, tuned at a 720p reference.
+# Bilateral-filter parameters for the blur control, tuned at a 720p reference.
 BILATERAL_REFERENCE_RESOLUTION = 720  # resolution the params below are tuned for
 BILATERAL_D = 30  # filter diameter in pixels
 BILATERAL_SIGMA_COLOR = 150  # color-space sigma
@@ -386,19 +392,19 @@ def uint8_cthw_to_normalized_5d(frames: torch.Tensor, *, dtype: torch.dtype) -> 
     return frames.to(dtype=dtype).div(127.5).sub(1.0).unsqueeze(0).contiguous()
 
 
+@nvtx_range("make_edge_control", color="blue")
 def make_edge_control(frames: torch.Tensor, preset: str) -> torch.Tensor:
-    cv2 = _import_cv2("edge")
+    """Canny edge control: uint8 ``[3, T, H, W]`` CUDA -> the same shape.
+
+    The single-channel edge map is broadcast across RGB, since the control
+    encoder consumes three channels.
+    """
     try:
         lower, upper = EDGE_PRESETS[preset]
     except KeyError as exc:
         raise ValueError(f"Unsupported Cosmos3 edge preset: {preset!r}.") from exc
-    frames_np = frames.detach().cpu().numpy().astype(np.uint8)
-    edge_maps = []
-    for idx in range(frames_np.shape[1]):
-        frame = np.ascontiguousarray(np.transpose(frames_np[:, idx], (1, 2, 0)))
-        edge_maps.append(cv2.Canny(frame, lower, upper))
-    edge = np.stack(edge_maps, axis=0)[None]
-    return torch.from_numpy(edge).expand(3, -1, -1, -1).contiguous()
+    edge = canny_edges(frames.contiguous(), lower, upper)
+    return edge[None].expand(3, -1, -1, -1).contiguous()
 
 
 def _scale_for_bilateral_resolution(value: float, longest_side: int) -> float:
@@ -421,51 +427,38 @@ def _scaled_bilateral_params(height: int, width: int) -> tuple[int, float, float
     return diameter, sigma_color, sigma_space
 
 
-def _import_cv2(hint_key: str):
-    try:
-        return importlib.import_module("cv2")
-    except ImportError as exc:
-        raise ImportError(
-            f"Cosmos3 transfer hint '{hint_key}' requires opencv-python for on-the-fly control generation. "
-            "Install opencv-python in the environment, or pass precomputed control bytes "
-            "for this hint."
-        ) from exc
-
-
+@nvtx_range("make_blur_control", color="blue")
 def make_blur_control(frames: torch.Tensor, preset: str) -> torch.Tensor:
-    cv2 = _import_cv2("blur")
+    """Bilateral-blur control: uint8 ``[3, T, H, W]`` CUDA -> the same shape.
+
+    Edge-preserving blur at ``pre_blur_downscale`` resolution, then a
+    ``downup`` round trip that discards high-frequency detail.
+    """
     preset = preset.lower()
     if preset not in BLUR_PRESETS:
         raise ValueError(f"Unsupported Cosmos3 blur preset: {preset!r}.")
     if preset == "none":
         return frames.clone()
 
-    frames_np = frames.detach().cpu().numpy().astype(np.uint8)
-    _, t, h, w = frames_np.shape
+    _, _, h, w = frames.shape
     blur_params = BLUR_PRESETS[preset]
     pre_blur_factor = max(1, int(blur_params["pre_blur_downscale"]))
     downup_factor = max(1, int(blur_params["downup"]))
-    result = np.empty_like(frames_np)
-    for idx in range(t):
-        frame = np.ascontiguousarray(np.transpose(frames_np[:, idx], (1, 2, 0)))
-        if pre_blur_factor > 1:
-            small_w = max(1, w // pre_blur_factor)
-            small_h = max(1, h // pre_blur_factor)
-            frame = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
-        diameter, sigma_color, sigma_space = _scaled_bilateral_params(
-            frame.shape[0], frame.shape[1]
-        )
-        for _ in range(BILATERAL_ITERATIONS):
-            frame = cv2.bilateralFilter(frame, diameter, sigma_color, sigma_space)
-        if pre_blur_factor > 1:
-            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
-        if downup_factor > 1:
-            small_w = max(1, w // downup_factor)
-            small_h = max(1, h // downup_factor)
-            frame = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_CUBIC)
-            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_CUBIC)
-        result[:, idx] = np.transpose(frame, (2, 0, 1))
-    return torch.from_numpy(result).contiguous()
+
+    # The kernels are channels-last, so permute once for the whole clip rather
+    # than per frame.
+    result = frames.permute(1, 2, 3, 0).contiguous()
+    if pre_blur_factor > 1:
+        result = resize_area_u8(result, pre_blur_factor)
+    diameter, sigma_color, sigma_space = _scaled_bilateral_params(result.shape[1], result.shape[2])
+    for _ in range(BILATERAL_ITERATIONS):
+        result = bilateral_filter(result, diameter, sigma_color, sigma_space)
+    if pre_blur_factor > 1:
+        result = resize_linear_u8(result, w, h)
+    if downup_factor > 1:
+        result = resize_cubic_u8(result, max(1, w // downup_factor), max(1, h // downup_factor))
+        result = resize_cubic_u8(result, w, h)
+    return result.permute(3, 0, 1, 2).contiguous()
 
 
 def load_or_compute_control_frames(
@@ -482,24 +475,22 @@ def load_or_compute_control_frames(
         return decode_media_to_uint8_cthw(
             hint.control, height=height, width=width, max_frames=max_frames, device=device
         )
-    # cv2 works on host memory, so the generated controls land on the CPU; put
-    # them where the decoded ones already are, or hints would mix devices.
+    # Generated controls stay on the input frames' device, which is where the
+    # decoded ones already are, so hints never mix devices.
     if hint.key == "edge":
         if input_frames is None:
             raise ValueError(
                 "Cosmos3 transfer hint 'edge' requires either a video input for on-the-fly "
                 "control generation or precomputed control bytes."
             )
-        edge = make_edge_control(input_frames[:, :max_frames], hint.preset_edge_threshold)
-        return edge.to(device)
+        return make_edge_control(input_frames[:, :max_frames], hint.preset_edge_threshold)
     if hint.key == "blur":
         if input_frames is None:
             raise ValueError(
                 "Cosmos3 transfer hint 'blur' requires either a video input for on-the-fly "
                 "control generation or precomputed control bytes."
             )
-        blur = make_blur_control(input_frames[:, :max_frames], hint.preset_blur_strength)
-        return blur.to(device)
+        return make_blur_control(input_frames[:, :max_frames], hint.preset_blur_strength)
     raise ValueError(
         f"Cosmos3 transfer hint '{hint.key}' requires precomputed control bytes; "
         "on-the-fly generation is supported only for edge and blur."
