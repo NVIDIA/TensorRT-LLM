@@ -4558,13 +4558,13 @@ class PyTorchModelEngine(ModelEngine):
             # variable-beam-width request narrows or widens per iteration, so
             # the widths can still diverge mid-batch. Compare the
             # *per-iteration* width: py_beam_width is fixed at admission and
-            # would be identical across those requests. CUDA-graph padding
-            # requests are built at the engine width and appended after
-            # scheduling, so they are excluded -- they carry no user request
-            # and would otherwise trip this on an ordinary padded batch.
+            # would be identical across those requests. Dummy requests are
+            # excluded -- they carry no user request and are built at their own
+            # width (CUDA-graph padding at the engine width, attention-DP and
+            # warmup dummies at width one), so they would otherwise trip this
+            # on an ordinary padded batch.
             real_requests = [
-                req for req in generation_requests
-                if not req.is_cuda_graph_dummy
+                req for req in generation_requests if not req.is_dummy
             ]
             iter_widths = {
                 req.get_beam_width_by_iter()
