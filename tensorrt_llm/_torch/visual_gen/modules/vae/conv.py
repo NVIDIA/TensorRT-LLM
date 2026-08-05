@@ -23,9 +23,9 @@ import torch.nn as nn
 def _spatial_channels_last_format(x: torch.Tensor) -> Optional[torch.memory_format]:
     """Return ``x``'s channels-last memory format (2D or 3D), or ``None``.
 
-    Halo exchange uses this to select physical NHWC/NDHWC wire buffers and
-    concatenation. Returns ``None`` when ``x`` is not unambiguously
-    channels-last, in which case the existing row-major path is preserved.
+    Halo exchange uses this to materialize NHWC/NDHWC exchange buffers and
+    preserve that layout through concatenation. Returns ``None`` when ``x`` is
+    not unambiguously channels-last, preserving the existing row-major path.
     """
     if x.dim() == 5 and x.is_contiguous(memory_format=torch.channels_last_3d):
         return torch.channels_last_3d
@@ -71,22 +71,59 @@ def _physical_to_logical_channels_last(x: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Expected a four- or five-dimensional halo tensor, got shape {x.shape}")
 
 
-def _pack_spatial_halo(
+def _halo_exchange_buffer(
     x: torch.Tensor,
     dim: int,
     start: int,
     length: int,
-    physical_wire: bool,
+    memory_format: Optional[torch.memory_format],
 ) -> torch.Tensor:
-    """Pack a logical halo into the wire layout selected by both peers.
+    """Slice a halo and materialize it as a contiguous exchange buffer.
 
-    Adjacent ranks must make the same ``physical_wire`` choice because
-    NHWC/NDHWC changes the communication buffer's physical shape.
+    Adjacent ranks must select the same ``memory_format`` because channels-last
+    changes the buffer shape seen by the communication operation. Pass ``None``
+    for row-major tensors or the matching channels-last format.
     """
     halo = torch.narrow(x, dim, start, length)
-    if physical_wire:
+    if memory_format is not None:
         return _logical_to_physical_channels_last(halo)
     return halo.contiguous()
+
+
+def _resolve_adjacent_groups(
+    adj_groups: List[Optional[dist.ProcessGroup]],
+    rank: int,
+    world_size: int,
+    communication_needed: bool,
+    module_name: str,
+) -> dict[int, dist.ProcessGroup]:
+    """Resolve the adjacent groups this rank will use before inference."""
+    if not communication_needed:
+        return {}
+
+    expected_count = world_size - 1
+    if len(adj_groups) != expected_count:
+        raise ValueError(
+            f"{module_name} requires {expected_count} VAE adjacent-group entries "
+            f"for world_size={world_size}, but got {len(adj_groups)}"
+        )
+
+    required_indices: list[int] = []
+    if rank > 0:
+        required_indices.append(rank - 1)
+    if rank < world_size - 1:
+        required_indices.append(rank)
+
+    resolved: dict[int, dist.ProcessGroup] = {}
+    for index in required_indices:
+        group = adj_groups[index]
+        if group is None:
+            raise ValueError(
+                f"{module_name} is missing VAE adjacent process group {index} "
+                f"for local rank {rank} with world_size={world_size}"
+            )
+        resolved[index] = group
+    return resolved
 
 
 class HaloExchangeConv(nn.Module):
@@ -111,6 +148,10 @@ class HaloExchangeConv(nn.Module):
             ``adj_groups[i]`` is the group containing ranks ``i`` and ``i+1``.
         rank: This rank's position within the VAE parallel group.
         world_size: Total number of ranks in the VAE parallel group.
+
+    Raises:
+        ValueError: If ``chunk_dim`` is incompatible with the convolution or a
+            required adjacent process group was not configured.
     """
 
     def __init__(
@@ -124,7 +165,6 @@ class HaloExchangeConv(nn.Module):
         super().__init__()
         self.module = module
         self.chunk_dim = chunk_dim
-        self.adj_groups = adj_groups
         self.rank = rank
         self.world_size = world_size
         # Derive halo size from kernel_size along chunk_dim
@@ -143,14 +183,13 @@ class HaloExchangeConv(nn.Module):
         d = chunk_kernel - 1
         self.halo_left = d // 2
         self.halo_right = d - self.halo_left
-
-    def _adj_group(self, index: int) -> dist.ProcessGroup:
-        group = self.adj_groups[index]
-        if group is None:
-            raise RuntimeError(
-                f"Missing VAE adjacent process group {index} for local rank {self.rank}"
-            )
-        return group
+        self._adj_groups = _resolve_adjacent_groups(
+            adj_groups,
+            rank,
+            world_size,
+            communication_needed=self.halo_left > 0 or self.halo_right > 0,
+            module_name=type(module).__name__,
+        )
 
     def _exchange_halos(self, x: torch.Tensor) -> torch.Tensor:
         """Exchange boundary slices with adjacent ranks.
@@ -170,19 +209,19 @@ class HaloExchangeConv(nn.Module):
         exchange_size = max(self.halo_left, self.halo_right)
         memory_format = _spatial_channels_last_format(x)
 
-        send_left = _pack_spatial_halo(
+        send_left = _halo_exchange_buffer(
             x,
             dim,
             0,
             exchange_size,
-            memory_format is not None,
+            memory_format,
         )
-        send_right = _pack_spatial_halo(
+        send_right = _halo_exchange_buffer(
             x,
             dim,
             x.shape[dim] - exchange_size,
             exchange_size,
-            memory_format is not None,
+            memory_format,
         )
 
         recv_from_left = torch.zeros_like(send_left)
@@ -194,17 +233,17 @@ class HaloExchangeConv(nn.Module):
         if self.rank % 2 == 0:
             if self.rank > 0:
                 gather_buf = [recv_from_left, send_left]
-                dist.all_gather(gather_buf, send_left, group=self._adj_group(self.rank - 1))
+                dist.all_gather(gather_buf, send_left, group=self._adj_groups[self.rank - 1])
             if self.rank < self.world_size - 1:
                 gather_buf = [send_right, recv_from_right]
-                dist.all_gather(gather_buf, send_right, group=self._adj_group(self.rank))
+                dist.all_gather(gather_buf, send_right, group=self._adj_groups[self.rank])
         else:
             if self.rank < self.world_size - 1:
                 gather_buf = [send_right, recv_from_right]
-                dist.all_gather(gather_buf, send_right, group=self._adj_group(self.rank))
+                dist.all_gather(gather_buf, send_right, group=self._adj_groups[self.rank])
             if self.rank > 0:
                 gather_buf = [recv_from_left, send_left]
-                dist.all_gather(gather_buf, send_left, group=self._adj_group(self.rank - 1))
+                dist.all_gather(gather_buf, send_left, group=self._adj_groups[self.rank - 1])
 
         # Trim received data to the actual needed halo sizes.
         # recv_from_left holds the left neighbor's right-edge slices; we need
@@ -280,6 +319,10 @@ class HaloExchangeConv2dStride2(nn.Module):
         world_size: Total ranks in the VAE parallel group.
         pad_before_conv: The (left, right, top, bottom) padding from the
             original ZeroPad2d that preceded this conv.
+
+    Raises:
+        ValueError: If ``chunk_dim`` is unsupported or a required adjacent
+            process group was not configured.
     """
 
     def __init__(
@@ -294,7 +337,6 @@ class HaloExchangeConv2dStride2(nn.Module):
         super().__init__()
         self.module = module
         self.chunk_dim = chunk_dim
-        self.adj_groups = adj_groups
         self.rank = rank
         self.world_size = world_size
         kernel_size = module.kernel_size
@@ -312,6 +354,13 @@ class HaloExchangeConv2dStride2(nn.Module):
         self.halo_left = d // 2
         self.halo_right = d - self.halo_left
         self.halo_needed = self.halo_left > 0
+        self._adj_groups = _resolve_adjacent_groups(
+            adj_groups,
+            rank,
+            world_size,
+            communication_needed=self.halo_needed,
+            module_name=type(module).__name__,
+        )
 
         # Build ZeroPad2d modules for the non-split dimension.
         # The split dimension's padding is handled by halo exchange instead.
@@ -325,14 +374,6 @@ class HaloExchangeConv2dStride2(nn.Module):
         else:
             raise ValueError(f"chunk_dim={chunk_dim} not supported for stride-2")
 
-    def _adj_group(self, index: int) -> dist.ProcessGroup:
-        group = self.adj_groups[index]
-        if group is None:
-            raise RuntimeError(
-                f"Missing VAE adjacent process group {index} for local rank {self.rank}"
-            )
-        return group
-
     def _recv_from_right(self, x: torch.Tensor) -> torch.Tensor:
         """Receive halo context from the right neighbor.
 
@@ -344,12 +385,12 @@ class HaloExchangeConv2dStride2(nn.Module):
 
         dim = self.chunk_dim
         memory_format = _spatial_channels_last_format(x)
-        send_left = _pack_spatial_halo(
+        send_left = _halo_exchange_buffer(
             x,
             dim,
             0,
             self.halo_left,
-            memory_format is not None,
+            memory_format,
         )
 
         right_context = None
@@ -357,11 +398,11 @@ class HaloExchangeConv2dStride2(nn.Module):
         # group ranks 1 and 0 identify the right and left peers, respectively.
         if self.rank != self.world_size - 1:
             right_context = torch.zeros_like(send_left)
-            right_group = self._adj_group(self.rank)
+            right_group = self._adj_groups[self.rank]
             right_global_rank = dist.get_global_rank(right_group, 1)
             dist.recv(right_context, src=right_global_rank, group=right_group)
         if self.rank != 0:
-            left_group = self._adj_group(self.rank - 1)
+            left_group = self._adj_groups[self.rank - 1]
             left_global_rank = dist.get_global_rank(left_group, 0)
             dist.send(send_left, dst=left_global_rank, group=left_group)
 
