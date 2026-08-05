@@ -671,8 +671,14 @@ def llama_eagle3_config():
 
 
 def get_ucx_tls():
-    if get_sm_version() < 90:
+    sm = get_sm_version()
+    if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
+    if sm == 90:
+        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
+        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
+        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
+        return "^gdr_copy"
     return "^ib,gdr_copy"
 
 

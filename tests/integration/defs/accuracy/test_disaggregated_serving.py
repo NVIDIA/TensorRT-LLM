@@ -24,8 +24,9 @@ from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
-from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
-                        skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
+from ..conftest import (get_device_count, get_sm_version, llm_models_root,
+                        parametrize_with_ids, skip_no_hopper,
+                        skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail,
                             LlmapiAccuracyTestHarness, get_accuracy_task)
@@ -92,6 +93,24 @@ def has_nvlink():
     except Exception:
         # Any other unexpected error
         return False
+
+
+def get_disagg_ucx_tls():
+    """UCX transports for the disaggregated worker processes.
+
+    Without NVLink, cuda_ipc is excluded (preserving the pre-existing
+    behavior, which leaves IB allowed there). With NVLink on Hopper (SM90),
+    IB is allowed: KVCacheManagerV2 KV pools are VMM allocations that CUDA
+    IPC cannot map without fabric handles, so KV transfers need IB GPUDirect
+    RDMA to avoid falling back to slow non-IPC emulation. On the remaining
+    NVLink architectures IB stays excluded to avoid hangs on the CI B200
+    cluster.
+    """
+    if not has_nvlink():
+        return "^cuda_ipc"
+    if get_sm_version() == 90:
+        return "^gdr_copy"
+    return "^ib"
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -295,8 +314,7 @@ def launch_disaggregated_llm(
         # NIXL backend ignores this env-var fallback; skip it.
         if cache_transceiver_config_backend != "NIXL":
             env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
-        env["UCX_TLS"] = "^ib"
+        env["UCX_TLS"] = get_disagg_ucx_tls()
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
@@ -305,8 +323,6 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
-        if not has_nvlink():
-            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += ctx_total_gpus
 
         ctx_server_args = ctx_args + [
@@ -332,8 +348,7 @@ def launch_disaggregated_llm(
         # NIXL backend ignores this env-var fallback; skip it.
         if cache_transceiver_config_backend != "NIXL":
             env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
-        env["UCX_TLS"] = "^ib"
+        env["UCX_TLS"] = get_disagg_ucx_tls()
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
         if cache_transceiver_config_backend == "NIXL":
@@ -341,8 +356,6 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
-        if not has_nvlink():
-            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
