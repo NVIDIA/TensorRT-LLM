@@ -129,6 +129,19 @@ def test_protocol_v1_refuses_allocator_without_snapshot_lease() -> None:
         )
 
 
+def test_protocol_v1_refuses_cpp_v2_without_lease_capability() -> None:
+    manager = SimpleNamespace(
+        snapshot_and_lease=Mock(),
+        supports_allocation_generation_leases=False,
+    )
+
+    with pytest.raises(RuntimeError, match="TLLM_KV_CACHE_MANAGER_V2_BACKEND=python"):
+        KvCacheTransceiverV2._validate_generation_safe_allocator(
+            manager,
+            _v1_contract(),
+        )
+
+
 def test_protocol_v1_refuses_mixed_mamba_without_state_slot_leases() -> None:
     manager = object.__new__(MixedMambaHybridCacheManager)
 

@@ -21,6 +21,7 @@ from uuid import uuid4
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheAllocationLease
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AllocationIdentity,
     AllocationRange,
@@ -195,7 +196,7 @@ def test_physical_retirement_failure_is_stably_in_doubt_and_retains_allocation()
 def test_wrapper_resolves_request_mapping_once_before_leasing_exact_allocation() -> None:
     manager = _make_wrapper()
     manager.kv_cache_map = {41: sentinel.exact_allocation}
-    manager.impl = Mock()
+    manager.impl = Mock(spec=["snapshot_and_lease"])
     manager.impl.snapshot_and_lease.return_value = sentinel.lease
 
     result = manager.snapshot_and_lease(41, [0, 2], (3, 7))
@@ -211,7 +212,7 @@ def test_wrapper_resolves_request_mapping_once_before_leasing_exact_allocation()
 def test_wrapper_rejects_missing_request_before_calling_allocator() -> None:
     manager = _make_wrapper()
     manager.kv_cache_map = {}
-    manager.impl = Mock()
+    manager.impl = Mock(spec=["snapshot_and_lease"])
 
     with pytest.raises(KeyError, match="request 41"):
         manager.snapshot_and_lease(41)
@@ -234,7 +235,7 @@ def test_wrapper_settlement_never_rechecks_request_mapping() -> None:
 
 def test_wrapper_shutdown_refuses_before_mutating_live_request_state() -> None:
     manager = _make_wrapper()
-    manager.impl = Mock()
+    manager.impl = Mock(spec=["outstanding_allocation_lease_count", "shutdown"])
     manager.impl.outstanding_allocation_lease_count = 2
     cache = Mock()
     manager.kv_cache_map = {41: cache}
@@ -245,3 +246,91 @@ def test_wrapper_shutdown_refuses_before_mutating_live_request_state() -> None:
     cache.close.assert_not_called()
     assert manager.kv_cache_map == {41: cache}
     manager.impl.shutdown.assert_not_called()
+
+
+def _cpp_lease_backend(*, outstanding_leases: int = 0, outstanding_pins: int = 0) -> Mock:
+    backend = Mock(
+        spec=[
+            "get_allocation_identity",
+            "snapshot_and_lease",
+            "settle_allocation_lease",
+            "get_allocation_lease_accounting",
+            "release_pools",
+        ]
+    )
+    backend.get_allocation_lease_accounting.return_value = Mock(
+        lease_state_known=True,
+        outstanding_lease_count=outstanding_leases,
+        outstanding_block_pin_count=outstanding_pins,
+    )
+    return backend
+
+
+def test_wrapper_adapts_identity_based_cpp_allocation_lease() -> None:
+    manager = _make_wrapper()
+    manager.impl = _cpp_lease_backend()
+    manager.kv_cache_map = {}
+    identity = sentinel.identity
+    snapshot = Mock(lease_id=7, identity=identity, blocks=())
+    manager.impl.get_allocation_identity.return_value = identity
+    manager.impl.snapshot_and_lease.return_value = snapshot
+
+    lease = manager.snapshot_and_lease(41)
+
+    assert isinstance(lease, KVCacheAllocationLease)
+    assert lease.snapshot is snapshot
+    manager.impl.get_allocation_identity.assert_called_once_with(41)
+    manager.impl.snapshot_and_lease.assert_called_once_with(identity)
+    assert manager.supports_allocation_generation_leases
+
+    proof = sentinel.reusable_proof
+    settlement = lease.settle(proof)
+    assert settlement is manager.impl.settle_allocation_lease.return_value
+    manager.impl.settle_allocation_lease.assert_called_once_with(7, identity, proof)
+
+
+def test_wrapper_cpp_shutdown_rejects_outstanding_lease_before_mutation() -> None:
+    manager = _make_wrapper()
+    manager.impl = _cpp_lease_backend(outstanding_leases=2, outstanding_pins=5)
+    cache = Mock()
+    manager.kv_cache_map = {41: cache}
+    manager.conversation_manager = None
+
+    with pytest.raises(RuntimeError, match="2 outstanding allocation lease"):
+        manager.shutdown()
+
+    cache.close.assert_not_called()
+    assert manager.kv_cache_map == {41: cache}
+    manager.impl.release_pools.assert_not_called()
+
+
+def test_wrapper_cpp_shutdown_releases_pools_after_closing_allocations() -> None:
+    manager = _make_wrapper()
+    manager.impl = _cpp_lease_backend()
+    cache = Mock()
+    manager.kv_cache_map = {41: cache}
+    manager.conversation_manager = None
+
+    manager.shutdown()
+
+    cache.close.assert_called_once_with()
+    assert manager.kv_cache_map == {}
+    manager.impl.release_pools.assert_called_once_with()
+
+
+def test_wrapper_lease_incapable_cpp_v2_keeps_legacy_shutdown_working() -> None:
+    manager = _make_wrapper()
+    manager.impl = Mock(spec=["shutdown"])
+    cache = Mock()
+    manager.kv_cache_map = {41: cache}
+    manager.conversation_manager = None
+
+    assert not manager.supports_allocation_generation_leases
+    with pytest.raises(TypeError, match="does not support allocation leases"):
+        manager.snapshot_and_lease(41)
+
+    manager.shutdown()
+
+    cache.close.assert_called_once_with()
+    assert manager.kv_cache_map == {}
+    manager.impl.shutdown.assert_called_once_with()

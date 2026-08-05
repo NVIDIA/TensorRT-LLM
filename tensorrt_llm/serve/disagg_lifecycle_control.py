@@ -56,6 +56,7 @@ from tensorrt_llm._torch.disaggregation.protocol import (
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle, TransceiverLifecycleAdvertisement
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.disagg_auth import build_internal_disagg_lifecycle_auth_headers
 
 GENERATION_GRANT_PATH = "/_internal/disagg_lifecycle/generation_grant"
 GENERATION_GRANT_RENEW_PATH = "/_internal/disagg_lifecycle/generation_grant/renew"
@@ -327,6 +328,7 @@ class DisaggLifecycleControl:
         clock: Callable[[], float] = time.monotonic,
         session: Optional[aiohttp.ClientSession] = None,
         endpoint_lifecycle: Optional[Callable[[], TransceiverLifecycleAdvertisement]] = None,
+        internal_disagg_auth_key: Optional[str] = None,
     ) -> None:
         if grant_ttl_s <= 0 or artifact_ttl_s <= 0:
             raise ValueError("obligation TTLs must be positive")
@@ -376,6 +378,7 @@ class DisaggLifecycleControl:
         self._sweep_interval_s = sweep_interval_s
         self._session = session
         self._owns_session = session is None
+        self._internal_disagg_auth_key = internal_disagg_auth_key
         self._sweeper: Optional[asyncio.Task] = None
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._generation_tickets: dict[UUID, _GenerationTicket] = {}
@@ -1477,9 +1480,16 @@ class DisaggLifecycleControl:
             metadata.context_control_endpoint,
             ARTIFACT_OBLIGATION_PATH,
         )
+        body = request.model_dump(mode="json")
+        headers = build_internal_disagg_lifecycle_auth_headers(
+            self._internal_disagg_auth_key,
+            ARTIFACT_OBLIGATION_PATH,
+            body,
+        )
         async with self._session.post(
             url,
-            json=request.model_dump(mode="json"),
+            json=body,
+            **({"headers": headers} if headers else {}),
         ) as response:
             body = await response.text()
             if response.status >= 400:
@@ -1725,9 +1735,16 @@ class DisaggLifecycleControl:
             request.context_control_endpoint,
             CONTEXT_ARTIFACT_ABORT_PATH,
         )
+        body = abort.model_dump(mode="json")
+        headers = build_internal_disagg_lifecycle_auth_headers(
+            self._internal_disagg_auth_key,
+            CONTEXT_ARTIFACT_ABORT_PATH,
+            body,
+        )
         async with self._session.post(
             url,
-            json=abort.model_dump(mode="json"),
+            json=body,
+            **({"headers": headers} if headers else {}),
         ) as response:
             body = await response.text()
             if response.status >= 400:

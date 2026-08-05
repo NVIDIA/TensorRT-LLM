@@ -217,6 +217,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 "MixedMambaHybridCacheManager because its independent Mamba "
                 "state slots lack allocation-generation leases"
             )
+        if getattr(kv_cache_manager, "supports_allocation_generation_leases", None) is False:
+            raise RuntimeError(
+                "lifecycle protocol v1 requires allocator-generation lease support; "
+                "the translated C++ KVCacheManagerV2 backend does not expose that "
+                "contract yet. Set TLLM_KV_CACHE_MANAGER_V2_BACKEND=python to use "
+                "protocol v1"
+            )
         if not callable(getattr(kv_cache_manager, "snapshot_and_lease", None)):
             raise RuntimeError(
                 "lifecycle protocol v1 requires allocator snapshot_and_lease support"

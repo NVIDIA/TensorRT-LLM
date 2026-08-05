@@ -26,6 +26,7 @@ from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
+    build_internal_disagg_lifecycle_auth_headers,
     request_requires_internal_disagg_auth,
 )
 from tensorrt_llm.serve.disagg_lifecycle_control import (
@@ -293,8 +294,6 @@ class OpenAIHttpClient(OpenAIClient):
         self._internal_disagg_auth_key = internal_disagg_auth_key
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
-        if self._role != ServerRole.GENERATION:
-            return {}
         if not request_requires_internal_disagg_auth(request):
             return {}
         return build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
@@ -414,7 +413,12 @@ class OpenAIHttpClient(OpenAIClient):
             if server.startswith(("http://", "https://"))
             else f"http://{server.rstrip('/')}{endpoint}"
         )
-        async with self._session.post(url, json=body) as response:
+        headers = build_internal_disagg_lifecycle_auth_headers(
+            self._internal_disagg_auth_key,
+            endpoint,
+            body,
+        )
+        async with self._session.post(url, json=body, headers=headers) as response:
             payload = await response.text()
             if response.status >= 400:
                 raise aiohttp.ClientResponseError(

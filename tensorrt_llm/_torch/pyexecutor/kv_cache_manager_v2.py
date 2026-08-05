@@ -97,6 +97,7 @@ from .resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
     DataType,
+    KVCacheAllocationLease,
     KVCacheManager,
     ModelConfigCpp,
     ModelConfigPython,
@@ -3220,7 +3221,7 @@ class KVCacheManagerV2(BaseResourceManager):
         request_id: int,
         layer_group_ids: Sequence[int] | None = None,
         block_range: tuple[int, int] | None = None,
-    ) -> AllocationLeaseHandle:
+    ) -> AllocationLeaseHandle | KVCacheAllocationLease:
         """Lease the exact allocation currently mapped to ``request_id``.
 
         The request map is consulted once. The allocator registry then retains
@@ -3228,10 +3229,47 @@ class KVCacheManagerV2(BaseResourceManager):
         subsequently assigned a new allocation. Callers must serialize this
         operation with request-map mutation on the scheduler-owner thread.
         """
+        get_identity = getattr(self.impl, "get_allocation_identity", None)
+        if callable(get_identity):
+            if layer_group_ids is not None or block_range is not None:
+                raise NotImplementedError(
+                    "the identity-based KV cache lease backend does not support "
+                    "V2 layer-group or block-range selection"
+                )
+            identity = get_identity(request_id)
+            if identity is None:
+                raise KeyError(f"KV cache for request {request_id} does not exist")
+            snapshot = self.impl.snapshot_and_lease(identity)
+            if snapshot is None:
+                raise RuntimeError(
+                    f"KV cache allocation for request {request_id} changed or is shutting down"
+                )
+            return KVCacheAllocationLease(snapshot, self.impl)
+
+        snapshot_and_lease = getattr(self.impl, "snapshot_and_lease", None)
+        if not callable(snapshot_and_lease):
+            raise TypeError("KV cache manager V2 backend does not support allocation leases")
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None:
             raise KeyError(f"KV cache for request {request_id} does not exist")
-        return self.impl.snapshot_and_lease(kv_cache, layer_group_ids, block_range)
+        return snapshot_and_lease(kv_cache, layer_group_ids, block_range)
+
+    @property
+    def supports_allocation_generation_leases(self) -> bool:
+        """Whether this manager backend implements the complete lease contract."""
+        snapshot_and_lease = getattr(self.impl, "snapshot_and_lease", None)
+        if not callable(snapshot_and_lease):
+            return False
+
+        get_identity = getattr(self.impl, "get_allocation_identity", None)
+        if callable(get_identity):
+            settle = getattr(self.impl, "settle_allocation_lease", None)
+            get_accounting = getattr(self.impl, "get_allocation_lease_accounting", None)
+            if not callable(settle) or not callable(get_accounting):
+                return False
+            return bool(get_accounting().lease_state_known)
+
+        return hasattr(self.impl, "outstanding_allocation_lease_count")
 
     @staticmethod
     def settle_allocation_lease(
@@ -3485,15 +3523,29 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
-        outstanding = self.impl.outstanding_allocation_lease_count
-        if outstanding:
+        get_accounting = getattr(self.impl, "get_allocation_lease_accounting", None)
+        outstanding_pins = 0
+        if callable(get_accounting):
+            accounting = get_accounting()
+            if not accounting.lease_state_known:
+                raise RuntimeError("KV cache manager allocation lease state is unknown")
+            outstanding = int(accounting.outstanding_lease_count)
+            outstanding_pins = int(accounting.outstanding_block_pin_count)
+        else:
+            outstanding = int(getattr(self.impl, "outstanding_allocation_lease_count", 0))
+        if outstanding or outstanding_pins:
             raise RuntimeError(
-                f"KV cache manager has {outstanding} outstanding allocation lease(s)"
+                f"KV cache manager has {outstanding} outstanding allocation lease(s) "
+                f"and {outstanding_pins} outstanding block pin(s)"
             )
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
-        self.impl.shutdown()
+        release_pools = getattr(self.impl, "release_pools", None)
+        if callable(release_pools):
+            release_pools()
+        else:
+            self.impl.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
 

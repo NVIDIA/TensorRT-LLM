@@ -83,7 +83,9 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request)
+    request_requires_internal_disagg_auth,
+    validate_internal_disagg_lifecycle_request,
+    validate_internal_disagg_request)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.disagg_lifecycle_control import (
     ARTIFACT_OBLIGATION_PATH, CONTEXT_ARTIFACT_ABORT_PATH,
@@ -361,6 +363,7 @@ class OpenAIServer(_VideoRoutesMixin):
                             os.getenv("TRTLLM_DISAGG_REPLAY_FILTER_CAPACITY",
                                       "262144")),
                         endpoint_lifecycle=self._local_transceiver_lifecycle,
+                        internal_disagg_auth_key=internal_disagg_auth_key,
                     )
 
         # Dedicated thread pools for the chat / completion path. Keeping
@@ -709,6 +712,18 @@ class OpenAIServer(_VideoRoutesMixin):
         headers = None if raw_request is None else raw_request.headers
         validate_internal_disagg_request(
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
+
+    def _validate_internal_disagg_lifecycle_request(
+            self, route: str, request, raw_request: Request) -> None:
+        try:
+            validate_internal_disagg_lifecycle_request(
+                getattr(self, "_internal_disagg_auth_key", None),
+                route,
+                request.model_dump(mode="json"),
+                raw_request.headers,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=401, detail=str(error)) from error
 
     def _has_cache_transceiver_config(self) -> bool:
         cache_transceiver_config = getattr(
@@ -1078,7 +1093,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 and getattr(params, "ctx_request_id", None) is not None
                 and getattr(params, "disagg_request_id", None) is not None)
 
-    async def issue_generation_grant(self, request: GenerationGrantRequest):
+    async def issue_generation_grant(self, request: GenerationGrantRequest,
+                                     raw_request: Request):
+        self._validate_internal_disagg_lifecycle_request(
+            GENERATION_GRANT_PATH,
+            request,
+            raw_request,
+        )
         control = self.disagg_lifecycle_control
         if control is None:
             raise HTTPException(
@@ -1109,8 +1130,13 @@ class OpenAIServer(_VideoRoutesMixin):
         except (KeyError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
-    async def renew_generation_grant(self,
-                                     request: GenerationGrantRenewRequest):
+    async def renew_generation_grant(self, request: GenerationGrantRenewRequest,
+                                     raw_request: Request):
+        self._validate_internal_disagg_lifecycle_request(
+            GENERATION_GRANT_RENEW_PATH,
+            request,
+            raw_request,
+        )
         control = self.disagg_lifecycle_control
         if control is None:
             raise HTTPException(
@@ -1121,8 +1147,13 @@ class OpenAIServer(_VideoRoutesMixin):
         except (KeyError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
-    async def abort_generation_grant(self,
-                                     request: GenerationGrantAbortRequest):
+    async def abort_generation_grant(self, request: GenerationGrantAbortRequest,
+                                     raw_request: Request):
+        self._validate_internal_disagg_lifecycle_request(
+            GENERATION_GRANT_ABORT_PATH,
+            request,
+            raw_request,
+        )
         control = self.disagg_lifecycle_control
         if control is None:
             raise HTTPException(
@@ -1134,7 +1165,13 @@ class OpenAIServer(_VideoRoutesMixin):
             raise HTTPException(status_code=409, detail=str(error)) from error
 
     async def handle_artifact_obligation(self,
-                                         request: ArtifactObligationRequest):
+                                         request: ArtifactObligationRequest,
+                                         raw_request: Request):
+        self._validate_internal_disagg_lifecycle_request(
+            ARTIFACT_OBLIGATION_PATH,
+            request,
+            raw_request,
+        )
         control = self.disagg_lifecycle_control
         if control is None:
             raise HTTPException(
@@ -1145,8 +1182,13 @@ class OpenAIServer(_VideoRoutesMixin):
         except (KeyError, RuntimeError, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
-    async def abort_context_artifact(self,
-                                     request: ContextArtifactAbortRequest):
+    async def abort_context_artifact(self, request: ContextArtifactAbortRequest,
+                                     raw_request: Request):
+        self._validate_internal_disagg_lifecycle_request(
+            CONTEXT_ARTIFACT_ABORT_PATH,
+            request,
+            raw_request,
+        )
         control = self.disagg_lifecycle_control
         if control is None:
             raise HTTPException(
