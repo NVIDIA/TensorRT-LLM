@@ -16,8 +16,8 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
-    CUDAGraphRunner, EncoderCUDAGraphRunner, _restore_spec_decode_capture_state,
-    _save_spec_decode_capture_state)
+    CUDAGraphRunner, EncoderCUDAGraphRunner, KeyType,
+    _restore_spec_decode_capture_state, _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -188,8 +188,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
 
 
 def _make_forward_only_engine(
-    graph_key: tuple[int, int, bool, bool, bool, tuple[int, ...],
-                     tuple[int, ...]] | None,
+    graph_key: KeyType | None,
     runner_enabled: bool = True,
 ) -> tuple[PyTorchModelEngine, Mock, Mock, Mock, dict[str, object]]:
     engine = object.__new__(PyTorchModelEngine)
@@ -611,7 +610,83 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         runner._get_seq_len_mode.assert_called_once_with(
             batch, None, promoted_ids)
-        self.assertEqual(key, (1, 0, False, True, True, (), (0, )))
+        self.assertEqual(
+            key,
+            KeyType(batch_size=1,
+                    draft_len=0,
+                    is_first_draft=False,
+                    short_seq_len_mode=True,
+                    num_encoder_tokens=0))
+
+    def test_graph_key_aggregates_encoder_tokens(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.max_beam_width = 1
+        runner._get_seq_len_mode.return_value = False
+        context = _make_request_stub(1)
+        context.encoder_output_len = 7
+        context.py_skip_cross_kv_projection = False
+        skipped_context = _make_request_stub(2)
+        skipped_context.encoder_output_len = 11
+        skipped_context.py_skip_cross_kv_projection = True
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [context, skipped_context]
+        batch.generation_requests = [_make_request_stub(3)]
+
+        key = CUDAGraphRunner.get_graph_key(runner, batch)
+
+        assert key is not None
+        self.assertEqual(key.num_contexts, 2)
+        self.assertEqual(key.context_query_len, 1)
+        self.assertEqual(key.num_encoder_tokens, 7)
+        self.assertEqual(CUDAGraphRunner._get_num_tokens_for_key(runner, key),
+                         3)
+
+    def test_graph_key_rejects_nonuniform_context_query_lengths(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner._get_seq_len_mode.return_value = False
+        first_context = _make_request_stub(1)
+        first_context.encoder_output_len = 7
+        first_context.py_skip_cross_kv_projection = False
+        second_context = _make_request_stub(2)
+        second_context.context_chunk_size = 2
+        second_context.encoder_output_len = 11
+        second_context.py_skip_cross_kv_projection = False
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [first_context, second_context]
+        batch.generation_requests = [_make_request_stub(3)]
+
+        key = CUDAGraphRunner.get_graph_key(runner, batch)
+
+        self.assertIsNone(key)
+
+    def test_graph_key_rounds_encoder_tokens_up_to_captured_extent(
+            self) -> None:
+        key = KeyType(batch_size=2,
+                      draft_len=0,
+                      is_first_draft=False,
+                      num_contexts=1,
+                      context_query_len=1,
+                      num_encoder_tokens=7)
+        smaller_key = key._replace(num_encoder_tokens=6)
+        compatible_key = key._replace(num_encoder_tokens=8)
+        larger_key = key._replace(num_encoder_tokens=16)
+        runner = SimpleNamespace(
+            padding_enabled=True,
+            _capture_allowed=False,
+            graph_metadata={},
+            graph_outputs={
+                smaller_key: object(),
+                compatible_key: object(),
+                larger_key: object(),
+            },
+        )
+
+        actual_key = CUDAGraphRunner._get_compatible_mixed_encoder_decoder_key(
+            runner, key)
+
+        self.assertEqual(actual_key, compatible_key)
 
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
@@ -620,7 +695,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             enable_attention_dp=False,
             use_mrope=False,
         )
-        key = (1, 0, False, True, True, (), (0, ))
+        key = KeyType(batch_size=1,
+                      draft_len=0,
+                      is_first_draft=False,
+                      short_seq_len_mode=True,
+                      num_encoder_tokens=0)
         graph_attn_metadata = object()
         graph_spec_metadata = object()
         runner.get_graph_key.return_value = key
@@ -654,7 +733,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                          (graph_attn_metadata, graph_spec_metadata, key))
 
     def test_forward_commits_candidate_only_on_graph_hit(self) -> None:
-        key = (2, 0, False, False, True, (), (0, ))
+        key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(key)
         context = _make_request_stub(1)
@@ -713,7 +792,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_zero_runtime_draft_speculation_commits_graph_candidate(
             self) -> None:
-        key = (2, 0, False, False, True, (), (0, ))
+        key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(key)
         engine.enable_spec_decode = True
@@ -809,7 +888,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner.replay.assert_not_called()
 
     def test_forward_allows_guided_context_logits_on_graph_hit(self) -> None:
-        key = (1, 0, False, False, True, (), (0, ))
+        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(key)
         engine.guided_decoder = Mock()
@@ -862,7 +941,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIn("multimodal_embedding", multimodal_data)
 
     def test_generation_only_forward_does_not_call_new_selector(self) -> None:
-        key = (1, 0, False, False, True, (), (0, ))
+        key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         generation = _make_request_stub(2)
         batch = ScheduledRequests()

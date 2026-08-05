@@ -2305,12 +2305,18 @@ class PyTorchModelEngine(ModelEngine):
                                 f"{operation} for batch size={batch_size}, "
                                 f"context requests={num_contexts}, "
                                 f"packed encoder tokens={total_encoder_tokens}")
-                    self.enable_spec_decode = False
-                    self.runtime_draft_len = 0
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
-                    torch.cuda.synchronize()
+                    saved_enable_spec_decode = self.enable_spec_decode
+                    saved_runtime_draft_len = self.runtime_draft_len
+                    try:
+                        self.enable_spec_decode = False
+                        self.runtime_draft_len = 0
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        torch.cuda.synchronize()
+                    finally:
+                        self.enable_spec_decode = saved_enable_spec_decode
+                        self.runtime_draft_len = saved_runtime_draft_len
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
@@ -3530,7 +3536,7 @@ class PyTorchModelEngine(ModelEngine):
                 cross_attn_metadata.prepare()
                 return
             assert isinstance(cross_attn_metadata, TrtllmAttentionMetadata)
-            cross_attn_metadata.prepare_encoder_decoder(
+            cross_attn_metadata.prepare_encoder_decoder_from_precomputed_lengths(
                 prompt_lens=attn_metadata.prompt_lens,
                 kv_lens=encoder_kv_lens,
                 context_kv_tokens=context_encoder_kv_tokens,
@@ -3814,7 +3820,7 @@ class PyTorchModelEngine(ModelEngine):
             num_extra_kv_tokens=0)
         attn_metadata.kv_cache_manager = kv_cache_manager
         assert isinstance(attn_metadata, TrtllmAttentionMetadata)
-        attn_metadata.prepare_encoder_decoder(
+        attn_metadata.prepare_encoder_decoder_from_precomputed_lengths(
             prompt_lens=buffers['prompt_lengths'][:num_sequences],
             kv_lens=buffers['kv_lengths'][:num_sequences],
             context_kv_tokens=context_kv_tokens,
@@ -6937,8 +6943,6 @@ class PyTorchModelEngine(ModelEngine):
                     padded_graph_requests.all_requests())
                 self._sync_group_all_greedy_sample(spec_metadata)
 
-            allow_mixed_encoder_decoder_graph = (
-                self.cuda_graph_runner.enable_encoder_decoder_mixed_cuda_graph)
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_graph_requests,
                 enable_spec_decode=self.enable_spec_decode,
@@ -6948,7 +6952,6 @@ class PyTorchModelEngine(ModelEngine):
                 if self.is_spec_decode else None,
                 new_tensors_device=new_tensors_device,
                 spec_resource_manager=spec_resource_manager,
-                allow_mixed_encoder_decoder=(allow_mixed_encoder_decoder_graph),
                 promoted_context_request_ids=promoted_context_request_ids,
             )
 

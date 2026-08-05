@@ -786,6 +786,57 @@ def test_greedy_no_repeat_ngram_uses_token_ban_path():
     assert new_tokens_host.reshape(-1)[0].item() == 3
 
 
+@force_ampere
+@pytest.mark.parametrize(
+    ("penalty_name", "penalty_value"),
+    [
+        pytest.param("repetition_penalty", 100.0, id="repetition"),
+        pytest.param("presence_penalty", 2.0, id="presence"),
+        pytest.param("frequency_penalty", 2.0, id="frequency"),
+    ],
+)
+def test_greedy_occurrence_penalties_bypass_stable_path(penalty_name: str, penalty_value: float):
+    sampler = TorchSampler(
+        TorchSampler.Args(
+            max_seq_len=16,
+            max_draft_len=0,
+            max_num_sequences=1,
+            max_beam_width=1,
+            max_total_draft_tokens=0,
+            disable_overlap_scheduler=True,
+        )
+    )
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=4,
+        input_tokens=[1],
+        sampling_config=SamplingConfig(
+            SamplingParams(**{penalty_name: penalty_value})._get_sampling_config()
+        ),
+        seq_slot=0,
+        is_streaming=False,
+    )
+
+    admission = ScheduledRequests()
+    admission.context_requests_last_chunk = [request]
+    sampler.setup_sampler_step(admission)
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.generation_requests = [request]
+    logits = torch.tensor([[0.0, 10.0, 9.0]], device="cuda")
+
+    *_, new_tokens_host, single_step_greedy = sampler._process_requests(
+        scheduled_requests,
+        {"logits": logits},
+        sampler.store.new_tokens,
+        [0],
+    )
+    torch.cuda.synchronize()
+
+    assert not single_step_greedy
+    assert new_tokens_host.reshape(-1)[0].item() == 2
+
+
 class TestFinishReasons:
     NOT_FINISHED = FinishReason.NOT_FINISHED
     STOP_WORDS = FinishReason.STOP_WORDS

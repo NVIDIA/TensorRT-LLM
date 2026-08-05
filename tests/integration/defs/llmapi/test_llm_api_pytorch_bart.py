@@ -681,7 +681,9 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
 
             assert encoder_runner.enabled
             assert encoder_runner.graphs
-            captured_mixed_keys = {key for key in decoder_runner.graphs if key[5] and key[6]}
+            captured_mixed_keys = {
+                key for key in decoder_runner.graphs if key.num_contexts and key.num_encoder_tokens
+            }
             assert captured_mixed_keys
 
             original_encoder_replay = encoder_runner.replay
@@ -742,6 +744,8 @@ def test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
             admitted_encoder_keys = encoder_replay_keys[encoder_replay_count_before_admission:]
             assert any(key[0] == 2 for key in admitted_encoder_keys)
             assert set(encoder_replay_keys) <= set(encoder_runner.graphs)
-            replayed_mixed_keys = {key for key in decoder_replay_keys if key[5] and key[6]}
+            replayed_mixed_keys = {
+                key for key in decoder_replay_keys if key.num_contexts and key.num_encoder_tokens
+            }
             assert replayed_mixed_keys
             assert replayed_mixed_keys <= captured_mixed_keys

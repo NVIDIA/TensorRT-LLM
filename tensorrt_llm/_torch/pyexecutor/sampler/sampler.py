@@ -98,7 +98,7 @@ from .logprobs import (
     get_logprobs_from_request,
     store_logprobs_list_to_request,
 )
-from .penalties import PenaltyHandler
+from .penalties import PenaltyHandler, has_occurrence_penalty
 from .sampler_common import (
     DEFAULT_BEAM_IDX,
     DEFAULT_STEP_IDX,
@@ -3869,6 +3869,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     request._py_embedding_bias_1d is None
                     and not getattr(request, "py_bad_words", None)
                     and not getattr(request, "py_no_repeat_ngram_size", None)
+                    and not has_occurrence_penalty(request)
                     and not request.py_min_length
                     and not request.py_return_log_probs
                     and not request.py_stop_words_list
