@@ -795,6 +795,11 @@ class MLA(nn.Module):
             [num_tokens, self.attention_output_hidden_size], dtype=hidden_states.dtype
         )
 
+    def prepare_sparse_attn(self, attn_metadata: AttentionMetadata) -> None:
+        """Prepare sparse module state before the model forward starts."""
+        if self.sparse_attn_hooks is not None:
+            self.sparse_attn_hooks.prepare(self, attn_metadata)
+
     def _create_outputs(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> list[torch.Tensor]:

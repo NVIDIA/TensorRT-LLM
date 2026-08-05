@@ -151,11 +151,6 @@ class TopK(nn.Module):
         self.register_buffer("_row_order_buffer", None, persistent=False)
         self._num_sms: int | None = None
 
-    @property
-    def is_state_prepared(self) -> bool:
-        """Whether stateful heuristic decode has persistent buffers."""
-        return self._prior_indices is not None
-
     def prepare(
         self,
         *,

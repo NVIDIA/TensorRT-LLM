@@ -260,6 +260,32 @@ def test_mla_backend_only_forward() -> None:
     )
 
 
+def test_mla_sparse_prepare_delegates_to_hooks() -> None:
+    mla = MLA.__new__(MLA)
+    torch.nn.Module.__init__(mla)
+    mla.sparse_attn_hooks = Mock()
+    attn_metadata = Mock()
+
+    MLA.prepare_sparse_attn(mla, attn_metadata)
+
+    mla.sparse_attn_hooks.prepare.assert_called_once_with(mla, attn_metadata)
+
+
+@pytest.mark.parametrize("algorithm", ["dsa", "deepseek_v4"])
+def test_sparse_mla_hooks_prepare_the_indexer(algorithm: str) -> None:
+    hook_module = ModuleType(f"{algorithm}_prepare")
+    hook_module.sparse_params = MockSparseParams()
+    hook_module.sparse_params.algorithm = algorithm
+    hooks = get_sparse_mla_hooks(hook_module)
+    indexer = Mock()
+    mla = Mock(indexer=indexer)
+    attn_metadata = Mock()
+
+    hooks.prepare(mla, attn_metadata)
+
+    indexer.prepare.assert_called_once_with(attn_metadata)
+
+
 def test_sparse_runtime_params_without_prediction() -> None:
     attention = TrtllmAttention.__new__(TrtllmAttention)
     attention.sparse_params = MockSparseParams()

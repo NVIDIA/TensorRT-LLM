@@ -136,7 +136,7 @@ def _compute_slot_mappings(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute flat byte indices for FP8/FP4 data and scales from global token positions.
 
-    Shared by Indexer.prepare() (CPU) and on_update_kv_lens() (GPU) to avoid
+    Shared by Indexer.prepare_metadata() (CPU) and on_update_kv_lens() (GPU) to avoid
     duplicating the slot mapping arithmetic.
 
     Args:
@@ -669,6 +669,19 @@ class Indexer(nn.Module):
     def post_load_weights(self) -> None:
         self.cache_derived_state()
 
+    def prepare(self, metadata: DSAtrtllmAttentionMetadata) -> None:
+        """Prepare this indexer's Top-K state before model forward."""
+        if metadata.kv_cache_manager is None:
+            return
+        self.top_k.prepare(
+            device=metadata.kv_lens_cuda.device,
+            max_num_columns=metadata.get_indexer_max_seq_len(),
+            next_n=1 + metadata.max_draft_tokens,
+            input_dtype=torch.float32,
+            num_sms=metadata.num_sms,
+            max_num_requests=metadata.max_num_sequences,
+        )
+
     @staticmethod
     def prepare_one_prefill_chunk(
         metadata: DSAtrtllmAttentionMetadata,
@@ -1084,7 +1097,7 @@ class Indexer(nn.Module):
             )
 
     @staticmethod
-    def prepare(metadata: DSAtrtllmAttentionMetadata):
+    def prepare_metadata(metadata: DSAtrtllmAttentionMetadata):
         """
         Prepare indexer for the forward pass.
         This should be called during metadata.prepare() stage.
@@ -1354,15 +1367,6 @@ class Indexer(nn.Module):
         num_tokens = metadata.num_tokens
 
         num_gen_tokens = num_tokens - num_ctx_tokens
-        if self._enable_heuristic_topk and not self.top_k.is_state_prepared:
-            self.top_k.prepare(
-                device=hidden_states.device,
-                max_num_columns=metadata.get_indexer_max_seq_len(),
-                next_n=1 + metadata.max_draft_tokens,
-                input_dtype=torch.float32,
-                num_sms=metadata.num_sms,
-                max_num_requests=metadata.max_num_sequences,
-            )
         if is_generation is None:
             has_prefill = num_contexts > 0
             has_decode = num_generations > 0
@@ -1601,7 +1605,7 @@ class Indexer(nn.Module):
             if self.use_cute_dsl_paged_mqa_logits:
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
                 # kNumNextNAtoms = 1 for any real next_n. The matching schedule
-                # is `scheduler_metadata_buffer` — built in `Indexer.prepare()`
+                # is `scheduler_metadata_buffer` — built in `Indexer.prepare_metadata()`
                 # with a (num_gen, 1) input shape, which makes DeepGEMM's wrapper
                 # compute `num_next_n_atoms = 1`. (DeepGEMM uses the same buffer
                 # for its own next_n=1 kernel; DSL piggy-backs on it for all

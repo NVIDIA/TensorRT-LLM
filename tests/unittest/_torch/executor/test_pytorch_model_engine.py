@@ -91,6 +91,19 @@ class DummyModel(torch.nn.Module):
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
 
 
+def test_sparse_attention_modules_are_prepared_once_per_metadata():
+    sparse_module = Mock()
+    sparse_module.prepare_sparse_attn = Mock()
+    engine = SimpleNamespace(model=Mock())
+    engine.model.modules.return_value = [object(), sparse_module]
+    attn_metadata = SimpleNamespace()
+
+    PyTorchModelEngine._prepare_sparse_attention_modules(engine, attn_metadata)
+    PyTorchModelEngine._prepare_sparse_attention_modules(engine, attn_metadata)
+
+    sparse_module.prepare_sparse_attn.assert_called_once_with(attn_metadata)
+
+
 class DummyMultimodalIndexModel(torch.nn.Module):
 
     class Config:
@@ -200,6 +213,7 @@ def _make_forward_only_engine(
     engine = object.__new__(PyTorchModelEngine)
     engine.model = SimpleNamespace(
         extra_attrs={},
+        modules=lambda: [],
         model_config=SimpleNamespace(pretrained_config=SimpleNamespace(
             rope_scaling=None)))
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER

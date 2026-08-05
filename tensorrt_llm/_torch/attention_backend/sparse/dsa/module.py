@@ -595,6 +595,10 @@ class DSAHooks(MLASparseHooks):
             self.need_dense_mha and mla.mapping.cp_size == 1 and mla.mqa.support_fused_rope()
         )
 
+    def prepare(self, mla: MLA, attn_metadata: AttentionMetadata) -> None:
+        if mla.indexer is not None:
+            mla.indexer.prepare(attn_metadata)
+
     def forward(
         self,
         mla: MLA,

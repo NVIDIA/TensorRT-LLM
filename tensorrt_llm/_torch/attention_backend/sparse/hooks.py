@@ -56,6 +56,9 @@ class MLASparseHooks(ABC):
     def transform_weights(self, mla: "MLA") -> None:
         """Transform algorithm-specific weights."""
 
+    def prepare(self, mla: "MLA", attn_metadata: "AttentionMetadata") -> None:
+        """Prepare algorithm-specific module state before model forward."""
+
     def prepare_outputs(
         self,
         mla: "MLA",

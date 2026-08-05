@@ -368,7 +368,7 @@ def test_indexer_k_cache_scatter_custom_op_fp4():
 
     from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
 
-    Indexer.prepare(metadata)
+    Indexer.prepare_metadata(metadata)
 
     # FP4 packed data: [num_tokens, 64] int8; scale: [num_tokens, 1] int32
     k_fp4 = torch.randint(-128, 127, (num_tokens, fp4_data_dim), device="cuda", dtype=torch.int8)
