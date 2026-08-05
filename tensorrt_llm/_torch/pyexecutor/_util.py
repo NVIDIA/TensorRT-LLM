@@ -2526,12 +2526,10 @@ def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
 
 
 def should_enable_dsv4_overlap_headroom(
-        model_type: Optional[str], spec_config: Optional[SpeculativeConfig],
-        mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to the validated DSv4 MTP overlap path."""
+        model_type: Optional[str], mapping: Mapping,
+        disable_overlap_scheduler: bool) -> bool:
+    """Gate extra sequence slots to the non-PP DSv4 overlap path."""
     return (should_enable_dsv4_adp_dummy_fixes(model_type, mapping)
-            and spec_config is not None
-            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
             and not disable_overlap_scheduler)
 
 

@@ -446,15 +446,14 @@ class PyTorchModelEngine(ModelEngine):
             self.model = model
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
-        # Keep the scheduler/dummy fix model-scoped, while the larger slot pool
-        # is restricted to the validated MTP overlap configuration. PP remains
-        # on its established path for follow-up changes.
+        # Keep the scheduler/dummy fix and larger slot pool model-scoped. The
+        # overlap lifetime requires headroom with or without speculative
+        # decoding. PP remains on its established path.
         self._enable_dsv4_adp_dummy_fixes = (should_enable_dsv4_adp_dummy_fixes(
             model_type, mapping))
         self._enable_dsv4_overlap_headroom = (
             should_enable_dsv4_overlap_headroom(
-                model_type, spec_config, mapping,
-                llm_args.disable_overlap_scheduler))
+                model_type, mapping, llm_args.disable_overlap_scheduler))
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping,
             self.batch_size,

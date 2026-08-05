@@ -7,15 +7,14 @@ still hold their sequence slots when the next iteration's
 prepare_resources runs, while the V2 scheduler has already dropped them
 from its budget (no_schedule_after_state=GENERATION_TO_COMPLETE) and
 backfilled their seats. Transient slot demand is therefore
-2 * max_batch_size. The headroom is intentionally limited to DeepSeek-V4;
-other models preserve their established sizing pending separate validation.
+2 * max_batch_size, regardless of whether speculative decoding is enabled.
+The headroom is intentionally limited to DeepSeek-V4; other models preserve
+their established sizing pending separate validation.
 
 compute_max_num_sequences is the single sizing implementation used both
 for the executor's SeqSlotManager pool (create_py_executor_instance) and
 for the sampler state (create_torch_sampler_args).
 """
-
-from unittest.mock import Mock
 
 import pytest
 
@@ -40,29 +39,18 @@ SIZING_CASES = [
 
 
 @pytest.mark.parametrize(
-    "model_type,has_spec,is_mtp_one_model,pp_size,disable_overlap,expected",
+    "model_type,pp_size,disable_overlap,expected",
     [
-        ("deepseek_v4", True, True, 1, False, True),
-        ("deepseek_v3", True, True, 1, False, False),
-        ("deepseek_v4", False, False, 1, False, False),
-        ("deepseek_v4", True, False, 1, False, False),
-        ("deepseek_v4", True, True, 2, False, False),
-        ("deepseek_v4", True, True, 1, True, False),
+        ("deepseek_v4", 1, False, True),
+        ("deepseek_v3", 1, False, False),
+        ("deepseek_v4", 2, False, False),
+        ("deepseek_v4", 1, True, False),
     ],
 )
-def test_dsv4_overlap_headroom_gate(
-    model_type, has_spec, is_mtp_one_model, pp_size, disable_overlap, expected
-):
-    spec_config = None
-    if has_spec:
-        spec_config = Mock()
-        spec_config.spec_dec_mode.is_mtp_eagle_one_model.return_value = is_mtp_one_model
+def test_dsv4_overlap_headroom_gate(model_type, pp_size, disable_overlap, expected):
     mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
 
-    assert (
-        should_enable_dsv4_overlap_headroom(model_type, spec_config, mapping, disable_overlap)
-        is expected
-    )
+    assert should_enable_dsv4_overlap_headroom(model_type, mapping, disable_overlap) is expected
 
 
 @pytest.mark.parametrize(
