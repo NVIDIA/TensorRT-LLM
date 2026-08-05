@@ -260,8 +260,10 @@ class TestWarmupCleanup(unittest.TestCase):
                 batch_size=16,
                 max_seq_len=2,
                 original_max_draft_len=0,
-                mapping=SimpleNamespace(tp_size=1),
+                max_total_draft_tokens=0,
+                mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 is_draft_model=False,
+                guided_decoder=None,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
                 _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
@@ -283,7 +285,12 @@ class TestWarmupCleanup(unittest.TestCase):
 
         self.assertEqual(
             calls,
-            ["flashinfer_autotune_enter", "forward", "flashinfer_autotune_exit"],
+            [
+                "flashinfer_autotune_enter",
+                "forward",
+                "forward",
+                "flashinfer_autotune_exit",
+            ],
         )
         self.assertEqual(method.backend, "auto")
         self.assertTrue(method._flashinfer_autotuned)
