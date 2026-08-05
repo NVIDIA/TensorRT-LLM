@@ -159,8 +159,9 @@ UncommittedPage::~UncommittedPage()
         if (!isSsm)
         {
             bool blockRemoved = kvCache->blocks().size() <= ordinal;
+            bool beamRemoved = !blockRemoved && kvCache->blocks()[ordinal].pages.size() <= beamIndex;
             bool pageOk = true;
-            if (!blockRemoved)
+            if (!blockRemoved && !beamRemoved)
             {
                 auto const& bp = kvCache->blocks()[ordinal].pages[beamIndex][lifeCycle];
                 // Raw pointers only: in the self-destruction case below the slot still
@@ -175,8 +176,8 @@ UncommittedPage::~UncommittedPage()
                 pageOk = slotPage == nullptr || slotPage == this
                     || dynamic_cast<CommittedPage const*>(slotPage) != nullptr;
             }
-            KVCM2_CHECK_FATAL_WITH_INFO(
-                blockRemoved || pageOk, "UncommittedPage destroyed but slot still holds a different uncommitted page");
+            KVCM2_CHECK_FATAL_WITH_INFO(blockRemoved || beamRemoved || pageOk,
+                "UncommittedPage destroyed but slot still holds a different uncommitted page");
         }
     }
     // Delegate slot release to Page::~Page().
