@@ -373,19 +373,20 @@ def processScanResults(ref) {
                 if (result.status == "unstable") {
                     echo "New risks detected: ${result.detail}"
                     if (result.detected_licenses) {
-                        def colWidths = [scan_type: 9, dependency_name: 15, license: 7, corrected_license: 17]
+                        def colWidths = [scan_type: 9, dependency_name: 15, license: 7, corrected_license: 17, is_nvidia_proprietary: 17]
                         result.detected_licenses.each { entry ->
-                            colWidths.scan_type         = Math.max(colWidths.scan_type,         entry.scan_type.toString().length())
-                            colWidths.dependency_name   = Math.max(colWidths.dependency_name,   entry.dependency_name.toString().length())
-                            colWidths.license           = Math.max(colWidths.license,           entry.license.toString().length())
-                            colWidths.corrected_license = Math.max(colWidths.corrected_license, entry.corrected_license.toString().length())
+                            colWidths.scan_type             = Math.max(colWidths.scan_type,             entry.scan_type.toString().length())
+                            colWidths.dependency_name       = Math.max(colWidths.dependency_name,       entry.dependency_name.toString().length())
+                            colWidths.license               = Math.max(colWidths.license,               entry.license.toString().length())
+                            colWidths.corrected_license     = Math.max(colWidths.corrected_license,     entry.corrected_license.toString().length())
+                            colWidths.is_nvidia_proprietary = Math.max(colWidths.is_nvidia_proprietary, entry.is_nvidia_proprietary.toString().length())
                         }
-                        def sep  = "+-${'-' * colWidths.scan_type}-+-${'-' * colWidths.dependency_name}-+-${'-' * colWidths.license}-+-${'-' * colWidths.corrected_license}-+-${'-' * 11}-+"
+                        def sep  = "+-${'-' * colWidths.scan_type}-+-${'-' * colWidths.dependency_name}-+-${'-' * colWidths.license}-+-${'-' * colWidths.corrected_license}-+-${'-' * 11}-+-${'-' * colWidths.is_nvidia_proprietary}-+"
                         def rows = [sep,
-                                    "| ${'SCAN TYPE'.padRight(colWidths.scan_type)} | ${'DEPENDENCY NAME'.padRight(colWidths.dependency_name)} | ${'LICENSE'.padRight(colWidths.license)} | ${'CORRECTED LICENSE'.padRight(colWidths.corrected_license)} | IS PERMISSIVE |",
+                                    "| ${'SCAN TYPE'.padRight(colWidths.scan_type)} | ${'DEPENDENCY NAME'.padRight(colWidths.dependency_name)} | ${'LICENSE'.padRight(colWidths.license)} | ${'CORRECTED LICENSE'.padRight(colWidths.corrected_license)} | IS PERMISSIVE | ${'IS NV PROPRIETARY'.padRight(colWidths.is_nvidia_proprietary)} |",
                                     sep]
                         result.detected_licenses.each { entry ->
-                            rows << "| ${entry.scan_type.toString().padRight(colWidths.scan_type)} | ${entry.dependency_name.toString().padRight(colWidths.dependency_name)} | ${entry.license.toString().padRight(colWidths.license)} | ${entry.corrected_license.toString().padRight(colWidths.corrected_license)} | ${entry.is_permissive.toString().padRight(13)} |"
+                            rows << "| ${entry.scan_type.toString().padRight(colWidths.scan_type)} | ${entry.dependency_name.toString().padRight(colWidths.dependency_name)} | ${entry.license.toString().padRight(colWidths.license)} | ${entry.corrected_license.toString().padRight(colWidths.corrected_license)} | ${entry.is_permissive.toString().padRight(13)} | ${entry.is_nvidia_proprietary.toString().padRight(colWidths.is_nvidia_proprietary)} |"
                         }
                         rows << sep
                         echo "Non-permissive licenses detected:\n${rows.join('\n')}"
@@ -455,7 +456,7 @@ pipeline {
                     }
                     steps {
                         script {
-                            generateLockFiles(env.LLM_REPO, env.REF)
+                            // generateLockFiles(env.LLM_REPO, env.REF)
                             pulseScanSourceCode(env.LLM_REPO, env.REF)
                         }
                     }
