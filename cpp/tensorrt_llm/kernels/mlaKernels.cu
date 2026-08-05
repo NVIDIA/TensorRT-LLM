@@ -162,16 +162,19 @@ inline __device__ void quantCopy(
 // NUM=4 (4B), T=bf16/half gives NUM=8 (8B); 16 is here for completeness.
 template <int BYTES>
 struct Fp8StoreVec;
+
 template <>
 struct Fp8StoreVec<4>
 {
     using Type = uint32_t;
 };
+
 template <>
 struct Fp8StoreVec<8>
 {
     using Type = uint2;
 };
+
 template <>
 struct Fp8StoreVec<16>
 {
@@ -2001,18 +2004,7 @@ void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_c
     // Sizing the grid to cover the SMs instead (divUp(rows, sm_count)) picks 1 at
     // batch 32 and 8 at batch 224, i.e. the slower option at both ends: the kernel
     // is latency-bound, not occupancy-bound, so SM coverage is the wrong knob.
-    // `TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK` pins it for re-tuning.
-    // `getIntEnv` is uncached, unlike `getEnvEnablePDL`, so without the static this
-    // would getenv+stoi on every launch of every layer.
-    static int const rows_per_block = []
-    {
-        int rows = 4;
-        if (auto const env_rows = tensorrt_llm::common::getIntEnv("TRTLLM_MLA_KVNORM_GEN_ROWS_PER_BLOCK"))
-        {
-            rows = env_rows.value();
-        }
-        return std::min(std::max(rows, 1), 8);
-    }();
+    constexpr int rows_per_block = 4;
 
     // `seq_len` is 1 + MTP depth, so it is a power of two in every shipping config
     // (MTP0 -> 1, MTP1 -> 2, MTP3 -> 4). Pass a shift for that case so the kernel
