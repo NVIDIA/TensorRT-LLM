@@ -159,9 +159,10 @@ Eviction controller
 - `Block::prev`, `Block::storage`, `CommittedPage::block`, and page manager
   pointers are observer/back-reference links with lifetime invariants, not
   ownership. Explicit unlinking and teardown order keep them valid.
-- `Block::releasePages()` must run while `StorageManager` is alive. Do not defer
-  page reclamation solely to `Block` destruction: external block references can
-  outlive tree membership.
+- Orphan blocks may retain pages while a live `KvCache` still references them;
+  `Block::~Block()` reclaims those pages when the last block owner releases them.
+  Every `KvCache` must be closed before manager shutdown so this deferred cleanup
+  runs while `StorageManager` is still alive.
 
 ## Correctness invariants
 
@@ -215,7 +216,7 @@ Eviction controller
 - Keep C++ implementation sources co-located here and add every compiled source
   to this directory's `CMakeLists.txt`. The parent target consumes its source
   list; do not add a separate shared library for this subsystem.
-- SHA-256 support is vendored under `cpp/tensorrt_llm/batch_manager/common/sha256`
+- SHA-256 support is vendored under `cpp/tensorrt_llm/common/sha256`
   and configured by this directory's `CMakeLists.txt`. Preserve the
   architecture-specific SHA extension flags when changing the hash integration.
   Do not add OpenSSL/libcrypto merely for block hashing; avoiding that dependency

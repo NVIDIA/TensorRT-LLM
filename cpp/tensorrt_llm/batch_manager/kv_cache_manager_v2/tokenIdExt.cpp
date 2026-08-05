@@ -256,7 +256,7 @@ Digest const& TokenIdExt::digest() const
     return DigestPool::instance().get(digestIndex());
 }
 
-bool TokenIdExt::operator==(TokenIdExt const& other) const noexcept
+bool TokenIdExt::operator==(TokenIdExt const& other) const
 {
     if (mBits == other.mBits)
     {

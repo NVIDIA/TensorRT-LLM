@@ -284,7 +284,7 @@ namespace
 
 // Takes raw (ptr, size) so it works uniformly over any TokenIdExt buffer
 // (the query vector and the std::vector<TokenIdExt> that backs Block::tokens).
-static bool isPrefix(TokenIdExt const* prefix, size_t prefixLen, TokenIdExt const* full, size_t fullLen)
+bool isPrefix(TokenIdExt const* prefix, size_t prefixLen, TokenIdExt const* full, size_t fullLen)
 {
     if (prefixLen > fullLen)
         return false;
@@ -593,7 +593,7 @@ SharedPtr<Block> removeSubtree(Block& root)
         }
         else
         {
-            // Remove this block from its parent.s next map and null prev to detach it.
+            // Remove this block from its parent's next map and null prev to detach it.
             NodeBase* parent = current->prev;
             BlockKey const currentKey = current->key;
             auto detached = parent->detachNext(currentKey);
@@ -628,7 +628,7 @@ BlockRadixTree::BlockRadixTree(
 
 BlockRadixTree::~BlockRadixTree()
 {
-    // Clear all roots (which will drop all blocks).
+    // Clear all roots (which will drop all blocks without external owners).
     mRoots.clear();
 }
 

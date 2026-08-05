@@ -54,6 +54,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         TokenIdExt,
         _introspection,
         _KVCache,
+        gen_multimodal_cache_key_tokens,
     )
     from kv_cache_manager_v2._block_radix_tree import Hasher
     from kv_cache_manager_v2._common import (
@@ -107,6 +108,7 @@ else:
         TokenIdExt,
         _introspection,
         _KVCache,
+        gen_multimodal_cache_key_tokens,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import Hasher
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
@@ -4270,6 +4272,11 @@ class TestBlockKeyHashing(unittest.TestCase):
         block = [randbytes(32), 5, 6, randbytes(32)] + list(range(20))
         seed = b"\x01"
         self.assertEqual(Hasher(seed).update(block).digest, self._ref_update(seed, block))
+
+    def test_multimodal_digest_requires_sha256_length(self) -> None:
+        for digest_size in (31, 33):
+            with self.subTest(digest_size=digest_size), self.assertRaises(ValueError):
+                gen_multimodal_cache_key_tokens(100, bytes(digest_size), 1)
 
 
 if __name__ == "__main__":

@@ -128,9 +128,9 @@ public:
 
     // Value equality: normal/tag-mismatch compare raw bits; digest-vs-digest
     // compares the pooled 32 bytes (equal content in different slots is equal).
-    bool operator==(TokenIdExt const& other) const noexcept;
+    bool operator==(TokenIdExt const& other) const;
 
-    bool operator!=(TokenIdExt const& other) const noexcept
+    bool operator!=(TokenIdExt const& other) const
     {
         return !(*this == other);
     }

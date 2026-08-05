@@ -259,7 +259,7 @@ class KVCacheManager:
         self._init_config = config
         self._life_cycles = LifeCycleRegistry(config)
         storage_config = create_storage_config(config)
-        self._storage = StorageManager(
+        storage = StorageManager(
             self._life_cycles,
             storage_config,
             config.tokens_per_block,
@@ -270,7 +270,9 @@ class KVCacheManager:
             event_manager=event_manager,
             max_util_for_resume=config.max_util_for_resume,
         )
-        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
+        radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
+        self._storage = storage
+        self._radix_tree = radix_tree
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
@@ -295,8 +297,14 @@ class KVCacheManager:
         self.shutdown()
 
     def shutdown(self) -> None:
-        self.clear_reusable_blocks()
-        self._storage.destroy()
+        # A failed constructor may leave either owner unset. Release tree pages
+        # before destroying storage whenever the corresponding objects exist.
+        radix_tree = getattr(self, "_radix_tree", None)
+        if radix_tree is not None:
+            radix_tree.clear()
+        storage = getattr(self, "_storage", None)
+        if storage is not None:
+            storage.destroy()
 
     def clear_reusable_blocks(self) -> None:
         self._radix_tree.clear()
