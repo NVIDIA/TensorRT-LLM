@@ -1105,6 +1105,10 @@ class ModelLoader:
                 # perturb NVLink barrier synchronization in multi-rank DG init.
                 torch.cuda.empty_cache()
 
+        metrics = ", ".join(f"{name}={value:.4f}"
+                            for name, value in self._metrics.items())
+        logger.info(
+            f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
         return model, moe_load_balancer
 
     def _check_gms_source_identity(self, gms_backend) -> None:

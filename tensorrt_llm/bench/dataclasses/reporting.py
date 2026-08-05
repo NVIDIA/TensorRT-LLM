@@ -257,6 +257,20 @@ class StatsKeeper:
 class ReportUtility:
     """A utility for reporting statistics."""
 
+    @staticmethod
+    def _format_startup_metrics(
+            startup_metrics: Optional[Dict[str, Any]]) -> str:
+        """Format startup metrics for terminal output."""
+        if not startup_metrics:
+            return ""
+
+        metric_lines = "".join(f"{name}: {value:.4f}\n"
+                               for name, value in startup_metrics.items())
+        return ("===========================================================\n"
+                "= STARTUP METRICS\n"
+                "===========================================================\n"
+                f"{metric_lines}\n")
+
     def __init__(self,
                  statistics: StatsKeeper,
                  dataset_metadata: DatasetMetadata,
@@ -642,6 +656,8 @@ class ReportUtility:
         perf = stats_dict["performance"]
         streaming = stats_dict.get("streaming_metrics")
         decoding = stats_dict.get("decoding_stats", None)
+        startup_metrics_info = self._format_startup_metrics(
+            stats_dict.get("startup_metrics"))
 
         backend_info = ""
         if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
@@ -853,6 +869,7 @@ class ReportUtility:
                 )
 
         logging_info = (f"{backend_info}"
+                        f"{startup_metrics_info}"
                         f"{machine_info}"
                         f"{request_info}"
                         f"{world_info}"

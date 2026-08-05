@@ -18,7 +18,7 @@ from unittest import mock
 
 import pytest
 
-from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
+from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.bench.utils.data import (
@@ -38,6 +38,20 @@ class _FakeTokenizer:
 
     def encode(self, text, **kwargs):
         return list(range(len(text.split())))
+
+
+def test_format_startup_metrics() -> None:
+    output = ReportUtility._format_startup_metrics(
+        {
+            "checkpoint_preparation_seconds": 1.25,
+            "total_model_loading_seconds": 2.5,
+        }
+    )
+
+    assert "= STARTUP METRICS\n" in output
+    assert "checkpoint_preparation_seconds: 1.2500\n" in output
+    assert "total_model_loading_seconds: 2.5000\n" in output
+    assert ReportUtility._format_startup_metrics({}) == ""
 
 
 def test_empty_stream_raises_dataset_format_error():

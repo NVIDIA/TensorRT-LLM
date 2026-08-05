@@ -485,7 +485,7 @@ def throughput_command(
             "max_num_tokens", runtime_config.settings_config.max_num_tokens)
 
         llm = get_llm(runtime_config, kwargs)
-        startup_metrics = None if options.report_json is None else llm.startup_metrics
+        startup_metrics = llm.startup_metrics
 
         sampler_args = {
             "end_id": options.eos_id,
