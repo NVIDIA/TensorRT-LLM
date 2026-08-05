@@ -122,6 +122,15 @@ BILATERAL_SIGMA_COLOR = 150  # color-space sigma
 BILATERAL_SIGMA_SPACE = 100  # coordinate-space sigma
 BILATERAL_ITERATIONS = 1  # number of bilateral passes
 
+# Control generation is batched over frames, so unwindowed its scratch scales
+# with the whole clip: a 189-frame 704p clip peaked at 7.5 GiB for edge and
+# 10.2 GiB for blur before denoising had allocated anything. No kernel reaches
+# across the temporal axis, so a bounded window is bitwise identical and makes
+# the scratch O(window) rather than O(clip). Measured at 704p: 32 frames holds
+# both under 3.4 GiB for +5% (edge) / +0.7% (blur) wall time, and still gives
+# the kernels enough parallelism to saturate the GPU.
+CONTROL_FRAME_WINDOW = 32
+
 
 @dataclass
 class Cosmos3TransferHint:
@@ -403,8 +412,12 @@ def make_edge_control(frames: torch.Tensor, preset: str) -> torch.Tensor:
         lower, upper = EDGE_PRESETS[preset]
     except KeyError as exc:
         raise ValueError(f"Unsupported Cosmos3 edge preset: {preset!r}.") from exc
-    edge = canny_edges(frames.contiguous(), lower, upper)
-    return edge[None].expand(3, -1, -1, -1).contiguous()
+    edges = torch.empty_like(frames)
+    for start in range(0, frames.shape[1], CONTROL_FRAME_WINDOW):
+        stop = min(start + CONTROL_FRAME_WINDOW, frames.shape[1])
+        # assigning [t, H, W] into [3, t, H, W] broadcasts the map across RGB
+        edges[:, start:stop] = canny_edges(frames[:, start:stop].contiguous(), lower, upper)
+    return edges
 
 
 def _scale_for_bilateral_resolution(value: float, longest_side: int) -> float:
@@ -440,25 +453,32 @@ def make_blur_control(frames: torch.Tensor, preset: str) -> torch.Tensor:
     if preset == "none":
         return frames.clone()
 
-    _, _, h, w = frames.shape
+    _, t, h, w = frames.shape
     blur_params = BLUR_PRESETS[preset]
     pre_blur_factor = max(1, int(blur_params["pre_blur_downscale"]))
     downup_factor = max(1, int(blur_params["downup"]))
 
-    # The kernels are channels-last, so permute once for the whole clip rather
-    # than per frame.
-    result = frames.permute(1, 2, 3, 0).contiguous()
-    if pre_blur_factor > 1:
-        result = resize_area_u8(result, pre_blur_factor)
-    diameter, sigma_color, sigma_space = _scaled_bilateral_params(result.shape[1], result.shape[2])
-    for _ in range(BILATERAL_ITERATIONS):
-        result = bilateral_filter(result, diameter, sigma_color, sigma_space)
-    if pre_blur_factor > 1:
-        result = resize_linear_u8(result, w, h)
-    if downup_factor > 1:
-        result = resize_cubic_u8(result, max(1, w // downup_factor), max(1, h // downup_factor))
-        result = resize_cubic_u8(result, w, h)
-    return result.permute(3, 0, 1, 2).contiguous()
+    blurred = torch.empty_like(frames)
+    for start in range(0, t, CONTROL_FRAME_WINDOW):
+        stop = min(start + CONTROL_FRAME_WINDOW, t)
+        # The kernels are channels-last, so permute once per window rather than
+        # per frame; windowing the whole chain also bounds the tensors handed
+        # between its stages, not just each stage's own scratch.
+        result = frames[:, start:stop].permute(1, 2, 3, 0).contiguous()
+        if pre_blur_factor > 1:
+            result = resize_area_u8(result, pre_blur_factor)
+        diameter, sigma_color, sigma_space = _scaled_bilateral_params(
+            result.shape[1], result.shape[2]
+        )
+        for _ in range(BILATERAL_ITERATIONS):
+            result = bilateral_filter(result, diameter, sigma_color, sigma_space)
+        if pre_blur_factor > 1:
+            result = resize_linear_u8(result, w, h)
+        if downup_factor > 1:
+            result = resize_cubic_u8(result, max(1, w // downup_factor), max(1, h // downup_factor))
+            result = resize_cubic_u8(result, w, h)
+        blurred[:, start:stop] = result.permute(3, 0, 1, 2)
+    return blurred
 
 
 def load_or_compute_control_frames(

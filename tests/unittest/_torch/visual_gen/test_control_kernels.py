@@ -20,6 +20,7 @@ import torch
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
+from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     BLUR_PRESETS,
     EDGE_PRESETS,
@@ -206,6 +207,22 @@ class TestTransferControlGeneration:
         for preset in ("low", "medium", "high"):
             blurred = make_blur_control(frames, preset).to(torch.float32)
             assert blurred.var().item() < sharp.var().item()
+
+    @pytest.mark.parametrize("preset", ["medium", "high"])
+    def test_generation_is_window_invariant(self, preset, monkeypatch):
+        # Control generation is windowed to bound preprocessing memory. Frames
+        # are independent, so the window size is a memory/parallelism knob and
+        # must not move a single pixel -- if this fails, some kernel grew a
+        # dependency across the temporal axis.
+        frames = _clip(64, 128, t=5).permute(3, 0, 1, 2).contiguous()
+        monkeypatch.setattr(transfer_module, "CONTROL_FRAME_WINDOW", frames.shape[1])
+        edge_unwindowed = make_edge_control(frames, preset)
+        blur_unwindowed = make_blur_control(frames, preset)
+
+        for window in (1, 2, 4):
+            monkeypatch.setattr(transfer_module, "CONTROL_FRAME_WINDOW", window)
+            assert torch.equal(make_edge_control(frames, preset), edge_unwindowed)
+            assert torch.equal(make_blur_control(frames, preset), blur_unwindowed)
 
     @pytest.mark.parametrize("preset", ["nonsense", ""])
     def test_unknown_presets_raise(self, preset):
