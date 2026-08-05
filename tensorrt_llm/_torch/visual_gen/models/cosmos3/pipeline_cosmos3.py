@@ -65,6 +65,28 @@ COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolutio
 
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
+# ``W,H`` bucket names the reference builds requests from. A request there starts
+# as a (resolution, bucket) pair and the bucket string is carried into the prompt
+# verbatim; we only ever see the resolved height/width, so map back to the nearest
+# bucket. Emitting the exact reduced ratio instead would put a string the model
+# never saw in training into the caption (832x480 reduces to "15,26", not "16,9").
+COSMOS3_ASPECT_RATIO_BUCKETS = ("1,1", "4,3", "3,4", "16,9", "9,16")
+
+
+def _aspect_ratio_bucket(height: int, width: int) -> str:
+    """Nearest reference aspect-ratio bucket for a resolved frame size."""
+    if height <= 0 or width <= 0:
+        raise ValueError(
+            f"Cosmos3 aspect ratio needs positive dimensions, got height={height}, width={width}."
+        )
+    ratio = width / height
+    return min(
+        COSMOS3_ASPECT_RATIO_BUCKETS,
+        key=lambda bucket: abs(
+            math.log(ratio / (int(bucket.split(",")[0]) / int(bucket.split(",")[1])))
+        ),
+    )
+
 
 def _validate_sampling_recipe(family: str, use_native_flow_schedule: bool, sampling) -> None:
     """Family, model_index schedule flag, and scheduler recipe must form a
@@ -584,16 +606,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     if duration_template is not None and (
                         num_frames > 1 or force_duration_template
                     ):
-                        duration = num_frames / frame_rate
-                        data["duration"] = f"{duration:.1f}s"
-                        data["fps"] = (
-                            int(frame_rate) if frame_rate == int(frame_rate) else frame_rate
-                        )
+                        data["duration"] = f"{int(num_frames / frame_rate)}s"
+                        data["fps"] = float(frame_rate)
+                    else:
+                        # A still carries no duration: drop whatever the caller's
+                        # JSON declared rather than leaving it stale.
+                        data.pop("duration", None)
+                        data.pop("fps", None)
                     if resolution_template is not None:
-                        data["resolution"] = {"W": width, "H": height}
-                        divisor = math.gcd(height, width)
-                        data["aspect_ratio"] = f"{height // divisor},{width // divisor}"
-                    return json.dumps(data, ensure_ascii=False)
+                        data["resolution"] = {"H": int(height), "W": int(width)}
+                        data["aspect_ratio"] = _aspect_ratio_bucket(height, width)
+                    return json.dumps(data)
 
         return self._apply_metadata_templates(
             prompt,
