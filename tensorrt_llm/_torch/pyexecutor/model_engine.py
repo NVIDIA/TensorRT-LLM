@@ -3700,11 +3700,11 @@ class PyTorchModelEngine(ModelEngine):
         filled = layout.fill_bucket(max_verify_len=1 + int(draft_len))
         for request, tokens in zip(requests, filled.verify_lens.tolist()):
             request.py_verify_len = int(tokens) - 1
-        # Publish it to the runner as well: the graph key re-derives its token
-        # axis from the batch (`_ragged_verify_bucket`), but the layout assert
-        # cross-checks that against `agreed_ragged_bucket` -- the fit's claim --
-        # and during capture nothing else sets it, because the runtime fit
-        # never runs here. Before this line existed the capture-time key's
+        # Publish it to the runner as well: the graph key carries this value
+        # (`_ragged_verify_bucket` returns the fit's claim so every
+        # attention-DP rank keys identically), and the layout assert
+        # cross-checks it against the batch walk. During capture nothing else
+        # sets it, because the runtime fit never runs here. Before this line existed the capture-time key's
         # token axis was None while the batch really held `verify_bucket`
         # tokens, and the mismatch surfaced far away, in the MoE's
         # shared-vs-routed row count, as `unmatched tensor shape` two graphs
@@ -3912,10 +3912,10 @@ class PyTorchModelEngine(ModelEngine):
         # trim_ratio went negative in four runs. Only the caller can reconcile
         # them, and it cannot do that without this number.
         self._dspark_last_padded_bs = int(padded_bs)
-        # The fit's agreed value; the graph key re-derives its token axis
-        # from the padded batch and the layout assert cross-checks the two
-        # derivations against each other. Both used to be derived
-        # independently WITHOUT that check --
+        # The fit's agreed value, which the graph key carries verbatim so
+        # every attention-DP rank keys on a number they agreed on; the layout
+        # assert cross-checks it against the batch walk. Both used to be
+        # derived independently WITHOUT that check --
         # the key walked generation_requests *after* padding was
         # appended, while the fit worked from the allgathered peer
         # stats -- so their agreement across attention-DP ranks was

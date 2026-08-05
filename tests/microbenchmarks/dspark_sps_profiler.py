@@ -167,7 +167,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import random
+import re
 import statistics
 import sys
 import threading
@@ -177,8 +179,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .dspark_observability import RAGGED_VERIFY_MODE_ENV, RaggedVerifyMode
-from .dspark_planner import (
+from tensorrt_llm._torch.speculative.dspark_observability import RAGGED_VERIFY_MODE_ENV, RaggedVerifyMode
+from tensorrt_llm._torch.speculative.dspark_planner import (
     SpsCostTable,
     budget_argmax_over_uniform_lens,
     derive_verify_len_tiers,
@@ -1192,15 +1194,17 @@ def _build_llm(config: SweepConfig, verify_len: int):
     # (An earlier revision popped it and relied on the one-rung ladder alone,
     # citing a "pin skips the padding reservation" theory for the Repeat.cu
     # assert. That theory was wrong -- the assert reproduced with no pin at
-    # all; the actual cause was the CUDA-graph key returning the PREDICTED
-    # bucket rather than the batch's measured token total, fixed in
-    # cuda_graph_runner._ragged_verify_bucket. And the one-rung ladder was
+    # all; the actual cause was the CUDA-graph key describing a
+    # different token width than the batch carried. The key publishes the
+    # fit's bucket (so attention-DP ranks agree by construction) and the
+    # layout assert cross-checks it against the batch walk; a divergence now
+    # has to show up there rather than inside a replayed graph. And the one-rung ladder was
     # never one rung anyway: the llm_args validator appends max_draft_len, so
     # under a constant block [L] is really [L, block]. With a seed table
     # present the planner argmax'd its way to the block on 93-95% of steps
     # while the samples file recorded M = bs*(L+1) as if L had run -- twelve
     # cells, eight mislabelled, and the fit dutifully concluded q ~ 0.)
-    from .dspark_verify import FORCE_VERIFY_LEN_ENV
+    from tensorrt_llm._torch.speculative.dspark_verify import FORCE_VERIFY_LEN_ENV
 
     # LAUNCH-MODE CAVEAT: this mutation reaches ranks 1..N-1 only when the
     # workers are spawned AFTER it (MPI-spawn path). On a pre-spawned world
@@ -1471,6 +1475,37 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--out", required=True, help="Path to write the cost-table JSON.")
+    source = parser.add_argument_group(
+        "sample source",
+        "Where the (batch size, verify length, step time) triples come from. "
+        "Default: build an engine in-process and sweep it. The two "
+        "alternatives measure the deployment itself, so the table cannot "
+        "describe a configuration nobody is running.")
+    source.add_argument(
+        "--from-iter-log", nargs="+", metavar="LOG",
+        help="Fit from production iteration logs (print_iter_log). No server, "
+             "no traffic, no machine time; coverage is whatever the "
+             "deployment happened to run.")
+    source.add_argument(
+        "--base-url",
+        help="Sweep a RUNNING trtllm-serve instead of building an engine. The "
+             "verify length is pinned over /dspark/verify_len_pin, so walking "
+             "the ladder costs no engine rebuild.")
+    source.add_argument("--server-settle-s", type=float, default=20.0,
+                        help="Seconds to let admission reach the plateau "
+                             "before a cell is measured (--base-url).")
+    source.add_argument("--server-poll-s", type=float, default=20.0,
+                        help="Seconds of steady state to collect per cell "
+                             "(--base-url).")
+    source.add_argument("--served-model-name", default="model",
+                        help="`model` field for /v1/completions (--base-url).")
+    source.add_argument(
+        "--cuda-graph-batch-sizes",
+        help="The deployment's captured batch-size ladder, comma separated "
+             "(--from-iter-log). Padding rounds a step's rows up to the "
+             "smallest entry at or above them, which is what makes the padded "
+             "token total resolve to exactly one verify length. Omit and only "
+             "steps whose shape is unambiguous on its own are kept.")
     parser.add_argument(
         "--samples-out",
         default=None,
@@ -1632,6 +1667,263 @@ def _write_samples(path: str, samples: Sequence[StepSample]) -> None:
             handle.write(json.dumps(sample.to_json()) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# Alternative sample sources
+#
+# The in-process sweep below builds its own engine per verify length. That
+# gives total control, and costs a rebuild per length plus a configuration
+# that has to be kept in sync with the deployment by hand -- when it drifts,
+# the table describes a machine nobody is running (a profiled (256, 1536) cell
+# read 150.2 ms against 118.8 ms measured live at the same shape, and nothing
+# in the fingerprint recorded the difference).
+#
+# These two collectors take the measurement to the deployment instead.
+# ---------------------------------------------------------------------------
+
+
+def resolve_padded_shape(
+    *,
+    num_rows: int,
+    num_generation_tokens: int,
+    max_draft_len: int,
+    max_batch_size: int,
+    padded_batch_sizes: Optional[Sequence[int]] = None,
+) -> Optional[Tuple[int, int]]:
+    """Recover ``(padded_bs, verify_len)`` from a step's row and token counts.
+
+    The token total is the PADDED one: a step with 244 real rows submits
+    ``256 * (L + 1)`` tokens because the batch is padded up to a captured
+    graph size, and it is that padded shape the step actually cost. So the
+    length cannot be read off the real row count -- ``M / rows`` is not even
+    integral -- and a filter that demands it throws away nearly every step (it
+    kept 312 of 5682 on two production runs).
+
+    Every candidate length implies a padded row count; the answer is the one
+    that is integral, at least the real row count, and within the engine's
+    batch ceiling. Ambiguous steps are rejected rather than guessed: filing a
+    step under a shape it did not run is the mislabelling that once produced a
+    clean-looking, entirely fictional table.
+    """
+    if num_rows <= 0 or num_generation_tokens <= 0:
+        return None
+    ladder = (sorted({int(b) for b in padded_batch_sizes})
+              if padded_batch_sizes else None)
+    if ladder:
+        # Padding rounds UP to the smallest captured batch size, never past
+        # it, so the row count alone fixes the padded width and the length
+        # follows. Without this the low-occupancy steps are genuinely
+        # ambiguous -- 768 tokens over 128 rows is L=5 at 128 rows, L=3 at
+        # 192, or L=2 at 256 -- and all of them would be dropped.
+        candidates = [b for b in ladder if b >= num_rows]
+        if not candidates:
+            return None
+        padded_bs = candidates[0]
+        if num_generation_tokens % padded_bs:
+            # Padding declined (a resource bail), so the step ran its real
+            # rows and this width does not describe it. Skip rather than
+            # invent one.
+            return None
+        verify_len = num_generation_tokens // padded_bs - 1
+        if not 0 < verify_len <= int(max_draft_len):
+            return None
+        return (padded_bs, verify_len)
+    found: List[Tuple[int, int]] = []
+    for verify_len in range(1, int(max_draft_len) + 1):
+        width = verify_len + 1
+        if num_generation_tokens % width:
+            continue
+        padded_bs = num_generation_tokens // width
+        if padded_bs < num_rows or padded_bs > int(max_batch_size):
+            continue
+        if ladder is not None and padded_bs not in ladder:
+            continue
+        found.append((padded_bs, verify_len))
+    return found[0] if len(found) == 1 else None
+
+
+def samples_from_iter_log(
+    paths: Sequence[str],
+    *,
+    max_draft_len: int,
+    max_batch_size: int = 256,
+    padded_batch_sizes: Optional[Sequence[int]] = None,
+    rank_prefix: str = "0:",
+    max_step_ms: float = 1000.0,
+) -> List[StepSample]:
+    """Read (bs, M, step time) triples out of production iteration logs.
+
+    ``print_iter_log`` already emits everything a cell needs::
+
+        iter = N, ..., num_scheduled_requests = R, ...,
+        host_step_time = T ms, ..., states = {..., 'num_generation_tokens': M}
+
+    so a table can be fitted from traffic that really ran, at the deployment's
+    own context depths, batch mix and captured-graph set -- no synthetic
+    prompts, no second engine, no machine time. The limitation is coverage:
+    only shapes the deployment happened to run appear, and rarely-taken rungs
+    may be thin. Use it to fit a table for a workload that is already in
+    production, or to check that a swept table has not drifted; use the server
+    sweep when specific cells have to be visited on purpose.
+
+    ``verify_len`` is recovered by :func:`resolve_padded_shape`, which reads it
+    out of the padded token total instead of assuming it; steps whose shape is
+    ambiguous are skipped rather than filed under a length they did not run.
+    Samples carry the PADDED row count, because that is the shape whose cost
+    was measured.
+
+    Pass ``padded_batch_sizes`` (the deployment's CUDA-graph ladder) when it is
+    known: it removes the last ambiguity, since only a captured row count can
+    have run.
+    """
+    line_re = re.compile(
+        r"iter = (\d+).*?num_scheduled_requests = (\d+).*?"
+        r"host_step_time = ([\d.]+)ms.*?'num_generation_tokens': (\d+)")
+    out: List[StepSample] = []
+    skipped_ratio = 0
+    for path in paths:
+        text = pathlib.Path(path).read_text(errors="replace")
+        for line in text.splitlines():
+            if "iter = " not in line:
+                continue
+            if rank_prefix and not line.lstrip().startswith(rank_prefix):
+                continue
+            match = line_re.search(line)
+            if not match:
+                continue
+            iteration = int(match.group(1))
+            batch_size = int(match.group(2))
+            step_ms = float(match.group(3))
+            tokens = int(match.group(4))
+            if iteration == 1:
+                # Each executor instance numbers from 1, and its first step
+                # carries the wait for the first request inside its host time
+                # (62 s on a live server). Identify it by the number rather
+                # than by having seen one, so a log FRAGMENT is still usable.
+                continue
+            if batch_size <= 0 or step_ms >= max_step_ms:
+                continue
+            shape = resolve_padded_shape(
+                num_rows=batch_size, num_generation_tokens=tokens,
+                max_draft_len=max_draft_len, max_batch_size=max_batch_size,
+                padded_batch_sizes=padded_batch_sizes)
+            if shape is None:
+                skipped_ratio += 1
+                continue
+            padded_bs, verify_len = shape
+            out.append(StepSample(batch_size=padded_bs, verify_len=verify_len,
+                                  step_time_ms=step_ms, iteration=iteration))
+    if skipped_ratio:
+        print(f"[dspark-sps] iter-log: skipped {skipped_ratio} steps whose "
+              f"padded shape could not be resolved unambiguously",
+              file=sys.stderr)
+    return out
+
+
+def samples_from_server(
+    *,
+    base_url: str,
+    batch_sizes: Sequence[int],
+    verify_lens: Sequence[int],
+    input_len: int,
+    max_tokens: int,
+    model: str,
+    warmup_steps: int,
+    settle_s: float,
+    poll_s: float,
+    max_draft_len: int,
+    seed: int,
+    padded_batch_sizes: Optional[Sequence[int]] = None,
+) -> List[StepSample]:
+    """Sweep a RUNNING server: pin the window over HTTP, then read /metrics.
+
+    The equivalent of SGLang's profiler loop, and the reason
+    ``/dspark/verify_len_pin`` exists: walking the verify-length ladder no
+    longer costs an engine rebuild per rung, and the engine being measured is
+    by construction the engine that will consume the table.
+
+    Load is synthetic (random token ids, ignore_eos) because a cell has to hold
+    a fixed batch size for long enough to measure it; the SHAPE is what the
+    table indexes, and the deployment's own graphs, context depths and
+    scheduler are what answer for it.
+    """
+    import requests
+
+    rng = random.Random(seed)
+    out: List[StepSample] = []
+
+    def pin(verify_len: Optional[int]) -> None:
+        response = requests.post(f"{base_url}/dspark/verify_len_pin",
+                                 json={"verify_len": verify_len}, timeout=60)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"pinning verify_len={verify_len} was refused by the server: "
+                f"{response.status_code} {response.text}")
+
+    def drain_metrics() -> List[dict]:
+        response = requests.get(f"{base_url}/metrics", timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else [payload]
+
+    try:
+        for verify_len in sorted(verify_lens):
+            pin(int(verify_len))
+            for batch_size in sorted(batch_sizes):
+                prompts = [[rng.randrange(1000, 30000) for _ in range(input_len)]
+                           for _ in range(int(batch_size))]
+                bodies = [{"model": model, "prompt": p, "max_tokens": max_tokens,
+                           "temperature": 0.0, "ignore_eos": True, "stream": False}
+                          for p in prompts]
+                threads = [threading.Thread(
+                    target=lambda b=b: requests.post(
+                        f"{base_url}/v1/completions", json=b, timeout=3600),
+                    daemon=True) for b in bodies]
+                for thread in threads:
+                    thread.start()
+                time.sleep(settle_s)          # let admission reach the plateau
+                drain_metrics()               # discard the ramp
+                time.sleep(poll_s)
+                rows = drain_metrics()
+                # The length is NOT read back from telemetry: /metrics carries
+                # no generation-token count (iter_states reaches the log line
+                # only), and it does not need to -- the sweep pinned it, and
+                # the pin is refused by the server if it could not be honoured.
+                # The row count is what the step really ran; the padded width
+                # is resolved from the ladder when one was supplied, since a
+                # partly-filled batch costs what its captured shape costs.
+                #
+                # hostStepTimeMS, not iterLatencyMS: under the overlap
+                # scheduler the latter spans about two loops (base_worker says
+                # so where it publishes both), which would inflate every cell
+                # by roughly a factor of two.
+                kept = 0
+                for row in rows:
+                    rows_seen = int(row.get("numActiveRequests") or 0)
+                    step_ms = float(row.get("hostStepTimeMS") or 0.0)
+                    if rows_seen <= 0 or step_ms <= 0:
+                        continue
+                    padded_bs = rows_seen
+                    if padded_batch_sizes:
+                        wider = [int(b) for b in sorted(padded_batch_sizes)
+                                 if int(b) >= rows_seen]
+                        if not wider:
+                            continue
+                        padded_bs = wider[0]
+                    out.append(StepSample(batch_size=padded_bs,
+                                          verify_len=int(verify_len),
+                                          step_time_ms=step_ms))
+                    kept += 1
+                print(f"[dspark-sps] server bs={batch_size:>5} L={verify_len} "
+                      f"kept {kept - warmup_steps if kept > warmup_steps else 0}"
+                      f" steps", file=sys.stderr)
+                for thread in threads:
+                    thread.join(timeout=1.0)
+    finally:
+        # Never leave a served deployment pinned to a profiling window.
+        pin(None)
+    return out
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
 
@@ -1648,6 +1940,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise SystemExit("--fit-only requires --samples-in")
         samples = _load_samples(_str_list(args.samples_in))
         provenance = {"source": "refit", "samples_in": _str_list(args.samples_in)}
+    elif args.from_iter_log:
+        ladder = (_int_list(args.cuda_graph_batch_sizes)
+                  if args.cuda_graph_batch_sizes else None)
+        samples = samples_from_iter_log(
+            args.from_iter_log, max_draft_len=args.max_draft_len,
+            max_batch_size=max(ladder) if ladder else 256,
+            padded_batch_sizes=ladder)
+        if not samples:
+            raise SystemExit(
+                "no usable steps in the iteration logs. They must come from a "
+                "run with print_iter_log AND enable_iter_perf_stats enabled: "
+                "the token total lives in the `states` dict at the end of each "
+                "line, and without it a step cannot be filed under a cell.")
+        _write_samples(samples_out, samples)
+        print(f"[dspark-sps] {len(samples)} steps from "
+              f"{len(args.from_iter_log)} iteration log(s)", file=sys.stderr)
+        provenance = {"source": "iter_log", "logs": list(args.from_iter_log)}
+    elif args.base_url:
+        samples = samples_from_server(
+            base_url=args.base_url.rstrip("/"),
+            batch_sizes=batch_sizes,
+            verify_lens=verify_lens,
+            input_len=args.input_len,
+            max_tokens=max(64, int(args.measure_steps)),
+            model=args.served_model_name,
+            warmup_steps=args.warmup_steps,
+            settle_s=float(args.server_settle_s),
+            poll_s=float(args.server_poll_s),
+            max_draft_len=args.max_draft_len,
+            seed=args.seed,
+            padded_batch_sizes=(_int_list(args.cuda_graph_batch_sizes)
+                                if args.cuda_graph_batch_sizes else None))
+        if not samples:
+            raise SystemExit(
+                "the server sweep collected nothing. Check that /metrics "
+                "returns iteration stats (enable_iter_perf_stats) and that "
+                "/dspark/verify_len_pin exists on this build.")
+        _write_samples(samples_out, samples)
+        print(f"[dspark-sps] {len(samples)} steps from {args.base_url}",
+              file=sys.stderr)
+        provenance = {"source": "server_sweep", "base_url": args.base_url}
     else:
         if not args.model:
             raise SystemExit("--model is required unless --fit-only is used")

@@ -27,30 +27,32 @@ disagree about units, keys or the meaning of a token count, that test is where
 it shows up.
 """
 
+import importlib.util
 import json
+import pathlib
+import sys
 
 import numpy as np
 import pytest
 
 from tensorrt_llm._torch.speculative.dspark_planner import SpsCostTable, total_verify_tokens
-from tensorrt_llm._torch.speculative.dspark_sps_profiler import (
-    CellStat,
-    FlatCostTableError,
-    InertCostTableError,
-    InsufficientSamplesError,
-    StepSample,
-    SweepConfig,
-    SweepGeometryError,
-    aligned_steps_from_stats,
-    build_cost_table_payload,
-    check_table_is_informative,
-    compress_to_risers,
-    fit_additive_cost_model,
-    load_cost_table,
-    profitability_probe,
-    running_max,
-    summarize_cells,
-)
+# The profiler is a development tool under tests/microbenchmarks, not part of
+# the shipped package: nothing on the serving path imports it, and keeping a
+# 1.8k-line sweep driver inside tensorrt_llm/ would ship it to every user.
+# Load it by path so this test follows the file rather than an import root.
+_SPEC = importlib.util.spec_from_file_location(
+    "dspark_sps_profiler",
+    pathlib.Path(__file__).resolve().parents[4] / "microbenchmarks" /
+    "dspark_sps_profiler.py")
+_PROFILER = importlib.util.module_from_spec(_SPEC)
+# Registered BEFORE exec: @dataclass resolves annotations through
+# sys.modules[cls.__module__].__dict__, so a module executed without being
+# registered raises "'NoneType' object has no attribute '__dict__'" on its
+# first dataclass.
+sys.modules[_SPEC.name] = _PROFILER
+_SPEC.loader.exec_module(_PROFILER)
+
+globals().update({name: getattr(_PROFILER, name) for name in ('CellStat', 'FlatCostTableError', 'InertCostTableError', 'InsufficientSamplesError', 'StepSample', 'SweepConfig', 'SweepGeometryError', 'aligned_steps_from_stats', 'build_cost_table_payload', 'check_table_is_informative', 'compress_to_risers', 'fit_additive_cost_model', 'load_cost_table', 'profitability_probe', 'running_max', 'summarize_cells')})
 
 #: The exact set of keys ``dspark.py::_build_verify_planner`` reads. Anything
 #: else in the file is ignored by the loader, so the profiler must not rely on

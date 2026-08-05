@@ -2901,7 +2901,7 @@ class DSparkDecodingConfig(DecodingBaseConfig):
             raise ValueError(
                 "enable_ragged_verify=True requires a profiled cost table: pass "
                 "confidence_sps_table_path (produced by "
-                "`python -m tensorrt_llm._torch.speculative.dspark_sps_profiler`) "
+                "`python tests/microbenchmarks/dspark_sps_profiler.py`) "
                 "or confidence_sts_path. Without one the planner cannot compare "
                 "the cost of extra verify tokens against their expected "
                 "acceptance, so it declines to trim and every request receives "

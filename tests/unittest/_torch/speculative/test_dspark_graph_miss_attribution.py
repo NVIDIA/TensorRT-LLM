@@ -150,28 +150,43 @@ def test_graph_key_uses_the_agreed_bucket_not_a_fresh_sum():
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
         CUDAGraphRunner
 
+    import types
+
     class _R:
         spec_config = type("S", (), {"enable_ragged_verify": True})()
 
+    def _batch(*verify_lens):
+        return types.SimpleNamespace(generation_requests=[
+            types.SimpleNamespace(py_verify_len=v) for v in verify_lens
+        ])
+
     r = _R()
     get = CUDAGraphRunner._ragged_verify_bucket
+    windowed = _batch(3, 2, 1)
 
     # Nothing fitted yet -> not ragged, key unchanged from the uniform one.
-    assert get(r, object()) is None
+    assert get(r, windowed) is None
 
-    # A fitted bucket is returned verbatim, regardless of the batch contents:
-    # the batch is not even inspected, which is the point.
+    # A fitted bucket is returned verbatim: the batch's own token total is
+    # never re-summed here, which is what makes every rank agree.
     r.agreed_ragged_bucket = 449
-    assert get(r, object()) == 449
+    assert get(r, windowed) == 449
+    # ... including when that total plainly differs from the fitted value.
+    assert get(r, _batch(1, 1)) == 449
+
+    # But a request without a window means the token-major staging chain never
+    # ran this step, so a ragged key would replay the PREVIOUS ragged step's
+    # row maps -- the ragged IMA. Decline, whatever the fit published.
+    assert get(r, _batch(3, None, 1)) is None
 
     # Cleared between steps so a stale bucket cannot key into the wrong graph.
     r.agreed_ragged_bucket = None
-    assert get(r, object()) is None
+    assert get(r, windowed) is None
 
     # Config gate still wins: a non-ragged engine keeps the original key shape.
     r.agreed_ragged_bucket = 512
     r.spec_config = type("S", (), {"enable_ragged_verify": False})()
-    assert get(r, object()) is None
+    assert get(r, windowed) is None
 
 
 def test_capture_publishes_the_bucket_it_shaped_the_batch_to():
