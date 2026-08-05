@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, Union, cast
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
@@ -360,10 +361,20 @@ def warmup_sampling_module() -> None:
     flashinfer ships these kernels as source, so the first sampling call runs
     nvcc inline (~90s with a cold cache). Doing that inside the executor loop
     stalls the rank past the hang detector's threshold. Cheap no-op once built.
+
+    Best-effort, like the neighbouring pre-JIT warmups: this runs ahead of every
+    guard in ``warmup()``, so a broken JIT toolchain must not abort startup for
+    deployments that never sample non-greedily. Ones that do will raise at the
+    real call site instead.
     """
     if not IS_FLASHINFER_AVAILABLE:
         return
-    flashinfer.sampling.get_sampling_module()
+    try:
+        flashinfer.sampling.get_sampling_module()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "flashinfer sampling module prewarm failed; it will be built "
+            f"lazily on first use. {type(e).__name__}: {e}")
 
 
 @torch.compile(options={"max-autotune": True})
