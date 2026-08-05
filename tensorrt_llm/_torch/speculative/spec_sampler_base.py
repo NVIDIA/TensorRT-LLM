@@ -70,6 +70,13 @@ class SampleStateSpec(SampleState):
     #: never coexist, and conflating them would rewind by the window after
     #: verifying the block, silently leaking KV.
     verify_caps_snapshot: Optional[dict] = None
+    #: The draft pass that produced the block THIS state's tokens verified;
+    #: the STS recorder joins its acceptance label to a logits snapshot by
+    #: this key. Snapshotted at sampling time for the same reason
+    #: ``verify_lens_snapshot`` is: by the time ``update_requests`` runs, the
+    #: live counter already belongs to a later pass. None unless STS
+    #: collection is on.
+    sts_target_seq: Optional[int] = None
 
 
 class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -200,10 +207,14 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
     #: everywhere else so this costs one attribute read per request.
     acceptance_stats = None
     #: STS calibration collection; attached alongside `acceptance_stats` and
-    #: None everywhere else. `sts_logits_buffer` is the worker's persistent
-    #: [rows, K] confidence buffer, indexed by the same py_seq_slot.
+    #: None everywhere else. `sts_row_for` resolves a py_request_id to its row
+    #: in the worker's confidence buffer through the worker's OWN allocator --
+    #: `py_seq_slot` comes from a different allocator whose numbering only
+    #: coincides until the first request completes. `sts_seq_provider` names
+    #: the draft pass the current step's verification targets.
     sts_recorder = None
-    sts_logits_buffer = None
+    sts_row_for = None
+    sts_seq_provider = None
 
     @staticmethod
     def _verified_len(request: LlmRequest, runtime_draft_len: int,
@@ -257,12 +268,6 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
         caps = state.verify_caps_snapshot
-        if self.sts_recorder is not None:
-            # A fresh step: drop the cached host mirror so the first `record`
-            # below pulls this step's logits rather than the previous step's.
-            self._sts_step = getattr(self, "_sts_step", 0) + 1
-            self.sts_recorder.begin_step(self._sts_step)
-
         for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
@@ -302,16 +307,17 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                     cap_trim=(0 if cap_trim_list is None else
                               cap_trim_list[req.py_seq_slot]))
             # STS calibration pairs this request's drafted-block logits with
-            # how much of that block was accepted. Recorded here for the same
-            # reason acceptance is: this is the only place both are host-side
-            # and belong to the same step. The recorder pulls the logits buffer
-            # once per step, not once per request.
-            if (self.sts_recorder is not None
-                    and self.sts_logits_buffer is not None):
+            # how much of that block was accepted. The logits come from the
+            # recorder's snapshot ring, selected by the draft pass snapshotted
+            # into this state at sampling time and checked against the row's
+            # own stamp -- reading the live buffer here paired the label with
+            # whatever a LATER pass had written over it.
+            if self.sts_recorder is not None:
                 self.sts_recorder.record(
-                    slot=req.py_seq_slot,
+                    row=(self.sts_row_for(req.py_request_id)
+                         if self.sts_row_for is not None else None),
                     accepted=req.py_num_accepted_draft_tokens,
-                    device_logits=self.sts_logits_buffer)
+                    target_seq=state.sts_target_seq)
             self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
         if self.sts_recorder is not None:
@@ -445,4 +451,6 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             runtime_draft_len=runtime_draft_len,
             verify_lens_snapshot=verify_lens_snapshot,
             verify_caps_snapshot=verify_caps_snapshot,
+            sts_target_seq=(self.sts_seq_provider()
+                            if self.sts_seq_provider is not None else None),
         )

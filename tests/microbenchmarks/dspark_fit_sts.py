@@ -143,51 +143,38 @@ def fit_sts_temperatures(*, logits: torch.Tensor, prefix_mask: torch.Tensor,
     }
 
 
-def load_shards(pattern: str,
-                source: str = "auto") -> Tuple[torch.Tensor, torch.Tensor]:
-    """Load shards, choosing which confidence column to fit against.
+def load_shards(pattern: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Load shards, refusing any whose pairing provenance is wrong or absent.
 
-    Shards carry two columns for the same rows. ``logits`` is the worker's
-    persistent buffer read back at sampler time; ``logits_at_draft`` is the
-    snapshot the draft pass actually produced, cloned on device before anything
-    else could touch it. Under the overlap scheduler these are NOT the same
-    tensor: the next step's draft overwrites the shared buffer before the
-    sampler gets there. Measured on job 2562577, 26383 of 32083 rows differed
-    (82.2%), mean |delta| 7.35, correlation 0.14 -- i.e. the ``logits`` column
-    pairs confidence(t+1) with accepted(t) four times out of five.
-
-    So ``auto`` prefers ``logits_at_draft`` whenever it is present. Fitting the
-    stale column does not fail loudly; it converges to a temperature vector that
-    calibrates noise, which is what the 0.23 residual ECE of the first table was.
+    Shards written by the current recorder carry ``meta.pairing ==
+    "draft_seq_ring"``: each row's logits were selected from a stamped host
+    snapshot of exactly the draft pass that produced the block the label
+    verifies, keyed by the worker's own row allocator. Earlier recorders
+    paired the label against a sampler-time read of the live buffer -- stale
+    by one draft pass for most rows under the overlap scheduler (on job
+    2562577, 26383 of 32083 rows differed, correlation 0.14) -- and keyed
+    rows by ``py_seq_slot``, a different allocator that drifts after the
+    first request completes. Fitting such a shard does not fail loudly; it
+    converges to a temperature vector that calibrates noise, which is what
+    the 0.23 residual ECE of the first deployed table was. There is
+    deliberately no flag to accept them: re-collect.
     """
     paths = sorted(glob.glob(pattern))
     if not paths:
         raise SystemExit(f"no shards matched {pattern!r}")
-    have_draft = []
-    for path in paths:
-        blob = torch.load(path, map_location="cpu")
-        have_draft.append("logits_at_draft" in blob)
-    if source == "auto":
-        key = "logits_at_draft" if all(have_draft) else "logits"
-        if not all(have_draft) and any(have_draft):
-            raise SystemExit(
-                "some shards carry 'logits_at_draft' and some do not; they came "
-                "from different builds. Fit them separately -- concatenating "
-                "aligned and stale rows produces a vector describing neither.")
-    else:
-        key = {"draft": "logits_at_draft", "late": "logits"}[source]
-    print(f"fitting against '{key}'"
-          + ("" if key == "logits_at_draft" else
-             "  <-- WARNING: sampler-time buffer read; under the overlap "
-             "scheduler this is stale by one draft for most rows"))
-
     logits, masks, block_size = [], [], None
-    dropped = 0
     for path in paths:
         blob = torch.load(path, map_location="cpu")
-        if key not in blob:
-            raise SystemExit(f"{path}: no '{key}' column (has {sorted(blob)})")
-        lg, pm = blob[key], blob["prefix_mask"]
+        meta = blob.get("meta") or {}
+        pairing = meta.get("pairing")
+        if pairing != "draft_seq_ring":
+            raise SystemExit(
+                f"{path}: pairing provenance is {pairing!r}, expected "
+                f"'draft_seq_ring'. This shard predates the stamped snapshot "
+                f"ring, so its labels are joined to the wrong draft pass "
+                f"and/or the wrong buffer row, and a fit on it calibrates "
+                f"noise. Re-collect with the current recorder.")
+        lg, pm = blob["logits"], blob["prefix_mask"]
         if lg.shape != pm.shape:
             raise SystemExit(f"{path}: logits {tuple(lg.shape)} != mask {tuple(pm.shape)}")
         if block_size is None:
@@ -197,16 +184,8 @@ def load_shards(pattern: str,
             # that never existed.
             raise SystemExit(
                 f"{path}: block size {lg.shape[1]} != {block_size} from earlier shards")
-        # A row is NaN when the draft stash had no entry for that slot (the
-        # request did not draft this step). Those rows carry a real acceptance
-        # label against no confidence at all, so they must go -- sigmoid(NaN)
-        # would poison every temperature in the left-to-right sweep.
-        keep = ~torch.isnan(lg).any(dim=1)
-        dropped += int((~keep).sum())
-        logits.append(lg[keep])
-        masks.append(pm[keep])
-    if dropped:
-        print(f"dropped {dropped} rows with no draft-time snapshot")
+        logits.append(lg)
+        masks.append(pm)
     return torch.cat(logits, 0), torch.cat(masks, 0)
 
 
@@ -231,14 +210,9 @@ def main(argv=None) -> int:
                          "large gap means the table does not describe the "
                          "live head (drift, wrong file, wrong column), and "
                          "nothing else in the pipeline can see that.")
-    ap.add_argument("--source", choices=("auto", "draft", "late"), default="auto",
-                    help="which confidence column to fit: 'draft' is the "
-                         "snapshot the draft pass produced (correct pairing), "
-                         "'late' is the sampler-time buffer read (stale under "
-                         "the overlap scheduler). 'auto' prefers draft.")
     args = ap.parse_args(argv)
 
-    logits, prefix_mask = load_shards(args.data, args.source)
+    logits, prefix_mask = load_shards(args.data)
 
     if args.eval_temps:
         with open(args.eval_temps, encoding="utf-8") as fh:

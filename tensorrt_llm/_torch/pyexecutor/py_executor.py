@@ -3360,13 +3360,38 @@ class PyExecutor:
             ValueError: if the length is outside the ladder (see
                 :meth:`DSparkVerifyPlanner.validate_verify_len_pin`).
         """
-        worker = getattr(self.model_engine, "_get_spec_worker", None)
-        planner = getattr(worker(), "verify_planner", None) if worker else None
+        worker_fn = getattr(self.model_engine, "_get_spec_worker", None)
+        worker = worker_fn() if worker_fn else None
+        planner = getattr(worker, "verify_planner", None) if worker else None
         if planner is None:
             raise RuntimeError(
                 "no DSpark confidence planner on this executor; the verify-len "
                 "pin only applies to a DSpark engine with confidence "
                 "scheduling enabled")
+        mode = getattr(worker, "ragged_verify_mode", None)
+        computes = (mode.computes_windows if mode is not None else
+                    getattr(self.model_engine.spec_config,
+                            "enable_ragged_verify", False))
+        if not computes:
+            # Static mode never calls decide_verify_lens, so an accepted pin
+            # would be adopted, logged as set -- and never influence a step.
+            # Answering 200 there is the mislabelled-sweep trap all over again.
+            raise RuntimeError(
+                "this engine runs static (uniform) verification; the "
+                "verify-length pin only affects window-computing modes, so "
+                "pinning here would be accepted and silently never applied")
+        if (getattr(worker, "sts_recorder", None) is not None
+                and verify_len is not None
+                and int(verify_len) < int(self.model_engine.max_draft_len)):
+            # The collector's own guard refuses to START under a censoring
+            # window; this closes the runtime door that guard cannot see. A
+            # sub-block pin clips the acceptance label of every sample
+            # collected after it, and the shards keep looking healthy.
+            raise RuntimeError(
+                "STS calibration collection is active on this engine; a pin "
+                "below the full block censors the acceptance label for every "
+                "sample collected after it. Pin the full block, clear the "
+                "pin, or restart without the collector.")
         return planner.request_verify_len_pin(verify_len)
 
     def _dspark_confidence_draft_len(self,
@@ -3416,15 +3441,17 @@ class PyExecutor:
                 and getattr(self.sampler, "acceptance_stats", None) is None):
             self.sampler.acceptance_stats = stats
         # Same wiring, same reason, for STS collection: the logits live on the
-        # worker and the accepted count is only host-side in the sampler, and
-        # `py_seq_slot` indexes both. None on every path that is not collecting.
+        # worker and the accepted count is only host-side in the sampler. The
+        # sampler gets the worker's OWN row resolver and pass counter, never a
+        # raw buffer: the recorder joins by (draft pass, buffer row), and both
+        # keys must come from the allocator that wrote the buffer.
         if (self.sampler is not None
                 and getattr(self.sampler, "sts_recorder", None) is None):
             recorder = getattr(worker, "sts_recorder", None)
             if recorder is not None:
                 self.sampler.sts_recorder = recorder
-                self.sampler.sts_logits_buffer = getattr(
-                    worker, "_confidence_logits", None)
+                self.sampler.sts_row_for = worker.sts_row_for
+                self.sampler.sts_seq_provider = worker.verified_draft_seq
         mode = getattr(worker, "ragged_verify_mode", None)
         compute_windows = (mode.computes_windows if mode is not None else
                            getattr(self.model_engine.spec_config,
@@ -3536,6 +3563,13 @@ class PyExecutor:
                     int(payload[1]),
                     int(payload[2]), 1 if all_can_graph else 0
                 ] for payload in payloads]
+        else:
+            # A single-rank world has no allgather to carry the pin, and
+            # without this branch a queued pin sat forever: the endpoint
+            # returned 200, forced_steps stayed 0, and a sweep labelled every
+            # cell with a length the planner never ran. The local queue IS the
+            # group's agreement when the group is one rank.
+            planner.adopt_verify_len_pin(planner.pending_verify_len_pin())
 
         # --- Phase 3: no more collectives -------------------------------------
         #
@@ -3633,13 +3667,17 @@ class PyExecutor:
             stats.record_step(num_gen_requests=num_gen_requests,
                               verify_lens=fitted,
                               bucket=bucket,
-                              # Was hardcoded None, which both left
-                              # padded_bs_hist empty in every summary ever
-                              # logged and denied record_step the row count it
-                              # needs to book a comparable ceiling.
-                              padded_bs=getattr(
-                                  self.model_engine,
-                                  "_dspark_last_padded_bs", None),
+                              # Only when the fit delivered: bucket is non-None
+                              # exactly then. Reading the attribute on every
+                              # step booked the LAST fit's padded row count
+                              # into padded_bs_hist on eager-ragged and
+                              # cap-accept steps -- phantom entries on exactly
+                              # the steps the histogram exists to explain, and
+                              # clearing at fit entry cannot help the branches
+                              # that never enter the fit.
+                              padded_bs=(getattr(self.model_engine,
+                                                 "_dspark_last_padded_bs", None)
+                                         if bucket is not None else None),
                               fallback=fallback_reason,
                               delivered=delivered)
 
@@ -3662,6 +3700,15 @@ class PyExecutor:
             # layout with uniform acceptance -- silent token misattribution.
             for request in gen_requests:
                 request.py_verify_len = None
+            # And the published fit state with them: a fallback step that
+            # inherits the previous ragged step's agreed bucket carries a
+            # claim about a batch it does not describe. The window guard in
+            # the graph key tolerates that today; the layout assert's uniform
+            # branch does not, on purpose -- one line of defense where there
+            # were zero.
+            if self.model_engine.cuda_graph_runner is not None:
+                self.model_engine.cuda_graph_runner.agreed_ragged_bucket = None
+                self.model_engine.cuda_graph_runner.ragged_pad_verify_len = 0
             # Verify the full drafted block. This is the only fallback: the
             # uniform tier ladder that used to sit between "schedule per
             # request" and "verify everything" is gone, so there is nothing to
@@ -3682,10 +3729,19 @@ class PyExecutor:
             if bump is not None:
                 staged_seq = bump()
             stamps_fn = getattr(worker, "confidence_stamp_buffer", None)
-            planner.stage_confidence(
-                buffer,
-                stamps=stamps_fn() if stamps_fn is not None else None,
-                staged_seq=staged_seq)
+            stamps = stamps_fn() if stamps_fn is not None else None
+            planner.stage_confidence(buffer, stamps=stamps,
+                                     staged_seq=staged_seq)
+            # The STS recorder keeps its own ring of these snapshots: its
+            # labels arrive one-plus steps later and must be paired with the
+            # pass that DRAFTED the block being labeled, not with whatever the
+            # live buffer holds by then. Same relay, same stamps, staged in
+            # the same breath as the planner's copy.
+            recorder = getattr(worker, "sts_recorder", None)
+            if recorder is not None:
+                recorder.stage_snapshot(device_logits=buffer,
+                                        device_stamps=stamps,
+                                        staged_seq=staged_seq)
 
         return int(runtime_draft_len)
 

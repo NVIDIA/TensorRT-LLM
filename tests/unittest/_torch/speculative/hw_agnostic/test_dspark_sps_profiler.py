@@ -177,6 +177,27 @@ def test_summarize_refuses_short_cell():
         summarize_cells(_samples(8, 3, [10.0] * 5), warmup_steps=4, min_samples=8)
 
 
+def test_summarize_drops_thin_cells_outside_the_requested_grid():
+    """A deployment log carries ramp/drain occupancy nobody asked to measure.
+
+    Job 2585129: a five-rung server sweep with 984-step cells at every
+    requested (bs, L) died at the very end on (bs=2, L=1) with one sample --
+    the admission ramp of the first cell's client, filed as a cell and then
+    held to the requested-grid bar. Incidental cells must be dropped when
+    thin, kept when thick, and a thin REQUESTED cell must still refuse.
+    """
+    grid = [(8, 3)]
+    requested = _samples(8, 3, [10.0] * 8)
+    ramp = _samples(2, 3, [30.0])                    # thin, incidental: drop
+    thick_extra = _samples(4, 3, [20.0] * 8)         # thick, incidental: keep
+    cells = summarize_cells(requested + ramp + thick_extra, warmup_steps=0,
+                            min_samples=4, expected_cells=grid)
+    assert [(c.batch_size, c.verify_len) for c in cells] == [(4, 3), (8, 3)]
+    with pytest.raises(InsufficientSamplesError, match="steady samples"):
+        summarize_cells(_samples(8, 3, [10.0]) + thick_extra, warmup_steps=0,
+                        min_samples=4, expected_cells=grid)
+
+
 def test_summarize_orders_by_iteration_before_cutting_warmup():
     """Stats arrive per queue, not necessarily in iteration order."""
     out_of_order = [
@@ -344,11 +365,20 @@ def test_compress_keeps_risers_and_closes_their_shelves():
     assert kept_times == [1.0, 1.004, 2.0]
 
 
-def test_compress_drops_the_shallowest_risers_first():
+def test_truncation_drops_the_point_cheapest_to_interpolate():
+    """Over budget, remove the interior point interpolation best reconstructs.
+
+    Here 64 goes: its neighbors predict it within 0.27ms, while removing 32
+    would ramp the near-flat 16..32 stretch into the 64 riser and misprice it
+    by 0.9ms. The previous rule (drop the smallest incoming jump first) chose
+    32 -- by construction it always chose the shelf-side point, re-billing
+    mid-shelf totals upward, the exact over-charge the pair encoding of
+    shelves exists to prevent.
+    """
     tokens = [16, 32, 64, 128]
     times = [1.0, 1.1, 4.0, 9.0]
     kept_tokens, _ = compress_to_risers(tokens, times, min_riser_ms=0.0, max_breakpoints=3)
-    assert kept_tokens == [16, 64, 128]
+    assert kept_tokens == [16, 32, 128]
 
 
 def test_compress_never_drops_the_base_shelf():
@@ -569,7 +599,18 @@ def test_validate_rejects_a_decode_step_wider_than_max_num_tokens():
 
 
 def test_validate_accepts_a_sane_sweep():
-    _sweep().validate()
+    """Sane means the drafted block matches what each cell verifies."""
+    _sweep(block_follows_verify_len=True).validate()
+    _sweep(verify_lens=[5], max_draft_len=5).validate()
+
+
+def test_validate_refuses_constant_block_verifying_below_it():
+    """Building an engine that drafts 5 and verifies 3 runs the regime that
+    trips the Repeat.cu output_size assert -- the sweep would crash mid-cell
+    after minutes of engine build, or worse, measure a crash-adjacent shape.
+    """
+    with pytest.raises(SweepGeometryError, match="Repeat.cu"):
+        _sweep().validate()
 
 
 def test_dp_size_only_counts_ranks_under_attention_dp():

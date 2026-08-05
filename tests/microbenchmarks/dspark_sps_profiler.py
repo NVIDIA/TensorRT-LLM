@@ -29,7 +29,7 @@ cannot answer "is trimming profitable here". Only a measured table can.
 
 Run it::
 
-    python -m tensorrt_llm._torch.speculative.dspark_sps_profiler \\
+    python tests/microbenchmarks/dspark_sps_profiler.py \\
         --model /models/DeepSeek-V4-Pro-DSpark --tp-size 8 --ep-size 8 \\
         --enable-attention-dp --batch-sizes 8,16,32,64,128 \\
         --max-draft-len 5 --out sps_table.json
@@ -442,6 +442,7 @@ def summarize_cells(
     *,
     warmup_steps: int,
     min_samples: int,
+    expected_cells: Optional[Sequence[Tuple[int, int]]] = None,
 ) -> List[CellStat]:
     """Median per ``(batch_size, verify_len)`` cell, after dropping warmup.
 
@@ -454,22 +455,36 @@ def summarize_cells(
         warmup_steps: leading aligned steps to discard *per cell*. They are kept
             in the raw sample file so a refit can choose a different cut.
         min_samples: post-warmup samples a cell must have to be admitted.
+        expected_cells: the requested grid, when there is one. Sources that
+            observe a deployment (a served sweep's iteration log, a production
+            log) inevitably capture ramp and drain steps whose occupancy was
+            never requested -- e.g. a batch of 2 while the client's 256
+            requests were still being admitted. Those incidental cells are
+            dropped (and reported) when thin; only a thin cell that was
+            actually REQUESTED is an error. None means every observed cell was
+            asked for (the engine-building sweep, existing callers).
 
     Raises:
-        InsufficientSamplesError: if any cell falls short. Silently dropping a
-            cell would punch a hole in the grid and can disconnect the
-            batch-size ladder, which changes the fit rather than just widening
-            its error bars.
+        InsufficientSamplesError: if a requested cell falls short. Silently
+            dropping one of those would punch a hole in the grid and can
+            disconnect the batch-size ladder, which changes the fit rather
+            than just widening its error bars.
     """
     grouped: Dict[Tuple[int, int], List[StepSample]] = {}
     for sample in samples:
         grouped.setdefault((int(sample.batch_size), int(sample.verify_len)), []).append(sample)
 
+    requested = None if expected_cells is None else {
+        (int(b), int(l)) for b, l in expected_cells}
+    dropped: List[str] = []
     cells: List[CellStat] = []
     for (batch_size, verify_len), cell_samples in sorted(grouped.items()):
         ordered = sorted(cell_samples, key=lambda s: s.iteration)
         steady = [s.step_time_ms for s in ordered[int(warmup_steps) :]]
         if len(steady) < int(min_samples):
+            if requested is not None and (batch_size, verify_len) not in requested:
+                dropped.append(f"(bs={batch_size}, L={verify_len}, n={len(steady)})")
+                continue
             raise InsufficientSamplesError(
                 f"cell (batch_size={batch_size}, verify_len={verify_len}) has "
                 f"{len(steady)} steady samples after discarding "
@@ -490,6 +505,12 @@ def summarize_cells(
                 p90_ms=float(np.percentile(values, 90)),
             )
         )
+    if dropped:
+        # Reported, not silent: a fit that quietly ignored data reads as
+        # "covered everything" when it did not.
+        print(f"[dspark-sps] dropped {len(dropped)} thin incidental cell(s) "
+              f"outside the requested grid: {', '.join(dropped[:12])}"
+              + (" ..." if len(dropped) > 12 else ""), file=sys.stderr)
     return cells
 
 
@@ -749,12 +770,29 @@ def compress_to_risers(
             kept.append(index)
 
     limit = max(int(max_breakpoints), 2)
+    truncated_from = len(kept)
     while len(kept) > limit:
-        # Only interior/trailing points are droppable: index 0 defines the base
-        # shelf that every below-range query clamps onto.
-        jumps = [(step_times[kept[i]] - step_times[kept[i - 1]], i) for i in range(1, len(kept))]
-        _, drop = min(jumps)
+        # Drop the interior point whose removal introduces the least
+        # interpolation error. The previous rule -- smallest incoming jump --
+        # deleted shelf-CLOSING points first by construction (their jump is
+        # below min_riser_ms), which turned every measured shelf back into a
+        # ramp and re-billed mid-shelf totals upward: the exact over-charge
+        # the pair encoding exists to prevent. Endpoints are never droppable:
+        # index 0 anchors the below-range clamp, the last point the above.
+        def _removal_error(pos: int) -> float:
+            x0, x1, x2 = (token_counts[kept[pos - 1]], token_counts[kept[pos]],
+                          token_counts[kept[pos + 1]])
+            y0, y2 = step_times[kept[pos - 1]], step_times[kept[pos + 1]]
+            interp = y0 + (y2 - y0) * (x1 - x0) / max(x2 - x0, 1)
+            return abs(step_times[kept[pos]] - interp)
+
+        drop = min(range(1, len(kept) - 1), key=_removal_error)
         kept.pop(drop)
+    if truncated_from > len(kept):
+        print(f"[dspark-sps] compress_to_risers: truncated {truncated_from} "
+              f"breakpoints to {len(kept)} (max_breakpoints={max_breakpoints});"
+              f" the kept set minimizes interpolation error, but raise the cap"
+              f" if the residuals matter", file=sys.stderr)
 
     return [int(token_counts[i]) for i in kept], [float(step_times[i]) for i in kept]
 
@@ -827,6 +865,11 @@ def build_cost_table_payload(
         "batch_overhead_ms": [float(round(v, 6)) for v in alphas],
     }
     payload["_meta"] = {
+        # Consumer contract marker. Tables written for the old floor consumer
+        # deliberately dropped shelf-closing breakpoints; interpolating those
+        # re-bills every mid-shelf total upward with nothing to say so. The
+        # loader warns when this key is absent.
+        "lookup": "interp",
         "encoding": "decomposed",
         "note": (
             "step_time_ms is theta(M) only -- the trimmable term. The "
@@ -1094,6 +1137,22 @@ class SweepConfig:
             raise SweepGeometryError("both --batch-sizes and --verify-lens must be non-empty")
         if min(self.verify_lens) < 1:
             raise SweepGeometryError("verify lengths must be >= 1 (the planner's floor)")
+        if (not self.block_follows_verify_len
+                and min(self.verify_lens) < int(self.max_draft_len)):
+            # Constant-block with a pinned window below the block currently
+            # dies on a device-side assert (Repeat.cu output_size vs
+            # sum(repeats)) at the first short cell -- AFTER minutes of engine
+            # build. Refusing here is this docstring's whole job; letting the
+            # default geometry walk into a known assert is not a validation.
+            raise SweepGeometryError(
+                f"constant-block geometry with verify lengths "
+                f"{sorted(self.verify_lens)} below the block "
+                f"{self.max_draft_len} runs the regime that currently trips "
+                f"the Repeat.cu output_size assert. Pass "
+                f"--block-follows-verify-len (each cell drafts exactly what "
+                f"it verifies), or sweep only L == {self.max_draft_len}, or "
+                f"use --base-url / --from-iter-log which measure a deployment "
+                f"instead of building one.")
         # A request that hits max_seq_len is evicted mid-cell, so the batch
         # drains and the steady window shrinks -- which surfaces much later as a
         # confusing "not enough steady samples".
@@ -1345,15 +1404,25 @@ def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int) -> 
     # cell that lost its tail this way is visible rather than merely short.
     rows: List[dict] = []
     drain_error: List[BaseException] = []
+    empty_reads = [0]
     stop = threading.Event()
 
     def _drain() -> None:
         while not stop.is_set():
             try:
-                rows.extend(list(llm.get_stats(timeout=config.stats_poll_s) or []))
+                got = list(llm.get_stats(timeout=config.stats_poll_s) or [])
             except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
                 drain_error.append(exc)
                 return
+            if got:
+                rows.extend(got)
+            else:
+                # Counted because one empty read is not merely a lost poll:
+                # IterationResult latches done on the first Empty, and until
+                # something un-latches it every later get_stats -- including
+                # the final post-cell drain -- returns [] instantly. A cell
+                # with a non-zero count here may have lost its tail.
+                empty_reads[0] += 1
             stop.wait(config.stats_poll_s)
 
     # A daemon drainer, NOT a poll loop that owns the exit condition. Making the
@@ -1388,7 +1457,19 @@ def _run_cell(llm, config: SweepConfig, *, batch_size: int, verify_len: int) -> 
               f"{drain_error[0]}); the cell may be short",
               file=sys.stderr)
     # Final drain for whatever crossed the IPC boundary after the last poll.
+    # Un-latch first: a single gap in stats production longer than the poll
+    # timeout latched IterationResult done, and a latched queue answers []
+    # instantly -- silently truncating the cell this drain exists to finish.
+    undo = getattr(getattr(getattr(llm, "_executor", None),
+                           "_iter_stats_result", None), "mark_undone", None)
+    if undo is not None:
+        undo()
     rows.extend(list(llm.get_stats(timeout=config.stats_timeout_s) or []))
+    if empty_reads[0]:
+        print(f"[dspark-sps]   bs={batch_size} L={verify_len}: "
+              f"{empty_reads[0]} empty stats read(s) mid-cell; the retained "
+              f"window may have closed early and the cell lost its tail",
+              file=sys.stderr)
 
     aligned = aligned_steps_from_stats(
         rows, expected_ranks=config.dp_size, timing_key=config.timing_key
@@ -1470,7 +1551,7 @@ def _float_list(text: str) -> List[float]:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m tensorrt_llm._torch.speculative.dspark_sps_profiler",
+        prog="python tests/microbenchmarks/dspark_sps_profiler.py",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1497,8 +1578,18 @@ def _build_parser() -> argparse.ArgumentParser:
     source.add_argument("--server-poll-s", type=float, default=20.0,
                         help="Seconds of steady state to collect per cell "
                              "(--base-url).")
-    source.add_argument("--served-model-name", default="model",
-                        help="`model` field for /v1/completions (--base-url).")
+    source.add_argument(
+        "--server-log",
+        help="The server's stdout/stderr (print_iter_log). When reachable this "
+             "is where --base-url takes its samples from: every step is "
+             "labelled by the shape it ran, and no metrics collector has to be "
+             "configured for the sweep to see anything.")
+    source.add_argument("--served-model-name", default=None,
+                        help="`model` field for /v1/completions (--base-url). "
+                             "Omit to read it from /v1/models, which is what "
+                             "the server actually registered -- for a local "
+                             "checkpoint that is the directory basename, not "
+                             "the path it was launched with.")
     source.add_argument(
         "--cuda-graph-batch-sizes",
         help="The deployment's captured batch-size ladder, comma separated "
@@ -1777,41 +1868,69 @@ def samples_from_iter_log(
     """
     line_re = re.compile(
         r"iter = (\d+).*?num_scheduled_requests = (\d+).*?"
-        r"host_step_time = ([\d.]+)ms.*?'num_generation_tokens': (\d+)")
+        r"host_step_time = ([\d.]+)ms.*?'num_ctx_requests': (\d+)"
+        r".*?'num_generation_tokens': (\d+)")
     out: List[StepSample] = []
     skipped_ratio = 0
+    skipped_mixed = 0
+
+    def _consume(line: str) -> None:
+        nonlocal skipped_ratio, skipped_mixed
+        match = line_re.search(line)
+        if not match:
+            return
+        iteration = int(match.group(1))
+        batch_size = int(match.group(2))
+        step_ms = float(match.group(3))
+        ctx_requests = int(match.group(4))
+        tokens = int(match.group(5))
+        if ctx_requests:
+            # A step carrying prefill chunks runs eager at a prefill-inflated
+            # time; the ladder resolution would still find a plausible
+            # (padded_bs, L) for it and file a mixed step as a pure decode
+            # cell -- confidently mislabelled, the exact failure this
+            # collector exists to avoid.
+            skipped_mixed += 1
+            return
+        if iteration == 1:
+            # Each executor instance numbers from 1, and its first step
+            # carries the wait for the first request inside its host time
+            # (62 s on a live server). Identify it by the number rather than
+            # by having seen one, so a log FRAGMENT is still usable.
+            return
+        if batch_size <= 0 or step_ms >= max_step_ms:
+            return
+        shape = resolve_padded_shape(
+            num_rows=batch_size, num_generation_tokens=tokens,
+            max_draft_len=max_draft_len, max_batch_size=max_batch_size,
+            padded_batch_sizes=padded_batch_sizes)
+        if shape is None:
+            skipped_ratio += 1
+            return
+        padded_bs, verify_len = shape
+        out.append(StepSample(batch_size=padded_bs, verify_len=verify_len,
+                              step_time_ms=step_ms, iteration=iteration))
+
     for path in paths:
         text = pathlib.Path(path).read_text(errors="replace")
-        for line in text.splitlines():
-            if "iter = " not in line:
-                continue
-            if rank_prefix and not line.lstrip().startswith(rank_prefix):
-                continue
-            match = line_re.search(line)
-            if not match:
-                continue
-            iteration = int(match.group(1))
-            batch_size = int(match.group(2))
-            step_ms = float(match.group(3))
-            tokens = int(match.group(4))
-            if iteration == 1:
-                # Each executor instance numbers from 1, and its first step
-                # carries the wait for the first request inside its host time
-                # (62 s on a live server). Identify it by the number rather
-                # than by having seen one, so a log FRAGMENT is still usable.
-                continue
-            if batch_size <= 0 or step_ms >= max_step_ms:
-                continue
-            shape = resolve_padded_shape(
-                num_rows=batch_size, num_generation_tokens=tokens,
-                max_draft_len=max_draft_len, max_batch_size=max_batch_size,
-                padded_batch_sizes=padded_batch_sizes)
-            if shape is None:
-                skipped_ratio += 1
-                continue
-            padded_bs, verify_len = shape
-            out.append(StepSample(batch_size=padded_bs, verify_len=verify_len,
-                                  step_time_ms=step_ms, iteration=iteration))
+        candidates = [ln for ln in text.splitlines() if "iter = " in ln]
+        matched = [ln for ln in candidates
+                   if not rank_prefix or ln.lstrip().startswith(rank_prefix)]
+        if candidates and not matched and rank_prefix:
+            # Single-process deployments write no srun/mpirun rank tag; a
+            # hard prefix requirement silently dropped every line and the
+            # error blamed print_iter_log. When the prefix matches nothing at
+            # all, the log simply is not rank-tagged -- read it as-is.
+            print(f"[dspark-sps] iter-log: no lines in {path} carry the rank "
+                  f"prefix {rank_prefix!r}; reading it as an untagged "
+                  f"single-process log", file=sys.stderr)
+            matched = candidates
+        for line in matched:
+            _consume(line)
+    if skipped_mixed:
+        print(f"[dspark-sps] iter-log: skipped {skipped_mixed} mixed "
+              f"context+generation steps (prefill-inflated times)",
+              file=sys.stderr)
     if skipped_ratio:
         print(f"[dspark-sps] iter-log: skipped {skipped_ratio} steps whose "
               f"padded shape could not be resolved unambiguously",
@@ -1825,7 +1944,6 @@ def samples_from_server(
     batch_sizes: Sequence[int],
     verify_lens: Sequence[int],
     input_len: int,
-    max_tokens: int,
     model: str,
     warmup_steps: int,
     settle_s: float,
@@ -1833,6 +1951,8 @@ def samples_from_server(
     max_draft_len: int,
     seed: int,
     padded_batch_sizes: Optional[Sequence[int]] = None,
+    server_log: Optional[str] = None,
+    dp_size: int = 1,
 ) -> List[StepSample]:
     """Sweep a RUNNING server: pin the window over HTTP, then read /metrics.
 
@@ -1845,11 +1965,47 @@ def samples_from_server(
     a fixed batch size for long enough to measure it; the SHAPE is what the
     table indexes, and the deployment's own graphs, context depths and
     scheduler are what answer for it.
+
+    ``dp_size`` is how many requests it takes to put ONE on each rank's
+    batch. Under attention DP every rank schedules its own subset, the
+    planner prices its own rank's batch, and the iteration log reports
+    per-rank rows -- so the table's bs axis is PER-RANK, and a cell labeled
+    ``bs`` needs ``bs * dp_size`` requests in flight. Job 2585129 swept a
+    tp8-ADP server with dp_size unaccounted: every requested cell (64..256)
+    actually measured per-rank batches of 8..40, and the fit refused the
+    grid as disconnected.
     """
     import requests
 
     rng = random.Random(seed)
     out: List[StepSample] = []
+
+    if not model:
+        # The served id is whatever the server registered -- for a local
+        # checkpoint that is the directory's basename, not the path that was
+        # passed to it. Posting the path gets every request rejected, no
+        # traffic runs, and every cell reports zero steps with nothing to say
+        # why. Ask the server instead of making the caller guess.
+        listing = requests.get(f"{base_url}/v1/models", timeout=60)
+        listing.raise_for_status()
+        entries = (listing.json() or {}).get("data") or []
+        if not entries:
+            raise RuntimeError(f"{base_url}/v1/models listed no model")
+        model = entries[0]["id"]
+        print(f"[dspark-sps] serving model id: {model}", file=sys.stderr)
+
+    post_errors: List[str] = []
+
+    def _fire(body: dict) -> None:
+        try:
+            response = requests.post(f"{base_url}/v1/completions", json=body,
+                                     timeout=3600)
+            if response.status_code != 200 and len(post_errors) < 3:
+                post_errors.append(
+                    f"{response.status_code} {response.text[:200]}")
+        except Exception as exc:  # noqa: BLE001 - reported below, not fatal
+            if len(post_errors) < 3:
+                post_errors.append(f"{type(exc).__name__}: {exc}")
 
     def pin(verify_len: Optional[int]) -> None:
         response = requests.post(f"{base_url}/dspark/verify_len_pin",
@@ -1867,17 +2023,31 @@ def samples_from_server(
 
     try:
         for verify_len in sorted(verify_lens):
-            pin(int(verify_len))
+            try:
+                pin(int(verify_len))
+            except RuntimeError as exc:
+                # A rung the server's ladder lacks. Raising out of the sweep
+                # threw away every already-collected sample (nothing is
+                # written until the sweep returns); a partial ladder is still
+                # a table, and the skip is counted in the output.
+                print(f"[dspark-sps] server: pin L={verify_len} refused "
+                      f"({exc}); skipping the rung", file=sys.stderr)
+                continue
             for batch_size in sorted(batch_sizes):
+                # H2: the load must outlive the measurement window, or the
+                # cell measures ramp-down rows filed under smaller batch
+                # sizes. Budget the output by the window at a conservative
+                # 30 ms/step lower bound.
+                window_steps = int((settle_s + poll_s) / 0.03) + 64
+                max_tokens = max(64, window_steps * (1 + int(verify_len)))
+                num_requests = int(batch_size) * max(1, int(dp_size))
                 prompts = [[rng.randrange(1000, 30000) for _ in range(input_len)]
-                           for _ in range(int(batch_size))]
+                           for _ in range(num_requests)]
                 bodies = [{"model": model, "prompt": p, "max_tokens": max_tokens,
                            "temperature": 0.0, "ignore_eos": True, "stream": False}
                           for p in prompts]
-                threads = [threading.Thread(
-                    target=lambda b=b: requests.post(
-                        f"{base_url}/v1/completions", json=b, timeout=3600),
-                    daemon=True) for b in bodies]
+                threads = [threading.Thread(target=_fire, args=(b, ),
+                                            daemon=True) for b in bodies]
                 for thread in threads:
                     thread.start()
                 time.sleep(settle_s)          # let admission reach the plateau
@@ -1897,6 +2067,7 @@ def samples_from_server(
                 # so where it publishes both), which would inflate every cell
                 # by roughly a factor of two.
                 kept = 0
+                cell_rows: List[StepSample] = []
                 for row in rows:
                     rows_seen = int(row.get("numActiveRequests") or 0)
                     step_ms = float(row.get("hostStepTimeMS") or 0.0)
@@ -1909,18 +2080,53 @@ def samples_from_server(
                         if not wider:
                             continue
                         padded_bs = wider[0]
-                    out.append(StepSample(batch_size=padded_bs,
-                                          verify_len=int(verify_len),
-                                          step_time_ms=step_ms))
+                    cell_rows.append(StepSample(batch_size=padded_bs,
+                                                verify_len=int(verify_len),
+                                                step_time_ms=step_ms))
                     kept += 1
+                # Applied, not just printed: the first rows after a pin change
+                # can straddle the previous window's shape.
+                out.extend(cell_rows[warmup_steps:])
+                note = ""
+                if not kept:
+                    if post_errors:
+                        note = f" -- requests refused: {post_errors[0]}"
+                    elif not rows:
+                        note = (" -- /metrics returned nothing: is "
+                                "enable_iter_perf_stats on?")
+                    else:
+                        keys = sorted(rows[-1])[:8]
+                        note = (f" -- {len(rows)} stats rows carried no usable "
+                                f"(numActiveRequests, hostStepTimeMS); keys "
+                                f"seen: {keys}")
                 print(f"[dspark-sps] server bs={batch_size:>5} L={verify_len} "
-                      f"kept {kept - warmup_steps if kept > warmup_steps else 0}"
-                      f" steps", file=sys.stderr)
+                      f"({num_requests} requests in flight) "
+                      f"kept {max(kept - warmup_steps, 0)}"
+                      f" steps{note}", file=sys.stderr)
                 for thread in threads:
                     thread.join(timeout=1.0)
     finally:
         # Never leave a served deployment pinned to a profiling window.
         pin(None)
+
+    if server_log:
+        # Preferred source when the server's log is reachable. /metrics needs
+        # a metrics collector (return_perf_metrics) to run its tee buffer, and
+        # its fallback path -- draining the stats queue directly -- came back
+        # empty on an MPI deployment. The iteration log needs neither: it
+        # carries the row count, the padded token total and the host step time
+        # for every step, so the samples are labelled by what ran rather than
+        # by what was asked for. The pin's job is then only to make sure every
+        # rung is VISITED.
+        from_log = samples_from_iter_log(
+            [server_log], max_draft_len=max_draft_len,
+            max_batch_size=(max(padded_batch_sizes) if padded_batch_sizes
+                            else 256),
+            padded_batch_sizes=padded_batch_sizes)
+        print(f"[dspark-sps] server log yielded {len(from_log)} steps "
+              f"(/metrics yielded {len(out)})", file=sys.stderr)
+        if from_log:
+            return from_log
     return out
 
 
@@ -1940,6 +2146,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise SystemExit("--fit-only requires --samples-in")
         samples = _load_samples(_str_list(args.samples_in))
         provenance = {"source": "refit", "samples_in": _str_list(args.samples_in)}
+        # Saved samples may come from any source, including deployment logs
+        # full of ramp-occupancy cells; require nothing, keep what is thick.
+        expected_cells = frozenset()
     elif args.from_iter_log:
         ladder = (_int_list(args.cuda_graph_batch_sizes)
                   if args.cuda_graph_batch_sizes else None)
@@ -1957,13 +2166,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[dspark-sps] {len(samples)} steps from "
               f"{len(args.from_iter_log)} iteration log(s)", file=sys.stderr)
         provenance = {"source": "iter_log", "logs": list(args.from_iter_log)}
+        # A production log has no requested grid at all.
+        expected_cells = frozenset()
     elif args.base_url:
         samples = samples_from_server(
             base_url=args.base_url.rstrip("/"),
             batch_sizes=batch_sizes,
             verify_lens=verify_lens,
             input_len=args.input_len,
-            max_tokens=max(64, int(args.measure_steps)),
             model=args.served_model_name,
             warmup_steps=args.warmup_steps,
             settle_s=float(args.server_settle_s),
@@ -1971,7 +2181,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_draft_len=args.max_draft_len,
             seed=args.seed,
             padded_batch_sizes=(_int_list(args.cuda_graph_batch_sizes)
-                                if args.cuda_graph_batch_sizes else None))
+                                if args.cuda_graph_batch_sizes else None),
+            server_log=args.server_log,
+            # The bs axis is per-rank under attention DP (see the collector's
+            # docstring); the flags describing the deployment double as the
+            # fan-out factor.
+            dp_size=(int(args.tp_size) if args.enable_attention_dp else 1))
         if not samples:
             raise SystemExit(
                 "the server sweep collected nothing. Check that /metrics "
@@ -1981,6 +2196,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[dspark-sps] {len(samples)} steps from {args.base_url}",
               file=sys.stderr)
         provenance = {"source": "server_sweep", "base_url": args.base_url}
+        # The requested concurrencies are ladder entries, so a steady cell's
+        # padded batch size lands exactly on them; everything else in the
+        # server's log is admission ramp or drain-down.
+        expected_cells = frozenset(
+            (int(b), int(l)) for b in batch_sizes for l in verify_lens)
     else:
         if not args.model:
             raise SystemExit("--model is required unless --fit-only is used")
@@ -2020,6 +2240,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             extra_llm_api_options=extra,
         )
         samples = run_sweep(config)
+        expected_cells = frozenset(
+            (int(b), int(l)) for b in batch_sizes for l in verify_lens)
         _write_samples(samples_out, samples)
         print(f"[dspark-sps] wrote {len(samples)} raw samples to {samples_out}", file=sys.stderr)
         provenance = {
@@ -2036,7 +2258,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "ragged_verify_mode": RaggedVerifyMode.STATIC.value,
         }
 
-    cells = summarize_cells(samples, warmup_steps=args.warmup_steps, min_samples=args.min_samples)
+    cells = summarize_cells(samples, warmup_steps=args.warmup_steps,
+                            min_samples=args.min_samples,
+                            expected_cells=expected_cells)
     if not cells:
         # Distinguished from a short cell: this means no step was ever aligned,
         # which is a wiring problem (iteration stats off, the wrong rank count,
@@ -2062,20 +2286,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "warmup_steps_discarded": int(args.warmup_steps),
             "statistic": "median",
             # The engine fingerprint the loader verifies (check_table_fingerprint).
-            # Attached only when this process ran the sweep itself: an offline
-            # --fit-only refit of merged sample files cannot vouch for the
-            # engine those samples came from, and an unfingerprinted table
-            # loads with a warning rather than a false claim.
+            # Facts only, and only facts this process can VOUCH for. The loader
+            # compares every key present in both dicts and refuses on mismatch,
+            # so a key must be absent -- not defaulted -- when the fact is
+            # unknown: recording ep as `args.ep_size or 0` fabricated ep=0
+            # whenever the flag was unset, the loader's Mapping normalizes
+            # unset to 1, and the profiler's own table was refused on the very
+            # engine that produced it. The deployment-measuring sources
+            # (--base-url, --from-iter-log) build no engine here at all, so
+            # they attach no engine dict; the deployment's own config is the
+            # fingerprint authority there, and an unfingerprinted table loads
+            # with a warning rather than a false claim.
             **({"engine": {
-                "tp": int(args.tp_size),
-                "ep": int(args.ep_size or 0),
+                **({"tp": int(args.tp_size)}
+                   if args.tp_size is not None else {}),
+                **({"ep": int(args.ep_size)}
+                   if args.ep_size else {}),
                 "attention_dp": bool(args.enable_attention_dp),
                 "block": block_size,
                 "max_batch_size": max(_int_list(args.batch_sizes)),
                 "geometry": ("block_follows_verify_len"
                              if getattr(args, "block_follows_verify_len", False)
                              else "constant_block"),
-            }} if not getattr(args, "samples_in", None) else {}),
+            }} if provenance.get("source") == "sweep" else {}),
             **provenance,
         },
     )

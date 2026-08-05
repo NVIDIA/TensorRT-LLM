@@ -3903,29 +3903,6 @@ class PyTorchModelEngine(ModelEngine):
                          f"to uniform scheduling: {exc}")
             return None
         padded_bs, bucket = shape.padded_bs, shape.bucket
-        # Remembered so a graph miss can report the shape it actually submitted
-        # rather than just that one happened.
-        self._dspark_last_total_tokens = int(bucket)
-        # And the ROW count behind that bucket. The observability ceiling is
-        # booked over the rank-local, unpadded request count while `delivered`
-        # is booked over this padded, cross-rank-maximum one, which is how
-        # trim_ratio went negative in four runs. Only the caller can reconcile
-        # them, and it cannot do that without this number.
-        self._dspark_last_padded_bs = int(padded_bs)
-        # The fit's agreed value, which the graph key carries verbatim so
-        # every attention-DP rank keys on a number they agreed on; the layout
-        # assert cross-checks it against the batch walk. Both used to be
-        # derived independently WITHOUT that check --
-        # the key walked generation_requests *after* padding was
-        # appended, while the fit worked from the allgathered peer
-        # stats -- so their agreement across attention-DP ranks was
-        # incidental rather than structural, and when they diverged the
-        # shape gate dropped every rank out of replay
-        # (peer_shape_mismatch: 2/265 steps without trimming, 16/318
-        # with). This value comes from data every rank allgathered and
-        # rules every rank runs identically, so it agrees by
-        # construction.
-        runner.agreed_ragged_bucket = int(bucket)
 
         # The CUDA-graph padding rows are appended later by _get_padded_batch,
         # which appends a *single shared dummy object*, so every pad row
@@ -3967,8 +3944,6 @@ class PyTorchModelEngine(ModelEngine):
                 f"outside [{floor_tokens}, {real_capacity}]; falling back "
                 f"to uniform scheduling")
             return None
-        # Communicated to _get_padded_batch, which stamps it on the dummy.
-        runner.ragged_pad_verify_len = pad_len - 1
 
         lens_tensor = torch.tensor(token_lens, dtype=torch.int32)
         layout = RaggedVerifyLayout.from_verify_lens(
@@ -3984,6 +3959,22 @@ class PyTorchModelEngine(ModelEngine):
             logger.debug(f"DSpark ragged bucket fit failed, falling back to "
                          f"uniform scheduling: {exc}")
             return None
+
+        # Published only now, past the last way this fit can fail: a stale
+        # published bucket on a fallback step is the state family behind the
+        # ragged IMA, and clearing at entry protects the next call, not the
+        # remainder of THIS one. The graph key carries `agreed_ragged_bucket`
+        # verbatim so every attention-DP rank keys on the value they
+        # allgathered, and the layout assert cross-checks it against the
+        # batch walk. `_dspark_last_total_tokens` lets a graph miss report the
+        # shape it submitted; `_dspark_last_padded_bs` is the row count the
+        # stats need to book a ceiling comparable to `delivered`;
+        # `ragged_pad_verify_len` is stamped on the shared dummy by
+        # _get_padded_batch.
+        self._dspark_last_total_tokens = int(bucket)
+        self._dspark_last_padded_bs = int(padded_bs)
+        runner.agreed_ragged_bucket = int(bucket)
+        runner.ragged_pad_verify_len = pad_len - 1
 
         for request, tokens in zip(generation_requests,
                                    filled.verify_lens.tolist()):
@@ -4074,6 +4065,17 @@ class PyTorchModelEngine(ModelEngine):
         verify_lens = self._ragged_token_lens(
             scheduled_requests.generation_requests)
         if verify_lens is None:
+            # A uniform step must not be carrying a published ragged bucket:
+            # that is exactly the stale state a failed fit used to leave
+            # behind, and a later ragged step would key a graph the batch
+            # does not describe. Checked here because the ragged branch below
+            # never runs for uniform steps, which made the staleness invisible
+            # even with this assert enabled.
+            agreed_stale = getattr(self.cuda_graph_runner,
+                                   "agreed_ragged_bucket", None)
+            assert agreed_stale is None, (
+                f"uniform step carries a stale published ragged bucket "
+                f"{agreed_stale}; a failed fit exited without clearing it")
             # Uniform step: assert the converse, that nothing ragged leaked
             # through. A half-published layout is the dangerous state.
             assert getattr(spec_metadata, "total_verify_tokens", None) is None, (
@@ -4100,13 +4102,12 @@ class PyTorchModelEngine(ModelEngine):
             f"tokens but spec_metadata.total_verify_tokens is {from_spec}; "
             f"acceptance would slice the target logits at the wrong offsets.")
         if agreed is not None:
-            # Two INDEPENDENT derivations of the token axis: `from_requests`
-            # walks this batch's windows, `agreed` is the fit's allgathered
-            # arithmetic, and the graph key carries the latter. Comparing the
-            # key's own return value instead (what an earlier form did) is a
-            # tautology -- _ragged_verify_bucket publishes `agreed` -- so a fit
-            # that budgeted for padding rows the batch never got would replay a
-            # graph captured at a different width with nothing to say so.
+            # Two derivations of the token axis: `from_requests` walks this
+            # batch's windows, `agreed` is the fit's allgathered arithmetic,
+            # and the graph key carries the latter. If the fit reserved for
+            # padding rows that were then not appended, the replayed graph is
+            # a different width than the batch -- and nothing downstream says
+            # so, because acceptance's output_size was frozen at capture.
             assert from_requests == int(agreed), (
                 f"ragged layout mismatch: the batch carries {from_requests} "
                 f"generation tokens but the fit agreed on {agreed}, which is "

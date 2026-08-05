@@ -2396,13 +2396,27 @@ class OpenAIServer(_VideoRoutesMixin):
         which cannot reach ranks spawned before it was set. The pin takes
         effect on the next decode step, simultaneously on every rank.
         """
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/dspark/verify_len_pin endpoint is only supported with AsyncLLM()"
+        # Dispatched by CAPABILITY, not by type. trtllm-serve builds a
+        # PyTorchLLM, which carries the synchronous `_collective_rpc`; only the
+        # AsyncLLM entry point has the awaitable `collective_rpc`. Asserting
+        # the type (as the memory endpoints do) rejects the very deployment
+        # this knob exists to profile, and does it with a 500.
+        rpc = getattr(self.generator, "collective_rpc", None)
+        sync_rpc = getattr(self.generator, "_collective_rpc", None)
+        if rpc is None and sync_rpc is None:
+            return JSONResponse(
+                content={"error": "this server exposes no worker RPC channel, "
+                                  "so the verify-length pin cannot be set"},
+                status_code=400)
         try:
-            applied = await self.generator.collective_rpc(
-                'set_dspark_verify_len_pin', args=(request.verify_len, ))
-        except (ValueError, RuntimeError) as exc:
+            if rpc is not None:
+                applied = await rpc('set_dspark_verify_len_pin',
+                                    args=(request.verify_len, ))
+            else:
+                applied = await asyncio.to_thread(
+                    sync_rpc, 'set_dspark_verify_len_pin',
+                    args=(request.verify_len, ))
+        except (ValueError, RuntimeError, NotImplementedError) as exc:
             # A bad tier or a non-DSpark engine is a caller error, not a server
             # fault: answer it rather than returning a 500 with a stack trace.
             return JSONResponse(content={"error": str(exc)}, status_code=400)

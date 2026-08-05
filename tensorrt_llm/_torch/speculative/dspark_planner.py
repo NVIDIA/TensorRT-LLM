@@ -145,8 +145,8 @@ class SpsCostTable:
             raise ValueError("token_counts must be strictly increasing")
         if any(not math.isfinite(t) or t <= 0.0 for t in self.step_time_ms):
             raise ValueError("step_time_ms entries must be positive and finite")
-        if self.fixed_overhead_ms < 0.0:
-            raise ValueError("fixed_overhead_ms must be >= 0")
+        if not math.isfinite(self.fixed_overhead_ms) or self.fixed_overhead_ms < 0.0:
+            raise ValueError("fixed_overhead_ms must be >= 0 and finite")
         if len(self.batch_sizes) != len(self.batch_overhead_ms):
             raise ValueError(
                 f"batch_sizes ({len(self.batch_sizes)}) and batch_overhead_ms "

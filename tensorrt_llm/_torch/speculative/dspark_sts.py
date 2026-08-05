@@ -47,6 +47,7 @@ from typing import List, Optional
 
 import torch
 
+from ..._utils import prefer_pinned
 from ...logger import logger
 
 __all__ = [
@@ -132,16 +133,31 @@ def resolve_confidence_head(draft_model):
 class DSparkStsRecorder:
     """Pair each drafted block's logits with how much of it was accepted.
 
-    The two halves live in different places and are joined by sequence slot:
-    the logits are in the worker's persistent ``[max_batch + 2, K]`` device
-    buffer, written by the draft pass; the accepted count is host-side in the
-    sampler. Both are indexed by ``py_seq_slot``, so the join is exact.
+    The two halves live in different places and on different clocks: the
+    logits sit in the worker's persistent slot-indexed device buffer, written
+    by draft pass ``i``; the accepted count arrives in the sampler while pass
+    ``i+1`` (or ``i+2``, under the overlap scheduler) has already overwritten
+    that buffer. The join is therefore made on TWO axes, neither of which is
+    wall-clock arrival:
 
-    One host copy per step, not per request. ``record`` is called once per
-    request inside the sampler's loop, and copying a row each time would be a
-    synchronization per request; instead the whole buffer is pulled once when
-    the step's first request arrives and reused for the rest.
+    * **time** -- ``stage_snapshot`` keeps a small ring of host copies keyed
+      by the worker's draft sequence counter, and ``record`` selects the ring
+      entry whose per-row stamp equals the pass that drafted the block being
+      verified;
+    * **row** -- the caller resolves the request's buffer row through the
+      worker's own allocator (``confidence_row_for``), never through
+      ``py_seq_slot``, which belongs to a different allocator and only
+      coincides until the first request completes.
+
+    A pair that cannot be made exactly is dropped and counted in ``stats``
+    rather than approximated: a mispaired shard is strictly worse than a
+    smaller one, and looks identical downstream.
     """
+
+    #: Ring depth. The pairing lag is one draft pass (two under the overlap
+    #: scheduler); four snapshots is comfortably past both without letting a
+    #: wrong target_seq silently match ancient content.
+    _RING_DEPTH = 4
 
     def __init__(self, *, path_stem: str, block_size: int, rank: int = 0,
                  flush_every: int = _DEFAULT_FLUSH_EVERY) -> None:
@@ -150,98 +166,106 @@ class DSparkStsRecorder:
         self.rank = int(rank)
         self.flush_every = max(1, int(flush_every))
         self._logits: List[torch.Tensor] = []
-        self._stashed_logits: List[torch.Tensor] = []
         self._accepted: List[int] = []
-        self._stash_logits = None
-        self._stash_slots = None
-        self._stash_host = None
         self._shard = 0
         self._steps_since_flush = 0
-        # Host mirror of the device buffer, refreshed once per step.
-        self._host_logits: Optional[torch.Tensor] = None
-        self._host_step = -1
-        self._stash_capture_warned = False
+        # Snapshot ring, indexed by staged_seq % _RING_DEPTH. Each entry is
+        # (host_logits, host_stamps, cuda_event, staged_seq): a copy of the
+        # whole slot-indexed confidence buffer plus the draft-pass stamp of
+        # every row, taken on the host path each step -- the same relay the
+        # planner trusts. `record` selects the entry whose stamp for the
+        # request's row equals the pass that drafted the block being verified,
+        # so the pairing is by draft-pass identity, not by wall-clock arrival:
+        # the single mutable stash this replaces was overwritten by the very
+        # forward that produced the label, and NO execution order paired it
+        # correctly (off by one plain, off by two under overlap).
+        self._ring: List[Optional[tuple]] = [None] * self._RING_DEPTH
+        # Every decline is counted: this feature's failures are all silent,
+        # and an empty or thin shard with healthy-looking stats was exactly
+        # how the mispaired fit shipped.
+        self.stats: dict = {"recorded": 0, "no_snapshot": 0,
+                            "stale_stamp": 0, "row_out_of_range": 0,
+                            "no_row": 0, "snapshots_staged": 0}
 
-    def stash_draft_confidence(self, *, logits, slots) -> None:
-        """Keep what THIS step's draft produced, indexed by slot.
+    def stage_snapshot(self, *, device_logits: torch.Tensor,
+                       device_stamps: Optional[torch.Tensor],
+                       staged_seq: Optional[int]) -> None:
+        """Snapshot the confidence buffer + stamps, keyed by draft pass.
 
-        The persistent buffer is shared and the sampler reads it later; under
-        the overlap scheduler "later" can be after the next draft has written
-        it. SGLang sidesteps this by recording the draft's own output rather
-        than re-reading the buffer, and so does this once the diagnostic below
-        confirms the two differ.
+        Called from the executor's host path once per step (next to the
+        planner's own staging), never from inside the captured graph: Python
+        in a captured region runs at capture time only, which is how the old
+        stash silently replayed stale rows on every graphed step.
         """
-        # DEVICE-side clone only. This runs inside the captured draft graph, so
-        # a .to("cpu") here raises "Cannot copy between CPU and CUDA tensors
-        # during CUDA graph capture" -- the same constraint that forces
-        # _confidence_logits to be written in place. SGLang keeps a device
-        # reference for exactly this reason. The host copy is deferred to the
-        # sampler, which is outside the graph.
-        #
-        # EAGER-ONLY diagnostic: Python inside a captured region executes at
-        # capture time only, so under graph replay these clones would keep
-        # pointing at the last CAPTURE's tensors (dummy-slot content) and the
-        # late-read comparison would diff against garbage while looking
-        # perfectly healthy. Refuse to arm the stash during capture and say so
-        # once, rather than let a replayed collection run silently measure the
-        # wrong thing.
-        if torch.cuda.is_current_stream_capturing():
-            if not self._stash_capture_warned:
-                self._stash_capture_warned = True
-                logger.warning(
-                    "DSpark STS stash skipped under CUDA-graph capture: the "
-                    "late-read diagnostic is eager-only. Run collection with "
-                    "cuda_graph_config disabled to exercise it.")
-            self._stash_logits = None
-            self._stash_slots = None
-            self._stash_host = None
+        if device_stamps is None or staged_seq is None:
             return
-        self._stash_logits = logits.detach().clone()
-        self._stash_slots = slots.detach().clone()
-        self._stash_host = None
+        idx = int(staged_seq) % self._RING_DEPTH
+        entry = self._ring[idx]
+        if (entry is None or entry[0].shape != device_logits.shape
+                or entry[1].shape != device_stamps.shape):
+            on_gpu = device_logits.is_cuda
+            entry = (
+                torch.empty(device_logits.shape, dtype=torch.float32,
+                            device="cpu",
+                            pin_memory=on_gpu and prefer_pinned()),
+                torch.empty(device_stamps.shape, dtype=torch.int32,
+                            device="cpu",
+                            pin_memory=on_gpu and prefer_pinned()),
+                torch.cuda.Event() if on_gpu else None,
+                None,
+            )
+        entry[0].copy_(device_logits.detach().to(torch.float32),
+                       non_blocking=True)
+        entry[1].copy_(device_stamps, non_blocking=True)
+        if entry[2] is not None:
+            entry[2].record()
+        self._ring[idx] = (entry[0], entry[1], entry[2], int(staged_seq))
+        self.stats["snapshots_staged"] += 1
 
-    def begin_step(self, step: int) -> None:
-        """Invalidate the host mirror; the next ``record`` refreshes it."""
-        if step != self._host_step:
-            self._host_logits = None
-            self._stash_host = None
-            self._host_step = step
-
-    def record(self, *, slot: int, accepted: int,
-               device_logits: torch.Tensor) -> None:
-        """Record one request's ``(logits, accepted)`` pair.
+    def record(self, *, row: Optional[int], accepted: int,
+               target_seq: Optional[int]) -> None:
+        """Pair one request's accepted count with the logits that drafted it.
 
         Args:
-            slot: ``py_seq_slot``; indexes both the device buffer and nothing
-                else, which is why it is the join key.
+            row: the request's row in the confidence buffer, resolved through
+                the worker's own allocator (``confidence_row_for``). The
+                previous join key -- ``py_seq_slot`` -- came from a DIFFERENT
+                allocator that only coincides until the first request
+                completes; every pair after roster churn was request A's
+                label against request B's logits, and the shards looked
+                healthy.
             accepted: drafted positions accepted, excluding the bonus token.
-                This is exactly the ``num_correct_drafts`` the prefix mask is
-                built from.
-            device_logits: the worker's ``[rows, K]`` confidence buffer.
+            target_seq: the draft pass that produced the block this label
+                verifies, snapshotted into the SampleState at sampling time
+                (the ``verify_lens_snapshot`` pattern; reading it live at
+                update time rewinds wrong under the overlap scheduler).
         """
-        if self._host_logits is None:
-            # The single sync of the step. Deliberate: see the module docstring.
-            self._host_logits = device_logits.detach().to(
-                device="cpu", dtype=torch.float32, copy=True)
-        if slot < 0 or slot >= self._host_logits.shape[0]:
+        if row is None:
+            self.stats["no_row"] += 1
             return
-        buffered = self._host_logits[slot].clone()
-        self._logits.append(buffered)
+        if target_seq is None:
+            self.stats["no_snapshot"] += 1
+            return
+        entry = self._ring[int(target_seq) % self._RING_DEPTH]
+        if entry is None:
+            self.stats["no_snapshot"] += 1
+            return
+        logits_host, stamps_host, event, staged_seq = entry
+        if not 0 <= int(row) < logits_host.shape[0]:
+            self.stats["row_out_of_range"] += 1
+            return
+        if event is not None:
+            event.synchronize()
+        if int(stamps_host[int(row)]) != int(target_seq):
+            # The buffer content for this row is from a different draft pass
+            # than the one this label verifies -- the ring slot was reused, or
+            # the row was never written for that pass. Refusing IS the fix:
+            # appending it anyway is the mispairing this design replaces.
+            self.stats["stale_stamp"] += 1
+            return
+        self._logits.append(logits_host[int(row)].clone())
         self._accepted.append(int(accepted))
-        # Diagnostic: the same row as the draft produced it. If these two agree
-        # everywhere, reading the shared buffer late is safe; if they diverge,
-        # every pair recorded so far was confidence(t+k) against accepted(t).
-        # Materialize the draft-time snapshot once per step, here, outside the
-        # captured region.
-        if self._stash_host is None and self._stash_logits is not None:
-            rows = self._stash_logits.to(device="cpu", dtype=torch.float32,
-                                         copy=True)
-            idx = self._stash_slots.to(device="cpu").tolist()
-            self._stash_host = {int(sl): rows[i] for i, sl in enumerate(idx)}
-        stashed = (self._stash_host or {}).get(int(slot))
-        self._stashed_logits.append(
-            stashed.clone() if stashed is not None
-            else torch.full_like(buffered, float("nan")))
+        self.stats["recorded"] += 1
 
     def end_step(self) -> None:
         self._steps_since_flush += 1
@@ -264,14 +288,24 @@ class DSparkStsRecorder:
 
         path = Path(f"{self.path_stem}.r{self.rank}.{self._shard}.pt")
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"logits": logits, "prefix_mask": prefix_mask}
-        if self._stashed_logits:
-            payload["logits_at_draft"] = torch.stack(self._stashed_logits, dim=0)
+        # The pairing marker lets the fitter reject shards from the pre-ring
+        # recorder, whose pairs were mislabeled in ways the tensors themselves
+        # cannot reveal. The running decline counters ride along so a thin
+        # shard explains itself.
+        payload = {
+            "logits": logits,
+            "prefix_mask": prefix_mask,
+            "meta": {
+                "pairing": "draft_seq_ring",
+                "block_size": self.block_size,
+                "stats": dict(self.stats),
+            },
+        }
         torch.save(payload, path)
         logger.info(
-            f"DSpark STS: wrote {logits.shape[0]} samples to {path}")
+            f"DSpark STS: wrote {logits.shape[0]} samples to {path} "
+            f"(stats={self.stats})")
         self._logits.clear()
-        self._stashed_logits.clear()
         self._accepted.clear()
         self._shard += 1
 

@@ -260,7 +260,12 @@ class DSparkVerifyPlanner:
         wire_value = int(wire_value)
         if wire_value < 0:
             return
-        self._pending_verify_len_pin = -1
+        # Compare-and-clear: the RPC thread may queue a NEW request between
+        # the decode loop reading the payload and adopting it (they are an
+        # allgather apart). Unconditionally resetting here wiped that second
+        # request after its endpoint had already answered 200.
+        if self._pending_verify_len_pin == wire_value:
+            self._pending_verify_len_pin = -1
         new_pin = None if wire_value == 0 else wire_value
         if new_pin == self._forced_verify_len:
             return

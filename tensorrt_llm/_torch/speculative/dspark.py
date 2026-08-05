@@ -333,6 +333,32 @@ class DSparkWorker(SpecWorkerBase):
             return self._neutral_conf_row
         return self._req_to_slot.get(req_id, self._neutral_conf_row)
 
+    def sts_row_for(self, req_id: int) -> Optional[int]:
+        """``confidence_row_for`` for the STS recorder: None, never neutral.
+
+        The planner WANTS the neutral fallback (it reads as "verify the full
+        block", the safe direction). The recorder must not get it: the neutral
+        row is a real buffer row that no draft ever writes, and pairing a
+        request's label against it would be a fabricated sample, not a safe
+        default. An unresolvable request is a dropped sample, counted by the
+        recorder as ``no_row``.
+        """
+        if self._confidence_logits is None:
+            return None
+        return self._req_to_slot.get(req_id)
+
+    def verified_draft_seq(self) -> Optional[int]:
+        """The draft pass that produced the block the CURRENT step verifies.
+
+        Read at sampling time: by then this step's ``bump_draft_seq`` has
+        already advanced the counter for the draft running alongside the
+        verification, so the pass being verified is the previous value. The
+        first pass is numbered 1 (the stamp buffer starts at zeros, so a
+        sequence of 0 would false-match every never-written row -- including
+        the neutral one), hence None until a pass numbered >= 1 exists.
+        """
+        return self._draft_seq_host - 1 if self._draft_seq_host > 1 else None
+
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
@@ -454,6 +480,15 @@ class DSparkWorker(SpecWorkerBase):
             # argmax. Omitting them says "step_time_ms already measures whole
             # steps at the deployment's batch size".
             from .dspark_planner import check_table_fingerprint
+            if (raw.get("_meta") or {}).get("lookup") != "interp":
+                logger.warning(
+                    f"DSpark cost table {table_path} carries no "
+                    f"lookup='interp' marker: it may predate the "
+                    f"interpolating consumer. Tables written for the old "
+                    f"floor lookup dropped shelf-closing breakpoints on "
+                    f"purpose, and interpolating across those gaps re-bills "
+                    f"every mid-shelf total upward. Re-emit the table with a "
+                    f"current profiler if trimming behaves oddly.")
             check_table_fingerprint(payload=raw, live={
                 "tp": int(getattr(self.mapping, "tp_size", 0) or 0),
                 "ep": int(getattr(self.mapping, "moe_ep_size", 0) or 0),
@@ -779,16 +814,6 @@ class DSparkWorker(SpecWorkerBase):
             self._confidence_logits[slots] = confidence.detach()
             # Same slots, same capture region: content-only update, graph-safe.
             self._confidence_stamp[slots] = self._draft_seq_cuda
-            # STS collection reads this buffer from inside the sampler, which
-            # under the overlap scheduler can run AFTER the next step's draft
-            # has already overwritten it. SGLang avoids the question by keeping
-            # what the draft produced (`last_confidence_raw`) rather than
-            # re-reading a shared buffer later. Stash the same thing here, so
-            # the recorder can pair against the step that actually produced it
-            # -- and, for one diagnostic run, compare the two sources.
-            if getattr(self, "sts_recorder", None) is not None:
-                self.sts_recorder.stash_draft_confidence(
-                    logits=confidence.detach(), slots=slots)
         return block_logits
 
     def _forward_impl(

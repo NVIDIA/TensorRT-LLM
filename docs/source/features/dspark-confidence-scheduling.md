@@ -192,7 +192,7 @@ T(bs, K) = bias + alpha(bs) + theta(M)
                     权重搬运）
 ```
 
-`SpsCostTable` 按总验证 token 数 `M` 做**阶梯**查表，绝不插值：
+`SpsCostTable` 按总验证 token 数 `M` 做**钳位线性插值**查表（对齐 SGLang 的加法表消费端）。想表达"平台"就必须把平台测出来——两个等值断点；消费端不再替硬件假设断点之间是平的（那个假设曾把 1512 token 的满块按 768 的价格计费，整个特性因此从未裁剪过）：
 
 ```text
 step_time
@@ -258,14 +258,12 @@ right_edge(breakpoint T) = (T - 1) // bs - 1        # length 空间
 预算是 `num_gen * (L* - min_verify_len)` —— 和 uniform 决策**花掉的 token 总量相同**，
 只是重新分配。
 
-`min_verify_len` 默认为 **0**：整个 block 的每个位置都参与竞争，draft 已经死掉的请求会拿到
-**0 个** draft 位置。这不是饿死 —— bonus token 不在 confidence 矩阵里（它不是 draft 出来的、
-必然被接受），所以该请求那一步照样出 1 个 token，只是退化成普通自回归解码。也不存在
-"不验证 → 拿不到新分数 → 永远不验证"的反馈陷阱：不变量 I1 保证 block 永远完整 draft，
-confidence head 对全部 K 个位置打分，与验几个无关。
-
-把 floor 调到 0 以上只有一个正当理由 —— **公平性**（保证每个请求每步至少有一次投机机会）
-—— 并且要付代价：floor 会把预算花在排名低于被它挤掉的那些位置上。
+`min_verify_len` 在本实现中**固定为 1**（配置校验强制 >= 1）：每个请求每步至少验证
+anchor 位置。SGLang 允许 floor 为 0——draft 已死的请求拿 0 个位置也不是饿死（bonus token
+不在 confidence 矩阵里，该请求照样出 1 个 token，退化为普通自回归），省下的预算可以喂给
+强请求的深位置，混合批下其可达 Θ 严格更优（test_starving_weak_rows_is_a_known_gap 钉死了
+这个差异）。移植 floor=0 需要 executor 支持零窗口请求（layout/采样路径改动），是已知的
+待决 gap 而非本实现的默认。
 
 ```python
 candidates = survival[:, floor:].flatten()   # 每一个 (request, position) 对
@@ -280,7 +278,7 @@ confidence，也必须选出相同的 verify 长度，否则它们的 batch 形�
 
 ## 一个完整的数值例子
 
-`K=7, bs=4, tiers=[1,3,7], min_verify_len=0`（默认），成本表
+`K=7, bs=4, tiers=[1,3,7], min_verify_len=0`（注意：这是 SGLang 语义的演示例；本实现 floor 固定为 1），成本表
 `token_counts=(0, 8, 16, 32)`、`step_time_ms=(2.0, 2.2, 2.6, 9.0)`。
 
 survival 矩阵：
@@ -397,7 +395,8 @@ capture 安全性依赖几个具体选择：
 draft_len 是 CUDA graph key 的一部分
         |
         v
-但它不在 attention-DP 的一致性 allgather 里
+但它（当时）不在 attention-DP 的一致性 allgather 里——这是促成现行 shape gate 的
+历史事故：现在的实现已把 draft_len 纳入 allgather 并逐 rank 比对，下图保留为动机说明
         |
         v
 两个 rank 选了不同长度 -> 选到不同的 graph
