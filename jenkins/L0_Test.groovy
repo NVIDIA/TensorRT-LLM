@@ -972,9 +972,11 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 // Enroot needs artifactory auth. Use a per-job config dir (nodeName is
                 // unique) — never the shared ~/.config/enroot, which races across jobs.
+                // ENROOT_CONFIG_PATH is exported in the sbatch submit shell so Slurm
+                // propagates it into the agent setup script (--export=ALL by default).
+                def enrootConfigDir = null
                 if (cluster.containerRuntime.toString() == "ENROOT") {
-                    def enrootConfigDir = "${cluster.scratchPath}/users/svc_tensorrt/enroot-config-${nodeName}"
-                    def remoteScript = "/home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint}"
+                    enrootConfigDir = "${cluster.scratchPath}/users/svc_tensorrt/enroot-config-${nodeName}"
                     withCredentials([usernamePassword(
                         credentialsId: ARTIFACTORY_CREDENTIALS_ID,
                         usernameVariable: 'ARTIFACTORY_USER',
@@ -987,12 +989,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                             file: credsLocal,
                             text: "machine ${ARTIFACTORY_DOCKER_HOST} login ${ARTIFACTORY_USER} password ${ARTIFACTORY_PASSWORD}\n"
                         )
-                        def setupCmd = [
-                            "mkdir -p '${enrootConfigDir}'",
-                            // Point the agent setup script at this job-private config; clean up on exit.
-                            "sed -i '2i export ENROOT_CONFIG_PATH=${enrootConfigDir}\\ntrap \"rm -rf ${enrootConfigDir}\" EXIT' '${remoteScript}'",
-                        ].join(" ; ")
-                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(setupCmd)))
+                        Utils.exec(pipeline, script: Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd("mkdir -p '${enrootConfigDir}'")))
                         Utils.copyFileToRemoteHost(
                             pipeline,
                             remote,
@@ -1020,12 +1017,17 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     }
                 }
 
+                def slurmSubmitCommand = slurmCommandWithExclusion
+                if (enrootConfigDir) {
+                    slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
+                }
+
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        Utils.bashWrappedRemoteCmd(slurmCommandWithExclusion)
+                        Utils.bashWrappedRemoteCmd(slurmSubmitCommand)
                     ),
                     returnStdout: true,
                     numRetries: 3
