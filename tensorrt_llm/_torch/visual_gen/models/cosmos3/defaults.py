@@ -464,7 +464,12 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "action_mode": ExtraParamSchema(
         type="Literal['policy', 'forward_dynamics', 'inverse_dynamics']",
         default=None,
-        description="Action generation mode: policy, forward_dynamics, or inverse_dynamics.",
+        description=(
+            "Action generation mode: policy, forward_dynamics, or inverse_dynamics. "
+            "The predicted trajectory is not representable in a video container, so "
+            "an action request is served as a tensor payload."
+        ),
+        requires_tensor_output=True,
     ),
     "domain_name": ExtraParamSchema(
         type="str",

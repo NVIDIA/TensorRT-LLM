@@ -58,6 +58,15 @@ class ExtraParamSchema(StrictBaseModel):
         "values. Must be a module-level function (specs are pickled to the "
         "coordinator in the READY handshake).",
     )
+    requires_tensor_output: bool = Field(
+        default=False,
+        description="Setting this parameter makes the request produce a result "
+        "the media encoders cannot represent (a non-image/video modality), so "
+        "the response must be a tensor payload. Serve resolves 'auto' to a "
+        "tensor format and rejects an explicit encoder format. Declared here "
+        "rather than hard-coded in the routes so the serving layer needs no "
+        "per-model knowledge.",
+    )
 
 
 if TYPE_CHECKING:
