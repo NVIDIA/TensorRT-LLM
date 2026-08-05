@@ -975,6 +975,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 raise ValueError(
                     "Cosmos3 transfer inference cannot be combined with sound generation."
                 )
+            if image is not None:
+                # _forward_transfer takes no image: structure comes from the
+                # control hints and the first chunk conditions on `video`. Say
+                # so rather than dropping the reference silently.
+                raise ValueError(
+                    "Cosmos3 transfer inference cannot be combined with an image reference; "
+                    "pass the conditioning clip as the 'video' extra param instead."
+                )
         guidance_interval = None
         if is_t2i:
             if image is not None:
@@ -1437,7 +1445,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return 1 + extra_chunks, stride
 
     @staticmethod
-    def positive_float(value: Optional[float]) -> Optional[float]:
+    def _positive_float(value: Optional[float]) -> Optional[float]:
         if value is None:
             return None
         try:
@@ -1453,6 +1461,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         timestep: torch.Tensor,
         interval: tuple[float, float] | None,
     ) -> bool:
+        """Is guidance active at ``timestep``?
+
+        ``interval`` is in the scheduler's own timestep units (raw, typically
+        0-1000 counting down), not a fraction of the schedule -- ``[0.0, 0.8]``
+        selects the last step rather than the first 80%.
+        """
         if interval is None:
             return True
         t_scalar = float(timestep.item()) if torch.is_tensor(timestep) else float(timestep)
@@ -1603,23 +1617,23 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def _forward_transfer(
         self,
         *,
-        prompt: str,
-        negative_prompt: str,
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[str],
         height: int,
         width: int,
         max_frames: int,
         num_inference_steps: int,
-        max_sequence_length,
-        use_system_prompt,
-        use_duration_template: str,
-        use_resolution_template: str,
-        seed,
+        max_sequence_length: int,
+        use_system_prompt: bool,
+        use_duration_template: bool,
+        use_resolution_template: bool,
+        seed: int,
         frame_rate: float,
         num_frames: int,
         use_guardrails: bool,
         timer: CudaPhaseTimer,
         transfer_config: Cosmos3TransferConfig,
-        video: Any,
+        video: Optional[bytes],
     ) -> PipelineOutput:
         if self.rank == 0:
             logger.info(f"Cosmos3 transfer target={width}x{height} (WxH)")
@@ -1700,7 +1714,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # boundary, so the hint's configured fps (wsm's 10) wins over the
         # request's, which falls back to the mode default.
         frame_rate = (
-            self.positive_float(transfer_config.fps) or self.positive_float(frame_rate) or 24.0
+            self._positive_float(transfer_config.fps) or self._positive_float(frame_rate) or 24.0
         )
         num_inference_steps = num_inference_steps or COSMOS3_720P_PARAMS["num_inference_steps"]
         guidance_scale = (
@@ -1822,7 +1836,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                             -1,
                         )
 
-            control_latents = [self._encode_video_tensor(video) for video in control_norms.values()]
+            control_latents = [
+                self._encode_video_tensor(control) for control in control_norms.values()
+            ]
             latents, velocity_mask, condition_latents = self._prepare_transfer_latents(
                 target_norm,
                 current_conditional_frames,

@@ -63,6 +63,23 @@ def _load_transfer_controls(extra_params: Dict[str, Any]) -> None:
         extra_params[key] = hint
 
 
+def _json_object(text: str) -> Dict[str, Any]:
+    """Argparse type for a JSON *object*.
+
+    ``json.loads`` alone also accepts arrays, scalars and null, which then
+    either fail deep in the merge or, for ``[]``, succeed while doing nothing.
+    """
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError(
+            f"expected a JSON object, got {type(value).__name__}: {text!r}"
+        )
+    return value
+
+
 def load_prompt_file(path: str) -> Dict[str, Any]:
     """Load a Cosmos3 omni prompt JSON (``prompt``, optional ``vision_path``, etc.)."""
     resolved = _resolve_path(path)
@@ -185,7 +202,7 @@ def main():
     )
     parser.add_argument(
         "--extra_params",
-        type=json.loads,
+        type=_json_object,
         default=None,
         help=(
             "Model-specific extra params as a JSON object, merged last (overrides "

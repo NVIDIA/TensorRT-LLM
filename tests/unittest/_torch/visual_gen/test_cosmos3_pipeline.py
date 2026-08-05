@@ -803,6 +803,58 @@ class TestCosmos3V2V:
 
 
 class TestCosmos3TransferRouting:
+    def test_transfer_rejects_an_image_reference(self):
+        """`_forward_transfer` takes no image, so a request carrying both used
+        to have its image silently dropped. The sibling guards already reject
+        transfer with image output and with audio; this one completes them."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
+
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.action_gen = False
+        pipeline.audio_gen = False
+        pipeline._apply_flow_shift = lambda *args, **kwargs: None
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+        pipeline.sampling = FakeSampling()
+        pipeline._forward_transfer = lambda **kwargs: None
+        # A precomputed control and no video: an existing guard already rejects
+        # image+video, so this is the shape where the image used to reach
+        # `_forward_transfer` and be discarded.
+        cfg = resolve_transfer_config(
+            {"edge": _V2V_FIXTURE_MP4.read_bytes()},
+            SimpleNamespace(num_frames=93, guidance_scale=None),
+            None,
+        )
+
+        with pytest.raises(ValueError, match="cannot be combined with an image reference"):
+            pipeline.forward(
+                prompt="bounce",
+                image="frame.png",
+                transfer_config=cfg,
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=None,
+                use_guardrails=False,
+            )
+
     def test_transfer_use_system_prompt_defaults_off(self):
         """Reference parity: transfer defaults ``use_system_prompt=False`` even
         when a video input is present — V2V's default-True rule must not leak

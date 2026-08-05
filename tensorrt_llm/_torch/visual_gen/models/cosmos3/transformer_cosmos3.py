@@ -1050,8 +1050,14 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 When provided, audio tokens are appended to the generation
                 sequence and an audio velocity is returned alongside the video
                 velocity.  Requires ``audio_gen=True`` in the pretrained config.
-            control_latents: Optional transfer-control latents. Controls are #TODO
-                clean vision context and are packed before the noisy target.
+            control_latents: Optional transfer-control latents. Controls are
+                clean (un-noised) vision context and are packed before the
+                noisy target; their outputs are discarded.
+            transfer_share_vision_temporal_positions: When True (the default),
+                control tokens reuse the target frames' mRoPE temporal
+                coordinates, so a control patch sits at zero displacement from
+                the output patch it governs and the shared coordinate carries
+                the correspondence. When False they take their own positions.
 
         Returns:
             TransformerOutput with video (and image alias) always set.

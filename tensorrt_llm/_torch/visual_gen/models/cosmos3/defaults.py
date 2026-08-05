@@ -387,7 +387,12 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "control_guidance_interval": ExtraParamSchema(
         type="list",
         default=None,
-        description="[lo, hi] timestep window where control guidance is active.",
+        description=(
+            "[lo, hi] window where control guidance is active, in raw scheduler "
+            "timesteps (typically 0-1000, counting down) rather than as a fraction "
+            "of the schedule: [0.0, 0.8] gates on the final step, not the first "
+            "80%. To cover most of the schedule use e.g. [200, 1000]."
+        ),
         validator=_validate_control_guidance_interval,
     ),
     "num_video_frames_per_chunk": ExtraParamSchema(

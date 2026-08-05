@@ -294,6 +294,18 @@ class TestTransferMediaHelpers:
         frames = torch.arange(3 * 3, dtype=torch.uint8).reshape(1, 3, 1, 3)
         assert pad_temporal_frames(frames, 5)[0, :, 0, 0].tolist() == [0, 3, 6, 6, 3]
 
+    def test_malformed_hints_are_client_errors(self):
+        # The worker classifier maps ValueError to a client error (400) and
+        # anything else to an unclassified server fault (500). A caller's
+        # malformed hint must not be reported as our failure.
+        for payload in (123, ["edge.mp4"], {"control": 123}):
+            with pytest.raises(ValueError):
+                resolve_transfer_config({"edge": payload}, _req())
+        with pytest.raises(ValueError):
+            decode_media_to_uint8_cthw(
+                "not-bytes", height=8, width=8, max_frames=1, device=torch.device("cpu")
+            )
+
     def test_bilateral_params_scale_with_resolution(self):
         # Tuned at a 720p reference: a 72px longest side is 1/10 of it, so the
         # diameter and both sigmas scale down by the same factor.
@@ -550,7 +562,7 @@ class TestTransferControlPayloads:
             resolve_transfer_config({"edge": {"control_path": "/tmp/control.mp4"}}, _req())
 
     def test_hint_rejects_non_bytes_control(self):
-        with pytest.raises(TypeError, match="encoded MP4/AVI bytes"):
+        with pytest.raises(ValueError, match="encoded MP4/AVI bytes"):
             resolve_transfer_config({"edge": {"control": torch.zeros(3, 1, 4, 4)}}, _req())
 
     def test_decode_asks_for_the_leading_window_and_returns_cthw(self, monkeypatch):
@@ -568,7 +580,7 @@ class TestTransferControlPayloads:
         assert seen == {"data": b"clip", "first": 0, "last": 3, "h": 8, "w": 6}
 
     def test_decode_rejects_unencoded_payloads(self):
-        with pytest.raises(TypeError, match="encoded MP4/AVI bytes"):
+        with pytest.raises(ValueError, match="encoded MP4/AVI bytes"):
             decode_media_to_uint8_cthw(
                 torch.zeros(3, 1, 4, 4),
                 height=4,

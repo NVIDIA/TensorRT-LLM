@@ -204,7 +204,11 @@ def resolve_transfer_config(
                 "'video' extra param does."
             )
         if not isinstance(raw, Mapping):
-            raise TypeError(
+            # ValueError, not TypeError: the worker's error classifier maps
+            # ValueError to a client error (400) and anything else to an
+            # unclassified server fault (500). A malformed hint is the caller's
+            # to fix, so it must not be reported as our failure.
+            raise ValueError(
                 f"Cosmos3 transfer hint '{key}' must be an object, encoded control bytes, or "
                 f"true; got {type(raw)!r}."
             )
@@ -215,7 +219,7 @@ def resolve_transfer_config(
             )
         control = raw.get("control")
         if control is not None and not isinstance(control, bytes):
-            raise TypeError(
+            raise ValueError(
                 f"Cosmos3 transfer hint '{key}' control must be encoded MP4/AVI bytes, got "
                 f"{type(control)!r}."
             )
@@ -361,7 +365,7 @@ def decode_media_to_uint8_cthw(
     high-resolution control never materializes at full size.
     """
     if not isinstance(data, bytes):
-        raise TypeError(
+        raise ValueError(
             f"Cosmos3 transfer media must be encoded MP4/AVI bytes, got {type(data)!r}."
         )
     max_frames = int(max_frames)
