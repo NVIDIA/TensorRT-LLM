@@ -4994,7 +4994,10 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                         usernameVariable: 'USERNAME',
                         passwordVariable: 'PASSWORD'
                     )]) {
-                        sh "docker login ${ARTIFACTORY_DOCKER_HOST} -u ${USERNAME} -p ${PASSWORD}"
+                        sh """
+                            set +x
+                            echo "\$PASSWORD" | docker login ${ARTIFACTORY_DOCKER_HOST} -u "\$USERNAME" --password-stdin
+                        """
                     }
                     docker.image(image).pull()
                 }
