@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import enum
@@ -3035,6 +3050,7 @@ def _mxfp8_cutlass_op_available() -> bool:
                    ) and torch.cuda.get_device_capability()[0] >= 10
 
 
+_MXFP8_CUTEDSL_DECODE_MAX_M = 32
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
@@ -3076,7 +3092,9 @@ class MXFP8LinearMethod(LinearMethodBase):
       - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
         with ``mm_mxfp8``. MiniMax-M3 enables this path automatically only
         while tuning or capturing decode CUDA graphs; eager execution remains
-        on the native TensorRT-LLM op.
+        on the native TensorRT-LLM op. When CuTeDSL is configured, automatic
+        decode-graph dispatch uses it for M <= 32 and retains CUTLASS for
+        larger shapes.
 
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
     ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
@@ -3095,11 +3113,17 @@ class MXFP8LinearMethod(LinearMethodBase):
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
         self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+        self.flashinfer_backend = os.environ.get(
+            "TRTLLM_MXFP8_FLASHINFER_BACKEND", "cutlass")
         self.use_native_autotuner = True
         self._native_autotuned = False
         if self.backend not in ("trtllm", "flashinfer", "auto"):
             raise ValueError("TRTLLM_MXFP8_GEMM_BACKEND must be 'trtllm', "
                              f"'flashinfer', or 'auto', got {self.backend!r}")
+        if self.flashinfer_backend not in ("cutlass", "cute-dsl"):
+            raise ValueError(
+                "TRTLLM_MXFP8_FLASHINFER_BACKEND must be 'cutlass' or "
+                f"'cute-dsl', got {self.flashinfer_backend!r}")
         self._flashinfer_mxfp8 = None
         self._flashinfer_autotuned = False
         if self.backend == "flashinfer":
@@ -3114,7 +3138,9 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     @property
     def needs_flashinfer_autotune(self) -> bool:
-        return self.uses_flashinfer and self._flashinfer_mxfp8 is not None
+        return (self.uses_flashinfer and self._flashinfer_mxfp8 is not None
+                and (self.flashinfer_backend == "cutlass"
+                     or self.backend == "auto"))
 
     @property
     def needs_native_autotune(self) -> bool:
@@ -3142,6 +3168,22 @@ class MXFP8LinearMethod(LinearMethodBase):
             return False
         self._flashinfer_mxfp8 = mm_mxfp8
         return True
+
+    def _flashinfer_backend_for_call(self,
+                                     input: torch.Tensor) -> Optional[str]:
+        if self.backend == "flashinfer":
+            return self.flashinfer_backend
+        if self.backend != "auto":
+            return None
+        if _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get():
+            return "cutlass"
+        if not (self._flashinfer_autotuned
+                and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
+            return None
+        if self.flashinfer_backend == "cute-dsl" and not (
+                1 <= input.shape[0] <= _MXFP8_CUTEDSL_DECODE_MAX_M):
+            return "cutlass"
+        return self.flashinfer_backend
 
     def enable_flashinfer_auto(self) -> bool:
         """Enable graph-only FlashInfer dispatch unless the user overrode it."""
@@ -3211,12 +3253,8 @@ class MXFP8LinearMethod(LinearMethodBase):
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
             act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
                 input.contiguous(), True)
-            use_flashinfer = self.backend == "flashinfer" or (
-                self.backend == "auto" and
-                (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
-                 (self._flashinfer_autotuned
-                  and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
-            if use_flashinfer:
+            flashinfer_backend = self._flashinfer_backend_for_call(input)
+            if flashinfer_backend is not None:
                 flashinfer_mxfp8 = self._flashinfer_mxfp8
                 assert flashinfer_mxfp8 is not None
                 output = flashinfer_mxfp8(
@@ -3226,7 +3264,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                     module.weight_scale,
                     out_dtype=module.dtype,
                     use_8x4_sf_layout=False,
-                    backend="cutlass",
+                    backend=flashinfer_backend,
                 )
             else:
                 # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.

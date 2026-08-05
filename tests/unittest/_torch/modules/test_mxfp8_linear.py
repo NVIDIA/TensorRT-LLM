@@ -64,6 +64,7 @@ def test_mxfp8_dispatch_returns_mxfp8_method(monkeypatch):
     This is a pure dispatch check; no CUDA required.
     """
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.delenv("TRTLLM_MXFP8_FLASHINFER_BACKEND", raising=False)
     qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     method = get_quant_method(qc)
     assert isinstance(method, MXFP8LinearMethod)
@@ -99,6 +100,7 @@ def _mock_mxfp8_ops(monkeypatch):
 def test_mxfp8_flashinfer_call_contract(monkeypatch):
     """The forced backend reuses TRT tensors and a zero-copy weight transpose."""
     monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "flashinfer")
+    monkeypatch.delenv("TRTLLM_MXFP8_FLASHINFER_BACKEND", raising=False)
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
 
     expected = torch.empty((2, 3), dtype=torch.bfloat16)
@@ -132,6 +134,7 @@ def test_mxfp8_flashinfer_call_contract(monkeypatch):
 
 def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.delenv("TRTLLM_MXFP8_FLASHINFER_BACKEND", raising=False)
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
 
     flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
@@ -160,6 +163,65 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     # Leaving the decode-capture scope restores the eager/native path.
     assert method.apply(module, activation, bias=None) is native_output
     assert native_gemm.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "m,expected_backend",
+    [
+        (1, "cute-dsl"),
+        (32, "cute-dsl"),
+        (33, "cutlass"),
+        (64, "cutlass"),
+    ],
+)
+def test_mxfp8_auto_cutedsl_uses_decode_m_cutoff(monkeypatch, m, expected_backend):
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setenv("TRTLLM_MXFP8_FLASHINFER_BACKEND", "cute-dsl")
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+
+    flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    mm_mxfp8 = Mock(return_value=flashinfer_output)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
+    _, _, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((m, 4), dtype=torch.bfloat16)
+    method = MXFP8LinearMethod()
+    assert method.enable_flashinfer_auto()
+    assert method.needs_flashinfer_autotune
+
+    assert method.apply(module, activation, bias=None) is native_output
+    native_gemm.assert_called_once()
+
+    method.mark_flashinfer_autotuned()
+    with flashinfer_mxfp8_decode_graph_capture():
+        assert method.apply(module, activation, bias=None) is flashinfer_output
+    assert mm_mxfp8.call_args.kwargs["backend"] == expected_backend
+
+
+def test_mxfp8_forced_cutedsl_is_not_limited_to_decode_cutoff(monkeypatch):
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "flashinfer")
+    monkeypatch.setenv("TRTLLM_MXFP8_FLASHINFER_BACKEND", "cute-dsl")
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+
+    flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    mm_mxfp8 = Mock(return_value=flashinfer_output)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
+    _mock_mxfp8_ops(monkeypatch)
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    method = MXFP8LinearMethod()
+    method.apply(module, torch.randn((64, 4), dtype=torch.bfloat16), bias=None)
+
+    assert mm_mxfp8.call_args.kwargs["backend"] == "cute-dsl"
 
 
 @pytest.mark.parametrize(
@@ -276,6 +338,12 @@ def test_mxfp8_native_autotuner_syncs_profiles():
 def test_mxfp8_rejects_unknown_backend(monkeypatch):
     monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "unknown")
     with pytest.raises(ValueError, match="TRTLLM_MXFP8_GEMM_BACKEND"):
+        MXFP8LinearMethod()
+
+
+def test_mxfp8_rejects_unknown_flashinfer_backend(monkeypatch):
+    monkeypatch.setenv("TRTLLM_MXFP8_FLASHINFER_BACKEND", "unknown")
+    with pytest.raises(ValueError, match="TRTLLM_MXFP8_FLASHINFER_BACKEND"):
         MXFP8LinearMethod()
 
 
